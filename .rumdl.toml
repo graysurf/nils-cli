@@ -1,0 +1,8 @@
+[MD013]
+line-length = 140
+code-blocks = false
+headings = false
+tables = false
+
+[MD060]
+enabled = true
