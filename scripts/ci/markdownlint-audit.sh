@@ -6,7 +6,7 @@ usage() {
 Usage:
   markdownlint-audit.sh [--strict]
 
-Run workspace Markdown lint checks using markdownlint-cli2 and the repo baseline config.
+Run workspace Markdown lint checks using rumdl and the repo baseline config.
 
 Options:
   --strict   Treat lint failures as hard failures (exit 1)
@@ -46,24 +46,34 @@ if ! command -v npx >/dev/null 2>&1; then
   exit 2
 fi
 
-config_file="$repo_root/.markdownlint-cli2.jsonc"
+config_file="$repo_root/.rumdl.toml"
 if [[ ! -f "$config_file" ]]; then
-  echo "error: missing markdownlint config: $config_file" >&2
+  echo "error: missing rumdl config: $config_file" >&2
+  exit 2
+fi
+
+declare -a md_files=()
+while IFS= read -r -d '' path; do
+  if [[ "$path" == "README.md" || "$path" == "DEVELOPMENT.md" || "$path" == "AGENTS.md" ]]; then
+    md_files+=("$path")
+    continue
+  fi
+
+  if [[ "$path" =~ ^docs/.+\.md$ || "$path" =~ ^crates/[^/]+/README\.md$ || "$path" =~ ^crates/[^/]+/docs/.+\.md$ ]]; then
+    md_files+=("$path")
+  fi
+done < <(git ls-files -z -- README.md DEVELOPMENT.md AGENTS.md docs crates)
+
+if [[ "${#md_files[@]}" -eq 0 ]]; then
+  echo "error: no Markdown files matched audit scope" >&2
   exit 2
 fi
 
 lint_cmd=(
-  npx --yes
-  --package markdownlint-cli2@0.21.0
-  --package katex@0.16.21
-  markdownlint-cli2
+  npx --yes rumdl@0.1.62
+  check
   --config "$config_file"
-  "README.md"
-  "DEVELOPMENT.md"
-  "AGENTS.md"
-  "docs/**/*.md"
-  "crates/*/README.md"
-  "crates/*/docs/**/*.md"
+  "${md_files[@]}"
 )
 
 echo "+ ${lint_cmd[*]}"
