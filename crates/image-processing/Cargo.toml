@@ -19,7 +19,7 @@ serde_json = { workspace = true }
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 globset = "0.4"
-image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 nils-common = { version = "0.6.7", path = "../nils-common", package = "nils-common" }
 nils-term = { version = "0.6.7", path = "../nils-term", package = "nils-term" }
 resvg = "0.47"

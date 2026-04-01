@@ -2,10 +2,10 @@
 
 ## Overview
 
-`image-processing` provides a modern SVG-first flow:
+`image-processing` provides a focused conversion and validation flow:
 
 - `svg-validate --in <svg> --out <svg>`
-- `convert --from-svg <path> --to png|webp|svg --out <file>`
+- `convert --in <path> --to png|webp|jpg --out <file>`
 
 `generate` is removed.
 
@@ -25,29 +25,29 @@ Help:
 ## Commands
 
 - `svg-validate`: Validate and sanitize one SVG input into one SVG output.
-- `convert`: Render trusted SVG source into `png`, `webp`, or `svg` output.
+- `convert`: Convert `svg|png|jpg|jpeg|webp` input into `png`, `webp`, or `jpg` output.
 
 ## Common flags
 
 - Input:
   - `svg-validate`: `--in <path>` (exactly one)
-  - `convert`: `--from-svg <path>`
+  - `convert`: `--in <path>` (exactly one)
 - Output: `--out <file>`
 - Output controls: `--overwrite`, `--dry-run`, `--json`, `--report`
 - Render sizing for raster output: `--width`, `--height`
 
-## `convert --from-svg` contract (v1)
+## `convert` contract
 
-- Required: `--from-svg`, `--to png|webp|svg`, `--out <file>`.
-- Forbidden: `--in`.
-- `--out` extension must match `--to`.
-- Optional: `--width` and `--height` for `png`/`webp` sizing.
-- `--to svg` does not support `--width`/`--height`.
+- Required: exactly one `--in`, `--to png|webp|jpg`, `--out <file>`.
+- Supported inputs: `svg`, `png`, `jpg`, `jpeg`, `webp`.
+- `--out` extension must match `--to` (`.jpeg` is accepted for `--to jpg`).
+- Optional: `--width` and `--height` for raster sizing.
+- `--to jpg` flattens alpha onto a white background.
 
 ## `svg-validate` contract
 
 - Required: exactly one `--in <svg>` and `--out <svg>`.
-- Forbidden: `--from-svg`, `--to`, `--width`, `--height`.
+- Forbidden: `--to`, `--width`, `--height`.
 - Output is deterministic for identical input.
 
 ## Examples
@@ -64,7 +64,7 @@ cargo run -p nils-image-processing -- svg-validate \
 
 ```bash
 cargo run -p nils-image-processing -- convert \
-  --from-svg out/plan-doc-examples/llm.cleaned.svg \
+  --in out/plan-doc-examples/llm.cleaned.svg \
   --to png \
   --out out/plan-doc-examples/llm.png \
   --json
@@ -72,9 +72,9 @@ cargo run -p nils-image-processing -- convert \
 
 ```bash
 cargo run -p nils-image-processing -- convert \
-  --from-svg crates/image-processing/tests/fixtures/sample-icon.svg \
-  --to webp \
-  --out out/plan-doc-examples/sample.webp \
+  --in crates/image-processing/tests/fixtures/sample-icon.svg \
+  --to jpg \
+  --out out/plan-doc-examples/sample.jpg \
   --width 512 \
   --json
 ```
@@ -87,7 +87,7 @@ cargo run -p nils-image-processing -- convert \
 
 ## Dependencies
 
-- `convert --from-svg` and `svg-validate`: no external binary dependency (Rust backend).
+- `convert --in` and `svg-validate`: no external binary dependency (Rust backend).
 
 ## Docs
 

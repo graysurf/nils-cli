@@ -5,6 +5,7 @@ use std::process;
 
 mod cli;
 mod completion;
+mod convert;
 mod model;
 mod processing;
 mod report;
@@ -39,23 +40,11 @@ fn run() -> i32 {
 
     let repo_root = util::find_repo_root();
 
-    let input_path = match cli.subcommand {
-        Operation::Convert => util::expand_user(
-            cli.from_svg
-                .as_deref()
-                .expect("validated convert --from-svg input"),
-        ),
-        Operation::SvgValidate => {
-            let inputs = match processing::expand_inputs(&cli.inputs) {
-                Ok(v) => v,
-                Err(e) => usage_error(&e.message),
-            };
-            inputs
-                .into_iter()
-                .next()
-                .expect("validated svg-validate single input")
-        }
+    let inputs = match processing::expand_inputs(&cli.inputs) {
+        Ok(v) => v,
+        Err(e) => usage_error(&e.message),
     };
+    let input_path = inputs.into_iter().next().expect("validated single input");
 
     let output_path = util::expand_user(cli.out.as_deref().expect("validated output path"));
 
@@ -79,13 +68,7 @@ fn run() -> i32 {
         ProgressOptions::default().with_finish(ProgressFinish::Leave),
     );
 
-    let backend = match cli.subcommand {
-        Operation::Convert => toolchain::RUST_FROM_SVG_BACKEND,
-        Operation::SvgValidate => toolchain::RUST_SVG_VALIDATE_BACKEND,
-    };
-
     let summary = match processing::process_items(processing::ProcessArgs {
-        backend,
         repo_root: &repo_root,
         run_dir: run_dir.as_deref(),
         progress,
@@ -93,12 +76,12 @@ fn run() -> i32 {
         input_path: &input_path,
         output_path: &output_path,
         convert_to: cli.to.as_deref(),
-        from_svg_width: if cli.subcommand == Operation::Convert {
+        width: if cli.subcommand == Operation::Convert {
             cli.width
         } else {
             None
         },
-        from_svg_height: if cli.subcommand == Operation::Convert {
+        height: if cli.subcommand == Operation::Convert {
             cli.height
         } else {
             None
@@ -177,27 +160,21 @@ fn validate(cli: &Cli) -> Result<(), util::UsageError> {
 
     match cli.subcommand {
         Operation::Convert => {
-            if cli.from_svg.is_none() {
+            if cli.inputs.len() != 1 {
                 return Err(util::UsageError {
-                    message: "convert requires --from-svg".to_string(),
-                });
-            }
-
-            if !cli.inputs.is_empty() {
-                return Err(util::UsageError {
-                    message: "convert --from-svg does not support --in".to_string(),
+                    message: "convert requires exactly one --in <path>".to_string(),
                 });
             }
 
             if cli.out.is_none() {
                 return Err(util::UsageError {
-                    message: "convert --from-svg requires --out".to_string(),
+                    message: "convert requires --out".to_string(),
                 });
             }
 
             if cli.to.is_none() {
                 return Err(util::UsageError {
-                    message: "convert with --from-svg requires --to png|webp|svg".to_string(),
+                    message: "convert requires --to png|webp|jpg".to_string(),
                 });
             }
 
@@ -205,7 +182,7 @@ fn validate(cli: &Cli) -> Result<(), util::UsageError> {
                 && width <= 0
             {
                 return Err(util::UsageError {
-                    message: "convert --from-svg --width must be > 0".to_string(),
+                    message: "convert --width must be > 0".to_string(),
                 });
             }
 
@@ -213,35 +190,22 @@ fn validate(cli: &Cli) -> Result<(), util::UsageError> {
                 && height <= 0
             {
                 return Err(util::UsageError {
-                    message: "convert --from-svg --height must be > 0".to_string(),
+                    message: "convert --height must be > 0".to_string(),
                 });
             }
 
-            if let Some(to) = cli.to.as_deref() {
-                if !svg_validate::SUPPORTED_FROM_SVG_TARGETS.contains(&to) {
-                    return Err(util::UsageError {
-                        message: "convert --from-svg --to must be one of: png|webp|svg".to_string(),
-                    });
-                }
-
-                if to == "svg" && (cli.width.is_some() || cli.height.is_some()) {
-                    return Err(util::UsageError {
-                        message: "convert --from-svg --to svg does not support --width/--height"
-                            .to_string(),
-                    });
-                }
+            if let Some(to) = cli.to.as_deref()
+                && convert::normalize_convert_target(to).is_none()
+            {
+                return Err(util::UsageError {
+                    message: "convert --to must be one of: png|webp|jpg".to_string(),
+                });
             }
         }
         Operation::SvgValidate => {
             if cli.inputs.len() != 1 {
                 return Err(util::UsageError {
                     message: "svg-validate requires exactly one --in <path>".to_string(),
-                });
-            }
-
-            if cli.from_svg.is_some() {
-                return Err(util::UsageError {
-                    message: "svg-validate does not support --from-svg".to_string(),
                 });
             }
 
@@ -282,8 +246,13 @@ mod tests {
         Cli {
             subcommand,
             inputs: vec![],
-            from_svg: None,
-            out: Some("out.svg".to_string()),
+            out: Some(
+                match subcommand {
+                    Operation::Convert => "out.png",
+                    Operation::SvgValidate => "out.svg",
+                }
+                .to_string(),
+            ),
             overwrite: false,
             dry_run: true,
             json: false,
@@ -295,16 +264,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_convert_requires_from_svg_and_to() {
+    fn validate_convert_requires_in_and_to() {
         let mut cli = base_cli(Operation::Convert);
-        let err = validate(&cli).expect_err("convert requires --from-svg");
-        assert!(err.to_string().contains("convert requires --from-svg"));
+        let err = validate(&cli).expect_err("convert requires --in");
+        assert!(
+            err.to_string()
+                .contains("convert requires exactly one --in")
+        );
 
-        cli.from_svg = Some("icon.svg".to_string());
+        cli.inputs = vec!["icon.svg".to_string()];
         let err = validate(&cli).expect_err("convert requires --to");
         assert!(
             err.to_string()
-                .contains("convert with --from-svg requires --to png|webp|svg")
+                .contains("convert requires --to png|webp|jpg")
         );
 
         cli.to = Some("png".to_string());
@@ -312,26 +284,22 @@ mod tests {
     }
 
     #[test]
-    fn validate_convert_rejects_input_flag_and_invalid_dimensions() {
+    fn validate_convert_rejects_extra_inputs_and_invalid_dimensions() {
         let mut cli = base_cli(Operation::Convert);
-        cli.from_svg = Some("icon.svg".to_string());
+        cli.inputs = vec!["icon.svg".to_string(), "other.png".to_string()];
         cli.to = Some("png".to_string());
-        cli.inputs = vec!["input.png".to_string()];
-        let err = validate(&cli).expect_err("convert should reject --in");
-        assert!(err.to_string().contains("does not support --in"));
+        let err = validate(&cli).expect_err("convert should reject multiple --in");
+        assert!(err.to_string().contains("exactly one --in"));
 
-        cli.inputs.clear();
+        cli.inputs = vec!["icon.svg".to_string()];
         cli.width = Some(0);
         let err = validate(&cli).expect_err("width must be > 0");
         assert!(err.to_string().contains("--width must be > 0"));
 
         cli.width = Some(64);
-        cli.to = Some("svg".to_string());
-        let err = validate(&cli).expect_err("svg target should reject dimensions");
-        assert!(
-            err.to_string()
-                .contains("does not support --width/--height")
-        );
+        cli.to = Some("gif".to_string());
+        let err = validate(&cli).expect_err("gif target should be rejected");
+        assert!(err.to_string().contains("png|webp|jpg"));
     }
 
     #[test]

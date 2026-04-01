@@ -10,7 +10,7 @@ fn codex_cli_bin() -> PathBuf {
 }
 
 fn run(args: &[&str], vars: &[(&str, &str)]) -> CmdOutput {
-    let mut options = CmdOptions::default();
+    let mut options = CmdOptions::default().with_env_remove("CODEX_CLI_EPHEMERAL_ENABLED");
     for (key, value) in vars {
         options = options.with_env(key, value);
     }
@@ -19,7 +19,9 @@ fn run(args: &[&str], vars: &[(&str, &str)]) -> CmdOutput {
 }
 
 fn run_with_path_prepend(args: &[&str], vars: &[(&str, &str)], path_prepend: &Path) -> CmdOutput {
-    let mut options = CmdOptions::default().with_path_prepend(path_prepend);
+    let mut options = CmdOptions::default()
+        .with_env_remove("CODEX_CLI_EPHEMERAL_ENABLED")
+        .with_path_prepend(path_prepend);
     for (key, value) in vars {
         options = options.with_env(key, value);
     }
@@ -28,7 +30,9 @@ fn run_with_path_prepend(args: &[&str], vars: &[(&str, &str)], path_prepend: &Pa
 }
 
 fn run_with_stdin(args: &[&str], vars: &[(&str, &str)], stdin: &str) -> CmdOutput {
-    let mut options = CmdOptions::default().with_stdin_str(stdin);
+    let mut options = CmdOptions::default()
+        .with_env_remove("CODEX_CLI_EPHEMERAL_ENABLED")
+        .with_stdin_str(stdin);
     for (key, value) in vars {
         options = options.with_env(key, value);
     }

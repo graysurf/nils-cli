@@ -1,4 +1,4 @@
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum, ValueHint};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -20,20 +20,23 @@ impl Operation {
 #[command(
     name = "image-processing",
     version,
-    about = "Validate SVG inputs and convert trusted SVG to raster/vector outputs.",
-    after_help = "Notes:\n  - convert requires --from-svg + --to png|webp|svg + --out.\n  - convert supports optional --width/--height for png|webp output sizing.\n  - svg-validate requires exactly one --in + --out.\n  - Use --json for machine-readable output (stdout JSON only; logs go to stderr).\n"
+    about = "Convert SVG or raster inputs to png/webp/jpg outputs and validate SVG inputs.",
+    after_help = "Notes:\n  - convert requires exactly one --in + --to png|webp|jpg + --out.\n  - convert accepts svg|png|jpg|jpeg|webp inputs.\n  - convert supports optional --width/--height for raster output sizing.\n  - svg-validate requires exactly one --in + --out.\n  - Use --json for machine-readable output (stdout JSON only; logs go to stderr).\n"
 )]
 pub struct Cli {
     #[arg(value_enum)]
     pub subcommand: Operation,
 
-    #[arg(long = "in", action = ArgAction::Append, default_value = None)]
+    #[arg(
+        long = "in",
+        action = ArgAction::Append,
+        default_value = None,
+        value_hint = ValueHint::FilePath,
+        help = "Input file path"
+    )]
     pub inputs: Vec<String>,
 
-    #[arg(long = "from-svg", help = "Trusted SVG input path for convert mode")]
-    pub from_svg: Option<String>,
-
-    #[arg(long, help = "Output file path")]
+    #[arg(long, help = "Output file path", value_hint = ValueHint::FilePath)]
     pub out: Option<String>,
 
     #[arg(long, help = "Overwrite existing output file")]
@@ -45,7 +48,7 @@ pub struct Cli {
     #[arg(long, help = "Print per-item processing report")]
     pub report: bool,
 
-    #[arg(long = "to", help = "Output format: png, webp, or svg")]
+    #[arg(long = "to", help = "Output format: png, webp, or jpg")]
     pub to: Option<String>,
 
     #[arg(long, help = "Raster output width in pixels")]

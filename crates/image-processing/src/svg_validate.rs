@@ -1,5 +1,6 @@
 use crate::model::ImageInfo;
 use crate::util;
+use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType as PngCompression, FilterType as PngFilter, PngEncoder};
 use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageEncoder};
@@ -9,7 +10,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-pub const SUPPORTED_FROM_SVG_TARGETS: [&str; 3] = ["png", "webp", "svg"];
+const JPEG_QUALITY: u8 = 90;
 const PNG_COMPRESSION: PngCompression = PngCompression::Best;
 const PNG_FILTER: PngFilter = PngFilter::NoFilter;
 
@@ -41,22 +42,6 @@ pub struct SvgValidateCommandResult {
     pub diagnostics: Vec<SvgDiagnostic>,
     pub width: Option<u32>,
     pub height: Option<u32>,
-}
-
-pub fn parse_from_svg_target(raw: Option<&str>) -> anyhow::Result<&'static str> {
-    let Some(target) = raw else {
-        return Err(util::usage_err(
-            "convert with --from-svg requires --to png|webp|svg",
-        ));
-    };
-    match target {
-        "png" => Ok("png"),
-        "webp" => Ok("webp"),
-        "svg" => Ok("svg"),
-        _ => Err(util::usage_err(
-            "convert --from-svg --to must be one of: png|webp|svg",
-        )),
-    }
 }
 
 pub fn sanitize_svg_file(path: &Path) -> anyhow::Result<SanitizedSvgDocument> {
@@ -244,26 +229,7 @@ pub fn render_svg_to_output(
     dry_run: bool,
 ) -> anyhow::Result<ImageInfo> {
     match output_format {
-        "svg" => {
-            if raster_size_hint.width.is_some() || raster_size_hint.height.is_some() {
-                return Err(util::usage_err(
-                    "convert --from-svg --to svg does not support --width/--height",
-                ));
-            }
-            if !dry_run {
-                util::ensure_parent_dir(output_path, false)?;
-                std::fs::write(output_path, doc.content.as_bytes())?;
-            }
-            output_info(
-                output_format,
-                doc.width,
-                doc.height,
-                doc.uses_alpha,
-                output_path,
-                dry_run,
-            )
-        }
-        "png" | "webp" => {
+        "png" | "webp" | "jpg" => {
             let tree = resvg::usvg::Tree::from_str(&doc.content, &resvg::usvg::Options::default())
                 .map_err(|err| anyhow::anyhow!("failed to parse sanitized svg: {err}"))?;
             let size = tree.size().to_int_size();
@@ -289,6 +255,7 @@ pub fn render_svg_to_output(
                 match output_format {
                     "png" => write_png(output_path, width, height, &rgba)?,
                     "webp" => write_webp(output_path, width, height, &rgba)?,
+                    "jpg" => write_jpg(output_path, width, height, &rgba)?,
                     _ => unreachable!(),
                 }
             }
@@ -296,13 +263,13 @@ pub fn render_svg_to_output(
                 output_format,
                 width,
                 height,
-                doc.uses_alpha,
+                output_format != "jpg" && doc.uses_alpha,
                 output_path,
                 dry_run,
             )
         }
         _ => Err(util::usage_err(
-            "unsupported --to for --from-svg (expected png|webp|svg)",
+            "unsupported --to for convert (expected png|webp|jpg)",
         )),
     }
 }
@@ -330,13 +297,11 @@ fn output_info(
     let format = match output_format {
         "png" => "PNG",
         "webp" => "WEBP",
-        "svg" => "SVG",
+        "jpg" => "JPEG",
         _ => "UNKNOWN",
     };
 
-    let channels = if output_format == "svg" {
-        None
-    } else if uses_alpha {
+    let channels = if uses_alpha {
         Some("rgba".to_string())
     } else {
         Some("rgb".to_string())
@@ -478,17 +443,30 @@ fn write_webp(path: &Path, width: u32, height: u32, rgba: &[u8]) -> anyhow::Resu
         .map_err(|err| anyhow::anyhow!("failed to encode webp: {err}"))
 }
 
+fn write_jpg(path: &Path, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<()> {
+    let file = File::create(path)?;
+    let writer = BufWriter::new(file);
+    let rgb = flatten_rgba_to_rgb(rgba);
+    JpegEncoder::new_with_quality(writer, JPEG_QUALITY)
+        .encode(&rgb, width, height, ExtendedColorType::Rgb8)
+        .map_err(|err| anyhow::anyhow!("failed to encode jpg: {err}"))
+}
+
+fn flatten_rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity((rgba.len() / 4) * 3);
+    for pixel in rgba.chunks_exact(4) {
+        let alpha = pixel[3] as u16;
+        let blend = |channel: u8| -> u8 {
+            (((channel as u16 * alpha) + (255 * (255 - alpha)) + 127) / 255) as u8
+        };
+        rgb.extend([blend(pixel[0]), blend(pixel[1]), blend(pixel[2])]);
+    }
+    rgb
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_from_svg_target_accepts_expected_values() {
-        assert_eq!(parse_from_svg_target(Some("png")).unwrap(), "png");
-        assert_eq!(parse_from_svg_target(Some("webp")).unwrap(), "webp");
-        assert_eq!(parse_from_svg_target(Some("svg")).unwrap(), "svg");
-        assert!(parse_from_svg_target(Some("jpg")).is_err());
-    }
 
     #[test]
     fn sanitize_svg_text_accepts_simple_svg() {

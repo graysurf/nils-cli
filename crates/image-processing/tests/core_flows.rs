@@ -5,7 +5,7 @@ use std::fs;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn from_svg_supports_png_webp_svg_outputs_without_external_binaries() {
+fn convert_supports_svg_inputs_for_png_webp_jpg_outputs_without_external_binaries() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::write(
         dir.path().join("icon.svg"),
@@ -20,11 +20,11 @@ fn from_svg_supports_png_webp_svg_outputs_without_external_binaries() {
     let path_s = stub.path().to_string_lossy().to_string();
     let envs = [("PATH", path_s.as_str())];
 
-    for (to, expected_format) in [("png", "PNG"), ("webp", "WEBP"), ("svg", "SVG")] {
+    for (to, expected_format) in [("png", "PNG"), ("webp", "WEBP"), ("jpg", "JPEG")] {
         let out_rel = format!("out/icon.{to}");
         let args = [
             "convert".to_string(),
-            "--from-svg".to_string(),
+            "--in".to_string(),
             "icon.svg".to_string(),
             "--to".to_string(),
             to.to_string(),
@@ -39,17 +39,13 @@ fn from_svg_supports_png_webp_svg_outputs_without_external_binaries() {
         let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
         assert_eq!(v["operation"], "convert");
         assert_eq!(v["backend"], "rust:resvg");
-        assert_eq!(v["source"]["mode"], "from_svg");
-        assert_eq!(v["source"]["from_svg"], "icon.svg");
+        assert_eq!(v["source"]["mode"], "svg");
+        assert_eq!(v["source"]["input_path"], "icon.svg");
+        assert_eq!(v["source"]["input_format"], "svg");
         assert_eq!(v["items"].as_array().unwrap().len(), 1);
         assert_eq!(v["items"][0]["status"], "ok");
         assert_eq!(v["items"][0]["output_path"], out_rel);
         assert_eq!(v["items"][0]["output_info"]["format"], expected_format);
-
-        if to == "svg" {
-            let svg = fs::read_to_string(dir.path().join(&out_rel)).unwrap();
-            assert!(svg.contains("<svg"), "svg output missing <svg: {svg}");
-        }
 
         assert!(
             dir.path().join(&out_rel).exists(),
@@ -59,7 +55,81 @@ fn from_svg_supports_png_webp_svg_outputs_without_external_binaries() {
 }
 
 #[test]
-fn from_svg_supports_explicit_raster_dimensions() {
+fn convert_supports_raster_inputs_for_png_webp_jpg_outputs_without_external_binaries() {
+    let dir = tempfile::TempDir::new().unwrap();
+    common::write_sample_png(&dir.path().join("sample.png"));
+
+    let stub = common::make_stub_dir();
+    let path_s = stub.path().to_string_lossy().to_string();
+    let envs = [("PATH", path_s.as_str())];
+
+    for (to, expected_format) in [("png", "PNG"), ("webp", "WEBP"), ("jpg", "JPEG")] {
+        let out_rel = format!("out/sample.{to}");
+        let out = common::run_image_processing(
+            dir.path(),
+            &[
+                "convert",
+                "--in",
+                "sample.png",
+                "--to",
+                to,
+                "--out",
+                &out_rel,
+                "--json",
+            ],
+            &envs,
+        );
+        assert_eq!(out.code, 0, "to={to}, stderr: {}", out.stderr);
+
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["backend"], "rust:image");
+        assert_eq!(v["source"]["mode"], "raster");
+        assert_eq!(v["source"]["input_path"], "sample.png");
+        assert_eq!(v["source"]["input_format"], "png");
+        assert_eq!(v["items"][0]["status"], "ok");
+        assert_eq!(v["items"][0]["output_info"]["format"], expected_format);
+        assert!(
+            dir.path().join(&out_rel).exists(),
+            "missing output: {out_rel}"
+        );
+    }
+}
+
+#[test]
+fn convert_accepts_jpg_and_webp_inputs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    common::write_sample_jpg(&dir.path().join("sample.jpg"));
+    common::write_sample_webp(&dir.path().join("sample.webp"));
+
+    let stub = common::make_stub_dir();
+    let path_s = stub.path().to_string_lossy().to_string();
+    let envs = [("PATH", path_s.as_str())];
+
+    for (input_name, input_format) in [("sample.jpg", "jpg"), ("sample.webp", "webp")] {
+        let output_name = format!("out/{}.png", input_format);
+        let out = common::run_image_processing(
+            dir.path(),
+            &[
+                "convert",
+                "--in",
+                input_name,
+                "--to",
+                "png",
+                "--out",
+                &output_name,
+                "--json",
+            ],
+            &envs,
+        );
+        assert_eq!(out.code, 0, "input={input_name}, stderr: {}", out.stderr);
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(v["source"]["input_format"], input_format);
+        assert_eq!(v["items"][0]["output_info"]["format"], "PNG");
+    }
+}
+
+#[test]
+fn convert_supports_explicit_raster_dimensions() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::write(
         dir.path().join("icon.svg"),
@@ -77,7 +147,7 @@ fn from_svg_supports_explicit_raster_dimensions() {
         dir.path(),
         &[
             "convert",
-            "--from-svg",
+            "--in",
             "icon.svg",
             "--to",
             "png",
@@ -98,7 +168,7 @@ fn from_svg_supports_explicit_raster_dimensions() {
         dir.path(),
         &[
             "convert",
-            "--from-svg",
+            "--in",
             "icon.svg",
             "--to",
             "png",
@@ -150,7 +220,9 @@ fn svg_validate_writes_sanitized_output_and_summary_artifact() {
     let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["operation"], "svg-validate");
     assert_eq!(v["backend"], "rust:svg-validate");
-    assert_eq!(v["source"]["mode"], "svg_validate");
+    assert_eq!(v["source"]["mode"], "svg");
+    assert_eq!(v["source"]["input_path"], "valid.svg");
+    assert_eq!(v["source"]["input_format"], "svg");
     assert_eq!(v["items"][0]["status"], "ok");
     assert_eq!(v["items"][0]["output_info"]["format"], "SVG");
 
