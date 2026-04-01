@@ -1,8 +1,9 @@
 use crate::cli::Operation;
+use crate::convert;
 use crate::model::{ImageInfo, ItemResult, SCHEMA_VERSION, SourceContext, Summary, SummaryOptions};
 use crate::report::render_report_md;
-use crate::svg_validate;
 use crate::util;
+use crate::{svg_validate, toolchain};
 use nils_term::progress::Progress;
 use std::path::{Path, PathBuf};
 
@@ -37,7 +38,6 @@ pub fn expand_inputs(inputs: &[String]) -> Result<Vec<PathBuf>, util::UsageError
 }
 
 pub struct ProcessArgs<'a> {
-    pub backend: &'a str,
     pub repo_root: &'a Path,
     pub run_dir: Option<&'a Path>,
     pub progress: Progress,
@@ -45,8 +45,8 @@ pub struct ProcessArgs<'a> {
     pub input_path: &'a Path,
     pub output_path: &'a Path,
     pub convert_to: Option<&'a str>,
-    pub from_svg_width: Option<i32>,
-    pub from_svg_height: Option<i32>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
     pub overwrite: bool,
     pub dry_run: bool,
     pub report_enabled: bool,
@@ -55,7 +55,6 @@ pub struct ProcessArgs<'a> {
 
 pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
     let ProcessArgs {
-        backend,
         repo_root,
         run_dir,
         progress,
@@ -63,8 +62,8 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
         input_path,
         output_path,
         convert_to,
-        from_svg_width,
-        from_svg_height,
+        width,
+        height,
         overwrite,
         dry_run,
         report_enabled,
@@ -82,7 +81,7 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
     }
 
     let convert_target = if subcommand == Operation::Convert {
-        Some(svg_validate::parse_from_svg_target(convert_to)?)
+        Some(convert::parse_convert_target(convert_to)?)
     } else {
         None
     };
@@ -106,23 +105,6 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
         util::ensure_parent_dir(&output_abs, false)?;
     }
 
-    let source = match subcommand {
-        Operation::Convert => SourceContext {
-            mode: "from_svg".to_string(),
-            from_svg: Some(util::maybe_relpath(&input_abs, repo_root)),
-        },
-        Operation::SvgValidate => SourceContext {
-            mode: "svg_validate".to_string(),
-            from_svg: None,
-        },
-    };
-
-    let sanitized_svg = if subcommand == Operation::Convert {
-        Some(svg_validate::sanitize_svg_file(&input_abs)?)
-    } else {
-        None
-    };
-
     progress.set_message(util::maybe_relpath(&input_abs, repo_root));
 
     let input_rel = util::maybe_relpath(&input_abs, repo_root);
@@ -132,35 +114,38 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
     let mut item_commands: Vec<String> = Vec::new();
     let mut item_error: Option<String> = None;
     let mut output_info: Option<ImageInfo> = None;
-
-    let mut input_info = ImageInfo {
-        format: Some("SVG".to_string()),
-        size_bytes: std::fs::metadata(&input_abs).ok().map(|m| m.len()),
-        ..Default::default()
-    };
+    let mut backend = toolchain::RUST_SVG_VALIDATE_BACKEND;
+    let source: SourceContext;
+    let mut input_info: ImageInfo;
+    let input_size_bytes = std::fs::metadata(&input_abs).ok().map(|m| m.len());
 
     match subcommand {
         Operation::Convert => {
+            let loaded = convert::LoadedInput::load(&input_abs)?;
             let target = convert_target.expect("convert target pre-validated");
-            let doc = sanitized_svg.as_ref().expect("convert document preloaded");
-            input_info.width = Some(doc.width as i32);
-            input_info.height = Some(doc.height as i32);
-            input_info.alpha = Some(doc.uses_alpha);
+            backend = loaded.backend();
+            source = SourceContext {
+                mode: loaded.source_mode().to_string(),
+                input_path: Some(input_rel.clone()),
+                input_format: Some(loaded.input_format().to_string()),
+            };
+            input_info = loaded.input_info(input_size_bytes);
+            let to_raw = convert_to.unwrap_or(target);
 
             let mut cmd = vec![
                 "image-processing".to_string(),
                 "convert".to_string(),
-                "--from-svg".to_string(),
+                "--in".to_string(),
                 input_rel.clone(),
                 "--to".to_string(),
-                target.to_string(),
+                to_raw.to_string(),
                 "--out".to_string(),
                 output_rel.clone(),
             ];
-            if let Some(width) = from_svg_width {
+            if let Some(width) = width {
                 cmd.extend(["--width".to_string(), width.to_string()]);
             }
-            if let Some(height) = from_svg_height {
+            if let Some(height) = height {
                 cmd.extend(["--height".to_string(), height.to_string()]);
             }
             if dry_run {
@@ -168,10 +153,8 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
             }
             item_commands.push(util::command_str(&cmd));
 
-            let render_result = from_svg_raster_size_hint(from_svg_width, from_svg_height)
-                .and_then(|hint| {
-                    svg_validate::render_svg_to_output(doc, target, &output_abs, hint, dry_run)
-                });
+            let render_result = convert_raster_size_hint(width, height)
+                .and_then(|hint| loaded.render_to_output(target, &output_abs, hint, dry_run));
 
             match render_result {
                 Ok(info) => {
@@ -185,6 +168,16 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
             }
         }
         Operation::SvgValidate => {
+            source = SourceContext {
+                mode: "svg".to_string(),
+                input_path: Some(input_rel.clone()),
+                input_format: Some("svg".to_string()),
+            };
+            input_info = ImageInfo {
+                format: Some("SVG".to_string()),
+                size_bytes: input_size_bytes,
+                ..Default::default()
+            };
             let mut cmd = vec![
                 "image-processing".to_string(),
                 "svg-validate".to_string(),
@@ -286,7 +279,11 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
             overwrite,
             auto_orient: None,
             strip_metadata: false,
-            background: None,
+            background: if convert_target == Some("jpg") {
+                Some("white".to_string())
+            } else {
+                None
+            },
             report: report_enabled,
         },
         commands,
@@ -317,7 +314,7 @@ fn ext_normalize(path: &Path) -> String {
     ext
 }
 
-fn from_svg_raster_size_hint(
+fn convert_raster_size_hint(
     width: Option<i32>,
     height: Option<i32>,
 ) -> anyhow::Result<svg_validate::RasterSizeHint> {
@@ -330,9 +327,7 @@ fn from_svg_raster_size_hint(
 fn parse_positive_dimension(value: Option<i32>, flag: &str) -> anyhow::Result<Option<u32>> {
     match value {
         Some(value) if value > 0 => Ok(Some(value as u32)),
-        Some(_) => Err(util::usage_err(format!(
-            "convert --from-svg {flag} must be > 0"
-        ))),
+        Some(_) => Err(util::usage_err(format!("convert {flag} must be > 0"))),
         None => Ok(None),
     }
 }

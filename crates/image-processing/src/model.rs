@@ -22,7 +22,8 @@ pub struct Collision {
 #[derive(Clone, Debug, Serialize)]
 pub struct SourceContext {
     pub mode: String,
-    pub from_svg: Option<String>,
+    pub input_path: Option<String>,
+    pub input_format: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

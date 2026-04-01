@@ -37,6 +37,7 @@ fn agent_prompt_requires_dangerous_mode() {
     let _path = prepend_path(&lock, stub.path());
 
     let _danger = EnvGuard::remove(&lock, "CODEX_ALLOW_DANGEROUS_ENABLED");
+    let _ephemeral = EnvGuard::remove(&lock, "CODEX_CLI_EPHEMERAL_ENABLED");
     let _model = EnvGuard::set(&lock, "CODEX_CLI_MODEL", "m");
     let _reasoning = EnvGuard::set(&lock, "CODEX_CLI_REASONING", "low");
     let args_log_path = args_log.path().to_string_lossy().to_string();
@@ -68,6 +69,7 @@ fn agent_prompt_execs_codex_with_expected_args() {
     let _path = prepend_path(&lock, stub.path());
 
     let _danger = EnvGuard::set(&lock, "CODEX_ALLOW_DANGEROUS_ENABLED", "true");
+    let _ephemeral = EnvGuard::remove(&lock, "CODEX_CLI_EPHEMERAL_ENABLED");
     let _model = EnvGuard::set(&lock, "CODEX_CLI_MODEL", "gpt-test");
     let _reasoning = EnvGuard::set(&lock, "CODEX_CLI_REASONING", "high");
     let args_log_path = args_log.path().to_string_lossy().to_string();
@@ -114,6 +116,7 @@ fn agent_prompt_execs_codex_with_ephemeral_arg_when_requested() {
     let _path = prepend_path(&lock, stub.path());
 
     let _danger = EnvGuard::set(&lock, "CODEX_ALLOW_DANGEROUS_ENABLED", "true");
+    let _ephemeral = EnvGuard::remove(&lock, "CODEX_CLI_EPHEMERAL_ENABLED");
     let _model = EnvGuard::set(&lock, "CODEX_CLI_MODEL", "gpt-test");
     let _reasoning = EnvGuard::set(&lock, "CODEX_CLI_REASONING", "high");
     let args_log_path = args_log.path().to_string_lossy().to_string();
@@ -161,6 +164,7 @@ fn agent_prompt_reads_stdin_when_no_args() {
     let _path = prepend_path(&lock, stub.path());
 
     let _danger = EnvGuard::set(&lock, "CODEX_ALLOW_DANGEROUS_ENABLED", "true");
+    let _ephemeral = EnvGuard::remove(&lock, "CODEX_CLI_EPHEMERAL_ENABLED");
     let _model = EnvGuard::set(&lock, "CODEX_CLI_MODEL", "m");
     let _reasoning = EnvGuard::set(&lock, "CODEX_CLI_REASONING", "medium");
     let args_log_path = args_log.path().to_string_lossy().to_string();

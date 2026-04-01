@@ -32,26 +32,18 @@ fn removed_subcommands_are_usage_errors() {
 }
 
 #[test]
-fn convert_requires_from_svg() {
+fn convert_requires_in() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::write(dir.path().join("a.png"), "img").unwrap();
 
     let out = common::run_image_processing(
         dir.path(),
-        &[
-            "convert",
-            "--in",
-            "a.png",
-            "--to",
-            "png",
-            "--out",
-            "out/a.png",
-        ],
+        &["convert", "--to", "png", "--out", "out/a.png"],
         &[],
     );
     assert_eq!(out.code, 2);
     assert!(
-        out.stderr.contains("convert requires --from-svg"),
+        out.stderr.contains("convert requires exactly one --in"),
         "stderr: {}",
         out.stderr
     );
@@ -72,26 +64,26 @@ fn convert_invalid_target_format_is_usage_error() {
         dir.path(),
         &[
             "convert",
-            "--from-svg",
+            "--in",
             "icon.svg",
             "--to",
-            "jpg",
+            "gif",
             "--out",
-            "out/icon.jpg",
+            "out/icon.gif",
             "--json",
         ],
         &[],
     );
     assert_eq!(out.code, 2);
     assert!(
-        out.stderr.contains("png|webp|svg"),
+        out.stderr.contains("png|webp|jpg"),
         "stderr: {}",
         out.stderr
     );
 }
 
 #[test]
-fn from_svg_rejects_invalid_input_flags() {
+fn convert_rejects_multiple_inputs() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::write(dir.path().join("a.png"), "img").unwrap();
     fs::write(
@@ -106,10 +98,10 @@ fn from_svg_rejects_invalid_input_flags() {
         dir.path(),
         &[
             "convert",
-            "--from-svg",
-            "icon.svg",
             "--in",
             "a.png",
+            "--in",
+            "icon.svg",
             "--to",
             "png",
             "--out",
@@ -120,15 +112,14 @@ fn from_svg_rejects_invalid_input_flags() {
     );
     assert_eq!(out.code, 2);
     assert!(
-        out.stderr
-            .contains("convert --from-svg does not support --in"),
+        out.stderr.contains("convert requires exactly one --in"),
         "stderr: {}",
         out.stderr
     );
 }
 
 #[test]
-fn from_svg_rejects_missing_out_or_extension_mismatch() {
+fn convert_rejects_missing_out_or_extension_mismatch() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::write(
         dir.path().join("icon.svg"),
@@ -140,14 +131,12 @@ fn from_svg_rejects_missing_out_or_extension_mismatch() {
 
     let missing_out = common::run_image_processing(
         dir.path(),
-        &["convert", "--from-svg", "icon.svg", "--to", "png", "--json"],
+        &["convert", "--in", "icon.svg", "--to", "png", "--json"],
         &[],
     );
     assert_eq!(missing_out.code, 2);
     assert!(
-        missing_out
-            .stderr
-            .contains("convert --from-svg requires --out"),
+        missing_out.stderr.contains("convert requires --out"),
         "stderr: {}",
         missing_out.stderr
     );
@@ -156,7 +145,7 @@ fn from_svg_rejects_missing_out_or_extension_mismatch() {
         dir.path(),
         &[
             "convert",
-            "--from-svg",
+            "--in",
             "icon.svg",
             "--to",
             "png",
@@ -177,7 +166,7 @@ fn from_svg_rejects_missing_out_or_extension_mismatch() {
 }
 
 #[test]
-fn from_svg_rejects_invalid_dimension_contracts() {
+fn convert_rejects_invalid_dimension_contracts() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::write(
         dir.path().join("icon.svg"),
@@ -187,36 +176,11 @@ fn from_svg_rejects_invalid_dimension_contracts() {
     )
     .unwrap();
 
-    let with_svg_target = common::run_image_processing(
-        dir.path(),
-        &[
-            "convert",
-            "--from-svg",
-            "icon.svg",
-            "--to",
-            "svg",
-            "--out",
-            "out/icon.svg",
-            "--width",
-            "256",
-            "--json",
-        ],
-        &[],
-    );
-    assert_eq!(with_svg_target.code, 2);
-    assert!(
-        with_svg_target
-            .stderr
-            .contains("does not support --width/--height"),
-        "stderr: {}",
-        with_svg_target.stderr
-    );
-
     let with_zero_width = common::run_image_processing(
         dir.path(),
         &[
             "convert",
-            "--from-svg",
+            "--in",
             "icon.svg",
             "--to",
             "png",
@@ -233,6 +197,29 @@ fn from_svg_rejects_invalid_dimension_contracts() {
         with_zero_width.stderr.contains("--width must be > 0"),
         "stderr: {}",
         with_zero_width.stderr
+    );
+
+    let with_zero_height = common::run_image_processing(
+        dir.path(),
+        &[
+            "convert",
+            "--in",
+            "icon.svg",
+            "--to",
+            "png",
+            "--out",
+            "out/icon.png",
+            "--height",
+            "0",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(with_zero_height.code, 2);
+    assert!(
+        with_zero_height.stderr.contains("--height must be > 0"),
+        "stderr: {}",
+        with_zero_height.stderr
     );
 }
 
@@ -306,7 +293,7 @@ fn svg_validate_invalid_svg_returns_actionable_error() {
 }
 
 #[test]
-fn from_svg_overwrite_flag_controls_existing_output_replacement() {
+fn convert_overwrite_flag_controls_existing_output_replacement() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::write(
         dir.path().join("icon.svg"),
@@ -322,7 +309,7 @@ fn from_svg_overwrite_flag_controls_existing_output_replacement() {
         dir.path(),
         &[
             "convert",
-            "--from-svg",
+            "--in",
             "icon.svg",
             "--to",
             "png",
@@ -345,7 +332,7 @@ fn from_svg_overwrite_flag_controls_existing_output_replacement() {
         dir.path(),
         &[
             "convert",
-            "--from-svg",
+            "--in",
             "icon.svg",
             "--to",
             "png",

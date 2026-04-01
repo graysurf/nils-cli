@@ -63,6 +63,7 @@ done
 
     let _path = prepend_path(&lock, stub.path());
     let _danger = EnvGuard::set(&lock, "CODEX_ALLOW_DANGEROUS_ENABLED", "true");
+    let _ephemeral = EnvGuard::remove(&lock, "CODEX_CLI_EPHEMERAL_ENABLED");
     let _model = EnvGuard::set(&lock, "CODEX_CLI_MODEL", "gpt-test");
     let _reason = EnvGuard::set(&lock, "CODEX_CLI_REASONING", "high");
     let _argv_log = EnvGuard::set(&lock, "CODEX_TEST_ARGV_LOG", &args_log_path);

@@ -2,12 +2,12 @@
 
 ## Purpose
 
-Use a provider-agnostic pipeline to turn user intent into policy-compliant SVG, then render with `image-processing convert --from-svg`.
+Use a provider-agnostic pipeline to turn user intent into policy-compliant SVG, then render with `image-processing convert --in`.
 
 ## Contract
 
 - `generate` is removed.
-- `convert --from-svg <path>` is the canonical SVG source flow.
+- `convert --in <path>` is the canonical SVG-to-raster flow.
 - `svg-validate` must gate LLM output before raster export.
 
 ## Quick start
@@ -32,7 +32,7 @@ cargo run -p nils-image-processing -- svg-validate \
 
 ```bash
 cargo run -p nils-image-processing -- convert \
-  --from-svg out/plan-llm/traffic-car.cleaned.svg \
+  --in out/plan-llm/traffic-car.cleaned.svg \
   --to png \
   --out out/plan-llm/traffic-car.png \
   --json
@@ -64,4 +64,4 @@ Any previous `generate --preset ...` usage must migrate to:
 
 1. intent -> SVG (LLM or hand-authored),
 2. `svg-validate`,
-3. `convert --from-svg`.
+3. `convert --in`.

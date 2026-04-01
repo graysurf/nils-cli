@@ -28,8 +28,8 @@ These tools are required for common command paths.
 
 ### 1.1 `image-processing` runtime policy
 
-- `convert --from-svg` and `svg-validate`:
-  - Rust-backed (`usvg`/`resvg` + Rust image encoding path).
+- `convert --in` and `svg-validate`:
+  - Rust-backed (`image` decode/encode for raster inputs, `usvg`/`resvg` for SVG inputs).
   - No external runtime binary requirement.
 
 ## 2. Runtime Dependencies (Optional / Degradation Paths)

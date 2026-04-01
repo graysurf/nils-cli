@@ -5,7 +5,7 @@ use std::fs;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn from_svg_dry_run_json_report_writes_artifacts_without_writing_output() {
+fn convert_dry_run_json_report_writes_artifacts_without_writing_output() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::write(
         dir.path().join("icon.svg"),
@@ -24,7 +24,7 @@ fn from_svg_dry_run_json_report_writes_artifacts_without_writing_output() {
         dir.path(),
         &[
             "convert",
-            "--from-svg",
+            "--in",
             "icon.svg",
             "--to",
             "webp",
@@ -46,8 +46,9 @@ fn from_svg_dry_run_json_report_writes_artifacts_without_writing_output() {
     let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["operation"], "convert");
     assert_eq!(v["backend"], "rust:resvg");
-    assert_eq!(v["source"]["mode"], "from_svg");
-    assert_eq!(v["source"]["from_svg"], "icon.svg");
+    assert_eq!(v["source"]["mode"], "svg");
+    assert_eq!(v["source"]["input_path"], "icon.svg");
+    assert_eq!(v["source"]["input_format"], "svg");
     assert_eq!(v["dry_run"], true);
     assert_eq!(v["options"]["report"], true);
     assert_eq!(v["items"].as_array().unwrap().len(), 1);
@@ -55,7 +56,7 @@ fn from_svg_dry_run_json_report_writes_artifacts_without_writing_output() {
     assert!(v["items"][0]["output_info"].is_null());
     let command = v["commands"][0].as_str().unwrap_or("");
     assert!(
-        command.contains("convert --from-svg icon.svg"),
+        command.contains("convert --in icon.svg"),
         "commands: {command}"
     );
     assert!(command.contains("--dry-run"), "commands: {command}");
@@ -83,19 +84,17 @@ fn from_svg_dry_run_json_report_writes_artifacts_without_writing_output() {
         report.contains("- Operation: `convert`"),
         "report: {report}"
     );
+    assert!(report.contains("- Source mode: `svg`"), "report: {report}");
     assert!(
-        report.contains("- Source mode: `from_svg`"),
+        report.contains("- Source input: `icon.svg`"),
         "report: {report}"
     );
     assert!(
-        report.contains("- Source SVG: `icon.svg`"),
+        report.contains("- Source format: `svg`"),
         "report: {report}"
     );
     assert!(report.contains("- Dry run: `true`"), "report: {report}");
-    assert!(
-        report.contains("convert --from-svg icon.svg"),
-        "report: {report}"
-    );
+    assert!(report.contains("convert --in icon.svg"), "report: {report}");
 }
 
 #[test]
@@ -137,7 +136,9 @@ fn svg_validate_dry_run_json_report_writes_artifacts_without_writing_output() {
     let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["operation"], "svg-validate");
     assert_eq!(v["backend"], "rust:svg-validate");
-    assert_eq!(v["source"]["mode"], "svg_validate");
+    assert_eq!(v["source"]["mode"], "svg");
+    assert_eq!(v["source"]["input_path"], "valid.svg");
+    assert_eq!(v["source"]["input_format"], "svg");
     assert_eq!(v["dry_run"], true);
     assert_eq!(v["options"]["report"], true);
     assert_eq!(v["items"][0]["status"], "ok");
@@ -162,6 +163,8 @@ fn svg_validate_dry_run_json_report_writes_artifacts_without_writing_output() {
 
     let report = fs::read_to_string(report_md).unwrap();
     assert!(report.contains("- Operation: `svg-validate`"));
-    assert!(report.contains("- Source mode: `svg_validate`"));
+    assert!(report.contains("- Source mode: `svg`"));
+    assert!(report.contains("- Source input: `valid.svg`"));
+    assert!(report.contains("- Source format: `svg`"));
     assert!(report.contains("svg-validate --in valid.svg"));
 }

@@ -44,7 +44,7 @@ Each crate is either a standalone CLI binary or a shared library used across the
 - [crates/fzf-cli](crates/fzf-cli): Interactive `fzf` toolbox for files, Git, processes, ports, and shell history.
 - [crates/memo-cli](crates/memo-cli): Capture-first memo workflow CLI with agent enrichment loop (`add`, `list`, `search`, `report`,
   `fetch`, `apply`).
-- [crates/image-processing](crates/image-processing): Batch image transformation CLI (resize/crop/optimize) with JSON/report outputs.
+- [crates/image-processing](crates/image-processing): Image conversion CLI for `svg/png/webp/jpg` plus SVG validation with JSON/report outputs.
 - [crates/screen-record](crates/screen-record): macOS ScreenCaptureKit + Linux (X11) recorder for a single window or display with optional
   audio.
 

@@ -13,8 +13,11 @@ pub fn render_report_md(
     lines.push(String::new());
     lines.push(format!("- Operation: `{subcommand}`"));
     lines.push(format!("- Source mode: `{}`", source.mode));
-    if let Some(from_svg) = source.from_svg.as_deref() {
-        lines.push(format!("- Source SVG: `{from_svg}`"));
+    if let Some(input_path) = source.input_path.as_deref() {
+        lines.push(format!("- Source input: `{input_path}`"));
+    }
+    if let Some(input_format) = source.input_format.as_deref() {
+        lines.push(format!("- Source format: `{input_format}`"));
     }
     lines.push(format!(
         "- Dry run: `{}`",
@@ -92,7 +95,8 @@ mod tests {
             "resize",
             &SourceContext {
                 mode: "inputs".to_string(),
-                from_svg: None,
+                input_path: Some("in.png".to_string()),
+                input_format: Some("png".to_string()),
             },
             &items,
             &["magick in.png out.png".to_string()],
@@ -102,6 +106,8 @@ mod tests {
         assert!(out.contains("# Image Processing Report (run123)"));
         assert!(out.contains("- Operation: `resize`"));
         assert!(out.contains("- Source mode: `inputs`"));
+        assert!(out.contains("- Source input: `in.png`"));
+        assert!(out.contains("- Source format: `png`"));
         assert!(out.contains("- Dry run: `true`"));
         assert!(out.contains("## Commands"));
         assert!(out.contains("- `magick in.png out.png`"));
@@ -133,8 +139,9 @@ mod tests {
             "run456",
             "convert",
             &SourceContext {
-                mode: "from_svg".to_string(),
-                from_svg: Some("fixtures/demo.svg".to_string()),
+                mode: "raster".to_string(),
+                input_path: Some("fixtures/demo.jpg".to_string()),
+                input_format: Some("jpg".to_string()),
             },
             &items,
             &[],
@@ -142,7 +149,8 @@ mod tests {
         );
 
         assert!(out.contains("- Dry run: `false`"));
-        assert!(out.contains("- Source SVG: `fixtures/demo.svg`"));
+        assert!(out.contains("- Source input: `fixtures/demo.jpg`"));
+        assert!(out.contains("- Source format: `jpg`"));
         assert!(out.contains("`error`: `a.jpg` -> `None`"));
         assert!(out.contains("error: boom"));
     }
