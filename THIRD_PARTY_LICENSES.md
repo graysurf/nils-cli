@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `ff3cda9281b91f2648461d7c04e826f2c7ec9759e22cfb2d4329bc5eb49e6f32`
+- Cargo.lock SHA256: `8c1bff9f475146c117189f65ff19b4288a4786e204a82a0de616fab39e1296a4`
 - Third-party crates (`source != null`): 446
 - Workspace crates (`source == null`, excluded below): 25
 
@@ -370,7 +370,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib | crates.io |
 | tokio | 1.50.0 | MIT | crates.io |
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 | crates.io |
-| toml | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
+| toml | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_edit | 0.25.11+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_parser | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
