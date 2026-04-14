@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `8c1bff9f475146c117189f65ff19b4288a4786e204a82a0de616fab39e1296a4`
+- Cargo.lock SHA256: `9caf306967a3e04276c729d498599c2c11616ecccf076ed10129dd50a700bb01`
 - Third-party crates (`source != null`): 446
 - Workspace crates (`source == null`, excluded below): 25
 
@@ -292,7 +292,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | quote | 1.0.45 | MIT OR Apache-2.0 | crates.io |
 | r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | crates.io |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | crates.io |
-| rand | 0.9.2 | MIT OR Apache-2.0 | crates.io |
+| rand | 0.9.4 | MIT OR Apache-2.0 | crates.io |
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 | crates.io |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 | crates.io |
 | redox_users | 0.5.2 | MIT | crates.io |
