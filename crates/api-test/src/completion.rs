@@ -1,5 +1,6 @@
 use clap::{CommandFactory, ValueEnum};
-use clap_complete::{Generator, Shell, generate};
+use clap_complete::{Shell, generate};
+use std::io::{self, Write};
 
 use crate::Cli;
 
@@ -21,6 +22,22 @@ pub(crate) fn run(shell: CompletionShell) -> i32 {
     0
 }
 
-fn print_completion<G: Generator>(generator: G, command: &mut clap::Command, bin_name: &str) {
-    generate(generator, command, bin_name, &mut std::io::stdout());
+fn print_completion(generator: Shell, command: &mut clap::Command, bin_name: &str) {
+    if matches!(generator, Shell::Bash) {
+        let mut output = Vec::new();
+        generate(generator, command, bin_name, &mut output);
+        let normalized = normalize_bash_completion(
+            String::from_utf8(output).expect("bash completion should be valid UTF-8"),
+        );
+        io::stdout()
+            .write_all(normalized.as_bytes())
+            .expect("failed to write bash completion");
+        return;
+    }
+
+    generate(generator, command, bin_name, &mut io::stdout());
+}
+
+fn normalize_bash_completion(script: String) -> String {
+    script.replace("__subcmd__", "__")
 }
