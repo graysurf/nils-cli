@@ -404,6 +404,14 @@ fn color_has_alpha(value: &str) -> bool {
     let Some(hex) = value.strip_prefix('#') else {
         return false;
     };
+    // Guard: only process pure-ASCII hex strings.  Non-ASCII bytes would
+    // make `str::len()` return the *byte* count (not the char count), so a
+    // 2-byte UTF-8 character could satisfy the length check while leaving
+    // the byte-based slice indices on a continuation byte → panic.
+    if !hex.is_ascii() {
+        return false;
+    }
+    // After the ASCII guard, byte length == char length, so slicing is safe.
     match hex.len() {
         4 => !hex[3..4].eq_ignore_ascii_case("f"),
         8 => !hex[6..8].eq_ignore_ascii_case("ff"),
@@ -486,6 +494,34 @@ mod tests {
                 .iter()
                 .any(|d| d.code == "disallowed_tag" || d.code == "unsafe_tag")
         );
+    }
+
+    #[test]
+    fn color_has_alpha_returns_true_for_4_and_8_digit_hex_with_alpha() {
+        assert!(color_has_alpha("#fff0"));
+        assert!(color_has_alpha("#FFF0"));
+        assert!(color_has_alpha("#ffffff00"));
+        assert!(color_has_alpha("#FFFFFF00"));
+    }
+
+    #[test]
+    fn color_has_alpha_returns_false_for_opaque_and_non_hex() {
+        assert!(!color_has_alpha("#ffff"));
+        assert!(!color_has_alpha("#ffffffff"));
+        assert!(!color_has_alpha("#fff"));
+        assert!(!color_has_alpha("#ffffff"));
+        assert!(!color_has_alpha("red"));
+        assert!(!color_has_alpha(""));
+    }
+
+    #[test]
+    fn color_has_alpha_does_not_panic_on_non_ascii_input() {
+        // A 2-byte UTF-8 char (é = 0xC3 0xA9) after two ASCII chars gives
+        // a 4-byte string that would previously match the len==4 arm and
+        // panic when slicing at byte index 3 (a continuation byte).
+        assert!(!color_has_alpha("#ffé"));
+        assert!(!color_has_alpha("#🎨"));
+        assert!(!color_has_alpha("#abcö1234"));
     }
 
     #[test]
