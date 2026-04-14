@@ -351,8 +351,7 @@ fn back_checkout() -> i32 {
         }
     };
 
-    if !from_branch.chars().all(|c| c.is_ascii_digit())
-        && from_branch.len() >= 7
+    if from_branch.len() >= 7
         && from_branch.len() <= 40
         && from_branch.chars().all(|c| c.is_ascii_hexdigit())
     {
