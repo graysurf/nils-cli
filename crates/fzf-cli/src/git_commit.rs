@@ -67,9 +67,10 @@ pub fn run(args: &[String]) -> i32 {
             "enter: open all (worktree) | ctrl-o: open selected"
         };
 
-        let diff_cmd = match diff_parent.as_deref() {
-            Some(parent) => format!("git diff --color=always {parent} {commit} -- \"$filepath\""),
-            None => format!("git diff --color=always {commit}^! -- \"$filepath\""),
+        let diff_cmd = if diff_parent.is_some() {
+            r#"git diff --color=always "$FZF_DIFF_PARENT" "$FZF_COMMIT" -- "$filepath""#
+        } else {
+            r#"git diff --color=always "$FZF_COMMIT"^! -- "$filepath""#
         };
         let preview = format!(
             r#"bash -c 'line="$1"; filepath=$(printf "%s\n" "$line" | sed -E "s/^\[[^]]+\] //; s/ *\[\+.*\]$//"); if command -v delta >/dev/null 2>&1; then {diff_cmd} | delta --width=100 --line-numbers | awk "NR==1 && NF==0 {{next}} {{print}}"; else {diff_cmd} | cat; fi' -- {{}}"#,
@@ -90,7 +91,11 @@ pub fn run(args: &[String]) -> i32 {
         ];
         let fzf_ref: Vec<&str> = fzf_args.iter().map(|s| s.as_str()).collect();
 
-        let (code, key, rest) = match fzf::run_expect(&input, &fzf_ref, &[]) {
+        let mut fzf_envs: Vec<(&str, &str)> = vec![("FZF_COMMIT", &commit)];
+        if let Some(parent) = diff_parent.as_deref() {
+            fzf_envs.push(("FZF_DIFF_PARENT", parent));
+        }
+        let (code, key, rest) = match fzf::run_expect(&input, &fzf_ref, &fzf_envs) {
             Ok(v) => v,
             Err(err) => {
                 eprintln!("{err:#}");
