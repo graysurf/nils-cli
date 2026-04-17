@@ -475,7 +475,16 @@ fi
 # Re-run artifact generation after checks in case lockfile changed during the check flow.
 refresh_third_party_artifacts_if_present
 
-git add -A
+# Stage only the files this skill is expected to produce. Using `git add -A`
+# would sweep in unrelated runtime state (e.g. `.claude/` session locks).
+stage_paths=(Cargo.toml Cargo.lock)
+for optional in README.md THIRD_PARTY_LICENSES.md THIRD_PARTY_NOTICES.md; do
+  [[ -f "$optional" ]] && stage_paths+=("$optional")
+done
+for manifest in crates/*/Cargo.toml; do
+  [[ -f "$manifest" ]] && stage_paths+=("$manifest")
+done
+git add -- "${stage_paths[@]}"
 
 if git diff --cached --quiet; then
   die "no changes staged for commit"
