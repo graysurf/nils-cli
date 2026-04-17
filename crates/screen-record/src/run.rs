@@ -62,7 +62,7 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
             }
             let content = fetch_shareable_content(&backend)?;
             let mut displays = content.displays;
-            displays.sort_by(|a, b| a.id.cmp(&b.id));
+            displays.sort_by_key(|display| display.id);
             for display in displays {
                 println!("{}", format_display_tsv(&display));
             }

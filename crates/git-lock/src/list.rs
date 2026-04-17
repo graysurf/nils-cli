@@ -24,7 +24,7 @@ pub fn run(_args: &[String]) -> Result<i32> {
         return Ok(0);
     }
 
-    entries.sort_by(|a, b| b.epoch.cmp(&a.epoch));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.epoch));
 
     println!("🔐 git-lock list for [{}]:", store.repo_id());
 
