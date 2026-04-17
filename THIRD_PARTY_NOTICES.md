@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `cf693ed7234f9f2cee6e669866a9b239f721c570c92938240cb73728420f53c4`
+- Cargo.lock SHA256: `59be8d38735a7f1219a0120f35295c7025fe0a0eed94619e2ff19f3e6526c448`
 - Third-party crates (`source != null`): 447
 
 ## Notice Extraction Policy
@@ -223,7 +223,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### aws-lc-rs 1.16.2
+### aws-lc-rs 1.16.3
 
 - License: `ISC AND (Apache-2.0 OR ISC)`
 - Source: `crates.io`
@@ -231,7 +231,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### aws-lc-sys 0.39.1
+### aws-lc-sys 0.40.0
 
 - License: `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)`
 - Source: `crates.io`
@@ -386,7 +386,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### clap 4.6.0
+### clap 4.6.1
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -413,7 +413,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### clap_derive 4.6.0
+### clap_derive 4.6.1
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -1947,7 +1947,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### portable-atomic-util 0.2.6
+### portable-atomic-util 0.2.7
 
 - License: `Apache-2.0 OR MIT`
 - Source: `crates.io`
@@ -2018,7 +2018,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### pxfm 0.1.28
+### pxfm 0.1.29
 
 - License: `BSD-3-Clause OR Apache-2.0`
 - Source: `crates.io`
@@ -2754,7 +2754,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT.md`
   - `LICENSE-ZLIB.md`
 
-### tokio 1.52.0
+### tokio 1.52.1
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3091,7 +3091,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### uuid 1.23.0
+### uuid 1.23.1
 
 - License: `Apache-2.0 OR MIT`
 - Source: `crates.io`
@@ -3251,7 +3251,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### webpki-root-certs 1.0.6
+### webpki-root-certs 1.0.7
 
 - License: `CDLA-Permissive-2.0`
 - Source: `crates.io`
@@ -3267,7 +3267,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### webpki-roots 1.0.6
+### webpki-roots 1.0.7
 
 - License: `CDLA-Permissive-2.0`
 - Source: `crates.io`
