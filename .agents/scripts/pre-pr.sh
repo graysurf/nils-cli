@@ -7,6 +7,12 @@
 # Local Check Entrypoints:
 #   NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage
 #
+# Note: this dispatcher runs a SUPERSET of the `nils-cli-verify-required-checks`
+# skill (it adds an llvm-cov coverage gate). Codex / opencode users who
+# discover through .agents/skills/ should invoke that skill directly for
+# the base check stack; see claude-kit's docs/dispatcher-commands.md for the
+# multi-CLI mirror rule.
+#
 # The entrypoint runs the required-checks verify script, optionally under
 # xvfb, and optionally with the llvm-cov coverage gate. Extra args forward
 # straight through (e.g. `--docs-only` for docs-only changes).

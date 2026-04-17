@@ -83,3 +83,15 @@ Failure modes:
     (`nils-cli-verify-required-checks.sh`).
 - Regenerate tracked third-party artifacts again before commit to keep release/CI artifacts in sync.
 - Commit with `semantic-commit`, tag `vX.Y.Z`, and push to trigger the release workflow.
+
+## Alternate entry points
+
+This skill is also reachable through the Claude Code `/release` slash command,
+which dispatches here via `<repo>/.agents/scripts/release.sh` — a thin wrapper
+that `exec`s the script above. Args forward unchanged; behaviour is identical
+whether you invoke the skill directly or type `/release --version X.Y.Z`.
+
+The skill script remains the canonical implementation per the multi-CLI mirror
+rule (see claude-kit's `docs/dispatcher-commands.md`): codex / opencode discover
+work through `.agents/skills/`, Claude Code reaches the same logic through the
+dispatcher convention.

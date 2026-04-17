@@ -56,3 +56,16 @@ Failure modes:
 - For docs-only changes (`README.md` / `docs/**` / `*.md` only), prefer:
   - `.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh --docs-only`
 - If it fails, fix the reported issue and re-run until it exits `0`.
+
+## Alternate entry points
+
+Claude Code's `/pre-pr` slash command covers the same intent via
+`<repo>/.agents/scripts/pre-pr.sh`, which runs a **superset** of these
+checks: `scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage` adds
+an llvm-cov coverage gate on top of the base audit stack. Invoke this
+skill's script directly when you want the base stack without the coverage
+gate, or when you are driving from a CLI that discovers through
+`.agents/skills/` (codex / opencode).
+
+See claude-kit's `docs/dispatcher-commands.md` for the multi-CLI mirror
+rule behind this pairing.
