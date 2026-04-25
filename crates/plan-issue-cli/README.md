@@ -117,6 +117,23 @@ plan-issue-local build-plan-task-spec \
 - `1`: runtime/validation failure
 - `2`: usage failure
 
+## Canonical runtime artifact layout
+
+`start-plan` and `start-sprint` materialize artifacts under
+`$AGENT_HOME/out/plan-issue-delivery/<repo-slug>/issue-<n>/...`, where
+`<repo-slug>` is `owner__repo`. Plan-scope artifacts live under
+`<issue-root>/plan/` and `<issue-root>/prompts/`; sprint-scope artifacts
+live under `<issue-root>/sprint-<n>/{prompts,manifests,specs}/`. Per-task
+dispatch records (`dispatch-<TASK_ID>.json`) carry the canonical ten-key
+shape; runtime-adapter fields (`runtime_name`, `runtime_role`,
+`runtime_role_fallback_reason`) are added by the active wrapper at
+dispatch time and are intentionally absent from the binary's emission.
+
+See [`CLI contract v2`](docs/specs/plan-issue-cli-contract-v2.md)
+"Canonical Runtime Artifacts (v2)" for the full path catalogue and
+[`agent-kit RUNTIME_LAYOUT.md`](https://github.com/sympoies/agent-kit/blob/main/skills/automation/plan-issue-delivery/references/RUNTIME_LAYOUT.md)
+for the upstream contract.
+
 ## Specifications
 
 - [CLI contract v2](docs/specs/plan-issue-cli-contract-v2.md)
