@@ -2,12 +2,14 @@
 
 ## Overview
 
-`image-processing` provides a focused conversion and validation flow:
+`image-processing` is a Rust CLI that provides two focused operations on a single input/output pair:
 
-- `svg-validate --in <svg> --out <svg>`
-- `convert --in <path> --to png|webp|jpg --out <file>`
+- `svg-validate --in <svg> --out <svg>`: sanitize an SVG against the policy contract.
+- `convert --in <path> --to png|webp|jpg --out <file>`: render an SVG or transcode a raster
+  (`png|jpg|jpeg|webp`) into `png`, `webp`, or `jpg`.
 
-`generate` is removed.
+The full sanitize policy (allowed/forbidden tags, attribute and `href` rules) lives in the
+[LLM SVG output contract](assets/llm-svg-output-contract.md) and is enforced by `svg-validate`.
 
 ## Usage
 
@@ -87,7 +89,12 @@ cargo run -p nils-image-processing -- convert \
 
 ## Dependencies
 
-- `convert --in` and `svg-validate`: no external binary dependency (Rust backend).
+- `convert` uses the `image` crate for raster decode/encode and `usvg`/`resvg` for SVG input.
+- `svg-validate` uses `roxmltree` for parsing and applies the policy contract in-process.
+- No external runtime binary is required for either subcommand.
+- See the workspace [`BINARY_DEPENDENCIES.md`](../../BINARY_DEPENDENCIES.md) for the canonical
+  external-tool matrix (the `image-processing` runtime policy section confirms the no-binary
+  contract).
 
 ## Docs
 

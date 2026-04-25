@@ -20,7 +20,7 @@
 
 - Release order is controlled by `release/crates-io-publish-order.txt`.
 - `nils-memo-cli` must be listed in dependency-safe position:
-  - after shared dependencies it consumes (for MVP: `nils-common`, `nils-term`)
+  - after shared dependencies it consumes (for MVP: `nils-common`)
   - before any future crates that depend on `nils-memo-cli`
 
 ## Dry-run verification gate

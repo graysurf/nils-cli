@@ -3,7 +3,7 @@
 ## Overview
 
 fzf-cli is a Rust CLI that provides interactive pickers for files, Git metadata, processes, ports,
-and shell definitions, all powered by `fzf`.
+shell history, and shell definitions, all powered by `fzf`.
 
 ## Usage
 
@@ -12,46 +12,51 @@ Usage:
   fzf-cli <command> [args]
 
 Commands:
-  file         Search and preview files
-  directory    Browse directories and pick files
-  git-status   Interactive git status viewer
-  git-commit   Browse commits and open changed files
-  git-checkout Pick and checkout a previous commit
-  git-branch   Browse and checkout branches
-  git-tag      Browse and checkout tags
-  process      Browse and kill running processes
-  port         Browse listening ports and owners
-  history      Search command history
-  env          Browse environment variables
-  alias        Browse shell aliases
-  function     Browse shell functions
-  def          Browse env, alias, and function definitions
-  help         Display help message
+  file              Search and preview text files
+  directory         Search directories and cd into selection
+  git-status        Interactive git status viewer
+  git-commit        Browse commits and open changed files in editor
+  git-checkout      Pick and checkout a previous commit
+  git-branch        Browse and checkout branches interactively
+  git-tag           Browse and checkout tags interactively
+  process           Browse and kill running processes (confirm before kill)
+  port              Browse listening ports and owners (confirm before kill)
+  history           Search and execute command history
+  env               Browse environment variables
+  alias             Browse shell aliases
+  function          Browse defined shell functions
+  def               Browse all definitions (env, alias, functions)
+  completion        Export shell completion script
 
 Help:
   fzf-cli help
   fzf-cli --help
+  fzf-cli <command> --help
 ```
 
 ## Commands
 
 ### file
 
-- `file [--vi|--vscode] [-- <query...>]`: Search files with preview and open the selection.
+- `file [--vi|--vscode] [-- <query...>]`: Search files (`bat` preview) and open the selection.
 
 ### directory
 
-- `directory [--vi|--vscode] [-- <query...>]`: Pick a directory, then pick a file to open. Use
-  `ctrl-d` to emit `cd <path>` to stdout.
+- `directory [--vi|--vscode] [-- <query...>]`: Pick a directory, then pick a file to open (`bat`
+  preview when available, falls back to `sed`). Use `ctrl-d` to emit `cd <path>` to stdout, `esc`
+  to step back to the directory picker.
 
 ### git-status
 
-- `git-status [query...]`: Interactive `git status -s` viewer with diff previews.
+- `git-status [query...]`: Interactive `git status -s` viewer with diff previews (`delta` when
+  available, falls back to `git diff`).
 
 ### git-commit
 
-- `git-commit [--snapshot] [query...]`: Browse commits and open changed files. `--snapshot` opens
-  file snapshots from the selected commit by default.
+- `git-commit [--snapshot] [query...]`: Browse commits, then pick changed files. Default action
+  opens the worktree files in the configured editor (capped by `OPEN_CHANGED_FILES_MAX_FILES`,
+  default `5`); `--snapshot` flips the default to opening file snapshots from the selected commit.
+  `ctrl-o` opens the highlighted file from the worktree regardless of `--snapshot`.
 
 ### git-checkout
 
@@ -67,15 +72,18 @@ Help:
 
 ### process
 
-- `process [-k|--kill] [-9|--force] [query...]`: Browse processes and optionally kill selected PIDs.
+- `process [-k|--kill] [-9|--force] [query...]`: Browse processes and optionally kill selected PIDs
+  (confirm before kill). `-9`/`--force` upgrades the signal to SIGKILL.
 
 ### port
 
-- `port [-k|--kill] [-9|--force] [query...]`: Browse listening ports and optionally kill owning PIDs.
+- `port [-k|--kill] [-9|--force] [query...]`: Browse listening ports and optionally kill owning
+  PIDs (confirm before kill). Uses `lsof` when available; falls back to `netstat` (no PID column
+  in the fallback view).
 
 ### history
 
-- `history [query...]`: Browse shell history and print the selected command to stdout.
+- `history [query...]`: Search shell history and print the selected command to stdout.
 
 ### env
 
@@ -93,12 +101,20 @@ Help:
 
 - `def [query...]`: Browse env, alias, and function definitions.
 
+### completion
+
+- `completion <bash|zsh>`: Print the shell completion script for the requested shell.
+
 ## Environment
 
 - `FZF_FILE_OPEN_WITH`: Default opener for `file`, `directory`, `git-commit` (`vi` or `vscode`).
 - `FZF_FILE_MAX_DEPTH`: Max directory depth for `file` and `directory` (default: `10`).
-- `FZF_PREVIEW_WINDOW`: Preview window layout for `directory` (default: `right:50%:wrap`).
-- `FZF_DEF_DELIM` and `FZF_DEF_DELIM_END`: Required delimiters for `env`, `alias`, `function`, `def`.
+- `FZF_PREVIEW_WINDOW`: Preview window layout for `directory` file picker (default:
+  `right:50%:wrap`).
+- `OPEN_CHANGED_FILES_MAX_FILES`: Max number of worktree files `git-commit` opens at once
+  (default: `5`).
+- `FZF_DEF_DELIM` and `FZF_DEF_DELIM_END`: Required delimiters for `env`, `alias`, `function`,
+  `def`.
 - `FZF_DEF_DOC_CACHE_ENABLED`: Enable definition doc caching.
 - `FZF_DEF_DOC_CACHE_EXPIRE_MINUTES`: Cache TTL in minutes (default: `10`).
 - `FZF_DEF_DOC_SEPARATOR_PAD`: Padding lines between definition docs (default: `2`).
@@ -107,8 +123,13 @@ Help:
 
 - `fzf` is required for all commands.
 - `git` is required for `git-*` commands.
-- `lsof` is optional for `port` (falls back to `netstat`).
-- `code` is required for `--vscode` (falls back to `vi`).
+- `bat` is required for the `file` preview and is the preferred `directory` preview (the
+  `directory` picker degrades to `sed` when `bat` is missing).
+- `lsof` is the preferred backend for `port`; `netstat` is the fallback when `lsof` is missing.
+- `code` is required for `--vscode` (and the `FZF_FILE_OPEN_WITH=vscode` default); the picker
+  falls back to `vi` if `code` is unavailable or fails.
+- See the workspace [`BINARY_DEPENDENCIES.md`](../../BINARY_DEPENDENCIES.md) for the canonical
+  external-tool matrix.
 
 ## Docs
 
