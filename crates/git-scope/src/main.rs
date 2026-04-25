@@ -249,7 +249,9 @@ fn run() -> Result<()> {
             commit::render_commit(&commit, parent.as_deref(), no_color, print, progress_opt_in)
                 .with_context(|| format!("git-scope commit {commit}"))?;
         }
-        Command::Help | Command::Completion { .. } => unreachable!(),
+        Command::Help | Command::Completion { .. } => {
+            unreachable!("Help/Completion handled by the early-return dispatch above")
+        }
     }
 
     Ok(())
