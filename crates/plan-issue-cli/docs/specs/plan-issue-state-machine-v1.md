@@ -99,10 +99,13 @@ Expected transitions:
 
 Mutation command notes:
 
-- `link-pr` records a concrete `PR` reference and updates selected row `Status` (default `in-progress`).
+- `link-pr` records a concrete `PR` reference and updates selected row `Status` to one of `{planned, in-progress, blocked}`
+  (default `in-progress`); `done` is reserved for sprint accept/close gates and is not selectable here.
 - `link-pr --task <id>` expands to all rows in the same runtime PR lane for `per-sprint` / `pr-shared` rows to keep shared-lane `PR` values
   consistent.
 - `link-pr --sprint <N>` must target a single runtime PR lane (or use `--pr-group`) to avoid ambiguous multi-lane updates.
+- `link-pr` re-runs the issue body structural invariants on the post-mutation table before persisting (live binary writes the issue body;
+  body-file mode rewrites the file unless `--dry-run`).
 
 Row-level status rules:
 

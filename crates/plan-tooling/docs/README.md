@@ -4,10 +4,12 @@
 
 ## Specs
 
-- [`split-prs Contract v2`](specs/split-prs-contract-v2.md): grouping-only split-prs output
-  contract (runtime metadata is materialized by `plan-issue-cli`).
-- [`split-prs Contract v1`](specs/split-prs-contract-v1.md): historical pre-v2 reference (split-prs
-  emitted runtime metadata fields).
+- [`split-prs Contract v2`](specs/split-prs-contract-v2.md): **active** contract. Grouping-only
+  `split-prs` output (`task_id`, `summary`, `pr_group`); runtime lane metadata is materialized by
+  `plan-issue-cli`.
+- [`split-prs Contract v1`](specs/split-prs-contract-v1.md): **deprecated**, retained for
+  historical reference. Documents the pre-v2 output shape where `split-prs` emitted runtime
+  execution metadata fields (`branch`, `worktree`, `owner`, `notes`). Superseded by v2.
 
 ## Runbooks
 

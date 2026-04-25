@@ -1,7 +1,10 @@
 # split-prs Contract v1
 
-> Historical reference: v1 documents the pre-v2 output shape where `split-prs` emitted runtime execution metadata fields (`branch`,
-> `worktree`, `owner`, `notes`). For current behavior, see `split-prs-contract-v2.md`.
+> Status: **Deprecated, retained for historical reference.** The active contract is
+> `split-prs-contract-v2.md`. v1 documents the pre-v2 output shape where `split-prs` emitted
+> runtime execution metadata fields (`branch`, `worktree`, `owner`, `notes`). Those fields are now
+> produced by `plan-issue-cli` from grouping primitives plus parsed plan content. Do not author new
+> tooling against v1.
 
 ## Purpose
 

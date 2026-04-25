@@ -1,5 +1,8 @@
 # split-prs Contract v2
 
+> Status: **Active contract.** Supersedes `split-prs-contract-v1.md`, which is retained for
+> historical reference only.
+
 ## Purpose
 
 `plan-tooling split-prs` emits deterministic grouping primitives for downstream orchestrators.
@@ -8,10 +11,8 @@ v2 intentionally removes task-level runtime execution metadata from `split-prs` 
 `plan-issue-cli` materializes runtime lane metadata from:
 
 - parsed plan task content
-- split-prs grouping results (`task_id`, `summary`, `pr_group`)
+- `split-prs` grouping results (`task_id`, `summary`, `pr_group`)
 - command prefixes / grouping strategy
-
-`split-prs-contract-v1.md` remains the historical reference for pre-v2 output shape.
 
 ## CLI
 
@@ -50,6 +51,23 @@ Compatibility note:
   - command grouping (`command-pr-grouping`)
   - plan metadata (`plan-metadata`)
   - auto fallback (`default-pr-grouping`)
+
+## Sprint Metadata Gate
+
+The plan parser is strict about sprint metadata field names and values. These rules apply uniformly
+to `to-json`, `validate`, `batches`, and `split-prs`:
+
+- Canonical field names are case-sensitive: `**PR grouping intent**: per-sprint|group` and
+  `**Execution Profile**: serial|parallel-xN`. Non-canonical casings (for example
+  `PR Grouping Intent`) are rejected at parse time with `invalid metadata field <name>; use '<canonical>'`.
+- Invalid values are rejected (`invalid PR grouping intent (expected per-sprint|group)`,
+  `invalid Execution Profile (expected serial|parallel-xN)`).
+- `validate` additionally enforces metadata coherence per sprint:
+  - if either `PR grouping intent` or `Execution Profile` is present, both must be present
+    (failure: `sprint metadata must include both \`PR grouping intent\` and \`Execution Profile\``).
+  - `PR grouping intent: per-sprint` cannot be combined with `Execution Profile` parallel width
+    `> 1` (failure: `\`PR grouping intent\` is per-sprint but \`Execution Profile\` indicates parallel
+    width N; use \`PR grouping intent: group\` for multi-lane execution`).
 
 ## TSV Output (format=tsv)
 
