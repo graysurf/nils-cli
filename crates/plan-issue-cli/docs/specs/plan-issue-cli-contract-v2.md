@@ -116,7 +116,7 @@ Sprint-scoped artifacts (owned by `start-sprint`):
 Per-task dispatch record (owned by `start-sprint`):
 
 - `DISPATCH_RECORD_PATH="$SPRINT_ROOT/manifests/dispatch-<TASK_ID>.json"`.
-- Required keys (snake_case, eleven total):
+- Required keys (snake_case, ten total):
   - `task_id`
   - `task_prompt_path`
   - `subagent_init_snapshot_path`
@@ -153,14 +153,11 @@ Worktree path rules:
 
 ### Breaking Change: Retired Flat Layout
 
-This contract **retires** the prior flat artifact layout:
+This contract **retires** the prior flat artifact layout entirely. The
+retired filenames and the migration note are catalogued in the crate
+[`CHANGELOG.md`](../../CHANGELOG.md) under the `BREAKING` section.
+Downstream consumers must read artifacts from the canonical
+`$ISSUE_ROOT` / `$SPRINT_ROOT` paths above.
 
-- `$AGENT_HOME/out/plan-issue-delivery/<plan-slug>-plan-tasks.tsv`
-- `$AGENT_HOME/out/plan-issue-delivery/<plan-slug>-plan-issue-body.md`
-- `$AGENT_HOME/out/plan-issue-delivery/<plan-slug>-sprint-<N>-tasks.tsv`
-- `$AGENT_HOME/out/plan-issue-delivery/<plan-slug>-sprint-<N>-subagent-prompts/<anchor>-subagent-prompt.md`
-
-The retirement is a breaking change; downstream consumers must read
-artifacts from the canonical `$ISSUE_ROOT` / `$SPRINT_ROOT` paths above.
 Migration delivered by
 [`docs/plans/plan-issue-cli-canonical-runtime-artifacts-plan.md`](../../../../docs/plans/plan-issue-cli-canonical-runtime-artifacts-plan.md).
