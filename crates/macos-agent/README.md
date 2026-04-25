@@ -67,7 +67,7 @@ macos-agent debug bundle --active-window --format json
   - `macos-agent apps list`
 - `window`
   - `macos-agent window activate (--window-id <id> | --active-window | --app <name>`
-    `[--window-title-contains <name>] | --bundle-id <bundle_id>) [--wait-ms <ms>]`
+    `[--window-title-contains <name>] | --bundle-id <bundle_id>) [--wait-ms <ms>] [--reopen-on-fail]`
 - `input`
   - `macos-agent input click --x <px> --y <px> [--button <left|right|middle>] [--count <n>] [--pre-wait-ms <ms>] [--post-wait-ms <ms>]`
   - `macos-agent input type --text <text> [--delay-ms <ms>] [--submit]`
@@ -119,6 +119,8 @@ macos-agent debug bundle --active-window --format json
 - `profile`
   - `macos-agent profile validate --file <profile.json>`
   - `macos-agent profile init [--name <profile-name>] [--path <output.json>]`
+- `completion`
+  - `macos-agent completion <bash|zsh|fish|powershell|elvish>` (prints shell completion script to `stdout`)
 
 ## Global Flags
 
@@ -199,6 +201,10 @@ Exit codes:
 - `1`: runtime failure
 - `2`: usage error
 
+Platform guard: `macos-agent` is macOS-only. On non-macOS hosts every subcommand short-circuits with exit code `2` and the
+message `error: macos-agent is only supported on macOS`. The deterministic test mode (`AGENTS_MACOS_AGENT_TEST_MODE=1`) bypasses
+this guard so CI-safe integration tests can run on Linux.
+
 Error envelope (`--error-format json`):
 
 ```json
@@ -216,22 +222,30 @@ Error envelope (`--error-format json`):
 
 ## Permission Matrix
 
-| Capability                | Required setup                                                                       | Typical failure symptom                | Mitigation                                                |
-| ------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------- | --------------------------------------------------------- |
-| Accessibility             | Terminal host allowed in **System Settings > Privacy & Security > Accessibility**    | click/type/hotkey fail                 | Enable the shell host app (Terminal/iTerm/etc.) and retry |
-| Automation (Apple Events) | Terminal host allowed in **System Settings > Privacy & Security > Automation**       | activation / System Events probe fails | Allow the terminal app to control System Events           |
-| Screen Recording          | Terminal host allowed in **System Settings > Privacy & Security > Screen Recording** | observe screenshot fails               | Enable Screen Recording for terminal host                 |
-| `cliclick` binary         | Installed and on `PATH`                                                              | preflight reports missing `cliclick`   | `brew install cliclick`                                   |
+| Capability                | Required setup                                                                       | Typical failure symptom                                           | Mitigation                                                                                   |
+| ------------------------- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Accessibility             | Terminal host allowed in **System Settings > Privacy & Security > Accessibility**    | click/type/hotkey fail                                            | Enable the shell host app (Terminal/iTerm/etc.) and retry                                    |
+| Automation (Apple Events) | Terminal host allowed in **System Settings > Privacy & Security > Automation**       | activation / System Events probe fails                            | Allow the terminal app to control System Events                                              |
+| Screen Recording          | Terminal host allowed in **System Settings > Privacy & Security > Screen Recording** | observe screenshot fails                                          | Enable Screen Recording for terminal host                                                    |
+| `osascript` binary        | Preinstalled on macOS; required for AppleScript backend + preflight probes           | preflight reports missing `osascript`                             | Reinstall macOS command-line tools if missing (`xcode-select --install`)                     |
+| `cliclick` binary         | Installed and on `PATH`                                                              | preflight reports missing `cliclick`                              | `brew install cliclick`                                                                      |
+| `hs` (Hammerspoon CLI)    | Required for Hammerspoon AX backend; install Hammerspoon and enable `hs.ipc`         | `ax attr/action/session/watch` fail with backend-unavailable hint | `brew install --cask hammerspoon`, then add `require('hs.ipc')` to `~/.hammerspoon/init.lua` |
+| `im-select` binary        | Required by `input-source current` and `input-source switch`                         | `input-source` commands fail with `missing dependency im-select`  | `brew install im-select`                                                                     |
+
+See the workspace [`BINARY_DEPENDENCIES.md`](../../BINARY_DEPENDENCIES.md) for the canonical install matrix (rows for `hs`, `cliclick`, `im-select`, and `osascript`).
 
 ## AX Backend Capability Matrix
 
-| Backend preference | `ax list/click/type`                                                             | `ax attr/action/session/watch` | Notes                                                                        |
-| ------------------ | -------------------------------------------------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------- |
-| `auto` (default)   | Hammerspoon first, fallback to AppleScript (JXA) when Hammerspoon is unavailable | Hammerspoon-only               | Best default for resilience; fallback does not apply to extended AX commands |
-| `hammerspoon`      | Supported                                                                        | Supported                      | Full AX surface; requires `hs` CLI and `hs.ipc` enabled                      |
-| `applescript`      | Supported (JXA)                                                                  | Not supported directly         | Extended AX commands still depend on Hammerspoon runtime                     |
+| Backend preference    | `ax list/click/type`                                                                              | `ax attr/action/session/watch` | Notes                                                                                                         |
+| --------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `auto` (default)      | Hammerspoon `hs` first; falls back to AppleScript (JXA) only when the Hammerspoon path is missing | Hammerspoon-only               | Best default for resilience; fallback does not apply to extended AX commands and surfaces a "fallback" hint   |
+| `hammerspoon` / `hs`  | Hammerspoon-only (no JXA fallback)                                                                | Supported                      | Full AX surface; requires the `hs` CLI on `PATH` and `require('hs.ipc')` enabled in `~/.hammerspoon/init.lua` |
+| `applescript` / `jxa` | AppleScript (JXA via `osascript`) only                                                            | Not supported directly         | Extended AX commands still require Hammerspoon; selecting this preference does not avoid the dependency       |
 
-Preflight now emits an `ax_backend_capabilities` row so operators can verify backend mode and fallback expectations before failures.
+Preflight emits an `ax_backend_capabilities` row so operators can verify backend mode and fallback expectations before failures.
+The row carries the `AX backend preference=<auto|hammerspoon|applescript>` message; when the preference is anything other than
+`hammerspoon`, the row also adds a hint pointing operators back to `AGENTS_MACOS_AGENT_AX_BACKEND` and
+`preflight --include-probes`.
 
 ## Reliability Boundaries and Practices
 
@@ -248,8 +262,13 @@ stability:
   - `--timeout-ms 5000`
 - Use `wait app-active` / `wait window-present` before mutating actions.
 - Prefer `ax click/type` first, then opt in to fallback flags when app AX trees are unstable.
-- AX backend selection defaults to `auto` (Hammerspoon first, JXA fallback).
+- AX backend selection defaults to `auto` (Hammerspoon `hs` CLI first, AppleScript JXA fallback for `ax list/click/type`).
   - Override with `AGENTS_MACOS_AGENT_AX_BACKEND=hammerspoon|applescript|auto`.
+  - Aliases `hs` and `jxa` are also accepted (mapped to `hammerspoon` and `applescript` respectively).
+  - Extended AX commands (`attr`, `action`, `session`, `watch`) always require Hammerspoon; the `applescript` and `auto`
+    paths do not provide a JXA fallback for them.
+  - In deterministic test mode (`AGENTS_MACOS_AGENT_TEST_MODE=1`) without an explicit override, the resolver picks
+    `applescript` to keep the JXA stub deterministic.
 
 ## Command Decision Matrix (AX/Input/Wait/Fallback/Backend)
 

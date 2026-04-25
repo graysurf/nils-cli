@@ -3,9 +3,11 @@
 ## Overview
 
 screen-record is a macOS 12+ and Linux CLI that records a single window (or a full display)
-to a video file. On macOS it uses ScreenCaptureKit and AVFoundation; on Linux it relies on X11 for
-discovery and `ffmpeg` for capture/encoding. On Wayland-only sessions, it can use an interactive
-portal picker (`--portal`) via xdg-desktop-portal + PipeWire. It also exposes parseable
+to a video file. On macOS it uses ScreenCaptureKit (`SCShareableContent` for discovery,
+`SCStream` for capture) and AVFoundation (`AVAssetWriter` for mux/encoding). On Linux it relies on
+X11 (`x11rb`) for window/display discovery and `ffmpeg` for capture/encoding. On Wayland-only
+sessions, it can use an interactive portal picker (`--portal`) via xdg-desktop-portal
+(`org.freedesktop.portal.ScreenCast` over DBus) + PipeWire. It also exposes parseable
 window/app/display lists (X11) to make selection deterministic in scripts.
 
 ## Linux (X11 + Wayland portal)
@@ -22,6 +24,11 @@ Prerequisites:
   - xdg-desktop-portal + a desktop backend (e.g. `xdg-desktop-portal-gnome` or
     `xdg-desktop-portal-kde`)
   - a PipeWire session (Ubuntu default)
+- For `--audio system|mic|both`: `pactl` (PulseAudio compatibility) on `PATH`.
+
+See the workspace [`BINARY_DEPENDENCIES.md`](../../BINARY_DEPENDENCIES.md) for the canonical install
+matrix (rows for `ffmpeg`, `pactl`, `xdg-desktop-portal` + PipeWire, and the macOS `cwebp` WebP
+fallback).
 
 Selection parity:
 
@@ -79,8 +86,10 @@ screen-record --display --duration 3 --audio off --path "./recordings/display.mp
   error: ffmpeg not found on PATH. Install it with: sudo apt-get install ffmpeg
   ```
 
-- **Audio capture prerequisites (`--audio system|mic`)**: Linux audio capture uses PulseAudio
-  compatibility via `pactl`. On Ubuntu, install:
+- **Audio capture prerequisites (`--audio system|mic|both`)**: Linux audio capture uses PulseAudio
+  compatibility via `pactl`. `--audio mic` resolves the PulseAudio default source; `--audio system`
+  resolves the default sink and records its `.monitor` source; `--audio both` combines both inputs
+  and requires a `.mov` container. On Ubuntu, install:
 
   ```text
   sudo apt-get install pulseaudio-utils pipewire-pulse
@@ -114,7 +123,7 @@ screen-record [options]
 | `--app` | `<name>` | (none) | Select a window by app/owner name (case-insensitive substring). |
 | `--window-name` | `<name>` | (none) | Narrow `--app` selection by window title substring. |
 | `--active-window` | (none) | (none) | Record the frontmost window on the current Space. |
-| `--display` | (none) | (none) | Record the main display. |
+| `--display` | (none) | (none) | Record the primary display. |
 | `--display-id` | `<id>` | (none) | Record a specific display id. |
 | `--duration` | `<seconds>` | (required for recording) | Record for N seconds. |
 | `--audio` | `off\|system\|mic\|both` | `off` | Control audio capture. `both` requires `.mov`. |
@@ -251,9 +260,13 @@ Candidate rows are identical to `--list-windows` TSV output and are printed to s
 - Otherwise, `.png`, `.jpg`/`.jpeg`, or `.webp` is selected from the `--path` extension.
 - If `--path` has no extension (or `--path` is omitted), the format defaults to `.png`.
 - If `--image-format` conflicts with the `--path` extension, exit 2 with a usage error.
-- Note: WebP encoding is best-effort. `screen-record` tries macOS ImageIO first, then falls back to
-  `cwebp` (install: `brew install webp`). If no encoder is available, `--image-format webp` fails
-  with exit 1.
+- Note: WebP encoding on macOS is best-effort with a two-stage fallback chain:
+  1. macOS ImageIO (`CGImageDestination` with the `org.webmproject.webp` UTI). Available when the
+     installed macOS bundles a WebP encoder for ImageIO.
+  2. `cwebp` (`brew install webp`). The capture is encoded as a temporary PNG via ImageIO, then
+     piped through `cwebp -lossless` to produce the final `.webp`.
+  If neither stage succeeds (no ImageIO WebP encoder and `cwebp` is missing or fails),
+  `--image-format webp` exits with code 1. Use `--image-format png|jpg` as a workaround.
 
 ## Diff-aware screenshot capture (`--if-changed`)
 

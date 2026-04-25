@@ -376,6 +376,12 @@ The SQL file must keep these object names unchanged:
   - `idx_item_tags_tag_id_derivation_id`
   - `idx_workflow_item_anchors_type_item`
 
+In addition, the runtime migration layer creates and maintains:
+
+- `schema_migrations(version, applied_at)`: bookkeeping table that records which
+  versions of `schema_v1.sql` have been applied; not part of the v1 data
+  schema and not queried by any command surface.
+
 ## Compatibility Policy
 
 - Post-consolidation builds initialize and maintain storage from
