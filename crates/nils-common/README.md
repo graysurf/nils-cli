@@ -29,16 +29,22 @@ Workspace-level keep/delete ownership decisions are tracked in
 
 ## Modules and purpose
 
-- `env`: truthy parsing helpers, `NO_COLOR` checks, and trimmed non-empty env lookup.
-- `shell`: POSIX single-quote escaping and ANSI stripping modes.
-- `process`: command execution wrappers plus PATH lookup helpers.
-- `git`: `git` command wrappers for repo probes, `rev-parse` helpers, staged-path listing, and scope suggestion primitives for commit
-  tooling.
+- `env`: truthy parsing helpers, env-presence checks, `NO_COLOR` and prompt-segment color toggles, duration parsing, and trimmed non-empty
+  env lookup.
+- `shell`: POSIX single-quote escaping (with selectable escape style) and ANSI stripping modes.
+- `process`: command execution wrappers (`run_output`/`run_checked`/`run_stdout_trimmed`/`run_status_*`), PATH lookup helpers, and headless
+  browser-launch detection.
+- `git`: `git` command wrappers for repo probes, `rev-parse` helpers, staged-path listing, name-status-z parsing, lockfile detection, and
+  scope suggestion primitives for commit tooling.
 - `clipboard`: best-effort clipboard copy with explicit tool priority.
-- `fs`: atomic write, timestamp write/remove, SHA-256 hashing, and cross-platform replace helpers with structured errors.
-- `markdown`: markdown payload validation, markdown-table-safe cell canonicalization, markdown heading/code-block rendering, and stable JSON
-  pretty-format helpers used by orchestration/reporting CLIs.
-- `greeting`: tiny sample helper used by `cli-template`.
+- `fs`: atomic write, timestamp write/remove, UTF-8 text write, SHA-256 hashing, and cross-platform replace helpers with structured errors.
+- `markdown`: markdown payload validation (with violation reporting), markdown-table-safe cell canonicalization, markdown heading/code-block
+  rendering, and stable JSON pretty-format helpers used by orchestration/reporting CLIs.
+- `provider_runtime`: provider-runtime substrate (paths, profiles, auth persistence, exec invocation, JSON/JWT helpers, structured errors)
+  shared by Codex/Gemini-style CLIs without provider-specific UX copy.
+- `rate_limits_ansi`: shared rate-limit table cell formatting (current-profile coloring and percent-band coloring) honoring `NO_COLOR`.
+
+The crate also exposes a tiny top-level `greeting(name: &str) -> String` helper used by `cli-template` for the new-crate smoke test.
 
 ## API examples
 
@@ -149,10 +155,18 @@ When introducing a shared helper at a call site:
 
 ## Non-goals
 
+These mirror the workspace shared-crate-boundary spec
+([`docs/specs/workspace-shared-crate-boundary-v1.md`](../../docs/specs/workspace-shared-crate-boundary-v1.md)) at the crate level:
+
+- Moving provider-specific message wording, JSON envelope copy, or exit-code mapping into `nils-common`.
+- Merging Codex and Gemini command-level UX into one behavior surface (parity-sensitive secret-dir routing stays crate-local until
+  characterization proves a safe merge).
+- Treating `nils-term` as a generic runtime helper crate; progress bars, spinners, and TTY presentation policy stay in `nils-term`.
 - Defining CLI-specific UX copy, warning templates, or emoji policy.
 - Owning command-level business logic for a single CLI.
 - Owning shared GitHub operation adapters such as `nils-common::github` (keep crate-local adapters).
 - Hiding meaningful behavior differences that should remain explicit in local adapters.
+- Keeping compatibility-only wrappers once shared helpers are canonical.
 - Replacing specialized shared crates such as `api-testing-core`, `nils-term`, or `nils-test-support`.
 
 ## Docs

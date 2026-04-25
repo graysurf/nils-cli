@@ -6,11 +6,17 @@ Define the shared markdown helper behavior in `nils-common::markdown` used by mu
 
 ## APIs
 
-### `validate_markdown_payload(markdown: &str)`
+### `validate_markdown_payload(markdown: &str) -> Result<(), MarkdownPayloadError>`
 
 - Rejects literal escaped-control artifacts (`\\n`, `\\r`, `\\t`) in markdown payloads.
 - Accepts real control characters (`\n`, `\r`, `\t`).
-- Returns structured violations via `MarkdownPayloadError`.
+- Returns structured violations via `MarkdownPayloadError::violations()` (a slice of
+  `MarkdownPayloadViolation { sequence, count }`).
+
+### `markdown_payload_violations(markdown: &str) -> Vec<MarkdownPayloadViolation>`
+
+- Lower-level scan that returns the per-sequence violation counts without wrapping them in an error.
+- Empty result implies the payload is acceptable for table/code-block rendering.
 
 ### `canonicalize_table_cell(value: &str) -> String`
 
