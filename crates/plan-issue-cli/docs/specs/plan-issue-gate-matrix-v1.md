@@ -33,23 +33,24 @@ execution.
 | `G8` | Close-plan dry-run body-file gate | `close-plan --dry-run` | `--body-file` is provided for local gate evaluation | `2` |
 | `G9` | Runtime-truth drift gate | `start-sprint` (live binary path) | sprint issue rows match plan-derived runtime lane metadata before artifact render | `1` |
 | `G10` | Link-pr target selection gate | `link-pr` | `--task` resolves to a row (or shared-lane group); `--sprint` resolves to a single PR lane (or `--pr-group` selects one) | `1` |
+| `G11` | Canonical runtime artifact emission gate | `start-plan`, `start-sprint` | `AGENT_HOME` is set; `$ISSUE_ROOT` / `$SPRINT_ROOT` directories are creatable; main-agent / subagent init snapshot sources exist; `MAIN_AGENT_INIT_SNAPSHOT_PATH`, `PLAN_BRANCH_REF_PATH`, `PLAN_SNAPSHOT_PATH`, `SUBAGENT_INIT_SNAPSHOT_PATH`, `TASK_PROMPT_PATH` per task, `PROMPT_MANIFEST_PATH`, `TASK_SPEC_PATH`, and `DISPATCH_RECORD_PATH` per task are written successfully (per `plan-issue-cli-contract-v2.md` Canonical Runtime Artifacts (v2)) | `1` |
 
 ## Command-to-Gate Matrix
 
-| Command | G0 | G1 | G2 | G3 | G4 | G5 | G6 | G7 | G8 | G9 | G10 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `build-task-spec` | required | - | - | - | - | - | - | optional | - | - | - |
-| `build-plan-task-spec` | required | - | - | - | - | - | - | optional | - | - | - |
-| `start-plan` | required | required (rendered body) | - | - | - | - | - | optional | - | - | - |
-| `status-plan` | required | required | - | - | - | - | - | optional | - | - | - |
-| `link-pr` | required | required (post-mutation) | - | - | - | - | - | optional | - | - | required |
-| `ready-plan` | required | required | - | - | - | - | - | optional | - | - | - |
-| `close-plan` | required | required | required | - | - | required | required (on success path) | optional | required when dry-run | - | - |
-| `cleanup-worktrees` | required | required | - | - | - | - | required | optional | - | - | - |
-| `start-sprint` | required | required | required for `N > 1` | required for `N > 1` | - | - | - | optional | - | required (live binary path) | - |
-| `ready-sprint` | required | required (live binary path) | - | - | - | - | - | optional | - | - | - |
-| `accept-sprint` | required | required | required | - | required | - | - | optional | - | - | - |
-| `multi-sprint-guide` | required | - | - | - | - | - | - | optional | - | - | - |
+| Command | G0 | G1 | G2 | G3 | G4 | G5 | G6 | G7 | G8 | G9 | G10 | G11 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `build-task-spec` | required | - | - | - | - | - | - | optional | - | - | - | - |
+| `build-plan-task-spec` | required | - | - | - | - | - | - | optional | - | - | - | - |
+| `start-plan` | required | required (rendered body) | - | - | - | - | - | optional | - | - | - | required |
+| `status-plan` | required | required | - | - | - | - | - | optional | - | - | - | - |
+| `link-pr` | required | required (post-mutation) | - | - | - | - | - | optional | - | - | required | - |
+| `ready-plan` | required | required | - | - | - | - | - | optional | - | - | - | - |
+| `close-plan` | required | required | required | - | - | required | required (on success path) | optional | required when dry-run | - | - | - |
+| `cleanup-worktrees` | required | required | - | - | - | - | required | optional | - | - | - | - |
+| `start-sprint` | required | required | required for `N > 1` | required for `N > 1` | - | - | - | optional | - | required (live binary path) | - | required |
+| `ready-sprint` | required | required (live binary path) | - | - | - | - | - | optional | - | - | - | - |
+| `accept-sprint` | required | required | required | - | required | - | - | optional | - | - | - | - |
+| `multi-sprint-guide` | required | - | - | - | - | - | - | optional | - | - | - | - |
 
 ## Gate Evaluation Order (Normative)
 
@@ -57,8 +58,11 @@ execution.
 2. Command-specific structural checks (`G1`) before remote mutations. For `link-pr`, `G1` runs after the in-memory PR/status mutation so
    the post-update body is validated before any GitHub write.
 3. Selection/progression/merge/drift gates (`G10`, `G2`, `G3`, `G4`, `G5`, `G9`) in command-specific order.
-4. Cleanup gate (`G6`) only after command gate success where cleanup is required.
-5. Dry-run behavior (`G7`, `G8`) wraps command execution and must preserve non-mutation semantics.
+4. Canonical runtime artifact emission (`G11`) runs after structural validation succeeds and before the command exits with
+   `exit 0`. Failure to write any required artifact in the canonical layout (per `plan-issue-cli-contract-v2.md` Canonical
+   Runtime Artifacts (v2)) is a hard fail with exit code `1`.
+5. Cleanup gate (`G6`) only after command gate success where cleanup is required.
+6. Dry-run behavior (`G7`, `G8`) wraps command execution and must preserve non-mutation semantics.
 
 ## Data Sources and Inputs
 
@@ -71,5 +75,5 @@ execution.
 ## Failure Contract
 
 - `exit 2`: usage errors (`G0`, `G8`) and invalid required inputs.
-- `exit 1`: gate failures (`G1` through `G7`, `G9`, `G10`) and runtime dependency failures.
+- `exit 1`: gate failures (`G1` through `G7`, `G9`, `G10`, `G11`) and runtime dependency failures.
 - `exit 0`: all applicable gates pass.
