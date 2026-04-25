@@ -101,7 +101,7 @@ Auth examples:
 
 - Human-readable text is the default output mode.
 - Machine-readable JSON mode is explicit: use `--format json` (preferred) or `--json` where supported for compatibility.
-- Contract spec: `docs/specs/codex-cli-diag-auth-json-contract-v1.md`
+- Contract spec: `docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - Consumer runbook: `docs/runbooks/json-consumers.md`
 - Covered surfaces: `diag rate-limits` (single/all/async) and `auth login|use|save|remove|refresh|auto-refresh|current|sync`.
 
@@ -138,7 +138,7 @@ Auth examples:
 ## Contract sign-off checklist
 
 - [ ] `cargo test -p nils-codex-cli --test main_entrypoint --test dispatch`
-- [ ] `rg -n "codex-cli\\.diag\\.rate-limits\\.v1|codex-cli\\.auth\\.v1" crates/codex-cli/docs/specs/codex-cli-diag-auth-json-contract-v1.md`
+- [ ] `rg -n "codex-cli\\.diag\\.rate-limits\\.v1|codex-cli\\.auth\\.v1" crates/codex-cli/docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - [ ] `NILS_WRAPPER_MODE=debug ./wrappers/codex-cli unknown-group` exits `64` with clap usage error output.
 
 ## Docs

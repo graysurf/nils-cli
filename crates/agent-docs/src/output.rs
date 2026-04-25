@@ -12,16 +12,28 @@ struct ContextsOutput<'a> {
     contexts: &'a [DocContext],
 }
 
-pub fn render_contexts(format: OutputFormat, contexts: &[DocContext]) -> Result<String> {
+pub fn render_contexts(format: ResolveFormat, contexts: &[DocContext]) -> Result<String> {
     match format {
-        OutputFormat::Text => Ok(contexts
+        ResolveFormat::Text => Ok(contexts
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n")),
-        OutputFormat::Json => serde_json::to_string_pretty(&ContextsOutput { contexts })
+        ResolveFormat::Json => serde_json::to_string_pretty(&ContextsOutput { contexts })
             .context("failed to serialize contexts output"),
+        ResolveFormat::Checklist => Ok(render_contexts_checklist(contexts)),
     }
+}
+
+fn render_contexts_checklist(contexts: &[DocContext]) -> String {
+    let total = contexts.len();
+    let mut lines = Vec::with_capacity(total + 2);
+    lines.push(format!("CONTEXTS_BEGIN total={total}"));
+    for ctx in contexts {
+        lines.push(ctx.to_string());
+    }
+    lines.push(format!("CONTEXTS_END total={total}"));
+    lines.join("\n")
 }
 
 pub fn render_resolve(format: ResolveFormat, report: &ResolveReport) -> Result<String> {

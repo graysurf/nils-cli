@@ -13,7 +13,7 @@ Shared baseline guidance:
 
 Gemini-specific contract source:
 
-- `crates/gemini-cli/docs/specs/gemini-cli-diag-auth-json-contract-v1.md`
+- `crates/gemini-cli/docs/specs/gemini-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 
 ## Provider-specific schema routing
 
