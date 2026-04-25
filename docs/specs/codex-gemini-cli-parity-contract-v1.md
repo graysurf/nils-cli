@@ -62,26 +62,22 @@ Compatibility rules:
 
 - `--refresh` remains the only blocking refresh path in both lanes. The default prompt path must keep printing the cached line first and
   keep appending the lane-specific stale suffix when the cache is stale.
-- Current gap: `gemini-cli` still calls `refresh_blocking()` from the default stale/missing-cache path, while `codex-cli` enqueues a
-  best-effort background refresh and returns immediately.
-- Current Gemini missing-cache behavior is part of the same gap: no cache entry falls through to the same inline `refresh_blocking()`
-  path instead of a detached enqueue.
-- When porting Codex semantics to Gemini, preserve these guardrails:
+- Current state: both `codex-cli` and `gemini-cli` call `refresh::enqueue_background_refresh(&target_file)` from the default
+  stale/missing-cache path (see `crates/codex-cli/src/prompt_segment/mod.rs` and `crates/gemini-cli/src/prompt_segment/mod.rs`). Inline
+  `refresh_blocking()` is reserved for the explicit `--refresh` path in both lanes.
+- The parity guardrails below are required invariants for both lanes; treat any future regression as a contract break:
   - Best-effort background spawn via the current executable; `current_exe` or spawn failures stay silent no-ops.
   - Minimum refresh interval throttling via `*_PROMPT_SEGMENT_REFRESH_MIN_SECONDS`.
   - Last-attempt markers are written before `spawn()` so prompt storms still throttle after child-launch failure.
   - Lock contention stays a no-op for prompt rendering, with stale-lock recovery via `*_PROMPT_SEGMENT_LOCK_STALE_SECONDS`.
   - Lock and throttle files stay cache-adjacent (`<cache-stem>.refresh.lock` and `<cache-stem>.refresh.at`).
   - Cache format, stale suffix rendering, and exit codes stay unchanged.
-- Existing Gemini tests that must change when the default path stops refreshing inline:
-  - `crates/gemini-cli/tests/prompt_segment_refresh.rs`: `prompt_segment_stale_cached_entry_refreshes_on_run`
-  - `crates/gemini-cli/tests/prompt_segment_cached.rs`: `prompt_segment_stale_cache_with_failed_refresh_returns_0`
-  - `crates/gemini-cli/tests/prompt_segment_cached.rs`: `prompt_segment_missing_cache_root_is_treated_as_no_cache`
-- Coverage still missing after the port:
-  - A default missing-cache test that asserts background enqueue instead of inline fetch.
-  - Lock/min-interval/stale-lock recovery coverage that matches the existing `codex-cli` prompt-segment contract.
-- `crates/gemini-cli/tests/prompt_segment_refresh.rs`: `prompt_segment_refresh_updates_cache` remains the blocking-path anchor and should stay
-  unchanged by the background-refresh rewrite.
+- Anchor tests for the cached/refresh paths live under the per-crate `integration` test target:
+  - `crates/gemini-cli/tests/integration/prompt_segment_cached.rs`
+  - `crates/codex-cli/tests/integration/prompt_segment_cached.rs`
+  - `crates/codex-cli/tests/integration/prompt_segment_refresh.rs`
+- Coverage gap to track separately: a dedicated `crates/gemini-cli/tests/integration/prompt_segment_refresh.rs` mirroring the codex
+  blocking-path test surface (lock/min-interval/stale-lock recovery) does not exist yet; backlog only — do not patch under this contract.
 
 ### Async rate-limits guardrails
 
@@ -116,14 +112,16 @@ Compatibility rules:
 
 ### Focused concurrency validation
 
-- `cargo test -p nils-gemini-cli --test prompt_segment_cached --test prompt_segment_refresh`
-- `cargo test -p nils-gemini-cli --test rate_limits_async --test rate_limits_network`
-- `cargo test -p nils-codex-cli --test prompt_segment_cached --test prompt_segment_refresh`
-- `cargo test -p nils-codex-cli --test rate_limits_async`
+Per-crate integration tests are consolidated under a single `--test integration` target; filter to the relevant submodule by name:
+
+- `cargo test -p nils-gemini-cli --test integration -- prompt_segment_cached`
+- `cargo test -p nils-gemini-cli --test integration -- rate_limits_async rate_limits_network`
+- `cargo test -p nils-codex-cli --test integration -- prompt_segment_cached prompt_segment_refresh`
+- `cargo test -p nils-codex-cli --test integration -- rate_limits_async`
 
 ## Validation anchors
 
-- `cargo test -p nils-codex-cli --test parity_oracle`
-- `cargo test -p nils-gemini-cli --test parity_oracle`
-- `cargo test -p nils-codex-cli --test runtime_auth_contract --test runtime_error_contract --test runtime_exec_contract --test runtime_paths_config_contract`
-- `cargo test -p nils-gemini-cli --test runtime_auth_contract --test runtime_error_contract --test runtime_exec_contract --test runtime_paths_config_contract`
+- `cargo test -p nils-codex-cli --test integration -- parity_oracle`
+- `cargo test -p nils-gemini-cli --test integration -- parity_oracle`
+- `cargo test -p nils-codex-cli --test integration -- runtime_auth_contract runtime_error_contract runtime_exec_contract runtime_paths_config_contract`
+- `cargo test -p nils-gemini-cli --test integration -- runtime_auth_contract runtime_error_contract runtime_exec_contract runtime_paths_config_contract`

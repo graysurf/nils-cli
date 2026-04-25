@@ -14,7 +14,7 @@ Priority model:
 
 Use these as the source of truth to avoid policy drift:
 
-- Global CLI priorities and completion/wrapper expectations:
+- Global CLI priorities and completion expectations:
   - `AGENTS.md`
 - Required checks and coverage policy:
   - `DEVELOPMENT.md`
@@ -51,7 +51,10 @@ If a crate is intentionally internal-only, keep this standard for UX/testing qua
 For a new publishable CLI crate:
 
 - `Cargo.toml` must include:
-  - `version = "0.3.0"` (or current workspace release version).
+  - `version` matching the current workspace release version (see root
+    `Cargo.toml` `[workspace.package]` and the latest published value in
+    `release/crates-io-publish-order.txt` / `crates/cli-template/Cargo.toml`
+    as the live exemplar).
   - `edition.workspace = true`
   - `license.workspace = true`
   - `description = "CLI crate for nils-<name> in the nils-cli workspace."`

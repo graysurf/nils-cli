@@ -40,6 +40,82 @@ Decision fields:
 All paths below are classified as `scope=crate-local`, `lifecycle=canonical`, `decision=keep`.
 Rationale: each file is owned by one crate and lives under `crates/<crate>/docs/**`.
 
+This section is the authoritative crate-local docs inventory. It MUST match the canonical find
+output exactly:
+
+```bash
+find crates -type f -name '*.md' \
+  -not -path '*/tests/*' \
+  -not -path '*/src/*' \
+  -not -path '*/assets/*' \
+  -not -path 'crates/*/README.md' \
+  -not -path 'crates/plan-tooling/plan-template.md'
+```
+
+Top-level `crates/<crate>/README.md` files and `crates/<crate>/docs/README.md` index files are
+tracked separately in the [Crate Top-Level README Inventory](#crate-top-level-readme-inventory-keep)
+below; the canonical `find` glob `crates/*/README.md` excludes any `README.md` under a crate root
+because BSD-style `-path` lets `*` cross slash boundaries.
+
+- `crates/api-websocket/docs/specs/websocket-cli-contract-v1.md`
+- `crates/api-websocket/docs/specs/websocket-request-schema-v1.md`
+- `crates/codex-cli/docs/runbooks/json-consumers.md`
+- `crates/codex-cli/docs/specs/codex-cli-diag-auth-json-contract-v1.md`
+- `crates/gemini-cli/docs/runbooks/json-consumers.md`
+- `crates/gemini-cli/docs/specs/gemini-cli-diag-auth-json-contract-v1.md`
+- `crates/image-processing/docs/runbooks/llm-svg-workflow.md`
+- `crates/memo-cli/docs/runbooks/memo-cli-agent-workflow.md`
+- `crates/memo-cli/docs/specs/memo-cli-command-contract-v1.md`
+- `crates/memo-cli/docs/specs/memo-cli-json-contract-v1.md`
+- `crates/memo-cli/docs/specs/memo-cli-release-policy.md`
+- `crates/memo-cli/docs/specs/memo-cli-storage-schema-v1.md`
+- `crates/memo-cli/docs/specs/memo-cli-workflow-extension-contract-v1.md`
+- `crates/nils-common/docs/specs/markdown-helpers-contract-v1.md`
+- `crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
+- `crates/plan-issue-cli/docs/specs/plan-issue-gate-matrix-v1.md`
+- `crates/plan-issue-cli/docs/specs/plan-issue-state-machine-v1.md`
+- `crates/plan-tooling/docs/runbooks/split-prs-build-task-spec-cutover.md`
+- `crates/plan-tooling/docs/specs/split-prs-contract-v1.md`
+- `crates/plan-tooling/docs/specs/split-prs-contract-v2.md`
+
+## Crate Top-Level README Inventory (Keep)
+
+All paths below are classified as `scope=crate-local`, `lifecycle=canonical`, `decision=keep`.
+Rationale: every workspace member crate ships a top-level `README.md` (rendered on crates.io and
+as the GitHub crate-directory landing page) and a `docs/README.md` index for crate-local docs.
+These files are excluded from the canonical Crate-Local Inventory `find` pattern, so they are
+tracked here.
+
+Top-level crate READMEs (one per workspace member, 25 total):
+
+- `crates/agent-docs/README.md`
+- `crates/api-gql/README.md`
+- `crates/api-grpc/README.md`
+- `crates/api-rest/README.md`
+- `crates/api-test/README.md`
+- `crates/api-testing-core/README.md`
+- `crates/api-websocket/README.md`
+- `crates/cli-template/README.md`
+- `crates/codex-cli/README.md`
+- `crates/fzf-cli/README.md`
+- `crates/gemini-cli/README.md`
+- `crates/git-cli/README.md`
+- `crates/git-lock/README.md`
+- `crates/git-scope/README.md`
+- `crates/git-summary/README.md`
+- `crates/image-processing/README.md`
+- `crates/macos-agent/README.md`
+- `crates/memo-cli/README.md`
+- `crates/nils-common/README.md`
+- `crates/nils-term/README.md`
+- `crates/nils-test-support/README.md`
+- `crates/plan-issue-cli/README.md`
+- `crates/plan-tooling/README.md`
+- `crates/screen-record/README.md`
+- `crates/semantic-commit/README.md`
+
+Crate `docs/README.md` index files (one per workspace member, 25 total):
+
 - `crates/agent-docs/docs/README.md`
 - `crates/api-gql/docs/README.md`
 - `crates/api-grpc/docs/README.md`
@@ -47,53 +123,31 @@ Rationale: each file is owned by one crate and lives under `crates/<crate>/docs/
 - `crates/api-test/docs/README.md`
 - `crates/api-testing-core/docs/README.md`
 - `crates/api-websocket/docs/README.md`
-- `crates/api-websocket/docs/specs/websocket-cli-contract-v1.md`
-- `crates/api-websocket/docs/specs/websocket-request-schema-v1.md`
 - `crates/cli-template/docs/README.md`
 - `crates/codex-cli/docs/README.md`
-- `crates/codex-cli/docs/runbooks/json-consumers.md`
-- `crates/codex-cli/docs/specs/codex-cli-diag-auth-json-contract-v1.md`
 - `crates/fzf-cli/docs/README.md`
 - `crates/gemini-cli/docs/README.md`
-- `crates/gemini-cli/docs/runbooks/json-consumers.md`
-- `crates/gemini-cli/docs/specs/gemini-cli-diag-auth-json-contract-v1.md`
 - `crates/git-cli/docs/README.md`
 - `crates/git-lock/docs/README.md`
 - `crates/git-scope/docs/README.md`
 - `crates/git-summary/docs/README.md`
 - `crates/image-processing/docs/README.md`
-- `crates/image-processing/docs/runbooks/llm-svg-workflow.md`
 - `crates/macos-agent/docs/README.md`
 - `crates/memo-cli/docs/README.md`
-- `crates/memo-cli/docs/runbooks/memo-cli-agent-workflow.md`
-- `crates/memo-cli/docs/specs/memo-cli-command-contract-v1.md`
-- `crates/memo-cli/docs/specs/memo-cli-json-contract-v1.md`
-- `crates/memo-cli/docs/specs/memo-cli-release-policy.md`
-- `crates/memo-cli/docs/specs/memo-cli-storage-schema-v1.md`
-- `crates/memo-cli/docs/specs/memo-cli-workflow-extension-contract-v1.md`
 - `crates/nils-common/docs/README.md`
-- `crates/nils-common/docs/specs/markdown-helpers-contract-v1.md`
 - `crates/nils-term/docs/README.md`
 - `crates/nils-test-support/docs/README.md`
 - `crates/plan-issue-cli/docs/README.md`
-- `crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
-- `crates/plan-issue-cli/docs/specs/plan-issue-gate-matrix-v1.md`
-- `crates/plan-issue-cli/docs/specs/plan-issue-state-machine-v1.md`
 - `crates/plan-tooling/docs/README.md`
-- `crates/plan-tooling/docs/runbooks/split-prs-build-task-spec-cutover.md`
-- `crates/plan-tooling/docs/specs/split-prs-contract-v1.md`
-- `crates/plan-tooling/docs/specs/split-prs-contract-v2.md`
 - `crates/screen-record/docs/README.md`
 - `crates/semantic-commit/docs/README.md`
 
 ## Transient/Obsolete Inventory (Delete or Move)
 
-| Path | Scope | Lifecycle | Decision | Reason | Inbound-reference proof |
-| --- | --- | --- | --- | --- | --- |
-| `docs/plans/markdown-gh-handling-audit-remediation-plan.md` | `transient-dev-record` | `delete` | `delete` | Completed migration plan; no active workflow caller remains. | `rg -n 'markdown-gh-handling-audit-remediation-plan\\.md' README.md DEVELOPMENT.md AGENTS.md BINARY_DEPENDENCIES.md docs crates scripts tests .github` -> no matches. |
-| `docs/plans/third-party-licenses-notices-release-packaging-plan.md` | `transient-dev-record` | `delete` | `delete` | Completed migration plan; contract moved to canonical spec + scripts. | `rg -n 'third-party-licenses-notices-release-packaging-plan\\.md' README.md DEVELOPMENT.md AGENTS.md BINARY_DEPENDENCIES.md docs crates scripts tests .github` -> no matches. |
-| `docs/reports/completion-coverage-matrix.md` | `workspace-level` | `delete` | `move` | Promoted from report to canonical workspace spec. | `rg -n 'docs/reports/completion-coverage-matrix\\.md' README.md DEVELOPMENT.md AGENTS.md BINARY_DEPENDENCIES.md docs crates scripts tests .github` -> no matches. |
-| `docs/runbooks/wrappers-mode-usage.md` | `transient-dev-record` | `delete` | `delete` | Compatibility-only wrapper-mode runbook superseded by canonical README guidance. | `rg -n 'wrappers-mode-usage\\.md' README.md DEVELOPMENT.md AGENTS.md BINARY_DEPENDENCIES.md docs crates scripts tests .github` -> no matches. |
-| `docs/specs/markdown-github-handling-audit-v1.md` | `transient-dev-record` | `delete` | `delete` | Audit artifact completed; no active policy gate depends on it. | `rg -n 'markdown-github-handling-audit-v1\\.md' README.md DEVELOPMENT.md AGENTS.md BINARY_DEPENDENCIES.md docs crates scripts tests .github` -> no matches. |
-| `crates/plan-tooling/docs/runbooks/split-prs-migration.md` | `crate-local` | `delete` | `delete` | Migration-only runbook superseded by cutover runbook + v2 contract docs. | `rg -n 'split-prs-migration\\.md' README.md DEVELOPMENT.md AGENTS.md BINARY_DEPENDENCIES.md docs crates scripts tests .github` -> no matches. |
-| `crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v1.md` | `crate-local` | `delete` | `delete` | Compatibility-era contract superseded by active v2 contract. | `rg -n 'plan-issue-cli-contract-v1\\.md' README.md DEVELOPMENT.md AGENTS.md BINARY_DEPENDENCIES.md docs crates scripts tests .github` -> no matches. |
+All transient/obsolete entries previously tracked here have been removed from the working tree and
+are kept off-tree by the `removed_transient_docs` allowlist in
+`scripts/ci/docs-hygiene-audit.sh`. No active rows remain in this matrix.
+
+If a new transient/obsolete artifact is added in the future, append it here with `scope`,
+`lifecycle`, `decision`, `reason`, and an inbound-reference proof; update
+`scripts/ci/docs-hygiene-audit.sh` to assert the file stays removed once delete is decided.
