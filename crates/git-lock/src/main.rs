@@ -88,6 +88,15 @@ fn run() -> i32 {
         return 0;
     }
 
+    if args.len() > 2
+        && is_known_command(&args[1])
+        && is_help(&args[2])
+        && let Some(text) = messages::subcommand_help(&args[1])
+    {
+        println!("{text}");
+        return 0;
+    }
+
     if args.len() > 1 && args[1] == "completion" {
         let cli = Cli::parse_from(&args);
         let command = cli.command.unwrap_or(Command::Help);
