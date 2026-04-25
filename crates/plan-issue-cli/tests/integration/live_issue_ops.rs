@@ -170,6 +170,7 @@ fn github_adapter_live_commands_use_gh_backend_for_issue_and_pr_state() {
 
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let body_json = json!({"body": issue_body_sprint4_in_progress()}).to_string();
@@ -225,6 +226,7 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
 
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let comment_capture = tmp.path().join("ready-plan-comment.md");
@@ -321,6 +323,7 @@ fn live_ready_plan_label_update_flag_applies_review_label() {
 
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let body_json = json!({"body": issue_body_plan_done()}).to_string();
@@ -373,6 +376,7 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
 
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let start_body_json = json!({"body": issue_body_sprint4_planned()}).to_string();
@@ -540,6 +544,7 @@ fn github_adapter_rejects_literal_escaped_newline_without_force() {
 
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let body_json = json!({"body": issue_body_plan_done()}).to_string();
@@ -597,6 +602,7 @@ fn github_adapter_force_flag_allows_literal_escaped_newline() {
 
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let comment_capture = tmp.path().join("ready-plan-force-comment.md");

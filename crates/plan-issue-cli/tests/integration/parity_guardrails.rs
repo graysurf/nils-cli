@@ -100,6 +100,7 @@ fn parity_shell_multi_sprint_guide_matches_shell_fixture_after_normalization() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let out = common::run_plan_issue_local_with_env(
@@ -157,6 +158,7 @@ fn parity_shell_start_comment_template_matches_shell_fixture() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let out = common::run_plan_issue_local_with_env(

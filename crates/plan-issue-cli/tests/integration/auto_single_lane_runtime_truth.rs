@@ -321,9 +321,10 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
     let prompt_files = sprint_payload["payload"]["result"]["subagent_prompt_files"]
         .as_array()
         .expect("prompt files");
-    assert_eq!(prompt_files.len(), 1, "{}", start_sprint_out.stdout);
+    assert_eq!(prompt_files.len(), 2, "{}", start_sprint_out.stdout);
 
     let prompt_path = prompt_files[0].as_str().expect("prompt path");
+    assert!(prompt_path.ends_with("/S1T1.md"), "{prompt_path}");
     let prompt = fs::read_to_string(prompt_path).expect("read prompt");
     assert!(prompt.contains("Tasks: S1T1, S1T2"), "{prompt}");
     assert!(prompt.contains("Execution Mode: per-sprint"), "{prompt}");

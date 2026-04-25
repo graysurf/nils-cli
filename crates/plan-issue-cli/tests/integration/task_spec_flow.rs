@@ -791,9 +791,10 @@ fn write_subagent_prompts_groups_tasks_by_runtime_lane() {
     let prompt_files = payload["payload"]["result"]["subagent_prompt_files"]
         .as_array()
         .expect("prompt files");
-    assert_eq!(prompt_files.len(), 1, "{}", out.stdout);
+    assert_eq!(prompt_files.len(), 2, "{}", out.stdout);
 
     let prompt_path = prompt_files[0].as_str().expect("prompt path");
+    assert!(prompt_path.ends_with("/S1T1.md"), "{prompt_path}");
     let prompt = fs::read_to_string(prompt_path).expect("read prompt");
     assert!(prompt.contains("- Tasks: S1T1, S1T2"), "{prompt}");
     assert!(prompt.contains("- Execution Mode: per-sprint"), "{prompt}");

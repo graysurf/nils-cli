@@ -18,10 +18,11 @@ use crate::commands::sprint::{
     AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs,
 };
 use crate::commands::{Command as CliCommand, SplitStrategy, SummaryArgs};
+use crate::dispatch_record::{self, DispatchRecord};
 use crate::github::{GhCliAdapter, GitHubAdapter};
 use crate::issue_body::{self, TaskRow};
 use crate::render::{self, SprintCommentInput, SprintCommentMode};
-use crate::runtime_layout::{self, IssueRoot};
+use crate::runtime_layout::{self, IssueRoot, SprintRoot};
 use crate::task_spec::{self, TaskSpecBuildOptions, TaskSpecRow, TaskSpecScope};
 use crate::{BinaryFlavor, CommandError};
 
@@ -994,24 +995,128 @@ fn run_start_sprint(
         issue_body_for_comment = Some(body);
     }
 
-    let task_spec_out = args.task_spec_out.clone().unwrap_or_else(|| {
-        task_spec::default_sprint_task_spec_path(&args.plan, i32::from(args.sprint))
-    });
+    let repo = crate::github::resolve_repo(repo_override)
+        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+    let repo_slug = runtime_layout::repo_slug(&repo);
+    let issue_root = IssueRoot::new(&repo_slug, args.issue)
+        .map_err(|err| CommandError::runtime("runtime-layout-failed", err.to_string()))?;
+    let sprint_root = SprintRoot::new(&issue_root, i32::from(args.sprint));
+
+    let task_spec_out = args
+        .task_spec_out
+        .clone()
+        .unwrap_or_else(|| sprint_root.task_spec());
     task_spec::write_tsv(&task_spec_out, &artifact_rows)
         .map_err(|err| CommandError::runtime("task-spec-write-failed", err))?;
 
-    let prompts_out = args
+    let prompts_dir = args
         .subagent_prompts_out
         .clone()
-        .unwrap_or_else(|| default_subagent_prompts_path(&args.plan, i32::from(args.sprint)));
+        .unwrap_or_else(|| sprint_root.prompts_dir());
+    runtime_layout::ensure_dir(&prompts_dir).map_err(|err| {
+        CommandError::runtime(
+            "runtime-layout-emit-failed",
+            format!(
+                "failed to create prompts dir {}: {err}",
+                prompts_dir.display()
+            ),
+        )
+    })?;
+    runtime_layout::ensure_dir(&sprint_root.manifests_dir()).map_err(|err| {
+        CommandError::runtime(
+            "runtime-layout-emit-failed",
+            format!(
+                "failed to create manifests dir {}: {err}",
+                sprint_root.manifests_dir().display()
+            ),
+        )
+    })?;
+    runtime_layout::ensure_dir(&sprint_root.specs_dir()).map_err(|err| {
+        CommandError::runtime(
+            "runtime-layout-emit-failed",
+            format!(
+                "failed to create specs dir {}: {err}",
+                sprint_root.specs_dir().display()
+            ),
+        )
+    })?;
+
+    let plan_snapshot_target = issue_root.plan_snapshot();
+    copy_source_into_snapshot(
+        &task_spec::resolve_plan_file(&args.plan),
+        &plan_snapshot_target,
+        "plan-snapshot-source-missing",
+    )?;
+
+    let subagent_init_source = task_spec::agent_home()
+        .join("prompts")
+        .join("plan-issue-delivery-subagent-init.md");
+    let subagent_init_target = sprint_root.subagent_init_snapshot();
+    copy_source_into_snapshot(
+        &subagent_init_source,
+        &subagent_init_target,
+        "subagent-init-snapshot-source-missing",
+    )?;
+
     let prompt_files = write_subagent_prompts(
-        &prompts_out,
+        &prompts_dir,
         args.issue,
         i32::from(args.sprint),
         &artifact_rows,
         args.grouping.strategy,
     )
     .map_err(|err| CommandError::runtime("subagent-prompt-write-failed", err))?;
+
+    let plan_branch = read_plan_branch(&issue_root, args.issue);
+
+    let mut dispatch_record_paths: Vec<String> = Vec::new();
+    for row in &artifact_rows {
+        let task_prompt_path = sprint_root
+            .task_prompt(&row.task_id)
+            .map_err(|err| CommandError::runtime("runtime-layout-failed", err.to_string()))?;
+        let dispatch_path = sprint_root
+            .dispatch_record(&row.task_id)
+            .map_err(|err| CommandError::runtime("runtime-layout-failed", err.to_string()))?;
+        let record = DispatchRecord::implementation(
+            row.task_id.clone(),
+            path_text(&task_prompt_path),
+            path_text(&subagent_init_target),
+            path_text(&plan_snapshot_target),
+            row.worktree.clone(),
+            row.branch.clone(),
+            execution_mode_for_row(row, args.grouping.strategy, &artifact_rows),
+            row.pr_group.clone(),
+            plan_branch.clone(),
+        );
+        dispatch_record::write_dispatch_record(&dispatch_path, &record).map_err(|err| {
+            CommandError::runtime(
+                "runtime-layout-emit-failed",
+                format!(
+                    "failed to write dispatch record {}: {err}",
+                    dispatch_path.display()
+                ),
+            )
+        })?;
+        dispatch_record_paths.push(path_text(&dispatch_path));
+    }
+    dispatch_record_paths.sort();
+
+    let prompt_manifest_path = sprint_root.prompt_manifest();
+    write_prompt_manifest(
+        &prompt_manifest_path,
+        &artifact_rows,
+        &sprint_root,
+        args.grouping.strategy,
+    )
+    .map_err(|err| {
+        CommandError::runtime(
+            "runtime-layout-emit-failed",
+            format!(
+                "failed to write prompt manifest {}: {err}",
+                prompt_manifest_path.display()
+            ),
+        )
+    })?;
 
     let comment = render::render_sprint_comment(SprintCommentInput {
         mode: SprintCommentMode::Start,
@@ -1051,12 +1156,102 @@ fn run_start_sprint(
         "task_spec_path": path_text(&task_spec_out),
         "comment_path": path_text(&comment_out),
         "record_count": artifact_rows.len(),
-        "subagent_prompts_out": path_text(&prompts_out),
+        "subagent_prompts_out": path_text(&prompts_dir),
         "subagent_prompt_files": prompt_files,
+        "sprint_root": path_text(sprint_root.root()),
+        "plan_snapshot_path": path_text(&plan_snapshot_target),
+        "subagent_init_snapshot_path": path_text(&subagent_init_target),
+        "prompt_manifest_path": path_text(&prompt_manifest_path),
+        "dispatch_record_paths": dispatch_record_paths,
         "synced_issue_rows": synced_rows,
         "comment_requested": should_comment,
         "live_mutations_performed": live_mutations,
     }))
+}
+
+fn copy_source_into_snapshot(
+    source: &Path,
+    target: &Path,
+    missing_code: &'static str,
+) -> Result<(), CommandError> {
+    if !source.exists() {
+        return Err(CommandError::runtime(
+            missing_code,
+            format!("snapshot source not found at {}", source.display()),
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        runtime_layout::ensure_dir(parent).map_err(|err| {
+            CommandError::runtime(
+                "runtime-layout-emit-failed",
+                format!("failed to create dir {}: {err}", parent.display()),
+            )
+        })?;
+    }
+    fs::copy(source, target).map_err(|err| {
+        CommandError::runtime(
+            "runtime-layout-emit-failed",
+            format!("failed to copy snapshot to {}: {err}", target.display()),
+        )
+    })?;
+    Ok(())
+}
+
+fn read_plan_branch(issue_root: &IssueRoot, issue: u64) -> String {
+    fs::read_to_string(issue_root.plan_branch_ref())
+        .ok()
+        .and_then(|raw| {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .unwrap_or_else(|| format!("plan/issue-{issue}"))
+}
+
+fn execution_mode_for_row(
+    row: &TaskSpecRow,
+    strategy: SplitStrategy,
+    rows: &[TaskSpecRow],
+) -> String {
+    task_spec::execution_mode_by_task(rows, strategy)
+        .get(&row.task_id)
+        .cloned()
+        .unwrap_or_else(|| "pr-isolated".to_string())
+}
+
+fn write_prompt_manifest(
+    path: &Path,
+    rows: &[TaskSpecRow],
+    sprint_root: &SprintRoot,
+    strategy: SplitStrategy,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut text = String::from("task_id\tprompt_path\texecution_mode\tworkflow_role\n");
+    let modes = task_spec::execution_mode_by_task(rows, strategy);
+    let mut sorted: Vec<&TaskSpecRow> = rows.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.task_id.cmp(&b.task_id));
+    for row in sorted {
+        let prompt_path = sprint_root
+            .task_prompt(&row.task_id)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let execution_mode = modes
+            .get(&row.task_id)
+            .cloned()
+            .unwrap_or_else(|| "pr-isolated".to_string());
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            row.task_id,
+            prompt_path.to_string_lossy(),
+            execution_mode,
+            dispatch_record::WORKFLOW_ROLE_IMPLEMENTATION,
+        ));
+    }
+    fs::write(path, text)
 }
 
 fn run_ready_sprint(
@@ -1586,19 +1781,6 @@ fn write_temp_markdown(stem: &str, content: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn default_subagent_prompts_path(plan_file: &Path, sprint: i32) -> PathBuf {
-    let plan_stem = plan_file
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("plan")
-        .to_string();
-
-    task_spec::agent_home()
-        .join("out")
-        .join("plan-issue-delivery")
-        .join(format!("{plan_stem}-sprint-{sprint}-subagent-prompts"))
-}
-
 fn write_subagent_prompts(
     out_dir: &Path,
     issue: u64,
@@ -1669,11 +1851,6 @@ fn write_subagent_prompts(
             .map(|row| row.task_id.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let summary = if lane.rows.len() == 1 {
-            lane.rows[0].summary.trim().to_string()
-        } else {
-            format!("{} tasks in shared runtime lane", lane.rows.len())
-        };
         let lane_tasks = lane
             .rows
             .iter()
@@ -1688,14 +1865,27 @@ fn write_subagent_prompts(
             .collect::<Vec<_>>()
             .join("\n");
 
-        let path = out_dir.join(format!("{anchor_task}-subagent-prompt.md"));
-        let body = format!(
-            "# Subagent Task Prompt\n\n- Issue: #{issue}\n- Sprint: S{sprint}\n- Task: {anchor_task}\n- Tasks: {task_list}\n- Summary: {summary}\n- Owner: {}\n- Branch: {}\n- Worktree: {}\n- Execution Mode: {}\n- Notes: {}\n\n## Lane Tasks\n{lane_tasks}\n",
-            lane.owner, lane.branch, lane.worktree, lane.execution_mode, lane.notes
-        );
-        fs::write(&path, body)
-            .map_err(|err| format!("failed to write subagent prompt {}: {err}", path.display()))?;
-        paths.push(path.to_string_lossy().to_string());
+        for row in &lane.rows {
+            let task_summary = if row.summary.trim().is_empty() {
+                "-".to_string()
+            } else {
+                row.summary.trim().to_string()
+            };
+            let path = out_dir.join(format!("{}.md", row.task_id));
+            let body = format!(
+                "# Subagent Task Prompt\n\n- Issue: #{issue}\n- Sprint: S{sprint}\n- Task: {}\n- Anchor: {anchor_task}\n- Tasks: {task_list}\n- Summary: {task_summary}\n- Owner: {}\n- Branch: {}\n- Worktree: {}\n- Execution Mode: {}\n- Notes: {}\n\n## Lane Tasks\n{lane_tasks}\n",
+                row.task_id,
+                lane.owner,
+                lane.branch,
+                lane.worktree,
+                lane.execution_mode,
+                lane.notes
+            );
+            fs::write(&path, body).map_err(|err| {
+                format!("failed to write subagent prompt {}: {err}", path.display())
+            })?;
+            paths.push(path.to_string_lossy().to_string());
+        }
     }
 
     paths.sort();
@@ -2758,14 +2948,16 @@ mod tests {
             "hello"
         );
 
-        let prompts_path = default_subagent_prompts_path(Path::new("docs/plans/sample-plan.md"), 3);
+        let issue_root = runtime_layout::IssueRoot::new("owner__sample", 7).expect("issue root");
+        let sprint_root = runtime_layout::SprintRoot::new(&issue_root, 3);
+        let prompts_path = sprint_root.prompts_dir();
         assert!(
             prompts_path
                 .to_string_lossy()
-                .contains("sample-plan-sprint-3-subagent-prompts")
+                .contains("/owner__sample/issue-7/sprint-3/prompts")
         );
 
-        let out_dir = tmp.path().join("out").join("subagent-prompts");
+        let out_dir = tmp.path().join("out").join("sprint-3").join("prompts");
         let rows = vec![TaskSpecRow {
             task_id: "S3T1".to_string(),
             summary: "Build feature".to_string(),
@@ -2787,6 +2979,11 @@ mod tests {
         assert!(
             rendered.contains("Execution Mode: per-sprint"),
             "{rendered}"
+        );
+        let file_path = std::path::Path::new(&files[0]);
+        assert_eq!(
+            file_path.file_name().and_then(|name| name.to_str()),
+            Some("S3T1.md")
         );
     }
 
@@ -2832,12 +3029,21 @@ mod tests {
 
         let files = write_subagent_prompts(&out_dir, 217, 3, &rows, SplitStrategy::Auto)
             .expect("write grouped prompts");
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3, "one prompt file per task: {files:?}");
+
+        for task_id in ["S3T1", "S3T2", "S3T3"] {
+            assert!(
+                files
+                    .iter()
+                    .any(|path| path.ends_with(&format!("/{task_id}.md"))),
+                "missing prompt for {task_id}: {files:?}"
+            );
+        }
 
         let lane_prompt_path = files
             .iter()
-            .find(|path| path.contains("S3T1-subagent-prompt.md"))
-            .expect("shared lane prompt");
+            .find(|path| path.ends_with("/S3T1.md"))
+            .expect("shared lane prompt for S3T1");
         let lane_prompt = fs::read_to_string(lane_prompt_path).expect("read shared lane prompt");
         assert!(lane_prompt.contains("Task: S3T1"), "{lane_prompt}");
         assert!(lane_prompt.contains("Tasks: S3T1, S3T2"), "{lane_prompt}");
@@ -2865,7 +3071,7 @@ mod tests {
 
         let isolated_prompt_path = files
             .iter()
-            .find(|path| path.contains("S3T3-subagent-prompt.md"))
+            .find(|path| path.ends_with("/S3T3.md"))
             .expect("isolated lane prompt");
         let isolated_prompt =
             fs::read_to_string(isolated_prompt_path).expect("read isolated lane prompt");

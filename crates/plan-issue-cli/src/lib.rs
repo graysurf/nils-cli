@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod commands;
 mod completion;
+pub mod dispatch_record;
 mod execute;
 mod github;
 mod issue_body;
