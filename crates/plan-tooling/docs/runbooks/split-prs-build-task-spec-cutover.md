@@ -5,6 +5,32 @@
 Replace downstream ad-hoc split generation with `plan-tooling split-prs` grouping primitives while
 keeping `plan-issue-cli build-task-spec` as the runtime metadata materialization authority.
 
+## Current Default Usage
+
+For new orchestration callers, prefer the auto strategy with a `group` fallback. This is the
+shape that current downstream automation drives by default:
+
+```bash
+plan-tooling split-prs \
+  --file <plan.md> \
+  --scope sprint \
+  --sprint <n> \
+  --strategy auto \
+  --default-pr-grouping group \
+  --format json
+```
+
+Notes:
+
+- `--strategy auto` resolves grouping per sprint from `PR grouping intent` plan metadata first;
+  `--default-pr-grouping group` is the fallback only for sprints whose metadata omits the field.
+- `--strategy auto` rejects `--pr-grouping`. Use plan metadata or `--default-pr-grouping` instead.
+- `--strategy deterministic` examples below remain valid for parity / regression cases and for
+  manual rollback when the auto path is unhealthy.
+
+The CLI flag default is still `--strategy deterministic`; the auto pattern above is the
+recommended *operational* default for callers, not the implicit flag default.
+
 ## Command Mapping
 
 Prior command shape:
@@ -45,8 +71,9 @@ Reduced `split-prs --format tsv` header:
 - `--pr-grouping group` + `--strategy deterministic`: pass `--pr-group` for every selected task.
 - `--strategy auto`: omit `--pr-grouping`; sprint metadata decides grouping intent and `--default-pr-grouping` is the fallback.
 - `--strategy auto` on group-resolved sprints: `--pr-group` mappings are optional pins; remaining tasks are auto-grouped.
-- mapping key accepts either `SxTy` or plan task id (`Task N.M`).
-- shared group output should map to one PR (`pr-shared` downstream execution mode).
+- `--strategy auto` rejects `--pr-group` pins targeting sprints resolved as `per-sprint`.
+- Mapping key accepts either generated id (`SxTy`) or plan task id (`Task N.M`).
+- Shared group output should map to one PR (`pr-shared` downstream execution mode).
 
 ## Parity Checks
 

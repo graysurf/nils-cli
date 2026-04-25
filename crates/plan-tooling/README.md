@@ -85,17 +85,22 @@ Help:
 
 ### completion
 
-- `completion <bash|zsh>`: Export completion script for shell integration.
+- `completion <bash|zsh>`: Export completion script for shell integration. Shell argument is
+  positional and required (the subcommand does not honor `--help`).
 
 ### Sprint metadata hints (Plan markdown)
 
 - Supported sprint metadata fields are case-sensitive and parser-enforced:
   - `**PR grouping intent**: per-sprint|group`
   - `**Execution Profile**: serial|parallel-xN`
-- Parse flows fail fast on invalid metadata keys/values (`to-json`, `split-prs`, `batches`).
-- `validate` enforces metadata coherence by default:
-  - if one metadata field is present, both must be present.
-  - `PR grouping intent=per-sprint` cannot be combined with parallel width `>1`.
+- Parse flows fail fast on invalid metadata keys/values across `to-json`, `validate`, `batches`,
+  and `split-prs`. Non-canonical casings (for example `PR Grouping Intent`) are rejected with
+  `invalid metadata field <name>; use '<canonical>'`.
+- `validate` additionally enforces metadata coherence per sprint:
+  - if either field is present, both must be present
+    (`sprint metadata must include both \`PR grouping intent\` and \`Execution Profile\``).
+  - `PR grouping intent: per-sprint` cannot be combined with `Execution Profile` parallel width
+    `> 1`.
 
 ## Quick examples
 
@@ -137,4 +142,7 @@ plan-tooling completion zsh > completions/zsh/_plan-tooling
 ## Docs
 
 - [Docs index](docs/README.md)
-- [split-prs contract v2](docs/specs/split-prs-contract-v2.md)
+- [split-prs contract v2](docs/specs/split-prs-contract-v2.md) — active contract.
+- [split-prs contract v1](docs/specs/split-prs-contract-v1.md) — deprecated; historical reference
+  only.
+- [split-prs build-task-spec cutover runbook](docs/runbooks/split-prs-build-task-spec-cutover.md)
