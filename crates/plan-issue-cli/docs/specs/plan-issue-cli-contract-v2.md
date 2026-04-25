@@ -144,6 +144,11 @@ Worktree path rules:
   - `pr-isolated`: `"$WORKTREE_ROOT/pr-isolated/<TASK_ID>"`.
   - `pr-shared`: `"$WORKTREE_ROOT/pr-shared/<PR_GROUP>"`.
   - `per-sprint`: `"$WORKTREE_ROOT/per-sprint/sprint-<N>"`.
+- The dispatch record's `worktree` key is the **absolute** assigned-path
+  computed from this mapping (not the short lane name from
+  `sprint-task-spec.tsv`). The `prompt-manifest.tsv` and
+  `sprint-task-spec.tsv` may keep the short lane name for
+  human-readable lookup; the JSON dispatch record is canonical.
 
 `AGENT_HOME` requirement:
 

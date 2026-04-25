@@ -1077,14 +1077,26 @@ fn run_start_sprint(
         let dispatch_path = sprint_root
             .dispatch_record(&row.task_id)
             .map_err(|err| CommandError::runtime("runtime-layout-failed", err.to_string()))?;
+        let execution_mode = execution_mode_for_row(row, args.grouping.strategy, &artifact_rows);
+        // Canonical contract: dispatch record `worktree` is the absolute
+        // assigned path under $WORKTREE_ROOT (RUNTIME_LAYOUT.md "Worktree
+        // Layout (Assigned Paths)"), not the short name from the TSV.
+        let assigned_worktree = issue_root
+            .assigned_worktree(
+                &execution_mode,
+                &row.task_id,
+                &row.pr_group,
+                i32::from(args.sprint),
+            )
+            .map_err(|err| CommandError::runtime("runtime-layout-failed", err.to_string()))?;
         let record = DispatchRecord::implementation(
             row.task_id.clone(),
             path_text(&task_prompt_path),
             path_text(&subagent_init_target),
             path_text(&plan_snapshot_target),
-            row.worktree.clone(),
+            path_text(&assigned_worktree),
             row.branch.clone(),
-            execution_mode_for_row(row, args.grouping.strategy, &artifact_rows),
+            execution_mode,
             row.pr_group.clone(),
             plan_branch.clone(),
         );
