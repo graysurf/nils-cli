@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `36c032ecafa3734404e9c097d907027b27b409cc8b560c29cea2993b0f6dc85f`
+- Cargo.lock SHA256: `899f73da638aa1ad7539d19e6464dfa32aeccb7e0bf7ed1d04ce296b73b8b9a1`
 - Third-party crates (`source != null`): 447
 - Workspace crates (`source == null`, excluded below): 25
 
@@ -316,7 +316,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | rustls-pki-types | 1.14.0 | MIT OR Apache-2.0 | crates.io |
 | rustls-platform-verifier | 0.6.2 | MIT OR Apache-2.0 | crates.io |
 | rustls-platform-verifier-android | 0.1.1 | MIT OR Apache-2.0 | crates.io |
-| rustls-webpki | 0.103.12 | ISC | crates.io |
+| rustls-webpki | 0.103.13 | ISC | crates.io |
 | rustversion | 1.0.22 | MIT OR Apache-2.0 | crates.io |
 | rustybuzz | 0.20.1 | MIT | crates.io |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 | crates.io |
