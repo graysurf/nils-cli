@@ -138,6 +138,41 @@ impl IssueRoot {
     pub fn worktree_root(&self) -> PathBuf {
         self.root.join(WORKTREES_DIR)
     }
+
+    /// Canonical assigned-worktree path for one task.
+    ///
+    /// Per `RUNTIME_LAYOUT.md` "Worktree Layout (Assigned Paths)":
+    ///
+    /// - `pr-isolated` → `$WORKTREE_ROOT/pr-isolated/<TASK_ID>`
+    /// - `pr-shared`   → `$WORKTREE_ROOT/pr-shared/<PR_GROUP>`
+    /// - `per-sprint`  → `$WORKTREE_ROOT/per-sprint/sprint-<N>`
+    ///
+    /// Unknown `execution_mode` falls back to the `pr-isolated` shape so
+    /// the dispatch record always names an absolute path under
+    /// `WORKTREE_ROOT`.
+    pub fn assigned_worktree(
+        &self,
+        execution_mode: &str,
+        task_id: &str,
+        pr_group: &str,
+        sprint: i32,
+    ) -> Result<PathBuf, RuntimeLayoutError> {
+        let trim_segment = |seg: &str| -> Result<String, RuntimeLayoutError> {
+            let t = seg.trim();
+            if t.is_empty() || t.contains('/') || t.contains('\\') || t.contains('\0') {
+                return Err(RuntimeLayoutError::InvalidTaskId {
+                    task_id: seg.to_string(),
+                });
+            }
+            Ok(t.to_string())
+        };
+        let root = self.worktree_root();
+        match execution_mode {
+            "pr-shared" => Ok(root.join("pr-shared").join(trim_segment(pr_group)?)),
+            "per-sprint" => Ok(root.join("per-sprint").join(format!("sprint-{sprint}"))),
+            _ => Ok(root.join("pr-isolated").join(trim_segment(task_id)?)),
+        }
+    }
 }
 
 /// Sprint-scoped runtime root.
@@ -301,6 +336,59 @@ mod tests {
             issue.root().join("plan/issue-body.md")
         );
         assert_eq!(issue.worktree_root(), issue.root().join("worktrees"));
+    }
+
+    #[test]
+    fn test_assigned_worktree_canonical_paths() {
+        let lock = GlobalStateLock::new();
+        let _guard = EnvGuard::set(&lock, "AGENT_HOME", "/tmp/agent-home-fixture");
+
+        let issue = issue_root_for("graysurf__plan-issue-smoke", 17);
+
+        // pr-isolated: pinned by TASK_ID
+        assert_eq!(
+            issue
+                .assigned_worktree("pr-isolated", "S1T1", "s1-auto-g1", 1)
+                .expect("pr-isolated"),
+            issue.worktree_root().join("pr-isolated").join("S1T1")
+        );
+
+        // pr-shared: pinned by PR_GROUP
+        assert_eq!(
+            issue
+                .assigned_worktree("pr-shared", "S1T1", "s1-auto-g1", 1)
+                .expect("pr-shared"),
+            issue.worktree_root().join("pr-shared").join("s1-auto-g1")
+        );
+
+        // per-sprint: pinned by sprint number
+        assert_eq!(
+            issue
+                .assigned_worktree("per-sprint", "S1T1", "s1", 1)
+                .expect("per-sprint"),
+            issue.worktree_root().join("per-sprint").join("sprint-1")
+        );
+        assert_eq!(
+            issue
+                .assigned_worktree("per-sprint", "S2T1", "s2", 2)
+                .expect("per-sprint sprint-2"),
+            issue.worktree_root().join("per-sprint").join("sprint-2")
+        );
+
+        // Unknown mode falls back to pr-isolated shape.
+        assert_eq!(
+            issue
+                .assigned_worktree("unknown-mode", "S1T1", "s1", 1)
+                .expect("fallback"),
+            issue.worktree_root().join("pr-isolated").join("S1T1")
+        );
+
+        // Empty task id rejected for pr-isolated.
+        assert!(issue
+            .assigned_worktree("pr-isolated", "", "g1", 1)
+            .is_err());
+        // Empty pr_group rejected for pr-shared.
+        assert!(issue.assigned_worktree("pr-shared", "S1T1", "", 1).is_err());
     }
 
     #[test]
