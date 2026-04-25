@@ -63,8 +63,15 @@ pub(crate) fn cmd_report(
             stderr,
         );
 
-    if let Some(parent) = out_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = out_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        let _ = writeln!(
+            stderr,
+            "error: cannot create report directory {}: {err}",
+            parent.display()
+        );
+        return 1;
     }
 
     let endpoint_note = cli_report::endpoint_note(
