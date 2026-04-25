@@ -24,8 +24,9 @@ Supported top-level fields:
   number, boolean, or null); empty values are dropped. Keys are inserted into the
   client request as-is.
 - `connectTimeoutSeconds` (integer or numeric string, optional): handshake-timeout
-  hint. Currently parsed for contract parity but not enforced by the in-process
-  `tungstenite` runner; see "Drift / known gaps" below.
+  ceiling. The runner spawns the connect on a worker thread and aborts the request
+  with a `websocket connect timed out after <secs>s` error if the handshake has
+  not completed in time.
 - `steps` (array, required, non-empty): ordered scripted session steps.
 - `expect` (object, optional): assertion against the last received message
   (see "Expect object" below).
@@ -46,9 +47,11 @@ Each `steps[i]` must be a JSON object that includes `type` (case-insensitive aft
 
 ### `type: "receive"`
 
-- `timeoutSeconds` (integer or numeric string, optional): per-receive timeout hint.
-  Currently parsed for contract parity but not enforced by the in-process runner;
-  the underlying `tungstenite::WebSocket::read` call blocks until the next message.
+- `timeoutSeconds` (integer or numeric string, optional): per-receive timeout
+  applied to the underlying TCP socket via `set_read_timeout` for the duration of
+  the step. The error surfaces as `websocket receive timed out after <secs>s at
+  step <i>` and the timeout is cleared before the next step runs. When the field
+  is absent the read call blocks until the next message.
 - `expect` (optional): see "Expect object" below.
 
 ### `type: "close"`
@@ -78,14 +81,6 @@ Validation behavior:
   `<PING:<payload>>`, `<PONG:<payload>>`, `<CLOSE:<code>:<reason>>`, `<FRAME>` for
   raw frames. There are no schema options for selectively suppressing these frames;
   scripted `receive` steps observe whichever message arrives next.
-
-## Drift / known gaps
-
-`connectTimeoutSeconds` and per-step `timeoutSeconds` are accepted by the schema
-parser but the current in-process runner ignores both values
-(`crates/api-testing-core/src/websocket/runner.rs` discards them via `let _ = …`).
-Documenting this honestly so request files written today remain forward-compatible
-once the runner wires the timeouts through.
 
 ## Error behavior
 

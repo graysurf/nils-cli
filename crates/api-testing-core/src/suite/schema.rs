@@ -14,8 +14,21 @@ fn default_auth_secret_env() -> String {
     "API_TEST_AUTH_JSON".to_string()
 }
 
+/// Canonical jq selector for extracting auth tokens from login responses.
+///
+/// Shared by:
+/// - [`default_auth_token_jq`] for `SuiteRestAuth::token_jq` / `SuiteGraphqlAuth::token_jq`
+///   (the schema-level default for explicit `auth.*` blocks).
+/// - `suite::runner::context::default_rest_flow_token_jq` (the per-flow default applied
+///   when a suite case omits `token_jq`).
+///
+/// Keep both consumers in sync — see the regression test
+/// `default_auth_token_jq_matches_rest_flow_default` in
+/// `crates/api-testing-core/src/suite/runner/context.rs`.
+pub(super) const DEFAULT_AUTH_TOKEN_JQ: &str = ".. | objects | (.accessToken? // .access_token? // .token? // .jwt? // empty) | select(type==\"string\" and length>0) | .";
+
 fn default_auth_token_jq() -> String {
-    ".. | objects | (.accessToken? // .access_token? // .token? // .jwt? // empty) | select(type==\"string\" and length>0) | .".to_string()
+    DEFAULT_AUTH_TOKEN_JQ.to_string()
 }
 
 fn default_rest_config_dir() -> String {

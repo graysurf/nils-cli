@@ -43,7 +43,7 @@ mod tests {
         RestExecutedRequest {
             method: "GET".to_string(),
             url: "http://localhost:6700/health".to_string(),
-            response: crate::rest::runner::RestHttpResponse {
+            response: crate::http::HttpResponse {
                 status,
                 body: serde_json::to_vec(&body).unwrap(),
                 content_type: Some("application/json".to_string()),

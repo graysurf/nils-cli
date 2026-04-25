@@ -4,20 +4,14 @@ use anyhow::Context;
 use base64::Engine;
 
 use crate::Result;
+use crate::http::{HttpBody, HttpResponse, execute_request};
 use crate::rest::schema::{RestMultipartPart, RestRequestFile};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestHttpResponse {
-    pub status: u16,
-    pub body: Vec<u8>,
-    pub content_type: Option<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestExecutedRequest {
     pub method: String,
     pub url: String,
-    pub response: RestHttpResponse,
+    pub response: HttpResponse,
 }
 
 fn resolve_part_file_path(request_file: &Path, raw: &str) -> Result<PathBuf> {
@@ -168,42 +162,24 @@ pub fn execute_rest_request(
         headers.append(name, value);
     }
 
-    let client = reqwest::blocking::Client::new();
-    let mut builder = client.request(method, &url).headers(headers);
-
-    if let Some(body) = &req.body {
+    let body = if let Some(body) = &req.body {
         let bytes = serde_json::to_vec(body).context("failed to serialize request body as JSON")?;
-        builder = builder.body(bytes);
+        HttpBody::Bytes(bytes)
     } else if let Some(parts) = &req.multipart {
-        let form = build_multipart_form(&request_file.path, parts)?;
-        if let Some(form) = form {
-            builder = builder.multipart(form);
+        match build_multipart_form(&request_file.path, parts)? {
+            Some(form) => HttpBody::Multipart(form),
+            None => HttpBody::None,
         }
-    }
+    } else {
+        HttpBody::None
+    };
 
-    let response = builder
-        .send()
-        .with_context(|| format!("HTTP request failed: {} {}", req.method, url))?;
-
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let body = response
-        .bytes()
-        .context("failed to read response body")?
-        .to_vec();
+    let response = execute_request(method, &url, headers, body)?;
 
     Ok(RestExecutedRequest {
         method: req.method.clone(),
         url,
-        response: RestHttpResponse {
-            status,
-            body,
-            content_type,
-        },
+        response,
     })
 }
 

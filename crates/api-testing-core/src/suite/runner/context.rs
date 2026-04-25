@@ -50,5 +50,25 @@ pub(super) fn case_type_normalized(case_type_raw: &str) -> String {
 }
 
 pub(super) fn default_rest_flow_token_jq() -> String {
-    ".. | objects | (.accessToken? // .access_token? // .token? // empty) | select(type==\"string\" and length>0) | .".to_string()
+    crate::suite::schema::DEFAULT_AUTH_TOKEN_JQ.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_rest_flow_token_jq;
+    use crate::suite::schema::DEFAULT_AUTH_TOKEN_JQ;
+
+    #[test]
+    fn default_auth_token_jq_matches_rest_flow_default() {
+        assert_eq!(default_rest_flow_token_jq(), DEFAULT_AUTH_TOKEN_JQ);
+    }
+
+    #[test]
+    fn default_jq_selector_includes_jwt_alternative() {
+        assert!(
+            DEFAULT_AUTH_TOKEN_JQ.contains(".jwt?"),
+            "DEFAULT_AUTH_TOKEN_JQ must include `.jwt?` so suites can extract JWT-shaped tokens \
+             without overriding the default selector"
+        );
+    }
 }

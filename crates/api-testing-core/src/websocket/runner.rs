@@ -1,7 +1,14 @@
+use std::net::TcpStream;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
 use anyhow::Context;
 use serde::Serialize;
+use tungstenite::WebSocket;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::{HeaderName, HeaderValue};
+use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, connect};
 
 use crate::Result;
@@ -18,6 +25,22 @@ pub struct WebsocketExecutedRequest {
     pub target: String,
     pub transcript: Vec<WebsocketTranscriptEntry>,
     pub last_received: Option<String>,
+}
+
+/// Apply a read timeout to the underlying TCP socket so per-step `read()`
+/// calls cannot hang forever. Pass `None` to clear the timeout.
+fn set_socket_read_timeout(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    timeout: Option<Duration>,
+) -> std::io::Result<()> {
+    let tcp = match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream,
+        MaybeTlsStream::Rustls(stream) => stream.get_mut(),
+        // Forward-compat: other variants (e.g. NativeTls if a future feature is
+        // enabled) do not expose a TcpStream we can configure here.
+        _ => return Ok(()),
+    };
+    tcp.set_read_timeout(timeout)
 }
 
 fn parse_message_text(message: Message) -> String {
@@ -82,12 +105,28 @@ pub fn execute_websocket_request(
         }
     }
 
-    let (mut socket, _resp) = connect(request)
-        .with_context(|| format!("failed to connect websocket target '{target}'"))?;
-
-    if let Some(connect_timeout_seconds) = request_file.request.connect_timeout_seconds {
-        let _ = connect_timeout_seconds;
-    }
+    let (mut socket, _resp) = match request_file.request.connect_timeout_seconds {
+        Some(secs) => {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(connect(request));
+            });
+            match rx.recv_timeout(Duration::from_secs(secs)) {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(err)) => {
+                    return Err(anyhow::Error::new(err))
+                        .with_context(|| format!("failed to connect websocket target '{target}'"));
+                }
+                Err(_) => {
+                    anyhow::bail!(
+                        "websocket connect timed out after {secs}s for target '{target}'"
+                    );
+                }
+            }
+        }
+        None => connect(request)
+            .with_context(|| format!("failed to connect websocket target '{target}'"))?,
+    };
 
     let mut transcript: Vec<WebsocketTranscriptEntry> = Vec::new();
     let mut last_received: Option<String> = None;
@@ -107,10 +146,22 @@ pub fn execute_websocket_request(
                 timeout_seconds,
                 expect,
             } => {
-                let _ = timeout_seconds;
-                let message = socket
-                    .read()
-                    .with_context(|| format!("websocket receive failed at step {idx}"))?;
+                let timeout = timeout_seconds.map(Duration::from_secs);
+                if let Some(dur) = timeout {
+                    set_socket_read_timeout(&mut socket, Some(dur)).with_context(|| {
+                        format!("failed to set read timeout for websocket step {idx}")
+                    })?;
+                }
+                let read_result = socket.read();
+                if timeout.is_some() {
+                    let _ = set_socket_read_timeout(&mut socket, None);
+                }
+                let message = read_result.with_context(|| match timeout_seconds {
+                    Some(secs) => {
+                        format!("websocket receive timed out after {secs}s at step {idx}")
+                    }
+                    None => format!("websocket receive failed at step {idx}"),
+                })?;
                 let text = parse_message_text(message);
                 apply_expect(
                     expect.as_ref(),
@@ -181,6 +232,62 @@ mod tests {
         });
 
         (format!("ws://{addr}"), handle)
+    }
+
+    fn spawn_silent_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept stream");
+            let mut ws = tungstenite::accept(stream).expect("accept handshake on silent server");
+            // Block on read until the client closes the connection — never
+            // sending anything ourselves so the client read times out.
+            let _ = ws.read();
+            let _ = ws.close(None);
+        });
+
+        (format!("ws://{addr}"), handle)
+    }
+
+    #[test]
+    fn websocket_runner_step_receive_timeout_surfaces_error() {
+        let tmp = TempDir::new().expect("tmp");
+        let request_path = tmp.path().join("silent.ws.json");
+
+        let (url, handle) = spawn_silent_server();
+
+        std::fs::write(
+            &request_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "url": url,
+                "steps": [
+                    {"type": "receive", "timeoutSeconds": 1}
+                ]
+            }))
+            .expect("serialize request"),
+        )
+        .expect("write request");
+
+        let loaded = WebsocketRequestFile::load(&request_path).expect("load request");
+        let started = std::time::Instant::now();
+        let err =
+            execute_websocket_request(&loaded, "", None).expect_err("expected receive to time out");
+        let elapsed = started.elapsed();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out after 1s"),
+            "expected timeout message; got: {msg}"
+        );
+        // Cushion for OS scheduling and TLS handshake — keep well under the
+        // default integration-test budget.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "expected timeout to fire within 5s; got {elapsed:?}"
+        );
+
+        let _ = handle.join();
     }
 
     #[test]
