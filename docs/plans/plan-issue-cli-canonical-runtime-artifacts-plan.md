@@ -160,7 +160,10 @@ subsequent sprints cut over each command.
   - Spec calls out the breaking-change cutover and links to this
     plan file.
 - **Validation**:
-  - `rg -n 'MAIN_AGENT_INIT_SNAPSHOT_PATH|PLAN_BRANCH_REF_PATH|PLAN_SNAPSHOT_PATH|SUBAGENT_INIT_SNAPSHOT_PATH|DISPATCH_RECORD_PATH|PROMPT_MANIFEST_PATH' crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
+  - `rg -n 'MAIN_AGENT_INIT_SNAPSHOT_PATH|PLAN_BRANCH_REF_PATH|PLAN_SNAPSHOT_PATH'
+    crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
+  - `rg -n 'SUBAGENT_INIT_SNAPSHOT_PATH|DISPATCH_RECORD_PATH|PROMPT_MANIFEST_PATH'
+    crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
   - `rg -n 'breaking change|removed flat layout' crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
   - `rg -n 'workflow_role' crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
 
