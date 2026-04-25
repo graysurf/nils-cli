@@ -484,11 +484,12 @@ fn validate_commit_message(path: &Path) -> Result<(), i32> {
             return fail_validation("commit body must be separated from header by a blank line");
         }
 
+        let mut prev_was_body_line = false;
         for (idx, line) in lines.iter().enumerate().skip(2) {
             let line_no = idx + 1;
             if line.is_empty() {
                 return fail_validation(&format!(
-                    "commit body line {line_no} is empty; body lines must start with '- ' followed by uppercase letter"
+                    "commit body line {line_no} is empty; body lines must start with '- ' followed by uppercase letter (or '  ' to continue the previous bullet)"
                 ));
             }
             if line.chars().count() > 100 {
@@ -496,17 +497,19 @@ fn validate_commit_message(path: &Path) -> Result<(), i32> {
                     "commit body line {line_no} exceeds 100 characters (max 100)"
                 ));
             }
-            if !line.starts_with("- ")
-                || line
-                    .chars()
-                    .nth(2)
-                    .map(|c| !c.is_ascii_uppercase())
-                    .unwrap_or(true)
-            {
+
+            let is_bullet = line.starts_with("- ")
+                && line.chars().nth(2).is_some_and(|c| c.is_ascii_uppercase());
+            let is_continuation = prev_was_body_line
+                && line.starts_with("  ")
+                && line.chars().nth(2).is_some_and(|c| !c.is_whitespace());
+
+            if !is_bullet && !is_continuation {
                 return fail_validation(&format!(
-                    "commit body line {line_no} must start with '- ' followed by uppercase letter"
+                    "commit body line {line_no} must start with '- ' followed by uppercase letter (or '  ' to continue the previous bullet)"
                 ));
             }
+            prev_was_body_line = true;
         }
     }
 

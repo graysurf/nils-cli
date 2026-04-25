@@ -182,7 +182,41 @@ fn commit_body_line_requires_capitalized_bullet() {
     assert!(
         as_str(&output.stderr).contains(
             "error: commit body line 3 must start with '- ' followed by uppercase letter"
-        )
+        ),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_body_accepts_two_space_continuation_lines() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+
+    let message = "feat: test\n\n- First bullet wraps onto the next line because it is long.\n  Continuation text describes the why in more detail.\n- Second bullet stands on its own.\n";
+    let output = common::run_semantic_commit_output(repo.path(), &["commit"], &[], Some(message));
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_body_rejects_continuation_without_preceding_bullet() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+
+    let message = "feat: test\n\n  Orphan continuation line without a leading bullet.\n";
+    let output = common::run_semantic_commit_output(repo.path(), &["commit"], &[], Some(message));
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        as_str(&output.stderr).contains("commit body line 3 must start with '- '"),
+        "stderr was: {}",
+        as_str(&output.stderr)
     );
 }
 
