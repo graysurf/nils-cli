@@ -13,7 +13,9 @@ A helper path is `keep` only when at least one active caller is discoverable by 
 - Canonical contributor docs (`README.md`, `DEVELOPMENT.md`, `docs/runbooks/**`, crate READMEs)
 - Canonical runtime entrypoints (`scripts/**`, `.agents/**`, `wrappers/**`) used by active workflows/docs
 
-A helper path is `delete` when no active caller exists outside historical/transient planning artifacts.
+A helper path is `delete-candidate` when no active caller exists outside historical/transient
+planning artifacts. Removal of a `delete-candidate` script is a separate code-change task and is
+out of scope for this governance inventory; flag it as a follow-up.
 
 ## Canonical Workflow Owners
 
@@ -57,21 +59,40 @@ No workflow may duplicate these audit commands as independent pre-steps unless t
 
 ## Helper Surface Decisions (Sprint 1 Scope)
 
+This section enumerates every script under `scripts/ci/*.sh` (matches `ls scripts/ci/*.sh`) and
+records the keep/delete decision plus the active caller evidence.
+
 | Path | Decision | Active caller evidence |
 | --- | --- | --- |
-| `scripts/ci/wrapper-mode-smoke.sh` | keep | `README.md` wrapper contributor flow + wrapper smoke command examples |
-| `scripts/ci/agent-docs-snapshots.sh` | keep | `crates/agent-docs/README.md` snapshot workflow |
-| obsolete completion matrix shell helper | delete | no active caller outside itself |
-| obsolete release package shell helper | delete | no active CI/release/contributor caller; replaced by canonical release tarball audit script |
-| `wrappers/plan-tooling` | keep | `README.md` wrapper contributor flow + runbook wrapper scope includes `plan-tooling` |
-| `wrappers/git-cli` | keep | `README.md` wrapper contributor flow includes `git-cli` wrapper behavior |
+| `scripts/ci/agent-docs-snapshots.sh` | keep | `crates/agent-docs/README.md` snapshot workflow (`scripts/ci/agent-docs-snapshots.sh [--bless]`) |
+| `scripts/ci/completion-asset-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` step |
+| `scripts/ci/completion-flag-parity-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` step |
+| `scripts/ci/coverage-badge.sh` | keep | `.github/workflows/ci.yml` `coverage_badge` job |
+| `scripts/ci/coverage-summary.sh` | keep | `.github/workflows/ci.yml` `coverage` job + `DEVELOPMENT.md` coverage flow |
+| `scripts/ci/docs-hygiene-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
+| `scripts/ci/docs-placement-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
+| `scripts/ci/markdownlint-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
+| `scripts/ci/nils-cli-checks-entrypoint.sh` | keep | `.github/workflows/ci.yml` `test` and `test_macos` jobs + `DEVELOPMENT.md` contributor commands |
+| `scripts/ci/plan-issue-cli-coverage-delta.sh` | delete-candidate | No active caller found in workflows / contributor docs / required-checks scripts. Removal is a code-change task; flag as follow-up rather than patching here. |
+| `scripts/ci/release-tarball-third-party-audit.sh` | keep | `.github/workflows/release.yml` `build` job |
+| `scripts/ci/test-stale-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` step |
+| `scripts/ci/third-party-artifacts-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` step + dependabot bump skill |
+| `scripts/ci/wrapper-mode-smoke.sh` | delete-candidate | No active caller currently references the script outside itself. Previous evidence claim ("`README.md` wrapper contributor flow + wrapper smoke command examples") is stale. Removal is a code-change task; flag as follow-up rather than patching here. |
+
+## Auxiliary Wrapper / Tooling Decisions
+
+| Path | Decision | Active caller evidence |
+| --- | --- | --- |
+| `wrappers/plan-tooling` | keep | `README.md` wrapper contributor flow + workspace wrapper directory contract |
+| `wrappers/git-cli` | keep | `README.md` wrapper contributor flow + `git-cli` wrapper behavior |
 
 ## Validation Commands
 
 ```bash
 test -f docs/specs/workspace-ci-entrypoint-inventory-v1.md
+ls scripts/ci/*.sh
 rg -n 'scripts/ci/|nils-cli-verify-required-checks' \
   .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/publish-crates.yml \
   DEVELOPMENT.md .agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh
-rg -n 'canonical|delete|keep|workflow' docs/specs/workspace-ci-entrypoint-inventory-v1.md
+rg -n 'canonical|delete|delete-candidate|keep|workflow' docs/specs/workspace-ci-entrypoint-inventory-v1.md
 ```

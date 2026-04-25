@@ -11,20 +11,20 @@ and provides recommended installation commands for Homebrew (macOS) and Linuxbre
 
 ## 1. Runtime Dependencies (Core)
 
-These tools are required for common command paths.
+These tools are required for common command paths. Each row is anchored to at least one
+`Command::new(...)` (or equivalent `shared_process` / `ProcessRequest`) call site in `crates/*/src`.
 
 | Tool | Used By | Requirement Level | Install (brew/linuxbrew) |
 |---|---|---|---|
-| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `semantic-commit`, `fzf-cli git-*` | Required | `brew install git` |
+| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `semantic-commit` (via `git-scope`), `codex-cli`, `gemini-cli`, `fzf-cli git-*` | Required | `brew install git` |
 | `fzf` | `fzf-cli` interactive commands | Required (for `fzf-cli`) | `brew install fzf` |
-| `grpcurl` | `api-grpc` unary request execution backend | Required (for `api-grpc call`/suite gRPC cases) | `brew install grpcurl` |
-| `ffmpeg` | `screen-record` on Linux | Required on Linux | `brew install ffmpeg` |
-| `codex` | `codex-cli agent *` flows | Required for agent commands | Install from official Codex distribution |
-
-### 1.2 `api-websocket` transport runtime dependency policy
-
-- `api-websocket` uses an in-process Rust transport (`tungstenite`) via `api-testing-core`.
-- No external adapter binary (for example `websocat`) is required for `api-websocket call` or suite websocket cases.
+| `grpcurl` | `api-grpc` unary backend (via `api-testing-core::grpc::runner`); overridable with `GRPCURL_BIN` | Required (for `api-grpc call` / suite gRPC cases) | `brew install grpcurl` |
+| `ffmpeg` | `screen-record` on Linux (X11 + Wayland portal capture, audio mux) | Required on Linux | `brew install ffmpeg` |
+| `codex` | `codex-cli auth login` and `codex-cli agent *` flows | Required for `codex-cli` runtime | Install from official Codex distribution |
+| `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
+| `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
+| `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
+| `gh` | `git-cli open *` GitHub helpers, `plan-issue-cli` GitHub I/O | Required for GitHub-facing flows | `brew install gh` |
 
 ### 1.1 `image-processing` runtime policy
 
@@ -32,23 +32,34 @@ These tools are required for common command paths.
   - Rust-backed (`image` decode/encode for raster inputs, `usvg`/`resvg` for SVG inputs).
   - No external runtime binary requirement.
 
+### 1.2 `api-websocket` transport runtime dependency policy
+
+- `api-websocket` uses an in-process Rust transport (`tungstenite`) via `api-testing-core`.
+- No external adapter binary (for example `websocat`) is required for `api-websocket call` or suite websocket cases.
+
 ## 2. Runtime Dependencies (Optional / Degradation Paths)
 
 These tools enable richer behavior. Missing tools typically trigger fallback behavior or reduced UX.
+Each row is anchored to at least one `Command::new(...)` / `find_in_path` / `cmd_exists` call site
+in `crates/*/src`.
 
 | Tool | Behavior Impact | Install (brew/linuxbrew) |
 |---|---|---|
 | `tree` | Enables directory tree rendering in `git-scope` | `brew install tree` |
 | `file` | MIME-based binary detection in `git-scope` and `git-cli commit context` | Usually preinstalled |
 | `lsof` | Preferred backend for `fzf-cli port` (fallback: `netstat`) | `brew install lsof` |
-| `bat` | Syntax-highlighted previews in `fzf-cli file` | `brew install bat` |
-| `code` | VS Code open mode for `fzf-cli` (`--vscode`) | macOS: `brew install --cask visual-studio-code` |
-| `pbcopy` / `wl-copy` / `xclip` / `xsel` | Clipboard integration for `git-cli commit context` | Linux: `brew install wl-clipboard xclip xsel` |
-| `cwebp` / `dwebp` | WebP optimization path; macOS WebP screenshot fallback in `screen-record` | `brew install webp` |
+| `netstat` | Fallback backend for `fzf-cli port` when `lsof` is missing | Usually preinstalled |
+| `bat` | Syntax-highlighted previews in `fzf-cli file` / `directory` (invoked via fzf preview shell) | `brew install bat` |
+| `vi` | Default editor for `fzf-cli` open / `git-commit` flows (override via `FZF_FILE_OPEN_WITH`) | Usually preinstalled |
+| `code` | VS Code open mode for `fzf-cli` (`--vscode`) and `git-commit --vscode` | macOS: `brew install --cask visual-studio-code` |
+| `pbcopy` / `wl-copy` / `xclip` / `xsel` | Clipboard integration via `nils-common::clipboard` (used by `git-cli commit context`, `fzf-cli` block preview) | Linux: `brew install wl-clipboard xclip xsel` |
+| `cwebp` | WebP encode path for `screen-record` macOS WebP screenshot fallback | `brew install webp` |
 | `pactl` | Linux audio source discovery for `screen-record --audio ...` | `brew install pulseaudio` |
 | `xdg-desktop-portal` + backend + PipeWire | Wayland portal capture path (`screen-record --portal`) | Prefer distro packages |
-| `open-changed-files` | Optional helper used by `fzf-cli git-commit` | Project-specific optional tool |
+| `open` | macOS `open` invocation for `screen-record` permission prompts | Preinstalled on macOS |
+| `open-changed-files` | Optional helper used by `fzf-cli git-commit` to launch changed files | Project-specific optional tool |
 | `hs` (Hammerspoon CLI) | Preferred AX backend path for `macos-agent ax *` (fallback to JXA when unavailable) | `brew install --cask hammerspoon` |
+| `cliclick` | Probed by `macos-agent` preflight as an alternate input backend | `brew install cliclick` |
 | `im-select` | Required by `macos-agent input-source *` and macOS real E2E keyboard/input-source setup | `brew install im-select` |
 
 ## 3. Development and Validation Toolchain
@@ -139,7 +150,7 @@ eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 ## 8. Quick Environment Verification
 
 ```bash
-for c in git gh fzf tree file ffmpeg bat im-select; do
+for c in git gh fzf grpcurl tree file ffmpeg bat im-select curl; do
   if command -v "$c" >/dev/null 2>&1; then
     echo "[OK]   $c -> $(command -v "$c")"
   else
