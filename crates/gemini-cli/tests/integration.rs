@@ -55,6 +55,8 @@ mod parity_oracle;
 mod paths;
 #[path = "integration/prompt_segment_cached.rs"]
 mod prompt_segment_cached;
+#[path = "integration/prompt_segment_refresh.rs"]
+mod prompt_segment_refresh;
 #[path = "integration/prompts.rs"]
 mod prompts;
 #[path = "integration/rate_limits_all.rs"]
