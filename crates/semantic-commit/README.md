@@ -54,7 +54,9 @@ Help:
 - Header must be non-empty, `<= 100` characters, and use a lowercase type.
 - Header format: `type(scope): subject` or `type: subject`.
 - If a body exists, line 2 must be blank and each body line must start with `-` + space, followed by an
-  uppercase letter and be `<= 100` characters.
+  uppercase letter and be `<= 100` characters. A bullet may wrap onto a following line by prefixing that
+  continuation line with two spaces (the same indent used on this README bullet); continuation lines
+  also have the `<= 100` character cap.
 
 ## Exit codes
 
