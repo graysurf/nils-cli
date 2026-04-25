@@ -21,6 +21,7 @@ use crate::commands::{Command as CliCommand, SplitStrategy, SummaryArgs};
 use crate::github::{GhCliAdapter, GitHubAdapter};
 use crate::issue_body::{self, TaskRow};
 use crate::render::{self, SprintCommentInput, SprintCommentMode};
+use crate::runtime_layout::{self, IssueRoot};
 use crate::task_spec::{self, TaskSpecBuildOptions, TaskSpecRow, TaskSpecScope};
 use crate::{BinaryFlavor, CommandError};
 
@@ -145,18 +146,6 @@ fn run_start_plan(
     let build = task_spec::build_task_spec(&args.plan, TaskSpecScope::Plan, &options)
         .map_err(|err| CommandError::runtime("task-spec-generation-failed", err))?;
 
-    let task_spec_out = args
-        .task_spec_out
-        .clone()
-        .unwrap_or_else(|| task_spec::default_plan_task_spec_path(&args.plan));
-    task_spec::write_tsv(&task_spec_out, &build.rows)
-        .map_err(|err| CommandError::runtime("task-spec-write-failed", err))?;
-
-    let issue_body_out = args
-        .issue_body_out
-        .clone()
-        .unwrap_or_else(|| render::default_plan_issue_body_path(&args.plan));
-
     let plan_title = args
         .title
         .clone()
@@ -178,24 +167,97 @@ fn run_start_plan(
             rendered_errors.join(" | "),
         ));
     }
-    render::write_rendered(&issue_body_out, &issue_body)
-        .map_err(|err| CommandError::runtime("issue-body-write-failed", err))?;
 
-    let mut issue_number: Option<u64> =
-        (binary == BinaryFlavor::PlanIssueLocal).then_some(LOCAL_ISSUE_PLACEHOLDER);
+    let repo = crate::github::resolve_repo(repo_override)
+        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+    let repo_slug = runtime_layout::repo_slug(&repo);
+
+    let mut issue_number: Option<u64> = None;
     let mut issue_url: Option<String> = None;
     let mut live_mutations = false;
 
     if binary == BinaryFlavor::PlanIssue && !dry_run {
-        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let temp_body = write_temp_markdown("plan-issue-body", &issue_body)
+            .map_err(|err| CommandError::runtime("issue-body-write-failed", err))?;
         let adapter = GhCliAdapter::new(force);
         let (number, url) = adapter
-            .create_issue(&repo, &plan_title, &issue_body_out, &args.label)
+            .create_issue(&repo, &plan_title, &temp_body, &args.label)
             .map_err(|err| CommandError::runtime("github-issue-create-failed", err))?;
         issue_number = Some(number);
         issue_url = Some(url);
         live_mutations = true;
+    } else if binary == BinaryFlavor::PlanIssueLocal {
+        issue_number = Some(LOCAL_ISSUE_PLACEHOLDER);
     }
+
+    let issue_root_number = issue_number.unwrap_or(LOCAL_ISSUE_PLACEHOLDER);
+    let issue_root = IssueRoot::new(&repo_slug, issue_root_number)
+        .map_err(|err| CommandError::runtime("runtime-layout-failed", err.to_string()))?;
+
+    let task_spec_out = args
+        .task_spec_out
+        .clone()
+        .unwrap_or_else(|| issue_root.plan_task_spec());
+    task_spec::write_tsv(&task_spec_out, &build.rows)
+        .map_err(|err| CommandError::runtime("task-spec-write-failed", err))?;
+
+    let issue_body_out = args
+        .issue_body_out
+        .clone()
+        .unwrap_or_else(|| issue_root.plan_issue_body());
+    render::write_rendered(&issue_body_out, &issue_body)
+        .map_err(|err| CommandError::runtime("issue-body-write-failed", err))?;
+
+    let main_agent_init_source = task_spec::agent_home()
+        .join("prompts")
+        .join("plan-issue-delivery-main-agent-init.md");
+    if !main_agent_init_source.exists() {
+        return Err(CommandError::runtime(
+            "main-agent-init-snapshot-source-missing",
+            format!(
+                "main-agent init source not found at {}; ensure agent-kit is installed",
+                main_agent_init_source.display()
+            ),
+        ));
+    }
+    let main_agent_init_target = issue_root.main_agent_init_snapshot();
+    if let Some(parent) = main_agent_init_target.parent() {
+        runtime_layout::ensure_dir(parent).map_err(|err| {
+            CommandError::runtime(
+                "runtime-layout-emit-failed",
+                format!("failed to create dir {}: {err}", parent.display()),
+            )
+        })?;
+    }
+    fs::copy(&main_agent_init_source, &main_agent_init_target).map_err(|err| {
+        CommandError::runtime(
+            "runtime-layout-emit-failed",
+            format!(
+                "failed to copy main-agent init snapshot to {}: {err}",
+                main_agent_init_target.display()
+            ),
+        )
+    })?;
+
+    let plan_branch_name = format!("plan/issue-{}", issue_root_number);
+    let plan_branch_ref = issue_root.plan_branch_ref();
+    if let Some(parent) = plan_branch_ref.parent() {
+        runtime_layout::ensure_dir(parent).map_err(|err| {
+            CommandError::runtime(
+                "runtime-layout-emit-failed",
+                format!("failed to create dir {}: {err}", parent.display()),
+            )
+        })?;
+    }
+    fs::write(&plan_branch_ref, plan_branch_name.as_bytes()).map_err(|err| {
+        CommandError::runtime(
+            "runtime-layout-emit-failed",
+            format!(
+                "failed to write plan-branch ref to {}: {err}",
+                plan_branch_ref.display()
+            ),
+        )
+    })?;
 
     Ok(json!({
         "scope": "plan",
@@ -203,6 +265,9 @@ fn run_start_plan(
         "dry_run": dry_run,
         "task_spec_path": path_text(&task_spec_out),
         "issue_body_path": path_text(&issue_body_out),
+        "issue_root": path_text(issue_root.root()),
+        "main_agent_init_snapshot_path": path_text(&main_agent_init_target),
+        "plan_branch_ref_path": path_text(&plan_branch_ref),
         "record_count": build.rows.len(),
         "issue_number": issue_number,
         "issue_url": issue_url,
@@ -1279,7 +1344,16 @@ fn run_multi_sprint_guide(
         ));
     }
 
-    let issue_body_path = render::default_plan_issue_body_path(&args.plan);
+    let issue_body_path = match crate::github::resolve_repo(None) {
+        Ok(repo) => {
+            let slug = runtime_layout::repo_slug(&repo);
+            match IssueRoot::new(&slug, LOCAL_ISSUE_PLACEHOLDER) {
+                Ok(issue_root) => issue_root.plan_issue_body(),
+                Err(_) => render::default_plan_issue_body_path(&args.plan),
+            }
+        }
+        Err(_) => render::default_plan_issue_body_path(&args.plan),
+    };
     let cli = binary.binary_name();
 
     let mut lines = vec![

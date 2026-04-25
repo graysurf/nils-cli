@@ -196,6 +196,7 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
 
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let log_path = tmp.path().join("gh.log");
@@ -229,7 +230,7 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
     .expect("write plan");
 
     let plan_task_spec = tmp.path().join("plan-task-spec.tsv");
-    let plan_issue_body = tmp.path().join("plan-issue-body.md");
+    let plan_issue_body = tmp.path().join("issue-body.md");
     let plan_task_spec_s = plan_task_spec.to_string_lossy().to_string();
     let plan_issue_body_s = plan_issue_body.to_string_lossy().to_string();
 

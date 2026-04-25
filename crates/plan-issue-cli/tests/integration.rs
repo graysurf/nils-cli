@@ -21,5 +21,7 @@ mod output_contract;
 mod parity_guardrails;
 #[path = "integration/runtime_truth_plan_and_sprint_flow.rs"]
 mod runtime_truth_plan_and_sprint_flow;
+#[path = "integration/start_plan_canonical.rs"]
+mod start_plan_canonical;
 #[path = "integration/task_spec_flow.rs"]
 mod task_spec_flow;

@@ -194,6 +194,7 @@ fn render_issue_body_start_plan_writes_issue_body_artifact() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
 
     let task_spec = tmp.path().join("plan.tsv");
     let issue_body = tmp.path().join("issue-body.md");
@@ -260,6 +261,7 @@ fn render_issue_body_start_plan_creates_missing_issue_body_directory() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
 
     let task_spec = tmp.path().join("nested").join("spec").join("plan.tsv");
     let issue_body = tmp
@@ -303,6 +305,7 @@ fn local_start_plan_returns_deterministic_issue_placeholder() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let out = common::run_plan_issue_local_with_env(
@@ -331,6 +334,7 @@ fn render_issue_body_start_plan_falls_back_when_preface_sections_missing() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let plan = tmp.path().join("minimal-plan.md");
@@ -393,6 +397,7 @@ fn task_decomposition_writer_and_parser_use_one_sanitized_schema() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let plan = tmp.path().join("pipe-summary-plan.md");
@@ -466,6 +471,7 @@ fn render_issue_body_start_sprint_writes_start_comment_with_modes() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let task_spec = tmp.path().join("s3.tsv");
@@ -514,6 +520,7 @@ fn render_issue_body_start_sprint_group_auto_single_pr_lane_uses_per_sprint_mode
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("auto-single-lane-plan.md");
@@ -586,6 +593,7 @@ fn render_issue_body_start_sprint_group_deterministic_single_pr_lane_uses_per_sp
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("deterministic-single-lane-plan.md");
@@ -662,6 +670,7 @@ fn start_sprint_rejects_deterministic_grouping_mismatch_with_plan_metadata() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("mismatch-plan.md");
@@ -724,6 +733,7 @@ fn write_subagent_prompts_groups_tasks_by_runtime_lane() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("auto-single-lane-prompts-plan.md");
@@ -797,6 +807,7 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let start_plan_out = common::run_plan_issue_local_with_env(
@@ -915,6 +926,7 @@ fn local_flow_status_plan_body_file_reports_counts_and_comment_preview() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let issue_body_s = render_issue_body_for_local_plan(&tmp, &agent_home_s);
@@ -964,6 +976,7 @@ fn local_flow_ready_plan_body_file_accepts_summary_file_without_comment() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let issue_body_s = render_issue_body_for_local_plan(&tmp, &agent_home_s);
@@ -1002,6 +1015,7 @@ fn local_flow_ready_plan_missing_summary_file_returns_error() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let issue_body_s = render_issue_body_for_local_plan(&tmp, &agent_home_s);
