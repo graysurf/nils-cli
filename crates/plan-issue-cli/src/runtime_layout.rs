@@ -384,9 +384,7 @@ mod tests {
         );
 
         // Empty task id rejected for pr-isolated.
-        assert!(issue
-            .assigned_worktree("pr-isolated", "", "g1", 1)
-            .is_err());
+        assert!(issue.assigned_worktree("pr-isolated", "", "g1", 1).is_err());
         // Empty pr_group rejected for pr-shared.
         assert!(issue.assigned_worktree("pr-shared", "S1T1", "", 1).is_err());
     }
