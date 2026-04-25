@@ -256,7 +256,9 @@ pub fn render_svg_to_output(
                     "png" => write_png(output_path, width, height, &rgba)?,
                     "webp" => write_webp(output_path, width, height, &rgba)?,
                     "jpg" => write_jpg(output_path, width, height, &rgba)?,
-                    _ => unreachable!(),
+                    other => {
+                        return Err(anyhow::anyhow!("unsupported raster output format: {other}"));
+                    }
                 }
             }
             output_info(
