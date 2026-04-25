@@ -236,7 +236,7 @@ pub(crate) fn cmd_call_internal(
         }
         Err(err) => {
             let _ = writeln!(stderr, "{err}");
-            append_history_best_effort(&history_ctx, exit_code);
+            append_history_best_effort(&history_ctx, exit_code, stderr);
             return 1;
         }
     };
@@ -249,7 +249,7 @@ pub(crate) fn cmd_call_internal(
         }
         Err(err) => {
             let _ = writeln!(stderr, "{err}");
-            append_history_best_effort(&history_ctx, exit_code);
+            append_history_best_effort(&history_ctx, exit_code, stderr);
             return 1;
         }
     };
@@ -263,7 +263,7 @@ pub(crate) fn cmd_call_internal(
         )
     {
         let _ = writeln!(stderr, "{err}");
-        append_history_best_effort(&history_ctx, exit_code);
+        append_history_best_effort(&history_ctx, exit_code, stderr);
         return 1;
     }
 
@@ -284,7 +284,7 @@ pub(crate) fn cmd_call_internal(
         Err(err) => {
             spinner.finish_and_clear();
             let _ = writeln!(stderr, "{err}");
-            append_history_best_effort(&history_ctx, exit_code);
+            append_history_best_effort(&history_ctx, exit_code, stderr);
             return 1;
         }
     };
@@ -302,7 +302,7 @@ pub(crate) fn cmd_call_internal(
             stdout_is_tty,
             stderr,
         );
-        append_history_best_effort(&history_ctx, exit_code);
+        append_history_best_effort(&history_ctx, exit_code, stderr);
         return 1;
     }
 
@@ -317,14 +317,14 @@ pub(crate) fn cmd_call_internal(
         ) {
             spinner.finish_and_clear();
             let _ = writeln!(stderr, "{err}");
-            append_history_best_effort(&history_ctx, exit_code);
+            append_history_best_effort(&history_ctx, exit_code, stderr);
             return 1;
         }
     }
 
     spinner.finish_and_clear();
     exit_code = 0;
-    append_history_best_effort(&history_ctx, exit_code);
+    append_history_best_effort(&history_ctx, exit_code, stderr);
 
     exit_code
 }
@@ -343,7 +343,7 @@ struct CallHistoryContext {
     token_name_for_log: String,
 }
 
-fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32) {
+fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32, stderr: &mut dyn Write) {
     if !ctx.enabled {
         return;
     }
@@ -378,7 +378,9 @@ fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32) {
         extra_flags: &[],
     });
 
-    let _ = history_writer.append(&record);
+    if let Err(err) = history_writer.append(&record) {
+        let _ = writeln!(stderr, "warning: failed to append api-rest history: {err}");
+    }
 }
 
 #[cfg(test)]

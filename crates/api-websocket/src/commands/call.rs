@@ -282,7 +282,7 @@ pub(crate) fn cmd_call_internal(
                 format!("{err}"),
                 None,
             );
-            append_history_best_effort(&history_ctx, exit_code);
+            append_history_best_effort(&history_ctx, exit_code, stderr);
             return code;
         }
     };
@@ -302,7 +302,7 @@ pub(crate) fn cmd_call_internal(
                 format!("{err}"),
                 None,
             );
-            append_history_best_effort(&history_ctx, exit_code);
+            append_history_best_effort(&history_ctx, exit_code, stderr);
             return code;
         }
     };
@@ -323,7 +323,7 @@ pub(crate) fn cmd_call_internal(
             format!("{err}"),
             None,
         );
-        append_history_best_effort(&history_ctx, exit_code);
+        append_history_best_effort(&history_ctx, exit_code, stderr);
         return code;
     }
 
@@ -359,7 +359,7 @@ pub(crate) fn cmd_call_internal(
                 format!("{err}"),
                 Some(serde_json::json!({"target": endpoint.websocket_url})),
             );
-            append_history_best_effort(&history_ctx, exit_code);
+            append_history_best_effort(&history_ctx, exit_code, stderr);
             return code;
         }
     };
@@ -390,7 +390,7 @@ pub(crate) fn cmd_call_internal(
             let _ = writeln!(stderr, "{err}");
             maybe_print_failure_body_to_stderr(&last_received, 8192, stdout_is_tty, stderr);
         }
-        append_history_best_effort(&history_ctx, exit_code);
+        append_history_best_effort(&history_ctx, exit_code, stderr);
         return 1;
     }
 
@@ -414,7 +414,7 @@ pub(crate) fn cmd_call_internal(
     }
 
     exit_code = 0;
-    append_history_best_effort(&history_ctx, exit_code);
+    append_history_best_effort(&history_ctx, exit_code, stderr);
 
     exit_code
 }
@@ -476,7 +476,7 @@ struct CallHistoryContext {
     output_format: OutputFormat,
 }
 
-fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32) {
+fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32, stderr: &mut dyn Write) {
     if !ctx.enabled {
         return;
     }
@@ -518,7 +518,12 @@ fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32) {
         extra_flags,
     });
 
-    let _ = history_writer.append(&record);
+    if let Err(err) = history_writer.append(&record) {
+        let _ = writeln!(
+            stderr,
+            "warning: failed to append api-websocket history: {err}"
+        );
+    }
 }
 
 fn maybe_print_failure_body_to_stderr(
@@ -629,7 +634,7 @@ mod tests {
             output_format: OutputFormat::Text,
         };
 
-        append_history_best_effort(&ctx, 0);
+        append_history_best_effort(&ctx, 0, &mut std::io::sink());
 
         let text = fs::read_to_string(&history_file).expect("history text");
         assert!(text.contains("api-websocket call \\\n"));
@@ -665,7 +670,7 @@ mod tests {
             output_format: OutputFormat::Text,
         };
 
-        append_history_best_effort(&ctx, 7);
+        append_history_best_effort(&ctx, 7, &mut std::io::sink());
 
         let text = fs::read_to_string(&history_file).expect("history text");
         assert!(text.contains("url=<omitted>"));
@@ -695,7 +700,7 @@ mod tests {
             output_format: OutputFormat::Json,
         };
 
-        append_history_best_effort(&ctx, 0);
+        append_history_best_effort(&ctx, 0, &mut std::io::sink());
         let text = fs::read_to_string(&history_file).expect("history text");
         assert!(text.contains("--format json"));
     }
@@ -721,7 +726,7 @@ mod tests {
             output_format: OutputFormat::Text,
         };
 
-        append_history_best_effort(&ctx, 0);
+        append_history_best_effort(&ctx, 0, &mut std::io::sink());
         assert!(!history_file.exists());
     }
 
