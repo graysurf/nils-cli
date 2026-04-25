@@ -2,6 +2,24 @@ use crate::common;
 use std::fs;
 
 #[test]
+fn commit_help_exits_zero_and_prints_subcommand_help() {
+    let repo = common::init_repo();
+    let (code, stdout) = common::run_git_scope_allow_fail(repo.path(), &["commit", "--help"], &[]);
+    assert_eq!(
+        code, 0,
+        "expected `commit --help` to exit 0; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Show commit details"),
+        "expected commit subcommand help; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("[COMMIT]"),
+        "expected [COMMIT] argument in help; got: {stdout}"
+    );
+}
+
+#[test]
 fn commit_merge_parent_selection() {
     let repo = common::init_repo();
     let root = repo.path();

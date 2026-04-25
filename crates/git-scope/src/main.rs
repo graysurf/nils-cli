@@ -77,7 +77,7 @@ enum Command {
         #[arg(long = "parent", short = 'P')]
         parent: Option<String>,
         /// Commit-ish (hash, HEAD, etc.)
-        commit: String,
+        commit: Option<String>,
     },
     /// Display help message for git-scope
     Help,
@@ -246,6 +246,15 @@ fn run() -> Result<()> {
             parent,
             commit,
         } => {
+            let Some(commit) = commit else {
+                eprintln!("error: the following required arguments were not provided:");
+                eprintln!("  <COMMIT>");
+                eprintln!();
+                eprintln!("Usage: git-scope commit [OPTIONS] <COMMIT>");
+                eprintln!();
+                eprintln!("For more information, try '--help commit <COMMIT>'.");
+                process::exit(2);
+            };
             commit::render_commit(&commit, parent.as_deref(), no_color, print, progress_opt_in)
                 .with_context(|| format!("git-scope commit {commit}"))?;
         }
