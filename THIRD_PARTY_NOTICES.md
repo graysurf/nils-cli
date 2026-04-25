@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `899f73da638aa1ad7539d19e6464dfa32aeccb7e0bf7ed1d04ce296b73b8b9a1`
-- Third-party crates (`source != null`): 447
+- Cargo.lock SHA256: `ec51ac1a1f3e131ee35ccf240015f2df80757751f9d1f7a21787cf8b9e5724e1`
+- Third-party crates (`source != null`): 448
 
 ## Notice Extraction Policy
 
@@ -337,7 +337,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### cc 1.2.60
+### cc 1.2.61
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -580,7 +580,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### data-encoding 2.10.0
+### data-encoding 2.11.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -1105,7 +1105,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### hybrid-array 0.4.10
+### hybrid-array 0.4.11
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -1341,7 +1341,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### jiff 0.2.23
+### jiff 0.2.24
 
 - License: `Unlicense OR MIT`
 - Source: `crates.io`
@@ -1351,7 +1351,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `COPYING`
   - `UNLICENSE`
 
-### jiff-static 0.2.23
+### jiff-static 0.2.24
 
 - License: `Unlicense OR MIT`
 - Source: `crates.io`
@@ -1460,7 +1460,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### libc 0.2.185
+### libc 0.2.186
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -2245,7 +2245,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
   - `LICENSE-Apache-2.0_WITH_LLVM-exception`
 
-### rustls 0.23.38
+### rustls 0.23.39
 
 - License: `Apache-2.0 OR ISC OR MIT`
 - Source: `crates.io`
@@ -2266,7 +2266,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
   - `LICENSE-ISC`
 
-### rustls-pki-types 1.14.0
+### rustls-pki-types 1.14.1
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -2554,7 +2554,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### sqlite-wasm-rs 0.5.2
+### sqlite-wasm-rs 0.5.3
 
 - License: `MIT`
 - Source: `crates.io`
@@ -2922,7 +2922,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### typenum 1.19.0
+### typenum 1.20.0
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -3153,12 +3153,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
   - `LICENSE-Apache-2.0_WITH_LLVM-exception`
 
-### wasip2 1.0.2+wasi-0.2.9
+### wasip2 1.0.3+wasi-0.2.9
 
 - License: `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`
 - Source: `crates.io`
 - Notice files: No explicit NOTICE file discovered.
-- License file reference: none declared
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+  - `LICENSE-Apache-2.0_WITH_LLVM-exception`
 
 ### wasip3 0.4.0+wasi-0.3.0-rc-2026-01-06
 
@@ -3626,7 +3629,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE-MIT`
 
-### winnow 1.0.1
+### winnow 1.0.2
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3635,6 +3638,16 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
 
 ### wit-bindgen 0.51.0
+
+- License: `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+  - `LICENSE-Apache-2.0_WITH_LLVM-exception`
+
+### wit-bindgen 0.57.1
 
 - License: `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`
 - Source: `crates.io`
