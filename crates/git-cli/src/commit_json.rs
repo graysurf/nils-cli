@@ -197,7 +197,7 @@ fn parse_args(args: &[String]) -> ParseOutcome<ContextJsonArgs> {
 
 fn print_usage() {
     println!(
-        "Usage: git-commit-context-json [--stdout|--both] [--pretty] [--bundle] [--out-dir <path>]"
+        "Usage: git-cli commit context-json [--stdout|--both] [--pretty] [--bundle] [--out-dir <path>]"
     );
     println!("  --stdout    Print to stdout only (JSON by default; bundle with --bundle)");
     println!(

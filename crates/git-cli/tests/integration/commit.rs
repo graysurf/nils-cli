@@ -187,7 +187,7 @@ fn commit_context_fixture_f031_missing_clipboard() {
     assert_stderr_contains_all(
         "F031",
         &stderr,
-        &["⚠️  No clipboard tool found (requires pbcopy, xclip, or xsel)"],
+        &["⚠️  No clipboard tool found (requires pbcopy, wl-copy, xclip, or xsel)"],
     );
     assert_stdout_contains_all(
         "F031",
@@ -304,7 +304,7 @@ fn commit_context_help_output() {
         "F037",
         &stdout,
         &[
-            "Usage: git-commit-context",
+            "Usage: git-cli commit context",
             "--stdout",
             "--both",
             "--no-color",
@@ -738,7 +738,7 @@ fn commit_context_json_help_output() {
         "F042",
         &stdout,
         &[
-            "Usage: git-commit-context-json",
+            "Usage: git-cli commit context-json",
             "--stdout",
             "--both",
             "--pretty",
