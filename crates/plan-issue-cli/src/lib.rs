@@ -6,6 +6,7 @@ mod github;
 mod issue_body;
 pub mod output;
 mod render;
+pub mod runtime_layout;
 mod task_spec;
 
 use std::ffi::OsString;

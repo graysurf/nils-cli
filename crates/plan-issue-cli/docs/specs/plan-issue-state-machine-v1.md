@@ -49,6 +49,11 @@ Transitions:
 
 - `start-plan`: `PLAN_UNSTARTED -> PLAN_OPEN`
   - Creates one issue with full task decomposition initialized to `Status=planned`, `PR=TBD`.
+  - Artifact emission (per `plan-issue-cli-contract-v2.md` Canonical Runtime Artifacts (v2)):
+    - `MAIN_AGENT_INIT_SNAPSHOT_PATH` copied to `$ISSUE_ROOT/prompts/plan-issue-delivery-main-agent-init.snapshot.md`.
+    - `PLAN_BRANCH_REF_PATH` written to `$ISSUE_ROOT/plan/plan-branch.ref` with the canonical plan branch name.
+    - Plan-scope `TASK_SPEC` and rendered issue body written under `$ISSUE_ROOT/plan/`.
+  - Failure to materialize any of the above is a hard gate failure with exit code `1` (see `plan-issue-gate-matrix-v1.md` `G11`).
 - `ready-plan`: `PLAN_OPEN -> PLAN_REVIEW_READY`
   - Records final review intent (label/comment behavior may vary by flags).
 - `close-plan`: `PLAN_OPEN|PLAN_REVIEW_READY -> PLAN_CLOSED`
@@ -74,6 +79,15 @@ Transitions:
   - Validates Task Decomposition runtime-truth rows against plan-derived sprint lanes.
   - Derives sprint task-spec and prompt artifacts from runtime-truth issue rows (no row rewrite).
   - For `N > 1`, requires previous sprint merge gate pass (see gate invariants).
+  - Artifact emission (per `plan-issue-cli-contract-v2.md` Canonical Runtime Artifacts (v2)):
+    - `PLAN_SNAPSHOT_PATH` copied to `$ISSUE_ROOT/plan/plan.snapshot.md`.
+    - `SUBAGENT_INIT_SNAPSHOT_PATH` copied to `$SPRINT_ROOT/prompts/plan-issue-delivery-subagent-init.snapshot.md`.
+    - `TASK_SPEC_PATH` written to `$SPRINT_ROOT/specs/sprint-task-spec.tsv`.
+    - `TASK_PROMPT_PATH` written to `$SPRINT_ROOT/prompts/<TASK_ID>.md` per assigned task.
+    - `PROMPT_MANIFEST_PATH` written to `$SPRINT_ROOT/manifests/prompt-manifest.tsv`.
+    - `DISPATCH_RECORD_PATH` written to `$SPRINT_ROOT/manifests/dispatch-<TASK_ID>.json` per assigned task with the eleven
+      required keys (see contract spec).
+  - Failure to materialize any of the above is a hard gate failure with exit code `1` (see `plan-issue-gate-matrix-v1.md` `G11`).
 - `ready-sprint N`: `SPRINT_IN_PROGRESS -> SPRINT_REVIEW_READY`
   - Posts or prints sprint-ready review artifact.
 - `accept-sprint N`: `SPRINT_REVIEW_READY -> SPRINT_ACCEPTED`

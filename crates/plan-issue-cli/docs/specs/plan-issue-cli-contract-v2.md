@@ -71,3 +71,96 @@ GitHub integration boundary:
 ```
 
 The header remains stable in v2; only the metadata generation authority changed.
+
+## Canonical Runtime Artifacts (v2)
+
+The `start-plan` and `start-sprint` commands materialize runtime artifacts under
+the canonical layout defined by
+`agent-kit/skills/automation/plan-issue-delivery/references/RUNTIME_LAYOUT.md`.
+
+Layout root and namespacing:
+
+- `RUNTIME_ROOT="$AGENT_HOME/out/plan-issue-delivery"`.
+- Repository slug: `<repo-slug>` derived from `owner/repo` as `owner__repo`
+  (double underscore separator).
+- `ISSUE_ROOT="$RUNTIME_ROOT/<repo-slug>/issue-<ISSUE_NUMBER>"`.
+- `SPRINT_ROOT="$ISSUE_ROOT/sprint-<N>"`.
+
+Plan-scoped artifacts (owned by `start-plan`):
+
+- `MAIN_AGENT_INIT_SNAPSHOT_PATH="$ISSUE_ROOT/prompts/plan-issue-delivery-main-agent-init.snapshot.md"`
+  copied from `MAIN_AGENT_INIT_SOURCE_PATH="$AGENT_HOME/prompts/plan-issue-delivery-main-agent-init.md"`.
+- `PLAN_SNAPSHOT_PATH="$ISSUE_ROOT/plan/plan.snapshot.md"` copied from the
+  source plan path. `start-sprint` may also rewrite this file when invoked
+  before the snapshot exists; the canonical contract treats it as
+  immutable-per-issue but does not forbid rewriting on resume.
+- `PLAN_BRANCH_REF_PATH="$ISSUE_ROOT/plan/plan-branch.ref"` containing the
+  canonical plan branch name (for example `plan/issue-<n>`), no trailing
+  newline, UTF-8.
+- Plan-scope task-spec TSV at `$ISSUE_ROOT/plan/tasks.tsv`.
+- Plan-scope rendered issue body at `$ISSUE_ROOT/plan/issue-body.md`.
+
+Sprint-scoped artifacts (owned by `start-sprint`):
+
+- `SUBAGENT_INIT_SNAPSHOT_PATH="$SPRINT_ROOT/prompts/plan-issue-delivery-subagent-init.snapshot.md"`
+  copied from `SUBAGENT_INIT_SOURCE_PATH="$AGENT_HOME/prompts/plan-issue-delivery-subagent-init.md"`.
+- `TASK_PROMPT_PATH="$SPRINT_ROOT/prompts/<TASK_ID>.md"` (one file per
+  dispatched task; replaces the prior `<anchor>-subagent-prompt.md` flat
+  filename).
+- `PROMPT_MANIFEST_PATH="$SPRINT_ROOT/manifests/prompt-manifest.tsv"` with
+  header `task_id\tprompt_path\texecution_mode\tworkflow_role` and one row
+  per task.
+- `TASK_SPEC_PATH="$SPRINT_ROOT/specs/sprint-task-spec.tsv"` (sprint-scope
+  task-spec TSV).
+
+Per-task dispatch record (owned by `start-sprint`):
+
+- `DISPATCH_RECORD_PATH="$SPRINT_ROOT/manifests/dispatch-<TASK_ID>.json"`.
+- Required keys (snake_case, eleven total):
+  - `task_id`
+  - `task_prompt_path`
+  - `subagent_init_snapshot_path`
+  - `plan_snapshot_path`
+  - `worktree`
+  - `branch`
+  - `execution_mode`
+  - `pr_group`
+  - `base_branch`
+  - `workflow_role`
+- Default `workflow_role` is `"implementation"`. Review and monitor records
+  are dispatched ad-hoc by the main agent and have no per-task record at
+  `start-sprint` time (per `AGENT_ROLE_MAPPING.md`).
+- Optional adapter keys (`runtime_name`, `runtime_role`,
+  `runtime_role_fallback_reason`) are intentionally **absent** from the
+  binary's emission. The active runtime adapter (claude-code, codex,
+  opencode) injects them at dispatch time per canonical
+  `agent-kit/skills/automation/plan-issue-delivery/SKILL.md` L81-82 +
+  L138-144.
+
+Worktree path rules:
+
+- `WORKTREE_ROOT="$ISSUE_ROOT/worktrees"`.
+- Mode mapping:
+  - `pr-isolated`: `"$WORKTREE_ROOT/pr-isolated/<TASK_ID>"`.
+  - `pr-shared`: `"$WORKTREE_ROOT/pr-shared/<PR_GROUP>"`.
+  - `per-sprint`: `"$WORKTREE_ROOT/per-sprint/sprint-<N>"`.
+
+`AGENT_HOME` requirement:
+
+- The canonical layout hard-requires `AGENT_HOME` to be set and non-empty.
+  `start-plan` and `start-sprint` fail with exit code `1` and a runtime
+  error referencing the `AGENT_HOME` env var when it is missing.
+
+### Breaking Change: Retired Flat Layout
+
+This contract **retires** the prior flat artifact layout:
+
+- `$AGENT_HOME/out/plan-issue-delivery/<plan-slug>-plan-tasks.tsv`
+- `$AGENT_HOME/out/plan-issue-delivery/<plan-slug>-plan-issue-body.md`
+- `$AGENT_HOME/out/plan-issue-delivery/<plan-slug>-sprint-<N>-tasks.tsv`
+- `$AGENT_HOME/out/plan-issue-delivery/<plan-slug>-sprint-<N>-subagent-prompts/<anchor>-subagent-prompt.md`
+
+The retirement is a breaking change; downstream consumers must read
+artifacts from the canonical `$ISSUE_ROOT` / `$SPRINT_ROOT` paths above.
+Migration delivered by
+[`docs/plans/plan-issue-cli-canonical-runtime-artifacts-plan.md`](../../../../docs/plans/plan-issue-cli-canonical-runtime-artifacts-plan.md).
