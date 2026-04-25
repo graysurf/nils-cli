@@ -49,18 +49,34 @@ Notes:
 
 ## api-testing-core scope
 
-`api-testing-core` is a library crate used by all five CLIs. Key modules:
+`api-testing-core` is a library crate used by all five CLIs.
 
-- `config`: setup dir discovery for REST/GraphQL/gRPC/WebSocket configs.
-- `env_file`: `.env` parsing + key normalization helpers.
-- `cli_*`: shared CLI helpers (endpoint resolution, history I/O, report args, CLI utilities).
-- `history`, `report`, `markdown`, `redact`, `cmd_snippet`: shared report/history rendering and snippet parsing.
-- `rest`: request schema, runner, expect/cleanup logic, report rendering.
-- `graphql`: schema/vars loading, auth/JWT resolution, runner, expect/allow-errors, report rendering, mutation detection.
-- `grpc`: unary request schema, transport runner, expect logic, report rendering.
-- `websocket`: request schema, scripted runner, expect logic, report rendering.
-- `suite`: suite schema v1, path resolution, filters, safety gates, auth integration, runner, cleanup, results, summary, JUnit (including
-  `type: websocket`).
+### Public modules
+
+The `lib.rs` re-exports the following top-level modules (see `crates/api-testing-core/src/lib.rs`):
+
+- `auth_env`: profile/env-fallback bearer-token resolution shared by REST/gRPC/WebSocket.
+- `cli_endpoint`: env-preset / `--url` resolution with `endpoints.env` lookup.
+- `cli_history`: history-file path resolution, append, and `history` subcommand rendering helpers.
+- `cli_io`: shared CLI I/O helpers (read response file/stdin, conditional stderr body printing).
+- `cli_report`: report metadata/path builder for the `report` subcommand.
+- `cli_util`: misc helpers (env-key normalization, slugify, timestamps, `WarnSink`).
+- `cmd_snippet`: parser for saved `call` command snippets used by `report-from-cmd`.
+- `config`: setup-dir discovery for REST/GraphQL/gRPC/WebSocket configs (resolves history defaults).
+- `env_file`: `.env` parsing with last-wins precedence and `.local.env` overrides.
+- `graphql`: schema/vars loading, auth/JWT resolution, runner, expect / allow-errors, report rendering, mutation detection.
+- `grpc`: unary request schema, transport runner (delegates to `grpcurl`), expect logic, report rendering.
+- `history`: rotating append-only history writer + path resolver.
+- `http`: placeholder HTTP executor (currently unimplemented; REST runner uses `nils_common` HTTP).
+- `jq`: in-process `jq`-style query helper backed by `jaq`.
+- `jwt`: JWT validation helpers (exp/nbf checks with leeway, strict/non-strict modes).
+- `markdown`: Markdown rendering helpers (headings, code blocks, JSON pretty-print).
+- `redact`: secret-key redaction for response bodies and report payloads.
+- `report`: shared report-builder primitives (header / sections).
+- `rest`: request schema, runner, expect / cleanup logic, report rendering.
+- `suite`: suite schema v1, path resolution, filters, safety gates, auth integration, runner, cleanup, results, summary, JUnit (covers
+  REST / GraphQL / gRPC / WebSocket case types).
+- `websocket`: request schema, scripted runner (native Rust `tungstenite`), expect logic, report rendering.
 
 ## Transport decision and reuse matrix
 

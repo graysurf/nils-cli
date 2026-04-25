@@ -1,5 +1,9 @@
 # WebSocket CLI Contract v1
 
+> Source of truth: `crates/api-websocket/src/cli.rs` (clap definitions),
+> `crates/api-websocket/src/commands/{call,history,report}.rs` (envelope shapes),
+> `crates/api-testing-core/src/websocket/{schema,runner}.rs` (request schema and transcript).
+
 ## Commands
 
 `api-websocket` supports:
@@ -8,10 +12,12 @@
 - `history`
 - `report`
 - `report-from-cmd`
+- `completion` (prints a `bash` or `zsh` completion script; no JSON envelope)
 
 Default command behavior:
 
 - bare positional request path is treated as `call`.
+- `--help` / `-h` and `--version` / `-V` are handled at the root before the default insertion.
 
 ## Exit codes
 
@@ -29,7 +35,8 @@ Default command behavior:
 ## JSON mode
 
 - Explicit only: `--format json`
-- Supported commands: `call`, `history`
+- Supported commands: `call`, `history`. `report`, `report-from-cmd`, and `completion`
+  do not accept `--format`.
 - Human-readable mode remains default.
 
 ## JSON envelope
@@ -48,10 +55,22 @@ Guideline reference:
   "result": {
     "target": "ws://127.0.0.1:9001/ws",
     "last_received": "{\"ok\":true}",
-    "transcript": []
+    "transcript": [
+      {"direction": "send", "payload": "ping"},
+      {"direction": "receive", "payload": "{\"ok\":true}"},
+      {"direction": "close", "payload": ""}
+    ]
   }
 }
 ```
+
+`result.transcript` is an array of `{ "direction": "send" | "receive" | "close", "payload": "<text>" }`
+entries. `payload` is always a string; binary frames are decoded as lossy UTF-8, and control
+frames render as `<PING:...>`, `<PONG:...>`, `<CLOSE:<code>:<reason>>`, or `<FRAME>` placeholders
+(see `api_testing_core::websocket::runner::parse_message_text`).
+
+`result.last_received` mirrors the most recent `receive` step's `payload` (or `null` if no
+`receive` step ran successfully).
 
 ### `call` failure
 
@@ -62,10 +81,16 @@ Guideline reference:
   "ok": false,
   "error": {
     "code": "request_not_found",
-    "message": "Request file not found: ..."
+    "message": "Request file not found: ...",
+    "details": {}
   }
 }
 ```
+
+`error.details` is optional. It is included for failure modes that carry contextual data:
+
+- `websocket_execute_error`: `{ "target": "<resolved url>" }`
+- `expectation_failed`: `{ "target": "<resolved url>", "last_received": "<text or null>" }`
 
 ### `history` success
 
@@ -91,10 +116,15 @@ Guideline reference:
   "ok": false,
   "error": {
     "code": "history_not_found",
-    "message": "History file not found: ..."
+    "message": "History file not found: ...",
+    "details": {
+      "history_file": ".../.ws_history"
+    }
   }
 }
 ```
+
+`error.details.history_file` is included for `history_not_found` and `history_empty`.
 
 ## Stable error codes
 
@@ -121,3 +151,12 @@ Guideline reference:
 - JSON output must not include bearer token material.
 - Tokens are never emitted in `result` payloads.
 - history command snippets mask token values (`REDACTED`) in suite artifacts.
+
+## Transport runtime
+
+- `api-websocket` always uses the in-process `tungstenite`-backed runner exposed by
+  `api_testing_core::websocket::runner::execute_websocket_request`. There is no shell-out
+  to an external WebSocket binary at any point in the CLI surface. See
+  `BINARY_DEPENDENCIES.md` section 1.2 and `crates/api-websocket/README.md` ("Transport
+  decision") for the workspace-level statement and the historical "rejected backend"
+  rationale.
