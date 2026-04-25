@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 
 use nils_test_support::cmd::{CmdOptions, run_resolved};
@@ -47,4 +48,25 @@ pub fn run_plan_issue_local_with_env(args: &[&str], env: &[(&str, &str)]) -> Cmd
         args,
         plan_issue_cmd_options().with_envs(env),
     )
+}
+
+/// Materialize the agent-kit prompts the canonical runtime layout requires.
+///
+/// `start-plan` and `start-sprint` copy these files into the plan-issue
+/// runtime tree, so every test that exercises those commands must pre-seed
+/// them under `$AGENT_HOME/prompts/`.
+#[allow(dead_code)]
+pub fn seed_agent_home_prompts(agent_home: &Path) {
+    let prompts = agent_home.join("prompts");
+    fs::create_dir_all(&prompts).expect("create prompts dir");
+    fs::write(
+        prompts.join("plan-issue-delivery-main-agent-init.md"),
+        "# Main Agent Init (test fixture)\n",
+    )
+    .expect("write main-agent init fixture");
+    fs::write(
+        prompts.join("plan-issue-delivery-subagent-init.md"),
+        "# Subagent Init (test fixture)\n",
+    )
+    .expect("write subagent init fixture");
 }

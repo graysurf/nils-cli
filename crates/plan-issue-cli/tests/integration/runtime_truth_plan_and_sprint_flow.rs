@@ -202,6 +202,7 @@ fn start_plan_dry_run_writes_runtime_truth_task_decomposition_metadata() {
     let tmp = TempDir::new().expect("temp dir");
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("sprint3-auto-single-lane.md");
@@ -230,7 +231,7 @@ fn start_plan_dry_run_writes_runtime_truth_task_decomposition_metadata() {
     .expect("write plan");
 
     let plan_task_spec = tmp.path().join("plan-task-spec.tsv");
-    let plan_issue_body = tmp.path().join("plan-issue-body.md");
+    let plan_issue_body = tmp.path().join("issue-body.md");
     let plan_task_spec_s = plan_task_spec.to_string_lossy().to_string();
     let plan_issue_body_s = plan_issue_body.to_string_lossy().to_string();
 
@@ -424,6 +425,7 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
 
     let agent_home = tmp.path().join("agent-home");
     fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
     let agent_home_s = agent_home.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("sprint1-runtime-truth.md");
@@ -452,7 +454,7 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
     .expect("write plan");
 
     let plan_task_spec = tmp.path().join("plan-task-spec.tsv");
-    let plan_issue_body = tmp.path().join("plan-issue-body.md");
+    let plan_issue_body = tmp.path().join("issue-body.md");
     let plan_task_spec_s = plan_task_spec.to_string_lossy().to_string();
     let plan_issue_body_s = plan_issue_body.to_string_lossy().to_string();
     let start_plan_out = common::run_plan_issue_local_with_env(
