@@ -14,15 +14,17 @@ Usage:
 
 Commands:
   tracked [prefix...]    Show files tracked by Git (prefix filter optional)
-  staged                Show files staged for commit
-  unstaged              Show modified files not yet staged
-  all                   Show staged + unstaged changes
-  untracked             Show untracked files
-  commit <id>           Show commit details (use -p to print content)
-  help                  Show help
+  staged                 Show files staged for commit
+  unstaged               Show modified files not yet staged
+  all                    Show all changes (staged and unstaged)
+  untracked              Show untracked files
+  commit <id>            Show commit details (use -p to print content)
+  completion <shell>     Export shell completion script (bash, zsh)
+  help                   Show help
 
 Options:
   --no-color             Disable ANSI colors (also via NO_COLOR)
+  -V, --version          Show version
 ```
 
 ## Commands
@@ -35,6 +37,7 @@ Options:
 - `untracked`: List untracked files. Use `-p, --print` to emit worktree contents.
 - `commit <commit-ish>`: Show commit metadata and file list. Options: `-p, --print` and
   `-P, --parent <n>` for merge commits.
+- `completion <shell>`: Print a shell completion script for `bash` or `zsh`.
 - `help`: Show help output.
 
 ## Exit codes
