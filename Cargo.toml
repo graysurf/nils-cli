@@ -47,3 +47,12 @@ toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 indicatif = "0.18"
+
+[profile.dev]
+# Faster dev/test link times: drop full DWARF (keep line tables so backtraces
+# remain accurate) and leave debug info in .o files instead of packing a .dSYM
+# on macOS. On this workspace (~25 crates, 2400+ tests) the link-heavy phase is
+# the dev-loop bottleneck; these two flags cut rebuild/link time significantly
+# with no effect on test semantics.
+debug = "line-tables-only"
+split-debuginfo = "unpacked"

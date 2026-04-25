@@ -7,11 +7,9 @@
 mod cli_smoke;
 #[path = "integration/completion_outside_repo.rs"]
 mod completion_outside_repo;
-#[path = "integration/env_and_auth_resolution.rs"]
-mod env_and_auth_resolution;
-#[path = "integration/history.rs"]
-mod history;
-#[path = "integration/integration.rs"]
-mod integration;
-#[path = "integration/schema_command.rs"]
-mod schema_command;
+#[path = "integration/e2e.rs"]
+mod e2e;
+#[path = "integration/grpc_integration.rs"]
+mod grpc_integration;
+#[path = "integration/progress_contract.rs"]
+mod progress_contract;
