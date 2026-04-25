@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `59be8d38735a7f1219a0120f35295c7025fe0a0eed94619e2ff19f3e6526c448`
+- Cargo.lock SHA256: `36c032ecafa3734404e9c097d907027b27b409cc8b560c29cea2993b0f6dc85f`
 - Third-party crates (`source != null`): 447
 - Workspace crates (`source == null`, excluded below): 25
 
@@ -97,7 +97,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | chrono-tz | 0.10.4 | MIT OR Apache-2.0 | crates.io |
 | clap | 4.6.1 | MIT OR Apache-2.0 | crates.io |
 | clap_builder | 4.6.0 | MIT OR Apache-2.0 | crates.io |
-| clap_complete | 4.6.0 | MIT OR Apache-2.0 | crates.io |
+| clap_complete | 4.6.2 | MIT OR Apache-2.0 | crates.io |
 | clap_derive | 4.6.1 | MIT OR Apache-2.0 | crates.io |
 | clap_lex | 1.1.0 | MIT OR Apache-2.0 | crates.io |
 | cmake | 0.1.58 | MIT OR Apache-2.0 | crates.io |
