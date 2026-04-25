@@ -60,9 +60,9 @@ because BSD-style `-path` lets `*` cross slash boundaries.
 - `crates/api-websocket/docs/specs/websocket-cli-contract-v1.md`
 - `crates/api-websocket/docs/specs/websocket-request-schema-v1.md`
 - `crates/codex-cli/docs/runbooks/json-consumers.md`
-- `crates/codex-cli/docs/specs/codex-cli-diag-auth-json-contract-v1.md`
+- `crates/codex-cli/docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - `crates/gemini-cli/docs/runbooks/json-consumers.md`
-- `crates/gemini-cli/docs/specs/gemini-cli-diag-auth-json-contract-v1.md`
+- `crates/gemini-cli/docs/specs/gemini-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - `crates/image-processing/docs/runbooks/llm-svg-workflow.md`
 - `crates/memo-cli/docs/runbooks/memo-cli-agent-workflow.md`
 - `crates/memo-cli/docs/specs/memo-cli-command-contract-v1.md`

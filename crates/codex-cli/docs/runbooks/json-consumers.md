@@ -13,7 +13,7 @@ Shared baseline guidance:
 
 Codex-specific contract source:
 
-- `crates/codex-cli/docs/specs/codex-cli-diag-auth-json-contract-v1.md`
+- `crates/codex-cli/docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 
 ## Provider-specific schema routing
 

@@ -13,6 +13,8 @@ pub mod common;
 mod completion_outside_repo;
 #[path = "integration/config.rs"]
 mod config;
+#[path = "integration/contexts_checklist.rs"]
+mod contexts_checklist;
 #[path = "integration/env_paths.rs"]
 mod env_paths;
 #[path = "integration/resolve_builtin.rs"]

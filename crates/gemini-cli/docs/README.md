@@ -4,7 +4,7 @@
 
 ## Specs
 
-- [gemini-cli-diag-auth-json-contract-v1.md](specs/gemini-cli-diag-auth-json-contract-v1.md)
+- [gemini-cli-diag-rate-limits-and-auth-json-contract-v1.md](specs/gemini-cli-diag-rate-limits-and-auth-json-contract-v1.md)
 - [../../../docs/specs/codex-gemini-cli-parity-contract-v1.md](../../../docs/specs/codex-gemini-cli-parity-contract-v1.md) (workspace
   canonical parity contract)
 

@@ -78,10 +78,10 @@ pub struct ContextsArgs {
     #[arg(
         long,
         value_enum,
-        default_value_t = OutputFormat::Text,
+        default_value_t = ResolveFormat::Text,
         help = "Output format"
     )]
-    pub format: OutputFormat,
+    pub format: ResolveFormat,
 }
 
 #[derive(Debug, Args)]
