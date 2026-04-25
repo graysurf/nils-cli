@@ -62,6 +62,7 @@ declare -a removed_transient_docs=(
   "docs/reports/completion-coverage-matrix.md"
   "docs/plans/codex-gemini-core-merge-plan.md"
   "docs/plans/markdown-gh-handling-audit-remediation-plan.md"
+  "docs/plans/repo-code-drift-followup-tracker.md"
   "docs/plans/repo-docs-cleanup-and-alignment-plan.md"
   "docs/plans/third-party-licenses-notices-release-packaging-plan.md"
   "docs/runbooks/image-processing-llm-svg.md"
