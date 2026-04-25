@@ -73,11 +73,9 @@ records the keep/delete decision plus the active caller evidence.
 | `scripts/ci/docs-placement-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/markdownlint-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/nils-cli-checks-entrypoint.sh` | keep | `.github/workflows/ci.yml` `test` and `test_macos` jobs + `DEVELOPMENT.md` contributor commands |
-| `scripts/ci/plan-issue-cli-coverage-delta.sh` | delete-candidate | No active caller found in workflows / contributor docs / required-checks scripts. Removal is a code-change task; flag as follow-up rather than patching here. |
 | `scripts/ci/release-tarball-third-party-audit.sh` | keep | `.github/workflows/release.yml` `build` job |
 | `scripts/ci/test-stale-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` step |
 | `scripts/ci/third-party-artifacts-audit.sh` | keep | `DEVELOPMENT.md` required checks list + `nils-cli-verify-required-checks.sh` step + dependabot bump skill |
-| `scripts/ci/wrapper-mode-smoke.sh` | delete-candidate | No active caller currently references the script outside itself. Previous evidence claim ("`README.md` wrapper contributor flow + wrapper smoke command examples") is stale. Removal is a code-change task; flag as follow-up rather than patching here. |
 
 ## Auxiliary Wrapper / Tooling Decisions
 

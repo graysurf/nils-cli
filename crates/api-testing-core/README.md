@@ -84,7 +84,6 @@ The `lib.rs` re-exports the following top-level modules (see `crates/api-testing
   - gRPC selected: `grpcurl` adapter for unary MVP (`api-testing-core::grpc::runner`).
   - gRPC rejected for MVP: native dynamic invocation path (higher complexity for the same unary delivery goal).
   - WebSocket selected: native Rust `tungstenite` transport (`api-testing-core::websocket::runner`).
-  - WebSocket rejected for MVP: external adapter shell-out (`websocat`-style).
 - Reuse matrix:
   - unchanged: suite selection/filtering, run directory/artifact envelope, summary/JUnit/results rendering.
   - additive grpc: suite schema defaults/case validation, `type: grpc` runner branch, gRPC endpoint/token resolution.
