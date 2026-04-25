@@ -9,9 +9,6 @@ It follows the same CLI conventions as `api-rest`, `api-gql`, and `api-grpc`.
 
 - Selected backend: in-process Rust transport via `tungstenite` in
   `api-testing-core::websocket::runner`. This is the only supported runtime path.
-- Rejected backend (historical): an external adapter that shells out to `websocat` was
-  considered for the MVP and rejected. `websocat` is **not** a runtime dependency of
-  `api-websocket` and is not invoked at any point.
 - Revisit when:
   - streaming/session orchestration needs async multiplexing beyond scripted send/receive steps;
   - platform/runtime behavior diverges in CI and a swap behind the transport boundary is justified.
