@@ -1,4 +1,5 @@
 #[cfg(target_os = "linux")]
+#[allow(clippy::module_inception)]
 mod linux_unit {
     use std::fs;
 

@@ -1,4 +1,5 @@
 #[cfg(target_os = "linux")]
+#[allow(clippy::module_inception)]
 mod linux_portal_unit {
     use std::collections::HashMap;
 

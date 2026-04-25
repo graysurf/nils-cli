@@ -1,4 +1,5 @@
 #[cfg(target_os = "linux")]
+#[allow(clippy::module_inception)]
 mod linux_x11_integration {
     use std::fs;
     use std::time::{Duration, Instant};

@@ -1,4 +1,5 @@
 #[cfg(target_os = "linux")]
+#[allow(clippy::module_inception)]
 mod linux_request_permission {
     use nils_test_support::bin::resolve;
     use nils_test_support::cmd::{CmdOptions, run_with};
