@@ -23,5 +23,7 @@ mod parity_guardrails;
 mod runtime_truth_plan_and_sprint_flow;
 #[path = "integration/start_plan_canonical.rs"]
 mod start_plan_canonical;
+#[path = "integration/start_sprint_canonical.rs"]
+mod start_sprint_canonical;
 #[path = "integration/task_spec_flow.rs"]
 mod task_spec_flow;

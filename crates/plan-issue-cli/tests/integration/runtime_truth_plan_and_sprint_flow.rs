@@ -341,11 +341,11 @@ fn start_plan_dry_run_writes_runtime_truth_task_decomposition_metadata() {
     let prompt_files = sprint_payload["payload"]["result"]["subagent_prompt_files"]
         .as_array()
         .expect("subagent prompt files");
-    assert_eq!(prompt_files.len(), 1, "{}", start_sprint_out.stdout);
+    assert_eq!(prompt_files.len(), 2, "{}", start_sprint_out.stdout);
     let lane_prompt_path = prompt_files
         .iter()
         .filter_map(|value| value.as_str())
-        .find(|path| path.contains(&format!("{anchor_id}-subagent-prompt.md")))
+        .find(|path| path.ends_with(&format!("/{anchor_id}.md")))
         .expect("lane prompt path");
     let lane_prompt = fs::read_to_string(lane_prompt_path).expect("read lane prompt");
     let prompt_fields = parse_prompt_fields(&lane_prompt);
@@ -539,9 +539,10 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
     let prompt_files = payload["payload"]["result"]["subagent_prompt_files"]
         .as_array()
         .expect("prompt files");
-    assert_eq!(prompt_files.len(), 1, "{}", start_out.stdout);
+    assert_eq!(prompt_files.len(), 2, "{}", start_out.stdout);
 
     let prompt_path = prompt_files[0].as_str().expect("prompt path");
+    assert!(prompt_path.ends_with("/S1T1.md"), "{prompt_path}");
     let prompt = fs::read_to_string(prompt_path).expect("read prompt");
     assert!(prompt.contains("Tasks: S1T1, S1T2"), "{prompt}");
     assert!(prompt.contains("Execution Mode: per-sprint"), "{prompt}");
