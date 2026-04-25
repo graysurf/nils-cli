@@ -12,13 +12,15 @@ for common primitives.
 Usage:
   codex-cli <group> <command> [args]
   codex-cli prompt-segment [options]
+  codex-cli completion <shell>
 
 Groups:
-  agent    prompt | advice | knowledge | commit
-  auth     login | use | save | remove | refresh | auto-refresh | current | sync
-  diag     rate-limits
-  config   show | set
-  prompt-segment (options)
+  agent           prompt | advice | knowledge | commit
+  auth            login | use | save | remove | refresh | auto-refresh | current | sync
+  diag            rate-limits
+  config          show | set
+  prompt-segment  (options)
+  completion      bash | zsh
 
 Help:
   codex-cli help
@@ -75,10 +77,11 @@ Auth examples:
 
 ### diag
 
-- `rate-limits [options] [secret.json]`: Rate-limit diagnostics. Options: `-c/--clear-cache`, `-d/--debug`, `--cached`, `--no-refresh-auth`,
-  `--json`, `--one-line`, `--all`, `--async`, `--jobs <n>`.
+- `rate-limits [options] [secret.json]`: Rate-limit diagnostics. Options: `-c/--clear-cache`, `-d/--debug`, `--cached`,
+  `--no-refresh-auth`, `--format <text|json>`, `--json`, `--one-line`, `--all`, `--async`, `--watch`, `--jobs <n>`.
 - `--cached` reads cache only. Freshness is controlled by `CODEX_RATE_LIMITS_CACHE_TTL` (default `3m`); stale cache is rejected unless
   `CODEX_RATE_LIMITS_CACHE_ALLOW_STALE=true`.
+- `--watch` refreshes output every 60 seconds until interrupted and requires `--async`.
 
 ### config
 
@@ -89,6 +92,10 @@ Auth examples:
 
 - `prompt-segment [--no-5h] [--ttl <duration>] [--time-format <strftime>] [--show-timezone] [--refresh] [--is-enabled]`: Render or refresh
   the prompt segment. Default reset time uses local time without timezone; `--show-timezone` adds the local offset.
+
+### completion
+
+- `completion <bash|zsh>`: Print the shell completion script for the requested shell to stdout.
 
 ## JSON contract (service consumers)
 

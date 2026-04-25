@@ -8,46 +8,73 @@ change context for message generation.
 ## Usage
 
 ```text
-Usage:
-  semantic-commit <command> [args]
+Usage: semantic-commit <command> [args]
 
 Commands:
-  staged-context  Print staged change context for commit message generation
-  commit          Commit staged changes with a prepared commit message
-  help            Display help message
-
-Help:
-  semantic-commit help
-  semantic-commit --help
+  staged-context    Print staged change context for commit message generation
+  commit            Commit staged changes with a prepared commit message
+  completion        Export shell completion script
+  help              Display help message
 ```
 
-## Commands
+Use `semantic-commit --help` (or `semantic-commit <command> --help`) for CLI help text.
 
-### staged-context
+### Top-level options
 
-- `staged-context [--format <bundle|json|patch>] [--json] [--repo <path>]`
-- Output formats:
-  - `bundle` (default): `commit-context.json` + `staged.patch`
-  - `json`: only `commit-context.json`
-  - `patch`: only `staged.patch`
-- `--repo <path>` runs against a repository path without changing shell cwd.
+- `-h`, `--help` — print help
+- `-V`, `--version` — print version
 
-### commit
+## Commands and Flags
 
-- `commit [options]`
-- Message sources:
-  - `-m, --message <text>`
-  - `-F, --message-file <path>`
-  - stdin (disabled with `--automation`)
-- Useful options:
-  - `--summary <git-scope|git-show|none>` (default: `git-scope` with fallback to `git-show`)
-  - `--no-summary`
-  - `--validate-only`
-  - `--dry-run`
-  - `--message-out <path>`
-  - `--repo <path>`
-  - `--no-progress`
-  - `--quiet`
+### `staged-context`
+
+Print staged change context for commit message generation.
+
+Flags:
+
+- `--format <bundle|json|patch>` (default: `bundle`)
+- `--json` — equivalent to `--format json`
+- `--repo <path>` — run git commands against the repository path
+
+Output formats:
+
+- `bundle` (default): emits both `commit-context.json` and `staged.patch` to
+  stdout, separated by `===== commit-context.json =====` and
+  `===== staged.patch =====` banners.
+- `json`: emits the `commit-context.json` payload only.
+- `patch`: emits the `git diff --cached` patch only.
+
+### `commit`
+
+Commit staged changes with a prepared commit message.
+
+Message sources (mutually exclusive):
+
+- `-m`, `--message <text>` — inline commit message
+- `-F`, `--message-file <path>` — read commit message from file
+- stdin — used when no message flag is supplied and stdin is non-TTY;
+  disabled by `--automation` / `--non-interactive`
+
+Flags:
+
+- `--message-out <path>` — write the resolved commit message to a file for recovery
+- `--summary <git-scope|git-show|none>` (default: `git-scope` with fallback to `git-show`)
+- `--no-summary` — equivalent to `--summary none`
+- `--repo <path>` — run git commands against the repository path
+- `--automation` (alias: `--non-interactive`) — disallow stdin message fallback
+- `--validate-only` — validate the commit message format and exit without committing
+- `--dry-run` — run validation and staged-change checks, then skip `git commit`
+- `--no-progress` — disable the progress spinner
+- `--quiet` — suppress progress and summary output (implies `--no-progress` and `--no-summary`)
+
+### `completion`
+
+Print a shell completion script to stdout. Pipe the output into your shell's
+completion loader.
+
+```text
+semantic-commit completion <bash|zsh>
+```
 
 ## Commit Message Validation
 

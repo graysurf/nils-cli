@@ -88,8 +88,8 @@ Stable (safe for strict parsing):
     `summary.weekly_remaining`, `summary.weekly_reset_at_epoch`,
     `summary.non_weekly_reset_at_epoch`
 - Auth:
-  - `auth login`: `method` (`chatgpt-browser|chatgpt-device-code|api-key`),
-    `provider` (`chatgpt|openai-api`), `completed`
+  - `auth login`: `method` (`gemini-browser|gemini-device-code|api-key`),
+    `provider` (`gemini|gemini-api`), `completed`
   - `auth use`: `target`, `matched_secret`, `applied`, `auth_file`
   - `auth save`: `auth_file`, `target_file`, `saved`, `overwritten`
     (`true` when an existing target file is replaced)
@@ -189,10 +189,10 @@ Informational (do not hard-depend for schema validation):
   "command": "diag rate-limits",
   "ok": false,
   "error": {
-    "code": "invalid-arguments",
-    "message": "--one-line is not compatible with --json",
+    "code": "invalid-flag-combination",
+    "message": "gemini-rate-limits: --one-line is not compatible with --json",
     "details": {
-      "flag": "--one-line"
+      "flags": ["--one-line", "--json"]
     }
   }
 }
@@ -222,8 +222,8 @@ Informational (do not hard-depend for schema validation):
   "command": "auth login",
   "ok": true,
   "result": {
-    "method": "chatgpt-device-code",
-    "provider": "chatgpt",
+    "method": "gemini-device-code",
+    "provider": "gemini",
     "completed": true
   }
 }
@@ -233,9 +233,9 @@ Informational (do not hard-depend for schema validation):
 
 | CLI invocation | `result.method` | `result.provider` |
 | --- | --- | --- |
-| `auth login` | `chatgpt-browser` | `chatgpt` |
-| `auth login --device-code` | `chatgpt-device-code` | `chatgpt` |
-| `auth login --api-key` | `api-key` | `openai-api` |
+| `auth login` | `gemini-browser` | `gemini` |
+| `auth login --device-code` | `gemini-device-code` | `gemini` |
+| `auth login --api-key` | `api-key` | `gemini-api` |
 
 ### auth save (success)
 
@@ -343,6 +343,60 @@ Informational (do not hard-depend for schema validation):
         "status": "failed",
         "reason": "token-endpoint-failed"
       }
+    ]
+  }
+}
+```
+
+### auth current (failure: secret-not-matched)
+
+```json
+{
+  "schema_version": "gemini-cli.auth.v1",
+  "command": "auth current",
+  "ok": false,
+  "error": {
+    "code": "secret-not-matched",
+    "message": "/home/user/.gemini/oauth_creds.json does not match any known secret",
+    "details": {
+      "auth_file": "/home/user/.gemini/oauth_creds.json",
+      "matched": false
+    }
+  }
+}
+```
+
+### auth current (failure: secret-dir-not-found)
+
+```json
+{
+  "schema_version": "gemini-cli.auth.v1",
+  "command": "auth current",
+  "ok": false,
+  "error": {
+    "code": "secret-dir-not-found",
+    "message": "/home/user/.gemini/secrets not found",
+    "details": {
+      "secret_dir": "/home/user/.gemini/secrets"
+    }
+  }
+}
+```
+
+### auth sync (success)
+
+```json
+{
+  "schema_version": "gemini-cli.auth.v1",
+  "command": "auth sync",
+  "ok": true,
+  "result": {
+    "auth_file": "/home/user/.gemini/oauth_creds.json",
+    "synced": 1,
+    "skipped": 3,
+    "failed": 0,
+    "updated_files": [
+      "/home/user/.gemini/secrets/alpha.json"
     ]
   }
 }
