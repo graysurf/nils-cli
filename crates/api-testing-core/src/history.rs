@@ -73,8 +73,23 @@ fn rotate_file_keep_n(history_file: &Path, keep: u32) {
             continue;
         }
 
-        let _ = std::fs::remove_file(&dst);
-        let _ = std::fs::rename(&src, &dst);
+        if let Err(err) = std::fs::remove_file(&dst)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "warning: history rotation failed to remove {}: {err}",
+                dst.display()
+            );
+            return;
+        }
+        if let Err(err) = std::fs::rename(&src, &dst) {
+            eprintln!(
+                "warning: history rotation failed to rename {} -> {}: {err}",
+                src.display(),
+                dst.display()
+            );
+            return;
+        }
     }
 }
 
