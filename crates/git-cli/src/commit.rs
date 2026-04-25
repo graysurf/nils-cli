@@ -187,11 +187,13 @@ fn parse_context_args(args: &[String]) -> ParseOutcome<ContextArgs> {
 }
 
 fn print_context_usage() {
-    println!("Usage: git-commit-context [--stdout|--both] [--no-color] [--include <path/glob>]");
-    println!("  --stdout   Print commit context to stdout only");
-    println!("  --both     Print to stdout and copy to clipboard");
-    println!("  --no-color Disable ANSI colors (also via NO_COLOR)");
-    println!("  --include  Show full content for selected paths (repeatable)");
+    println!(
+        "Usage: git-cli commit context [-p|--stdout|--both] [--no-color] [--include <path/glob>]"
+    );
+    println!("  -p, --stdout, --print   Print commit context to stdout only");
+    println!("  --both                  Print to stdout and copy to clipboard");
+    println!("  --no-color              Disable ANSI colors (also via NO_COLOR)");
+    println!("  --include               Show full content for selected paths (repeatable)");
 }
 
 fn git_scope_available() -> bool {

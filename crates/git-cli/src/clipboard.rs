@@ -11,7 +11,7 @@ const CLIPBOARD_TOOL_ORDER: [ClipboardTool; 4] = [
 
 pub fn set_clipboard_best_effort(text: &str) -> Result<()> {
     if env::var("GIT_CLI_FIXTURE_CLIPBOARD_MODE").ok().as_deref() == Some("missing") {
-        eprintln!("⚠️  No clipboard tool found (requires pbcopy, xclip, or xsel)");
+        eprintln!("⚠️  No clipboard tool found (requires pbcopy, wl-copy, xclip, or xsel)");
         return Ok(());
     }
 
@@ -20,7 +20,7 @@ pub fn set_clipboard_best_effort(text: &str) -> Result<()> {
         copy_best_effort(text, &policy),
         ClipboardOutcome::SkippedNoTool | ClipboardOutcome::SkippedFailure
     ) {
-        eprintln!("⚠️  No clipboard tool found (requires pbcopy, xclip, or xsel)");
+        eprintln!("⚠️  No clipboard tool found (requires pbcopy, wl-copy, xclip, or xsel)");
     }
     Ok(())
 }

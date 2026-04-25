@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 fn copy_staged_help() -> &'static str {
-    "Usage: git-copy-staged [--stdout|--both]\n  --stdout   Print staged diff to stdout (no status message)\n  --both     Print to stdout and copy to clipboard\n"
+    "Usage: git-cli utils copy-staged [-p|--stdout|--both]\n  -p, --stdout, --print   Print staged diff to stdout (no status message)\n  --both                  Print to stdout and copy to clipboard\n"
 }
 
 fn trim_trailing_newlines(input: &str) -> &str {
@@ -140,7 +140,7 @@ fn utils_copy_staged_rejects_unknown_arg() {
     assert_eq!(output.stdout_text(), "");
     assert_eq!(
         output.stderr_text(),
-        "❗ Unknown argument: --nope\nUsage: git-copy-staged [--stdout|--both]\n"
+        "❗ Unknown argument: --nope\nUsage: git-cli utils copy-staged [-p|--stdout|--both]\n"
     );
 }
 

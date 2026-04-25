@@ -66,7 +66,7 @@ fn copy_staged(args: &[String]) -> i32 {
 
     if let Some(arg) = unknown_arg {
         eprintln!("❗ Unknown argument: {arg}");
-        eprintln!("Usage: git-copy-staged [--stdout|--both]");
+        eprintln!("Usage: git-cli utils copy-staged [-p|--stdout|--both]");
         return 1;
     }
 
@@ -191,7 +191,7 @@ fn shell_escape(value: &str) -> String {
 
 fn print_copy_staged_help() {
     print!(
-        "Usage: git-copy-staged [--stdout|--both]\n  --stdout   Print staged diff to stdout (no status message)\n  --both     Print to stdout and copy to clipboard\n"
+        "Usage: git-cli utils copy-staged [-p|--stdout|--both]\n  -p, --stdout, --print   Print staged diff to stdout (no status message)\n  --both                  Print to stdout and copy to clipboard\n"
     );
 }
 
