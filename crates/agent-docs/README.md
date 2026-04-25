@@ -72,7 +72,7 @@ Path resolution is deterministic and applies to all commands.
 
 ```text
 Usage:
-  agent-docs <command> [options]
+  agent-docs [OPTIONS] <command> [options]
 
 Commands:
   resolve            Resolve required docs for a context
@@ -81,9 +81,25 @@ Commands:
   scaffold-agents    Scaffold default AGENTS.md template
   baseline           Check baseline doc coverage
   scaffold-baseline  Scaffold missing baseline docs
+  completion         Print shell completion script (bash, zsh)
 ```
 
 Use `agent-docs --help` (or `agent-docs <command> --help`) for CLI help text.
+
+### Top-level options
+
+These options sit before the subcommand and apply to every command:
+
+- `--agent-home <path>` — override `AGENT_HOME` root path
+- `--project-path <path>` — override project root path
+- `--worktree-fallback <auto|local-only>` (default: `auto`) — `auto` enables
+  linked-worktree fallback to the primary worktree; `local-only` disables fallback
+  and enforces local project files only
+- `-h`, `--help` — print help
+- `-V`, `--version` — print version
+
+For convenience, the same `--agent-home`, `--project-path`, and
+`--worktree-fallback` flags are also accepted positionally on each subcommand.
 
 ## Commands and Flags
 
@@ -184,10 +200,10 @@ Audit minimum baseline documents.
 
 Flags:
 
-- `--check` (required in Sprint contract)
+- `--check` (run baseline check mode; required to produce a baseline report)
 - `--target home|project|all` (default: `all`)
 - `--format text|json` (default: `text`)
-- `--strict` (missing required docs become exit code `1`)
+- `--strict` (missing required baseline docs become exit code `1`)
 - `--agent-home <path>`
 - `--project-path <path>`
 
@@ -204,6 +220,21 @@ Flags:
 - `--format text|json` (default: `text`)
 - `--agent-home <path>`
 - `--project-path <path>`
+
+### `completion`
+
+Print a shell completion script to stdout. Pipe the output into your shell's
+completion loader.
+
+Usage:
+
+```bash
+agent-docs completion <bash|zsh>
+```
+
+Arguments:
+
+- `<SHELL>` — one of `bash`, `zsh`
 
 ## Exit Codes
 
@@ -288,6 +319,9 @@ summary: required_total=2 present_required=2 missing_required=0 strict=false
   "strict": false,
   "agent_home": "/Users/example/.agents",
   "project_path": "/Users/example/work/nils-cli",
+  "is_linked_worktree": false,
+  "git_common_dir": null,
+  "primary_worktree_path": null,
   "documents": [
     {
       "context": "startup",
@@ -315,6 +349,10 @@ summary: required_total=2 present_required=2 missing_required=0 strict=false
   }
 }
 ```
+
+The `is_linked_worktree`, `git_common_dir`, and `primary_worktree_path` fields are
+emitted on every `resolve --format json` invocation. They are populated only when
+the project root is a linked Git worktree (see "Worktree fallback").
 
 ### `resolve` checklist example
 

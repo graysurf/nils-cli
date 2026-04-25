@@ -107,6 +107,12 @@ Auth examples:
 - `GEMINI_SECRET_CACHE_DIR` controls secret cache timestamps.
 - `GEMINI_PROMPT_SEGMENT_ENABLED=true` enables prompt-segment output.
 - `GEMINI_PROMPT_SEGMENT_TTL` overrides the prompt-segment cache TTL.
+- `GEMINI_PROMPT_SEGMENT_REFRESH_MIN_SECONDS` (default `30`) throttles background-refresh attempts; see
+  parity contract for invariants.
+- `GEMINI_PROMPT_SEGMENT_LOCK_STALE_SECONDS` (default `90`) controls stale-lock recovery for
+  background refresh.
+- `GEMINI_RATE_LIMITS_DEFAULT_ALL_ENABLED=true` makes `diag rate-limits` default to `--all` when no
+  positional secret is supplied.
 - `GEMINI_AUTO_REFRESH_ENABLED` and `GEMINI_AUTO_REFRESH_MIN_DAYS` configure auth auto-refresh behavior.
 
 ## Dependencies

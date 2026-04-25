@@ -23,9 +23,12 @@ Gemini-specific contract source:
 ## Gemini-specific integration notes
 
 - `auth login` stable method values:
-  - `chatgpt-browser`
-  - `chatgpt-device-code`
+  - `gemini-browser`
+  - `gemini-device-code`
   - `api-key`
+- `auth login` stable provider values:
+  - `gemini` (browser / device-code)
+  - `gemini-api` (api-key)
 - `auth save` overwrite confirmation failure code:
   - `overwrite-confirmation-required`
 - `auth remove` confirmation failure code:
@@ -34,6 +37,8 @@ Gemini-specific contract source:
   - `secret-dir-not-configured`
   - `secret-dir-not-found`
   - `secret-dir-read-failed`
+- `auth current` no-match failure code:
+  - `secret-not-matched`
 
 ## Consumer checklist
 
