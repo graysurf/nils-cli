@@ -8,36 +8,45 @@ optional history, and can generate Markdown reports.
 ## Usage
 
 ```text
-Usage:
-  api-rest <command> [args]
+Usage: api-rest <command> [args]
 
 Commands:
   call             Execute a request file and print the response body to stdout (default)
   history          Print the last (or last N) history entries
   report           Generate a Markdown API test report
   report-from-cmd  Generate a report from a saved `call` snippet
+  completion       Print shell completion script
 
-Help:
+Common options (see subcommand help for full details):
+  --config-dir <dir>   Seed setup/rest discovery (call/history/report)
+  -h, --help           Print help
+
+Examples:
   api-rest --help
   api-rest call --help
-  api-rest history --help
   api-rest report --help
   api-rest report-from-cmd --help
+  api-rest completion zsh
 ```
 
 ## Commands
 
 - `call` (default): Execute a request file and print the response body.
-  Options: `--env <name>`, `--url <url>`, `--token <name>`, `--config-dir <dir>`, `--no-history`.
+  Positional: `<request.request.json>`.
+  Options: `-e/--env <name>`, `-u/--url <url>`, `--token <name>`, `--config-dir <dir>`,
+  `--no-history`.
 - `history`: Print the last entry or tail N entries.
   Options: `--config-dir <dir>`, `--file <path>`, `--last`, `--tail <n>`, `--command-only`.
 - `report`: Generate a Markdown report for a request.
-  Options: `--case <name>`, `--request <file>`, `--run` | `--response <file|->`, `--out <path>`,
-  `--env <name>`, `--url <url>`, `--token <name>`, `--no-redact`, `--no-command`,
-  `--no-command-url`, `--project-root <path>`, `--config-dir <dir>`.
-- `report-from-cmd`: Generate a report from a saved `call` command snippet.
-  Options: `--case <name>`, `--out <path>`, `--response <file|->`, `--allow-empty`, `--dry-run`,
-  `--stdin`.
+  Required: `--case <name>`, `--request <file>`.
+  Options: `--out <path>`, `-e/--env <name>`, `-u/--url <url>`, `--token <name>`,
+  `--run`, `--response <file|->`, `--no-redact`, `--no-command`, `--no-command-url`,
+  `--project-root <path>`, `--config-dir <dir>`.
+- `report-from-cmd`: Generate a Markdown report from a saved `call` command snippet.
+  Positional: `[snippet]` (or pass via `--stdin`).
+  Options: `--case <name>`, `--out <path>`, `--response <file|->`, `--allow-empty`,
+  `--dry-run`, `--stdin`.
+- `completion`: Print a shell completion script. Argument: `<SHELL>` (`bash` or `zsh`).
 
 ## Docs
 

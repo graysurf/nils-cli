@@ -7,16 +7,20 @@ It follows the same CLI conventions as `api-rest`, `api-gql`, and `api-grpc`.
 
 ## Transport decision
 
-- Selected backend: native Rust transport via `tungstenite` in `api-testing-core::websocket::runner`.
-- Rejected backend: external adapter (`websocat`-style shell-out) for MVP.
+- Selected backend: in-process Rust transport via `tungstenite` in
+  `api-testing-core::websocket::runner`. This is the only supported runtime path.
+- Rejected backend (historical): an external adapter that shells out to `websocat` was
+  considered for the MVP and rejected. `websocat` is **not** a runtime dependency of
+  `api-websocket` and is not invoked at any point.
 - Revisit when:
   - streaming/session orchestration needs async multiplexing beyond scripted send/receive steps;
   - platform/runtime behavior diverges in CI and a swap behind the transport boundary is justified.
 
 ## Runtime dependency policy
 
-- Runtime dependency policy: no extra external binary is required for WebSocket execution.
+- No extra external binary is required for WebSocket execution.
 - `api-websocket` uses the embedded Rust transport path only.
+- Cross-reference: see `BINARY_DEPENDENCIES.md` section 1.2 for the workspace-level statement.
 
 ## Setup and naming conventions
 
@@ -75,16 +79,55 @@ Quick example:
 }
 ```
 
+## Usage
+
+```text
+Usage: api-websocket <command> [args]
+
+Commands:
+  call             Execute a request file and print the last received message to stdout (default)
+  history          Print the last (or last N) history entries
+  report           Generate a Markdown API test report
+  report-from-cmd  Generate a report from a saved `call` snippet
+  completion       Print shell completion script
+
+Common options (see subcommand help for full details):
+  --config-dir <dir>   Seed setup/websocket discovery (call/history/report)
+  --format <text|json> Structured output for call/history
+  -h, --help           Print help
+
+Examples:
+  api-websocket --help
+  api-websocket call --help
+  api-websocket report --help
+  api-websocket report-from-cmd --help
+  api-websocket completion zsh
+```
+
 ## Commands
 
-- `call` (default): execute request and print the last received message.
-- `history`: print last entry or tail entries.
-- `report`: generate Markdown report from `--run` or `--response`.
-- `report-from-cmd`: reconstruct `report` args from a saved `call` snippet.
+- `call` (default): Execute a request file and print the last received message.
+  Positional: `<request.ws.json>` (also accepts `*.websocket.json`).
+  Options: `-e/--env <name>`, `-u/--url <url>`, `--token <name>`, `--config-dir <dir>`,
+  `--no-history`, `--format <text|json>`.
+- `history`: Print the last entry or tail N entries.
+  Options: `--config-dir <dir>`, `--file <path>`, `--last`, `--tail <n>`, `--command-only`,
+  `--format <text|json>`.
+- `report`: Generate a Markdown report for a request.
+  Required: `--case <name>`, `--request <file>`. Exactly one of `--run` or `--response <file|->`.
+  Options: `--out <path>`, `-e/--env <name>`, `-u/--url <url>`, `--token <name>`,
+  `--no-redact`, `--no-command`, `--no-command-url`, `--project-root <path>`,
+  `--config-dir <dir>`.
+- `report-from-cmd`: Generate a Markdown report from a saved `call` command snippet.
+  Positional: `[snippet]` (or pass `--stdin` to read from stdin).
+  Options: `--case <name>`, `--out <path>`, `--response <file|->`, `--allow-empty`
+  (alias `--expect-empty`; no-op for `api-websocket`, kept for parity), `--dry-run`,
+  `--stdin`.
+- `completion`: Print a shell completion script. Argument: `<SHELL>` (`bash` or `zsh`).
 
 ## JSON contract (`--format json`)
 
-Supported for `call` and `history`.
+Supported for `call` and `history`. Other subcommands ignore `--format`.
 
 Success envelope:
 
@@ -106,10 +149,15 @@ Failure envelope:
   "ok": false,
   "error": {
     "code": "stable-machine-code",
-    "message": "human-readable summary"
+    "message": "human-readable summary",
+    "details": {}
   }
 }
 ```
+
+`error.details` is optional and only present for failure modes that carry contextual
+data (for example `expectation_failed` includes `target` and `last_received`;
+`history_not_found` includes `history_file`).
 
 Full CLI/JSON contract: [`docs/specs/websocket-cli-contract-v1.md`](docs/specs/websocket-cli-contract-v1.md)
 
