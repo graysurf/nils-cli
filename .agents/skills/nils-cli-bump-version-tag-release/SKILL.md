@@ -44,6 +44,7 @@ Inputs:
   - `--from-tap` (resume mode: skip nils-cli stages 1-8 and run only the tap stage; requires
     an existing local `v<version>` tag in the nils-cli work tree)
   - `--tap-formula <name>` (formula basename, default `nils-cli`; reserved for AWL et al.)
+  - `--skip-dev-clean` (do not clear `~/.local/nils-cli/bin` after a successful release)
   - `NILS_CLI_HOMEBREW_TAP_DIR` (env var; tap path)
   - `NILS_CLI_RELEASE_WAIT_SECONDS` (env var; max seconds to wait for source `release.yml`, default 1200)
   - `NILS_CLI_TAP_WAIT_SECONDS` (env var; max seconds to wait for tap `release.yml`, default 1200)
@@ -89,6 +90,7 @@ Outputs (tap stage):
 - Creates a tap-side semantic commit `chore(formula): bump <formula> to v<version>` and pushes `main`.
 - Creates an annotated prefix tag `<formula>-v<version>` and pushes it to trigger the tap `release.yml`.
 - Unless `--skip-tap-wait`, waits for the tap `release.yml` run on the prefix tag to finish `success`.
+- Unless `--skip-dev-clean`, clears `~/.local/nils-cli/bin` so the freshly published brew formula takes precedence over any prior dev install (no-op when the directory is missing or already empty).
 
 Exit codes:
 

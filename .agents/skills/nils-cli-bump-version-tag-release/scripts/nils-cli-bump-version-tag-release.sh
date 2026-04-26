@@ -21,6 +21,7 @@ Options:
   --from-tap              Resume mode: skip nils-cli stages 1-8 and run only the tap stage.
                           Requires --version and an existing v<version> tag in this repo.
   --tap-formula <name>    Formula basename to bump (default: nils-cli). Reserved for AWL et al.
+  --skip-dev-clean        Do not clear ~/.local/nils-cli/bin after a successful release.
   -h, --help              Show help.
 
 Default behavior:
@@ -584,6 +585,23 @@ run_tap_stage() {
   note "tap release.yml green for ${prefix_tag}"
 }
 
+clean_dev_install() {
+  local skip="$1"
+  if [[ "$skip" -eq 1 ]]; then
+    note "--skip-dev-clean set; leaving ~/.local/nils-cli/bin untouched"
+    return 0
+  fi
+  local dev_bin="${HOME}/.local/nils-cli/bin"
+  if [[ ! -d "$dev_bin" ]]; then
+    return 0
+  fi
+  if [[ -z "$(ls -A "$dev_bin" 2>/dev/null)" ]]; then
+    return 0
+  fi
+  note "clearing dev install at ${dev_bin} so brew copies take precedence"
+  find "$dev_bin" -mindepth 1 -delete
+}
+
 # === Argument parsing ========================================================
 
 version=""
@@ -599,6 +617,7 @@ skip_tap_wait=0
 skip_tap_tag=0
 from_tap=0
 tap_formula="nils-cli"
+skip_dev_clean=0
 
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
@@ -662,6 +681,10 @@ while [[ $# -gt 0 ]]; do
       fi
       tap_formula="${2:-}"
       shift 2
+      ;;
+    --skip-dev-clean)
+      skip_dev_clean=1
+      shift
       ;;
     -h|--help)
       usage
@@ -741,6 +764,7 @@ if [[ "$from_tap" -eq 1 ]]; then
     "$tap_formula" \
     "$skip_tap_tag" \
     "$skip_tap_wait"
+  clean_dev_install "$skip_dev_clean"
   exit 0
 fi
 
@@ -1030,3 +1054,5 @@ run_tap_stage \
   "$tap_formula" \
   "$skip_tap_tag" \
   "$skip_tap_wait"
+
+clean_dev_install "$skip_dev_clean"
