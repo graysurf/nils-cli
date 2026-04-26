@@ -190,10 +190,7 @@ fn render_tree(files: &[String], no_color: bool) -> Result<()> {
         return Ok(());
     }
 
-    let mut tree_args = vec!["--fromfile"];
-    if !no_color {
-        tree_args.push("-C");
-    }
+    let tree_args = build_tree_args(no_color);
 
     let tree_input = expand_tree_paths(files);
     let mut cmd = Command::new("tree");
@@ -245,6 +242,17 @@ pub fn render_tree_for_commit(files: &[String], no_color: bool) -> Result<()> {
     render_tree(files, no_color)
 }
 
+fn build_tree_args(no_color: bool) -> Vec<&'static str> {
+    // `-a` is required even when callers feed paths via stdin: `tree --fromfile`
+    // still applies its hidden-name filter on each node, so dot-prefixed paths
+    // (e.g. `.agents/`, `.github/`) are silently dropped without it.
+    let mut args = vec!["--fromfile", "-a"];
+    if !no_color {
+        args.push("-C");
+    }
+    args
+}
+
 fn expand_tree_paths(files: &[String]) -> Vec<String> {
     let mut set = BTreeSet::new();
     for file in files {
@@ -269,8 +277,8 @@ fn strip_ansi(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        color_reset_for_commit, expand_tree_paths, kind_color_for_commit, strip_ansi,
-        write_tree_input,
+        build_tree_args, color_reset_for_commit, expand_tree_paths, kind_color_for_commit,
+        strip_ansi, write_tree_input,
     };
 
     #[test]
@@ -311,6 +319,36 @@ mod tests {
             String::from_utf8(sink).expect("utf8"),
             "src/main.rs\nsrc/lib.rs\n"
         );
+    }
+
+    #[test]
+    fn build_tree_args_always_includes_dash_a_to_show_dot_paths() {
+        // Regression: `tree --fromfile` would silently drop dot-prefixed paths
+        // (e.g. `.agents/...`) from the rendered tree without `-a`.
+        assert!(build_tree_args(true).contains(&"-a"));
+        assert!(build_tree_args(false).contains(&"-a"));
+    }
+
+    #[test]
+    fn build_tree_args_toggles_color_flag() {
+        assert!(!build_tree_args(true).contains(&"-C"));
+        assert!(build_tree_args(false).contains(&"-C"));
+    }
+
+    #[test]
+    fn expand_tree_paths_preserves_dot_prefixed_segments() {
+        let files = vec![
+            ".agents/skills/foo/SKILL.md".to_string(),
+            ".github/workflows/ci.yml".to_string(),
+            "docs/plans/plan.md".to_string(),
+        ];
+        let paths = expand_tree_paths(&files);
+        assert!(paths.contains(&".agents".to_string()));
+        assert!(paths.contains(&".agents/skills".to_string()));
+        assert!(paths.contains(&".agents/skills/foo".to_string()));
+        assert!(paths.contains(&".agents/skills/foo/SKILL.md".to_string()));
+        assert!(paths.contains(&".github/workflows/ci.yml".to_string()));
+        assert!(paths.contains(&"docs/plans/plan.md".to_string()));
     }
 
     #[test]
