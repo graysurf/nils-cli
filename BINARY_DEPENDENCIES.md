@@ -92,6 +92,16 @@ These are repository scripts (not third-party packages):
   - `scripts/ci/coverage-summary.sh`
   - `scripts/ci/coverage-badge.sh`
 
+## 4.1 Adapter Opt-Outs
+
+`plan-issue-cli` exposes one runtime opt-out env var consumed at command time.
+
+| Env var | Effect | Intended consumer |
+|---|---|---|
+| `PLAN_ISSUE_SKIP_INIT_SNAPSHOT` | When set non-empty, `start-plan` and `start-sprint` skip both the existence check on `<AGENT_HOME>/prompts/plan-issue-delivery-{main,subagent}-init.md` and the matching `.snapshot.md` copy into the per-issue / per-sprint workspace. The result payload sets `init_snapshot_skipped: true` for auditability; every other artifact (plan snapshot, dispatch records, prompt manifest, etc.) is unaffected. | Runtime adapters (such as the Claude Code `plan-issue` plugin) that ship their own role/protocol prompts inline with their adapter agents and do not need the canonical init-prompt snapshots in sprint workspaces. |
+
+The codex and opencode adapters must not set this var; they continue to rely on the canonical init prompts. The env var defaults to unset, so the binary's behaviour is unchanged for every other caller.
+
 ## 5. `agent-docs` integration for `project-dev`
 
 Use `agent-docs add` to register this file as a required project-level document for
