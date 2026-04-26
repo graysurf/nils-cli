@@ -151,6 +151,8 @@ fn start_sprint_emits_dispatch_record_per_task() {
             "subagent_init_snapshot_path",
             "plan_snapshot_path",
             "worktree",
+            // Task 1.4: explicit absolute worktree path for orchestrators.
+            "worktree_abs_path",
             "branch",
             "execution_mode",
             "pr_group",
@@ -164,6 +166,23 @@ fn start_sprint_emits_dispatch_record_per_task() {
         }
         assert_eq!(record["workflow_role"], "implementation");
         assert_eq!(record["base_branch"], "plan/issue-217");
+        // Task 1.4: worktree_abs_path is absolute and lives under the
+        // canonical $AGENT_HOME/out/plan-issue-delivery/<slug>/issue-N/worktrees/ tree.
+        let worktree_abs = record["worktree_abs_path"]
+            .as_str()
+            .expect("worktree_abs_path string");
+        assert!(
+            std::path::Path::new(worktree_abs).is_absolute(),
+            "worktree_abs_path must be absolute: {worktree_abs}"
+        );
+        assert!(
+            worktree_abs.contains("/out/plan-issue-delivery/")
+                && worktree_abs.contains("/issue-217/worktrees/"),
+            "worktree_abs_path must live under canonical runtime root: {worktree_abs}"
+        );
+        // For backwards compatibility v1 readers expect `worktree` to be
+        // identical to the new field.
+        assert_eq!(record["worktree"], record["worktree_abs_path"]);
     }
 }
 
@@ -245,6 +264,61 @@ fn start_sprint_relocates_task_prompt() {
             "task id stem should not embed retired-format suffixes: {file_name}"
         );
     }
+}
+
+#[test]
+fn start_sprint_emits_repo_slug_and_v2_schema_version() {
+    // Task 1.1: start-sprint result exposes the runtime repo slug;
+    // schema_version bumps to v2.
+    let (_tmp, _ah, ah_s) = seeded_agent_home();
+    let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
+    assert_eq!(
+        run.payload["schema_version"], "plan-issue-cli.start.sprint.v2",
+        "schema_version should bump to v2"
+    );
+    assert_eq!(
+        run.payload["payload"]["result"]["repo_slug"], "graysurf__plan-issue-smoke",
+        "result.repo_slug should mirror runtime_layout::repo_slug derivation"
+    );
+}
+
+#[test]
+fn start_sprint_emits_pr_groups_array() {
+    // Task 1.3: start-sprint payload includes `pr_groups` listing every
+    // group actually created (name + task_ids).
+    let (_tmp, _ah, ah_s) = seeded_agent_home();
+    let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
+
+    let pr_groups = run.payload["payload"]["result"]["pr_groups"]
+        .as_array()
+        .expect("pr_groups in result");
+    assert!(
+        !pr_groups.is_empty(),
+        "pr_groups must list at least one group: {pr_groups:?}"
+    );
+
+    let mut total_tasks = 0;
+    for group in pr_groups {
+        let name = group["name"].as_str().expect("group name");
+        assert!(
+            !name.is_empty(),
+            "pr_group name must be non-empty: {group:?}"
+        );
+        let task_ids = group["task_ids"].as_array().expect("task_ids array");
+        assert!(
+            !task_ids.is_empty(),
+            "pr_group task_ids must be non-empty: {group:?}"
+        );
+        total_tasks += task_ids.len();
+    }
+
+    let record_count = run.payload["payload"]["result"]["record_count"]
+        .as_u64()
+        .expect("record_count");
+    assert_eq!(
+        total_tasks as u64, record_count,
+        "every task should appear in exactly one pr-group"
+    );
 }
 
 #[test]

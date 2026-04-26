@@ -197,7 +197,27 @@ impl Command {
     }
 
     pub fn schema_version(&self) -> String {
-        format!("plan-issue-cli.{}.v1", self.command_id().replace('-', "."))
+        // Most commands stay on `.v1`. Commands whose `result` payload picked
+        // up new orchestrator-friendly fields in Sprint 1 (`repo_slug`,
+        // `pr_groups`, `worktree_abs_path`) bump to `.v2`. Existing v1
+        // readers that read only the older fields are still compatible —
+        // the new fields are additive — but should be considered deprecated
+        // and updated to the v2 schema.
+        let suffix = match self {
+            // Result now exposes `repo_slug` (Task 1.1).
+            Self::StartPlan(_) => "v2",
+            // Result now exposes `repo_slug` (Task 1.1).
+            Self::StatusPlan(_) => "v2",
+            // Result now exposes `repo_slug` (Task 1.1) + `pr_groups`
+            // (Task 1.3); dispatch records gain `worktree_abs_path`
+            // (Task 1.4).
+            Self::StartSprint(_) => "v2",
+            _ => "v1",
+        };
+        format!(
+            "plan-issue-cli.{}.{suffix}",
+            self.command_id().replace('-', ".")
+        )
     }
 
     pub fn payload(&self) -> Value {

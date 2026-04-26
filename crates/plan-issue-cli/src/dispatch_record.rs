@@ -21,13 +21,24 @@ pub const WORKFLOW_ROLE_IMPLEMENTATION: &str = "implementation";
 /// Stable, sorted JSON object written to `dispatch-<TASK_ID>.json`.
 ///
 /// Field order matches the canonical contract.
+///
+/// **Deprecation note (Task 1.4)**: `worktree` is retained verbatim for
+/// backwards compatibility with existing v1 readers. New consumers should
+/// read `worktree_abs_path` instead — both fields carry the canonical
+/// absolute path under `$AGENT_HOME/out/plan-issue-delivery/<slug>/issue-<N>/worktrees/`,
+/// but `worktree_abs_path` is the explicit, self-describing name and will
+/// remain stable across future refactors. `worktree` may eventually be
+/// removed in a v3 schema bump.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchRecord {
     pub task_id: String,
     pub task_prompt_path: String,
     pub subagent_init_snapshot_path: String,
     pub plan_snapshot_path: String,
+    /// Deprecated alias for `worktree_abs_path`; kept for v1 readers.
     pub worktree: String,
+    /// Canonical absolute path of the assigned worktree (Task 1.4).
+    pub worktree_abs_path: String,
     pub branch: String,
     pub execution_mode: String,
     pub pr_group: String,
@@ -42,18 +53,23 @@ impl DispatchRecord {
         task_prompt_path: impl Into<String>,
         subagent_init_snapshot_path: impl Into<String>,
         plan_snapshot_path: impl Into<String>,
-        worktree: impl Into<String>,
+        worktree_abs_path: impl Into<String>,
         branch: impl Into<String>,
         execution_mode: impl Into<String>,
         pr_group: impl Into<String>,
         base_branch: impl Into<String>,
     ) -> Self {
+        let worktree_abs = worktree_abs_path.into();
         Self {
             task_id: task_id.into(),
             task_prompt_path: task_prompt_path.into(),
             subagent_init_snapshot_path: subagent_init_snapshot_path.into(),
             plan_snapshot_path: plan_snapshot_path.into(),
-            worktree: worktree.into(),
+            // `worktree` was already the assigned absolute path post the
+            // canonical-runtime refactor; keep it identical to
+            // `worktree_abs_path` for v1 reader compatibility.
+            worktree: worktree_abs.clone(),
+            worktree_abs_path: worktree_abs,
             branch: branch.into(),
             execution_mode: execution_mode.into(),
             pr_group: pr_group.into(),
@@ -105,6 +121,8 @@ mod tests {
             "\"subagent_init_snapshot_path\"",
             "\"plan_snapshot_path\"",
             "\"worktree\"",
+            // Task 1.4: explicit absolute path field for orchestrators.
+            "\"worktree_abs_path\"",
             "\"branch\"",
             "\"execution_mode\"",
             "\"pr_group\"",
@@ -126,6 +144,17 @@ mod tests {
                 "json must not include adapter key {absent}: {json}"
             );
         }
+    }
+
+    #[test]
+    fn test_worktree_abs_path_mirrors_worktree() {
+        let record = sample();
+        assert_eq!(record.worktree_abs_path, record.worktree);
+        assert!(
+            record.worktree_abs_path.starts_with('/'),
+            "worktree_abs_path must be absolute: {}",
+            record.worktree_abs_path
+        );
     }
 
     #[test]

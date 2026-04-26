@@ -267,6 +267,7 @@ fn run_start_plan(
         "task_spec_path": path_text(&task_spec_out),
         "issue_body_path": path_text(&issue_body_out),
         "issue_root": path_text(issue_root.root()),
+        "repo_slug": repo_slug,
         "main_agent_init_snapshot_path": path_text(&main_agent_init_target),
         "plan_branch_ref_path": path_text(&plan_branch_ref),
         "record_count": build.rows.len(),
@@ -344,11 +345,23 @@ fn run_status_plan(
         live_mutations = true;
     }
 
+    // Repo slug is the runtime fact orchestrators most often rebuild from
+    // strings; expose it whenever we know it. For body-file flows where the
+    // operator did not pass `--repo`, fall back to whatever repo_override
+    // resolves to (None when no remote is detected).
+    let repo_slug = match repo.as_deref() {
+        Some(repo) => Some(runtime_layout::repo_slug(repo)),
+        None => crate::github::resolve_repo(repo_override)
+            .ok()
+            .map(|repo| runtime_layout::repo_slug(&repo)),
+    };
+
     Ok(json!({
         "scope": "plan",
         "execution_mode": binary.execution_mode(),
         "dry_run": dry_run,
         "issue_source": source,
+        "repo_slug": repo_slug,
         "task_count": table.rows().len(),
         "status_counts": counts,
         "comment_requested": should_comment,
@@ -581,13 +594,36 @@ fn select_link_pr_rows_by_sprint(
     let mut target_label = format!("sprint:S{sprint}");
     if let Some(group_raw) = pr_group {
         let group = group_raw.trim();
+        // Enumerate the actual pr-group values present on this sprint's
+        // rows so the error message names the real options. Aligns with
+        // start-sprint's `pr_groups` payload (Task 1.3) — orchestrators
+        // should pass the same names verbatim.
+        let mut available_groups: BTreeSet<String> = BTreeSet::new();
+        for idx in &row_indexes {
+            if let Some(value) = note_value(&rows[*idx].notes, "pr-group") {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    available_groups.insert(trimmed.to_string());
+                }
+            }
+        }
         row_indexes.retain(|idx| {
             note_value(&rows[*idx].notes, "pr-group")
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case(group))
         });
         if row_indexes.is_empty() {
+            let suggestion = if available_groups.is_empty() {
+                String::from("this sprint has no pr-group rows; use --task instead")
+            } else {
+                let options = available_groups
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("valid pr-group values for sprint S{sprint}: {options}")
+            };
             return Err(format!(
-                "sprint S{sprint} has no rows with pr-group `{group}`; use --task or a valid --pr-group"
+                "sprint S{sprint} has no rows with pr-group `{group}`; {suggestion}"
             ));
         }
         target_label = format!("sprint:S{sprint}/pr-group:{group}");
@@ -1113,6 +1149,27 @@ fn run_start_sprint(
     }
     dispatch_record_paths.sort();
 
+    // Aggregate pr_groups for the start-sprint result payload (Task 1.3).
+    // Each row carries the resolved `pr_group` string (e.g. `s1`,
+    // `s1-auto-g1`, `s2-core`); group rows by that name so orchestrators
+    // can pass the value verbatim to `link-pr --pr-group`.
+    let pr_groups: Vec<Value> = {
+        let mut by_group: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in &artifact_rows {
+            by_group
+                .entry(row.pr_group.clone())
+                .or_default()
+                .push(row.task_id.clone());
+        }
+        by_group
+            .into_iter()
+            .map(|(name, mut task_ids)| {
+                task_ids.sort();
+                json!({ "name": name, "task_ids": task_ids })
+            })
+            .collect()
+    };
+
     let prompt_manifest_path = sprint_root.prompt_manifest();
     write_prompt_manifest(
         &prompt_manifest_path,
@@ -1171,10 +1228,12 @@ fn run_start_sprint(
         "subagent_prompts_out": path_text(&prompts_dir),
         "subagent_prompt_files": prompt_files,
         "sprint_root": path_text(sprint_root.root()),
+        "repo_slug": repo_slug,
         "plan_snapshot_path": path_text(&plan_snapshot_target),
         "subagent_init_snapshot_path": path_text(&subagent_init_target),
         "prompt_manifest_path": path_text(&prompt_manifest_path),
         "dispatch_record_paths": dispatch_record_paths,
+        "pr_groups": pr_groups,
         "synced_issue_rows": synced_rows,
         "comment_requested": should_comment,
         "live_mutations_performed": live_mutations,
