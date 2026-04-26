@@ -118,6 +118,16 @@ where
         }
     };
 
+    // Task 1.5: `resolve-approval` text mode prints just the URL (or fails
+    // with a clear stderr message naming the count). JSON mode falls
+    // through to the standard envelope so consumers can read the candidate
+    // array.
+    if let Command::ResolveApproval(args) = &cli.command
+        && matches!(output_format, crate::cli::OutputFormat::Text)
+    {
+        return execute::run_resolve_approval_text(binary, cli.repo.as_deref(), args);
+    }
+
     if let Err(err) = cli.validate() {
         let schema_version = cli.command.schema_version();
         if let Err(render_err) = output::emit_error(

@@ -9,6 +9,8 @@ mod auto_single_lane_runtime_truth;
 mod cli_contract;
 #[path = "integration/common.rs"]
 pub mod common;
+#[path = "integration/grouping_default.rs"]
+mod grouping_default;
 #[path = "integration/link_pr_flow.rs"]
 mod link_pr_flow;
 #[path = "integration/live_issue_ops.rs"]
@@ -19,6 +21,8 @@ mod live_start_sprint_runtime_truth;
 mod output_contract;
 #[path = "integration/parity_guardrails.rs"]
 mod parity_guardrails;
+#[path = "integration/resolve_approval.rs"]
+mod resolve_approval;
 #[path = "integration/runtime_layout_parity.rs"]
 mod runtime_layout_parity;
 #[path = "integration/runtime_truth_plan_and_sprint_flow.rs"]

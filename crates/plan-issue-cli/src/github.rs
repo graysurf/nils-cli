@@ -40,6 +40,11 @@ pub trait GitHubAdapter {
     ) -> Result<(), String>;
 
     fn pr_is_merged(&self, repo: &str, pr: u64) -> Result<bool, String>;
+
+    /// List the PR's issue-style comments via `gh api`. Returns an array of
+    /// objects with at least `body` and `html_url` keys (passed through
+    /// from the GitHub REST response). Used by `resolve-approval`.
+    fn pr_comments(&self, repo: &str, pr: u64) -> Result<Vec<Value>, String>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -281,6 +286,57 @@ impl GitHubAdapter for GhCliAdapter {
             .is_some_and(|state| state.eq_ignore_ascii_case("merged"));
 
         Ok(merged_at_present || merged_state)
+    }
+
+    fn pr_comments(&self, repo: &str, pr: u64) -> Result<Vec<Value>, String> {
+        // Use `--paginate` so PRs with > 100 comments still return the full
+        // list. Endpoint mirrors REST `/repos/{owner}/{repo}/issues/{n}/comments`
+        // which is the issue-style stream used for review-evidence comments.
+        let endpoint = format!("repos/{repo}/issues/{pr}/comments");
+        let args = vec!["api".to_string(), "--paginate".to_string(), endpoint];
+        let stdout = Self::run(&args)?;
+
+        // `gh api --paginate` concatenates JSON arrays back-to-back without
+        // a wrapping comma, so we parse each top-level array on its own
+        // line first; falling back to a single-array parse keeps the simple
+        // case fast.
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            return Ok(match value {
+                Value::Array(items) => items,
+                other => vec![other],
+            });
+        }
+
+        // Fall back to splitting concatenated arrays.
+        let mut combined: Vec<Value> = Vec::new();
+        for chunk in trimmed.split("][") {
+            let chunk = chunk.trim();
+            if chunk.is_empty() {
+                continue;
+            }
+            let normalized = if !chunk.starts_with('[') {
+                format!("[{chunk}")
+            } else {
+                chunk.to_string()
+            };
+            let normalized = if !normalized.ends_with(']') {
+                format!("{normalized}]")
+            } else {
+                normalized
+            };
+            let value: Value = serde_json::from_str(&normalized)
+                .map_err(|err| format!("failed to parse pr comments page: {err}"))?;
+            if let Value::Array(items) = value {
+                combined.extend(items);
+            } else {
+                combined.push(value);
+            }
+        }
+        Ok(combined)
     }
 }
 

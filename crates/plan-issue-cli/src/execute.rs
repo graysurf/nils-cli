@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use crate::cli::Cli;
 use crate::commands::build::{BuildPlanTaskSpecArgs, BuildTaskSpecArgs};
 use crate::commands::plan::{
-    CleanupWorktreesArgs, ClosePlanArgs, LinkPrArgs, LinkPrStatus, ReadyPlanArgs, StartPlanArgs,
-    StatusPlanArgs,
+    CleanupWorktreesArgs, ClosePlanArgs, LinkPrArgs, LinkPrStatus, ReadyPlanArgs,
+    ResolveApprovalArgs, StartPlanArgs, StatusPlanArgs,
 };
 use crate::commands::sprint::{
     AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs,
@@ -60,6 +60,9 @@ pub fn execute(binary: BinaryFlavor, cli: &Cli) -> Result<Value, CommandError> {
             run_accept_sprint(binary, cli.dry_run, cli.force, cli.repo.as_deref(), args)
         }
         CliCommand::MultiSprintGuide(args) => run_multi_sprint_guide(binary, args),
+        CliCommand::ResolveApproval(args) => {
+            run_resolve_approval_json(binary, cli.force, cli.repo.as_deref(), args)
+        }
         CliCommand::Completion(_) => Err(CommandError::usage(
             "completion-direct-output-only",
             "completion output is emitted directly; run `<binary> completion <bash|zsh>`",
@@ -267,6 +270,7 @@ fn run_start_plan(
         "task_spec_path": path_text(&task_spec_out),
         "issue_body_path": path_text(&issue_body_out),
         "issue_root": path_text(issue_root.root()),
+        "repo_slug": repo_slug,
         "main_agent_init_snapshot_path": path_text(&main_agent_init_target),
         "plan_branch_ref_path": path_text(&plan_branch_ref),
         "record_count": build.rows.len(),
@@ -344,11 +348,23 @@ fn run_status_plan(
         live_mutations = true;
     }
 
+    // Repo slug is the runtime fact orchestrators most often rebuild from
+    // strings; expose it whenever we know it. For body-file flows where the
+    // operator did not pass `--repo`, fall back to whatever repo_override
+    // resolves to (None when no remote is detected).
+    let repo_slug = match repo.as_deref() {
+        Some(repo) => Some(runtime_layout::repo_slug(repo)),
+        None => crate::github::resolve_repo(repo_override)
+            .ok()
+            .map(|repo| runtime_layout::repo_slug(&repo)),
+    };
+
     Ok(json!({
         "scope": "plan",
         "execution_mode": binary.execution_mode(),
         "dry_run": dry_run,
         "issue_source": source,
+        "repo_slug": repo_slug,
         "task_count": table.rows().len(),
         "status_counts": counts,
         "comment_requested": should_comment,
@@ -581,13 +597,36 @@ fn select_link_pr_rows_by_sprint(
     let mut target_label = format!("sprint:S{sprint}");
     if let Some(group_raw) = pr_group {
         let group = group_raw.trim();
+        // Enumerate the actual pr-group values present on this sprint's
+        // rows so the error message names the real options. Aligns with
+        // start-sprint's `pr_groups` payload (Task 1.3) — orchestrators
+        // should pass the same names verbatim.
+        let mut available_groups: BTreeSet<String> = BTreeSet::new();
+        for idx in &row_indexes {
+            if let Some(value) = note_value(&rows[*idx].notes, "pr-group") {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    available_groups.insert(trimmed.to_string());
+                }
+            }
+        }
         row_indexes.retain(|idx| {
             note_value(&rows[*idx].notes, "pr-group")
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case(group))
         });
         if row_indexes.is_empty() {
+            let suggestion = if available_groups.is_empty() {
+                String::from("this sprint has no pr-group rows; use --task instead")
+            } else {
+                let options = available_groups
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("valid pr-group values for sprint S{sprint}: {options}")
+            };
             return Err(format!(
-                "sprint S{sprint} has no rows with pr-group `{group}`; use --task or a valid --pr-group"
+                "sprint S{sprint} has no rows with pr-group `{group}`; {suggestion}"
             ));
         }
         target_label = format!("sprint:S{sprint}/pr-group:{group}");
@@ -932,14 +971,32 @@ fn run_start_sprint(
     repo_override: Option<&str>,
     args: &StartSprintArgs,
 ) -> Result<Value, CommandError> {
+    // Task 1.2: read plan-declared `pr-grouping` for this sprint and
+    // default `--strategy` / `--default-pr-grouping` from it when the
+    // operator passed neither.
+    let mut grouping = args.grouping.clone();
+    let mut inferred_defaults_note: Option<String> = None;
+    if let Some(inferred) =
+        infer_grouping_defaults_from_plan(&args.plan, i32::from(args.sprint), &grouping)
+    {
+        apply_inferred_grouping_defaults(&mut grouping, &inferred);
+        inferred_defaults_note = Some(format!(
+            "auto/{}",
+            match inferred.default_pr_grouping {
+                crate::commands::PrGrouping::PerSprint => "per-sprint",
+                crate::commands::PrGrouping::Group => "group",
+            }
+        ));
+    }
+
     let options = to_build_options(
         args.prefixes.owner_prefix.clone(),
         args.prefixes.branch_prefix.clone(),
         args.prefixes.worktree_prefix.clone(),
-        args.grouping.pr_grouping,
-        args.grouping.default_pr_grouping,
-        args.grouping.strategy,
-        args.grouping.pr_group.clone(),
+        grouping.pr_grouping,
+        grouping.default_pr_grouping,
+        grouping.strategy,
+        grouping.pr_group.clone(),
     );
 
     let build = task_spec::build_task_spec(
@@ -989,7 +1046,7 @@ fn run_start_sprint(
             table.rows(),
             i32::from(args.sprint),
             &build.rows,
-            args.grouping.strategy,
+            grouping.strategy,
         )
         .map_err(|err| CommandError::runtime("task-sync-drift-detected", err))?;
         issue_body_for_comment = Some(body);
@@ -1063,7 +1120,7 @@ fn run_start_sprint(
         args.issue,
         i32::from(args.sprint),
         &artifact_rows,
-        args.grouping.strategy,
+        grouping.strategy,
     )
     .map_err(|err| CommandError::runtime("subagent-prompt-write-failed", err))?;
 
@@ -1077,7 +1134,7 @@ fn run_start_sprint(
         let dispatch_path = sprint_root
             .dispatch_record(&row.task_id)
             .map_err(|err| CommandError::runtime("runtime-layout-failed", err.to_string()))?;
-        let execution_mode = execution_mode_for_row(row, args.grouping.strategy, &artifact_rows);
+        let execution_mode = execution_mode_for_row(row, grouping.strategy, &artifact_rows);
         // Canonical contract: dispatch record `worktree` is the absolute
         // assigned path under $WORKTREE_ROOT (RUNTIME_LAYOUT.md "Worktree
         // Layout (Assigned Paths)"), not the short name from the TSV.
@@ -1113,12 +1170,33 @@ fn run_start_sprint(
     }
     dispatch_record_paths.sort();
 
+    // Aggregate pr_groups for the start-sprint result payload (Task 1.3).
+    // Each row carries the resolved `pr_group` string (e.g. `s1`,
+    // `s1-auto-g1`, `s2-core`); group rows by that name so orchestrators
+    // can pass the value verbatim to `link-pr --pr-group`.
+    let pr_groups: Vec<Value> = {
+        let mut by_group: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in &artifact_rows {
+            by_group
+                .entry(row.pr_group.clone())
+                .or_default()
+                .push(row.task_id.clone());
+        }
+        by_group
+            .into_iter()
+            .map(|(name, mut task_ids)| {
+                task_ids.sort();
+                json!({ "name": name, "task_ids": task_ids })
+            })
+            .collect()
+    };
+
     let prompt_manifest_path = sprint_root.prompt_manifest();
     write_prompt_manifest(
         &prompt_manifest_path,
         &artifact_rows,
         &sprint_root,
-        args.grouping.strategy,
+        grouping.strategy,
     )
     .map_err(|err| {
         CommandError::runtime(
@@ -1136,7 +1214,7 @@ fn run_start_sprint(
         sprint: i32::from(args.sprint),
         sprint_name: &sprint_name,
         rows: &artifact_rows,
-        strategy: args.grouping.strategy,
+        strategy: grouping.strategy,
         note_text: None,
         approval_comment_url: None,
         issue_body_text: issue_body_for_comment.as_deref(),
@@ -1171,11 +1249,14 @@ fn run_start_sprint(
         "subagent_prompts_out": path_text(&prompts_dir),
         "subagent_prompt_files": prompt_files,
         "sprint_root": path_text(sprint_root.root()),
+        "repo_slug": repo_slug,
         "plan_snapshot_path": path_text(&plan_snapshot_target),
         "subagent_init_snapshot_path": path_text(&subagent_init_target),
         "prompt_manifest_path": path_text(&prompt_manifest_path),
         "dispatch_record_paths": dispatch_record_paths,
+        "pr_groups": pr_groups,
         "synced_issue_rows": synced_rows,
+        "inferred_grouping_defaults": inferred_defaults_note,
         "comment_requested": should_comment,
         "live_mutations_performed": live_mutations,
     }))
@@ -1273,14 +1354,23 @@ fn run_ready_sprint(
     repo_override: Option<&str>,
     args: &ReadySprintArgs,
 ) -> Result<Value, CommandError> {
+    // Task 1.2: inherit grouping defaults from plan metadata when the
+    // operator passed no explicit flags.
+    let mut grouping = args.grouping.clone();
+    if let Some(inferred) =
+        infer_grouping_defaults_from_plan(&args.plan, i32::from(args.sprint), &grouping)
+    {
+        apply_inferred_grouping_defaults(&mut grouping, &inferred);
+    }
+
     let options = to_build_options(
         args.prefixes.owner_prefix.clone(),
         args.prefixes.branch_prefix.clone(),
         args.prefixes.worktree_prefix.clone(),
-        args.grouping.pr_grouping,
-        args.grouping.default_pr_grouping,
-        args.grouping.strategy,
-        args.grouping.pr_group.clone(),
+        grouping.pr_grouping,
+        grouping.default_pr_grouping,
+        grouping.strategy,
+        grouping.pr_group.clone(),
     );
 
     let build = task_spec::build_task_spec(
@@ -1329,7 +1419,7 @@ fn run_ready_sprint(
         sprint: i32::from(args.sprint),
         sprint_name: &sprint_name,
         rows: &build.rows,
-        strategy: args.grouping.strategy,
+        strategy: grouping.strategy,
         note_text: summary.as_deref(),
         approval_comment_url: None,
         issue_body_text: issue_body_for_comment.as_deref(),
@@ -1380,14 +1470,23 @@ fn run_accept_sprint(
         ));
     }
 
+    // Task 1.2: inherit grouping defaults from plan metadata when the
+    // operator passed no explicit flags.
+    let mut grouping = args.grouping.clone();
+    if let Some(inferred) =
+        infer_grouping_defaults_from_plan(&args.plan, i32::from(args.sprint), &grouping)
+    {
+        apply_inferred_grouping_defaults(&mut grouping, &inferred);
+    }
+
     let options = to_build_options(
         args.prefixes.owner_prefix.clone(),
         args.prefixes.branch_prefix.clone(),
         args.prefixes.worktree_prefix.clone(),
-        args.grouping.pr_grouping,
-        args.grouping.default_pr_grouping,
-        args.grouping.strategy,
-        args.grouping.pr_group.clone(),
+        grouping.pr_grouping,
+        grouping.default_pr_grouping,
+        grouping.strategy,
+        grouping.pr_group.clone(),
     );
 
     let build = task_spec::build_task_spec(
@@ -1474,7 +1573,7 @@ fn run_accept_sprint(
         sprint: i32::from(args.sprint),
         sprint_name: &sprint_name,
         rows: &build.rows,
-        strategy: args.grouping.strategy,
+        strategy: grouping.strategy,
         note_text: summary.as_deref(),
         approval_comment_url: Some(&args.approved_comment_url),
         issue_body_text: issue_body_for_comment.as_deref(),
@@ -1631,6 +1730,164 @@ fn run_multi_sprint_guide(
     }))
 }
 
+// ----------------------------------------------------------------------------
+// Task 1.5: resolve-approval
+// ----------------------------------------------------------------------------
+
+/// One review-evidence comment whose body matched `Decision: merge`.
+#[derive(Debug, Clone)]
+struct ApprovalCandidate {
+    html_url: String,
+    created_at: Option<String>,
+    body_excerpt: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResolveApprovalOutcome {
+    repo: String,
+    pr: u64,
+    candidates: Vec<ApprovalCandidate>,
+}
+
+impl ResolveApprovalOutcome {
+    fn latest_url(&self) -> Option<&str> {
+        self.candidates.first().map(|c| c.html_url.as_str())
+    }
+}
+
+fn collect_approval_candidates(
+    binary: BinaryFlavor,
+    force: bool,
+    repo_override: Option<&str>,
+    pr: u64,
+) -> Result<ResolveApprovalOutcome, CommandError> {
+    ensure_live_binary_for_command(
+        binary,
+        "resolve-approval --pr <number>",
+        Some("plan-issue resolve-approval --pr <number> --repo <owner/repo>"),
+    )?;
+    let repo = resolve_repo_for_live(binary, repo_override)?;
+
+    let adapter = GhCliAdapter::new(force);
+    let comments = adapter
+        .pr_comments(&repo, pr)
+        .map_err(|err| CommandError::runtime("github-pr-comments-failed", err))?;
+
+    let mut matched: Vec<ApprovalCandidate> = comments
+        .into_iter()
+        .filter_map(|comment| {
+            let body = comment.get("body").and_then(Value::as_str)?;
+            // Match canonical "Decision: merge" line; allow surrounding
+            // whitespace/punctuation (Markdown bullet, bold, etc.) so the
+            // orchestrator's actual review-evidence comment shape is
+            // accepted verbatim.
+            if !body.lines().any(|line| line.contains("Decision: merge")) {
+                return None;
+            }
+            let html_url = comment.get("html_url").and_then(Value::as_str)?.to_string();
+            let created_at = comment
+                .get("created_at")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let body_excerpt = body
+                .lines()
+                .find(|line| line.contains("Decision: merge"))
+                .unwrap_or("Decision: merge")
+                .chars()
+                .take(120)
+                .collect::<String>();
+            Some(ApprovalCandidate {
+                html_url,
+                created_at,
+                body_excerpt,
+            })
+        })
+        .collect();
+
+    // Latest first by `created_at` (lexicographic on ISO-8601 is correct).
+    matched.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(ResolveApprovalOutcome {
+        repo,
+        pr,
+        candidates: matched,
+    })
+}
+
+fn run_resolve_approval_json(
+    binary: BinaryFlavor,
+    force: bool,
+    repo_override: Option<&str>,
+    args: &ResolveApprovalArgs,
+) -> Result<Value, CommandError> {
+    let outcome = collect_approval_candidates(binary, force, repo_override, args.pr)?;
+    let candidates: Vec<Value> = outcome
+        .candidates
+        .iter()
+        .map(|c| {
+            json!({
+                "html_url": c.html_url,
+                "created_at": c.created_at,
+                "body_excerpt": c.body_excerpt,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "repo": outcome.repo,
+        "pr": outcome.pr,
+        "count": candidates.len(),
+        "url": outcome.latest_url(),
+        "candidates": candidates,
+    }))
+}
+
+/// Text-mode driver for `resolve-approval` — returns the process exit
+/// code so the binary can short-circuit the standard text envelope. On
+/// exactly one match prints the URL on stdout; otherwise prints a clear
+/// stderr message naming the count and exits non-zero.
+pub fn run_resolve_approval_text(
+    binary: BinaryFlavor,
+    repo_override: Option<&str>,
+    args: &ResolveApprovalArgs,
+) -> i32 {
+    // Force flag is irrelevant for read-only `gh api` calls; pass `false`.
+    let outcome = match collect_approval_candidates(binary, false, repo_override, args.pr) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!(
+                "error[{code}]: {message}",
+                code = err.code,
+                message = err.message
+            );
+            return err.exit_code;
+        }
+    };
+
+    match outcome.candidates.len() {
+        0 => {
+            eprintln!(
+                "no merge-decision review-evidence comment found on PR #{pr} of {repo}",
+                pr = outcome.pr,
+                repo = outcome.repo
+            );
+            crate::EXIT_FAILURE
+        }
+        1 => {
+            // SAFETY: count == 1.
+            println!("{}", outcome.latest_url().expect("single candidate"));
+            crate::EXIT_SUCCESS
+        }
+        many => {
+            eprintln!(
+                "found {many} merge-decision review-evidence comments on PR #{pr} of {repo}; pass --format json to inspect candidates and choose explicitly",
+                pr = outcome.pr,
+                repo = outcome.repo
+            );
+            crate::EXIT_FAILURE
+        }
+    }
+}
+
 fn to_build_options(
     owner_prefix: String,
     branch_prefix: String,
@@ -1649,6 +1906,90 @@ fn to_build_options(
         strategy,
         pr_group,
     }
+}
+
+/// Inferred grouping defaults derived from a plan sprint's `pr-grouping`
+/// metadata (Task 1.2). Returned only when the operator did NOT pass any of
+/// `--strategy` / `--pr-grouping` / `--default-pr-grouping` and the sprint
+/// declared an intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InferredGroupingDefaults {
+    pub strategy: crate::commands::SplitStrategy,
+    pub default_pr_grouping: crate::commands::PrGrouping,
+    pub source_sprint: i32,
+}
+
+/// Resolve plan-derived defaults for `--strategy` and `--default-pr-grouping`.
+///
+/// Behaviour (Task 1.2):
+///
+/// * Returns `Ok(None)` when the operator passed any explicit grouping flag
+///   (so CLI flags always win).
+/// * Returns `Ok(None)` when the plan parses cleanly but the named sprint
+///   has no `pr-grouping` metadata.
+/// * Returns `Ok(Some(_))` when the plan declares the sprint's intent and
+///   no CLI flag overrode it; the caller mutates `grouping` accordingly
+///   and prints the hint to stderr.
+/// * Returns `Ok(None)` when the plan cannot be parsed; the downstream
+///   `task_spec::build_task_spec` call surfaces the same parse error with
+///   a richer message.
+pub(crate) fn infer_grouping_defaults_from_plan(
+    plan_path: &Path,
+    sprint: i32,
+    grouping: &crate::commands::GroupingArgs,
+) -> Option<InferredGroupingDefaults> {
+    // Operator already pinned at least one grouping decision — never
+    // override.
+    if grouping.pr_grouping.is_some()
+        || grouping.default_pr_grouping.is_some()
+        || grouping.strategy != crate::commands::SplitStrategy::Deterministic
+        || !grouping.pr_group.is_empty()
+    {
+        return None;
+    }
+
+    let resolved = task_spec::resolve_plan_file(plan_path);
+    let display = plan_path.to_string_lossy().to_string();
+    let (plan, parse_errors) = parse_plan_with_display(&resolved, &display).ok()?;
+    if !parse_errors.is_empty() {
+        return None;
+    }
+
+    let target = plan.sprints.iter().find(|s| s.number == sprint)?;
+    let intent = target.metadata.pr_grouping_intent.as_deref()?;
+    let pr_grouping = match intent {
+        "per-sprint" => crate::commands::PrGrouping::PerSprint,
+        "group" => crate::commands::PrGrouping::Group,
+        _ => return None,
+    };
+
+    Some(InferredGroupingDefaults {
+        strategy: crate::commands::SplitStrategy::Auto,
+        default_pr_grouping: pr_grouping,
+        source_sprint: sprint,
+    })
+}
+
+/// Apply inferred defaults to a mutable `GroupingArgs` clone and emit the
+/// stderr hint required by Task 1.2.
+pub(crate) fn apply_inferred_grouping_defaults(
+    grouping: &mut crate::commands::GroupingArgs,
+    inferred: &InferredGroupingDefaults,
+) {
+    grouping.strategy = inferred.strategy;
+    grouping.default_pr_grouping = Some(inferred.default_pr_grouping);
+    let strategy_text = match inferred.strategy {
+        crate::commands::SplitStrategy::Auto => "auto",
+        crate::commands::SplitStrategy::Deterministic => "deterministic",
+    };
+    let grouping_text = match inferred.default_pr_grouping {
+        crate::commands::PrGrouping::PerSprint => "per-sprint",
+        crate::commands::PrGrouping::Group => "group",
+    };
+    eprintln!(
+        "inferred --strategy={strategy_text}; --default-pr-grouping={grouping_text} from plan sprint S{}",
+        inferred.source_sprint
+    );
 }
 
 fn load_summary(summary: &SummaryArgs) -> Result<Option<String>, CommandError> {
@@ -2572,6 +2913,10 @@ mod tests {
 
         fn pr_is_merged(&self, _repo: &str, pr: u64) -> Result<bool, String> {
             self.merged.get(&pr).cloned().unwrap_or(Ok(true))
+        }
+
+        fn pr_comments(&self, _repo: &str, _pr: u64) -> Result<Vec<Value>, String> {
+            unreachable!("pr_comments is not needed in this test")
         }
     }
 

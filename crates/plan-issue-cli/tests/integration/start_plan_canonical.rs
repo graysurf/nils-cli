@@ -163,6 +163,88 @@ fn start_plan_local_uses_placeholder_issue() {
 }
 
 #[test]
+fn status_plan_emits_repo_slug_and_v2_schema_version() {
+    // Task 1.1: status-plan exposes the runtime repo slug and bumps to v2.
+    // Drive it via a body-file flow with an explicit --repo so the slug is
+    // derivable without contacting GitHub.
+    let tmp = TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
+    let agent_home_s = agent_home.to_string_lossy().to_string();
+
+    // First run start-plan to produce an issue body we can feed into
+    // status-plan.
+    let start = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
+    assert_eq!(start.code, 0, "start-plan stderr: {}", start.stderr);
+    let start_payload = parse_json(&start.stdout);
+    let issue_body_path = start_payload["payload"]["result"]["issue_body_path"]
+        .as_str()
+        .expect("issue_body_path")
+        .to_string();
+
+    let status = common::run_plan_issue_local_with_env(
+        &[
+            "--format",
+            "json",
+            "--dry-run",
+            "--repo",
+            "graysurf/plan-issue-smoke",
+            "status-plan",
+            "--body-file",
+            &issue_body_path,
+        ],
+        &[("AGENT_HOME", &agent_home_s)],
+    );
+    assert_eq!(status.code, 0, "status-plan stderr: {}", status.stderr);
+
+    let payload = parse_json(&status.stdout);
+    assert_eq!(
+        payload["schema_version"], "plan-issue-cli.status.plan.v2",
+        "schema_version should bump to v2"
+    );
+    assert_eq!(
+        payload["payload"]["result"]["repo_slug"], "graysurf__plan-issue-smoke",
+        "result.repo_slug should mirror runtime_layout::repo_slug derivation"
+    );
+}
+
+#[test]
+fn start_plan_emits_repo_slug_and_v2_schema_version() {
+    // Task 1.1: result payload exposes the runtime repo slug; schema_version
+    // bumps to v2 so consumers know the new field is present.
+    let tmp = TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    fs::create_dir_all(&agent_home).expect("create agent home");
+    common::seed_agent_home_prompts(&agent_home);
+    let agent_home_s = agent_home.to_string_lossy().to_string();
+
+    let out = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let payload = parse_json(&out.stdout);
+    assert_eq!(
+        payload["schema_version"], "plan-issue-cli.start.plan.v2",
+        "schema_version should bump to v2: {}",
+        out.stdout
+    );
+    let result = &payload["payload"]["result"];
+    assert_eq!(
+        result["repo_slug"], "graysurf__plan-issue-smoke",
+        "result.repo_slug should mirror runtime_layout::repo_slug derivation"
+    );
+
+    // Round-trip: a second run produces an identical repo_slug.
+    let out2 = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
+    assert_eq!(out2.code, 0, "stderr: {}", out2.stderr);
+    let payload2 = parse_json(&out2.stdout);
+    assert_eq!(
+        payload2["payload"]["result"]["repo_slug"], result["repo_slug"],
+        "repo_slug must round-trip identically across runs"
+    );
+}
+
+#[test]
 fn start_plan_fails_on_missing_main_agent_init_source() {
     let tmp = TempDir::new().expect("tempdir");
     let agent_home = tmp.path().join("agent-home");

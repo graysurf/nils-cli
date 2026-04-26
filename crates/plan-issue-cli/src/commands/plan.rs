@@ -182,3 +182,15 @@ pub struct CleanupWorktreesArgs {
     #[arg(long, value_name = "number")]
     pub issue: u64,
 }
+
+/// Args for the `resolve-approval` subcommand (Task 1.5).
+///
+/// Wraps the orchestrator pattern of finding the latest review-evidence
+/// comment whose body contains `Decision: merge` on a PR and returning its
+/// `html_url`.
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct ResolveApprovalArgs {
+    /// PR number (live `plan-issue` path only).
+    #[arg(long, value_name = "number")]
+    pub pr: u64,
+}

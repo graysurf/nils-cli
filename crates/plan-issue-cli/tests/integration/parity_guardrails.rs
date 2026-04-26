@@ -46,6 +46,7 @@ fn parity_shell_help_surface_tracks_current_command_contract() {
         "ready-sprint          Post sprint-ready comment for main-agent review before merge",
         "accept-sprint         Enforce merged-PR gate, sync sprint status=done, then post accepted comment",
         "multi-sprint-guide    Print the full repeated command flow for a plan (1 plan = 1 issue)",
+        "resolve-approval      Resolve the URL of the most recent `Decision: merge` review-evidence comment on a PR, suitable for `accept-sprint --approved-comment-url`",
         "completion            Export shell completion script",
     ] {
         assert!(
