@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::parse::{Plan, Sprint, Task, parse_plan_with_display};
 
 const USAGE: &str = r#"Usage:
-  validate_plans.sh [--file <path>]... [--format text|json]
+  validate_plans.sh [--file <path>]... [--format text|json] [--explain]
 
 Purpose:
   Lint plan markdown files under docs/plans/ against Plan Format v1.
@@ -17,6 +17,8 @@ Purpose:
 Options:
   --file <path>  Validate a specific plan file (may be repeated)
   --format <fmt> text (default) or json
+  --explain      Append canonical accepted-shape examples per error class.
+                 Output is independent of exit code (also prints on success).
   -h, --help     Show help
 
 Defaults:
@@ -42,11 +44,21 @@ struct ValidateOutput {
     ok: bool,
     files: Vec<String>,
     errors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    explanations: Option<Vec<ExplainEntry>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExplainEntry {
+    class: &'static str,
+    rule: &'static str,
+    example: &'static str,
 }
 
 pub fn run(args: &[String]) -> i32 {
     let mut files: Vec<String> = Vec::new();
     let mut format = "text".to_string();
+    let mut explain = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -64,6 +76,10 @@ pub fn run(args: &[String]) -> i32 {
                 }
                 format = args[i + 1].to_string();
                 i += 2;
+            }
+            "--explain" => {
+                explain = true;
+                i += 1;
             }
             "-h" | "--help" => {
                 print_usage();
@@ -94,8 +110,16 @@ pub fn run(args: &[String]) -> i32 {
                 ok: true,
                 files: Vec::new(),
                 errors: Vec::new(),
+                explanations: if explain {
+                    Some(all_explanations())
+                } else {
+                    None
+                },
             };
             return print_json_output(output, 0);
+        }
+        if explain {
+            print_explanations_text(&all_explanations());
         }
         return 0;
     }
@@ -136,20 +160,32 @@ pub fn run(args: &[String]) -> i32 {
 
     if format == "json" {
         let code = if errors.is_empty() { 0 } else { 1 };
+        let explanations = if explain {
+            Some(explanations_for(&errors))
+        } else {
+            None
+        };
         let output = ValidateOutput {
             ok: errors.is_empty(),
             files: discovered_for_output,
             errors,
+            explanations,
         };
         return print_json_output(output, code);
     }
 
     if errors.is_empty() {
+        if explain {
+            print_explanations_text(&all_explanations());
+        }
         return 0;
     }
 
-    for err in errors {
+    for err in &errors {
         eprintln!("error: {err}");
+    }
+    if explain {
+        print_explanations_text(&explanations_for(&errors));
     }
     1
 }
@@ -373,22 +409,32 @@ fn validate_task(plan_path: &str, task: &Task, all_task_ids: &HashSet<String>) -
             "{prefix}: missing Dependencies (use 'none' or list task IDs)"
         )),
         Some(deps) => {
+            let mut invalid: Vec<String> = Vec::new();
+            let mut unknown: Vec<String> = Vec::new();
             for dep in deps {
                 let d = dep.trim();
                 if d.is_empty() {
                     continue;
                 }
                 if !is_task_id(d) {
-                    errs.push(format!(
-                        "{prefix}: invalid dependency (expected 'Task N.M'): {}",
-                        crate::repr::py_repr(dep)
-                    ));
+                    invalid.push(crate::repr::py_repr(dep));
                 } else if !all_task_ids.contains(d) {
-                    errs.push(format!(
-                        "{prefix}: unknown dependency (not found in plan): {}",
-                        crate::repr::py_repr(d)
-                    ));
+                    unknown.push(crate::repr::py_repr(d));
                 }
+            }
+            if !invalid.is_empty() {
+                errs.push(format!(
+                    "{prefix}: line {line}: invalid dependency (expected 'Task N.M', e.g. 'Task 1.2'): {values}",
+                    line = task.start_line,
+                    values = invalid.join(", ")
+                ));
+            }
+            if !unknown.is_empty() {
+                errs.push(format!(
+                    "{prefix}: line {line}: unknown dependency (not found in plan): {values}",
+                    line = task.start_line,
+                    values = unknown.join(", ")
+                ));
             }
         }
     }
@@ -433,11 +479,35 @@ fn validate_task(plan_path: &str, task: &Task, all_task_ids: &HashSet<String>) -
 }
 
 fn has_placeholder(value: &str) -> bool {
-    if contains_angle_placeholder(value) {
+    let scan = strip_backtick_spans(value);
+    if contains_angle_placeholder(&scan) {
         return true;
     }
 
-    contains_word_case_insensitive(value, "TBD") || contains_word_case_insensitive(value, "TODO")
+    contains_word_case_insensitive(&scan, "TBD") || contains_word_case_insensitive(&scan, "TODO")
+}
+
+/// Drop the contents of paired backtick spans so placeholder checks only fire
+/// on prose. An unpaired trailing backtick is kept verbatim (treated as
+/// literal text), matching how Markdown renders it.
+fn strip_backtick_spans(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            if let Some(rel_end) = chars[i + 1..].iter().position(|c| *c == '`') {
+                i = i + 1 + rel_end + 1;
+                continue;
+            }
+            out.push('`');
+            i += 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 fn contains_angle_placeholder(value: &str) -> bool {
@@ -508,6 +578,181 @@ fn is_task_id(s: &str) -> bool {
     a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit())
 }
 
+struct ExplainCatalogEntry {
+    /// Substring used to detect that this error class fired. Must appear in
+    /// the matching error message and be unique across the catalog.
+    pattern: &'static str,
+    explain: ExplainEntry,
+}
+
+const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
+    ExplainCatalogEntry {
+        pattern: "Location must be repo-relative",
+        explain: ExplainEntry {
+            class: "location-absolute",
+            rule: "Location entries must be repo-relative paths (no leading '/').",
+            example: "- **Location**:\n  - `crates/foo/src/bar.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Location must be a file path",
+        explain: ExplainEntry {
+            class: "location-directory",
+            rule: "Location entries must point at files, not directories.",
+            example: "- **Location**:\n  - `crates/foo/src/lib.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "must not use globs",
+        explain: ExplainEntry {
+            class: "location-glob",
+            rule: "Enumerate every touched file; globs and braces are rejected.",
+            example: "- **Location**:\n  - `crates/foo/src/a.rs`\n  - `crates/foo/src/b.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Location contains placeholder",
+        explain: ExplainEntry {
+            class: "location-placeholder",
+            rule: "Replace `<...>` / TODO / TBD placeholders with real paths.",
+            example: "- **Location**:\n  - `crates/plan-tooling/src/validate.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Description",
+        explain: ExplainEntry {
+            class: "description-missing",
+            rule: "Description is required and must be non-empty prose.",
+            example: "- **Description**: Validate task dependencies against the plan's task IDs.",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Description contains placeholder",
+        explain: ExplainEntry {
+            class: "description-placeholder",
+            rule: "Description must not contain `<...>` / TODO / TBD outside backticks. \
+                   Wrap usage slots in backticks (e.g. `<arg>`) when documenting CLI shapes.",
+            example: "- **Description**: Invoke `<arg>` to wire the slot.",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Dependencies",
+        explain: ExplainEntry {
+            class: "dependencies-missing",
+            rule: "Dependencies field is required: use 'none' or list `Task N.M` IDs.",
+            example: "- **Dependencies**:\n  - none",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid dependency",
+        explain: ExplainEntry {
+            class: "dependency-invalid",
+            rule: "Dependency entries must use the canonical `Task N.M` form.",
+            example: "- **Dependencies**:\n  - Task 1.2\n  - Task 2.1",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "unknown dependency",
+        explain: ExplainEntry {
+            class: "dependency-unknown",
+            rule: "Dependency must reference a `### Task N.M` heading present in the plan.",
+            example: "- **Dependencies**:\n  - Task 1.1     # must match an actual task heading",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Complexity out of range",
+        explain: ExplainEntry {
+            class: "complexity-range",
+            rule: "Complexity is a 1-10 integer.",
+            example: "- **Complexity**: 5",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Acceptance criteria",
+        explain: ExplainEntry {
+            class: "acceptance-missing",
+            rule: "Acceptance criteria is a non-empty list of testable outcomes.",
+            example: "- **Acceptance criteria**:\n  - All callers of foo() return Result<()>.",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Acceptance criteria contains placeholder",
+        explain: ExplainEntry {
+            class: "acceptance-placeholder",
+            rule: "Acceptance criteria entries must be concrete; no `<...>` / TODO / TBD placeholders.",
+            example: "- **Acceptance criteria**:\n  - validate() rejects empty input with exit 2.",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Validation",
+        explain: ExplainEntry {
+            class: "validation-missing",
+            rule: "Validation is a non-empty list of runnable commands or steps.",
+            example: "- **Validation**:\n  - cargo test -p plan-tooling",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Validation contains placeholder",
+        explain: ExplainEntry {
+            class: "validation-placeholder",
+            rule: "Validation entries must be concrete commands; no `<...>` / TODO / TBD placeholders.",
+            example: "- **Validation**:\n  - cargo nextest run --profile ci -p plan-tooling",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "must include both `PR grouping intent` and `Execution Profile`",
+        explain: ExplainEntry {
+            class: "sprint-metadata-partial",
+            rule: "Sprint metadata must declare both `PR grouping intent` and `Execution Profile`.",
+            example: "**PR grouping intent**: `per-sprint`\n**Execution Profile**: `serial`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "is per-sprint but `Execution Profile` indicates parallel width",
+        explain: ExplainEntry {
+            class: "sprint-metadata-mismatch",
+            rule: "`per-sprint` grouping cannot run with parallel execution; use `group` for parallel-x{N}.",
+            example: "**PR grouping intent**: `group`\n**Execution Profile**: `parallel-x2`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid or missing task id",
+        explain: ExplainEntry {
+            class: "task-id-invalid",
+            rule: "Task headings must use `### Task N.M: name` (numeric N and M).",
+            example: "### Task 2.1: Validate sprint metadata",
+        },
+    },
+];
+
+fn all_explanations() -> Vec<ExplainEntry> {
+    EXPLAIN_CATALOG.iter().map(|e| e.explain.clone()).collect()
+}
+
+fn explanations_for(errors: &[String]) -> Vec<ExplainEntry> {
+    let mut hits: Vec<ExplainEntry> = Vec::new();
+    for entry in EXPLAIN_CATALOG {
+        if errors.iter().any(|err| err.contains(entry.pattern)) {
+            hits.push(entry.explain.clone());
+        }
+    }
+    hits
+}
+
+fn print_explanations_text(entries: &[ExplainEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    eprintln!();
+    eprintln!("Examples:");
+    for entry in entries {
+        eprintln!("  [{}] {}", entry.class, entry.rule);
+        for line in entry.example.lines() {
+            eprintln!("      {line}");
+        }
+    }
+}
+
 fn parse_parallel_width_from_execution_profile(profile: &str) -> Option<usize> {
     let digits = profile
         .to_ascii_lowercase()
@@ -527,7 +772,7 @@ mod tests {
 
     use super::{
         contains_angle_placeholder, contains_word_case_insensitive, has_placeholder,
-        is_non_empty_list, is_task_id, validate_task,
+        is_non_empty_list, is_task_id, strip_backtick_spans, validate_task,
     };
 
     #[test]
@@ -558,6 +803,28 @@ mod tests {
     }
 
     #[test]
+    fn has_placeholder_ignores_tokens_inside_backtick_spans() {
+        // Legitimate usage docs that wrap argument slots in backticks.
+        assert!(!has_placeholder("invoke `<arg>` with the path"));
+        assert!(!has_placeholder("plan-issue resolve-approval `<TBD>`"));
+        assert!(!has_placeholder("write `TODO: hook entry` then return"));
+        // Bare placeholders outside backticks still fail.
+        assert!(has_placeholder("invoke <arg> with the path"));
+        assert!(has_placeholder("plan-issue resolve-approval <TBD>"));
+        assert!(has_placeholder("write TODO: hook entry then return"));
+    }
+
+    #[test]
+    fn strip_backtick_spans_handles_pairs_and_dangling() {
+        assert_eq!(strip_backtick_spans("hi `code` bye"), "hi  bye");
+        assert_eq!(strip_backtick_spans("a `b` c `d` e"), "a  c  e");
+        // Unpaired backtick is preserved as literal text.
+        assert_eq!(strip_backtick_spans("a `b c"), "a `b c");
+        // Empty span drops nothing visible (just two backticks).
+        assert_eq!(strip_backtick_spans("a `` b"), "a  b");
+    }
+
+    #[test]
     fn is_task_id_accepts_expected_shape_only() {
         assert!(is_task_id("Task 1.1"));
         assert!(is_task_id("Task 10.42"));
@@ -580,7 +847,7 @@ mod tests {
             id: "Task 1.1".to_string(),
             name: "demo".to_string(),
             sprint: 1,
-            start_line: 1,
+            start_line: 42,
             location: vec![
                 "/abs/path.rs".to_string(),
                 "dir/".to_string(),
@@ -602,6 +869,48 @@ mod tests {
         assert!(errs.iter().any(|e| e.contains("invalid dependency")));
         assert!(errs.iter().any(|e| e.contains("unknown dependency")));
         assert!(errs.iter().any(|e| e.contains("Complexity out of range")));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("line 42") && e.contains("e.g. 'Task 1.2'")),
+            "expected dep error to carry task line + canonical example, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn validate_task_groups_invalid_deps_into_single_error() {
+        let task = Task {
+            id: "Task 2.5".to_string(),
+            name: "multi-bad-deps".to_string(),
+            sprint: 2,
+            start_line: 87,
+            location: vec!["src/lib.rs".to_string()],
+            description: Some("Ship feature".to_string()),
+            dependencies: Some(vec![
+                "Task x.y".to_string(),
+                "1.1".to_string(),
+                "Task 1".to_string(),
+            ]),
+            complexity: Some(3),
+            acceptance_criteria: vec!["Done".to_string()],
+            validation: vec!["cargo test".to_string()],
+        };
+        let all_ids = HashSet::from(["Task 2.5".to_string()]);
+        let errs = validate_task("plan.md", &task, &all_ids);
+        let invalid: Vec<&String> = errs
+            .iter()
+            .filter(|e| e.contains("invalid dependency"))
+            .collect();
+        assert_eq!(
+            invalid.len(),
+            1,
+            "expected a single grouped invalid-dep error, got: {errs:?}",
+        );
+        let msg = invalid[0];
+        assert!(msg.contains("line 87"), "missing line ref: {msg}");
+        assert!(msg.contains("e.g. 'Task 1.2'"), "missing example: {msg}");
+        assert!(msg.contains("'Task x.y'"), "missing first bad value: {msg}");
+        assert!(msg.contains("'1.1'"), "missing second bad value: {msg}");
+        assert!(msg.contains("'Task 1'"), "missing third bad value: {msg}");
     }
 
     #[test]
