@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use crate::cli::Cli;
 use crate::commands::build::{BuildPlanTaskSpecArgs, BuildTaskSpecArgs};
 use crate::commands::plan::{
-    CleanupWorktreesArgs, ClosePlanArgs, LinkPrArgs, LinkPrStatus, ReadyPlanArgs, StartPlanArgs,
-    StatusPlanArgs,
+    CleanupWorktreesArgs, ClosePlanArgs, LinkPrArgs, LinkPrStatus, ReadyPlanArgs,
+    ResolveApprovalArgs, StartPlanArgs, StatusPlanArgs,
 };
 use crate::commands::sprint::{
     AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs,
@@ -60,6 +60,9 @@ pub fn execute(binary: BinaryFlavor, cli: &Cli) -> Result<Value, CommandError> {
             run_accept_sprint(binary, cli.dry_run, cli.force, cli.repo.as_deref(), args)
         }
         CliCommand::MultiSprintGuide(args) => run_multi_sprint_guide(binary, args),
+        CliCommand::ResolveApproval(args) => {
+            run_resolve_approval_json(binary, cli.force, cli.repo.as_deref(), args)
+        }
         CliCommand::Completion(_) => Err(CommandError::usage(
             "completion-direct-output-only",
             "completion output is emitted directly; run `<binary> completion <bash|zsh>`",
@@ -1727,6 +1730,164 @@ fn run_multi_sprint_guide(
     }))
 }
 
+// ----------------------------------------------------------------------------
+// Task 1.5: resolve-approval
+// ----------------------------------------------------------------------------
+
+/// One review-evidence comment whose body matched `Decision: merge`.
+#[derive(Debug, Clone)]
+struct ApprovalCandidate {
+    html_url: String,
+    created_at: Option<String>,
+    body_excerpt: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResolveApprovalOutcome {
+    repo: String,
+    pr: u64,
+    candidates: Vec<ApprovalCandidate>,
+}
+
+impl ResolveApprovalOutcome {
+    fn latest_url(&self) -> Option<&str> {
+        self.candidates.first().map(|c| c.html_url.as_str())
+    }
+}
+
+fn collect_approval_candidates(
+    binary: BinaryFlavor,
+    force: bool,
+    repo_override: Option<&str>,
+    pr: u64,
+) -> Result<ResolveApprovalOutcome, CommandError> {
+    ensure_live_binary_for_command(
+        binary,
+        "resolve-approval --pr <number>",
+        Some("plan-issue resolve-approval --pr <number> --repo <owner/repo>"),
+    )?;
+    let repo = resolve_repo_for_live(binary, repo_override)?;
+
+    let adapter = GhCliAdapter::new(force);
+    let comments = adapter
+        .pr_comments(&repo, pr)
+        .map_err(|err| CommandError::runtime("github-pr-comments-failed", err))?;
+
+    let mut matched: Vec<ApprovalCandidate> = comments
+        .into_iter()
+        .filter_map(|comment| {
+            let body = comment.get("body").and_then(Value::as_str)?;
+            // Match canonical "Decision: merge" line; allow surrounding
+            // whitespace/punctuation (Markdown bullet, bold, etc.) so the
+            // orchestrator's actual review-evidence comment shape is
+            // accepted verbatim.
+            if !body.lines().any(|line| line.contains("Decision: merge")) {
+                return None;
+            }
+            let html_url = comment.get("html_url").and_then(Value::as_str)?.to_string();
+            let created_at = comment
+                .get("created_at")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let body_excerpt = body
+                .lines()
+                .find(|line| line.contains("Decision: merge"))
+                .unwrap_or("Decision: merge")
+                .chars()
+                .take(120)
+                .collect::<String>();
+            Some(ApprovalCandidate {
+                html_url,
+                created_at,
+                body_excerpt,
+            })
+        })
+        .collect();
+
+    // Latest first by `created_at` (lexicographic on ISO-8601 is correct).
+    matched.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(ResolveApprovalOutcome {
+        repo,
+        pr,
+        candidates: matched,
+    })
+}
+
+fn run_resolve_approval_json(
+    binary: BinaryFlavor,
+    force: bool,
+    repo_override: Option<&str>,
+    args: &ResolveApprovalArgs,
+) -> Result<Value, CommandError> {
+    let outcome = collect_approval_candidates(binary, force, repo_override, args.pr)?;
+    let candidates: Vec<Value> = outcome
+        .candidates
+        .iter()
+        .map(|c| {
+            json!({
+                "html_url": c.html_url,
+                "created_at": c.created_at,
+                "body_excerpt": c.body_excerpt,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "repo": outcome.repo,
+        "pr": outcome.pr,
+        "count": candidates.len(),
+        "url": outcome.latest_url(),
+        "candidates": candidates,
+    }))
+}
+
+/// Text-mode driver for `resolve-approval` — returns the process exit
+/// code so the binary can short-circuit the standard text envelope. On
+/// exactly one match prints the URL on stdout; otherwise prints a clear
+/// stderr message naming the count and exits non-zero.
+pub fn run_resolve_approval_text(
+    binary: BinaryFlavor,
+    repo_override: Option<&str>,
+    args: &ResolveApprovalArgs,
+) -> i32 {
+    // Force flag is irrelevant for read-only `gh api` calls; pass `false`.
+    let outcome = match collect_approval_candidates(binary, false, repo_override, args.pr) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!(
+                "error[{code}]: {message}",
+                code = err.code,
+                message = err.message
+            );
+            return err.exit_code;
+        }
+    };
+
+    match outcome.candidates.len() {
+        0 => {
+            eprintln!(
+                "no merge-decision review-evidence comment found on PR #{pr} of {repo}",
+                pr = outcome.pr,
+                repo = outcome.repo
+            );
+            crate::EXIT_FAILURE
+        }
+        1 => {
+            // SAFETY: count == 1.
+            println!("{}", outcome.latest_url().expect("single candidate"));
+            crate::EXIT_SUCCESS
+        }
+        many => {
+            eprintln!(
+                "found {many} merge-decision review-evidence comments on PR #{pr} of {repo}; pass --format json to inspect candidates and choose explicitly",
+                pr = outcome.pr,
+                repo = outcome.repo
+            );
+            crate::EXIT_FAILURE
+        }
+    }
+}
+
 fn to_build_options(
     owner_prefix: String,
     branch_prefix: String,
@@ -1762,14 +1923,14 @@ pub(crate) struct InferredGroupingDefaults {
 ///
 /// Behaviour (Task 1.2):
 ///
-/// * Returns `None` when the operator passed any explicit grouping flag
+/// * Returns `Ok(None)` when the operator passed any explicit grouping flag
 ///   (so CLI flags always win).
-/// * Returns `None` when the plan parses cleanly but the named sprint
+/// * Returns `Ok(None)` when the plan parses cleanly but the named sprint
 ///   has no `pr-grouping` metadata.
-/// * Returns `Some(_)` when the plan declares the sprint's intent and
+/// * Returns `Ok(Some(_))` when the plan declares the sprint's intent and
 ///   no CLI flag overrode it; the caller mutates `grouping` accordingly
 ///   and prints the hint to stderr.
-/// * Returns `None` when the plan cannot be parsed; the downstream
+/// * Returns `Ok(None)` when the plan cannot be parsed; the downstream
 ///   `task_spec::build_task_spec` call surfaces the same parse error with
 ///   a richer message.
 pub(crate) fn infer_grouping_defaults_from_plan(
@@ -2752,6 +2913,10 @@ mod tests {
 
         fn pr_is_merged(&self, _repo: &str, pr: u64) -> Result<bool, String> {
             self.merged.get(&pr).cloned().unwrap_or(Ok(true))
+        }
+
+        fn pr_comments(&self, _repo: &str, _pr: u64) -> Result<Vec<Value>, String> {
+            unreachable!("pr_comments is not needed in this test")
         }
     }
 

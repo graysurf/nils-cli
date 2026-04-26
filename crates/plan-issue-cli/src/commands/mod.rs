@@ -12,7 +12,8 @@ use crate::{ValidationError, issue_body};
 use self::build::{BuildPlanTaskSpecArgs, BuildTaskSpecArgs};
 use self::completion::CompletionArgs;
 use self::plan::{
-    CleanupWorktreesArgs, ClosePlanArgs, LinkPrArgs, ReadyPlanArgs, StartPlanArgs, StatusPlanArgs,
+    CleanupWorktreesArgs, ClosePlanArgs, LinkPrArgs, ReadyPlanArgs, ResolveApprovalArgs,
+    StartPlanArgs, StatusPlanArgs,
 };
 use self::sprint::{AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs};
 
@@ -173,6 +174,10 @@ pub enum Command {
     /// Print the full repeated command flow for a plan (1 plan = 1 issue).
     MultiSprintGuide(MultiSprintGuideArgs),
 
+    /// Resolve the URL of the most recent `Decision: merge` review-evidence
+    /// comment on a PR, suitable for `accept-sprint --approved-comment-url`.
+    ResolveApproval(ResolveApprovalArgs),
+
     /// Export shell completion script.
     Completion(CompletionArgs),
 }
@@ -192,6 +197,7 @@ impl Command {
             Self::ReadySprint(_) => "ready-sprint",
             Self::AcceptSprint(_) => "accept-sprint",
             Self::MultiSprintGuide(_) => "multi-sprint-guide",
+            Self::ResolveApproval(_) => "resolve-approval",
             Self::Completion(_) => "completion",
         }
     }
@@ -234,6 +240,7 @@ impl Command {
             Self::ReadySprint(args) => serde_json::to_value(args),
             Self::AcceptSprint(args) => serde_json::to_value(args),
             Self::MultiSprintGuide(args) => serde_json::to_value(args),
+            Self::ResolveApproval(args) => serde_json::to_value(args),
             Self::Completion(args) => serde_json::to_value(args),
         };
 
@@ -259,6 +266,7 @@ impl Command {
             Self::Completion(_)
             | Self::StatusPlan(_)
             | Self::ReadyPlan(_)
+            | Self::ResolveApproval(_)
             | Self::CleanupWorktrees(_) => Ok(()),
         }
     }
