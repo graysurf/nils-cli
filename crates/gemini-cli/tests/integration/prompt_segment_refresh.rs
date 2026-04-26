@@ -222,6 +222,16 @@ fn prompt_segment_stale_cache_triggers_background_refresh() {
             ("GEMINI_PROMPT_SEGMENT_REFRESH_MIN_SECONDS", "0"),
             ("GEMINI_PROMPT_SEGMENT_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
             ("GEMINI_PROMPT_SEGMENT_CURL_MAX_TIME_SECONDS", "3"),
+            // Pin the refresh subprocess exe explicitly. Sibling
+            // `prompt_segment_cached` tests in this same test binary set
+            // `GEMINI_PROMPT_SEGMENT_EXE=/usr/bin/false` via `std::env::set_var`
+            // (process-wide), which leaks into the env this child inherits at
+            // spawn time and causes the background `--refresh` lane to exec
+            // /usr/bin/false instead of gemini-cli.
+            (
+                "GEMINI_PROMPT_SEGMENT_EXE",
+                gemini_cli_bin().to_str().unwrap(),
+            ),
         ],
     );
     assert_exit(&output, 0);
@@ -307,12 +317,21 @@ fn prompt_segment_refresh_respects_min_interval() {
         ),
     );
 
+    let exe = gemini_cli_bin();
+    let exe_str = exe.to_str().expect("utf8 exe path");
     let vars = [
         ("GEMINI_PROMPT_SEGMENT_ENABLED", "true"),
         ("CODE_ASSIST_ENDPOINT", base_url.as_str()),
         ("GEMINI_PROMPT_SEGMENT_REFRESH_MIN_SECONDS", "9999"),
         ("GEMINI_PROMPT_SEGMENT_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
         ("GEMINI_PROMPT_SEGMENT_CURL_MAX_TIME_SECONDS", "3"),
+        // Pin the refresh subprocess exe explicitly. Sibling
+        // `prompt_segment_cached` tests in this same test binary set
+        // `GEMINI_PROMPT_SEGMENT_EXE=/usr/bin/false` via `std::env::set_var`
+        // (process-wide), which leaks into the env this child inherits at
+        // spawn time and causes the background `--refresh` lane to exec
+        // /usr/bin/false instead of gemini-cli.
+        ("GEMINI_PROMPT_SEGMENT_EXE", exe_str),
     ];
     let envs = [
         ("GEMINI_AUTH_FILE", auth_file.as_path()),
