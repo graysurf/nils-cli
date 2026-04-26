@@ -264,3 +264,81 @@ fn start_plan_fails_on_missing_main_agent_init_source() {
         out.stderr
     );
 }
+
+#[test]
+fn start_plan_skips_init_snapshot_when_env_set() {
+    // Adapter opt-out: setting PLAN_ISSUE_SKIP_INIT_SNAPSHOT=1 makes
+    // the binary skip both the existence check on the canonical
+    // main-agent init prompt and the copy into the runtime workspace,
+    // even if `$AGENT_HOME/prompts/` is empty.
+    let tmp = TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    fs::create_dir_all(&agent_home).expect("create agent home");
+    let agent_home_s = agent_home.to_string_lossy().to_string();
+
+    let out = common::run_plan_issue_local_with_env(
+        &[
+            "--format",
+            "json",
+            "--dry-run",
+            "--repo",
+            "graysurf/plan-issue-smoke",
+            "start-plan",
+            "--plan",
+            PLAN_PATH,
+            "--pr-grouping",
+            "per-sprint",
+        ],
+        &[
+            ("AGENT_HOME", &agent_home_s),
+            ("PLAN_ISSUE_SKIP_INIT_SNAPSHOT", "1"),
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let payload = parse_json(&out.stdout);
+    let result = &payload["payload"]["result"];
+    assert_eq!(
+        result["init_snapshot_skipped"], true,
+        "result must flag init_snapshot_skipped when env is set"
+    );
+
+    let main_init_path = result["main_agent_init_snapshot_path"]
+        .as_str()
+        .expect("main_agent_init_snapshot_path string");
+    assert!(
+        !std::path::Path::new(main_init_path).exists(),
+        "main-agent init snapshot must NOT be written when env is set: {main_init_path}"
+    );
+
+    let issue_root = result["issue_root"].as_str().expect("issue_root in result");
+    let issue_root_path = std::path::Path::new(issue_root);
+    let stray = walk_for_init_snapshot(issue_root_path);
+    assert!(
+        stray.is_empty(),
+        "no *-init.snapshot.md files allowed under issue_root when env is set: {stray:?}"
+    );
+}
+
+fn walk_for_init_snapshot(root: &std::path::Path) -> Vec<String> {
+    let mut hits = Vec::new();
+    walk_recursive(root, &mut hits);
+    hits
+}
+
+fn walk_recursive(dir: &std::path::Path, sink: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let path = entry.path();
+        if meta.is_dir() {
+            walk_recursive(&path, sink);
+        } else if let Some(name) = path.file_name().and_then(|s| s.to_str())
+            && name.ends_with("-init.snapshot.md")
+        {
+            sink.push(path.to_string_lossy().to_string());
+        }
+    }
+}

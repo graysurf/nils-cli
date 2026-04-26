@@ -227,4 +227,116 @@ fn runtime_layout_parity() {
         .as_str()
         .expect("sprint_root in result");
     assert_eq!(PathBuf::from(sprint_root), runtime_root.join("sprint-1"));
+    assert_eq!(
+        plan_payload["payload"]["result"]["init_snapshot_skipped"], false,
+        "init_snapshot_skipped must be false when env unset"
+    );
+    assert_eq!(
+        sprint_payload["payload"]["result"]["init_snapshot_skipped"], false,
+        "init_snapshot_skipped must be false when env unset"
+    );
+}
+
+#[test]
+fn runtime_layout_parity_with_skip_init_snapshot() {
+    // Mirror of `runtime_layout_parity` but with
+    // PLAN_ISSUE_SKIP_INIT_SNAPSHOT=1 and an empty `$AGENT_HOME/prompts/`.
+    // The init-prompt snapshots must be absent; every other artifact
+    // (plan snapshot, dispatch record, prompt manifest, etc.) is
+    // produced byte-for-byte the same.
+    let tmp = TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    fs::create_dir_all(&agent_home).expect("agent home");
+    let agent_home_s = agent_home.to_string_lossy().to_string();
+
+    let start_plan_out = common::run_plan_issue_local_with_env(
+        &[
+            "--format",
+            "json",
+            "--dry-run",
+            "--repo",
+            FIXTURE_REPO,
+            "start-plan",
+            "--plan",
+            FIXTURE_PLAN_FROM_REPO,
+            "--pr-grouping",
+            "per-sprint",
+        ],
+        &[
+            ("AGENT_HOME", &agent_home_s),
+            ("PLAN_ISSUE_SKIP_INIT_SNAPSHOT", "1"),
+        ],
+    );
+    assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
+
+    let start_sprint_out = common::run_plan_issue_local_with_env(
+        &[
+            "--format",
+            "json",
+            "--dry-run",
+            "--repo",
+            FIXTURE_REPO,
+            "start-sprint",
+            "--plan",
+            FIXTURE_PLAN_FROM_REPO,
+            "--issue",
+            "999",
+            "--sprint",
+            "1",
+            "--pr-grouping",
+            "per-sprint",
+            "--no-comment",
+        ],
+        &[
+            ("AGENT_HOME", &agent_home_s),
+            ("PLAN_ISSUE_SKIP_INIT_SNAPSHOT", "1"),
+        ],
+    );
+    assert_eq!(
+        start_sprint_out.code, 0,
+        "stderr: {}",
+        start_sprint_out.stderr
+    );
+
+    let runtime_root = agent_home
+        .join("out")
+        .join("plan-issue-delivery")
+        .join(FIXTURE_REPO_SLUG)
+        .join(format!("issue-{PLACEHOLDER_ISSUE}"));
+    let actual_files = collect_relative_paths(&runtime_root);
+    let expected_files: BTreeSet<String> = [
+        "plan/issue-body.md",
+        "plan/plan-branch.ref",
+        "plan/plan.snapshot.md",
+        "plan/tasks.tsv",
+        "sprint-1/manifests/dispatch-S1T1.json",
+        "sprint-1/manifests/prompt-manifest.tsv",
+        "sprint-1/prompts/S1T1.md",
+        "sprint-1/specs/sprint-task-spec.tsv",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        actual_files, expected_files,
+        "skip-init layout must drop both *-init.snapshot.md files"
+    );
+
+    for stray in actual_files.iter() {
+        assert!(
+            !stray.ends_with("-init.snapshot.md"),
+            "no init-snapshot file allowed under runtime root: {stray}"
+        );
+    }
+
+    let plan_payload = parse_json(&start_plan_out.stdout);
+    let sprint_payload = parse_json(&start_sprint_out.stdout);
+    assert_eq!(
+        plan_payload["payload"]["result"]["init_snapshot_skipped"], true,
+        "start-plan must flag init_snapshot_skipped"
+    );
+    assert_eq!(
+        sprint_payload["payload"]["result"]["init_snapshot_skipped"], true,
+        "start-sprint must flag init_snapshot_skipped"
+    );
 }

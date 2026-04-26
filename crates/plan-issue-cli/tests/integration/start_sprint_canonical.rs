@@ -344,3 +344,108 @@ fn dispatch_record_omits_runtime_adapter_keys() {
         }
     }
 }
+
+#[test]
+fn start_sprint_skips_init_snapshot_when_env_set() {
+    // Adapter opt-out: setting PLAN_ISSUE_SKIP_INIT_SNAPSHOT=1 makes
+    // start-sprint skip the canonical subagent-init snapshot copy
+    // entirely. Plan snapshot, prompt manifest, and dispatch records
+    // are still produced (only the init snapshot is conditional).
+    let tmp = TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    fs::create_dir_all(&agent_home).expect("create agent home");
+    let agent_home_s = agent_home.to_string_lossy().to_string();
+
+    let out = common::run_plan_issue_local_with_env(
+        &[
+            "--format",
+            "json",
+            "--dry-run",
+            "--repo",
+            "graysurf/plan-issue-smoke",
+            "start-sprint",
+            "--plan",
+            PLAN_PATH,
+            "--issue",
+            "217",
+            "--sprint",
+            "3",
+            "--strategy",
+            "auto",
+            "--default-pr-grouping",
+            "per-sprint",
+            "--no-comment",
+        ],
+        &[
+            ("AGENT_HOME", &agent_home_s),
+            ("PLAN_ISSUE_SKIP_INIT_SNAPSHOT", "1"),
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let payload = parse_json(&out.stdout);
+    let result = &payload["payload"]["result"];
+    assert_eq!(
+        result["init_snapshot_skipped"], true,
+        "result must flag init_snapshot_skipped when env is set"
+    );
+
+    let subagent_init_path = result["subagent_init_snapshot_path"]
+        .as_str()
+        .expect("subagent_init_snapshot_path string");
+    assert!(
+        !std::path::Path::new(subagent_init_path).exists(),
+        "subagent init snapshot must NOT be written when env is set: {subagent_init_path}"
+    );
+
+    let plan_snapshot_path = result["plan_snapshot_path"]
+        .as_str()
+        .expect("plan_snapshot_path string");
+    assert!(
+        std::path::Path::new(plan_snapshot_path).is_file(),
+        "plan snapshot must still be written: {plan_snapshot_path}"
+    );
+
+    let dispatch_paths = result["dispatch_record_paths"]
+        .as_array()
+        .expect("dispatch_record_paths");
+    assert!(
+        !dispatch_paths.is_empty(),
+        "dispatch records must still be produced when env is set"
+    );
+
+    let sprint_root = PathBuf::from(
+        result["sprint_root"]
+            .as_str()
+            .expect("sprint_root in result"),
+    );
+    let issue_root_path = sprint_root.parent().expect("issue_root parent");
+    let stray = walk_init_snapshots(issue_root_path);
+    assert!(
+        stray.is_empty(),
+        "no *-init.snapshot.md files allowed under issue_root when env is set: {stray:?}"
+    );
+}
+
+fn walk_init_snapshots(root: &std::path::Path) -> Vec<String> {
+    let mut hits = Vec::new();
+    walk_init_recursive(root, &mut hits);
+    hits
+}
+
+fn walk_init_recursive(dir: &std::path::Path, sink: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let path = entry.path();
+        if meta.is_dir() {
+            walk_init_recursive(&path, sink);
+        } else if let Some(name) = path.file_name().and_then(|s| s.to_str())
+            && name.ends_with("-init.snapshot.md")
+        {
+            sink.push(path.to_string_lossy().to_string());
+        }
+    }
+}

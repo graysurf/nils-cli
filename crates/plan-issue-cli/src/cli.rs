@@ -13,7 +13,7 @@ pub enum OutputFormat {
 #[command(
     version,
     about = "Rust implementation of the plan-issue orchestration workflow.",
-    after_help = "Usage paths:\n  - plan-issue: live GitHub-backed orchestration\n  - plan-issue-local: local-first rehearsal and dry-run flow\n\nUnsupported in plan-issue-local:\n  - Any --issue path that requires live GitHub reads/writes (for example: status-plan/ready-plan with --issue, close-plan with --issue-only, cleanup-worktrees).\n\nUse instead:\n  - plan-issue <command> ...        (live GitHub path)\n  - --body-file + --dry-run flows   (local rehearsal path where supported)\n\nBoth binaries share the same typed command contract.",
+    after_help = "Usage paths:\n  - plan-issue: live GitHub-backed orchestration\n  - plan-issue-local: local-first rehearsal and dry-run flow\n\nUnsupported in plan-issue-local:\n  - Any --issue path that requires live GitHub reads/writes (for example: status-plan/ready-plan with --issue, close-plan with --issue-only, cleanup-worktrees).\n\nUse instead:\n  - plan-issue <command> ...        (live GitHub path)\n  - --body-file + --dry-run flows   (local rehearsal path where supported)\n\nAdapter opt-outs:\n  - PLAN_ISSUE_SKIP_INIT_SNAPSHOT=1 makes start-plan / start-sprint skip the canonical *-init.snapshot.md copy entirely; intended for runtime adapters (such as Claude Code) that ship their own role/protocol prompts. Codex / opencode adapters must not set this.\n\nBoth binaries share the same typed command contract.",
     disable_help_subcommand = true
 )]
 pub struct Cli {
