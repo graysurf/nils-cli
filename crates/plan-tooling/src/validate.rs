@@ -373,22 +373,32 @@ fn validate_task(plan_path: &str, task: &Task, all_task_ids: &HashSet<String>) -
             "{prefix}: missing Dependencies (use 'none' or list task IDs)"
         )),
         Some(deps) => {
+            let mut invalid: Vec<String> = Vec::new();
+            let mut unknown: Vec<String> = Vec::new();
             for dep in deps {
                 let d = dep.trim();
                 if d.is_empty() {
                     continue;
                 }
                 if !is_task_id(d) {
-                    errs.push(format!(
-                        "{prefix}: invalid dependency (expected 'Task N.M'): {}",
-                        crate::repr::py_repr(dep)
-                    ));
+                    invalid.push(crate::repr::py_repr(dep));
                 } else if !all_task_ids.contains(d) {
-                    errs.push(format!(
-                        "{prefix}: unknown dependency (not found in plan): {}",
-                        crate::repr::py_repr(d)
-                    ));
+                    unknown.push(crate::repr::py_repr(d));
                 }
+            }
+            if !invalid.is_empty() {
+                errs.push(format!(
+                    "{prefix}: line {line}: invalid dependency (expected 'Task N.M', e.g. 'Task 1.2'): {values}",
+                    line = task.start_line,
+                    values = invalid.join(", ")
+                ));
+            }
+            if !unknown.is_empty() {
+                errs.push(format!(
+                    "{prefix}: line {line}: unknown dependency (not found in plan): {values}",
+                    line = task.start_line,
+                    values = unknown.join(", ")
+                ));
             }
         }
     }
@@ -580,7 +590,7 @@ mod tests {
             id: "Task 1.1".to_string(),
             name: "demo".to_string(),
             sprint: 1,
-            start_line: 1,
+            start_line: 42,
             location: vec![
                 "/abs/path.rs".to_string(),
                 "dir/".to_string(),
@@ -602,6 +612,48 @@ mod tests {
         assert!(errs.iter().any(|e| e.contains("invalid dependency")));
         assert!(errs.iter().any(|e| e.contains("unknown dependency")));
         assert!(errs.iter().any(|e| e.contains("Complexity out of range")));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("line 42") && e.contains("e.g. 'Task 1.2'")),
+            "expected dep error to carry task line + canonical example, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn validate_task_groups_invalid_deps_into_single_error() {
+        let task = Task {
+            id: "Task 2.5".to_string(),
+            name: "multi-bad-deps".to_string(),
+            sprint: 2,
+            start_line: 87,
+            location: vec!["src/lib.rs".to_string()],
+            description: Some("Ship feature".to_string()),
+            dependencies: Some(vec![
+                "Task x.y".to_string(),
+                "1.1".to_string(),
+                "Task 1".to_string(),
+            ]),
+            complexity: Some(3),
+            acceptance_criteria: vec!["Done".to_string()],
+            validation: vec!["cargo test".to_string()],
+        };
+        let all_ids = HashSet::from(["Task 2.5".to_string()]);
+        let errs = validate_task("plan.md", &task, &all_ids);
+        let invalid: Vec<&String> = errs
+            .iter()
+            .filter(|e| e.contains("invalid dependency"))
+            .collect();
+        assert_eq!(
+            invalid.len(),
+            1,
+            "expected a single grouped invalid-dep error, got: {errs:?}",
+        );
+        let msg = invalid[0];
+        assert!(msg.contains("line 87"), "missing line ref: {msg}");
+        assert!(msg.contains("e.g. 'Task 1.2'"), "missing example: {msg}");
+        assert!(msg.contains("'Task x.y'"), "missing first bad value: {msg}");
+        assert!(msg.contains("'1.1'"), "missing second bad value: {msg}");
+        assert!(msg.contains("'Task 1'"), "missing third bad value: {msg}");
     }
 
     #[test]

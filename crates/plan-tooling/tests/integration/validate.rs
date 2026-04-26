@@ -112,6 +112,31 @@ fn validate_redirect_command_is_not_placeholder() {
 }
 
 #[test]
+fn validate_dependency_error_carries_line_and_example() {
+    let repo = init_repo();
+    write_file(&repo.path().join("bad-deps.md"), INVALID_DEP_FORMAT_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "bad-deps.md"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stdout.is_empty());
+    assert!(
+        out.stderr.contains("invalid dependency"),
+        "stderr: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("e.g. 'Task 1.2'"),
+        "stderr: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("line "),
+        "stderr should reference a line number, got: {}",
+        out.stderr
+    );
+}
+
+#[test]
 fn validate_json_ok_with_explicit_file() {
     let repo = init_repo();
     write_file(&repo.path().join("plan.md"), VALID_PLAN);
@@ -288,6 +313,23 @@ const REDIRECT_VALIDATION_PLAN: &str = r#"# Plan: Redirect
   - Redirect command is accepted
 - **Validation**:
   - cat < input.txt > output.txt
+"#;
+
+const INVALID_DEP_FORMAT_PLAN: &str = r#"# Plan: Bad deps
+
+## Sprint 1: First sprint
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - 1.1
+  - Task x.y
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test
 "#;
 
 const METADATA_MISMATCH_PLAN: &str = r#"# Plan: Metadata mismatch
