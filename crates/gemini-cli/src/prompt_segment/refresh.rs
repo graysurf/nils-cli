@@ -2,11 +2,15 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
+use nils_common::fs as shared_fs;
+
 use crate::rate_limits;
 use crate::rate_limits::client::{UsageRequest, fetch_usage};
 use crate::rate_limits::render as rate_render;
 
 use super::render as prompt_segment_render;
+
+const REFRESH_MARKER_MODE: u32 = 0o644;
 
 pub(crate) fn enqueue_background_refresh(target_file: &Path) {
     let cache_file = match rate_limits::cache_file_for_target(target_file) {
@@ -163,10 +167,10 @@ fn write_last_attempt(cache_file: &Path) {
         return;
     }
 
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, now_epoch.to_string());
+    // Use an atomic temp+rename so a concurrent `is_within_min_interval`
+    // reader never observes an empty or partial marker (which would parse
+    // as zero, disarm the gate, and fire a redundant background refresh).
+    let _ = shared_fs::write_atomic(&path, now_epoch.to_string().as_bytes(), REFRESH_MARKER_MODE);
 }
 
 fn is_within_min_interval(cache_file: &Path, refresh_min_seconds: u64) -> bool {
