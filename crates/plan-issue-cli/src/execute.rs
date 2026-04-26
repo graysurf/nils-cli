@@ -968,14 +968,32 @@ fn run_start_sprint(
     repo_override: Option<&str>,
     args: &StartSprintArgs,
 ) -> Result<Value, CommandError> {
+    // Task 1.2: read plan-declared `pr-grouping` for this sprint and
+    // default `--strategy` / `--default-pr-grouping` from it when the
+    // operator passed neither.
+    let mut grouping = args.grouping.clone();
+    let mut inferred_defaults_note: Option<String> = None;
+    if let Some(inferred) =
+        infer_grouping_defaults_from_plan(&args.plan, i32::from(args.sprint), &grouping)
+    {
+        apply_inferred_grouping_defaults(&mut grouping, &inferred);
+        inferred_defaults_note = Some(format!(
+            "auto/{}",
+            match inferred.default_pr_grouping {
+                crate::commands::PrGrouping::PerSprint => "per-sprint",
+                crate::commands::PrGrouping::Group => "group",
+            }
+        ));
+    }
+
     let options = to_build_options(
         args.prefixes.owner_prefix.clone(),
         args.prefixes.branch_prefix.clone(),
         args.prefixes.worktree_prefix.clone(),
-        args.grouping.pr_grouping,
-        args.grouping.default_pr_grouping,
-        args.grouping.strategy,
-        args.grouping.pr_group.clone(),
+        grouping.pr_grouping,
+        grouping.default_pr_grouping,
+        grouping.strategy,
+        grouping.pr_group.clone(),
     );
 
     let build = task_spec::build_task_spec(
@@ -1025,7 +1043,7 @@ fn run_start_sprint(
             table.rows(),
             i32::from(args.sprint),
             &build.rows,
-            args.grouping.strategy,
+            grouping.strategy,
         )
         .map_err(|err| CommandError::runtime("task-sync-drift-detected", err))?;
         issue_body_for_comment = Some(body);
@@ -1099,7 +1117,7 @@ fn run_start_sprint(
         args.issue,
         i32::from(args.sprint),
         &artifact_rows,
-        args.grouping.strategy,
+        grouping.strategy,
     )
     .map_err(|err| CommandError::runtime("subagent-prompt-write-failed", err))?;
 
@@ -1113,7 +1131,7 @@ fn run_start_sprint(
         let dispatch_path = sprint_root
             .dispatch_record(&row.task_id)
             .map_err(|err| CommandError::runtime("runtime-layout-failed", err.to_string()))?;
-        let execution_mode = execution_mode_for_row(row, args.grouping.strategy, &artifact_rows);
+        let execution_mode = execution_mode_for_row(row, grouping.strategy, &artifact_rows);
         // Canonical contract: dispatch record `worktree` is the absolute
         // assigned path under $WORKTREE_ROOT (RUNTIME_LAYOUT.md "Worktree
         // Layout (Assigned Paths)"), not the short name from the TSV.
@@ -1175,7 +1193,7 @@ fn run_start_sprint(
         &prompt_manifest_path,
         &artifact_rows,
         &sprint_root,
-        args.grouping.strategy,
+        grouping.strategy,
     )
     .map_err(|err| {
         CommandError::runtime(
@@ -1193,7 +1211,7 @@ fn run_start_sprint(
         sprint: i32::from(args.sprint),
         sprint_name: &sprint_name,
         rows: &artifact_rows,
-        strategy: args.grouping.strategy,
+        strategy: grouping.strategy,
         note_text: None,
         approval_comment_url: None,
         issue_body_text: issue_body_for_comment.as_deref(),
@@ -1235,6 +1253,7 @@ fn run_start_sprint(
         "dispatch_record_paths": dispatch_record_paths,
         "pr_groups": pr_groups,
         "synced_issue_rows": synced_rows,
+        "inferred_grouping_defaults": inferred_defaults_note,
         "comment_requested": should_comment,
         "live_mutations_performed": live_mutations,
     }))
@@ -1332,14 +1351,23 @@ fn run_ready_sprint(
     repo_override: Option<&str>,
     args: &ReadySprintArgs,
 ) -> Result<Value, CommandError> {
+    // Task 1.2: inherit grouping defaults from plan metadata when the
+    // operator passed no explicit flags.
+    let mut grouping = args.grouping.clone();
+    if let Some(inferred) =
+        infer_grouping_defaults_from_plan(&args.plan, i32::from(args.sprint), &grouping)
+    {
+        apply_inferred_grouping_defaults(&mut grouping, &inferred);
+    }
+
     let options = to_build_options(
         args.prefixes.owner_prefix.clone(),
         args.prefixes.branch_prefix.clone(),
         args.prefixes.worktree_prefix.clone(),
-        args.grouping.pr_grouping,
-        args.grouping.default_pr_grouping,
-        args.grouping.strategy,
-        args.grouping.pr_group.clone(),
+        grouping.pr_grouping,
+        grouping.default_pr_grouping,
+        grouping.strategy,
+        grouping.pr_group.clone(),
     );
 
     let build = task_spec::build_task_spec(
@@ -1388,7 +1416,7 @@ fn run_ready_sprint(
         sprint: i32::from(args.sprint),
         sprint_name: &sprint_name,
         rows: &build.rows,
-        strategy: args.grouping.strategy,
+        strategy: grouping.strategy,
         note_text: summary.as_deref(),
         approval_comment_url: None,
         issue_body_text: issue_body_for_comment.as_deref(),
@@ -1439,14 +1467,23 @@ fn run_accept_sprint(
         ));
     }
 
+    // Task 1.2: inherit grouping defaults from plan metadata when the
+    // operator passed no explicit flags.
+    let mut grouping = args.grouping.clone();
+    if let Some(inferred) =
+        infer_grouping_defaults_from_plan(&args.plan, i32::from(args.sprint), &grouping)
+    {
+        apply_inferred_grouping_defaults(&mut grouping, &inferred);
+    }
+
     let options = to_build_options(
         args.prefixes.owner_prefix.clone(),
         args.prefixes.branch_prefix.clone(),
         args.prefixes.worktree_prefix.clone(),
-        args.grouping.pr_grouping,
-        args.grouping.default_pr_grouping,
-        args.grouping.strategy,
-        args.grouping.pr_group.clone(),
+        grouping.pr_grouping,
+        grouping.default_pr_grouping,
+        grouping.strategy,
+        grouping.pr_group.clone(),
     );
 
     let build = task_spec::build_task_spec(
@@ -1533,7 +1570,7 @@ fn run_accept_sprint(
         sprint: i32::from(args.sprint),
         sprint_name: &sprint_name,
         rows: &build.rows,
-        strategy: args.grouping.strategy,
+        strategy: grouping.strategy,
         note_text: summary.as_deref(),
         approval_comment_url: Some(&args.approved_comment_url),
         issue_body_text: issue_body_for_comment.as_deref(),
@@ -1708,6 +1745,90 @@ fn to_build_options(
         strategy,
         pr_group,
     }
+}
+
+/// Inferred grouping defaults derived from a plan sprint's `pr-grouping`
+/// metadata (Task 1.2). Returned only when the operator did NOT pass any of
+/// `--strategy` / `--pr-grouping` / `--default-pr-grouping` and the sprint
+/// declared an intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InferredGroupingDefaults {
+    pub strategy: crate::commands::SplitStrategy,
+    pub default_pr_grouping: crate::commands::PrGrouping,
+    pub source_sprint: i32,
+}
+
+/// Resolve plan-derived defaults for `--strategy` and `--default-pr-grouping`.
+///
+/// Behaviour (Task 1.2):
+///
+/// * Returns `None` when the operator passed any explicit grouping flag
+///   (so CLI flags always win).
+/// * Returns `None` when the plan parses cleanly but the named sprint
+///   has no `pr-grouping` metadata.
+/// * Returns `Some(_)` when the plan declares the sprint's intent and
+///   no CLI flag overrode it; the caller mutates `grouping` accordingly
+///   and prints the hint to stderr.
+/// * Returns `None` when the plan cannot be parsed; the downstream
+///   `task_spec::build_task_spec` call surfaces the same parse error with
+///   a richer message.
+pub(crate) fn infer_grouping_defaults_from_plan(
+    plan_path: &Path,
+    sprint: i32,
+    grouping: &crate::commands::GroupingArgs,
+) -> Option<InferredGroupingDefaults> {
+    // Operator already pinned at least one grouping decision — never
+    // override.
+    if grouping.pr_grouping.is_some()
+        || grouping.default_pr_grouping.is_some()
+        || grouping.strategy != crate::commands::SplitStrategy::Deterministic
+        || !grouping.pr_group.is_empty()
+    {
+        return None;
+    }
+
+    let resolved = task_spec::resolve_plan_file(plan_path);
+    let display = plan_path.to_string_lossy().to_string();
+    let (plan, parse_errors) = parse_plan_with_display(&resolved, &display).ok()?;
+    if !parse_errors.is_empty() {
+        return None;
+    }
+
+    let target = plan.sprints.iter().find(|s| s.number == sprint)?;
+    let intent = target.metadata.pr_grouping_intent.as_deref()?;
+    let pr_grouping = match intent {
+        "per-sprint" => crate::commands::PrGrouping::PerSprint,
+        "group" => crate::commands::PrGrouping::Group,
+        _ => return None,
+    };
+
+    Some(InferredGroupingDefaults {
+        strategy: crate::commands::SplitStrategy::Auto,
+        default_pr_grouping: pr_grouping,
+        source_sprint: sprint,
+    })
+}
+
+/// Apply inferred defaults to a mutable `GroupingArgs` clone and emit the
+/// stderr hint required by Task 1.2.
+pub(crate) fn apply_inferred_grouping_defaults(
+    grouping: &mut crate::commands::GroupingArgs,
+    inferred: &InferredGroupingDefaults,
+) {
+    grouping.strategy = inferred.strategy;
+    grouping.default_pr_grouping = Some(inferred.default_pr_grouping);
+    let strategy_text = match inferred.strategy {
+        crate::commands::SplitStrategy::Auto => "auto",
+        crate::commands::SplitStrategy::Deterministic => "deterministic",
+    };
+    let grouping_text = match inferred.default_pr_grouping {
+        crate::commands::PrGrouping::PerSprint => "per-sprint",
+        crate::commands::PrGrouping::Group => "group",
+    };
+    eprintln!(
+        "inferred --strategy={strategy_text}; --default-pr-grouping={grouping_text} from plan sprint S{}",
+        inferred.source_sprint
+    );
 }
 
 fn load_summary(summary: &SummaryArgs) -> Result<Option<String>, CommandError> {

@@ -245,9 +245,14 @@ impl Command {
             Self::BuildTaskSpec(args) => validate_grouping(&args.grouping),
             Self::BuildPlanTaskSpec(args) => validate_grouping(&args.grouping),
             Self::StartPlan(args) => validate_grouping(&args.grouping),
-            Self::StartSprint(args) => validate_grouping(&args.grouping),
-            Self::ReadySprint(args) => validate_grouping(&args.grouping),
-            Self::AcceptSprint(args) => validate_grouping(&args.grouping),
+            // Sprint commands may infer `--strategy` / `--default-pr-grouping`
+            // from the plan markdown's `pr-grouping` metadata at runtime
+            // (Task 1.2), so the no-flag deterministic path is intentionally
+            // permitted here; the runtime resolver enforces the real
+            // requirement once the plan has been read.
+            Self::StartSprint(args) => validate_grouping_with_plan_inference(&args.grouping),
+            Self::ReadySprint(args) => validate_grouping_with_plan_inference(&args.grouping),
+            Self::AcceptSprint(args) => validate_grouping_with_plan_inference(&args.grouping),
             Self::ClosePlan(args) => validate_close_plan_args(args, dry_run),
             Self::LinkPr(args) => validate_link_pr_args(args),
             Self::MultiSprintGuide(args) => validate_multi_sprint_guide_args(args),
@@ -296,6 +301,23 @@ fn validate_grouping(grouping: &GroupingArgs) -> Result<(), ValidationError> {
             Ok(())
         }
     }
+}
+
+/// Validate grouping for sprint commands that may infer flags from the
+/// plan's per-sprint `pr-grouping` metadata (Task 1.2). Identical to
+/// `validate_grouping` except the "deterministic with no `--pr-grouping`"
+/// case is permitted: the runtime resolver in `execute::run_*_sprint`
+/// either substitutes plan-derived defaults or surfaces a richer error.
+fn validate_grouping_with_plan_inference(grouping: &GroupingArgs) -> Result<(), ValidationError> {
+    // No-flag path that downstream inference will fill in.
+    if grouping.strategy == SplitStrategy::Deterministic
+        && grouping.pr_grouping.is_none()
+        && grouping.default_pr_grouping.is_none()
+        && grouping.pr_group.is_empty()
+    {
+        return Ok(());
+    }
+    validate_grouping(grouping)
 }
 
 fn validate_close_plan_args(args: &ClosePlanArgs, dry_run: bool) -> Result<(), ValidationError> {
