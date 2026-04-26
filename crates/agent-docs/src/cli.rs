@@ -18,9 +18,9 @@ pub struct Cli {
         long,
         global = true,
         value_name = "PATH",
-        help = "Override AGENT_HOME root path"
+        help = "Override AGENT_DOCS_HOME root path"
     )]
-    pub agent_home: Option<PathBuf>,
+    pub docs_home: Option<PathBuf>,
 
     #[arg(
         long,

@@ -23,7 +23,7 @@ fn write_markdown(path: &Path) {
 
 fn roots(home: &TempDir, project: &TempDir) -> ResolvedRoots {
     ResolvedRoots {
-        agent_home: home.path().to_path_buf(),
+        docs_home: home.path().to_path_buf(),
         project_path: project.path().to_path_buf(),
         is_linked_worktree: false,
         git_common_dir: None,
@@ -116,7 +116,7 @@ fn baseline_check_strict_mode_returns_non_zero_when_required_docs_missing() {
 
     let exit_missing = run_with_args([
         "agent-docs",
-        "--agent-home",
+        "--docs-home",
         home.path().to_str().expect("home path should be utf-8"),
         "--project-path",
         project
@@ -134,7 +134,7 @@ fn baseline_check_strict_mode_returns_non_zero_when_required_docs_missing() {
     write_markdown(&project.path().join("DEVELOPMENT.md"));
     let exit_complete = run_with_args([
         "agent-docs",
-        "--agent-home",
+        "--docs-home",
         home.path().to_str().expect("home path should be utf-8"),
         "--project-path",
         project
@@ -227,7 +227,7 @@ when = "always"
 
     let exit_missing_extension = run_with_args([
         "agent-docs",
-        "--agent-home",
+        "--docs-home",
         home.path().to_str().expect("home path should be utf-8"),
         "--project-path",
         project
@@ -245,7 +245,7 @@ when = "always"
     write_markdown(&project.path().join("BINARY_DEPENDENCIES.md"));
     let exit_complete = run_with_args([
         "agent-docs",
-        "--agent-home",
+        "--docs-home",
         home.path().to_str().expect("home path should be utf-8"),
         "--project-path",
         project
@@ -281,7 +281,7 @@ when = "always"
 
     let exit_code = run_with_args([
         "agent-docs",
-        "--agent-home",
+        "--docs-home",
         home.path().to_str().expect("home path should be utf-8"),
         "--project-path",
         project

@@ -41,7 +41,7 @@ pub fn check_builtin_baseline_with_mode(
     Ok(BaselineCheckReport::from_items(
         target,
         strict,
-        roots.agent_home.clone(),
+        roots.docs_home.clone(),
         roots.project_path.clone(),
         items,
         suggested_actions,
@@ -67,23 +67,23 @@ fn builtin_items_for_target(
 
 fn home_items(roots: &ResolvedRoots) -> Vec<BaselineCheckItem> {
     vec![
-        startup_policy_item(Scope::Home, &roots.agent_home, None),
+        startup_policy_item(Scope::Home, &roots.docs_home, None),
         required_item(
             Scope::Home,
             Context::SkillDev,
             "skill-dev",
-            &roots.agent_home,
+            &roots.docs_home,
             "DEVELOPMENT.md",
-            "skill development guidance from AGENT_HOME/DEVELOPMENT.md",
+            "skill development guidance from AGENT_DOCS_HOME/DEVELOPMENT.md",
             DocumentSource::Builtin,
         ),
         required_item(
             Scope::Home,
             Context::TaskTools,
             "task-tools",
-            &roots.agent_home,
+            &roots.docs_home,
             "CLI_TOOLS.md",
-            "tool-selection guidance from AGENT_HOME/CLI_TOOLS.md",
+            "tool-selection guidance from AGENT_DOCS_HOME/CLI_TOOLS.md",
             DocumentSource::Builtin,
         ),
     ]
@@ -345,7 +345,7 @@ fn extension_source(source_scope: Scope) -> DocumentSource {
 
 fn resolve_extension_path(entry: &ConfigDocumentEntry, roots: &ResolvedRoots) -> PathBuf {
     let root = match entry.scope {
-        Scope::Home => &roots.agent_home,
+        Scope::Home => &roots.docs_home,
         Scope::Project => &roots.project_path,
     };
     normalize_path(&root.join(&entry.path))

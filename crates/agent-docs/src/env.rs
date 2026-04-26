@@ -8,13 +8,13 @@ use crate::paths::normalize_root_path;
 
 #[derive(Debug, Clone, Default)]
 pub struct PathOverrides {
-    pub agent_home: Option<PathBuf>,
+    pub docs_home: Option<PathBuf>,
     pub project_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRoots {
-    pub agent_home: PathBuf,
+    pub docs_home: PathBuf,
     pub project_path: PathBuf,
     pub is_linked_worktree: bool,
     pub git_common_dir: Option<PathBuf>,
@@ -23,12 +23,12 @@ pub struct ResolvedRoots {
 
 pub fn resolve_roots(overrides: &PathOverrides) -> Result<ResolvedRoots> {
     let cwd = env::current_dir().context("failed to read current directory")?;
-    let agent_home = resolve_agent_home(overrides.agent_home.as_deref(), &cwd)?;
+    let docs_home = resolve_docs_home(overrides.docs_home.as_deref(), &cwd)?;
     let project_path = resolve_project_path(overrides.project_path.as_deref(), &cwd);
     let metadata = resolve_linked_worktree_metadata(&project_path);
 
     Ok(ResolvedRoots {
-        agent_home,
+        docs_home,
         project_path,
         is_linked_worktree: metadata.is_linked_worktree,
         git_common_dir: metadata.git_common_dir,
@@ -36,16 +36,16 @@ pub fn resolve_roots(overrides: &PathOverrides) -> Result<ResolvedRoots> {
     })
 }
 
-fn resolve_agent_home(cli_value: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
+fn resolve_docs_home(cli_value: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
     if let Some(path) = cli_value {
         return Ok(normalize_root_path(path, cwd));
     }
 
-    if let Some(path) = read_env_path("AGENT_HOME") {
+    if let Some(path) = read_env_path("AGENT_DOCS_HOME") {
         return Ok(normalize_root_path(&path, cwd));
     }
 
-    bail!("AGENT_HOME is required; set AGENT_HOME or pass --agent-home")
+    bail!("AGENT_DOCS_HOME is required; set AGENT_DOCS_HOME or pass --docs-home")
 }
 
 fn resolve_project_path(cli_value: Option<&Path>, cwd: &Path) -> PathBuf {

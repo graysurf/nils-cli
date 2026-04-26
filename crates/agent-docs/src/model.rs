@@ -268,7 +268,7 @@ impl ResolveSummary {
 pub struct ResolveReport {
     pub context: Context,
     pub strict: bool,
-    pub agent_home: PathBuf,
+    pub docs_home: PathBuf,
     pub project_path: PathBuf,
     pub is_linked_worktree: bool,
     pub git_common_dir: Option<PathBuf>,
@@ -299,7 +299,7 @@ pub struct BaselineCheckItem {
 pub struct BaselineCheckReport {
     pub target: BaselineTarget,
     pub strict: bool,
-    pub agent_home: PathBuf,
+    pub docs_home: PathBuf,
     pub project_path: PathBuf,
     pub items: Vec<BaselineCheckItem>,
     pub missing_required: usize,
@@ -311,7 +311,7 @@ impl BaselineCheckReport {
     pub fn from_items(
         target: BaselineTarget,
         strict: bool,
-        agent_home: PathBuf,
+        docs_home: PathBuf,
         project_path: PathBuf,
         items: Vec<BaselineCheckItem>,
         suggested_actions: Vec<String>,
@@ -328,7 +328,7 @@ impl BaselineCheckReport {
         Self {
             target,
             strict,
-            agent_home,
+            docs_home,
             project_path,
             items,
             missing_required,
