@@ -443,11 +443,35 @@ fn validate_task(plan_path: &str, task: &Task, all_task_ids: &HashSet<String>) -
 }
 
 fn has_placeholder(value: &str) -> bool {
-    if contains_angle_placeholder(value) {
+    let scan = strip_backtick_spans(value);
+    if contains_angle_placeholder(&scan) {
         return true;
     }
 
-    contains_word_case_insensitive(value, "TBD") || contains_word_case_insensitive(value, "TODO")
+    contains_word_case_insensitive(&scan, "TBD") || contains_word_case_insensitive(&scan, "TODO")
+}
+
+/// Drop the contents of paired backtick spans so placeholder checks only fire
+/// on prose. An unpaired trailing backtick is kept verbatim (treated as
+/// literal text), matching how Markdown renders it.
+fn strip_backtick_spans(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            if let Some(rel_end) = chars[i + 1..].iter().position(|c| *c == '`') {
+                i = i + 1 + rel_end + 1;
+                continue;
+            }
+            out.push('`');
+            i += 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 fn contains_angle_placeholder(value: &str) -> bool {
@@ -537,7 +561,7 @@ mod tests {
 
     use super::{
         contains_angle_placeholder, contains_word_case_insensitive, has_placeholder,
-        is_non_empty_list, is_task_id, validate_task,
+        is_non_empty_list, is_task_id, strip_backtick_spans, validate_task,
     };
 
     #[test]
@@ -565,6 +589,28 @@ mod tests {
         assert!(has_placeholder("mark as tBd"));
         assert!(!has_placeholder("cat < input > output"));
         assert!(!has_placeholder("all good"));
+    }
+
+    #[test]
+    fn has_placeholder_ignores_tokens_inside_backtick_spans() {
+        // Legitimate usage docs that wrap argument slots in backticks.
+        assert!(!has_placeholder("invoke `<arg>` with the path"));
+        assert!(!has_placeholder("plan-issue resolve-approval `<TBD>`"));
+        assert!(!has_placeholder("write `TODO: hook entry` then return"));
+        // Bare placeholders outside backticks still fail.
+        assert!(has_placeholder("invoke <arg> with the path"));
+        assert!(has_placeholder("plan-issue resolve-approval <TBD>"));
+        assert!(has_placeholder("write TODO: hook entry then return"));
+    }
+
+    #[test]
+    fn strip_backtick_spans_handles_pairs_and_dangling() {
+        assert_eq!(strip_backtick_spans("hi `code` bye"), "hi  bye");
+        assert_eq!(strip_backtick_spans("a `b` c `d` e"), "a  c  e");
+        // Unpaired backtick is preserved as literal text.
+        assert_eq!(strip_backtick_spans("a `b c"), "a `b c");
+        // Empty span drops nothing visible (just two backticks).
+        assert_eq!(strip_backtick_spans("a `` b"), "a  b");
     }
 
     #[test]

@@ -112,6 +112,21 @@ fn validate_redirect_command_is_not_placeholder() {
 }
 
 #[test]
+fn validate_backtick_wrapped_placeholder_in_description_is_accepted() {
+    let repo = init_repo();
+    write_file(&repo.path().join("backtick.md"), BACKTICK_DESCRIPTION_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "backtick.md"]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn validate_dependency_error_carries_line_and_example() {
     let repo = init_repo();
     write_file(&repo.path().join("bad-deps.md"), INVALID_DEP_FORMAT_PLAN);
@@ -313,6 +328,22 @@ const REDIRECT_VALIDATION_PLAN: &str = r#"# Plan: Redirect
   - Redirect command is accepted
 - **Validation**:
   - cat < input.txt > output.txt
+"#;
+
+const BACKTICK_DESCRIPTION_PLAN: &str = r#"# Plan: Backtick description
+
+## Sprint 1: First sprint
+
+### Task 1.1: Document a usage slot
+- **Location**:
+  - `src/a.rs`
+- **Description**: Invoke `<arg>` and `<TBD>` like `TODO: keep` to wire the slot.
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - Slot resolves
+- **Validation**:
+  - cargo test
 "#;
 
 const INVALID_DEP_FORMAT_PLAN: &str = r#"# Plan: Bad deps
