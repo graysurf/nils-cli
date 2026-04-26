@@ -13,7 +13,7 @@ fn parse_json(stdout: &str) -> Value {
     serde_json::from_str(stdout).expect("stdout should be valid JSON")
 }
 
-fn run_local_start_plan(agent_home: &str, repo: &str) -> common::CmdOut {
+fn run_local_start_plan(state_dir: &str, repo: &str) -> common::CmdOut {
     common::run_plan_issue_local_with_env(
         &[
             "--format",
@@ -27,25 +27,24 @@ fn run_local_start_plan(agent_home: &str, repo: &str) -> common::CmdOut {
             "--pr-grouping",
             "per-sprint",
         ],
-        &[("AGENT_HOME", agent_home)],
+        &[("PLAN_ISSUE_HOME", state_dir)],
     )
 }
 
 #[test]
 fn start_plan_emits_canonical_artifacts() {
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let out = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
+    let out = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
 
     let payload = parse_json(&out.stdout);
     let result = &payload["payload"]["result"];
     let issue_root = result["issue_root"].as_str().expect("issue_root in result");
-    let expected_issue_root = agent_home
+    let expected_issue_root = state_dir
         .join("out")
         .join("plan-issue-delivery")
         .join("graysurf__plan-issue-smoke")
@@ -87,33 +86,34 @@ fn start_plan_emits_canonical_artifacts() {
         "issue body missing on disk: {issue_body_path}"
     );
 
-    let main_init_path = result["main_agent_init_snapshot_path"]
-        .as_str()
-        .expect("main_agent_init_snapshot_path in result");
-    assert_eq!(
-        main_init_path,
-        expected_issue_root
-            .join("prompts")
-            .join("plan-issue-delivery-main-agent-init.snapshot.md")
-            .to_string_lossy()
-            .to_string()
-    );
-    let snapshot = fs::read_to_string(main_init_path).expect("read main-init snapshot");
+    // Init-snapshot machinery removed in 0.8: result must NOT include
+    // `main_agent_init_snapshot_path` or `init_snapshot_skipped`.
     assert!(
-        snapshot.contains("Main Agent Init"),
-        "snapshot must mirror source content: {snapshot}"
+        result.get("main_agent_init_snapshot_path").is_none(),
+        "main_agent_init_snapshot_path must be absent post-0.8: {result}"
+    );
+    assert!(
+        result.get("init_snapshot_skipped").is_none(),
+        "init_snapshot_skipped must be absent post-0.8: {result}"
+    );
+
+    // No *-init.snapshot.md files should be written under the issue root.
+    let issue_root_path = std::path::Path::new(issue_root);
+    let stray = walk_for_init_snapshot(issue_root_path);
+    assert!(
+        stray.is_empty(),
+        "no *-init.snapshot.md files should be written: {stray:?}"
     );
 }
 
 #[test]
 fn start_plan_writes_plan_branch_ref() {
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let out = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
+    let out = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
 
     let payload = parse_json(&out.stdout);
@@ -121,7 +121,7 @@ fn start_plan_writes_plan_branch_ref() {
         .as_str()
         .expect("plan_branch_ref_path in result");
 
-    let expected_path = agent_home
+    let expected_path = state_dir
         .join("out")
         .join("plan-issue-delivery")
         .join("graysurf__plan-issue-smoke")
@@ -144,12 +144,11 @@ fn start_plan_writes_plan_branch_ref() {
 #[test]
 fn start_plan_local_uses_placeholder_issue() {
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let out = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
+    let out = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
 
     let payload = parse_json(&out.stdout);
@@ -168,14 +167,13 @@ fn status_plan_emits_repo_slug_and_v2_schema_version() {
     // Drive it via a body-file flow with an explicit --repo so the slug is
     // derivable without contacting GitHub.
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     // First run start-plan to produce an issue body we can feed into
     // status-plan.
-    let start = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
+    let start = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
     assert_eq!(start.code, 0, "start-plan stderr: {}", start.stderr);
     let start_payload = parse_json(&start.stdout);
     let issue_body_path = start_payload["payload"]["result"]["issue_body_path"]
@@ -194,7 +192,7 @@ fn status_plan_emits_repo_slug_and_v2_schema_version() {
             "--body-file",
             &issue_body_path,
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(status.code, 0, "status-plan stderr: {}", status.stderr);
 
@@ -214,12 +212,11 @@ fn start_plan_emits_repo_slug_and_v2_schema_version() {
     // Task 1.1: result payload exposes the runtime repo slug; schema_version
     // bumps to v2 so consumers know the new field is present.
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let out = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
+    let out = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
 
     let payload = parse_json(&out.stdout);
@@ -235,88 +232,12 @@ fn start_plan_emits_repo_slug_and_v2_schema_version() {
     );
 
     // Round-trip: a second run produces an identical repo_slug.
-    let out2 = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
+    let out2 = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
     assert_eq!(out2.code, 0, "stderr: {}", out2.stderr);
     let payload2 = parse_json(&out2.stdout);
     assert_eq!(
         payload2["payload"]["result"]["repo_slug"], result["repo_slug"],
         "repo_slug must round-trip identically across runs"
-    );
-}
-
-#[test]
-fn start_plan_fails_on_missing_main_agent_init_source() {
-    let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    let agent_home_s = agent_home.to_string_lossy().to_string();
-
-    let out = run_local_start_plan(&agent_home_s, "graysurf/plan-issue-smoke");
-    assert_eq!(out.code, 1, "stdout: {} stderr: {}", out.stdout, out.stderr);
-    assert!(
-        out.stderr
-            .contains("main-agent-init-snapshot-source-missing")
-            || out
-                .stdout
-                .contains("main-agent-init-snapshot-source-missing"),
-        "missing-source error not surfaced; stdout={} stderr={}",
-        out.stdout,
-        out.stderr
-    );
-}
-
-#[test]
-fn start_plan_skips_init_snapshot_when_env_set() {
-    // Adapter opt-out: setting PLAN_ISSUE_SKIP_INIT_SNAPSHOT=1 makes
-    // the binary skip both the existence check on the canonical
-    // main-agent init prompt and the copy into the runtime workspace,
-    // even if `$AGENT_HOME/prompts/` is empty.
-    let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    let agent_home_s = agent_home.to_string_lossy().to_string();
-
-    let out = common::run_plan_issue_local_with_env(
-        &[
-            "--format",
-            "json",
-            "--dry-run",
-            "--repo",
-            "graysurf/plan-issue-smoke",
-            "start-plan",
-            "--plan",
-            PLAN_PATH,
-            "--pr-grouping",
-            "per-sprint",
-        ],
-        &[
-            ("AGENT_HOME", &agent_home_s),
-            ("PLAN_ISSUE_SKIP_INIT_SNAPSHOT", "1"),
-        ],
-    );
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-
-    let payload = parse_json(&out.stdout);
-    let result = &payload["payload"]["result"];
-    assert_eq!(
-        result["init_snapshot_skipped"], true,
-        "result must flag init_snapshot_skipped when env is set"
-    );
-
-    let main_init_path = result["main_agent_init_snapshot_path"]
-        .as_str()
-        .expect("main_agent_init_snapshot_path string");
-    assert!(
-        !std::path::Path::new(main_init_path).exists(),
-        "main-agent init snapshot must NOT be written when env is set: {main_init_path}"
-    );
-
-    let issue_root = result["issue_root"].as_str().expect("issue_root in result");
-    let issue_root_path = std::path::Path::new(issue_root);
-    let stray = walk_for_init_snapshot(issue_root_path);
-    assert!(
-        stray.is_empty(),
-        "no *-init.snapshot.md files allowed under issue_root when env is set: {stray:?}"
     );
 }
 

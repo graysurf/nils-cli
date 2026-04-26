@@ -20,9 +20,9 @@ fn shell_fixture(name: &str) -> String {
     })
 }
 
-fn normalize_shell_text(text: &str, agent_home: &str) -> String {
+fn normalize_shell_text(text: &str, state_dir: &str) -> String {
     text.trim()
-        .replace(agent_home, "$AGENT_HOME")
+        .replace(state_dir, "$PLAN_ISSUE_HOME")
         .replace("\\<", "<")
         .replace("\\>", ">")
 }
@@ -99,10 +99,9 @@ fn parity_shell_completion_scripts_emit_expected_headers() {
 #[test]
 fn parity_shell_multi_sprint_guide_matches_shell_fixture_after_normalization() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let out = common::run_plan_issue_local_with_env(
         &[
@@ -117,7 +116,7 @@ fn parity_shell_multi_sprint_guide_matches_shell_fixture_after_normalization() {
             "--to-sprint",
             "2",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
 
@@ -129,8 +128,8 @@ fn parity_shell_multi_sprint_guide_matches_shell_fixture_after_normalization() {
     let expected = shell_fixture("multi_sprint_guide_dry_run.txt");
 
     assert_eq!(
-        normalize_shell_text(&actual, &agent_home_s),
-        normalize_shell_text(&expected, &agent_home_s),
+        normalize_shell_text(&actual, &state_dir_s),
+        normalize_shell_text(&expected, &state_dir_s),
     );
 }
 
@@ -157,10 +156,9 @@ fn command_guardrails_local_issue_path_error_contains_subcommand_specific_guidan
 #[test]
 fn parity_shell_start_comment_template_matches_shell_fixture() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let out = common::run_plan_issue_local_with_env(
         &[
@@ -184,7 +182,7 @@ fn parity_shell_start_comment_template_matches_shell_fixture() {
             "S1T3=s1-fixtures",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
 

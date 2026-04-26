@@ -200,10 +200,9 @@ fn gh_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
 #[test]
 fn start_plan_dry_run_writes_runtime_truth_task_decomposition_metadata() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("sprint3-auto-single-lane.md");
     let plan_file_s = plan_file.to_string_lossy().to_string();
@@ -250,7 +249,7 @@ fn start_plan_dry_run_writes_runtime_truth_task_decomposition_metadata() {
             "--issue-body-out",
             &plan_issue_body_s,
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
 
@@ -292,7 +291,7 @@ fn start_plan_dry_run_writes_runtime_truth_task_decomposition_metadata() {
             "auto",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(
         start_sprint_out.code, 0,
@@ -423,10 +422,9 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
     let stub = StubBinDir::new();
     stub.write_exe("gh", gh_stub_script());
 
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("sprint1-runtime-truth.md");
     let plan_file_s = plan_file.to_string_lossy().to_string();
@@ -472,7 +470,7 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
             "--issue-body-out",
             &plan_issue_body_s,
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
 
@@ -513,7 +511,7 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -576,7 +574,7 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &drift_body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );

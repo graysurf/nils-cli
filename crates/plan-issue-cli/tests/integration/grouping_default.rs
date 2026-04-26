@@ -20,10 +20,9 @@ fn parse_json(stdout: &str) -> Value {
 #[test]
 fn start_sprint_grouping_default_inferred_when_plan_only() {
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_path = tmp.path().join("plan-grouping-per-sprint.md");
     fs::write(
@@ -71,7 +70,7 @@ Plan that declares per-sprint pr-grouping intent so plan-issue can default
             "1",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -95,10 +94,9 @@ Plan that declares per-sprint pr-grouping intent so plan-issue can default
 #[test]
 fn start_sprint_grouping_default_inferred_for_group_intent() {
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_path = tmp.path().join("plan-grouping-group.md");
     fs::write(
@@ -174,7 +172,7 @@ auto/group without explicit flags and produce a single combined PR group.
             "2",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -203,10 +201,9 @@ auto/group without explicit flags and produce a single combined PR group.
 #[test]
 fn start_sprint_grouping_cli_overrides_plan_metadata() {
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_path = tmp.path().join("plan-grouping-override.md");
     fs::write(
@@ -258,7 +255,7 @@ Plan declares `group` intent for sprint 1 but the operator passes
             "per-sprint",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -281,10 +278,9 @@ Plan declares `group` intent for sprint 1 but the operator passes
 #[test]
 fn start_sprint_grouping_silent_plan_still_requires_explicit_flags() {
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_path = tmp.path().join("plan-grouping-silent.md");
     fs::write(
@@ -329,7 +325,7 @@ infer; the existing validation should still demand `--pr-grouping`.
             "1",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(

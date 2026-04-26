@@ -15,7 +15,7 @@ shape of every emitted artifact without churning on plan content.
 
 ## Assumptions
 
-1. Test uses a temp `AGENT_HOME` and seeded prompts.
+1. Test uses a temp `PLAN_ISSUE_HOME` workspace; no init-prompt seeding required.
 
 ## Sprint 1: Smoke
 

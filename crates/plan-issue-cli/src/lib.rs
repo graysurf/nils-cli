@@ -8,7 +8,7 @@ mod issue_body;
 pub mod output;
 mod render;
 pub mod runtime_layout;
-pub mod runtime_skip;
+pub mod state;
 mod task_spec;
 
 use std::ffi::OsString;
@@ -106,6 +106,8 @@ where
             return code;
         }
     };
+
+    crate::state::set_state_dir_override(cli.state_dir.clone());
 
     if let Command::Completion(args) = &cli.command {
         return completion::run(binary, args.shell);

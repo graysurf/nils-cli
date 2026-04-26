@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 
 use nils_test_support::cmd::{CmdOptions, run_resolved};
@@ -50,23 +49,12 @@ pub fn run_plan_issue_local_with_env(args: &[&str], env: &[(&str, &str)]) -> Cmd
     )
 }
 
-/// Materialize the agent-kit prompts the canonical runtime layout requires.
-///
-/// `start-plan` and `start-sprint` copy these files into the plan-issue
-/// runtime tree, so every test that exercises those commands must pre-seed
-/// them under `$AGENT_HOME/prompts/`.
+/// Reserved hook for tests that historically pre-seeded
+/// `$PLAN_ISSUE_HOME/prompts/` before plan-issue copied init snapshots into
+/// each runtime workspace. The init-snapshot copy was removed in the
+/// 0.8 cut, so callers no longer need fixture content — the helper now
+/// only verifies the workspace path is a directory.
 #[allow(dead_code)]
-pub fn seed_agent_home_prompts(agent_home: &Path) {
-    let prompts = agent_home.join("prompts");
-    fs::create_dir_all(&prompts).expect("create prompts dir");
-    fs::write(
-        prompts.join("plan-issue-delivery-main-agent-init.md"),
-        "# Main Agent Init (test fixture)\n",
-    )
-    .expect("write main-agent init fixture");
-    fs::write(
-        prompts.join("plan-issue-delivery-subagent-init.md"),
-        "# Subagent Init (test fixture)\n",
-    )
-    .expect("write subagent init fixture");
+pub fn ensure_state_dir(state_dir: &Path) {
+    std::fs::create_dir_all(state_dir).expect("create plan-issue state-dir");
 }

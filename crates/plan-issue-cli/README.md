@@ -120,14 +120,21 @@ plan-issue-local build-plan-task-spec \
 ## Canonical runtime artifact layout
 
 `start-plan` and `start-sprint` materialize artifacts under
-`$AGENT_HOME/out/plan-issue-delivery/<repo-slug>/issue-<n>/...`, where
+`<state-dir>/out/plan-issue-delivery/<repo-slug>/issue-<n>/...`, where
 `<repo-slug>` is `owner__repo`. Plan-scope artifacts live under
-`<issue-root>/plan/` and `<issue-root>/prompts/`; sprint-scope artifacts
-live under `<issue-root>/sprint-<n>/{prompts,manifests,specs}/`. Per-task
-dispatch records (`dispatch-<TASK_ID>.json`) carry the canonical ten-key
-shape; runtime-adapter fields (`runtime_name`, `runtime_role`,
+`<issue-root>/plan/`; sprint-scope artifacts live under
+`<issue-root>/sprint-<n>/{prompts,manifests,specs}/`. Per-task dispatch
+records (`dispatch-<TASK_ID>.json`) carry the canonical nine-key shape;
+runtime-adapter fields (`runtime_name`, `runtime_role`,
 `runtime_role_fallback_reason`) are added by the active wrapper at
 dispatch time and are intentionally absent from the binary's emission.
+
+The state directory is resolved (in order) from `--state-dir <PATH>`
+(global flag), the `PLAN_ISSUE_HOME` environment variable, or the
+`${XDG_STATE_HOME:-$HOME/.local/state}/plan-issue` default. The
+`AGENT_HOME` env var the binary previously consumed was retired in 0.8 —
+adapters that drove plan-issue via `AGENT_HOME` should rename to
+`PLAN_ISSUE_HOME` (or pass `--state-dir`) when upgrading.
 
 See [`CLI contract v2`](docs/specs/plan-issue-cli-contract-v2.md)
 "Canonical Runtime Artifacts (v2)" for the full path catalogue and

@@ -11,7 +11,7 @@ bash crates/plan-issue-cli/tests/fixtures/shell_parity/regenerate.sh
 ```
 
 Normalization rules applied by `regenerate.sh`:
-- Replace `${AGENT_HOME}` absolute path with `$AGENT_HOME`.
+- Replace `${PLAN_ISSUE_HOME}` absolute path with `$PLAN_ISSUE_HOME`.
 - Replace `${HOME}/.config/agent-kit` absolute path with `$AGENT_KIT_HOME`.
 
 Fixtures:

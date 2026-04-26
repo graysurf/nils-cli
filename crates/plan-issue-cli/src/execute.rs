@@ -23,7 +23,6 @@ use crate::github::{GhCliAdapter, GitHubAdapter};
 use crate::issue_body::{self, TaskRow};
 use crate::render::{self, SprintCommentInput, SprintCommentMode};
 use crate::runtime_layout::{self, IssueRoot, SprintRoot};
-use crate::runtime_skip;
 use crate::task_spec::{self, TaskSpecBuildOptions, TaskSpecRow, TaskSpecScope};
 use crate::{BinaryFlavor, CommandError};
 
@@ -213,40 +212,6 @@ fn run_start_plan(
     render::write_rendered(&issue_body_out, &issue_body)
         .map_err(|err| CommandError::runtime("issue-body-write-failed", err))?;
 
-    let main_agent_init_target = issue_root.main_agent_init_snapshot();
-    let init_snapshot_skipped = runtime_skip::should_skip_init_snapshot();
-    if !init_snapshot_skipped {
-        let main_agent_init_source = task_spec::agent_home()
-            .join("prompts")
-            .join("plan-issue-delivery-main-agent-init.md");
-        if !main_agent_init_source.exists() {
-            return Err(CommandError::runtime(
-                "main-agent-init-snapshot-source-missing",
-                format!(
-                    "main-agent init source not found at {}; ensure agent-kit is installed",
-                    main_agent_init_source.display()
-                ),
-            ));
-        }
-        if let Some(parent) = main_agent_init_target.parent() {
-            runtime_layout::ensure_dir(parent).map_err(|err| {
-                CommandError::runtime(
-                    "runtime-layout-emit-failed",
-                    format!("failed to create dir {}: {err}", parent.display()),
-                )
-            })?;
-        }
-        fs::copy(&main_agent_init_source, &main_agent_init_target).map_err(|err| {
-            CommandError::runtime(
-                "runtime-layout-emit-failed",
-                format!(
-                    "failed to copy main-agent init snapshot to {}: {err}",
-                    main_agent_init_target.display()
-                ),
-            )
-        })?;
-    }
-
     let plan_branch_name = format!("plan/issue-{}", issue_root_number);
     let plan_branch_ref = issue_root.plan_branch_ref();
     if let Some(parent) = plan_branch_ref.parent() {
@@ -275,8 +240,6 @@ fn run_start_plan(
         "issue_body_path": path_text(&issue_body_out),
         "issue_root": path_text(issue_root.root()),
         "repo_slug": repo_slug,
-        "main_agent_init_snapshot_path": path_text(&main_agent_init_target),
-        "init_snapshot_skipped": init_snapshot_skipped,
         "plan_branch_ref_path": path_text(&plan_branch_ref),
         "record_count": build.rows.len(),
         "issue_number": issue_number,
@@ -1110,19 +1073,6 @@ fn run_start_sprint(
         "plan-snapshot-source-missing",
     )?;
 
-    let subagent_init_target = sprint_root.subagent_init_snapshot();
-    let init_snapshot_skipped = runtime_skip::should_skip_init_snapshot();
-    if !init_snapshot_skipped {
-        let subagent_init_source = task_spec::agent_home()
-            .join("prompts")
-            .join("plan-issue-delivery-subagent-init.md");
-        copy_source_into_snapshot(
-            &subagent_init_source,
-            &subagent_init_target,
-            "subagent-init-snapshot-source-missing",
-        )?;
-    }
-
     let prompt_files = write_subagent_prompts(
         &prompts_dir,
         args.issue,
@@ -1157,7 +1107,6 @@ fn run_start_sprint(
         let record = DispatchRecord::implementation(
             row.task_id.clone(),
             path_text(&task_prompt_path),
-            path_text(&subagent_init_target),
             path_text(&plan_snapshot_target),
             path_text(&assigned_worktree),
             row.branch.clone(),
@@ -1259,8 +1208,6 @@ fn run_start_sprint(
         "sprint_root": path_text(sprint_root.root()),
         "repo_slug": repo_slug,
         "plan_snapshot_path": path_text(&plan_snapshot_target),
-        "subagent_init_snapshot_path": path_text(&subagent_init_target),
-        "init_snapshot_skipped": init_snapshot_skipped,
         "prompt_manifest_path": path_text(&prompt_manifest_path),
         "dispatch_record_paths": dispatch_record_paths,
         "pr_groups": pr_groups,
@@ -2118,7 +2065,7 @@ fn should_emit_comment(comment_mode: &crate::commands::CommentModeArgs) -> bool 
 }
 
 fn write_temp_markdown(stem: &str, content: &str) -> Result<PathBuf, String> {
-    let dir = task_spec::agent_home()
+    let dir = task_spec::state_dir()
         .join("out")
         .join("plan-issue-delivery")
         .join("tmp");
@@ -3298,10 +3245,12 @@ mod tests {
     }
 
     #[test]
-    fn temp_markdown_and_prompt_outputs_use_agent_home_and_expected_paths() {
+    fn temp_markdown_and_prompt_outputs_use_state_dir_and_expected_paths() {
         let lock = GlobalStateLock::new();
         let tmp = TempDir::new().expect("tempdir");
-        let _agent_home = EnvGuard::set(&lock, "AGENT_HOME", tmp.path().to_string_lossy().as_ref());
+        crate::state::set_state_dir_override(None);
+        let _state_dir =
+            EnvGuard::set(&lock, "PLAN_ISSUE_HOME", tmp.path().to_string_lossy().as_ref());
 
         let markdown = write_temp_markdown("status", "hello").expect("write temp markdown");
         assert!(

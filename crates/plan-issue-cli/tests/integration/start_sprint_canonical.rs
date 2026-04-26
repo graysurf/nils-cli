@@ -21,7 +21,7 @@ struct StartSprintRun {
 }
 
 fn run_local_start_sprint(
-    agent_home: &str,
+    state_dir: &str,
     sprint: &str,
     issue: &str,
     repo: &str,
@@ -46,7 +46,7 @@ fn run_local_start_sprint(
             "per-sprint",
             "--no-comment",
         ],
-        &[("AGENT_HOME", agent_home)],
+        &[("PLAN_ISSUE_HOME", state_dir)],
     );
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     let payload = parse_json(&out.stdout);
@@ -66,18 +66,17 @@ fn run_local_start_sprint(
     }
 }
 
-fn seeded_agent_home() -> (TempDir, PathBuf, String) {
+fn seeded_state_dir() -> (TempDir, PathBuf, String) {
     let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
-    (tmp, agent_home, agent_home_s)
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
+    (tmp, state_dir, state_dir_s)
 }
 
 #[test]
 fn start_sprint_emits_plan_snapshot() {
-    let (_tmp, _ah, ah_s) = seeded_agent_home();
+    let (_tmp, _ah, ah_s) = seeded_state_dir();
     let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
 
     let snapshot_path = PathBuf::from(
@@ -97,32 +96,37 @@ fn start_sprint_emits_plan_snapshot() {
 }
 
 #[test]
-fn start_sprint_emits_subagent_init_snapshot() {
-    let (_tmp, _ah, ah_s) = seeded_agent_home();
+fn start_sprint_omits_subagent_init_snapshot_post_0_8() {
+    // Init-snapshot machinery removed in 0.8: result must NOT include
+    // `subagent_init_snapshot_path`, and no *-init.snapshot.md file is
+    // ever written under the sprint root.
+    let (_tmp, _ah, ah_s) = seeded_state_dir();
     let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
 
-    let snapshot_path = PathBuf::from(
-        run.payload["payload"]["result"]["subagent_init_snapshot_path"]
-            .as_str()
-            .expect("subagent_init_snapshot_path"),
+    let result = &run.payload["payload"]["result"];
+    assert!(
+        result.get("subagent_init_snapshot_path").is_none(),
+        "subagent_init_snapshot_path must be absent post-0.8: {result}"
     );
-    let expected = run
+    assert!(
+        result.get("init_snapshot_skipped").is_none(),
+        "init_snapshot_skipped must be absent post-0.8: {result}"
+    );
+
+    let stray = run
         .sprint_root
         .join("prompts")
         .join("plan-issue-delivery-subagent-init.snapshot.md");
-    assert_eq!(snapshot_path, expected);
-    assert!(snapshot_path.is_file());
-
-    let snapshot = fs::read_to_string(&snapshot_path).expect("read snapshot");
     assert!(
-        snapshot.contains("Subagent Init"),
-        "snapshot must mirror source: {snapshot}"
+        !stray.exists(),
+        "subagent init snapshot must NOT be written: {}",
+        stray.display()
     );
 }
 
 #[test]
 fn start_sprint_emits_dispatch_record_per_task() {
-    let (_tmp, _ah, ah_s) = seeded_agent_home();
+    let (_tmp, _ah, ah_s) = seeded_state_dir();
     let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
 
     let dispatch_paths = run.payload["payload"]["result"]["dispatch_record_paths"]
@@ -148,7 +152,6 @@ fn start_sprint_emits_dispatch_record_per_task() {
         for key in [
             "task_id",
             "task_prompt_path",
-            "subagent_init_snapshot_path",
             "plan_snapshot_path",
             "worktree",
             // Task 1.4: explicit absolute worktree path for orchestrators.
@@ -167,7 +170,7 @@ fn start_sprint_emits_dispatch_record_per_task() {
         assert_eq!(record["workflow_role"], "implementation");
         assert_eq!(record["base_branch"], "plan/issue-217");
         // Task 1.4: worktree_abs_path is absolute and lives under the
-        // canonical $AGENT_HOME/out/plan-issue-delivery/<slug>/issue-N/worktrees/ tree.
+        // canonical $PLAN_ISSUE_HOME/out/plan-issue-delivery/<slug>/issue-N/worktrees/ tree.
         let worktree_abs = record["worktree_abs_path"]
             .as_str()
             .expect("worktree_abs_path string");
@@ -188,7 +191,7 @@ fn start_sprint_emits_dispatch_record_per_task() {
 
 #[test]
 fn start_sprint_emits_prompt_manifest() {
-    let (_tmp, _ah, ah_s) = seeded_agent_home();
+    let (_tmp, _ah, ah_s) = seeded_state_dir();
     let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
 
     let manifest_path = PathBuf::from(
@@ -224,7 +227,7 @@ fn start_sprint_emits_prompt_manifest() {
 
 #[test]
 fn start_sprint_relocates_task_prompt() {
-    let (_tmp, _ah, ah_s) = seeded_agent_home();
+    let (_tmp, _ah, ah_s) = seeded_state_dir();
     let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
 
     let prompt_files = run.payload["payload"]["result"]["subagent_prompt_files"]
@@ -270,7 +273,7 @@ fn start_sprint_relocates_task_prompt() {
 fn start_sprint_emits_repo_slug_and_v2_schema_version() {
     // Task 1.1: start-sprint result exposes the runtime repo slug;
     // schema_version bumps to v2.
-    let (_tmp, _ah, ah_s) = seeded_agent_home();
+    let (_tmp, _ah, ah_s) = seeded_state_dir();
     let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
     assert_eq!(
         run.payload["schema_version"], "plan-issue-cli.start.sprint.v2",
@@ -286,7 +289,7 @@ fn start_sprint_emits_repo_slug_and_v2_schema_version() {
 fn start_sprint_emits_pr_groups_array() {
     // Task 1.3: start-sprint payload includes `pr_groups` listing every
     // group actually created (name + task_ids).
-    let (_tmp, _ah, ah_s) = seeded_agent_home();
+    let (_tmp, _ah, ah_s) = seeded_state_dir();
     let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
 
     let pr_groups = run.payload["payload"]["result"]["pr_groups"]
@@ -323,7 +326,7 @@ fn start_sprint_emits_pr_groups_array() {
 
 #[test]
 fn dispatch_record_omits_runtime_adapter_keys() {
-    let (_tmp, _ah, ah_s) = seeded_agent_home();
+    let (_tmp, _ah, ah_s) = seeded_state_dir();
     let run = run_local_start_sprint(&ah_s, "3", "217", "graysurf/plan-issue-smoke");
 
     let dispatch_paths = run.payload["payload"]["result"]["dispatch_record_paths"]
@@ -343,88 +346,6 @@ fn dispatch_record_omits_runtime_adapter_keys() {
             );
         }
     }
-}
-
-#[test]
-fn start_sprint_skips_init_snapshot_when_env_set() {
-    // Adapter opt-out: setting PLAN_ISSUE_SKIP_INIT_SNAPSHOT=1 makes
-    // start-sprint skip the canonical subagent-init snapshot copy
-    // entirely. Plan snapshot, prompt manifest, and dispatch records
-    // are still produced (only the init snapshot is conditional).
-    let tmp = TempDir::new().expect("tempdir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    let agent_home_s = agent_home.to_string_lossy().to_string();
-
-    let out = common::run_plan_issue_local_with_env(
-        &[
-            "--format",
-            "json",
-            "--dry-run",
-            "--repo",
-            "graysurf/plan-issue-smoke",
-            "start-sprint",
-            "--plan",
-            PLAN_PATH,
-            "--issue",
-            "217",
-            "--sprint",
-            "3",
-            "--strategy",
-            "auto",
-            "--default-pr-grouping",
-            "per-sprint",
-            "--no-comment",
-        ],
-        &[
-            ("AGENT_HOME", &agent_home_s),
-            ("PLAN_ISSUE_SKIP_INIT_SNAPSHOT", "1"),
-        ],
-    );
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-
-    let payload = parse_json(&out.stdout);
-    let result = &payload["payload"]["result"];
-    assert_eq!(
-        result["init_snapshot_skipped"], true,
-        "result must flag init_snapshot_skipped when env is set"
-    );
-
-    let subagent_init_path = result["subagent_init_snapshot_path"]
-        .as_str()
-        .expect("subagent_init_snapshot_path string");
-    assert!(
-        !std::path::Path::new(subagent_init_path).exists(),
-        "subagent init snapshot must NOT be written when env is set: {subagent_init_path}"
-    );
-
-    let plan_snapshot_path = result["plan_snapshot_path"]
-        .as_str()
-        .expect("plan_snapshot_path string");
-    assert!(
-        std::path::Path::new(plan_snapshot_path).is_file(),
-        "plan snapshot must still be written: {plan_snapshot_path}"
-    );
-
-    let dispatch_paths = result["dispatch_record_paths"]
-        .as_array()
-        .expect("dispatch_record_paths");
-    assert!(
-        !dispatch_paths.is_empty(),
-        "dispatch records must still be produced when env is set"
-    );
-
-    let sprint_root = PathBuf::from(
-        result["sprint_root"]
-            .as_str()
-            .expect("sprint_root in result"),
-    );
-    let issue_root_path = sprint_root.parent().expect("issue_root parent");
-    let stray = walk_init_snapshots(issue_root_path);
-    assert!(
-        stray.is_empty(),
-        "no *-init.snapshot.md files allowed under issue_root when env is set: {stray:?}"
-    );
 }
 
 fn walk_init_snapshots(root: &std::path::Path) -> Vec<String> {

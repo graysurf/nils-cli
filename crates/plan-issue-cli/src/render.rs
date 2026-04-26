@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::commands::SplitStrategy;
 use crate::issue_body;
 use crate::task_spec::{
-    TaskSpecRow, agent_home, execution_mode_by_task, runtime_lane_metadata_by_task,
+    TaskSpecRow, execution_mode_by_task, runtime_lane_metadata_by_task, state_dir,
 };
 use nils_common::fs as common_fs;
 use nils_common::git as common_git;
@@ -37,7 +37,7 @@ pub fn default_plan_issue_body_path(plan_file: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("plan")
         .to_string();
-    agent_home()
+    state_dir()
         .join("out")
         .join("plan-issue-delivery")
         .join(format!("{plan_stem}-plan-issue-body.md"))
@@ -59,7 +59,7 @@ pub fn default_sprint_comment_path(
         SprintCommentMode::Accepted => "accepted",
     };
 
-    agent_home()
+    state_dir()
         .join("out")
         .join("plan-issue-delivery")
         .join(format!(
