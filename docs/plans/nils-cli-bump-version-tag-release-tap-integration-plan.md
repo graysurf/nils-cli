@@ -110,9 +110,9 @@ since the new skill is formula-scoped.
 
 ## Phased implementation outline
 
-1. **Sprint 1 — read-only scaffolding.** Add tap discovery + sha256 fetcher
-   + `release.yml` waiter behind a `--dry-run-tap` flag. Skill prints what it
-   would commit without touching the tap. Lands as a no-op for current
+1. **Sprint 1 — read-only scaffolding.** Add tap discovery, sha256 fetcher,
+   and `release.yml` waiter behind a `--dry-run-tap` flag. Skill prints what
+   it would commit without touching the tap. Lands as a no-op for current
    users.
 2. **Sprint 2 — formula edit + commit.** Implement in-place URL/sha256 edit
    with the Python editor; add `ruby -c` / `brew style` gates;
@@ -124,8 +124,8 @@ since the new skill is formula-scoped.
 4. **Sprint 4 — `--from-tap` recovery + multi-formula parameterization.**
    Resume mode for half-finished releases; parameterize formula name so the
    same machinery covers `agent-workspace-launcher`.
-5. **Sprint 5 — post-publish smoke.** `brew update-reset` + `brew reinstall`
-   + `brew test` against the published formula; report PASS/FAIL.
+5. **Sprint 5 — post-publish smoke.** `brew update-reset`, `brew reinstall`,
+   and `brew test` against the published formula; report PASS/FAIL.
 
 Each sprint is independently shippable and individually reduces operator
 toil.
