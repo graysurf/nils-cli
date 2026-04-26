@@ -5,8 +5,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "${script_dir}/../../../../.." && pwd -P)"
 plan_fixture_rel="crates/plan-tooling/tests/fixtures/split_prs/duck-plan.md"
 
-if [[ -z "${AGENT_HOME:-}" ]]; then
-  echo "error: AGENT_HOME is required" >&2
+if [[ -z "${PLAN_ISSUE_HOME:-}" ]]; then
+  echo "error: PLAN_ISSUE_HOME is required" >&2
   exit 1
 fi
 
@@ -14,7 +14,7 @@ cd "$repo_root"
 
 normalize_paths() {
   sed \
-    -e "s|${AGENT_HOME%/}|\$AGENT_HOME|g" \
+    -e "s|${PLAN_ISSUE_HOME%/}|\$PLAN_ISSUE_HOME|g" \
     -e "s|$HOME/.config/agent-kit|\$AGENT_KIT_HOME|g"
 }
 

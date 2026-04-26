@@ -179,10 +179,9 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
     let stub = StubBinDir::new();
     stub.write_exe("gh", gh_stub_script());
 
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("sprint1-auto-single-lane.md");
     let plan_file_s = plan_file.to_string_lossy().to_string();
@@ -229,7 +228,7 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
             "--issue-body-out",
             &plan_issue_body_s,
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
 
@@ -284,7 +283,7 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -353,7 +352,7 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );

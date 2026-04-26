@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use nils_common::env as common_env;
+use crate::state;
 
 const RUNTIME_DIR: &str = "out";
 const PLAN_ISSUE_DELIVERY_DIR: &str = "plan-issue-delivery";
@@ -22,8 +22,6 @@ const PLAN_DIR: &str = "plan";
 const SPECS_DIR: &str = "specs";
 const MANIFESTS_DIR: &str = "manifests";
 const WORKTREES_DIR: &str = "worktrees";
-const MAIN_AGENT_INIT_FILE: &str = "plan-issue-delivery-main-agent-init.snapshot.md";
-const SUBAGENT_INIT_FILE: &str = "plan-issue-delivery-subagent-init.snapshot.md";
 const PLAN_SNAPSHOT_FILE: &str = "plan.snapshot.md";
 const PLAN_BRANCH_REF_FILE: &str = "plan-branch.ref";
 const PROMPT_MANIFEST_FILE: &str = "prompt-manifest.tsv";
@@ -32,8 +30,6 @@ const SPRINT_TASK_SPEC_FILE: &str = "sprint-task-spec.tsv";
 /// Errors emitted by canonical runtime-layout helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeLayoutError {
-    /// `AGENT_HOME` env var is missing or empty.
-    AgentHomeNotSet,
     /// Repo slug is empty or contains a path separator after substitution.
     InvalidRepoSlug { slug: String },
     /// Task id is empty or contains a path separator.
@@ -43,10 +39,6 @@ pub enum RuntimeLayoutError {
 impl fmt::Display for RuntimeLayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AgentHomeNotSet => write!(
-                f,
-                "AGENT_HOME env var is not set; canonical runtime layout requires AGENT_HOME"
-            ),
             Self::InvalidRepoSlug { slug } => {
                 write!(f, "invalid repo slug `{slug}` for runtime layout")
             }
@@ -59,13 +51,13 @@ impl fmt::Display for RuntimeLayoutError {
 
 impl Error for RuntimeLayoutError {}
 
-/// Resolve `RUNTIME_ROOT="$AGENT_HOME/out/plan-issue-delivery"`.
-pub fn runtime_root() -> Result<PathBuf, RuntimeLayoutError> {
-    let agent_home =
-        common_env::env_non_empty("AGENT_HOME").ok_or(RuntimeLayoutError::AgentHomeNotSet)?;
-    Ok(PathBuf::from(agent_home)
+/// Resolve `RUNTIME_ROOT="<state-dir>/out/plan-issue-delivery"` using the
+/// plan-issue state-dir resolution chain (CLI override > `PLAN_ISSUE_HOME`
+/// env > XDG default). See [`crate::state::state_dir`] for details.
+pub fn runtime_root() -> PathBuf {
+    state::state_dir()
         .join(RUNTIME_DIR)
-        .join(PLAN_ISSUE_DELIVERY_DIR))
+        .join(PLAN_ISSUE_DELIVERY_DIR)
 }
 
 /// Convert `owner/repo` to `owner__repo`.
@@ -97,7 +89,7 @@ impl IssueRoot {
                 slug: repo_slug.to_string(),
             });
         }
-        let runtime = runtime_root()?;
+        let runtime = runtime_root();
         let root = runtime
             .join(trimmed)
             .join(format!("{ISSUE_PREFIX}{issue_number}"));
@@ -107,11 +99,6 @@ impl IssueRoot {
     /// `$ISSUE_ROOT`.
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// `$ISSUE_ROOT/prompts/plan-issue-delivery-main-agent-init.snapshot.md`.
-    pub fn main_agent_init_snapshot(&self) -> PathBuf {
-        self.root.join(PROMPTS_DIR).join(MAIN_AGENT_INIT_FILE)
     }
 
     /// `$ISSUE_ROOT/plan/plan.snapshot.md`.
@@ -208,11 +195,6 @@ impl SprintRoot {
         self.root.join(SPECS_DIR)
     }
 
-    /// `$SPRINT_ROOT/prompts/plan-issue-delivery-subagent-init.snapshot.md`.
-    pub fn subagent_init_snapshot(&self) -> PathBuf {
-        self.prompts_dir().join(SUBAGENT_INIT_FILE)
-    }
-
     /// `$SPRINT_ROOT/prompts/<TASK_ID>.md`.
     pub fn task_prompt(&self, task_id: &str) -> Result<PathBuf, RuntimeLayoutError> {
         let trimmed = task_id.trim();
@@ -265,32 +247,36 @@ mod tests {
         IssueRoot::new(repo, issue).expect("issue root")
     }
 
-    #[test]
-    fn test_runtime_root_requires_agent_home() {
-        let lock = GlobalStateLock::new();
-        let _guard = EnvGuard::remove(&lock, "AGENT_HOME");
-
-        let err = runtime_root().expect_err("missing AGENT_HOME must error");
-        assert_eq!(err, RuntimeLayoutError::AgentHomeNotSet);
-        assert!(
-            err.to_string().contains("AGENT_HOME"),
-            "error message must reference AGENT_HOME: {err}"
-        );
-
-        let _empty = EnvGuard::set(&lock, "AGENT_HOME", "");
-        let err = runtime_root().expect_err("empty AGENT_HOME must error");
-        assert_eq!(err, RuntimeLayoutError::AgentHomeNotSet);
+    /// Reset the global `--state-dir` override and pin the env path to a
+    /// known value. Used by tests that exercise canonical layout math.
+    fn pin_state_dir(lock: &GlobalStateLock, value: &str) -> EnvGuard {
+        crate::state::set_state_dir_override(None);
+        EnvGuard::set(lock, "PLAN_ISSUE_HOME", value)
     }
 
     #[test]
-    fn test_runtime_root_uses_agent_home_value() {
+    fn test_runtime_root_uses_state_dir_value() {
         let lock = GlobalStateLock::new();
-        let _guard = EnvGuard::set(&lock, "AGENT_HOME", "/tmp/agent-home-fixture");
+        let _guard = pin_state_dir(&lock, "/tmp/plan-issue-fixture");
 
-        let root = runtime_root().expect("runtime_root");
+        let root = runtime_root();
         assert_eq!(
             root,
-            PathBuf::from("/tmp/agent-home-fixture/out/plan-issue-delivery")
+            PathBuf::from("/tmp/plan-issue-fixture/out/plan-issue-delivery")
+        );
+    }
+
+    #[test]
+    fn test_runtime_root_falls_back_to_xdg_default_when_env_unset() {
+        let lock = GlobalStateLock::new();
+        crate::state::set_state_dir_override(None);
+        let _empty = EnvGuard::remove(&lock, "PLAN_ISSUE_HOME");
+        let _xdg = EnvGuard::set(&lock, "XDG_STATE_HOME", "/tmp/xdg-state");
+
+        let root = runtime_root();
+        assert_eq!(
+            root,
+            PathBuf::from("/tmp/xdg-state/plan-issue/out/plan-issue-delivery")
         );
     }
 
@@ -307,20 +293,14 @@ mod tests {
     #[test]
     fn test_issue_root_path_layout() {
         let lock = GlobalStateLock::new();
-        let _guard = EnvGuard::set(&lock, "AGENT_HOME", "/tmp/agent-home-fixture");
+        let _guard = pin_state_dir(&lock, "/tmp/plan-issue-fixture");
 
         let issue = issue_root_for("graysurf__plan-issue-smoke", 17);
         assert_eq!(
             issue.root(),
             Path::new(
-                "/tmp/agent-home-fixture/out/plan-issue-delivery/graysurf__plan-issue-smoke/issue-17"
+                "/tmp/plan-issue-fixture/out/plan-issue-delivery/graysurf__plan-issue-smoke/issue-17"
             )
-        );
-        assert_eq!(
-            issue.main_agent_init_snapshot(),
-            issue
-                .root()
-                .join("prompts/plan-issue-delivery-main-agent-init.snapshot.md")
         );
         assert_eq!(
             issue.plan_snapshot(),
@@ -341,7 +321,7 @@ mod tests {
     #[test]
     fn test_assigned_worktree_canonical_paths() {
         let lock = GlobalStateLock::new();
-        let _guard = EnvGuard::set(&lock, "AGENT_HOME", "/tmp/agent-home-fixture");
+        let _guard = pin_state_dir(&lock, "/tmp/plan-issue-fixture");
 
         let issue = issue_root_for("graysurf__plan-issue-smoke", 17);
 
@@ -392,7 +372,7 @@ mod tests {
     #[test]
     fn test_issue_root_rejects_invalid_repo_slug() {
         let lock = GlobalStateLock::new();
-        let _guard = EnvGuard::set(&lock, "AGENT_HOME", "/tmp/agent-home-fixture");
+        let _guard = pin_state_dir(&lock, "/tmp/plan-issue-fixture");
 
         let err = IssueRoot::new("", 1).expect_err("empty slug must reject");
         assert!(matches!(err, RuntimeLayoutError::InvalidRepoSlug { .. }));
@@ -404,7 +384,7 @@ mod tests {
     #[test]
     fn test_sprint_root_path_layout() {
         let lock = GlobalStateLock::new();
-        let _guard = EnvGuard::set(&lock, "AGENT_HOME", "/tmp/agent-home-fixture");
+        let _guard = pin_state_dir(&lock, "/tmp/plan-issue-fixture");
 
         let issue = issue_root_for("graysurf__plan-issue-smoke", 17);
         let sprint = SprintRoot::new(&issue, 1);
@@ -412,12 +392,6 @@ mod tests {
         assert_eq!(sprint.prompts_dir(), sprint.root().join("prompts"));
         assert_eq!(sprint.manifests_dir(), sprint.root().join("manifests"));
         assert_eq!(sprint.specs_dir(), sprint.root().join("specs"));
-        assert_eq!(
-            sprint.subagent_init_snapshot(),
-            sprint
-                .root()
-                .join("prompts/plan-issue-delivery-subagent-init.snapshot.md")
-        );
         assert_eq!(
             sprint.task_prompt("S1T1").expect("task prompt"),
             sprint.root().join("prompts/S1T1.md")
@@ -439,7 +413,7 @@ mod tests {
     #[test]
     fn test_sprint_root_rejects_invalid_task_id() {
         let lock = GlobalStateLock::new();
-        let _guard = EnvGuard::set(&lock, "AGENT_HOME", "/tmp/agent-home-fixture");
+        let _guard = pin_state_dir(&lock, "/tmp/plan-issue-fixture");
 
         let issue = issue_root_for("graysurf__plan-issue-smoke", 17);
         let sprint = SprintRoot::new(&issue, 1);

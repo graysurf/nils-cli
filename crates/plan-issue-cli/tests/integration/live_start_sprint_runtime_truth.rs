@@ -194,10 +194,9 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
     let stub = StubBinDir::new();
     stub.write_exe("gh", gh_stub_script());
 
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let log_path = tmp.path().join("gh.log");
     let log_s = log_path.to_string_lossy().to_string();
@@ -249,7 +248,7 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
             "--issue-body-out",
             &plan_issue_body_s,
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
 
@@ -288,7 +287,7 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_GH_CAPTURE_BODY_FILE", &capture_body_s),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );

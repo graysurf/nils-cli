@@ -168,10 +168,9 @@ fn github_adapter_live_commands_use_gh_backend_for_issue_and_pr_state() {
     let log_path = tmp.path().join("gh.log");
     let log_s = log_path.to_string_lossy().to_string();
 
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let body_json = json!({"body": issue_body_sprint4_in_progress()}).to_string();
 
@@ -200,7 +199,7 @@ fn github_adapter_live_commands_use_gh_backend_for_issue_and_pr_state() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -224,10 +223,9 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
     let log_path = tmp.path().join("gh.log");
     let log_s = log_path.to_string_lossy().to_string();
 
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let comment_capture = tmp.path().join("ready-plan-comment.md");
     let comment_capture_s = comment_capture.to_string_lossy().to_string();
@@ -252,7 +250,7 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_GH_CAPTURE_COMMENT_FILE", &comment_capture_s),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -287,7 +285,7 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -321,10 +319,9 @@ fn live_ready_plan_label_update_flag_applies_review_label() {
     let log_path = tmp.path().join("gh.log");
     let log_s = log_path.to_string_lossy().to_string();
 
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let body_json = json!({"body": issue_body_plan_done()}).to_string();
 
@@ -347,7 +344,7 @@ fn live_ready_plan_label_update_flag_applies_review_label() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -374,10 +371,9 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
     let log_path = tmp.path().join("gh.log");
     let log_s = log_path.to_string_lossy().to_string();
 
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let start_body_json = json!({"body": issue_body_sprint4_planned()}).to_string();
 
@@ -403,7 +399,7 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &start_body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -455,7 +451,7 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &start_body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -491,7 +487,7 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &accept_body_json),
                 ("PLAN_ISSUE_GH_CAPTURE_BODY_FILE", &accept_capture_s),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -542,10 +538,9 @@ fn github_adapter_rejects_literal_escaped_newline_without_force() {
     let log_path = tmp.path().join("gh.log");
     let log_s = log_path.to_string_lossy().to_string();
 
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let body_json = json!({"body": issue_body_plan_done()}).to_string();
 
@@ -566,7 +561,7 @@ fn github_adapter_rejects_literal_escaped_newline_without_force() {
             &[
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
@@ -600,10 +595,9 @@ fn github_adapter_force_flag_allows_literal_escaped_newline() {
     let log_path = tmp.path().join("gh.log");
     let log_s = log_path.to_string_lossy().to_string();
 
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let comment_capture = tmp.path().join("ready-plan-force-comment.md");
     let comment_capture_s = comment_capture.to_string_lossy().to_string();
@@ -629,7 +623,7 @@ fn github_adapter_force_flag_allows_literal_escaped_newline() {
                 ("PLAN_ISSUE_GH_LOG", &log_s),
                 ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_GH_CAPTURE_COMMENT_FILE", &comment_capture_s),
-                ("AGENT_HOME", &agent_home_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );

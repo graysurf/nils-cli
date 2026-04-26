@@ -64,7 +64,7 @@ fn json_optional_path(value: &Value, key: &str) -> Option<PathBuf> {
 }
 
 #[test]
-fn resolve_uses_env_overrides_for_agent_home_and_project_path() {
+fn resolve_uses_env_overrides_for_docs_home_and_project_path() {
     let home = TempDir::new().expect("create home");
     let project = TempDir::new().expect("create project");
     let cwd = TempDir::new().expect("create cwd");
@@ -76,7 +76,7 @@ fn resolve_uses_env_overrides_for_agent_home_and_project_path() {
         cwd.path(),
         &["resolve", "--context", "project-dev", "--format", "json"],
         &[
-            ("AGENT_HOME", home.path()),
+            ("AGENT_DOCS_HOME", home.path()),
             ("PROJECT_PATH", project.path()),
         ],
         &[],
@@ -84,7 +84,7 @@ fn resolve_uses_env_overrides_for_agent_home_and_project_path() {
 
     let json = parse_json_stdout(&output);
     assert_eq!(
-        canonical_string(&json_path(&json, "agent_home")),
+        canonical_string(&json_path(&json, "docs_home")),
         canonical_string(home.path())
     );
     assert_eq!(
@@ -94,26 +94,26 @@ fn resolve_uses_env_overrides_for_agent_home_and_project_path() {
 }
 
 #[test]
-fn resolve_fails_when_agent_home_is_missing() {
+fn resolve_fails_when_docs_home_is_missing() {
     let cwd = TempDir::new().expect("create cwd");
 
     let output = run_agent_docs(
         cwd.path(),
         &["resolve", "--context", "startup", "--format", "json"],
         &[],
-        &["AGENT_HOME", "PROJECT_PATH"],
+        &["AGENT_DOCS_HOME", "PROJECT_PATH"],
     );
 
     assert_ne!(
         output.code, 0,
-        "resolve should fail when AGENT_HOME is missing: stdout=\n{}\nstderr=\n{}",
+        "resolve should fail when AGENT_DOCS_HOME is missing: stdout=\n{}\nstderr=\n{}",
         output.stdout, output.stderr
     );
     assert!(
         output
             .stderr
-            .contains("AGENT_HOME is required; set AGENT_HOME or pass --agent-home"),
-        "missing AGENT_HOME error should be explicit: stderr=\n{}",
+            .contains("AGENT_DOCS_HOME is required; set AGENT_DOCS_HOME or pass --docs-home"),
+        "missing AGENT_DOCS_HOME error should be explicit: stderr=\n{}",
         output.stderr
     );
 }
@@ -134,7 +134,7 @@ fn resolve_detects_linked_worktree_metadata_when_project_path_not_set() {
     let output = run_agent_docs(
         &nested,
         &["resolve", "--context", "project-dev", "--format", "json"],
-        &[("AGENT_HOME", home.path())],
+        &[("AGENT_DOCS_HOME", home.path())],
         &["PROJECT_PATH"],
     );
 
@@ -174,7 +174,7 @@ fn resolve_falls_back_to_cwd_when_not_git_repo_and_no_project_path() {
     let output = run_agent_docs(
         cwd.path(),
         &["resolve", "--context", "project-dev", "--format", "json"],
-        &[("AGENT_HOME", home.path())],
+        &[("AGENT_DOCS_HOME", home.path())],
         &["PROJECT_PATH"],
     );
 
@@ -248,7 +248,7 @@ fn resolve_strict_auto_uses_primary_worktree_fallback_but_local_only_keeps_local
             "checklist",
             "--strict",
         ],
-        &[("AGENT_HOME", home.path())],
+        &[("AGENT_DOCS_HOME", home.path())],
         &["PROJECT_PATH"],
     );
     assert_eq!(
@@ -283,7 +283,7 @@ fn resolve_strict_auto_uses_primary_worktree_fallback_but_local_only_keeps_local
             "checklist",
             "--strict",
         ],
-        &[("AGENT_HOME", home.path())],
+        &[("AGENT_DOCS_HOME", home.path())],
         &["PROJECT_PATH"],
     );
     assert_eq!(
@@ -311,7 +311,7 @@ fn resolve_strict_auto_uses_primary_worktree_fallback_but_local_only_keeps_local
         &[
             "baseline", "--check", "--target", "project", "--strict", "--format", "text",
         ],
-        &[("AGENT_HOME", home.path())],
+        &[("AGENT_DOCS_HOME", home.path())],
         &["PROJECT_PATH"],
     );
     assert_eq!(
@@ -333,7 +333,7 @@ fn resolve_strict_auto_uses_primary_worktree_fallback_but_local_only_keeps_local
             "--format",
             "text",
         ],
-        &[("AGENT_HOME", home.path())],
+        &[("AGENT_DOCS_HOME", home.path())],
         &["PROJECT_PATH"],
     );
     assert_eq!(

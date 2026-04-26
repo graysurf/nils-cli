@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-docs"
-version = "0.7.7"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "nils-plan-issue-cli"
-version = "0.7.7"
+version = "0.8.0"
 dependencies = [
  "clap",
  "clap_complete",

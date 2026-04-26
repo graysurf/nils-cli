@@ -155,7 +155,7 @@ fn resolve_builtin_startup_text_output_is_stable_ordered_and_deduped() {
 #[test]
 fn resolve_builtin_strict_and_non_strict_have_different_exit_codes_for_missing_required_docs() {
     let workspace = common::FixtureWorkspace::from_fixtures();
-    common::remove_file_if_exists(&workspace.agent_home.join("DEVELOPMENT.md"));
+    common::remove_file_if_exists(&workspace.docs_home.join("DEVELOPMENT.md"));
 
     let non_strict =
         common::run_resolve_exit_code(&workspace, Context::SkillDev, OutputFormat::Text, false);
@@ -232,7 +232,7 @@ fn resolve_builtin_startup_checklist_output_is_stable_ordered_and_deduped() {
 
     assert_eq!(first, second, "checklist rendering should be deterministic");
     let parsed = common::parse_checklist(&first);
-    let home_root = workspace.agent_home.display().to_string();
+    let home_root = workspace.docs_home.display().to_string();
     let project_root = workspace.project_path.display().to_string();
     assert_eq!(parsed.begin.context, Context::Startup.as_str());
     assert_eq!(parsed.begin.mode, "non-strict");
@@ -289,7 +289,7 @@ fn resolve_builtin_project_dev_merges_extensions_with_stable_precedence_and_orde
     .expect("write extra policy");
 
     fs::write(
-        workspace.agent_home.join(CONFIG_FILE_NAME),
+        workspace.docs_home.join(CONFIG_FILE_NAME),
         r#"
 [[document]]
 context = "project-dev"

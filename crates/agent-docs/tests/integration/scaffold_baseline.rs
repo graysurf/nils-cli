@@ -18,12 +18,12 @@ fn read_fixture(relative: &str) -> String {
 #[test]
 fn scaffold_baseline_missing_only_creates_only_missing_files() {
     let workspace = common::FixtureWorkspace::from_fixtures();
-    seed_cargo_workspace(&workspace.agent_home);
+    seed_cargo_workspace(&workspace.docs_home);
     seed_cargo_workspace(&workspace.project_path);
 
-    let home_agents = workspace.agent_home.join("AGENTS.md");
-    let home_development = workspace.agent_home.join("DEVELOPMENT.md");
-    let home_cli_tools = workspace.agent_home.join("CLI_TOOLS.md");
+    let home_agents = workspace.docs_home.join("AGENTS.md");
+    let home_development = workspace.docs_home.join("DEVELOPMENT.md");
+    let home_cli_tools = workspace.docs_home.join("CLI_TOOLS.md");
     let project_agents = workspace.project_path.join("AGENTS.md");
     let project_development = workspace.project_path.join("DEVELOPMENT.md");
 
@@ -76,10 +76,10 @@ fn scaffold_baseline_missing_only_creates_only_missing_files() {
 #[test]
 fn scaffold_baseline_force_overwrite_updates_existing_baseline_files() {
     let workspace = common::FixtureWorkspace::from_fixtures();
-    seed_cargo_workspace(&workspace.agent_home);
+    seed_cargo_workspace(&workspace.docs_home);
     seed_cargo_workspace(&workspace.project_path);
 
-    let home_cli_tools = workspace.agent_home.join("CLI_TOOLS.md");
+    let home_cli_tools = workspace.docs_home.join("CLI_TOOLS.md");
     let project_development = workspace.project_path.join("DEVELOPMENT.md");
     common::write_text(&home_cli_tools, "# stale home cli tools\n");
     common::write_text(&project_development, "# stale project development\n");
@@ -121,7 +121,7 @@ fn scaffold_baseline_force_overwrite_updates_existing_baseline_files() {
 #[test]
 fn scaffold_baseline_generated_templates_include_required_sections_and_actionable_commands() {
     let workspace = common::FixtureWorkspace::from_fixtures();
-    seed_cargo_workspace(&workspace.agent_home);
+    seed_cargo_workspace(&workspace.docs_home);
     seed_cargo_workspace(&workspace.project_path);
 
     let output = common::run_agent_docs_command(
@@ -161,7 +161,7 @@ fn scaffold_baseline_generated_templates_include_required_sections_and_actionabl
         development
     );
 
-    let cli_tools = read_file(&workspace.agent_home.join("CLI_TOOLS.md"));
+    let cli_tools = read_file(&workspace.docs_home.join("CLI_TOOLS.md"));
     for required in [
         "# CLI_TOOLS.md",
         "## Tool Selection",

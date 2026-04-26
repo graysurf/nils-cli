@@ -1,9 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use nils_common::{
-    env as common_env, fs as common_fs, git as common_git, markdown as common_markdown,
-};
+use nils_common::{fs as common_fs, git as common_git, markdown as common_markdown};
 use plan_tooling::parse::{Sprint as ParsedSprint, parse_plan_with_display};
 use plan_tooling::split_prs::{
     SplitPlanOptions, SplitPlanRecord, SplitPrGrouping, SplitPrStrategy, SplitScope,
@@ -535,7 +533,7 @@ pub fn default_plan_task_spec_path(plan_file: &Path) -> PathBuf {
         .unwrap_or("plan")
         .to_string();
 
-    agent_home()
+    state_dir()
         .join("out")
         .join("plan-issue-delivery")
         .join(format!("{plan_stem}-plan-tasks.tsv"))
@@ -548,17 +546,14 @@ pub fn default_sprint_task_spec_path(plan_file: &Path, sprint: i32) -> PathBuf {
         .unwrap_or("plan")
         .to_string();
 
-    agent_home()
+    state_dir()
         .join("out")
         .join("plan-issue-delivery")
         .join(format!("{plan_stem}-sprint-{sprint}-tasks.tsv"))
 }
 
-pub fn agent_home() -> PathBuf {
-    if let Some(agent_home) = common_env::env_non_empty("AGENT_HOME") {
-        return PathBuf::from(agent_home);
-    }
-    detect_repo_root().join(".agents")
+pub fn state_dir() -> PathBuf {
+    crate::state::state_dir()
 }
 
 pub fn resolve_plan_file(plan_file: &Path) -> PathBuf {

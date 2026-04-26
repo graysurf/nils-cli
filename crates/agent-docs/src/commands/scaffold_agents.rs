@@ -138,7 +138,7 @@ pub fn scaffold_agents(
 
 pub fn default_output_path(target: Scope, roots: &ResolvedRoots) -> PathBuf {
     let base = match target {
-        Scope::Home => &roots.agent_home,
+        Scope::Home => &roots.docs_home,
         Scope::Project => &roots.project_path,
     };
     base.join(DEFAULT_AGENTS_FILE_NAME)
@@ -182,7 +182,7 @@ mod tests {
 
     fn roots(home: &TempDir, project: &TempDir) -> ResolvedRoots {
         ResolvedRoots {
-            agent_home: home.path().to_path_buf(),
+            docs_home: home.path().to_path_buf(),
             project_path: project.path().to_path_buf(),
             is_linked_worktree: false,
             git_common_dir: None,

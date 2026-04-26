@@ -33,7 +33,7 @@ execution.
 | `G8` | Close-plan dry-run body-file gate | `close-plan --dry-run` | `--body-file` is provided for local gate evaluation | `2` |
 | `G9` | Runtime-truth drift gate | `start-sprint` (live binary path) | sprint issue rows match plan-derived runtime lane metadata before artifact render | `1` |
 | `G10` | Link-pr target selection gate | `link-pr` | `--task` resolves to a row (or shared-lane group); `--sprint` resolves to a single PR lane (or `--pr-group` selects one) | `1` |
-| `G11` | Canonical runtime artifact emission gate | `start-plan`, `start-sprint` | `AGENT_HOME` is set; `$ISSUE_ROOT` / `$SPRINT_ROOT` directories are creatable; main-agent / subagent init snapshot sources exist; `MAIN_AGENT_INIT_SNAPSHOT_PATH`, `PLAN_BRANCH_REF_PATH`, `PLAN_SNAPSHOT_PATH`, `SUBAGENT_INIT_SNAPSHOT_PATH`, `TASK_PROMPT_PATH` per task, `PROMPT_MANIFEST_PATH`, `TASK_SPEC_PATH`, and `DISPATCH_RECORD_PATH` per task are written successfully (per `plan-issue-cli-contract-v2.md` Canonical Runtime Artifacts (v2)) | `1` |
+| `G11` | Canonical runtime artifact emission gate | `start-plan`, `start-sprint` | the resolved state-dir (CLI override / `PLAN_ISSUE_HOME` env / XDG default) is writable; `$ISSUE_ROOT` / `$SPRINT_ROOT` directories are creatable; `PLAN_BRANCH_REF_PATH`, `PLAN_SNAPSHOT_PATH`, `TASK_PROMPT_PATH` per task, `PROMPT_MANIFEST_PATH`, `TASK_SPEC_PATH`, and `DISPATCH_RECORD_PATH` per task are written successfully (per `plan-issue-cli-contract-v2.md` Canonical Runtime Artifacts (v2)) | `1` |
 
 ## Command-to-Gate Matrix
 

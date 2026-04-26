@@ -20,7 +20,7 @@ fn result_path(payload: &Value, key: &str) -> String {
         .to_string()
 }
 
-fn render_issue_body_for_local_plan(tmp: &TempDir, agent_home: &str) -> String {
+fn render_issue_body_for_local_plan(tmp: &TempDir, state_dir: &str) -> String {
     let task_spec = tmp.path().join("plan.tsv");
     let issue_body = tmp.path().join("issue-body.md");
     let task_spec_s = task_spec.to_string_lossy().to_string();
@@ -41,7 +41,7 @@ fn render_issue_body_for_local_plan(tmp: &TempDir, agent_home: &str) -> String {
             "--issue-body-out",
             &issue_body_s,
         ],
-        &[("AGENT_HOME", agent_home)],
+        &[("PLAN_ISSUE_HOME", state_dir)],
     );
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     issue_body_s
@@ -192,15 +192,14 @@ fn strategy_auto_partial_mapping_allows_unmapped_rows() {
 #[test]
 fn render_issue_body_start_plan_writes_issue_body_artifact() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
 
     let task_spec = tmp.path().join("plan.tsv");
     let issue_body = tmp.path().join("issue-body.md");
     let task_spec_s = task_spec.to_string_lossy().to_string();
     let issue_body_s = issue_body.to_string_lossy().to_string();
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let out = common::run_plan_issue_local_with_env(
         &[
@@ -217,7 +216,7 @@ fn render_issue_body_start_plan_writes_issue_body_artifact() {
             "--issue-body-out",
             &issue_body_s,
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -259,9 +258,8 @@ fn render_issue_body_start_plan_writes_issue_body_artifact() {
 #[test]
 fn render_issue_body_start_plan_creates_missing_issue_body_directory() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
 
     let task_spec = tmp.path().join("nested").join("spec").join("plan.tsv");
     let issue_body = tmp
@@ -271,7 +269,7 @@ fn render_issue_body_start_plan_creates_missing_issue_body_directory() {
         .join("issue-body.md");
     let task_spec_s = task_spec.to_string_lossy().to_string();
     let issue_body_s = issue_body.to_string_lossy().to_string();
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir_s = state_dir.to_string_lossy().to_string();
     assert!(
         !issue_body.parent().expect("parent").exists(),
         "precondition: parent should not exist"
@@ -292,7 +290,7 @@ fn render_issue_body_start_plan_creates_missing_issue_body_directory() {
             "--issue-body-out",
             &issue_body_s,
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -303,10 +301,9 @@ fn render_issue_body_start_plan_creates_missing_issue_body_directory() {
 #[test]
 fn local_start_plan_returns_deterministic_issue_placeholder() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let out = common::run_plan_issue_local_with_env(
         &[
@@ -319,7 +316,7 @@ fn local_start_plan_returns_deterministic_issue_placeholder() {
             "--pr-grouping",
             "per-sprint",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -332,10 +329,9 @@ fn local_start_plan_returns_deterministic_issue_placeholder() {
 #[test]
 fn render_issue_body_start_plan_falls_back_when_preface_sections_missing() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan = tmp.path().join("minimal-plan.md");
     fs::write(
@@ -379,7 +375,7 @@ fn render_issue_body_start_plan_falls_back_when_preface_sections_missing() {
             "--issue-body-out",
             &issue_body_s,
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -395,10 +391,9 @@ fn render_issue_body_start_plan_falls_back_when_preface_sections_missing() {
 #[test]
 fn task_decomposition_writer_and_parser_use_one_sanitized_schema() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan = tmp.path().join("pipe-summary-plan.md");
     fs::write(
@@ -442,7 +437,7 @@ fn task_decomposition_writer_and_parser_use_one_sanitized_schema() {
             "--issue-body-out",
             &issue_body_s,
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(start_out.code, 0, "stderr: {}", start_out.stderr);
 
@@ -469,10 +464,9 @@ fn task_decomposition_writer_and_parser_use_one_sanitized_schema() {
 #[test]
 fn render_issue_body_start_sprint_writes_start_comment_with_modes() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let task_spec = tmp.path().join("s3.tsv");
     let task_spec_s = task_spec.to_string_lossy().to_string();
@@ -500,7 +494,7 @@ fn render_issue_body_start_sprint_writes_start_comment_with_modes() {
             "--pr-group",
             "S3T3=s3-c",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -518,10 +512,9 @@ fn render_issue_body_start_sprint_writes_start_comment_with_modes() {
 #[test]
 fn render_issue_body_start_sprint_group_auto_single_pr_lane_uses_per_sprint_mode() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("auto-single-lane-plan.md");
     let plan_file_s = plan_file.to_string_lossy().to_string();
@@ -566,7 +559,7 @@ fn render_issue_body_start_sprint_group_auto_single_pr_lane_uses_per_sprint_mode
             "group",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -591,10 +584,9 @@ fn render_issue_body_start_sprint_group_auto_single_pr_lane_uses_per_sprint_mode
 #[test]
 fn render_issue_body_start_sprint_group_deterministic_single_pr_lane_uses_per_sprint_mode() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("deterministic-single-lane-plan.md");
     let plan_file_s = plan_file.to_string_lossy().to_string();
@@ -643,7 +635,7 @@ fn render_issue_body_start_sprint_group_deterministic_single_pr_lane_uses_per_sp
             "S1T2=s1-serial",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -668,10 +660,9 @@ fn render_issue_body_start_sprint_group_deterministic_single_pr_lane_uses_per_sp
 #[test]
 fn start_sprint_rejects_deterministic_grouping_mismatch_with_plan_metadata() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("mismatch-plan.md");
     let plan_file_s = plan_file.to_string_lossy().to_string();
@@ -712,7 +703,7 @@ fn start_sprint_rejects_deterministic_grouping_mismatch_with_plan_metadata() {
             "S1T1=s1-lane",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 1, "stderr: {}", out.stderr);
@@ -731,10 +722,9 @@ fn start_sprint_rejects_deterministic_grouping_mismatch_with_plan_metadata() {
 #[test]
 fn write_subagent_prompts_groups_tasks_by_runtime_lane() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let plan_file = tmp.path().join("auto-single-lane-prompts-plan.md");
     let plan_file_s = plan_file.to_string_lossy().to_string();
@@ -783,7 +773,7 @@ fn write_subagent_prompts_groups_tasks_by_runtime_lane() {
             "group",
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -806,10 +796,9 @@ fn write_subagent_prompts_groups_tasks_by_runtime_lane() {
 #[test]
 fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let start_plan_out = common::run_plan_issue_local_with_env(
         &[
@@ -822,7 +811,7 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
             "--pr-grouping",
             "per-sprint",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
     let start_plan_json = parse_json(&start_plan_out.stdout);
@@ -844,7 +833,7 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
             "--pr-grouping",
             "per-sprint",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(
         start_sprint_out.code, 0,
@@ -872,7 +861,7 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
             "--summary",
             "Ready for review",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(
         ready_sprint_out.code, 0,
@@ -900,7 +889,7 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
             "--approved-comment-url",
             "https://github.com/sympoies/nils-cli/issues/217#issuecomment-123456789",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(
         accept_sprint_out.code, 0,
@@ -925,12 +914,11 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
 #[test]
 fn local_flow_status_plan_body_file_reports_counts_and_comment_preview() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let issue_body_s = render_issue_body_for_local_plan(&tmp, &agent_home_s);
+    let issue_body_s = render_issue_body_for_local_plan(&tmp, &state_dir_s);
     let out = common::run_plan_issue_local_with_env(
         &[
             "--format",
@@ -940,7 +928,7 @@ fn local_flow_status_plan_body_file_reports_counts_and_comment_preview() {
             &issue_body_s,
             "--comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -975,12 +963,11 @@ fn local_flow_status_plan_body_file_reports_counts_and_comment_preview() {
 #[test]
 fn local_flow_ready_plan_body_file_accepts_summary_file_without_comment() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let issue_body_s = render_issue_body_for_local_plan(&tmp, &agent_home_s);
+    let issue_body_s = render_issue_body_for_local_plan(&tmp, &state_dir_s);
     let summary_file = tmp.path().join("ready-summary.md");
     fs::write(&summary_file, "Final plan review from summary file.\n").expect("write summary file");
     let summary_file_s = summary_file.to_string_lossy().to_string();
@@ -996,7 +983,7 @@ fn local_flow_ready_plan_body_file_accepts_summary_file_without_comment() {
             &summary_file_s,
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
@@ -1014,12 +1001,11 @@ fn local_flow_ready_plan_body_file_accepts_summary_file_without_comment() {
 #[test]
 fn local_flow_ready_plan_missing_summary_file_returns_error() {
     let tmp = TempDir::new().expect("temp dir");
-    let agent_home = tmp.path().join("agent-home");
-    fs::create_dir_all(&agent_home).expect("create agent home");
-    common::seed_agent_home_prompts(&agent_home);
-    let agent_home_s = agent_home.to_string_lossy().to_string();
+    let state_dir = tmp.path().join("state-dir");
+    fs::create_dir_all(&state_dir).expect("create agent home");
+    let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let issue_body_s = render_issue_body_for_local_plan(&tmp, &agent_home_s);
+    let issue_body_s = render_issue_body_for_local_plan(&tmp, &state_dir_s);
     let missing_summary = tmp.path().join("missing-summary.md");
     let missing_summary_s = missing_summary.to_string_lossy().to_string();
 
@@ -1034,7 +1020,7 @@ fn local_flow_ready_plan_missing_summary_file_returns_error() {
             &missing_summary_s,
             "--no-comment",
         ],
-        &[("AGENT_HOME", &agent_home_s)],
+        &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
     assert_eq!(out.code, 1, "stderr: {}", out.stderr);

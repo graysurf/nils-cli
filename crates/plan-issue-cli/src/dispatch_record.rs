@@ -3,7 +3,7 @@
 //! Defined in `agent-kit/skills/automation/plan-issue-delivery/references/RUNTIME_LAYOUT.md`
 //! L48-52 and `plan-issue-cli-contract-v2.md` "Canonical Runtime Artifacts (v2)".
 //!
-//! The binary writes the ten required keys at sprint start. Optional adapter
+//! The binary writes the nine required keys at sprint start. Optional adapter
 //! fields (`runtime_name`, `runtime_role`, `runtime_role_fallback_reason`)
 //! are intentionally **absent** — they belong to the active runtime adapter
 //! and are added post-emission by the wrapper / main-agent.
@@ -25,7 +25,8 @@ pub const WORKFLOW_ROLE_IMPLEMENTATION: &str = "implementation";
 /// **Deprecation note (Task 1.4)**: `worktree` is retained verbatim for
 /// backwards compatibility with existing v1 readers. New consumers should
 /// read `worktree_abs_path` instead — both fields carry the canonical
-/// absolute path under `$AGENT_HOME/out/plan-issue-delivery/<slug>/issue-<N>/worktrees/`,
+/// absolute path under
+/// `<state-dir>/out/plan-issue-delivery/<slug>/issue-<N>/worktrees/`,
 /// but `worktree_abs_path` is the explicit, self-describing name and will
 /// remain stable across future refactors. `worktree` may eventually be
 /// removed in a v3 schema bump.
@@ -33,7 +34,6 @@ pub const WORKFLOW_ROLE_IMPLEMENTATION: &str = "implementation";
 pub struct DispatchRecord {
     pub task_id: String,
     pub task_prompt_path: String,
-    pub subagent_init_snapshot_path: String,
     pub plan_snapshot_path: String,
     /// Deprecated alias for `worktree_abs_path`; kept for v1 readers.
     pub worktree: String,
@@ -51,7 +51,6 @@ impl DispatchRecord {
     pub fn implementation(
         task_id: impl Into<String>,
         task_prompt_path: impl Into<String>,
-        subagent_init_snapshot_path: impl Into<String>,
         plan_snapshot_path: impl Into<String>,
         worktree_abs_path: impl Into<String>,
         branch: impl Into<String>,
@@ -63,7 +62,6 @@ impl DispatchRecord {
         Self {
             task_id: task_id.into(),
             task_prompt_path: task_prompt_path.into(),
-            subagent_init_snapshot_path: subagent_init_snapshot_path.into(),
             plan_snapshot_path: plan_snapshot_path.into(),
             // `worktree` was already the assigned absolute path post the
             // canonical-runtime refactor; keep it identical to
@@ -101,10 +99,9 @@ mod tests {
     fn sample() -> DispatchRecord {
         DispatchRecord::implementation(
             "S1T1",
-            "/agent-home/out/plan-issue-delivery/owner__repo/issue-7/sprint-1/prompts/S1T1.md",
-            "/agent-home/out/plan-issue-delivery/owner__repo/issue-7/sprint-1/prompts/plan-issue-delivery-subagent-init.snapshot.md",
-            "/agent-home/out/plan-issue-delivery/owner__repo/issue-7/plan/plan.snapshot.md",
-            "/agent-home/out/plan-issue-delivery/owner__repo/issue-7/worktrees/pr-isolated/S1T1",
+            "/state-dir/out/plan-issue-delivery/owner__repo/issue-7/sprint-1/prompts/S1T1.md",
+            "/state-dir/out/plan-issue-delivery/owner__repo/issue-7/plan/plan.snapshot.md",
+            "/state-dir/out/plan-issue-delivery/owner__repo/issue-7/worktrees/pr-isolated/S1T1",
             "issue/s1-t1",
             "pr-isolated",
             "s1-t1",
@@ -118,7 +115,6 @@ mod tests {
         for key in [
             "\"task_id\"",
             "\"task_prompt_path\"",
-            "\"subagent_init_snapshot_path\"",
             "\"plan_snapshot_path\"",
             "\"worktree\"",
             // Task 1.4: explicit absolute path field for orchestrators.
@@ -138,6 +134,7 @@ mod tests {
             "\"runtime_name\"",
             "\"runtime_role\"",
             "\"runtime_role_fallback_reason\"",
+            "\"subagent_init_snapshot_path\"",
         ] {
             assert!(
                 !json.contains(absent),

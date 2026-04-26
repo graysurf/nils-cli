@@ -74,17 +74,17 @@ pub fn resolve_builtin_only_with_mode(
         Context::SkillDev => vec![resolve_required_doc(
             Context::SkillDev,
             Scope::Home,
-            &roots.agent_home,
+            &roots.docs_home,
             "DEVELOPMENT.md",
-            "skill development guidance from AGENT_HOME/DEVELOPMENT.md",
+            "skill development guidance from AGENT_DOCS_HOME/DEVELOPMENT.md",
             DocumentSource::Builtin,
         )],
         Context::TaskTools => vec![resolve_required_doc(
             Context::TaskTools,
             Scope::Home,
-            &roots.agent_home,
+            &roots.docs_home,
             "CLI_TOOLS.md",
-            "tool-selection guidance from AGENT_HOME/CLI_TOOLS.md",
+            "tool-selection guidance from AGENT_DOCS_HOME/CLI_TOOLS.md",
             DocumentSource::Builtin,
         )],
         Context::ProjectDev => vec![resolve_required_doc_with_project_fallback(
@@ -103,7 +103,7 @@ pub fn resolve_builtin_only_with_mode(
     ResolveReport {
         context,
         strict,
-        agent_home: roots.agent_home.clone(),
+        docs_home: roots.docs_home.clone(),
         project_path: roots.project_path.clone(),
         is_linked_worktree: roots.is_linked_worktree,
         git_common_dir: roots.git_common_dir.clone(),
@@ -155,7 +155,7 @@ pub fn resolve_with_configs_with_mode(
     ResolveReport {
         context,
         strict,
-        agent_home: roots.agent_home.clone(),
+        docs_home: roots.docs_home.clone(),
         project_path: roots.project_path.clone(),
         is_linked_worktree: roots.is_linked_worktree,
         git_common_dir: roots.git_common_dir.clone(),
@@ -219,7 +219,7 @@ fn extension_source(source_scope: Scope) -> DocumentSource {
 
 fn resolve_extension_path(entry: &ConfigDocumentEntry, roots: &ResolvedRoots) -> PathBuf {
     let root = match entry.scope {
-        Scope::Home => &roots.agent_home,
+        Scope::Home => &roots.docs_home,
         Scope::Project => &roots.project_path,
     };
     normalize_path(&root.join(&entry.path))
@@ -290,7 +290,7 @@ impl ResolveKey {
 
 fn resolve_startup(roots: &ResolvedRoots, fallback_mode: FallbackMode) -> Vec<ResolvedDocument> {
     vec![
-        resolve_startup_scope(Scope::Home, &roots.agent_home, None),
+        resolve_startup_scope(Scope::Home, &roots.docs_home, None),
         resolve_startup_scope(
             Scope::Project,
             &roots.project_path,
