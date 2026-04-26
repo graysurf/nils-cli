@@ -347,26 +347,3 @@ fn dispatch_record_omits_runtime_adapter_keys() {
         }
     }
 }
-
-fn walk_init_snapshots(root: &std::path::Path) -> Vec<String> {
-    let mut hits = Vec::new();
-    walk_init_recursive(root, &mut hits);
-    hits
-}
-
-fn walk_init_recursive(dir: &std::path::Path, sink: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
-        let path = entry.path();
-        if meta.is_dir() {
-            walk_init_recursive(&path, sink);
-        } else if let Some(name) = path.file_name().and_then(|s| s.to_str())
-            && name.ends_with("-init.snapshot.md")
-        {
-            sink.push(path.to_string_lossy().to_string());
-        }
-    }
-}
