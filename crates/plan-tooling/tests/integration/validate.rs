@@ -152,6 +152,116 @@ fn validate_dependency_error_carries_line_and_example() {
 }
 
 #[test]
+fn validate_explain_appends_examples_only_for_triggered_classes_on_failure() {
+    let repo = init_repo();
+    write_file(&repo.path().join("bad.md"), INVALID_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "bad.md", "--explain"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stdout.is_empty());
+    // Errors still printed.
+    assert!(out.stderr.contains("error:"));
+    // Examples block appears.
+    assert!(
+        out.stderr.contains("Examples:"),
+        "stderr should append Examples block, got: {}",
+        out.stderr
+    );
+    // Triggered classes from INVALID_PLAN: location-absolute, description-placeholder
+    // (TODO), dependency-unknown (Task 1.2 not in plan), acceptance-placeholder
+    // (<TBD>), validation-placeholder (TBD).
+    assert!(out.stderr.contains("[location-absolute]"));
+    assert!(out.stderr.contains("[description-placeholder]"));
+    assert!(out.stderr.contains("[dependency-unknown]"));
+    // Classes that did NOT fire should be absent (no globs, no missing fields).
+    assert!(!out.stderr.contains("[location-glob]"));
+    assert!(!out.stderr.contains("[description-missing]"));
+    assert!(!out.stderr.contains("[dependencies-missing]"));
+}
+
+#[test]
+fn validate_explain_on_success_prints_full_catalog() {
+    let repo = init_repo();
+    write_file(&repo.path().join("plan.md"), VALID_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "plan.md", "--explain"]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    assert!(out.stdout.is_empty());
+    // Successful validate prints zero errors but still emits the explainer.
+    assert!(!out.stderr.contains("error:"));
+    assert!(out.stderr.contains("Examples:"));
+    // Catalog should expose every known class on success.
+    for class in [
+        "[location-absolute]",
+        "[location-glob]",
+        "[description-placeholder]",
+        "[dependency-invalid]",
+        "[dependency-unknown]",
+        "[sprint-metadata-mismatch]",
+    ] {
+        assert!(
+            out.stderr.contains(class),
+            "stderr missing class {class}, got: {}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn validate_explain_json_includes_explanations_array() {
+    let repo = init_repo();
+    write_file(&repo.path().join("bad.md"), INVALID_PLAN);
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &[
+            "validate",
+            "--file",
+            "bad.md",
+            "--format",
+            "json",
+            "--explain",
+        ],
+    );
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.is_empty());
+
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(v["ok"], false);
+    let explanations = v["explanations"].as_array().expect("explanations array");
+    assert!(!explanations.is_empty());
+    let classes: Vec<&str> = explanations
+        .iter()
+        .map(|e| e["class"].as_str().unwrap_or(""))
+        .collect();
+    assert!(classes.contains(&"location-absolute"));
+    assert!(classes.contains(&"description-placeholder"));
+}
+
+#[test]
+fn validate_no_explain_omits_explanations() {
+    let repo = init_repo();
+    write_file(&repo.path().join("bad.md"), INVALID_PLAN);
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "bad.md", "--format", "json"],
+    );
+    assert_eq!(out.code, 1);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    // explanations field should be absent (skip_serializing_if).
+    assert!(
+        v.get("explanations").is_none(),
+        "default validate must not emit explanations: {}",
+        out.stdout
+    );
+}
+
+#[test]
 fn validate_json_ok_with_explicit_file() {
     let repo = init_repo();
     write_file(&repo.path().join("plan.md"), VALID_PLAN);

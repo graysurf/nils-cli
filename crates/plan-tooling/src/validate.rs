@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::parse::{Plan, Sprint, Task, parse_plan_with_display};
 
 const USAGE: &str = r#"Usage:
-  validate_plans.sh [--file <path>]... [--format text|json]
+  validate_plans.sh [--file <path>]... [--format text|json] [--explain]
 
 Purpose:
   Lint plan markdown files under docs/plans/ against Plan Format v1.
@@ -17,6 +17,8 @@ Purpose:
 Options:
   --file <path>  Validate a specific plan file (may be repeated)
   --format <fmt> text (default) or json
+  --explain      Append canonical accepted-shape examples per error class.
+                 Output is independent of exit code (also prints on success).
   -h, --help     Show help
 
 Defaults:
@@ -42,11 +44,21 @@ struct ValidateOutput {
     ok: bool,
     files: Vec<String>,
     errors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    explanations: Option<Vec<ExplainEntry>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExplainEntry {
+    class: &'static str,
+    rule: &'static str,
+    example: &'static str,
 }
 
 pub fn run(args: &[String]) -> i32 {
     let mut files: Vec<String> = Vec::new();
     let mut format = "text".to_string();
+    let mut explain = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -64,6 +76,10 @@ pub fn run(args: &[String]) -> i32 {
                 }
                 format = args[i + 1].to_string();
                 i += 2;
+            }
+            "--explain" => {
+                explain = true;
+                i += 1;
             }
             "-h" | "--help" => {
                 print_usage();
@@ -94,8 +110,16 @@ pub fn run(args: &[String]) -> i32 {
                 ok: true,
                 files: Vec::new(),
                 errors: Vec::new(),
+                explanations: if explain {
+                    Some(all_explanations())
+                } else {
+                    None
+                },
             };
             return print_json_output(output, 0);
+        }
+        if explain {
+            print_explanations_text(&all_explanations());
         }
         return 0;
     }
@@ -136,20 +160,32 @@ pub fn run(args: &[String]) -> i32 {
 
     if format == "json" {
         let code = if errors.is_empty() { 0 } else { 1 };
+        let explanations = if explain {
+            Some(explanations_for(&errors))
+        } else {
+            None
+        };
         let output = ValidateOutput {
             ok: errors.is_empty(),
             files: discovered_for_output,
             errors,
+            explanations,
         };
         return print_json_output(output, code);
     }
 
     if errors.is_empty() {
+        if explain {
+            print_explanations_text(&all_explanations());
+        }
         return 0;
     }
 
-    for err in errors {
+    for err in &errors {
         eprintln!("error: {err}");
+    }
+    if explain {
+        print_explanations_text(&explanations_for(&errors));
     }
     1
 }
@@ -540,6 +576,181 @@ fn is_task_id(s: &str) -> bool {
         return false;
     }
     a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit())
+}
+
+struct ExplainCatalogEntry {
+    /// Substring used to detect that this error class fired. Must appear in
+    /// the matching error message and be unique across the catalog.
+    pattern: &'static str,
+    explain: ExplainEntry,
+}
+
+const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
+    ExplainCatalogEntry {
+        pattern: "Location must be repo-relative",
+        explain: ExplainEntry {
+            class: "location-absolute",
+            rule: "Location entries must be repo-relative paths (no leading '/').",
+            example: "- **Location**:\n  - `crates/foo/src/bar.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Location must be a file path",
+        explain: ExplainEntry {
+            class: "location-directory",
+            rule: "Location entries must point at files, not directories.",
+            example: "- **Location**:\n  - `crates/foo/src/lib.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "must not use globs",
+        explain: ExplainEntry {
+            class: "location-glob",
+            rule: "Enumerate every touched file; globs and braces are rejected.",
+            example: "- **Location**:\n  - `crates/foo/src/a.rs`\n  - `crates/foo/src/b.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Location contains placeholder",
+        explain: ExplainEntry {
+            class: "location-placeholder",
+            rule: "Replace `<...>` / TODO / TBD placeholders with real paths.",
+            example: "- **Location**:\n  - `crates/plan-tooling/src/validate.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Description",
+        explain: ExplainEntry {
+            class: "description-missing",
+            rule: "Description is required and must be non-empty prose.",
+            example: "- **Description**: Validate task dependencies against the plan's task IDs.",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Description contains placeholder",
+        explain: ExplainEntry {
+            class: "description-placeholder",
+            rule: "Description must not contain `<...>` / TODO / TBD outside backticks. \
+                   Wrap usage slots in backticks (e.g. `<arg>`) when documenting CLI shapes.",
+            example: "- **Description**: Invoke `<arg>` to wire the slot.",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Dependencies",
+        explain: ExplainEntry {
+            class: "dependencies-missing",
+            rule: "Dependencies field is required: use 'none' or list `Task N.M` IDs.",
+            example: "- **Dependencies**:\n  - none",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid dependency",
+        explain: ExplainEntry {
+            class: "dependency-invalid",
+            rule: "Dependency entries must use the canonical `Task N.M` form.",
+            example: "- **Dependencies**:\n  - Task 1.2\n  - Task 2.1",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "unknown dependency",
+        explain: ExplainEntry {
+            class: "dependency-unknown",
+            rule: "Dependency must reference a `### Task N.M` heading present in the plan.",
+            example: "- **Dependencies**:\n  - Task 1.1     # must match an actual task heading",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Complexity out of range",
+        explain: ExplainEntry {
+            class: "complexity-range",
+            rule: "Complexity is a 1-10 integer.",
+            example: "- **Complexity**: 5",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Acceptance criteria",
+        explain: ExplainEntry {
+            class: "acceptance-missing",
+            rule: "Acceptance criteria is a non-empty list of testable outcomes.",
+            example: "- **Acceptance criteria**:\n  - All callers of foo() return Result<()>.",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Acceptance criteria contains placeholder",
+        explain: ExplainEntry {
+            class: "acceptance-placeholder",
+            rule: "Acceptance criteria entries must be concrete; no `<...>` / TODO / TBD placeholders.",
+            example: "- **Acceptance criteria**:\n  - validate() rejects empty input with exit 2.",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Validation",
+        explain: ExplainEntry {
+            class: "validation-missing",
+            rule: "Validation is a non-empty list of runnable commands or steps.",
+            example: "- **Validation**:\n  - cargo test -p plan-tooling",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Validation contains placeholder",
+        explain: ExplainEntry {
+            class: "validation-placeholder",
+            rule: "Validation entries must be concrete commands; no `<...>` / TODO / TBD placeholders.",
+            example: "- **Validation**:\n  - cargo nextest run --profile ci -p plan-tooling",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "must include both `PR grouping intent` and `Execution Profile`",
+        explain: ExplainEntry {
+            class: "sprint-metadata-partial",
+            rule: "Sprint metadata must declare both `PR grouping intent` and `Execution Profile`.",
+            example: "**PR grouping intent**: `per-sprint`\n**Execution Profile**: `serial`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "is per-sprint but `Execution Profile` indicates parallel width",
+        explain: ExplainEntry {
+            class: "sprint-metadata-mismatch",
+            rule: "`per-sprint` grouping cannot run with parallel execution; use `group` for parallel-x{N}.",
+            example: "**PR grouping intent**: `group`\n**Execution Profile**: `parallel-x2`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid or missing task id",
+        explain: ExplainEntry {
+            class: "task-id-invalid",
+            rule: "Task headings must use `### Task N.M: name` (numeric N and M).",
+            example: "### Task 2.1: Validate sprint metadata",
+        },
+    },
+];
+
+fn all_explanations() -> Vec<ExplainEntry> {
+    EXPLAIN_CATALOG.iter().map(|e| e.explain.clone()).collect()
+}
+
+fn explanations_for(errors: &[String]) -> Vec<ExplainEntry> {
+    let mut hits: Vec<ExplainEntry> = Vec::new();
+    for entry in EXPLAIN_CATALOG {
+        if errors.iter().any(|err| err.contains(entry.pattern)) {
+            hits.push(entry.explain.clone());
+        }
+    }
+    hits
+}
+
+fn print_explanations_text(entries: &[ExplainEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    eprintln!();
+    eprintln!("Examples:");
+    for entry in entries {
+        eprintln!("  [{}] {}", entry.class, entry.rule);
+        for line in entry.example.lines() {
+            eprintln!("      {line}");
+        }
+    }
 }
 
 fn parse_parallel_width_from_execution_profile(profile: &str) -> Option<usize> {
