@@ -3249,8 +3249,11 @@ mod tests {
         let lock = GlobalStateLock::new();
         let tmp = TempDir::new().expect("tempdir");
         crate::state::set_state_dir_override(None);
-        let _state_dir =
-            EnvGuard::set(&lock, "PLAN_ISSUE_HOME", tmp.path().to_string_lossy().as_ref());
+        let _state_dir = EnvGuard::set(
+            &lock,
+            "PLAN_ISSUE_HOME",
+            tmp.path().to_string_lossy().as_ref(),
+        );
 
         let markdown = write_temp_markdown("status", "hello").expect("write temp markdown");
         assert!(
