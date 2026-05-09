@@ -13,6 +13,7 @@ use std::path::Path;
 const JPEG_QUALITY: u8 = 90;
 const PNG_COMPRESSION: PngCompression = PngCompression::Best;
 const PNG_FILTER: PngFilter = PngFilter::NoFilter;
+const SUPPORTED_CONVERT_INPUT_FORMATS: &str = "svg|png|jpg|jpeg|webp";
 
 pub enum LoadedInput {
     Svg(SanitizedSvgDocument),
@@ -40,7 +41,7 @@ impl LoadedInput {
         })?;
         let Some(format) = reader.format() else {
             return Err(util::usage_err(format!(
-                "unsupported convert input format (expected svg|png|jpg|webp): {}",
+                "unsupported convert input format (expected {SUPPORTED_CONVERT_INPUT_FORMATS}): {}",
                 path.display()
             )));
         };
@@ -51,7 +52,7 @@ impl LoadedInput {
             ImageFormat::WebP => "webp",
             _ => {
                 return Err(util::usage_err(format!(
-                    "unsupported convert input format (expected svg|png|jpg|webp): {}",
+                    "unsupported convert input format (expected {SUPPORTED_CONVERT_INPUT_FORMATS}): {}",
                     path.display()
                 )));
             }

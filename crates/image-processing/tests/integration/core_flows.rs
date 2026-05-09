@@ -95,17 +95,22 @@ fn convert_supports_raster_inputs_for_png_webp_jpg_outputs_without_external_bina
 }
 
 #[test]
-fn convert_accepts_jpg_and_webp_inputs() {
+fn convert_accepts_jpg_jpeg_and_webp_inputs() {
     let dir = tempfile::TempDir::new().unwrap();
     common::write_sample_jpg(&dir.path().join("sample.jpg"));
+    common::write_sample_jpg(&dir.path().join("sample.jpeg"));
     common::write_sample_webp(&dir.path().join("sample.webp"));
 
     let stub = common::make_stub_dir();
     let path_s = stub.path().to_string_lossy().to_string();
     let envs = [("PATH", path_s.as_str())];
 
-    for (input_name, input_format) in [("sample.jpg", "jpg"), ("sample.webp", "webp")] {
-        let output_name = format!("out/{}.png", input_format);
+    for (input_name, input_format, output_stem) in [
+        ("sample.jpg", "jpg", "jpg"),
+        ("sample.jpeg", "jpg", "jpeg"),
+        ("sample.webp", "webp", "webp"),
+    ] {
+        let output_name = format!("out/{output_stem}.png");
         let out = common::run_image_processing(
             dir.path(),
             &[

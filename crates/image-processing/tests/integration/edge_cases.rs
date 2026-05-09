@@ -82,6 +82,34 @@ fn convert_invalid_target_format_is_usage_error() {
 }
 
 #[test]
+fn convert_unsupported_input_format_lists_jpeg() {
+    let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("sample.gif"), b"GIF89a").unwrap();
+
+    let out = common::run_image_processing(
+        dir.path(),
+        &[
+            "convert",
+            "--in",
+            "sample.gif",
+            "--to",
+            "webp",
+            "--out",
+            "out/sample.webp",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(out.code, 2);
+    assert!(
+        out.stderr
+            .contains("unsupported convert input format (expected svg|png|jpg|jpeg|webp)"),
+        "stderr: {}",
+        out.stderr
+    );
+}
+
+#[test]
 fn convert_rejects_multiple_inputs() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::write(dir.path().join("a.png"), "img").unwrap();
