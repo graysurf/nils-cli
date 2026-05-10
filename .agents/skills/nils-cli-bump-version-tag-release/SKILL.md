@@ -45,6 +45,7 @@ Inputs:
     an existing local `v<version>` tag in the nils-cli work tree)
   - `--tap-formula <name>` (formula basename, default `nils-cli`; reserved for AWL et al.)
   - `--skip-dev-clean` (do not clear `~/.local/nils-cli/bin` after a successful release)
+  - `--skip-local-brew-upgrade` (do not run `brew update` + `brew upgrade <formula>` for an installed local formula after a successful tap release)
   - `NILS_CLI_HOMEBREW_TAP_DIR` (env var; tap path)
   - `NILS_CLI_RELEASE_WAIT_SECONDS` (env var; max seconds to wait for source `release.yml`, default 1200)
   - `NILS_CLI_TAP_WAIT_SECONDS` (env var; max seconds to wait for tap `release.yml`, default 1200)
@@ -91,6 +92,7 @@ Outputs (tap stage):
 - Creates an annotated prefix tag `<formula>-v<version>` and pushes it to trigger the tap `release.yml`.
 - Unless `--skip-tap-wait`, waits for the tap `release.yml` run on the prefix tag to finish `success`.
 - Unless `--skip-dev-clean`, clears `~/.local/nils-cli/bin` so the freshly published brew formula takes precedence over any prior dev install (no-op when the directory is missing or already empty).
+- Unless `--skip-local-brew-upgrade`, when Homebrew is available and `<formula>` is installed locally, runs `brew update`, runs `brew upgrade <formula>`, and verifies `brew list --versions <formula>` matches `X.Y.Z`.
 
 Exit codes:
 
@@ -117,6 +119,7 @@ Failure modes:
   - Formula does not reference all four expected archs (would silently miss platforms otherwise).
   - sha256 sidecar fetch fails or returns non-hex content.
   - `ruby -c` or `brew style` fail on the rewritten formula.
+  - Local Homebrew upgrade fails, or the installed local formula version remains different from `X.Y.Z`.
   - `--from-tap` and `--skip-tap` passed together (mutually exclusive).
 
 ## Scripts (only entrypoints)
@@ -145,6 +148,7 @@ Failure modes:
   - `semantic-commit` + push `main` (only when formula changed).
   - Create + push annotated prefix tag `<formula>-vX.Y.Z` to trigger tap `release.yml`.
   - Unless `--skip-tap-wait`, wait for tap `release.yml` to finish `success`.
+  - Clear stale dev-install binaries, then upgrade the installed local Homebrew formula when present.
 
 ## Alternate entry points
 

@@ -22,6 +22,8 @@ Options:
                           Requires --version and an existing v<version> tag in this repo.
   --tap-formula <name>    Formula basename to bump (default: nils-cli). Reserved for AWL et al.
   --skip-dev-clean        Do not clear ~/.local/nils-cli/bin after a successful release.
+  --skip-local-brew-upgrade
+                          Do not update/upgrade an installed local Homebrew formula after tap release.
   -h, --help              Show help.
 
 Default behavior:
@@ -602,6 +604,40 @@ clean_dev_install() {
   find "$dev_bin" -mindepth 1 -delete
 }
 
+upgrade_local_brew_install() {
+  local skip="$1"
+  local formula="$2"
+  local target_version="$3"
+
+  if [[ "$skip" -eq 1 ]]; then
+    note "--skip-local-brew-upgrade set; leaving local Homebrew install untouched"
+    return 0
+  fi
+
+  if ! command -v brew >/dev/null 2>&1; then
+    note "brew not on PATH; skipping local Homebrew upgrade"
+    return 0
+  fi
+
+  if ! brew list --formula "$formula" >/dev/null 2>&1; then
+    note "Homebrew formula ${formula} is not installed locally; skipping local upgrade"
+    return 0
+  fi
+
+  note "updating Homebrew taps before local ${formula} upgrade"
+  brew update
+
+  note "upgrading local Homebrew formula ${formula} to v${target_version}"
+  brew upgrade "$formula"
+
+  local installed_version=""
+  installed_version="$(brew list --versions "$formula" 2>/dev/null | awk '{print $2; exit}')"
+  if [[ "$installed_version" != "$target_version" ]]; then
+    die "local Homebrew formula ${formula} is at ${installed_version:-unknown}, expected ${target_version}"
+  fi
+  note "local Homebrew formula ${formula} is at ${target_version}"
+}
+
 # === Argument parsing ========================================================
 
 version=""
@@ -618,6 +654,7 @@ skip_tap_tag=0
 from_tap=0
 tap_formula="nils-cli"
 skip_dev_clean=0
+skip_local_brew_upgrade=0
 
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
@@ -684,6 +721,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-dev-clean)
       skip_dev_clean=1
+      shift
+      ;;
+    --skip-local-brew-upgrade)
+      skip_local_brew_upgrade=1
       shift
       ;;
     -h|--help)
@@ -765,6 +806,7 @@ if [[ "$from_tap" -eq 1 ]]; then
     "$skip_tap_tag" \
     "$skip_tap_wait"
   clean_dev_install "$skip_dev_clean"
+  upgrade_local_brew_install "$skip_local_brew_upgrade" "$tap_formula" "$version"
   exit 0
 fi
 
@@ -1056,3 +1098,4 @@ run_tap_stage \
   "$skip_tap_wait"
 
 clean_dev_install "$skip_dev_clean"
+upgrade_local_brew_install "$skip_local_brew_upgrade" "$tap_formula" "$version"

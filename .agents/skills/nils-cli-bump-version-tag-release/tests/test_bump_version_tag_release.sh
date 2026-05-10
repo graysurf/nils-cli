@@ -180,6 +180,115 @@ EOF
   chmod +x "${bin_dir}/bad-wrapper"
 }
 
+create_mock_gh() {
+  local bin_dir="$1"
+  cat > "${bin_dir}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$*" == *"run list"* ]]; then
+  printf '[{"databaseId":1,"status":"completed","conclusion":"success","url":"https://example.test/run","headBranch":"v0.9.9","headSha":"abc123"}]\n'
+  exit 0
+fi
+
+echo "unexpected gh command: $*" >&2
+exit 1
+EOF
+  chmod +x "${bin_dir}/gh"
+}
+
+create_mock_curl() {
+  local bin_dir="$1"
+  cat > "${bin_dir}/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+url=""
+for arg in "$@"; do
+  url="$arg"
+done
+case "$url" in
+  *aarch64-apple-darwin.tar.gz.sha256)
+    printf '%s  dist/nils-cli-aarch64-apple-darwin.tar.gz\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ;;
+  *x86_64-apple-darwin.tar.gz.sha256)
+    printf '%s  dist/nils-cli-x86_64-apple-darwin.tar.gz\n' "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ;;
+  *aarch64-unknown-linux-gnu.tar.gz.sha256)
+    printf '%s  dist/nils-cli-aarch64-unknown-linux-gnu.tar.gz\n' "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    ;;
+  *x86_64-unknown-linux-gnu.tar.gz.sha256)
+    printf '%s  dist/nils-cli-x86_64-unknown-linux-gnu.tar.gz\n' "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    ;;
+  *)
+    echo "unexpected curl URL: $url" >&2
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "${bin_dir}/curl"
+}
+
+create_mock_ruby() {
+  local bin_dir="$1"
+  cat > "${bin_dir}/ruby" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-c" ]]; then
+  exit 0
+fi
+
+echo "unexpected ruby command: $*" >&2
+exit 1
+EOF
+  chmod +x "${bin_dir}/ruby"
+}
+
+create_mock_brew() {
+  local bin_dir="$1"
+  cat > "${bin_dir}/brew" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+log_file="${MOCK_LOG:?}"
+
+case "${1:-}" in
+  style)
+    echo "brew:style ${2:-}" >> "$log_file"
+    ;;
+  list)
+    case "${2:-}" in
+      --formula)
+        echo "brew:list_formula ${3:-}" >> "$log_file"
+        [[ "${3:-}" == "nils-cli" ]] || exit 1
+        ;;
+      --versions)
+        echo "brew:list_versions ${3:-}" >> "$log_file"
+        printf 'nils-cli %s\n' "${MOCK_BREW_VERSION:?}"
+        ;;
+      *)
+        echo "unexpected brew list command: $*" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  update)
+    echo "brew:update" >> "$log_file"
+    ;;
+  upgrade)
+    echo "brew:upgrade ${2:-}" >> "$log_file"
+    [[ "${2:-}" == "nils-cli" ]] || exit 1
+    ;;
+  *)
+    echo "unexpected brew command: $*" >&2
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "${bin_dir}/brew"
+}
+
 test_full_checks_refresh_lockfile_and_disable_bad_wrapper() {
   local tmp repo bin_dir log_file stderr_file
   tmp="$(mktemp -d)"
@@ -328,6 +437,93 @@ test_from_tap_with_skip_tap_is_mutually_exclusive() {
   assert_contains "$stderr_file" 'mutually exclusive'
 }
 
+test_from_tap_upgrades_installed_local_brew_formula() {
+  local tmp repo tap tap_remote bin_dir log_file stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  tap="${tmp}/tap"
+  tap_remote="${tmp}/tap.git"
+  bin_dir="${tmp}/bin"
+  log_file="${tmp}/mock.log"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$tap" "$bin_dir" "${tmp}/home"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+  create_mock_gh "$bin_dir"
+  create_mock_curl "$bin_dir"
+  create_mock_ruby "$bin_dir"
+  create_mock_brew "$bin_dir"
+
+  git -C "$repo" remote add origin git@github.com:test-org/test-repo.git
+  git -C "$repo" tag -a v0.9.9 -m "v0.9.9"
+
+  git init --bare "$tap_remote" >/dev/null
+  git init --initial-branch=main "$tap" >/dev/null
+  git -C "$tap" config user.email "test@example.com"
+  git -C "$tap" config user.name "Test User"
+  git -C "$tap" config commit.gpgSign false
+  mkdir -p "${tap}/Formula"
+  cat > "${tap}/Formula/nils-cli.rb" <<'EOF'
+class NilsCli < Formula
+  desc "Test"
+  homepage "https://example.com"
+  license "MIT"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/test-org/test-repo/releases/download/v0.9.8/nils-cli-v0.9.8-aarch64-apple-darwin.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000001"
+    else
+      url "https://github.com/test-org/test-repo/releases/download/v0.9.8/nils-cli-v0.9.8-x86_64-apple-darwin.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000002"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/test-org/test-repo/releases/download/v0.9.8/nils-cli-v0.9.8-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000003"
+    else
+      url "https://github.com/test-org/test-repo/releases/download/v0.9.8/nils-cli-v0.9.8-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000004"
+    end
+  end
+
+  def install
+    bin.install Dir["bin/*"]
+  end
+end
+EOF
+  git -C "$tap" add .
+  git -C "$tap" commit -m "init formula" >/dev/null
+  git -C "$tap" remote add origin "$tap_remote"
+  if ! git -C "$tap" push -u origin main >"${tmp}/tap-push.log" 2>&1; then
+    sed -n '1,120p' "${tmp}/tap-push.log" >&2 || true
+    fail "failed to seed tap remote"
+  fi
+
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER \
+      HOME="${tmp}/home" \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_LOG="$log_file" \
+      MOCK_BREW_VERSION="0.9.9" \
+      NILS_CLI_RELEASE_WAIT_SECONDS=1 \
+      "$entrypoint" --version 0.9.9 --from-tap --tap-dir "$tap" --skip-tap-tag
+  ) >"${tmp}/stdout.log" 2>"${stderr_file}"
+
+  assert_contains "${tap}/Formula/nils-cli.rb" 'v0.9.9/nils-cli-v0.9.9-aarch64-apple-darwin'
+  assert_contains "$log_file" 'brew:style'
+  assert_contains "$log_file" 'brew:list_formula nils-cli'
+  assert_contains "$log_file" 'brew:update'
+  assert_contains "$log_file" 'brew:upgrade nils-cli'
+  assert_contains "$log_file" 'brew:list_versions nils-cli'
+  assert_contains "$stderr_file" 'local Homebrew formula nils-cli is at 0.9.9'
+}
+
 test_formula_inplace_editor_idempotent() {
   local tmp formula_path
   tmp="$(mktemp -d)"
@@ -450,6 +646,7 @@ test_readme_already_at_target_is_not_warned
 test_skip_push_skips_tap_stage_with_note
 test_from_tap_without_tag_fails
 test_from_tap_with_skip_tap_is_mutually_exclusive
+test_from_tap_upgrades_installed_local_brew_formula
 test_formula_inplace_editor_idempotent
 
 echo "ok: project skill smoke checks passed"
