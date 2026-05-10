@@ -27,13 +27,24 @@ This installs/updates:
 
 ### 1.2 Minimum tools required for local checks
 
-The required-checks entrypoint depends on:
+All local check flows assume `bash` is available to run repo scripts.
+
+Docs-only checks require:
 
 - `git`
 - `npx`
+
+Full required checks also require:
+
 - `cargo`
 - `zsh`
 - `rg`
+- `cargo-nextest` when `NILS_CLI_TEST_RUNNER=nextest`
+
+Coverage checks also require:
+
+- `cargo-llvm-cov`
+- `cargo-nextest`
 
 For optional runtime tools used by individual CLIs, see `BINARY_DEPENDENCIES.md`.
 
@@ -71,7 +82,8 @@ NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh
 Notes:
 
 - `nextest` mode runs `cargo nextest run --profile ci --workspace`.
-- Doctests are not included in nextest and must still be run separately unless coverage flow is used.
+- Because doctests are not included in nextest, the entrypoint also runs
+  `cargo test --workspace --doc` when `NILS_CLI_TEST_RUNNER=nextest`.
 
 ### 3.3 Full pre-delivery flow (required for non-docs changes)
 
@@ -91,10 +103,10 @@ bash scripts/ci/coverage-summary.sh target/coverage/lcov.info
 cargo test --workspace --doc
 ```
 
-To override the threshold locally:
+Use the default threshold for delivery. To run a stricter local check, override the threshold:
 
 ```bash
-NILS_CLI_COVERAGE_FAIL_UNDER_LINES=85 bash scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage
+NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage
 ```
 
 ## 4. Required checks included by the entrypoint
@@ -111,7 +123,8 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=85 bash scripts/ci/nils-cli-checks-entrypoint
 - `zsh -f tests/zsh/completion.test.zsh`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --workspace` (or `cargo nextest run --profile ci --workspace` when `NILS_CLI_TEST_RUNNER=nextest`)
+- `cargo test --workspace` (or `cargo nextest run --profile ci --workspace`
+  plus `cargo test --workspace --doc` when `NILS_CLI_TEST_RUNNER=nextest`)
 
 ## 5. Additional checks when completion assets change
 
