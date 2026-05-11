@@ -1,0 +1,27 @@
+[package]
+name = "nils-agent-out"
+version = "0.8.1"
+edition.workspace = true
+license.workspace = true
+
+description = "CLI crate for nils-agent-out in the nils-cli workspace."
+repository = "https://github.com/sympoies/nils-cli"
+
+[lib]
+name = "agent_out"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-out"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3"

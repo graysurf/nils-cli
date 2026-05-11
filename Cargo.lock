@@ -1723,6 +1723,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-agent-out"
+version = "0.8.1"
+dependencies = [
+ "chrono",
+ "clap",
+ "clap_complete",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-api-gql"
 version = "0.8.1"
 dependencies = [

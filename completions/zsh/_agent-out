@@ -1,0 +1,93 @@
+#compdef agent-out
+
+autoload -U is-at-least
+
+_agent-out() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_agent-out_commands" \
+"*::: :->agent-out" \
+&& ret=0
+    case $state in
+    (agent-out)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-out-command-$line[1]:"
+        case $line[1] in
+            (project)
+_arguments "${_arguments_options[@]}" : \
+'--topic=[Human-readable topic for this run directory]:TOPIC:_default' \
+'--repo=[Repository path used for slug discovery. Defaults to the current directory]:PATH:_files -/' \
+'--repo-slug=[Explicit repository slug, preferably owner/repo]:OWNER/REPO:_default' \
+'--agent-home=[Agent home root. Defaults to AGENT_HOME]:PATH:_files -/' \
+'--format=[Output format]:FORMAT:(path json env)' \
+'--mkdir[Create the generated directory]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(audit)
+_arguments "${_arguments_options[@]}" : \
+'--agent-home=[Agent home root. Defaults to AGENT_HOME]:PATH:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--strict[Exit non-zero when noncanonical entries are present]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_agent-out_commands] )) ||
+_agent-out_commands() {
+    local commands; commands=(
+'project:Generate a canonical project-scoped artifact directory path' \
+'audit:Audit top-level AGENT_HOME/out entries' \
+'completion:Print shell completion script' \
+    )
+    _describe -t commands 'agent-out commands' commands "$@"
+}
+(( $+functions[_agent-out__subcmd__audit_commands] )) ||
+_agent-out__subcmd__audit_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-out audit commands' commands "$@"
+}
+(( $+functions[_agent-out__subcmd__completion_commands] )) ||
+_agent-out__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-out completion commands' commands "$@"
+}
+(( $+functions[_agent-out__subcmd__project_commands] )) ||
+_agent-out__subcmd__project_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-out project commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_agent-out" ]; then
+    _agent-out "$@"
+else
+    compdef _agent-out agent-out
+fi
