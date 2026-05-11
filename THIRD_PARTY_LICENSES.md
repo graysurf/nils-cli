@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `ad464ee103524060b4c9e4e25b4df307de3eb6799af74c870894c8422d2c929d`
+- Cargo.lock SHA256: `2b9e497d253b9b6fe267f38806219301fc5f9fb2a3694d93519889a4327875d1`
 - Third-party crates (`source != null`): 437
 - Workspace crates (`source == null`, excluded below): 26
 
@@ -175,7 +175,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | http-body | 1.0.1 | MIT | crates.io |
 | http-body-util | 0.1.3 | MIT | crates.io |
 | httparse | 1.10.1 | MIT OR Apache-2.0 | crates.io |
-| hybrid-array | 0.4.11 | MIT OR Apache-2.0 | crates.io |
+| hybrid-array | 0.4.12 | MIT OR Apache-2.0 | crates.io |
 | hyper | 1.9.0 | MIT | crates.io |
 | hyper-rustls | 0.27.9 | Apache-2.0 OR ISC OR MIT | crates.io |
 | hyper-util | 0.1.20 | MIT | crates.io |
@@ -232,7 +232,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | crates.io |
 | mio | 1.2.0 | MIT | crates.io |
 | moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 | crates.io |
-| nix | 0.31.2 | MIT | crates.io |
+| nix | 0.31.3 | MIT | crates.io |
 | nu-ansi-term | 0.50.3 | MIT | crates.io |
 | num-bigint | 0.4.6 | MIT OR Apache-2.0 | crates.io |
 | num-conv | 0.2.1 | MIT OR Apache-2.0 | crates.io |
