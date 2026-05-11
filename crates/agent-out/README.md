@@ -47,7 +47,8 @@ agent-out audit --strict
 agent-out audit --format json
 ```
 
-The MVP allowlist covers the canonical `projects/` root, current home-scope policy roots, and explicit tool/workflow roots already documented in nils-cli or agent-kit:
+The MVP allowlist covers the canonical `projects/` root, current home-scope policy roots,
+and explicit tool/workflow roots already documented in nils-cli or agent-kit:
 
 - `projects`
 - `agent-browser`
