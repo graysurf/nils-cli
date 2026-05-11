@@ -12,7 +12,7 @@ Options:
   --ci-gate-main          Require CI gate on main; fail if gate conditions are not met.
   --skip-readme           Do not update README release tag examples.
   --skip-push             Do not push commit or tag to origin (also disables tap stage).
-  --allow-dirty           Allow a dirty working tree.
+  --allow-dirty           Allow dirty release-managed files only.
   --force-tag             Delete existing local/remote tag before re-tagging.
   --tap-dir <path>        Path to homebrew-tap work tree (overrides env + convention).
   --skip-tap              Skip the homebrew-tap stage entirely.
@@ -64,6 +64,40 @@ verify_workspace_locked() {
 refresh_lockfile_and_verify_locked() {
   refresh_lockfile
   verify_workspace_locked
+}
+
+release_managed_paths() {
+  printf '%s\n' Cargo.toml Cargo.lock
+  for optional in README.md THIRD_PARTY_LICENSES.md THIRD_PARTY_NOTICES.md; do
+    if [[ -e "$optional" || -L "$optional" ]]; then
+      printf '%s\n' "$optional"
+    fi
+  done
+  for manifest in crates/*/Cargo.toml; do
+    if [[ -f "$manifest" ]]; then
+      printf '%s\n' "$manifest"
+    fi
+  done
+}
+
+assert_allow_dirty_only_release_managed() {
+  if [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+    return 0
+  fi
+
+  local managed_file dirty_file unexpected
+  managed_file="$(mktemp)"
+  dirty_file="$(mktemp)"
+  release_managed_paths | sort -u >"$managed_file"
+  git status --porcelain=v1 --untracked-files=all \
+    | sed -E 's/^.. //' \
+    | sort -u >"$dirty_file"
+  unexpected="$(comm -23 "$dirty_file" "$managed_file" || true)"
+  rm -f "$managed_file" "$dirty_file"
+
+  if [[ -n "$unexpected" ]]; then
+    die "--allow-dirty only permits release-managed paths; commit/stash these first: ${unexpected//$'\n'/, }"
+  fi
 }
 
 sanitize_rust_build_env() {
@@ -816,6 +850,8 @@ if [[ "$allow_dirty" -eq 0 ]]; then
   if [[ -n "$(git status --porcelain)" ]]; then
     die "working tree is not clean; commit/stash changes or use --allow-dirty"
   fi
+else
+  assert_allow_dirty_only_release_managed
 fi
 
 if [[ "$skip_checks" -eq 0 ]]; then
@@ -1006,13 +1042,10 @@ refresh_third_party_artifacts_if_present
 
 # Stage only the files this skill is expected to produce. Using `git add -A`
 # would sweep in unrelated runtime state (e.g. `.claude/` session locks).
-stage_paths=(Cargo.toml Cargo.lock)
-for optional in README.md THIRD_PARTY_LICENSES.md THIRD_PARTY_NOTICES.md; do
-  [[ -f "$optional" ]] && stage_paths+=("$optional")
-done
-for manifest in crates/*/Cargo.toml; do
-  [[ -f "$manifest" ]] && stage_paths+=("$manifest")
-done
+stage_paths=()
+while IFS= read -r release_path; do
+  stage_paths+=("$release_path")
+done < <(release_managed_paths)
 git add -- "${stage_paths[@]}"
 
 if git diff --cached --quiet; then

@@ -352,6 +352,44 @@ test_readme_already_at_target_is_not_warned() {
   assert_contains "$log_file" 'cargo:check --workspace --locked'
 }
 
+test_allow_dirty_rejects_non_release_managed_paths() {
+  local tmp repo bin_dir log_file stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  bin_dir="${tmp}/bin"
+  log_file="${tmp}/mock.log"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_cargo "$bin_dir"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+
+  echo "temporary docs fix" >"${repo}/crates/codex-cli/README.md"
+
+  set +e
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_LOG="$log_file" \
+      "$entrypoint" --version v0.6.5 --skip-checks --skip-push --allow-dirty \
+      >"${tmp}/stdout.log" 2>"${stderr_file}"
+  )
+  local rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    fail "expected --allow-dirty with non-release-managed paths to exit non-zero"
+  fi
+  assert_contains "$stderr_file" '--allow-dirty only permits release-managed paths'
+  assert_contains "$stderr_file" 'crates/codex-cli/README.md'
+  if [[ -f "$log_file" ]]; then
+    assert_not_contains "$log_file" 'cargo:'
+  fi
+}
+
 test_skip_push_skips_tap_stage_with_note() {
   local tmp repo bin_dir log_file stderr_file
   tmp="$(mktemp -d)"
@@ -643,6 +681,7 @@ fi
 
 test_full_checks_refresh_lockfile_and_disable_bad_wrapper
 test_readme_already_at_target_is_not_warned
+test_allow_dirty_rejects_non_release_managed_paths
 test_skip_push_skips_tap_stage_with_note
 test_from_tap_without_tag_fails
 test_from_tap_with_skip_tap_is_mutually_exclusive

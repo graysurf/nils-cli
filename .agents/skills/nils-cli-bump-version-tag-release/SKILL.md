@@ -33,7 +33,8 @@ Inputs:
   - `--ci-gate-main` (strict mode: require CI gate on `main`; fail when gate conditions are not met)
   - `--skip-readme` (do not update README release tag example)
   - `--skip-push` (do not push commit or tag to `origin`; **also disables the tap stage**)
-  - `--allow-dirty` (allow a dirty working tree)
+  - `--allow-dirty` (allow dirty release-managed files only: Cargo manifests, `Cargo.lock`,
+    root `README.md`, and tracked third-party artifacts; fail on other dirty paths)
   - `--force-tag` (delete existing local/remote tag before re-tagging)
   - `NILS_CLI_TEST_RUNNER=cargo|nextest` (environment variable; default is `nextest` in this release script)
 - Optional (tap stage):
@@ -103,7 +104,8 @@ Exit codes:
 Failure modes:
 
 - Invalid version format or missing `--version`.
-- Dirty working tree without `--allow-dirty`.
+- Dirty working tree without `--allow-dirty`, or dirty non-release-managed paths with
+  `--allow-dirty`.
 - Tag already exists without `--force-tag`.
 - Required commands missing (`git`, `python3`, `cargo`, `semantic-commit`, `git-scope`).
 - `cargo-nextest` missing while default check path (`nextest`) is active.
