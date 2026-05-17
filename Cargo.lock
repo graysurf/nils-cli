@@ -239,9 +239,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.3"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
+checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -249,9 +249,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
+checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
 dependencies = [
  "cc",
  "cmake",
@@ -1548,12 +1548,13 @@ dependencies = [
 
 [[package]]
 name = "kurbo"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7564e90fe3c0d5771e1f0bc95322b21baaeaa0d9213fa6a0b61c99f8b17b3bfb"
+checksum = "4b60dfc32f652b926df6192e55525b16d186c69d47876c3ead4da5cc9f8450e2"
 dependencies = [
  "arrayvec",
  "euclid",
+ "polycool",
  "smallvec",
 ]
 
@@ -1707,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-docs"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1724,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-out"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "chrono",
  "clap",
@@ -1737,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-scope-lock"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1750,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-gql"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1765,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-grpc"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1781,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-rest"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1797,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-test"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1813,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-testing-core"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1836,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-websocket"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1852,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "nils-cli-template"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1866,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "nils-codex-cli"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1885,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "nils-common"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "base64",
  "nils-test-support",
@@ -1897,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "nils-fzf-cli"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1914,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "nils-gemini-cli"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1929,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-cli"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1945,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-lock"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1960,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-scope"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1973,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-summary"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1988,7 +1989,7 @@ dependencies = [
 
 [[package]]
 name = "nils-image-processing"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2012,7 +2013,7 @@ dependencies = [
 
 [[package]]
 name = "nils-macos-agent"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2029,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "nils-memo-cli"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2047,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "nils-plan-issue-cli"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2062,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "nils-plan-tooling"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2078,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "nils-screen-record"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "block2",
  "chrono",
@@ -2105,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "nils-semantic-commit"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2121,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "nils-term"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "indicatif",
  "pretty_assertions",
@@ -2129,7 +2130,7 @@ dependencies = [
 
 [[package]]
 name = "nils-test-support"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -2139,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "nils-web-evidence"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2573,6 +2574,15 @@ dependencies = [
  "pin-project-lite",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "polycool"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50596ddc09eb5ad5f75cacd40209568e66df71baf86e1499a0e99c4cff12a5a6"
+dependencies = [
+ "arrayvec",
 ]
 
 [[package]]
@@ -4335,9 +4345,9 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winnow"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee1708bef14716a11bae175f579062d4554d95be2c6829f518df847b7b3fdd0"
+checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
 ]
@@ -4577,9 +4587,9 @@ dependencies = [
 
 [[package]]
 name = "zerofrom"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69faa1f2a1ea75661980b013019ed6687ed0e83d069bc1114e2cc74c6c04c4df"
+checksum = "0ec05a11813ea801ff6d75110ad09cd0824ddba17dfe17128ea0d5f68e6c5272"
 dependencies = [
  "zerofrom-derive",
 ]

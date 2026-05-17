@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `a8f6abd136434652801ccaa7e7eae04f7a80f1cc7e413acf353f96d10566b6c3`
-- Third-party crates (`source != null`): 437
+- Cargo.lock SHA256: `3415094f6f22112a90323122586fd45ea228bf5f8c0d7bde3401aba50ad06ac1`
+- Third-party crates (`source != null`): 438
 
 ## Notice Extraction Policy
 
@@ -223,7 +223,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### aws-lc-rs 1.16.3
+### aws-lc-rs 1.17.0
 
 - License: `ISC AND (Apache-2.0 OR ISC)`
 - Source: `crates.io`
@@ -231,7 +231,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### aws-lc-sys 0.40.0
+### aws-lc-sys 0.41.0
 
 - License: `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)`
 - Source: `crates.io`
@@ -1413,7 +1413,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### kurbo 0.13.0
+### kurbo 0.13.1
 
 - License: `Apache-2.0 OR MIT`
 - Source: `crates.io`
@@ -1912,6 +1912,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
 ### polling 3.11.0
 
 - License: `Apache-2.0 OR MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+
+### polycool 0.4.0
+
+- License: `MIT OR Apache-2.0`
 - Source: `crates.io`
 - Notice files: No explicit NOTICE file discovered.
 - License file references:
@@ -3529,7 +3538,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `license-mit`
   - `license-apache-2.0`
 
-### winnow 1.0.2
+### winnow 1.0.3
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3704,7 +3713,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
   - `LICENSE-BSD`
 
-### zerofrom 0.1.7
+### zerofrom 0.1.8
 
 - License: `Unicode-3.0`
 - Source: `crates.io`
