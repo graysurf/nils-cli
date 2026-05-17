@@ -82,8 +82,8 @@ Help:
 
 ### scaffold
 
-- `scaffold --slug <kebab-case> [--title <title>] [--force]`: Write to `docs/plans/<slug>-plan.md` (or `<slug>.md` if the slug already ends
-  with `-plan`).
+- `scaffold --slug <kebab-case> [--title <title>] [--force]`: Write to `docs/plans/<slug>/<slug>-plan.md` (or
+  `docs/plans/<slug>/<slug>.md` if the slug already ends with `-plan`).
 - `scaffold --file <path> [--title <title>] [--force]`: Write to a specific `-plan.md` path.
 
 ### completion
