@@ -35,6 +35,9 @@ Help:
 ### validate
 
 - `validate [--file <path>]... [--format text|json]`: Validate plan files. With no `--file`, scans tracked `docs/plans/*-plan.md` files.
+- `validate` requires a `Read First` section with `Primary source`, `Source type`, and `Open questions carried into execution`. Repo-local
+  primary source paths must exist; use `Source type: plan-only waiver` for explicit plan-only exceptions.
+- If `Complexity` is present it must parse as a 1-10 integer. Omit the field when complexity is intentionally unspecified.
 
 ### batches
 

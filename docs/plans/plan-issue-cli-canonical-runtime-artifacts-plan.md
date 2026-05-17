@@ -19,6 +19,12 @@ backward-compat shim is shipped because the user explicitly
 authorized it and the only consumers (the wrapper + adapter agents)
 already expect the canonical layout.
 
+## Read First
+
+- Primary source: plan-only waiver: historical plan predates source artifact split
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
 ## Scope
 
 - In scope:

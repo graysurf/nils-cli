@@ -23,7 +23,19 @@ fn sprint_metadata_is_empty(metadata: &SprintMetadata) -> bool {
 pub struct Plan {
     pub title: String,
     pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_first: Option<ReadFirst>,
     pub sprints: Vec<Sprint>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReadFirst {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_questions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +77,8 @@ pub fn parse_plan_with_display(
             break;
         }
     }
+
+    let read_first = parse_read_first(&raw_lines);
 
     let mut errors: Vec<String> = Vec::new();
 
@@ -197,16 +211,28 @@ pub fn parse_plan_with_display(
 
         match field.as_str() {
             "Description" => {
-                let v = rest.unwrap_or_default();
+                let (v, next_idx) = parse_scalar_continuation(
+                    &raw_lines,
+                    i + 1,
+                    base_indent,
+                    &rest.unwrap_or_default(),
+                );
                 if let Some(task) = current_task.as_mut() {
                     task.description = Some(v);
                 }
-                i += 1;
+                i = next_idx;
             }
             "Complexity" => {
-                let v = rest.unwrap_or_default();
-                if !v.trim().is_empty() {
-                    match v.trim().parse::<i32>() {
+                let (v, next_idx) =
+                    parse_complexity_value(&raw_lines, i + 1, base_indent, rest.as_deref());
+                let trimmed = v.trim();
+                if trimmed.is_empty() {
+                    errors.push(format!(
+                        "{display_path}:{}: missing Complexity value; omit the field or set a 1-10 integer",
+                        i + 1,
+                    ));
+                } else {
+                    match trimmed.parse::<i32>() {
                         Ok(n) => {
                             if let Some(task) = current_task.as_mut() {
                                 task.complexity = Some(n);
@@ -216,17 +242,19 @@ pub fn parse_plan_with_display(
                             errors.push(format!(
                                 "{display_path}:{}: invalid Complexity (expected int): {}",
                                 i + 1,
-                                crate::repr::py_repr(v.trim())
+                                crate::repr::py_repr(trimmed)
                             ));
                         }
                     }
                 }
-                i += 1;
+                i = next_idx;
             }
             "Location" | "Dependencies" | "Acceptance criteria" | "Validation" => {
                 let (items, next_idx) = if let Some(r) = rest.clone() {
                     if !r.trim().is_empty() {
-                        (vec![strip_inline_code(&r)], i + 1)
+                        let (value, next_idx) =
+                            parse_scalar_continuation(&raw_lines, i + 1, base_indent, &r);
+                        (vec![value], next_idx)
                     } else {
                         parse_list_block(&raw_lines, i + 1, base_indent)
                     }
@@ -298,6 +326,7 @@ pub fn parse_plan_with_display(
         Plan {
             title: plan_title,
             file: display_path.to_string(),
+            read_first,
             sprints,
         },
         errors,
@@ -368,6 +397,48 @@ fn parse_any_field_line(line: &str) -> Option<(usize, String, Option<String>)> {
     let (field, rest) = after_star.split_once("**:")?;
     let field = field.to_string();
     Some((base_indent, field, Some(rest.trim().to_string())))
+}
+
+fn parse_read_first(lines: &[String]) -> Option<ReadFirst> {
+    let start = lines
+        .iter()
+        .position(|line| line.trim() == "## Read First")?;
+    let mut end = lines.len();
+    for (idx, line) in lines.iter().enumerate().skip(start + 1) {
+        if idx > start && line.starts_with("## ") {
+            end = idx;
+            break;
+        }
+    }
+
+    let mut read_first = ReadFirst::default();
+    let mut i = start + 1;
+    while i < end {
+        let Some((base_indent, field, rest)) = parse_read_first_field_line(&lines[i]) else {
+            i += 1;
+            continue;
+        };
+
+        let (value, next_idx) = parse_scalar_continuation(lines, i + 1, base_indent, &rest);
+        match field.as_str() {
+            "Primary source" => read_first.primary_source = Some(value),
+            "Source type" => read_first.source_type = Some(value),
+            "Open questions carried into execution" => read_first.open_questions = Some(value),
+            _ => {}
+        }
+        i = next_idx.min(end);
+    }
+
+    Some(read_first)
+}
+
+fn parse_read_first_field_line(line: &str) -> Option<(usize, String, String)> {
+    let base_indent = line.chars().take_while(|c| *c == ' ').count();
+    let trimmed = line.trim_start_matches(' ');
+    let after_dash = trimmed.strip_prefix('-')?.trim_start();
+    let (field, rest) = after_dash.split_once(':')?;
+    let field = field.trim().trim_matches('*').to_string();
+    Some((base_indent, field, rest.trim().to_string()))
 }
 
 fn canonical_metadata_field_name(field: &str) -> Option<&'static str> {
@@ -473,6 +544,86 @@ fn strip_inline_code(text: &str) -> String {
     t.to_string()
 }
 
+fn parse_scalar_continuation(
+    lines: &[String],
+    start_idx: usize,
+    base_indent: usize,
+    initial: &str,
+) -> (String, usize) {
+    let mut parts: Vec<String> = Vec::new();
+    let first = strip_inline_code(initial);
+    if !first.trim().is_empty() {
+        parts.push(first);
+    }
+
+    let mut i = start_idx;
+    while i < lines.len() {
+        let raw = lines[i].as_str();
+        if raw.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let indent = raw.chars().take_while(|c| *c == ' ').count();
+        if indent <= base_indent {
+            break;
+        }
+        if parse_any_field_line(raw).is_some() {
+            break;
+        }
+
+        parts.push(strip_inline_code(raw.trim_start_matches(' ')));
+        i += 1;
+    }
+
+    (join_continuation_parts(parts), i)
+}
+
+fn parse_complexity_value(
+    lines: &[String],
+    start_idx: usize,
+    base_indent: usize,
+    rest: Option<&str>,
+) -> (String, usize) {
+    let Some(rest) = rest else {
+        return (String::new(), start_idx);
+    };
+    if !rest.trim().is_empty() {
+        return parse_scalar_continuation(lines, start_idx, base_indent, rest);
+    }
+
+    let (items, next_idx) = parse_list_block(lines, start_idx, base_indent);
+    if items.len() == 1 {
+        (items[0].clone(), next_idx)
+    } else if items.is_empty() {
+        (String::new(), next_idx)
+    } else {
+        (items.join(" "), next_idx)
+    }
+}
+
+fn join_continuation_parts(parts: Vec<String>) -> String {
+    parts
+        .into_iter()
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn parse_list_item_line(line: &str) -> Option<(usize, String)> {
+    let indent = line.chars().take_while(|c| *c == ' ').count();
+    let trimmed = line.trim_start_matches(' ');
+    let after_dash = trimmed.strip_prefix('-')?;
+    if after_dash.is_empty() || !after_dash.chars().next().unwrap_or('x').is_whitespace() {
+        return None;
+    }
+    Some((
+        indent,
+        strip_inline_code(after_dash.trim_start().trim_end()),
+    ))
+}
+
 fn parse_list_block(
     lines: &[String],
     start_idx: usize,
@@ -487,21 +638,39 @@ fn parse_list_block(
             continue;
         }
 
-        let indent = raw.chars().take_while(|c| *c == ' ').count();
-        let trimmed = raw.trim_start_matches(' ');
-        if !trimmed.starts_with('-') {
+        let Some((indent, text)) = parse_list_item_line(raw) else {
             break;
-        }
-        let after_dash = &trimmed[1..];
-        if after_dash.is_empty() || !after_dash.chars().next().unwrap_or('x').is_whitespace() {
-            break;
-        }
+        };
         if indent <= base_indent {
             break;
         }
-        let text = after_dash.trim_start().trim_end();
-        items.push(strip_inline_code(text));
+
+        let mut parts = vec![text];
         i += 1;
+        while i < lines.len() {
+            let raw = lines[i].as_str();
+            if raw.trim().is_empty() {
+                i += 1;
+                continue;
+            }
+
+            let next_indent = raw.chars().take_while(|c| *c == ' ').count();
+            if next_indent <= base_indent {
+                break;
+            }
+            if let Some((item_indent, _)) = parse_list_item_line(raw)
+                && item_indent <= indent
+            {
+                break;
+            }
+            if parse_any_field_line(raw).is_some() {
+                break;
+            }
+
+            parts.push(strip_inline_code(raw.trim_start_matches(' ')));
+            i += 1;
+        }
+        items.push(join_continuation_parts(parts));
     }
 
     (items, i)
