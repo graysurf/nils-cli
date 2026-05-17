@@ -1,6 +1,6 @@
 [package]
 name = "nils-api-rest"
-version = "0.8.5"
+version = "0.8.6"
 edition.workspace = true
 license.workspace = true
 
@@ -12,14 +12,14 @@ name = "api-rest"
 path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
-api-testing-core = { version = "0.8.5", path = "../api-testing-core", package = "nils-api-testing-core" }
+api-testing-core = { version = "0.8.6", path = "../api-testing-core", package = "nils-api-testing-core" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-term = { version = "0.8.5", path = "../nils-term", package = "nils-term" }
+nils-term = { version = "0.8.6", path = "../nils-term", package = "nils-term" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 base64 = "0.22"
-nils-test-support = { version = "0.8.5", path = "../nils-test-support" }
+nils-test-support = { version = "0.8.6", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
