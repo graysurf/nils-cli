@@ -35,6 +35,67 @@ fn validate_explicit_file_without_git_repo() {
 }
 
 #[test]
+fn validate_fails_when_read_first_section_is_missing() {
+    let repo = init_repo();
+    write_file(
+        &repo.path().join("missing-read-first.md"),
+        MISSING_READ_FIRST_PLAN,
+    );
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "missing-read-first.md"],
+    );
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("missing Read First"));
+    assert!(out.stderr.contains("Primary source"));
+}
+
+#[test]
+fn validate_fails_when_read_first_source_path_is_missing() {
+    let repo = init_repo();
+    write_file(
+        &repo.path().join("missing-source.md"),
+        MISSING_SOURCE_PATH_PLAN,
+    );
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "missing-source.md"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("Primary source path not found"));
+    assert!(out.stderr.contains("docs/source/missing.md"));
+}
+
+#[test]
+fn validate_accepts_existing_read_first_source_path() {
+    let repo = init_repo();
+    write_file(&repo.path().join("docs/source/spec.md"), "# Spec\n");
+    write_file(&repo.path().join("source-backed.md"), SOURCE_BACKED_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "source-backed.md"]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn validate_fails_when_complexity_field_is_present_without_integer() {
+    let repo = init_repo();
+    write_file(
+        &repo.path().join("empty-complexity.md"),
+        EMPTY_COMPLEXITY_PLAN,
+    );
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "empty-complexity.md"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("missing Complexity"));
+    assert!(out.stderr.contains("omit the field or set a 1-10 integer"));
+}
+
+#[test]
 fn validate_fails_with_errors() {
     let repo = init_repo();
     write_file(&repo.path().join("bad.md"), INVALID_PLAN);
@@ -379,6 +440,12 @@ fn validate_fails_when_sprint_metadata_is_partial() {
 
 const VALID_PLAN: &str = r#"# Plan: Example
 
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
 ## Sprint 1: First sprint
 
 ### Task 1.1: Do thing
@@ -394,6 +461,12 @@ const VALID_PLAN: &str = r#"# Plan: Example
 "#;
 
 const INVALID_PLAN: &str = r#"# Plan: Bad
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
 
 ## Sprint 1: Bad sprint
 
@@ -411,6 +484,12 @@ const INVALID_PLAN: &str = r#"# Plan: Bad
 
 const MISSING_DEPS_PLAN: &str = r#"# Plan: Missing deps
 
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
 ## Sprint 1: First sprint
 
 ### Task 1.1: Do thing
@@ -425,6 +504,12 @@ const MISSING_DEPS_PLAN: &str = r#"# Plan: Missing deps
 "#;
 
 const REDIRECT_VALIDATION_PLAN: &str = r#"# Plan: Redirect
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
 
 ## Sprint 1: First sprint
 
@@ -442,6 +527,12 @@ const REDIRECT_VALIDATION_PLAN: &str = r#"# Plan: Redirect
 
 const BACKTICK_DESCRIPTION_PLAN: &str = r#"# Plan: Backtick description
 
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
 ## Sprint 1: First sprint
 
 ### Task 1.1: Document a usage slot
@@ -457,6 +548,12 @@ const BACKTICK_DESCRIPTION_PLAN: &str = r#"# Plan: Backtick description
 "#;
 
 const INVALID_DEP_FORMAT_PLAN: &str = r#"# Plan: Bad deps
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
 
 ## Sprint 1: First sprint
 
@@ -474,6 +571,12 @@ const INVALID_DEP_FORMAT_PLAN: &str = r#"# Plan: Bad deps
 "#;
 
 const METADATA_MISMATCH_PLAN: &str = r#"# Plan: Metadata mismatch
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
 
 ## Sprint 1: First sprint
 - **PR grouping intent**: `per-sprint`
@@ -493,6 +596,12 @@ const METADATA_MISMATCH_PLAN: &str = r#"# Plan: Metadata mismatch
 
 const METADATA_PARTIAL_PLAN: &str = r#"# Plan: Metadata partial
 
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
 ## Sprint 1: First sprint
 - **PR grouping intent**: `group`
 
@@ -502,6 +611,89 @@ const METADATA_PARTIAL_PLAN: &str = r#"# Plan: Metadata partial
 - **Description**: Do A
 - **Dependencies**:
   - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test -p plan-tooling
+"#;
+
+const MISSING_READ_FIRST_PLAN: &str = r#"# Plan: Missing Read First
+
+## Sprint 1: First sprint
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test -p plan-tooling
+"#;
+
+const MISSING_SOURCE_PATH_PLAN: &str = r#"# Plan: Missing source path
+
+## Read First
+
+- Primary source: docs/source/missing.md
+- Source type: review-to-improvement-doc
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test -p plan-tooling
+"#;
+
+const SOURCE_BACKED_PLAN: &str = r#"# Plan: Source backed
+
+## Read First
+
+- Primary source: docs/source/spec.md
+- Source type: existing issue/spec
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test -p plan-tooling
+"#;
+
+const EMPTY_COMPLEXITY_PLAN: &str = r#"# Plan: Empty complexity
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Complexity**:
 - **Acceptance criteria**:
   - A works
 - **Validation**:

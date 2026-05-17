@@ -3,6 +3,11 @@
 ## Overview
 <2–5 sentences: what changes, what stays the same, approach>
 
+## Read First
+- Primary source: <repo path, issue/ticket URL, or explicit plan-only waiver>
+- Source type: <discussion-to-implementation-doc | review-to-improvement-doc | existing issue/spec | plan-only waiver>
+- Open questions carried into execution: none
+
 ## Scope
 - In scope: ...
 - Out of scope: ...
@@ -22,7 +27,7 @@
 - **Description**: ...
 - **Dependencies**:
   - <task IDs or "none">
-- **Complexity**:
+- **Complexity**: <optional int 1-10>
 - **Acceptance criteria**:
   - ...
 - **Validation**:

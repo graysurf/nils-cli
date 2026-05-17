@@ -147,7 +147,7 @@ pub fn run(args: &[String]) -> i32 {
             }
             continue;
         }
-        errors.extend(validate_plan(&display_path, &read_path));
+        errors.extend(validate_plan(&display_path, &read_path, &repo_root));
 
         if let Some(p) = progress.as_ref() {
             p.set_position((idx + 1) as u64);
@@ -265,7 +265,7 @@ fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
     repo_root.join(path)
 }
 
-fn validate_plan(display_path: &str, read_path: &Path) -> Vec<String> {
+fn validate_plan(display_path: &str, read_path: &Path, repo_root: &Path) -> Vec<String> {
     let plan: Plan;
     let parse_errors: Vec<String>;
     match parse_plan_with_display(read_path, display_path) {
@@ -303,11 +303,108 @@ fn validate_plan(display_path: &str, read_path: &Path) -> Vec<String> {
 
     let all_task_ids: HashSet<String> = tasks.iter().map(|t| t.id.trim().to_string()).collect();
 
-    let mut errs: Vec<String> = validate_sprint_metadata(display_path, &plan.sprints);
+    let mut errs: Vec<String> = validate_read_first(display_path, &plan, repo_root);
+    errs.extend(validate_sprint_metadata(display_path, &plan.sprints));
     for task in tasks {
         errs.extend(validate_task(display_path, task, &all_task_ids));
     }
     errs
+}
+
+fn validate_read_first(plan_path: &str, plan: &Plan, repo_root: &Path) -> Vec<String> {
+    let mut errs = Vec::new();
+    let Some(read_first) = plan.read_first.as_ref() else {
+        return vec![format!(
+            "{plan_path}: missing Read First section (expected Primary source, Source type, and Open questions carried into execution)"
+        )];
+    };
+
+    let primary_source = read_first
+        .primary_source
+        .as_deref()
+        .map(clean_source_value)
+        .unwrap_or_default();
+    let source_type = read_first
+        .source_type
+        .as_deref()
+        .map(clean_source_value)
+        .unwrap_or_default();
+    let open_questions = read_first
+        .open_questions
+        .as_deref()
+        .map(clean_source_value)
+        .unwrap_or_default();
+
+    if primary_source.trim().is_empty() {
+        errs.push(format!("{plan_path}: Read First missing Primary source"));
+    }
+    if source_type.trim().is_empty() {
+        errs.push(format!("{plan_path}: Read First missing Source type"));
+    } else if !is_allowed_source_type(&source_type) {
+        errs.push(format!(
+            "{plan_path}: invalid Read First Source type (expected discussion-to-implementation-doc|review-to-improvement-doc|existing issue/spec|plan-only waiver): {}",
+            crate::repr::py_repr(&source_type)
+        ));
+    }
+    if open_questions.trim().is_empty() {
+        errs.push(format!(
+            "{plan_path}: Read First missing Open questions carried into execution"
+        ));
+    }
+
+    if source_type == "plan-only waiver" {
+        if !primary_source.to_ascii_lowercase().contains("waiver") {
+            errs.push(format!(
+                "{plan_path}: plan-only waiver requires Primary source to state an explicit waiver"
+            ));
+        }
+        return errs;
+    }
+
+    if primary_source.trim().is_empty()
+        || primary_source.starts_with("http://")
+        || primary_source.starts_with("https://")
+        || primary_source.starts_with('#')
+    {
+        return errs;
+    }
+    if Path::new(&primary_source).is_absolute() {
+        errs.push(format!(
+            "{plan_path}: Primary source must be repo-relative or a URL: {}",
+            crate::repr::py_repr(&primary_source)
+        ));
+        return errs;
+    }
+
+    let source_path = repo_root.join(&primary_source);
+    if !source_path.is_file() {
+        errs.push(format!(
+            "{plan_path}: Primary source path not found: {}",
+            crate::repr::py_repr(&primary_source)
+        ));
+    }
+
+    errs
+}
+
+fn clean_source_value(value: &str) -> String {
+    let trimmed = value.trim();
+    let unwrapped = if trimmed.len() >= 2 && trimmed.starts_with('`') && trimmed.ends_with('`') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    unwrapped.trim().to_string()
+}
+
+fn is_allowed_source_type(value: &str) -> bool {
+    matches!(
+        value,
+        "discussion-to-implementation-doc"
+            | "review-to-improvement-doc"
+            | "existing issue/spec"
+            | "plan-only waiver"
+    )
 }
 
 fn validate_sprint_metadata(plan_path: &str, sprints: &[Sprint]) -> Vec<String> {
@@ -587,6 +684,30 @@ struct ExplainCatalogEntry {
 
 const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
     ExplainCatalogEntry {
+        pattern: "missing Read First",
+        explain: ExplainEntry {
+            class: "read-first-missing",
+            rule: "Plans must start with a Read First section that names the primary source artifact.",
+            example: "## Read First\n\n- Primary source: docs/runbooks/example-source.md\n- Source type: review-to-improvement-doc\n- Open questions carried into execution: none",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Primary source path not found",
+        explain: ExplainEntry {
+            class: "read-first-source-missing",
+            rule: "Repo-local Primary source paths must exist; use a URL or explicit plan-only waiver when no repo file exists.",
+            example: "- Primary source: docs/runbooks/example-source.md\n- Source type: existing issue/spec",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid Read First Source type",
+        explain: ExplainEntry {
+            class: "read-first-source-type",
+            rule: "Source type must be one of the canonical plan source categories.",
+            example: "- Source type: discussion-to-implementation-doc",
+        },
+    },
+    ExplainCatalogEntry {
         pattern: "Location must be repo-relative",
         explain: ExplainEntry {
             class: "location-absolute",
@@ -657,6 +778,14 @@ const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
             class: "dependency-unknown",
             rule: "Dependency must reference a `### Task N.M` heading present in the plan.",
             example: "- **Dependencies**:\n  - Task 1.1     # must match an actual task heading",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Complexity value",
+        explain: ExplainEntry {
+            class: "complexity-missing-value",
+            rule: "If the Complexity field is present, set a 1-10 integer or omit the field entirely.",
+            example: "- **Complexity**: 5",
         },
     },
     ExplainCatalogEntry {
@@ -771,8 +900,9 @@ mod tests {
     use crate::parse::Task;
 
     use super::{
-        contains_angle_placeholder, contains_word_case_insensitive, has_placeholder,
-        is_non_empty_list, is_task_id, strip_backtick_spans, validate_task,
+        clean_source_value, contains_angle_placeholder, contains_word_case_insensitive,
+        has_placeholder, is_allowed_source_type, is_non_empty_list, is_task_id,
+        strip_backtick_spans, validate_task,
     };
 
     #[test]
@@ -930,5 +1060,20 @@ mod tests {
         let all_ids = HashSet::from(["Task 2.1".to_string(), "Task 2.3".to_string()]);
         let errs = validate_task("plan.md", &task, &all_ids);
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn clean_source_value_unwraps_backticks() {
+        assert_eq!(clean_source_value("`docs/source.md`"), "docs/source.md");
+        assert_eq!(clean_source_value(" docs/source.md "), "docs/source.md");
+    }
+
+    #[test]
+    fn allowed_source_types_are_exact() {
+        assert!(is_allowed_source_type("discussion-to-implementation-doc"));
+        assert!(is_allowed_source_type("review-to-improvement-doc"));
+        assert!(is_allowed_source_type("existing issue/spec"));
+        assert!(is_allowed_source_type("plan-only waiver"));
+        assert!(!is_allowed_source_type("review"));
     }
 }

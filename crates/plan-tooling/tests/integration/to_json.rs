@@ -15,12 +15,39 @@ fn to_json_pretty_parses_and_includes_start_lines() {
     let v: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
     assert_eq!(v["title"], "Plan: Example");
     assert_eq!(v["file"], "plan.md");
+    assert_eq!(
+        v["read_first"]["primary_source"],
+        "plan-only waiver: integration fixture"
+    );
+    assert_eq!(v["read_first"]["source_type"], "plan-only waiver");
+    assert_eq!(v["read_first"]["open_questions"], "none");
     assert_eq!(v["sprints"][0]["number"], 1);
-    assert_eq!(v["sprints"][0]["start_line"], 3);
+    assert_eq!(v["sprints"][0]["start_line"], 9);
     assert_eq!(v["sprints"][0]["tasks"][0]["id"], "Task 1.1");
-    assert_eq!(v["sprints"][0]["tasks"][0]["start_line"], 9);
+    assert_eq!(v["sprints"][0]["tasks"][0]["start_line"], 15);
     assert_eq!(v["sprints"][0]["tasks"][1]["id"], "Task 1.2");
-    assert_eq!(v["sprints"][0]["tasks"][1]["start_line"], 21);
+    assert_eq!(v["sprints"][0]["tasks"][1]["start_line"], 27);
+}
+
+#[test]
+fn to_json_merges_scalar_and_list_continuation_lines() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let plan_path = dir.path().join("plan.md");
+    write_file(&plan_path, CONTINUATION_PLAN);
+
+    let out = run_plan_tooling(dir.path(), &["to-json", "--file", "plan.md"]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    let task = &v["sprints"][0]["tasks"][0];
+    assert_eq!(
+        task["description"],
+        "Document nested area rules and link the target map source."
+    );
+    assert_eq!(task["complexity"], 3);
+    assert_eq!(
+        task["acceptance_criteria"][0],
+        "The target map is referenced from the source artifact rather than copied into multiple docs."
+    );
 }
 
 #[test]
@@ -153,6 +180,12 @@ fn to_json_missing_file_is_parse_error() {
 
 const VALID_PLAN: &str = r#"# Plan: Example
 
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
 ## Sprint 1: First sprint
 **Goal**: ...
 **Demo/Validation**:
@@ -186,6 +219,12 @@ const VALID_PLAN: &str = r#"# Plan: Example
 
 const METADATA_PLAN: &str = r#"# Plan: Metadata Example
 
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
 ## Sprint 1: First sprint
 - **PR grouping intent**: `group`
 - **Execution Profile**: `parallel-x2` (parallel width 2)
@@ -205,6 +244,12 @@ const METADATA_PLAN: &str = r#"# Plan: Metadata Example
 
 const METADATA_BAD_FIELD_PLAN: &str = r#"# Plan: Metadata Bad Field
 
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
 ## Sprint 1: First sprint
 - **PR Grouping Intent**: `group`
 - **Execution Profile**: `serial` (parallel width 1)
@@ -218,6 +263,33 @@ const METADATA_BAD_FIELD_PLAN: &str = r#"# Plan: Metadata Bad Field
 - **Complexity**: 3
 - **Acceptance criteria**:
   - A works
+- **Validation**:
+  - cargo test -p plan-tooling
+"#;
+
+const CONTINUATION_PLAN: &str = r#"# Plan: Continuation Example
+
+## Read First
+
+- Primary source:
+  plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Document nested area rules
+- **Location**:
+  - `src/a.rs`
+- **Description**: Document nested area rules and link
+  the target map source.
+- **Dependencies**:
+  - none
+- **Complexity**:
+  - 3
+- **Acceptance criteria**:
+  - The target map is referenced from the source artifact rather than copied
+    into multiple docs.
 - **Validation**:
   - cargo test -p plan-tooling
 "#;
