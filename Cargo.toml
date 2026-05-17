@@ -25,6 +25,7 @@ members = [
   "crates/agent-scope-lock",
   "crates/web-evidence",
   "crates/test-first-evidence",
+  "crates/agent-workflow-primitives",
   "crates/gemini-cli",
 ]
 resolver = "2"

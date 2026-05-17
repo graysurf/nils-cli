@@ -1,0 +1,44 @@
+[package]
+name = "nils-agent-workflow-primitives"
+version = "0.8.3"
+edition.workspace = true
+license.workspace = true
+
+description = "CLI crate for nils-agent-workflow-primitives in the nils-cli workspace."
+repository = "https://github.com/sympoies/nils-cli"
+
+[lib]
+name = "agent_workflow_primitives"
+path = "src/lib.rs"
+
+[[bin]]
+name = "browser-session"
+path = "src/bin/browser-session.rs"
+
+[[bin]]
+name = "canary-check"
+path = "src/bin/canary-check.rs"
+
+[[bin]]
+name = "docs-impact"
+path = "src/bin/docs-impact.rs"
+
+[[bin]]
+name = "model-cross-check"
+path = "src/bin/model-cross-check.rs"
+
+[[bin]]
+name = "review-evidence"
+path = "src/bin/review-evidence.rs"
+
+[dependencies]
+clap = { workspace = true }
+clap_complete = { workspace = true }
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+nils-test-support = { version = "0.8.3", path = "../nils-test-support" }
+pretty_assertions = { workspace = true }
+tempfile = "3"

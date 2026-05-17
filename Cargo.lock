@@ -1750,6 +1750,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-agent-workflow-primitives"
+version = "0.8.3"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "nils-test-support",
+ "pretty_assertions",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-api-gql"
 version = "0.8.3"
 dependencies = [

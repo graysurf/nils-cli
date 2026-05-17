@@ -1,0 +1,106 @@
+#compdef canary-check
+
+autoload -U is-at-least
+
+_canary-check() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_canary-check_commands" \
+"*::: :->canary-check" \
+&& ret=0
+    case $state in
+    (canary-check)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:canary-check-command-$line[1]:"
+        case $line[1] in
+            (run)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory where \`canary-check.json\` is written]:DIR:_files -/' \
+'--name=[Canary label]:TEXT:_default' \
+'--command=[Command to execute through the local shell]:TEXT:_default' \
+'--expect-exit=[Expected command exit code]:EXPECT_EXIT:_default' \
+'--preview-bytes=[Maximum stdout/stderr preview characters to persist]:PREVIEW_BYTES:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(verify)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory containing \`canary-check.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory containing \`canary-check.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_canary-check_commands] )) ||
+_canary-check_commands() {
+    local commands; commands=(
+'run:Run one local canary command and persist the redacted result' \
+'verify:Verify the latest canary result is passing' \
+'show:Print the latest canary record' \
+'completion:Print shell completion script' \
+    )
+    _describe -t commands 'canary-check commands' commands "$@"
+}
+(( $+functions[_canary-check__subcmd__completion_commands] )) ||
+_canary-check__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'canary-check completion commands' commands "$@"
+}
+(( $+functions[_canary-check__subcmd__run_commands] )) ||
+_canary-check__subcmd__run_commands() {
+    local commands; commands=()
+    _describe -t commands 'canary-check run commands' commands "$@"
+}
+(( $+functions[_canary-check__subcmd__show_commands] )) ||
+_canary-check__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'canary-check show commands' commands "$@"
+}
+(( $+functions[_canary-check__subcmd__verify_commands] )) ||
+_canary-check__subcmd__verify_commands() {
+    local commands; commands=()
+    _describe -t commands 'canary-check verify commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_canary-check" ]; then
+    _canary-check "$@"
+else
+    compdef _canary-check canary-check
+fi

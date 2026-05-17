@@ -5,6 +5,7 @@ nils-agent-out
 nils-agent-scope-lock
 nils-web-evidence
 nils-test-first-evidence
+nils-agent-workflow-primitives
 nils-term
 nils-git-cli
 nils-memo-cli
