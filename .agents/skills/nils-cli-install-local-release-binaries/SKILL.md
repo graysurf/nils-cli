@@ -24,7 +24,7 @@ Outputs:
 
 - Builds the workspace in release mode (unless `--skip-build`).
 - Installs selected binaries into the destination directory.
-  - Default binaries: all workspace `bin` targets (auto-discovered via `scripts/workspace-bins.py`)
+  - Default binaries: all workspace `bin` targets (auto-discovered via `scripts/workspace-bins.sh`)
 
 Exit codes:
 

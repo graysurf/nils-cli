@@ -16,7 +16,7 @@ Options:
   -h, --help      Show help
 
 Default binaries:
-  - All workspace binaries (auto-discovered via scripts/workspace-bins.py)
+  - All workspace binaries (auto-discovered via scripts/workspace-bins.sh)
   - Use --bin NAME (repeatable) to install a subset
 
 Example:
@@ -69,7 +69,7 @@ if [[ "$prefix" == "~" ]]; then
 elif [[ "$prefix" == "~/"* ]]; then
   prefix="$HOME/${prefix#~/}"
 fi
-for cmd in git cargo install python3; do
+for cmd in git cargo install bash; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "error: missing required tool on PATH: $cmd" >&2
     exit 2
@@ -85,7 +85,7 @@ fi
 cd "$repo_root"
 
 if [[ ${#bins[@]} -eq 0 ]]; then
-  bins_script="$repo_root/scripts/workspace-bins.py"
+  bins_script="$repo_root/scripts/workspace-bins.sh"
   if [[ ! -f "$bins_script" ]]; then
     echo "error: missing bins script: $bins_script" >&2
     exit 2
@@ -94,7 +94,7 @@ if [[ ${#bins[@]} -eq 0 ]]; then
   while IFS= read -r bin; do
     [[ -n "$bin" ]] || continue
     bins+=( "$bin" )
-  done < <(python3 "$bins_script")
+  done < <(bash "$bins_script")
 
   if [[ ${#bins[@]} -eq 0 ]]; then
     echo "error: no workspace binaries found" >&2

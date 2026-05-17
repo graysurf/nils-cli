@@ -79,7 +79,7 @@ Outputs (nils-cli stage):
 - Runs full release checks through `nils-cli-verify-required-checks.sh` with `NILS_CLI_TEST_RUNNER=nextest` by default (unless overridden).
 - Creates a semantic commit for the version bump.
 - Creates an annotated tag `vX.Y.Z` and (unless `--skip-push`) pushes commit + tag to `origin`.
-- GitHub Release artifacts are built by `.github/workflows/release.yml` and include all workspace `bin` targets (auto-discovered via `scripts/workspace-bins.py`).
+- GitHub Release artifacts are built by `.github/workflows/release.yml` and include all workspace `bin` targets (auto-discovered via `scripts/workspace-bins.sh`).
 
 Outputs (tap stage):
 
