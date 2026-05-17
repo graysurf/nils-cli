@@ -2138,6 +2138,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-web-evidence"
+version = "0.8.2"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "nils-test-support",
+ "pretty_assertions",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

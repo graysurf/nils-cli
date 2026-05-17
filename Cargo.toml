@@ -23,6 +23,7 @@ members = [
   "crates/agent-docs",
   "crates/agent-out",
   "crates/agent-scope-lock",
+  "crates/web-evidence",
   "crates/gemini-cli",
 ]
 resolver = "2"

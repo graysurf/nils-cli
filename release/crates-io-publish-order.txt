@@ -3,6 +3,7 @@ nils-common
 nils-agent-docs
 nils-agent-out
 nils-agent-scope-lock
+nils-web-evidence
 nils-term
 nils-git-cli
 nils-memo-cli
