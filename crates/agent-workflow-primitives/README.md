@@ -13,8 +13,28 @@ provider credentials.
 - `browser-session`: record browser-session goals, steps, and evidence artifacts.
 - `model-cross-check`: record primary/checker model observations without owning
   provider invocation.
+- `skill-usage`: record skill invocation intent, linked evidence, validation,
+  outcome, and failure handling.
 
 Each binary supports `--version` and `completion <bash|zsh>`.
+
+## skill-usage
+
+`skill-usage` writes `skill-usage.record.json` under `--out DIR`.
+
+```bash
+skill-usage init --out <dir> --skill <skill-path> \
+  --intent <intent> --user-request-summary <summary>
+skill-usage link-record --out <dir> --type review-evidence --path review-evidence.json
+skill-usage record-failure --out <dir> --phase validation \
+  --classification project-state --symptom <text> --diagnosis <text> \
+  --handling <text> --result fixed
+skill-usage record-validation --out <dir> --command <command> \
+  --status pass --summary <summary>
+skill-usage record-outcome --out <dir> --status pass --summary <summary>
+skill-usage verify --out <dir> --format json
+skill-usage show --out <dir> --format json
+```
 
 ## JSON contract
 

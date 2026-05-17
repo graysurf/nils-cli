@@ -229,7 +229,7 @@ pub fn record_path(out_dir: &Path, file_name: &str) -> Result<PathBuf, CliError>
 pub fn redact_text(input: &str) -> String {
     static SECRET_RE: OnceLock<Regex> = OnceLock::new();
     let re = SECRET_RE.get_or_init(|| {
-        Regex::new(r"(?i)(sk-[A-Za-z0-9_-]+|ghp_[A-Za-z0-9_]+|[A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD)[A-Za-z0-9_]*=\S+)")
+        Regex::new(r"(?i)(-----BEGIN [A-Z ]*PRIVATE KEY-----|Authorization:\s*Bearer\s+\S+|Cookie:\s*\S+|sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]+|[A-Za-z0-9_]*(?:API[_-]?KEY|TOKEN|KEY|SECRET|PASSWORD)[A-Za-z0-9_]*\s*=\s*\S+)")
             .expect("secret regex should compile")
     });
     re.replace_all(input, "[REDACTED]").into_owned()

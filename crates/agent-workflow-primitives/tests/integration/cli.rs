@@ -27,6 +27,7 @@ fn all_binaries_export_zsh_completion() {
         "docs-impact",
         "model-cross-check",
         "review-evidence",
+        "skill-usage",
     ] {
         let output = run(bin, tmp.path(), &["completion", "zsh"]);
         assert_eq!(output.code, 0, "{bin} stderr={}", output.stderr_text());
@@ -170,6 +171,240 @@ fn review_evidence_requires_no_open_medium_or_high_findings() {
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
     assert_eq!(json_stdout(&verify)["result"]["complete"], true);
+}
+
+#[test]
+fn skill_usage_records_successful_skill_invocation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("skill");
+    let out = out_arg(&out_dir);
+
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "init",
+                "--out",
+                &out,
+                "--skill",
+                "skills/tools/devex/review-evidence",
+                "--intent",
+                "record review evidence",
+                "--user-request-summary",
+                "Review PR #12",
+                "--referenced-file",
+                "docs/runbook.md",
+                "--format",
+                "json",
+            ],
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "link-record",
+                "--out",
+                &out,
+                "--type",
+                "review-evidence",
+                "--path",
+                "review-evidence.json",
+            ],
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "record-validation",
+                "--out",
+                &out,
+                "--command",
+                "scripts/check.sh --docs",
+                "--status",
+                "pass",
+                "--summary",
+                "docs freshness passed",
+            ],
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "record-outcome",
+                "--out",
+                &out,
+                "--status",
+                "pass",
+                "--summary",
+                "skill completed",
+                "--artifact",
+                "docs/runbook.md",
+            ],
+        )
+        .code,
+        0
+    );
+
+    let verify = run(
+        "skill-usage",
+        tmp.path(),
+        &["verify", "--out", &out, "--format", "json"],
+    );
+    assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+    let value = json_stdout(&verify);
+    assert_eq!(value["schema_version"], "cli.skill-usage.verify.v1");
+    assert_eq!(value["result"]["complete"], true);
+    assert_eq!(value["result"]["record"]["schema"], "skill-usage.record.v1");
+    assert_eq!(value["result"]["record"]["outcome"]["status"], "pass");
+    assert_eq!(
+        value["result"]["record"]["linked_records"][0]["type"],
+        "review-evidence"
+    );
+}
+
+#[test]
+fn skill_usage_requires_failure_record_for_blocked_outcome() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("skill-blocked");
+    let out = out_arg(&out_dir);
+
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "init",
+                "--out",
+                &out,
+                "--skill",
+                "skills/tools/devex/skill-usage",
+                "--intent",
+                "record skill usage",
+                "--user-request-summary",
+                "record this workflow",
+            ],
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "record-validation",
+                "--out",
+                &out,
+                "--command",
+                "scripts/check.sh --docs",
+                "--status",
+                "pass",
+                "--summary",
+                "docs freshness passed",
+            ],
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "record-outcome",
+                "--out",
+                &out,
+                "--status",
+                "blocked",
+                "--summary",
+                "missing dependency",
+            ],
+        )
+        .code,
+        0
+    );
+
+    let verify = run(
+        "skill-usage",
+        tmp.path(),
+        &["verify", "--out", &out, "--format", "json"],
+    );
+    assert_eq!(verify.code, 1);
+    assert!(
+        verify.stdout_text().contains("missing_failure_record"),
+        "stdout={}",
+        verify.stdout_text()
+    );
+}
+
+#[test]
+fn skill_usage_accepts_validation_waiver_and_redacts_secrets() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("skill-waiver");
+    let out = out_arg(&out_dir);
+
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "init",
+                "--out",
+                &out,
+                "--skill",
+                "skills/workflows/prompts/parallel-first",
+                "--intent",
+                "Authorization: Bearer secret-token",
+                "--user-request-summary",
+                "Enable parallel-first",
+                "--validation-waiver",
+                "prompt-only mode enablement",
+            ],
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "record-outcome",
+                "--out",
+                &out,
+                "--status",
+                "pass",
+                "--summary",
+                "mode enabled",
+            ],
+        )
+        .code,
+        0
+    );
+
+    let verify = run(
+        "skill-usage",
+        tmp.path(),
+        &["verify", "--out", &out, "--format", "json"],
+    );
+    assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+    let record =
+        fs::read_to_string(out_dir.join("skill-usage.record.json")).expect("skill usage record");
+    assert!(record.contains("[REDACTED]"));
+    assert!(!record.contains("secret-token"));
 }
 
 #[test]

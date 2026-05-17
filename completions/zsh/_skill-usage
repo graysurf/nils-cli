@@ -1,0 +1,188 @@
+#compdef skill-usage
+
+autoload -U is-at-least
+
+_skill-usage() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_skill-usage_commands" \
+"*::: :->skill-usage" \
+&& ret=0
+    case $state in
+    (skill-usage)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:skill-usage-command-$line[1]:"
+        case $line[1] in
+            (init)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--skill=[Skill path or skill id]:TEXT:_default' \
+'--intent=[Skill invocation intent]:TEXT:_default' \
+'--trigger=[Trigger source]:TRIGGER:(user-explicit agent-selected project-policy other)' \
+'--user-request-summary=[User request summary]:TEXT:_default' \
+'*--referenced-file=[Referenced local input file. Repeat for multiple files]:PATH:_files' \
+'*--external-source=[External source URL or label. Repeat for multiple sources]:TEXT:_default' \
+'--cwd=[Working directory to record. Defaults to the current directory]:DIR:_files -/' \
+'--started-at=[Start timestamp. Defaults to current UTC RFC3339 time]:TEXT:_default' \
+'--validation-waiver=[Explicit waiver when validation is not required]:TEXT:_default' \
+'--force[Overwrite an existing record]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(link-record)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--type=[Linked record type, such as \`test-first-evidence\`]:TEXT:_default' \
+'--path=[Linked record path]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(record-failure)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--phase=[Failure phase]:PHASE:(preflight execution validation cleanup delivery)' \
+'--command=[Optional failed command]:TEXT:_default' \
+'--exit-code=[Optional failed command exit code]:EXIT_CODE:_default' \
+'--symptom=[Observable failure symptom]:TEXT:_default' \
+'--classification=[Failure classification]:CLASSIFICATION:(skill-contract script-bug missing-dependency external-service project-state user-scope unknown)' \
+'--diagnosis=[Diagnosis for the failure]:TEXT:_default' \
+'--handling=[Handling performed by the workflow]:TEXT:_default' \
+'--result=[Result after handling]:RESULT:(fixed worked-around blocked accepted-risk)' \
+'*--artifact=[Optional failure artifact path. Repeat for multiple artifacts]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(record-validation)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--command=[Validation command or manual validation step]:TEXT:_default' \
+'--status=[Validation status]:STATUS:(pass fail skipped)' \
+'--summary=[Validation summary]:TEXT:_default' \
+'--artifact=[Optional validation artifact path]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(record-outcome)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--status=[Final outcome status]:STATUS:(pass fail blocked worked-around accepted-risk skipped)' \
+'--summary=[Final outcome summary]:TEXT:_default' \
+'--ended-at=[End timestamp. Defaults to current UTC RFC3339 time]:TEXT:_default' \
+'*--artifact=[Top-level artifact path. Repeat for multiple artifacts]:PATH:_files' \
+'*--follow-up=[Follow-up item. Repeat for multiple items]:TEXT:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(verify)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_skill-usage_commands] )) ||
+_skill-usage_commands() {
+    local commands; commands=(
+'init:Create a skill usage record' \
+'link-record:Link a child evidence record' \
+'record-failure:Append one failure entry' \
+'record-validation:Append one validation entry' \
+'record-outcome:Record the final skill outcome' \
+'verify:Verify the skill usage record is complete' \
+'show:Print the current skill usage record' \
+'completion:Print shell completion script' \
+    )
+    _describe -t commands 'skill-usage commands' commands "$@"
+}
+(( $+functions[_skill-usage__subcmd__completion_commands] )) ||
+_skill-usage__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'skill-usage completion commands' commands "$@"
+}
+(( $+functions[_skill-usage__subcmd__init_commands] )) ||
+_skill-usage__subcmd__init_commands() {
+    local commands; commands=()
+    _describe -t commands 'skill-usage init commands' commands "$@"
+}
+(( $+functions[_skill-usage__subcmd__link-record_commands] )) ||
+_skill-usage__subcmd__link-record_commands() {
+    local commands; commands=()
+    _describe -t commands 'skill-usage link-record commands' commands "$@"
+}
+(( $+functions[_skill-usage__subcmd__record-failure_commands] )) ||
+_skill-usage__subcmd__record-failure_commands() {
+    local commands; commands=()
+    _describe -t commands 'skill-usage record-failure commands' commands "$@"
+}
+(( $+functions[_skill-usage__subcmd__record-outcome_commands] )) ||
+_skill-usage__subcmd__record-outcome_commands() {
+    local commands; commands=()
+    _describe -t commands 'skill-usage record-outcome commands' commands "$@"
+}
+(( $+functions[_skill-usage__subcmd__record-validation_commands] )) ||
+_skill-usage__subcmd__record-validation_commands() {
+    local commands; commands=()
+    _describe -t commands 'skill-usage record-validation commands' commands "$@"
+}
+(( $+functions[_skill-usage__subcmd__show_commands] )) ||
+_skill-usage__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'skill-usage show commands' commands "$@"
+}
+(( $+functions[_skill-usage__subcmd__verify_commands] )) ||
+_skill-usage__subcmd__verify_commands() {
+    local commands; commands=()
+    _describe -t commands 'skill-usage verify commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_skill-usage" ]; then
+    _skill-usage "$@"
+else
+    compdef _skill-usage skill-usage
+fi

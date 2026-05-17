@@ -31,12 +31,17 @@ path = "src/bin/model-cross-check.rs"
 name = "review-evidence"
 path = "src/bin/review-evidence.rs"
 
+[[bin]]
+name = "skill-usage"
+path = "src/bin/skill-usage.rs"
+
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
 nils-test-support = { version = "0.8.4", path = "../nils-test-support" }

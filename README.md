@@ -59,7 +59,7 @@ Each crate is either a standalone CLI binary or a shared library used across the
 - [crates/test-first-evidence](crates/test-first-evidence): Deterministic failing-test/waiver/final-validation evidence records for
   test-first workflow gates.
 - [crates/agent-workflow-primitives](crates/agent-workflow-primitives): Local-first agent workflow primitives (`browser-session`,
-  `canary-check`, `docs-impact`, `model-cross-check`, `review-evidence`).
+  `canary-check`, `docs-impact`, `model-cross-check`, `review-evidence`, `skill-usage`).
 - [crates/codex-cli](crates/codex-cli): Provider-specific CLI for OpenAI/Codex workflows (auth, diagnostics, execution flows, Starship),
   with adapters over `nils-common::provider_runtime`.
 - [crates/gemini-cli](crates/gemini-cli): Provider-specific CLI lane for Gemini workflows, with adapters over
