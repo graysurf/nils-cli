@@ -2,6 +2,7 @@ nils-test-support
 nils-common
 nils-agent-docs
 nils-agent-out
+nils-agent-scope-lock
 nils-term
 nils-git-cli
 nils-memo-cli

@@ -1736,6 +1736,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-agent-scope-lock"
+version = "0.8.2"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "nils-test-support",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-api-gql"
 version = "0.8.2"
 dependencies = [

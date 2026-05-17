@@ -1,0 +1,121 @@
+#compdef agent-scope-lock
+
+autoload -U is-at-least
+
+_agent-scope-lock() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_agent-scope-lock_commands" \
+"*::: :->agent-scope-lock" \
+&& ret=0
+    case $state in
+    (agent-scope-lock)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-scope-lock-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+'--lock-file=[Lock file path. Defaults to \`git rev-parse --git-path agent-scope-lock.json\`]:PATH:_files' \
+'--format=[Output format]:FORMAT:(text json)' \
+'*--path=[Allowed repo-relative path or prefix. Repeat for multiple scopes]:PATH:_files' \
+'--owner=[Optional lock owner label]:OWNER:_default' \
+'--note=[Optional lock note]:NOTE:_default' \
+'--force[Overwrite an existing lock file]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(read)
+_arguments "${_arguments_options[@]}" : \
+'--lock-file=[Lock file path. Defaults to \`git rev-parse --git-path agent-scope-lock.json\`]:PATH:_files' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(validate)
+_arguments "${_arguments_options[@]}" : \
+'--lock-file=[Lock file path. Defaults to \`git rev-parse --git-path agent-scope-lock.json\`]:PATH:_files' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--changes=[Changed path set to validate]:CHANGES:(all staged unstaged)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(clear)
+_arguments "${_arguments_options[@]}" : \
+'--lock-file=[Lock file path. Defaults to \`git rev-parse --git-path agent-scope-lock.json\`]:PATH:_files' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_agent-scope-lock_commands] )) ||
+_agent-scope-lock_commands() {
+    local commands; commands=(
+'create:Create a lock with allowed repo-relative path prefixes' \
+'read:Read the current lock' \
+'validate:Validate changed paths against the current lock' \
+'clear:Remove the current lock if present' \
+'completion:Print shell completion script' \
+    )
+    _describe -t commands 'agent-scope-lock commands' commands "$@"
+}
+(( $+functions[_agent-scope-lock__subcmd__clear_commands] )) ||
+_agent-scope-lock__subcmd__clear_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-scope-lock clear commands' commands "$@"
+}
+(( $+functions[_agent-scope-lock__subcmd__completion_commands] )) ||
+_agent-scope-lock__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-scope-lock completion commands' commands "$@"
+}
+(( $+functions[_agent-scope-lock__subcmd__create_commands] )) ||
+_agent-scope-lock__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-scope-lock create commands' commands "$@"
+}
+(( $+functions[_agent-scope-lock__subcmd__read_commands] )) ||
+_agent-scope-lock__subcmd__read_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-scope-lock read commands' commands "$@"
+}
+(( $+functions[_agent-scope-lock__subcmd__validate_commands] )) ||
+_agent-scope-lock__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-scope-lock validate commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_agent-scope-lock" ]; then
+    _agent-scope-lock "$@"
+else
+    compdef _agent-scope-lock agent-scope-lock
+fi

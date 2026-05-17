@@ -53,6 +53,8 @@ Each crate is either a standalone CLI binary or a shared library used across the
 - [crates/agent-docs](crates/agent-docs): Deterministic policy-document resolver for Codex/agent workflows (`resolve`, `contexts`, `add`,
   `baseline`).
 - [crates/agent-out](crates/agent-out): Canonical `$AGENT_HOME/out/` path generator and layout auditor for agent workflow artifacts.
+- [crates/agent-scope-lock](crates/agent-scope-lock): Deterministic edit-scope lock CLI for agent workflows (`create`, `read`,
+  `validate`, `clear`).
 - [crates/codex-cli](crates/codex-cli): Provider-specific CLI for OpenAI/Codex workflows (auth, diagnostics, execution flows, Starship),
   with adapters over `nils-common::provider_runtime`.
 - [crates/gemini-cli](crates/gemini-cli): Provider-specific CLI lane for Gemini workflows, with adapters over

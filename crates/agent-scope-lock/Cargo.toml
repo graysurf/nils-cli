@@ -1,0 +1,23 @@
+[package]
+name = "nils-agent-scope-lock"
+version = "0.8.2"
+edition.workspace = true
+license.workspace = true
+
+description = "CLI crate for nils-agent-scope-lock in the nils-cli workspace."
+repository = "https://github.com/sympoies/nils-cli"
+
+[[bin]]
+name = "agent-scope-lock"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+clap_complete = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+nils-test-support = { version = "0.8.2", path = "../nils-test-support" }
+pretty_assertions = { workspace = true }
+tempfile = "3"

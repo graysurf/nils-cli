@@ -22,6 +22,7 @@ members = [
   "crates/plan-issue-cli",
   "crates/agent-docs",
   "crates/agent-out",
+  "crates/agent-scope-lock",
   "crates/gemini-cli",
 ]
 resolver = "2"
