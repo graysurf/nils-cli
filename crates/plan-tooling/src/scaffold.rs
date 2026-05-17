@@ -11,8 +11,8 @@ Purpose:
   Create a new plan markdown file from the shared plan template.
 
 Options:
-  --slug <slug>   Base slug (kebab-case). Writes to docs/plans/<slug>-plan.md.
-                 If <slug> already ends with "-plan", writes to docs/plans/<slug>.md.
+  --slug <slug>   Base slug (kebab-case). Writes to docs/plans/<slug>/<slug>-plan.md.
+                 If <slug> already ends with "-plan", writes to docs/plans/<slug>/<slug>.md.
   --file <path>   Explicit output path (must end with "-plan.md")
   --title <text>  Replace the plan title line ("# Plan: ...")
   --force         Overwrite if the output file already exists
@@ -101,11 +101,7 @@ pub fn run(args: &[String]) -> i32 {
         if !is_kebab_case(slug) {
             return die_usage("--slug must be kebab-case (lowercase letters, digits, hyphens)");
         }
-        if slug.ends_with("-plan") {
-            out_file = Some(format!("docs/plans/{slug}.md"));
-        } else {
-            out_file = Some(format!("docs/plans/{slug}-plan.md"));
-        }
+        out_file = Some(default_slug_plan_path(slug));
     }
 
     let Some(out_file_raw) = out_file else {
@@ -157,6 +153,15 @@ fn is_kebab_case(s: &str) -> bool {
     })
 }
 
+fn default_slug_plan_path(slug: &str) -> String {
+    let filename = if slug.ends_with("-plan") {
+        format!("{slug}.md")
+    } else {
+        format!("{slug}-plan.md")
+    };
+    format!("docs/plans/{slug}/{filename}")
+}
+
 fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
@@ -198,7 +203,8 @@ fn relativize_for_created(path: &Path, repo_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TEMPLATE, is_kebab_case, relativize_for_created, resolve_repo_relative, write_template,
+        TEMPLATE, default_slug_plan_path, is_kebab_case, relativize_for_created,
+        resolve_repo_relative, write_template,
     };
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -211,6 +217,18 @@ mod tests {
         assert!(!is_kebab_case("Hello-world"));
         assert!(!is_kebab_case("hello--world"));
         assert!(!is_kebab_case("-hello"));
+    }
+
+    #[test]
+    fn default_slug_plan_path_uses_plan_bundle_folder() {
+        assert_eq!(
+            default_slug_plan_path("hello-world"),
+            "docs/plans/hello-world/hello-world-plan.md"
+        );
+        assert_eq!(
+            default_slug_plan_path("hello-world-plan"),
+            "docs/plans/hello-world-plan/hello-world-plan.md"
+        );
     }
 
     #[test]

@@ -20,12 +20,12 @@ fn scaffold_slug_creates_plan_and_replaces_title() {
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert!(
         out.stdout
-            .contains("created: docs/plans/plan-tooling-cli-consolidation-test-plan.md")
+            .contains("created: docs/plans/plan-tooling-cli-consolidation-test/plan-tooling-cli-consolidation-test-plan.md")
     );
 
     let created_path = dir
         .path()
-        .join("docs/plans/plan-tooling-cli-consolidation-test-plan.md");
+        .join("docs/plans/plan-tooling-cli-consolidation-test/plan-tooling-cli-consolidation-test-plan.md");
     let created = std::fs::read_to_string(created_path).expect("read created");
     assert!(
         created
