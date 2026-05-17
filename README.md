@@ -5,12 +5,33 @@
 [![Release](https://img.shields.io/github/v/release/sympoies/nils-cli?sort=semver)](https://github.com/sympoies/nils-cli/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Rust workspace of focused CLI binaries for Git operations, API test orchestration, and workflow automation, unified by shared cross-crate
-helpers.
+A Rust workspace of focused CLI binaries for API testing, Git operations, agent workflow evidence, provider automation, planning, and
+desktop/media utilities. Shared crates keep JSON contracts, terminal UX, and cross-CLI behavior consistent.
+
+## CLI surface map
+
+Start here when choosing a binary. The source of truth for the current installable binary list is:
+
+```bash
+bash scripts/workspace-bins.sh
+```
+
+Completion obligations for those binaries are tracked in
+[docs/specs/completion-coverage-matrix-v1.md](docs/specs/completion-coverage-matrix-v1.md).
+
+| Area | Binaries | Use when |
+| ---- | -------- | -------- |
+| API testing | `api-rest`, `api-gql`, `api-grpc`, `api-websocket`, `api-test` | Run protocol-specific API checks or orchestrate a mixed API test suite. |
+| Git tooling | `git-scope`, `git-cli`, `git-summary`, `git-lock` | Inspect changes, run Git helper flows, summarize commits, or manage repo-local commit locks. |
+| Agent policy and evidence | `agent-docs`, `agent-out`, `agent-scope-lock`, `test-first-evidence`, `web-evidence`, `browser-session`, `canary-check`, `docs-impact`, `model-cross-check`, `review-evidence`, `skill-usage` | Resolve agent policy docs, allocate artifact paths, enforce edit scope, or persist deterministic workflow evidence. |
+| Planning and delivery | `plan-tooling`, `plan-issue`, `plan-issue-local`, `semantic-commit` | Validate/split implementation plans, orchestrate issue delivery, rehearse local plan flows, or create semantic commits. |
+| Provider lanes | `codex-cli`, `gemini-cli` | Run provider-specific diagnostics, auth checks, and workflow adapters. |
+| Desktop, media, and local utilities | `macos-agent`, `screen-record`, `image-processing`, `fzf-cli`, `memo-cli` | Automate local desktop tasks, capture media, convert images, use interactive shell helpers, or record/search local memos. |
+| Development-only/internal | `cli-template` | Validate packaging and new-crate patterns; excluded from user-facing completion obligations. |
 
 ## Workspace layout
 
-Each crate is either a standalone CLI binary or a shared library used across the workspace.
+Each crate is either a standalone CLI binary, a multi-binary crate, or a shared library used across the workspace.
 
 ### Shared foundations
 
@@ -37,7 +58,7 @@ Each crate is either a standalone CLI binary or a shared library used across the
 - [crates/git-summary](crates/git-summary): Per-author contribution summaries over a date range (adds/dels/net/commits).
 - [crates/git-lock](crates/git-lock): Label-based commit locks per repo (lock/list/diff/unlock/tag).
 
-### Automation and utility CLIs
+### Desktop, media, and local utility CLIs
 
 - [crates/macos-agent](crates/macos-agent): macOS desktop automation primitives for app/window discovery, input actions, screenshot, and
   wait helpers.
@@ -48,7 +69,7 @@ Each crate is either a standalone CLI binary or a shared library used across the
 - [crates/screen-record](crates/screen-record): macOS ScreenCaptureKit + Linux (X11) recorder for a single window or display with optional
   audio.
 
-### Agent and workflow tooling
+### Agent policy and evidence tooling
 
 - [crates/agent-docs](crates/agent-docs): Deterministic policy-document resolver for Codex/agent workflows (`resolve`, `contexts`, `add`,
   `baseline`).
@@ -58,8 +79,11 @@ Each crate is either a standalone CLI binary or a shared library used across the
 - [crates/web-evidence](crates/web-evidence): Redacted static HTTP evidence capture for agent workflows (`capture`, `completion`).
 - [crates/test-first-evidence](crates/test-first-evidence): Deterministic failing-test/waiver/final-validation evidence records for
   test-first workflow gates.
-- [crates/agent-workflow-primitives](crates/agent-workflow-primitives): Local-first agent workflow primitives (`browser-session`,
-  `canary-check`, `docs-impact`, `model-cross-check`, `review-evidence`, `skill-usage`).
+- [crates/agent-workflow-primitives](crates/agent-workflow-primitives): Multi-binary local-first agent workflow primitives
+  (`browser-session`, `canary-check`, `docs-impact`, `model-cross-check`, `review-evidence`, `skill-usage`).
+
+### Planning, delivery, and provider lanes
+
 - [crates/codex-cli](crates/codex-cli): Provider-specific CLI for OpenAI/Codex workflows (auth, diagnostics, execution flows, Starship),
   with adapters over `nils-common::provider_runtime`.
 - [crates/gemini-cli](crates/gemini-cli): Provider-specific CLI lane for Gemini workflows, with adapters over
