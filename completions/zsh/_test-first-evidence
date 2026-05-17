@@ -1,0 +1,159 @@
+#compdef test-first-evidence
+
+autoload -U is-at-least
+
+_test-first-evidence() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_test-first-evidence_commands" \
+"*::: :->test-first-evidence" \
+&& ret=0
+    case $state in
+    (test-first-evidence)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:test-first-evidence-command-$line[1]:"
+        case $line[1] in
+            (init)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--classification=[Change classification such as behavior-change, bug-fix, docs-only, or generated-only]:TEXT:_default' \
+'*--production-path=[Production path affected by the change. Repeat for multiple paths]:PATH:_files' \
+'*--note=[Optional note to keep with the record. Repeat for multiple notes]:TEXT:_default' \
+'--force[Overwrite an existing record]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(record-failing)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--command=[Command or manual step that produced the before-fix failure]:TEXT:_default' \
+'--exit-code=[Exit code from the failing command]:CODE:_default' \
+'--summary=[Concise failure summary]:TEXT:_default' \
+'--test-name=[Optional test name or scenario identifier]:TEXT:_default' \
+'*--artifact=[Optional evidence artifact path. Repeat for multiple artifacts]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(record-waiver)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--reason=[Reason failing-test evidence was not practical]:TEXT:_default' \
+'*--substitute-validation=[Substitute validation captured before editing. Repeat for multiple items]:TEXT:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(record-final)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--command=[Final validation command or manual validation step]:TEXT:_default' \
+'--status=[Final validation status]:STATUS:(pass fail)' \
+'--summary=[Optional final validation summary]:TEXT:_default' \
+'*--artifact=[Optional validation artifact path. Repeat for multiple artifacts]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(verify)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_test-first-evidence_commands] )) ||
+_test-first-evidence_commands() {
+    local commands; commands=(
+'init:Create a deterministic evidence record' \
+'record-failing:Record a failing test or reproducible failure before the fix' \
+'record-waiver:Record an explicit waiver when failing evidence is not practical' \
+'record-final:Record final validation after the implementation' \
+'verify:Verify the evidence record is complete enough for delivery' \
+'show:Print the current evidence record' \
+'completion:Print shell completion script' \
+    )
+    _describe -t commands 'test-first-evidence commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__completion_commands] )) ||
+_test-first-evidence__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence completion commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__init_commands] )) ||
+_test-first-evidence__subcmd__init_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence init commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__record-failing_commands] )) ||
+_test-first-evidence__subcmd__record-failing_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence record-failing commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__record-final_commands] )) ||
+_test-first-evidence__subcmd__record-final_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence record-final commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__record-waiver_commands] )) ||
+_test-first-evidence__subcmd__record-waiver_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence record-waiver commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__show_commands] )) ||
+_test-first-evidence__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence show commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__verify_commands] )) ||
+_test-first-evidence__subcmd__verify_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence verify commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_test-first-evidence" ]; then
+    _test-first-evidence "$@"
+else
+    compdef _test-first-evidence test-first-evidence
+fi
