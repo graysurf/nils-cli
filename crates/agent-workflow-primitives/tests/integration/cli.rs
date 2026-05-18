@@ -26,6 +26,7 @@ fn all_binaries_export_zsh_completion() {
         "canary-check",
         "docs-impact",
         "model-cross-check",
+        "repo-retro",
         "review-evidence",
         "skill-usage",
     ] {
@@ -37,6 +38,325 @@ fn all_binaries_export_zsh_completion() {
             output.stdout_text()
         );
     }
+}
+
+#[test]
+fn repo_retro_help_mentions_report_contract() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let help = run("repo-retro", tmp.path(), &["--help"]);
+    assert_eq!(help.code, 0, "stderr={}", help.stderr_text());
+    assert!(help.stdout_text().contains("report"));
+    assert!(help.stdout_text().contains("completion"));
+    assert!(help.stdout_text().contains("-V"));
+
+    let report_help = run("repo-retro", tmp.path(), &["report", "--help"]);
+    assert_eq!(report_help.code, 0, "stderr={}", report_help.stderr_text());
+    assert!(report_help.stdout_text().contains("--mode"));
+    assert!(report_help.stdout_text().contains("--format"));
+    assert!(report_help.stdout_text().contains("--since"));
+    assert!(report_help.stdout_text().contains("--days"));
+    assert!(report_help.stdout_text().contains("--from"));
+    assert!(report_help.stdout_text().contains("--to"));
+    assert!(report_help.stdout_text().contains("--timeline-jsonl"));
+    assert!(report_help.stdout_text().contains("--learnings-jsonl"));
+    assert!(report_help.stdout_text().contains("--validation-jsonl"));
+    assert!(report_help.stdout_text().contains("--review-jsonl"));
+    assert!(report_help.stdout_text().contains("--incidents-jsonl"));
+    assert!(report_help.stdout_text().contains("--decisions-jsonl"));
+    assert!(report_help.stdout_text().contains("--history-dir"));
+    assert!(report_help.stdout_text().contains("--write"));
+}
+
+#[test]
+fn repo_retro_reports_git_heuristic_analysis_and_sources() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = create_repo_retro_fixture(tmp.path());
+    let repo_arg = out_arg(&repo);
+
+    let output = run(
+        "repo-retro",
+        tmp.path(),
+        &[
+            "report",
+            "--repo",
+            &repo_arg,
+            "--from",
+            "2026-05-12",
+            "--to",
+            "2026-05-16",
+            "--mode",
+            "team",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = json_stdout(&output);
+    assert_eq!(value["schema_version"], "cli.repo-retro.report.v1");
+    assert_eq!(value["command"], "repo-retro report");
+    assert_eq!(value["result"]["schema"], "repo-retro.report.v1");
+    assert_eq!(value["result"]["mode"], "team");
+    assert_eq!(value["result"]["repo"]["slug"], "repo");
+    assert_eq!(value["result"]["window"]["mode"], "fixed");
+    assert_eq!(value["result"]["git"]["summary"]["commitCount"], 5);
+    assert_eq!(value["result"]["git"]["commitTypes"]["feat"], 1);
+    assert_eq!(value["result"]["git"]["commitTypes"]["test"], 1);
+    assert_eq!(value["result"]["git"]["commitTypes"]["fix"], 1);
+    assert_eq!(
+        value["result"]["git"]["testSignals"]["changedTestFileCount"],
+        1
+    );
+    assert_eq!(
+        value["result"]["heuristicSystem"]["activeInbox"]["byStatus"]["triaged"],
+        1
+    );
+    assert_eq!(
+        value["result"]["heuristicSystem"]["activeInbox"]["bySeverity"]["medium"],
+        1
+    );
+    assert_eq!(
+        value["result"]["heuristicSystem"]["errorInboxMovement"]["archived"]["count"],
+        1
+    );
+    assert_eq!(
+        value["result"]["heuristicSystem"]["operationRecords"]["changedCount"],
+        1
+    );
+    assert_eq!(value["result"]["history"]["write"], false);
+    assert!(
+        value["result"]["analysis"]["themes"]
+            .as_array()
+            .expect("themes")
+            .iter()
+            .any(|item| item.as_str().unwrap_or("").contains("feat work"))
+    );
+    assert!(
+        value["result"]["analysis"]["followUpQuestions"]
+            .as_array()
+            .expect("follow up")
+            .iter()
+            .any(|item| item.as_str().unwrap_or("").contains("HEURISTIC_SYSTEM"))
+    );
+    assert!(
+        value["result"]["sources"]["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .any(|item| item["command"].as_str().unwrap_or("").contains("git -C"))
+    );
+}
+
+#[test]
+fn repo_retro_loads_all_typed_jsonl_inputs_and_warns_on_malformed_lines() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = create_repo_retro_fixture(tmp.path());
+    let repo_arg = out_arg(&repo);
+    let timeline = tmp.path().join("timeline.jsonl");
+    let learnings = tmp.path().join("learnings.jsonl");
+    let validation = tmp.path().join("validation.jsonl");
+    let review = tmp.path().join("review.jsonl");
+    let incidents = tmp.path().join("incidents.jsonl");
+    let decisions = tmp.path().join("decisions.jsonl");
+    fs::write(
+        &timeline,
+        "{\"timestamp\":\"2026-05-13\",\"summary\":\"built retro\"}\nnot-json\n",
+    )
+    .expect("timeline");
+    fs::write(&learnings, "{\"summary\":\"keep deterministic\"}\n").expect("learnings");
+    fs::write(&validation, "{\"summary\":\"cargo test passed\"}\n").expect("validation");
+    fs::write(&review, "{\"summary\":\"reviewed hotspots\"}\n").expect("review");
+    fs::write(&incidents, "{\"summary\":\"no incidents\"}\n").expect("incidents");
+    fs::write(&decisions, "{\"summary\":\"ship as repo-retro\"}\n").expect("decisions");
+
+    let output = run(
+        "repo-retro",
+        tmp.path(),
+        &[
+            "report",
+            "--repo",
+            &repo_arg,
+            "--from",
+            "2026-05-12",
+            "--to",
+            "2026-05-16",
+            "--timeline-jsonl",
+            &out_arg(&timeline),
+            "--learnings-jsonl",
+            &out_arg(&learnings),
+            "--validation-jsonl",
+            &out_arg(&validation),
+            "--review-jsonl",
+            &out_arg(&review),
+            "--incidents-jsonl",
+            &out_arg(&incidents),
+            "--decisions-jsonl",
+            &out_arg(&decisions),
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = json_stdout(&output);
+    assert_eq!(
+        value["result"]["optionalInputs"]["timeline"]["malformedLines"],
+        1
+    );
+    assert_eq!(
+        value["result"]["optionalInputs"]["validation"]["validLines"],
+        1
+    );
+    assert_eq!(value["result"]["optionalInputs"]["review"]["validLines"], 1);
+    assert_eq!(
+        value["result"]["optionalInputs"]["incidents"]["validLines"],
+        1
+    );
+    assert_eq!(
+        value["result"]["optionalInputs"]["decisions"]["validLines"],
+        1
+    );
+    assert!(
+        value["result"]["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|item| item == "timeline JSONL had 1 malformed line(s)")
+    );
+}
+
+#[test]
+fn repo_retro_history_dir_without_write_does_not_create_files() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = create_repo_retro_fixture(tmp.path());
+    let history_dir = tmp.path().join("history");
+
+    let output = run(
+        "repo-retro",
+        tmp.path(),
+        &[
+            "report",
+            "--repo",
+            &out_arg(&repo),
+            "--from",
+            "2026-05-12",
+            "--to",
+            "2026-05-16",
+            "--history-dir",
+            &out_arg(&history_dir),
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = json_stdout(&output);
+    assert_eq!(value["result"]["history"]["enabled"], true);
+    assert_eq!(value["result"]["history"]["write"], false);
+    assert!(
+        value["result"]["history"]["intended"]["markdown"]
+            .as_str()
+            .expect("markdown path")
+            .ends_with("retros/2026/2026-05-16-repo-repo-retro.md")
+    );
+    assert!(!history_dir.exists());
+}
+
+#[test]
+fn repo_retro_history_write_creates_index_raw_and_markdown() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = create_repo_retro_fixture(tmp.path());
+    let history_dir = tmp.path().join("history");
+
+    let output = run(
+        "repo-retro",
+        tmp.path(),
+        &[
+            "report",
+            "--repo",
+            &out_arg(&repo),
+            "--from",
+            "2026-05-12",
+            "--to",
+            "2026-05-16",
+            "--history-dir",
+            &out_arg(&history_dir),
+            "--write",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = json_stdout(&output);
+    let markdown_path = Path::new(
+        value["result"]["history"]["intended"]["markdown"]
+            .as_str()
+            .expect("markdown"),
+    );
+    let json_path = Path::new(
+        value["result"]["history"]["intended"]["json"]
+            .as_str()
+            .expect("json"),
+    );
+    let index_path = Path::new(
+        value["result"]["history"]["intended"]["index"]
+            .as_str()
+            .expect("index"),
+    );
+    assert!(markdown_path.is_file());
+    assert!(json_path.is_file());
+    assert!(index_path.is_file());
+    assert!(
+        fs::read_to_string(markdown_path)
+            .expect("markdown")
+            .contains("# Project Retro: repo")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&fs::read_to_string(json_path).expect("raw"))
+            .expect("raw json")["schema"],
+        "repo-retro.report.v1"
+    );
+    let index_rows: Vec<Value> = fs::read_to_string(index_path)
+        .expect("index")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("index row"))
+        .collect();
+    assert_eq!(index_rows.last().expect("row")["commitCount"], 5);
+    assert_eq!(
+        index_rows.last().expect("row")["rawPath"],
+        "raw/2026/2026-05-16-repo-repo-retro.json"
+    );
+}
+
+#[test]
+fn repo_retro_invalid_window_uses_usage_exit_code() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = create_repo_retro_fixture(tmp.path());
+
+    let output = run(
+        "repo-retro",
+        tmp.path(),
+        &[
+            "report",
+            "--repo",
+            &out_arg(&repo),
+            "--from",
+            "2026-05-16",
+            "--to",
+            "2026-05-12",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 64);
+    assert!(
+        output.stdout_text().contains("window start"),
+        "stdout={}",
+        output.stdout_text()
+    );
 }
 
 #[test]
@@ -550,4 +870,101 @@ fn git(dir: &Path, args: &[&str]) {
         .status()
         .expect("run git");
     assert!(status.success(), "git {args:?} failed");
+}
+
+fn git_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(dir);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let status = command.status().expect("run git");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn commit_retro_file(repo: &Path, rel: &str, text: &str, message: &str, commit_date: &str) {
+    let path = repo.join(rel);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("parent");
+    }
+    fs::write(path, text).expect("write fixture file");
+    git(repo, &["add", rel]);
+    let author_date = format!("{commit_date}T12:00:00+0000");
+    git_with_env(
+        repo,
+        &["commit", "-q", "-m", message],
+        &[
+            ("GIT_AUTHOR_DATE", &author_date),
+            ("GIT_COMMITTER_DATE", &author_date),
+        ],
+    );
+}
+
+fn create_repo_retro_fixture(tmp: &Path) -> std::path::PathBuf {
+    let repo = tmp.join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.name", "Terry"]);
+    git(&repo, &["config", "user.email", "terry@example.com"]);
+    commit_retro_file(
+        &repo,
+        "src/retro.rs",
+        "pub fn retro() {}\n",
+        "feat: add repo retro helper",
+        "2026-05-12",
+    );
+    commit_retro_file(
+        &repo,
+        "tests/repo_retro_test.rs",
+        "#[test]\nfn repo_retro() { assert!(true); }\n",
+        "test: cover repo retro helper",
+        "2026-05-13",
+    );
+    commit_retro_file(
+        &repo,
+        "heuristic-system/error-inbox/runtime-gap.md",
+        "# Runtime Gap\n\n## Status\n\n- Status: open\n- First observed: 2026-05-14\n- Area: repo-retro\n- Severity: high\n",
+        "fix: retain heuristic inbox record",
+        "2026-05-14",
+    );
+    commit_retro_file(
+        &repo,
+        "heuristic-system/operation-records/gating.md",
+        "# Gating\n",
+        "docs: add operation record",
+        "2026-05-14",
+    );
+    fs::create_dir_all(repo.join("heuristic-system/error-inbox/archive/2026"))
+        .expect("archive dir");
+    git(
+        &repo,
+        &[
+            "mv",
+            "heuristic-system/error-inbox/runtime-gap.md",
+            "heuristic-system/error-inbox/archive/2026/runtime-gap.md",
+        ],
+    );
+    fs::write(
+        repo.join("heuristic-system/error-inbox/current-gap.md"),
+        "# Current Gap\n\n## Status\n\n- Status: triaged\n- First observed: 2026-05-15\n- Area: repo-retro\n- Severity: medium\n",
+    )
+    .expect("current gap");
+    git(
+        &repo,
+        &["add", "heuristic-system/error-inbox/current-gap.md"],
+    );
+    git_with_env(
+        &repo,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "docs: archive resolved heuristic record",
+        ],
+        &[
+            ("GIT_AUTHOR_DATE", "2026-05-15T12:00:00+0000"),
+            ("GIT_COMMITTER_DATE", "2026-05-15T12:00:00+0000"),
+        ],
+    );
+    repo
 }

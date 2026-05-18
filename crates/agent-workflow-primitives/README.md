@@ -11,7 +11,7 @@ provider credentials.
 | Field | Value |
 | ----- | ----- |
 | Package name | `nils-agent-workflow-primitives` |
-| Binary names | `browser-session`, `canary-check`, `docs-impact`, `model-cross-check`, `review-evidence`, `skill-usage` |
+| Binary names | `browser-session`, `canary-check`, `docs-impact`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage` |
 
 Each binary supports `--version` and `completion <bash|zsh>`.
 
@@ -23,6 +23,7 @@ Each binary supports `--version` and `completion <bash|zsh>`.
 | `canary-check` | Run one local command and persist a redacted pass/fail result. | `canary-check.json` under `--out DIR` |
 | `docs-impact` | Classify changed Git paths as docs or non-docs and suggest documentation review. | stdout/JSON only |
 | `model-cross-check` | Record primary/checker model observations without owning provider calls. | `model-cross-check.json` under `--out DIR` |
+| `repo-retro` | Generate deterministic repo-local implementation retrospectives from local Git, HEURISTIC_SYSTEM records, and explicit JSONL inputs. | stdout by default; optional Markdown/raw JSON/index under `--history-dir DIR --write` |
 | `review-evidence` | Record review findings and passing validation evidence. | `review-evidence.json` under `--out DIR` |
 | `skill-usage` | Record skill invocation intent, linked records, validation, failures, outcome, and follow-up. | `skill-usage.record.json` under `--out DIR` |
 
@@ -41,6 +42,8 @@ Examples:
 
 ```bash
 docs-impact scan --repo . --include-untracked --format json
+repo-retro report --repo . --days 7 --mode team --format json
+repo-retro report --repo . --mode maintainer --format markdown
 canary-check run --out /tmp/canary --name smoke --command "cargo test smoke"
 browser-session init --out /tmp/browser --target http://localhost:3000 --goal "verify checkout flow"
 review-evidence init --out /tmp/review --subject "PR #123"
@@ -87,6 +90,11 @@ Exit codes:
 - `0`: success
 - `1`: runtime failure or incomplete evidence from `verify`
 - `64`: usage/configuration error
+
+`repo-retro report --format json` uses the service envelope
+`cli.repo-retro.report.v1` and returns a `repo-retro.report.v1` result. The
+default `markdown` output is intended for direct review agendas and does not
+write files unless `--history-dir <dir> --write` is supplied.
 
 ## Secret-safety boundary
 

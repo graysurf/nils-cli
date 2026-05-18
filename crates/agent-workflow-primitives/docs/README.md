@@ -10,8 +10,19 @@ completion, release, and new-crate rules in the root `docs/` tree.
 - `review-evidence`: review finding and validation evidence records.
 - `browser-session`: browser-session goal, step, and artifact records.
 - `model-cross-check`: cross-model observation records without provider calls.
+- `repo-retro`: repo-local implementation retrospectives from local Git,
+  HEURISTIC_SYSTEM records, and explicit JSONL inputs.
 - `skill-usage`: skill invocation, linked evidence, validation, outcome, and
   failure handling records.
+
+## `repo-retro` examples
+
+```bash
+repo-retro report --repo . --days 7 --mode team --format json
+repo-retro report --repo . --mode maintainer --format markdown
+repo-retro report --repo . --from 2026-05-11 --to 2026-05-17 \
+  --history-dir "$HOME/retro-history" --write
+```
 
 ## Specs
 
