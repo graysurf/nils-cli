@@ -1,6 +1,6 @@
 [package]
 name = "nils-api-websocket"
-version = "0.8.7"
+version = "0.8.8"
 edition.workspace = true
 license.workspace = true
 
@@ -12,14 +12,14 @@ name = "api-websocket"
 path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
-api-testing-core = { version = "0.8.7", path = "../api-testing-core", package = "nils-api-testing-core" }
+api-testing-core = { version = "0.8.8", path = "../api-testing-core", package = "nils-api-testing-core" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-term = { version = "0.8.7", path = "../nils-term", package = "nils-term" }
+nils-term = { version = "0.8.8", path = "../nils-term", package = "nils-term" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "0.8.7", path = "../nils-test-support" }
+nils-test-support = { version = "0.8.8", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
 tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
