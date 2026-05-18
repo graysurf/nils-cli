@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `fc396f0debb6afa592b9ec73e7717fab423f0f5972eaa5e12aaa704575b5884a`
+- Cargo.lock SHA256: `042ed98a58c09d7a566ab145208cd8e00b05d1be5f3fbb9938bea0be7350424d`
 - Third-party crates (`source != null`): 438
 - Workspace crates (`source == null`, excluded below): 30
 
@@ -235,7 +235,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | nix | 0.31.3 | MIT | crates.io |
 | nu-ansi-term | 0.50.3 | MIT | crates.io |
 | num-bigint | 0.4.6 | MIT OR Apache-2.0 | crates.io |
-| num-conv | 0.2.1 | MIT OR Apache-2.0 | crates.io |
+| num-conv | 0.2.2 | MIT OR Apache-2.0 | crates.io |
 | num-integer | 0.1.46 | MIT OR Apache-2.0 | crates.io |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | crates.io |
 | num_threads | 0.1.7 | MIT OR Apache-2.0 | crates.io |
@@ -376,7 +376,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | toml_parser | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_writer | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | tower | 0.5.3 | MIT | crates.io |
-| tower-http | 0.6.10 | MIT | crates.io |
+| tower-http | 0.6.11 | MIT | crates.io |
 | tower-layer | 0.3.3 | MIT | crates.io |
 | tower-service | 0.3.3 | MIT | crates.io |
 | tracing | 0.1.44 | MIT | crates.io |
