@@ -13,13 +13,14 @@ Usage:
   plan-tooling <command> [args]
 
 Commands:
-  to-json   Parse a plan markdown file into a stable JSON schema
-  validate  Lint plan markdown files
-  batches   Compute dependency layers (parallel batches) for a sprint
-  split-prs Build task-to-PR split records (deterministic/auto)
-  scaffold  Create a new plan from template
-  completion Export shell completion script
-  help      Display help message
+  to-json         Parse a plan markdown file into a stable JSON schema
+  validate        Lint plan markdown files
+  batches         Compute dependency layers (parallel batches) for a sprint
+  artifact-audit  Classify durable coordination artifacts without side effects
+  split-prs       Build task-to-PR split records (deterministic/auto)
+  scaffold        Create a new plan from template
+  completion      Export shell completion script
+  help            Display help message
 
 Help:
   plan-tooling help
@@ -38,10 +39,26 @@ Help:
 - `validate` requires a `Read First` section with `Primary source`, `Source type`, and `Open questions carried into execution`. Repo-local
   primary source paths must exist; use `Source type: plan-only waiver` for explicit plan-only exceptions.
 - If `Complexity` is present it must parse as a 1-10 integer. Omit the field when complexity is intentionally unspecified.
+- For plan-source bundles under `docs/plans/<slug>/`, `validate` also checks the sibling source-doc contract when the plan shape is
+  `<slug>-plan.md`. Accepted source docs are `<slug>-discussion-source.md` and `<slug>-review-source.md`.
+- Bundle validation accepts a not-yet-started bundle without an execution-state file. When `<slug>-execution-state.md` exists, it must point
+  at the plan with `Source document`, or point directly at the source doc only with `Direct source-doc execution waiver`.
+- Bundle validation is separate from durable-artifact cleanup audit. `validate` checks hard source/plan/state links; cleanup audit remains
+  an advisory classification flow and does not delete, move, or archive files.
 
 ### batches
 
 - `batches --file <plan.md> --sprint <n> [--format json|text]`: Compute dependency batches for a sprint.
+
+### artifact-audit
+
+- `artifact-audit --candidate <path>... [--repo <path>] [--format text|json] [--explain]`: Classify durable coordination artifacts
+  without deleting or moving files.
+- `artifact-audit --candidate-file <path> [--repo <path>] [--format text|json] [--explain]`: Read candidates from a newline-delimited
+  file.
+- Classifications are `delete`, `keep`, `rehome`, and `manual-review`.
+- This helper is audit-only. Treat output as cleanup evidence, then use the owning workflow for review, approval, and any filesystem
+  changes.
 
 ### split-prs
 
@@ -117,6 +134,11 @@ plan-tooling validate
 # Compute sprint batches in text mode
 plan-tooling batches --file docs/plans/example-plan.md --sprint 2 --format text
 
+# Audit a completed coordination artifact candidate
+plan-tooling artifact-audit \
+  --candidate docs/plans/example/example-plan.md \
+  --format json
+
 # Split sprint tasks with deterministic groups
 plan-tooling split-prs \
   --file docs/plans/example-plan.md \
@@ -145,6 +167,8 @@ plan-tooling completion zsh > completions/zsh/_plan-tooling
 ## Docs
 
 - [Docs index](docs/README.md)
+- [plan-source bundle contract v1](docs/specs/plan-source-bundle-contract-v1.md) — active contract
+  for sibling source docs, plans, and optional execution state.
 - [split-prs contract v2](docs/specs/split-prs-contract-v2.md) — active contract.
 - [split-prs contract v1](docs/specs/split-prs-contract-v1.md) — deprecated; historical reference
   only.

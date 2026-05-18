@@ -1,4 +1,6 @@
+mod artifact_audit;
 mod batches;
+mod bundle;
 mod completion;
 pub mod parse;
 mod repo_root;

@@ -118,6 +118,42 @@ fn build_completion_command() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("artifact-audit")
+                .about("Classify durable coordination artifacts without side effects")
+                .arg(
+                    Arg::new("candidate")
+                        .long("candidate")
+                        .help("Candidate artifact path (repeatable)")
+                        .value_name("path")
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("candidate-file")
+                        .long("candidate-file")
+                        .help("File containing candidate paths, one per line")
+                        .value_name("path"),
+                )
+                .arg(
+                    Arg::new("repo")
+                        .long("repo")
+                        .help("Repository root for reference scans")
+                        .value_name("path"),
+                )
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .help("Audit output format")
+                        .value_name("fmt")
+                        .value_parser(["text", "json"]),
+                )
+                .arg(
+                    Arg::new("explain")
+                        .long("explain")
+                        .help("Include evidence details in text output")
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
             Command::new("split-prs")
                 .about("Build task-to-PR split records (deterministic/auto)")
                 .arg(

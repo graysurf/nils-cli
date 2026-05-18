@@ -1,4 +1,4 @@
-use crate::{batches, scaffold, validate};
+use crate::{artifact_audit, batches, scaffold, validate};
 
 pub fn dispatch(args: &[String]) -> i32 {
     if args.len() <= 1 {
@@ -20,6 +20,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         "to-json" => crate::parse::to_json::run(&args[2..]),
         "validate" => validate::run(&args[2..]),
         "batches" => batches::run(&args[2..]),
+        "artifact-audit" => artifact_audit::run(&args[2..]),
         "split-prs" => crate::split_prs::run(&args[2..]),
         "scaffold" => scaffold::run(&args[2..]),
         "completion" => crate::completion::run(&args[2..]),
@@ -63,27 +64,32 @@ fn print_help(stderr: bool) {
     let _ = writeln!(out, "Commands:");
     let _ = writeln!(
         out,
-        "  {:<10}  Parse a plan markdown file into a stable JSON schema",
+        "  {:<14}  Parse a plan markdown file into a stable JSON schema",
         "to-json"
     );
-    let _ = writeln!(out, "  {:<10}  Lint plan markdown files", "validate");
+    let _ = writeln!(out, "  {:<14}  Lint plan markdown files", "validate");
     let _ = writeln!(
         out,
-        "  {:<10}  Compute dependency layers (parallel batches) for a sprint",
+        "  {:<14}  Compute dependency layers (parallel batches) for a sprint",
         "batches"
     );
     let _ = writeln!(
         out,
-        "  {:<10}  Build task-to-PR split records (deterministic/auto)",
-        "split-prs"
+        "  {:<14}  Classify durable coordination artifacts without side effects",
+        "artifact-audit"
     );
-    let _ = writeln!(out, "  {:<10}  Create a new plan from template", "scaffold");
     let _ = writeln!(
         out,
-        "  {:<10}  Export shell completion script",
+        "  {:<14}  Build task-to-PR split records (deterministic/auto)",
+        "split-prs"
+    );
+    let _ = writeln!(out, "  {:<14}  Create a new plan from template", "scaffold");
+    let _ = writeln!(
+        out,
+        "  {:<14}  Export shell completion script",
         "completion"
     );
-    let _ = writeln!(out, "  {:<10}  Display help message", "help");
+    let _ = writeln!(out, "  {:<14}  Display help message", "help");
 }
 
 #[cfg(test)]

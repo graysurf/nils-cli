@@ -308,6 +308,12 @@ fn validate_plan(display_path: &str, read_path: &Path, repo_root: &Path) -> Vec<
     for task in tasks {
         errs.extend(validate_task(display_path, task, &all_task_ids));
     }
+    errs.extend(crate::bundle::validate_plan_bundle(
+        display_path,
+        read_path,
+        &plan,
+        repo_root,
+    ));
     errs
 }
 

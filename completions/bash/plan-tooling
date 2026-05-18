@@ -16,6 +16,9 @@ _plan-tooling() {
             ",$1")
                 cmd="plan__tooling"
                 ;;
+            plan__tooling,artifact-audit)
+                cmd="plan__tooling__artifact__audit"
+                ;;
             plan__tooling,batches)
                 cmd="plan__tooling__batches"
                 ;;
@@ -44,12 +47,42 @@ _plan-tooling() {
 
     case "${cmd}" in
         plan__tooling)
-            opts="-h -V --help --version to-json validate batches split-prs scaffold completion help"
+            opts="-h -V --help --version to-json validate batches artifact-audit split-prs scaffold completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        plan__tooling__artifact__audit)
+            opts="-h --candidate --candidate-file --repo --format --explain --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --candidate)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --candidate-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;

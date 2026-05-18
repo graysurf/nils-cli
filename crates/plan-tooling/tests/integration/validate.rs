@@ -409,6 +409,143 @@ fn validate_invalid_format_is_usage_error() {
 }
 
 #[test]
+fn validate() {
+    let repo = init_repo();
+    write_file(&repo.path().join("plan.md"), VALID_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "plan.md"]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+}
+
+#[test]
+fn validate_bundle_contract_docs() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let spec = std::fs::read_to_string(repo.join("docs/specs/plan-source-bundle-contract-v1.md"))
+        .expect("bundle contract spec");
+    assert!(spec.contains("Direct source-doc execution waiver"));
+    assert!(spec.contains("Recommended execution state"));
+    assert!(spec.contains("discussion-source.md"));
+    assert!(spec.contains("review-source.md"));
+}
+
+#[test]
+fn validate_accepts_not_yet_started_plan_bundle() {
+    let repo = init_repo();
+    write_valid_bundle_source_and_plan(repo.path(), "demo");
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "docs/plans/demo/demo-plan.md"],
+    );
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+}
+
+#[test]
+fn validate_fails_when_source_doc_recommends_another_plan() {
+    let repo = init_repo();
+    write_valid_bundle_source_and_plan(repo.path(), "demo");
+    write_file(
+        &repo
+            .path()
+            .join("docs/plans/demo/demo-discussion-source.md"),
+        r#"# Demo Source
+
+- Recommended plan:
+  `docs/plans/other/other-plan.md`
+- Recommended execution state:
+  `docs/plans/demo/demo-execution-state.md`
+"#,
+    );
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "docs/plans/demo/demo-plan.md"],
+    );
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("recommends wrong plan"));
+    assert!(out.stderr.contains("docs/plans/demo/demo-plan.md"));
+}
+
+#[test]
+fn validate_fails_when_execution_state_points_to_wrong_plan() {
+    let repo = init_repo();
+    write_valid_bundle_source_and_plan(repo.path(), "demo");
+    write_file(
+        &repo.path().join("docs/plans/demo/demo-execution-state.md"),
+        r#"# Execution State: Demo
+
+- Status: in progress
+- Source document:
+  `docs/plans/other/other-plan.md`
+- Direct source-doc execution waiver: not applicable
+"#,
+    );
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "docs/plans/demo/demo-plan.md"],
+    );
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("points to wrong source document"));
+}
+
+#[test]
+fn validate_fails_without_direct_source_doc_waiver() {
+    let repo = init_repo();
+    write_valid_bundle_source_and_plan(repo.path(), "demo");
+    write_file(
+        &repo.path().join("docs/plans/demo/demo-execution-state.md"),
+        r#"# Execution State: Demo
+
+- Status: in progress
+- Source document:
+  `docs/plans/demo/demo-discussion-source.md`
+- Direct source-doc execution waiver: not applicable
+"#,
+    );
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "docs/plans/demo/demo-plan.md"],
+    );
+    assert_eq!(out.code, 1);
+    assert!(
+        out.stderr
+            .contains("without `Direct source-doc execution waiver`")
+    );
+}
+
+#[test]
+fn validate_accepts_direct_source_doc_waiver() {
+    let repo = init_repo();
+    write_valid_bundle_source_and_plan(repo.path(), "demo");
+    write_file(
+        &repo.path().join("docs/plans/demo/demo-execution-state.md"),
+        r#"# Execution State: Demo
+
+- Status: in progress
+- Source document:
+  `docs/plans/demo/demo-discussion-source.md`
+- Direct source-doc execution waiver: bounded single-step source execution
+"#,
+    );
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "docs/plans/demo/demo-plan.md"],
+    );
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+}
+
+#[test]
 fn validate_fails_when_per_sprint_intent_conflicts_with_parallel_profile() {
     let repo = init_repo();
     write_file(
@@ -435,6 +572,47 @@ fn validate_fails_when_sprint_metadata_is_partial() {
     assert!(
         out.stderr
             .contains("must include both `PR grouping intent` and `Execution Profile`")
+    );
+}
+
+fn write_valid_bundle_source_and_plan(repo: &std::path::Path, slug: &str) {
+    write_file(
+        &repo.join(format!("docs/plans/{slug}/{slug}-discussion-source.md")),
+        &format!(
+            r#"# Demo Source
+
+- Recommended plan:
+  `docs/plans/{slug}/{slug}-plan.md`
+- Recommended execution state:
+  `docs/plans/{slug}/{slug}-execution-state.md`
+"#
+        ),
+    );
+    write_file(
+        &repo.join(format!("docs/plans/{slug}/{slug}-plan.md")),
+        &format!(
+            r#"# Plan: Demo
+
+## Read First
+
+- Primary source: docs/plans/{slug}/{slug}-discussion-source.md
+- Source type: discussion-to-implementation-doc
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test -p nils-plan-tooling
+"#
+        ),
     );
 }
 

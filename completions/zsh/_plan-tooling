@@ -54,6 +54,17 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(artifact-audit)
+_arguments "${_arguments_options[@]}" : \
+'*--candidate=[Candidate artifact path (repeatable)]:path:_default' \
+'--candidate-file=[File containing candidate paths, one per line]:path:_default' \
+'--repo=[Repository root for reference scans]:path:_default' \
+'--format=[Audit output format]:fmt:(text json)' \
+'--explain[Include evidence details in text output]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (split-prs)
 _arguments "${_arguments_options[@]}" : \
 '--file=[Plan markdown file path]:path:_default' \
@@ -105,6 +116,7 @@ _plan-tooling_commands() {
 'to-json:Parse a plan markdown file into a stable JSON schema' \
 'validate:Lint plan markdown files' \
 'batches:Compute dependency layers (parallel batches) for a sprint' \
+'artifact-audit:Classify durable coordination artifacts without side effects' \
 'split-prs:Build task-to-PR split records (deterministic/auto)' \
 'scaffold:Create a new plan from template' \
 'completion:Export shell completion script' \
@@ -112,38 +124,43 @@ _plan-tooling_commands() {
     )
     _describe -t commands 'plan-tooling commands' commands "$@"
 }
-(( $+functions[_plan-tooling__batches_commands] )) ||
-_plan-tooling__batches_commands() {
+(( $+functions[_plan-tooling__subcmd__artifact-audit_commands] )) ||
+_plan-tooling__subcmd__artifact-audit_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-tooling artifact-audit commands' commands "$@"
+}
+(( $+functions[_plan-tooling__subcmd__batches_commands] )) ||
+_plan-tooling__subcmd__batches_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling batches commands' commands "$@"
 }
-(( $+functions[_plan-tooling__completion_commands] )) ||
-_plan-tooling__completion_commands() {
+(( $+functions[_plan-tooling__subcmd__completion_commands] )) ||
+_plan-tooling__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling completion commands' commands "$@"
 }
-(( $+functions[_plan-tooling__help_commands] )) ||
-_plan-tooling__help_commands() {
+(( $+functions[_plan-tooling__subcmd__help_commands] )) ||
+_plan-tooling__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling help commands' commands "$@"
 }
-(( $+functions[_plan-tooling__scaffold_commands] )) ||
-_plan-tooling__scaffold_commands() {
+(( $+functions[_plan-tooling__subcmd__scaffold_commands] )) ||
+_plan-tooling__subcmd__scaffold_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling scaffold commands' commands "$@"
 }
-(( $+functions[_plan-tooling__split-prs_commands] )) ||
-_plan-tooling__split-prs_commands() {
+(( $+functions[_plan-tooling__subcmd__split-prs_commands] )) ||
+_plan-tooling__subcmd__split-prs_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling split-prs commands' commands "$@"
 }
-(( $+functions[_plan-tooling__to-json_commands] )) ||
-_plan-tooling__to-json_commands() {
+(( $+functions[_plan-tooling__subcmd__to-json_commands] )) ||
+_plan-tooling__subcmd__to-json_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling to-json commands' commands "$@"
 }
-(( $+functions[_plan-tooling__validate_commands] )) ||
-_plan-tooling__validate_commands() {
+(( $+functions[_plan-tooling__subcmd__validate_commands] )) ||
+_plan-tooling__subcmd__validate_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling validate commands' commands "$@"
 }

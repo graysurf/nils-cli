@@ -4,6 +4,9 @@
 
 ## Specs
 
+- [`Plan-Source Bundle Contract v1`](specs/plan-source-bundle-contract-v1.md): **active**
+  contract for sibling source docs, plans, and optional execution state validated by
+  `plan-tooling validate`.
 - [`split-prs Contract v2`](specs/split-prs-contract-v2.md): **active** contract. Grouping-only
   `split-prs` output (`task_id`, `summary`, `pr_group`); runtime lane metadata is materialized by
   `plan-issue-cli`.

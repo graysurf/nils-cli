@@ -75,6 +75,7 @@ because BSD-style `-path` lets `*` cross slash boundaries.
 - `crates/plan-issue-cli/docs/specs/plan-issue-gate-matrix-v1.md`
 - `crates/plan-issue-cli/docs/specs/plan-issue-state-machine-v1.md`
 - `crates/plan-tooling/docs/runbooks/split-prs-build-task-spec-cutover.md`
+- `crates/plan-tooling/docs/specs/plan-source-bundle-contract-v1.md`
 - `crates/plan-tooling/docs/specs/split-prs-contract-v1.md`
 - `crates/plan-tooling/docs/specs/split-prs-contract-v2.md`
 
