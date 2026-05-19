@@ -3,6 +3,12 @@
 //! returns `Result<i32, ForgeError>`.
 
 pub mod auth_status;
+pub mod issue_close;
+pub mod issue_comment;
+pub mod issue_create;
+pub mod issue_edit;
+pub mod issue_reopen;
+pub mod issue_view;
 pub mod pr_checks;
 pub mod pr_checks_gitlab;
 pub mod pr_close;

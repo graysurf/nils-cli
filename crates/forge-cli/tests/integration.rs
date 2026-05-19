@@ -5,6 +5,7 @@ mod integration {
     mod auth_status;
     mod cli;
     mod exit_codes;
+    mod issue_atoms;
     mod pr_checks_github;
     mod pr_checks_gitlab;
     mod pr_create;
