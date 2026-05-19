@@ -1,0 +1,292 @@
+//! Typed error returned by every op. Each variant carries the discriminator
+//! that goes into `data.error.kind` plus the BSD sysexits constant it maps to.
+//!
+//! Spec: `crates/forge-cli/docs/specs/forge-cli-spec-v1.md` §"Exit code map" + §"Lock-down
+//! policy". The numeric exit values come from `nils_common::cli_contract::exit`
+//! and are never inlined as integer literals.
+
+use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit};
+use serde::Serialize;
+use thiserror::Error;
+
+use crate::cli::BINARY;
+
+/// Top-level forge-cli error type. Every leaf knows its `error.kind` and
+/// exit-code class.
+#[derive(Debug, Error)]
+pub enum ForgeError {
+    /// Subcommand has not been implemented in this sprint.
+    #[error("{message}")]
+    NotImplemented {
+        schema_version: String,
+        message: String,
+    },
+    /// Backend binary (`gh` or `glab`) is missing or unauthenticated.
+    #[error("{message}")]
+    BackendUnavailable {
+        schema_version: String,
+        kind: &'static str,
+        message: String,
+        detail: Option<String>,
+    },
+    /// Backend exited with a non-zero status while attempting a remote
+    /// operation.
+    #[error("{message}")]
+    BackendError {
+        schema_version: String,
+        message: String,
+        detail: Option<String>,
+    },
+    /// Provider could not be resolved (unknown host or no git remote).
+    #[error("{message}")]
+    ProviderUnsupported {
+        schema_version: String,
+        message: String,
+        detail: Option<String>,
+    },
+    /// Internal invariant violation — backend JSON did not match the expected
+    /// shape, or another assumption that should hold blew up.
+    #[error("{message}")]
+    SoftwareError {
+        schema_version: String,
+        message: String,
+        detail: Option<String>,
+    },
+}
+
+impl ForgeError {
+    /// Build a `not_implemented` error.
+    pub fn not_implemented(
+        schema_version: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::NotImplemented {
+            schema_version: schema_version.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Build a `backend_missing` error (`UNAVAILABLE 69`).
+    pub fn backend_missing(
+        schema_version: impl Into<String>,
+        message: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::BackendUnavailable {
+            schema_version: schema_version.into(),
+            kind: "backend_missing",
+            message: message.into(),
+            detail,
+        }
+    }
+
+    /// Build a `backend_unauthenticated` error (`UNAVAILABLE 69`).
+    pub fn backend_unauthenticated(
+        schema_version: impl Into<String>,
+        message: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::BackendUnavailable {
+            schema_version: schema_version.into(),
+            kind: "backend_unauthenticated",
+            message: message.into(),
+            detail,
+        }
+    }
+
+    /// Build a `backend_error` error (`RUNTIME 1`).
+    pub fn backend_error(
+        schema_version: impl Into<String>,
+        message: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::BackendError {
+            schema_version: schema_version.into(),
+            message: message.into(),
+            detail,
+        }
+    }
+
+    /// Build a `provider_unsupported` error (`USAGE 64`).
+    pub fn provider_unsupported(
+        schema_version: impl Into<String>,
+        message: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::ProviderUnsupported {
+            schema_version: schema_version.into(),
+            message: message.into(),
+            detail,
+        }
+    }
+
+    /// Build a `SOFTWARE 70` error for invariant violations.
+    pub fn software(
+        schema_version: impl Into<String>,
+        message: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::SoftwareError {
+            schema_version: schema_version.into(),
+            message: message.into(),
+            detail,
+        }
+    }
+
+    /// Map the error to its exit-code constant.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::NotImplemented { .. } => exit::SOFTWARE,
+            Self::BackendUnavailable { .. } => exit::UNAVAILABLE,
+            Self::BackendError { .. } => exit::RUNTIME,
+            Self::ProviderUnsupported { .. } => exit::USAGE,
+            Self::SoftwareError { .. } => exit::SOFTWARE,
+        }
+    }
+
+    /// Return the `error.kind` discriminator.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotImplemented { .. } => "not_implemented",
+            Self::BackendUnavailable { kind, .. } => kind,
+            Self::BackendError { .. } => "backend_error",
+            Self::ProviderUnsupported { .. } => "provider_unsupported",
+            Self::SoftwareError { .. } => "software_error",
+        }
+    }
+
+    fn schema_version(&self) -> &str {
+        match self {
+            Self::NotImplemented { schema_version, .. }
+            | Self::BackendUnavailable { schema_version, .. }
+            | Self::BackendError { schema_version, .. }
+            | Self::ProviderUnsupported { schema_version, .. }
+            | Self::SoftwareError { schema_version, .. } => schema_version,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::NotImplemented { message, .. }
+            | Self::BackendUnavailable { message, .. }
+            | Self::BackendError { message, .. }
+            | Self::ProviderUnsupported { message, .. }
+            | Self::SoftwareError { message, .. } => message,
+        }
+    }
+
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Self::NotImplemented { .. } => None,
+            Self::BackendUnavailable { detail, .. }
+            | Self::BackendError { detail, .. }
+            | Self::ProviderUnsupported { detail, .. }
+            | Self::SoftwareError { detail, .. } => detail.as_deref(),
+        }
+    }
+
+    /// Render the error through the workspace envelope and return the
+    /// exit-code constant.
+    pub fn emit(&self, format: OutputFormat) -> i32 {
+        let code = self.exit_code();
+        let envelope_error = EnvelopeError::new(self.kind(), self.message());
+        let envelope_error = match self.detail() {
+            Some(detail) => envelope_error.with_details(serde_json::json!({ "detail": detail })),
+            None => envelope_error,
+        };
+        let envelope: Envelope<EnvelopeStub> =
+            Envelope::failure(self.schema_version().to_string(), envelope_error);
+
+        match format {
+            OutputFormat::Json => {
+                let serialized = serde_json::to_string(&envelope)
+                    .unwrap_or_else(|_| String::from("{\"ok\":false}"));
+                println!("{serialized}");
+            }
+            OutputFormat::Text => {
+                let kind = self.kind();
+                let detail_suffix = self
+                    .detail()
+                    .map(|d| format!("\n  detail: {d}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "error: {kind}: {message}{detail_suffix}",
+                    message = self.message()
+                );
+            }
+        }
+        let _ = BINARY; // silence unused-import lint when this module is consumed in isolation
+        code
+    }
+}
+
+/// Placeholder envelope payload for error-only emissions.
+#[derive(Serialize)]
+struct EnvelopeStub {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn exit_code_mapping_matches_spec() {
+        let cases = [
+            (
+                ForgeError::not_implemented("cli.forge-cli.error.v1", "x"),
+                exit::SOFTWARE,
+            ),
+            (
+                ForgeError::backend_missing("cli.forge-cli.error.v1", "x", None),
+                exit::UNAVAILABLE,
+            ),
+            (
+                ForgeError::backend_unauthenticated("cli.forge-cli.error.v1", "x", None),
+                exit::UNAVAILABLE,
+            ),
+            (
+                ForgeError::backend_error("cli.forge-cli.error.v1", "x", None),
+                exit::RUNTIME,
+            ),
+            (
+                ForgeError::provider_unsupported("cli.forge-cli.error.v1", "x", None),
+                exit::USAGE,
+            ),
+            (
+                ForgeError::software("cli.forge-cli.error.v1", "x", None),
+                exit::SOFTWARE,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.exit_code(), expected, "{}", err.kind());
+        }
+    }
+
+    #[test]
+    fn kind_discriminators_match_spec() {
+        assert_eq!(
+            ForgeError::backend_missing("v1", "x", None).kind(),
+            "backend_missing"
+        );
+        assert_eq!(
+            ForgeError::backend_unauthenticated("v1", "x", None).kind(),
+            "backend_unauthenticated"
+        );
+        assert_eq!(
+            ForgeError::backend_error("v1", "x", None).kind(),
+            "backend_error"
+        );
+        assert_eq!(
+            ForgeError::provider_unsupported("v1", "x", None).kind(),
+            "provider_unsupported"
+        );
+        assert_eq!(
+            ForgeError::software("v1", "x", None).kind(),
+            "software_error"
+        );
+        assert_eq!(
+            ForgeError::not_implemented("v1", "x").kind(),
+            "not_implemented"
+        );
+    }
+}

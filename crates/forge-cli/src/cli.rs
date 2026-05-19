@@ -1,0 +1,523 @@
+//! Clap derive tree, global flag definitions, and the top-level dispatch
+//! entry consumed by `crate::run`.
+//!
+//! Every subcommand listed in `crates/forge-cli/docs/specs/forge-cli-spec-v1.md` §"Command
+//! tree" is declared here, even when the v1 handler is not yet implemented in
+//! this sprint. Stubs return a structured `not_implemented` envelope under
+//! `SOFTWARE 70` so callers see a stable failure shape rather than a panic.
+
+use std::ffi::OsString;
+
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
+use nils_common::cli_contract::{OutputFormat, emit_parse_error, exit, schema_version_for};
+
+use crate::error::ForgeError;
+use crate::ops;
+use crate::provider::ProviderHint;
+
+/// Stable binary name used in `schema_version` literals (`cli.forge-cli.*`).
+pub const BINARY: &str = "forge-cli";
+
+/// Top-level CLI definition.
+#[derive(Parser, Debug)]
+#[command(
+    name = "forge-cli",
+    version,
+    about = "Provider-neutral CLI for remote forge operations (gh / glab wrapper)."
+)]
+pub struct Cli {
+    /// Output format (defaults to text).
+    #[arg(long, global = true, value_enum)]
+    pub format: Option<OutputFormat>,
+
+    /// Git remote whose URL feeds provider detection (default: `origin`).
+    #[arg(long, global = true, default_value = "origin")]
+    pub remote: String,
+
+    /// Override auto-detected provider.
+    #[arg(long, global = true, value_enum)]
+    pub provider: Option<ProviderFlag>,
+
+    /// Override the repo slug (`owner/name`). When absent it is derived from
+    /// the remote URL.
+    #[arg(long, global = true, value_name = "owner/name")]
+    pub repo: Option<String>,
+
+    /// Render the backend command that would run, without invoking it. The
+    /// envelope's `data.plan` carries the exact argv.
+    #[arg(long, global = true, action = ArgAction::SetTrue)]
+    pub dry_run: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Snapshot of the global flags handed to ops without re-parsing.
+#[derive(Debug, Clone)]
+pub struct GlobalFlags {
+    pub format: Option<OutputFormat>,
+    pub remote: String,
+    pub provider: Option<ProviderFlag>,
+    pub repo: Option<String>,
+    pub dry_run: bool,
+}
+
+impl From<&Cli> for GlobalFlags {
+    fn from(cli: &Cli) -> Self {
+        Self {
+            format: cli.format,
+            remote: cli.remote.clone(),
+            provider: cli.provider,
+            repo: cli.repo.clone(),
+            dry_run: cli.dry_run,
+        }
+    }
+}
+
+impl GlobalFlags {
+    /// Resolve the output format, defaulting to text.
+    pub fn output_format(&self) -> OutputFormat {
+        self.format.unwrap_or_default()
+    }
+
+    /// Convert the optional `--provider` flag into the typed provider hint.
+    pub fn provider_hint(&self) -> ProviderHint {
+        match self.provider {
+            Some(ProviderFlag::Github) => ProviderHint::Forced(crate::provider::Provider::GitHub),
+            Some(ProviderFlag::Gitlab) => ProviderHint::Forced(crate::provider::Provider::GitLab),
+            None => ProviderHint::Auto,
+        }
+    }
+}
+
+/// Provider override for `--provider`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum ProviderFlag {
+    Github,
+    Gitlab,
+}
+
+/// Top-level subcommand tree.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Pull / merge request lifecycle.
+    Pr(PrArgs),
+    /// Issue lifecycle.
+    Issue(IssueArgs),
+    /// Repository helpers.
+    Repo(RepoArgs),
+    /// Backend authentication helpers.
+    Auth(AuthArgs),
+    /// Emit shell-completion scripts.
+    Completion(CompletionArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PrArgs {
+    #[command(subcommand)]
+    pub command: Option<PrCommand>,
+}
+
+#[derive(Args, Debug)]
+pub struct IssueArgs {
+    #[command(subcommand)]
+    pub command: Option<IssueCommand>,
+}
+
+#[derive(Args, Debug)]
+pub struct RepoArgs {
+    #[command(subcommand)]
+    pub command: Option<RepoCommand>,
+}
+
+#[derive(Args, Debug)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: Option<AuthCommand>,
+}
+
+#[derive(Args, Debug)]
+pub struct CompletionArgs {
+    /// Target shell.
+    #[arg(value_enum)]
+    pub shell: Shell,
+}
+
+/// `pr` subtree.
+#[derive(Subcommand, Debug)]
+pub enum PrCommand {
+    /// Open a draft pull / merge request from the current branch.
+    Create,
+    /// Fetch a single PR / MR with normalised fields.
+    View {
+        /// Numeric id or branch name.
+        id: String,
+    },
+    /// List PRs / MRs.
+    List,
+    /// Mutate PR / MR title, body, base, labels, reviewers.
+    Edit {
+        /// Numeric id.
+        id: u64,
+    },
+    /// Append a comment to a PR / MR.
+    Comment {
+        /// Numeric id.
+        id: u64,
+    },
+    /// Promote a draft PR / MR to ready-for-review.
+    Ready {
+        /// Numeric id.
+        id: u64,
+    },
+    /// Merge a ready PR / MR.
+    Merge {
+        /// Numeric id.
+        id: u64,
+    },
+    /// Close a PR / MR without merging.
+    Close {
+        /// Numeric id.
+        id: u64,
+    },
+    /// One-shot snapshot of PR / MR check state.
+    Checks {
+        /// Numeric id or branch name.
+        id: String,
+    },
+    /// Block until every required check reaches a terminal state.
+    WaitChecks {
+        /// Numeric id or branch name.
+        id: String,
+    },
+    /// End-to-end "open draft → CI green → ready → merge" macro.
+    Deliver,
+}
+
+/// `issue` subtree.
+#[derive(Subcommand, Debug)]
+pub enum IssueCommand {
+    /// Open a new issue.
+    Create,
+    /// Fetch a single issue.
+    View {
+        /// Numeric id.
+        id: u64,
+    },
+    /// Mutate an issue.
+    Edit {
+        /// Numeric id.
+        id: u64,
+    },
+    /// Append a comment to an issue.
+    Comment {
+        /// Numeric id.
+        id: u64,
+    },
+    /// Close an issue.
+    Close {
+        /// Numeric id.
+        id: u64,
+    },
+    /// Reopen a closed issue.
+    Reopen {
+        /// Numeric id.
+        id: u64,
+    },
+}
+
+/// `repo` subtree.
+#[derive(Subcommand, Debug)]
+pub enum RepoCommand {
+    /// Resolve the repo slug, default branch, and supported merge methods.
+    View,
+}
+
+/// `auth` subtree.
+#[derive(Subcommand, Debug)]
+pub enum AuthCommand {
+    /// Verify backend auth (gh / glab).
+    Status,
+}
+
+/// Public entry point: parses argv and dispatches to a handler.
+pub fn dispatch(args: Vec<OsString>) -> i32 {
+    let cli = match parse_or_exit(args) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
+
+    let global: GlobalFlags = (&cli).into();
+    let format = global.output_format();
+
+    let result = match cli.command {
+        Some(Command::Auth(AuthArgs {
+            command: Some(AuthCommand::Status),
+        })) => ops::auth_status::run(&global, format),
+        Some(Command::Repo(RepoArgs {
+            command: Some(RepoCommand::View),
+        })) => ops::repo_view::run(&global, format),
+        Some(Command::Completion(CompletionArgs { shell })) => emit_completion(shell),
+        None
+        | Some(Command::Auth(AuthArgs { command: None }))
+        | Some(Command::Repo(RepoArgs { command: None }))
+        | Some(Command::Pr(PrArgs { command: None }))
+        | Some(Command::Issue(IssueArgs { command: None })) => {
+            // No subcommand: print help and exit USAGE so callers don't
+            // mistake the no-op for success.
+            let _ = <Cli as clap::CommandFactory>::command().print_help();
+            return exit::USAGE;
+        }
+        // Every other subcommand declared above is part of the v1 surface but
+        // not implemented in Sprint 1. The structured failure keeps callers on
+        // the contract instead of panicking on `todo!()`.
+        _ => Err(ForgeError::not_implemented(
+            schema_version_for(BINARY, "error", 1),
+            "subcommand not implemented in this sprint",
+        )),
+    };
+
+    match result {
+        Ok(code) => code,
+        Err(err) => err.emit(format),
+    }
+}
+
+/// Parse argv, gracefully routing parse errors through the workspace
+/// contract's `emit_parse_error` helper so `--format json` works at the parse
+/// layer too.
+fn parse_or_exit(args: Vec<OsString>) -> Result<Cli, i32> {
+    let mut argv: Vec<OsString> = Vec::with_capacity(args.len() + 1);
+    argv.push(OsString::from("forge-cli"));
+    argv.extend(args);
+
+    match Cli::try_parse_from(argv.iter()) {
+        Ok(cli) => Ok(cli),
+        Err(err) => {
+            use clap::error::ErrorKind;
+            let kind = err.kind();
+            if matches!(
+                kind,
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                // Mirror clap's own help/version output to the user's terminal
+                // and exit cleanly.
+                let _ = err.print();
+                return Err(exit::SUCCESS);
+            }
+
+            let format = detect_format_from_argv(&argv);
+            let code = match kind {
+                ErrorKind::InvalidSubcommand
+                | ErrorKind::UnknownArgument
+                | ErrorKind::InvalidValue => "unknown-subcommand",
+                _ => "parse-error",
+            };
+            let message = render_clap_message(&err);
+            Err(emit_parse_error(BINARY, format, code, &message))
+        }
+    }
+}
+
+/// Scan raw argv for `--format json`, `--format=json`, or the (forbidden but
+/// pre-parse-time) `--json` token so parse errors render as the JSON envelope
+/// when the caller asked for JSON.
+fn detect_format_from_argv(argv: &[OsString]) -> OutputFormat {
+    let mut iter = argv.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        let Some(s) = arg.to_str() else { continue };
+        if s == "--format"
+            && let Some(next) = iter.next()
+            && let Some(value) = next.to_str()
+            && value.eq_ignore_ascii_case("json")
+        {
+            return OutputFormat::Json;
+        }
+        if let Some(rest) = s.strip_prefix("--format=")
+            && rest.eq_ignore_ascii_case("json")
+        {
+            return OutputFormat::Json;
+        }
+    }
+    OutputFormat::Text
+}
+
+/// Reduce clap's multi-line error rendering to a single, terse message
+/// suitable for the envelope's `error.message` field.
+fn render_clap_message(err: &clap::Error) -> String {
+    err.to_string()
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix("error:")
+                .map(str::trim)
+                .unwrap_or(line)
+                .to_string()
+        })
+        .unwrap_or_else(|| "command-line parse failed".to_string())
+}
+
+/// Emit a clap-generated shell-completion script to stdout. The bash output
+/// goes through [`normalize_bash_completion`] so case labels stay flat
+/// (`forge__cli__pr__create` instead of clap_complete's default
+/// `forge__cli__subcmd__pr__subcmd__create`). The flat form is what the
+/// workspace's `completion-flag-parity-audit.sh` audit expects.
+fn emit_completion(shell: Shell) -> Result<i32, ForgeError> {
+    use clap::CommandFactory;
+    use std::io::Write as _;
+    let mut cmd = Cli::command();
+    let bin = cmd.get_name().to_string();
+    if matches!(shell, Shell::Bash) {
+        let mut out: Vec<u8> = Vec::new();
+        clap_complete::generate(shell, &mut cmd, bin, &mut out);
+        let normalized = normalize_bash_completion(
+            String::from_utf8(out)
+                .map_err(|e| ForgeError::software(
+                    nils_common::cli_contract::schema_version_for(BINARY, "error", 1),
+                    "bash completion output not UTF-8",
+                    Some(e.to_string()),
+                ))?,
+        );
+        let _ = std::io::stdout().write_all(normalized.as_bytes());
+    } else {
+        clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
+    }
+    Ok(exit::SUCCESS)
+}
+
+fn normalize_bash_completion(script: String) -> String {
+    script.replace("__subcmd__", "__")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv: Vec<OsString> = vec![OsString::from("forge-cli")];
+        argv.extend(args.iter().map(OsString::from));
+        Cli::try_parse_from(argv.iter())
+    }
+
+    #[test]
+    fn parses_auth_status_with_defaults() {
+        let cli = parse(&["auth", "status"]).expect("parse");
+        match &cli.command {
+            Some(Command::Auth(AuthArgs {
+                command: Some(command),
+            })) => {
+                assert!(matches!(command, AuthCommand::Status));
+            }
+            other => panic!("expected auth, got {other:?}"),
+        }
+        let global: GlobalFlags = (&cli).into();
+        assert_eq!(global.remote, "origin");
+        assert!(!global.dry_run);
+        assert_eq!(global.output_format(), OutputFormat::Text);
+    }
+
+    #[test]
+    fn parses_global_format_json() {
+        let cli = parse(&["--format", "json", "repo", "view"]).expect("parse");
+        let global: GlobalFlags = (&cli).into();
+        assert_eq!(global.output_format(), OutputFormat::Json);
+    }
+
+    #[test]
+    fn rejects_legacy_json_boolean_flag() {
+        let result = parse(&["--json", "repo", "view"]);
+        assert!(result.is_err(), "--json must not be accepted");
+    }
+
+    #[test]
+    fn parses_provider_override() {
+        let cli = parse(&["--provider", "github", "auth", "status"]).expect("parse");
+        let global: GlobalFlags = (&cli).into();
+        assert_eq!(global.provider, Some(ProviderFlag::Github));
+    }
+
+    #[test]
+    fn parses_dry_run_flag() {
+        let cli = parse(&["--dry-run", "auth", "status"]).expect("parse");
+        let global: GlobalFlags = (&cli).into();
+        assert!(global.dry_run);
+    }
+
+    #[test]
+    fn rejects_unknown_subcommand() {
+        let result = parse(&["bogus"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lists_every_pr_v1_subcommand() {
+        for sub in [
+            "create",
+            "view",
+            "list",
+            "edit",
+            "comment",
+            "ready",
+            "merge",
+            "close",
+            "checks",
+            "wait-checks",
+            "deliver",
+        ] {
+            let mut argv = vec!["pr", sub];
+            match sub {
+                "view" | "checks" | "wait-checks" => argv.push("1"),
+                "edit" | "comment" | "ready" | "merge" | "close" => argv.push("1"),
+                _ => {}
+            }
+            let result = parse(&argv);
+            assert!(result.is_ok(), "pr {sub} should parse, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn lists_every_issue_v1_subcommand() {
+        for sub in ["create", "view", "edit", "comment", "close", "reopen"] {
+            let mut argv = vec!["issue", sub];
+            if sub != "create" {
+                argv.push("1");
+            }
+            let result = parse(&argv);
+            assert!(result.is_ok(), "issue {sub} should parse, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn detect_format_from_argv_finds_json() {
+        let argv = vec![
+            OsString::from("forge-cli"),
+            OsString::from("--format"),
+            OsString::from("json"),
+            OsString::from("auth"),
+            OsString::from("status"),
+        ];
+        assert_eq!(detect_format_from_argv(&argv), OutputFormat::Json);
+    }
+
+    #[test]
+    fn detect_format_from_argv_handles_equals_form() {
+        let argv = vec![
+            OsString::from("forge-cli"),
+            OsString::from("--format=json"),
+            OsString::from("auth"),
+            OsString::from("status"),
+        ];
+        assert_eq!(detect_format_from_argv(&argv), OutputFormat::Json);
+    }
+
+    #[test]
+    fn detect_format_from_argv_defaults_to_text() {
+        let argv = vec![OsString::from("forge-cli"), OsString::from("auth")];
+        assert_eq!(detect_format_from_argv(&argv), OutputFormat::Text);
+    }
+}
