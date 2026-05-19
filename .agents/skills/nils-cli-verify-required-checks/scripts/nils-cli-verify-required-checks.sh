@@ -11,6 +11,7 @@ Runs the required pre-delivery checks from DEVELOPMENT.md:
   - bash scripts/ci/docs-hygiene-audit.sh --strict
   - bash scripts/ci/markdownlint-audit.sh --strict
   - bash scripts/ci/plan-bundle-validate.sh --strict
+  - bash scripts/ci/cli-output-contract-lint.sh --strict
   - bash scripts/ci/test-stale-audit.sh --strict
   - bash scripts/ci/third-party-artifacts-audit.sh --strict
   - bash scripts/ci/completion-asset-audit.sh --strict
@@ -29,6 +30,7 @@ Modes:
       - bash scripts/ci/docs-hygiene-audit.sh --strict
       - bash scripts/ci/markdownlint-audit.sh --strict
       - bash scripts/ci/plan-bundle-validate.sh --strict
+      - bash scripts/ci/cli-output-contract-lint.sh --strict
     Skip fmt/clippy/workspace tests/zsh completion tests.
 
 Environment:
@@ -116,6 +118,7 @@ run bash scripts/ci/docs-placement-audit.sh --strict
 run bash scripts/ci/docs-hygiene-audit.sh --strict
 run bash scripts/ci/markdownlint-audit.sh --strict
 run bash scripts/ci/plan-bundle-validate.sh --strict
+run bash scripts/ci/cli-output-contract-lint.sh --strict
 if [[ "$docs_only" -eq 1 ]]; then
   echo "ok: docs-only nils-cli checks passed"
   exit 0
