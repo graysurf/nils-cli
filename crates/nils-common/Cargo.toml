@@ -8,6 +8,8 @@ repository = "https://github.com/sympoies/nils-cli"
 
 [dependencies]
 base64 = "0.22"
+clap = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
