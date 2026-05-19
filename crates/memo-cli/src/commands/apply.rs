@@ -3,9 +3,9 @@ use std::io::{self, Read};
 
 use serde::Serialize;
 
-use crate::cli::{ApplyArgs, OutputMode};
+use crate::cli::{ApplyArgs, OutputFormat};
 use crate::errors::AppError;
-use crate::output::{emit_json_result, format_item_id, parse_item_id, text};
+use crate::output::{emit_data_with_warnings, format_item_id, parse_item_id, text};
 use crate::preprocess::{ContentType, ValidationStatus};
 use crate::storage::Storage;
 use crate::storage::derivations::{self, ApplyInputItem, IncomingStatus};
@@ -38,7 +38,7 @@ struct JsonApplyItem<'a> {
     error: Option<&'a derivations::ApplyItemError>,
 }
 
-pub fn run(storage: &Storage, output_mode: OutputMode, args: &ApplyArgs) -> Result<(), AppError> {
+pub fn run(storage: &Storage, format: OutputFormat, args: &ApplyArgs) -> Result<(), AppError> {
     if args.input.is_some() == args.stdin {
         return Err(AppError::usage(
             "apply requires exactly one input source: --input <file> or --stdin",
@@ -80,7 +80,21 @@ pub fn run(storage: &Storage, output_mode: OutputMode, args: &ApplyArgs) -> Resu
         derivations::apply_items(tx, &parsed.items, args.dry_run, &default_agent_run_id)
     })?;
 
-    if output_mode.is_json() {
+    if format.is_json() {
+        let warnings: Vec<String> = summary
+            .items
+            .iter()
+            .filter_map(|item| {
+                item.error.as_ref().map(|error| {
+                    format!(
+                        "{} {}: {}",
+                        format_item_id(item.item_id),
+                        item.status,
+                        error.message
+                    )
+                })
+            })
+            .collect();
         let result = JsonApplyResult {
             dry_run: summary.dry_run,
             processed: summary.processed,
@@ -101,7 +115,7 @@ pub fn run(storage: &Storage, output_mode: OutputMode, args: &ApplyArgs) -> Resu
                 })
                 .collect(),
         };
-        return emit_json_result("memo-cli.apply.v1", "memo-cli apply", result);
+        return emit_data_with_warnings("cli.memo-cli.apply.v1", result, warnings);
     }
 
     text::print_apply(&summary);
@@ -536,8 +550,7 @@ mod tests {
     use super::*;
 
     fn error_path(err: &AppError) -> Option<&str> {
-        err.json_error()
-            .details
+        err.details()
             .and_then(|details| details.get("path"))
             .and_then(Value::as_str)
     }

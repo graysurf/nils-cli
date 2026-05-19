@@ -16,7 +16,7 @@ fn hard_delete_does_not_reuse_item_ids() {
         first_add.stderr_text()
     );
     let first_add_json = parse_json_stdout(&first_add);
-    let first_item_id_str = first_add_json["result"]["item_id"]
+    let first_item_id_str = first_add_json["data"]["item_id"]
         .as_str()
         .expect("first item_id should be a string");
     let first_item_id = parse_item_id(first_item_id_str).expect("first item_id should parse");
@@ -41,7 +41,7 @@ fn hard_delete_does_not_reuse_item_ids() {
         second_add.stderr_text()
     );
     let second_add_json = parse_json_stdout(&second_add);
-    let second_item_id_str = second_add_json["result"]["item_id"]
+    let second_item_id_str = second_add_json["data"]["item_id"]
         .as_str()
         .expect("second item_id should be a string");
     let second_item_id = parse_item_id(second_item_id_str).expect("second item_id should parse");
@@ -63,7 +63,7 @@ fn allocator_row_backfills_from_existing_max_item_id() {
         "first add failed: {}",
         first_add.stderr_text()
     );
-    let first_item_id_str = parse_json_stdout(&first_add)["result"]["item_id"]
+    let first_item_id_str = parse_json_stdout(&first_add)["data"]["item_id"]
         .as_str()
         .expect("first item_id should be a string")
         .to_string();
@@ -76,7 +76,7 @@ fn allocator_row_backfills_from_existing_max_item_id() {
         "second add failed: {}",
         second_add.stderr_text()
     );
-    let second_item_id_str = parse_json_stdout(&second_add)["result"]["item_id"]
+    let second_item_id_str = parse_json_stdout(&second_add)["data"]["item_id"]
         .as_str()
         .expect("second item_id should be a string")
         .to_string();
@@ -98,7 +98,7 @@ fn allocator_row_backfills_from_existing_max_item_id() {
         "third add failed: {}",
         third_add.stderr_text()
     );
-    let third_item_id_str = parse_json_stdout(&third_add)["result"]["item_id"]
+    let third_item_id_str = parse_json_stdout(&third_add)["data"]["item_id"]
         .as_str()
         .expect("third item_id should be a string")
         .to_string();

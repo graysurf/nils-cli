@@ -37,7 +37,7 @@ fn fetch_apply_flow() {
         fetch_before.stderr_text()
     );
     let fetch_before_json = parse_json_stdout(&fetch_before);
-    let fetch_before_rows = fetch_before_json["results"]
+    let fetch_before_rows = fetch_before_json["data"]["items"]
         .as_array()
         .expect("results array should exist");
     assert_eq!(fetch_before_rows.len(), 2);
@@ -73,8 +73,8 @@ fn fetch_apply_flow() {
         apply_output.stderr_text()
     );
     let apply_json = parse_json_stdout(&apply_output);
-    assert_eq!(apply_json["result"]["accepted"], 1);
-    assert_eq!(apply_json["result"]["failed"], 0);
+    assert_eq!(apply_json["data"]["accepted"], 1);
+    assert_eq!(apply_json["data"]["failed"], 0);
 
     let fetch_after = run_memo_cli(&db_path, &["--json", "fetch", "--limit", "20"], None);
     assert_eq!(
@@ -84,7 +84,7 @@ fn fetch_apply_flow() {
         fetch_after.stderr_text()
     );
     let fetch_after_json = parse_json_stdout(&fetch_after);
-    let fetch_after_rows = fetch_after_json["results"]
+    let fetch_after_rows = fetch_after_json["data"]["items"]
         .as_array()
         .expect("results array should exist");
     assert_eq!(fetch_after_rows.len(), 1);
@@ -107,7 +107,7 @@ fn apply_idempotency() {
         add_output.stderr_text()
     );
     let add_json = parse_json_stdout(&add_output);
-    let item_id_str = add_json["result"]["item_id"]
+    let item_id_str = add_json["data"]["item_id"]
         .as_str()
         .expect("item_id should be string");
     let item_id = parse_item_id(item_id_str).expect("item_id should parse");
@@ -135,8 +135,8 @@ fn apply_idempotency() {
         apply_first.stderr_text()
     );
     let apply_first_json = parse_json_stdout(&apply_first);
-    assert_eq!(apply_first_json["result"]["accepted"], 1);
-    assert_eq!(apply_first_json["result"]["skipped"], 0);
+    assert_eq!(apply_first_json["data"]["accepted"], 1);
+    assert_eq!(apply_first_json["data"]["skipped"], 0);
 
     let apply_second = run_memo_cli(
         &db_path,
@@ -150,8 +150,8 @@ fn apply_idempotency() {
         apply_second.stderr_text()
     );
     let apply_second_json = parse_json_stdout(&apply_second);
-    assert_eq!(apply_second_json["result"]["accepted"], 0);
-    assert_eq!(apply_second_json["result"]["skipped"], 1);
+    assert_eq!(apply_second_json["data"]["accepted"], 0);
+    assert_eq!(apply_second_json["data"]["skipped"], 1);
 
     let second_payload = json!({
         "items": [{
@@ -176,7 +176,7 @@ fn apply_idempotency() {
         apply_third.stderr_text()
     );
     let apply_third_json = parse_json_stdout(&apply_third);
-    assert_eq!(apply_third_json["result"]["accepted"], 1);
+    assert_eq!(apply_third_json["data"]["accepted"], 1);
 
     let conn = rusqlite::Connection::open(db_path).expect("open db for assertions");
     let derivation_count: i64 = conn

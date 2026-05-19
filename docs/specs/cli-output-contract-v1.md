@@ -89,15 +89,19 @@ Failure envelope:
   "error": {
     "code": "stable-machine-code",
     "message": "human-readable summary",
-    "hint": "optional follow-up suggestion"
+    "hint": "optional follow-up suggestion",
+    "details": { /* optional machine-readable structured payload */ }
   }
 }
 ```
 
 The error `code` is stable and machine-usable; the `message` is a single
-line; the optional `hint` is human-only. Additional structured detail
-(stack traces, partial-failure records) belongs in `data` or
-crate-specific extension fields, never as free-form text.
+line; the optional `hint` is human-only; the optional `details` carries
+machine-readable structured payload (e.g. the offending payload path or
+per-item validation errors). When richer per-item detail is needed for
+partial-failure flows, prefer extending `details` over inventing
+crate-specific top-level fields. Free-form text never belongs anywhere
+in the error envelope.
 
 Reference implementation:
 [`nils_common::cli_contract::Envelope`](../../crates/nils-common/src/cli_contract.rs)

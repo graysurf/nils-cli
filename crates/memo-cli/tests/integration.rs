@@ -11,6 +11,8 @@ mod agent_roundtrip;
 mod apply_metadata_validation;
 #[path = "integration/completion_outside_repo.rs"]
 mod completion_outside_repo;
+#[path = "integration/exit_codes.rs"]
+mod exit_codes;
 #[path = "integration/extension_cleanup_contract.rs"]
 mod extension_cleanup_contract;
 #[path = "integration/fetch_apply_flow.rs"]

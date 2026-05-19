@@ -1,12 +1,12 @@
 use serde_json::json;
 
-use crate::cli::{OutputMode, UpdateArgs};
+use crate::cli::{OutputFormat, UpdateArgs};
 use crate::errors::AppError;
-use crate::output::{emit_json_result, format_item_id, parse_item_id, text};
+use crate::output::{emit_data, format_item_id, parse_item_id, text};
 use crate::storage::Storage;
 use crate::storage::repository;
 
-pub fn run(storage: &Storage, args: &UpdateArgs, output_mode: OutputMode) -> Result<(), AppError> {
+pub fn run(storage: &Storage, args: &UpdateArgs, format: OutputFormat) -> Result<(), AppError> {
     let item_id = parse_item_id(&args.item_id)
         .ok_or_else(|| AppError::usage("update requires a valid item_id"))?;
     let text = args.text.trim();
@@ -16,10 +16,9 @@ pub fn run(storage: &Storage, args: &UpdateArgs, output_mode: OutputMode) -> Res
 
     let updated = storage.with_transaction(|tx| repository::update_item(tx, item_id, text))?;
 
-    if output_mode.is_json() {
-        return emit_json_result(
-            "memo-cli.update.v1",
-            "memo-cli update",
+    if format.is_json() {
+        return emit_data(
+            "cli.memo-cli.update.v1",
             json!({
                 "item_id": format_item_id(updated.item_id),
                 "updated_at": updated.updated_at,

@@ -69,7 +69,7 @@ fn memo_flow_capture_fetch_apply_search_report() {
         fetch_output.stderr_text()
     );
     let fetch_json = parse_json_stdout(&fetch_output);
-    let fetch_rows = fetch_json["results"]
+    let fetch_rows = fetch_json["data"]["items"]
         .as_array()
         .expect("fetch results should be an array");
     assert_eq!(
@@ -133,9 +133,9 @@ fn memo_flow_capture_fetch_apply_search_report() {
         apply_output.stderr_text()
     );
     let apply_json = parse_json_stdout(&apply_output);
-    assert_eq!(apply_json["result"]["processed"], fixture.expected.captured);
-    assert_eq!(apply_json["result"]["accepted"], fixture.expected.captured);
-    assert_eq!(apply_json["result"]["failed"], 0);
+    assert_eq!(apply_json["data"]["processed"], fixture.expected.captured);
+    assert_eq!(apply_json["data"]["accepted"], fixture.expected.captured);
+    assert_eq!(apply_json["data"]["failed"], 0);
 
     let search_output = run_memo_cli(
         &db_path,
@@ -149,7 +149,7 @@ fn memo_flow_capture_fetch_apply_search_report() {
         search_output.stderr_text()
     );
     let search_json = parse_json_stdout(&search_output);
-    let search_rows = search_json["results"]
+    let search_rows = search_json["data"]["items"]
         .as_array()
         .expect("search results should be an array");
     assert!(
@@ -177,12 +177,12 @@ fn memo_flow_capture_fetch_apply_search_report() {
     );
     let report_json = parse_json_stdout(&report_output);
     assert_eq!(
-        report_json["result"]["totals"]["captured"],
+        report_json["data"]["totals"]["captured"],
         fixture.expected.captured
     );
     assert_eq!(
-        report_json["result"]["totals"]["enriched"],
+        report_json["data"]["totals"]["enriched"],
         fixture.expected.captured
     );
-    assert_eq!(report_json["result"]["totals"]["pending"], 0);
+    assert_eq!(report_json["data"]["totals"]["pending"], 0);
 }

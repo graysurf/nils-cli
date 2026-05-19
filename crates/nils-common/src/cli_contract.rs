@@ -106,6 +106,8 @@ pub struct EnvelopeError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 impl EnvelopeError {
@@ -115,12 +117,19 @@ impl EnvelopeError {
             code: code.into(),
             message: message.into(),
             hint: None,
+            details: None,
         }
     }
 
-    /// Attach an optional hint to the error.
+    /// Attach an optional human-readable hint to the error.
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Attach optional machine-readable structured detail to the error (e.g. the offending payload path).
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
         self
     }
 }

@@ -1,13 +1,13 @@
 use serde_json::json;
 
-use crate::cli::{AddArgs, OutputMode};
+use crate::cli::{AddArgs, OutputFormat};
 use crate::errors::AppError;
-use crate::output::{emit_json_result, format_item_id, text};
+use crate::output::{emit_data, format_item_id, text};
 use crate::storage::Storage;
 use crate::storage::repository;
 use crate::timestamps::{format_utc, parse_rfc3339_utc};
 
-pub fn run(storage: &Storage, args: &AddArgs, output_mode: OutputMode) -> Result<(), AppError> {
+pub fn run(storage: &Storage, args: &AddArgs, format: OutputFormat) -> Result<(), AppError> {
     let text = args.text.trim();
     if text.is_empty() {
         return Err(AppError::usage("add requires a non-empty text argument"));
@@ -27,10 +27,9 @@ pub fn run(storage: &Storage, args: &AddArgs, output_mode: OutputMode) -> Result
     let added = storage
         .with_transaction(|tx| repository::add_item(tx, text, source, created_at.as_deref()))?;
 
-    if output_mode.is_json() {
-        return emit_json_result(
-            "memo-cli.add.v1",
-            "memo-cli add",
+    if format.is_json() {
+        return emit_data(
+            "cli.memo-cli.add.v1",
             json!({
                 "item_id": format_item_id(added.item_id),
                 "created_at": added.created_at,

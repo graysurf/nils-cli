@@ -1,7 +1,7 @@
 pub mod json;
 pub mod text;
 
-pub use json::{emit_json_error, emit_json_result, emit_json_results, emit_json_results_with_meta};
+pub use json::{emit_data, emit_data_with_warnings, emit_json_error};
 
 pub fn format_item_id(item_id: i64) -> String {
     format!("itm_{item_id:08}")

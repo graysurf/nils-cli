@@ -16,16 +16,15 @@ fn json_contract() {
         add_output.stderr_text()
     );
     let add_json = parse_json_stdout(&add_output);
-    assert_eq!(add_json["schema_version"], "memo-cli.add.v1");
-    assert_eq!(add_json["command"], "memo-cli add");
+    assert_eq!(add_json["schema_version"], "cli.memo-cli.add.v1");
     assert_eq!(add_json["ok"], true);
-    let item_id = add_json["result"]["item_id"]
+    let item_id = add_json["data"]["item_id"]
         .as_str()
         .expect("item_id should be a string");
-    assert!(add_json.get("result").is_some(), "result key should exist");
+    assert!(add_json.get("data").is_some(), "data key should exist");
     assert!(
-        add_json.get("results").is_none(),
-        "results key should not exist"
+        add_json.get("error").is_none(),
+        "error key should be absent on success"
     );
 
     let update_output = run_memo_cli(
@@ -40,10 +39,9 @@ fn json_contract() {
         update_output.stderr_text()
     );
     let update_json = parse_json_stdout(&update_output);
-    assert_eq!(update_json["schema_version"], "memo-cli.update.v1");
-    assert_eq!(update_json["command"], "memo-cli update");
+    assert_eq!(update_json["schema_version"], "cli.memo-cli.update.v1");
     assert_eq!(update_json["ok"], true);
-    assert_eq!(update_json["result"]["state"], "pending");
+    assert_eq!(update_json["data"]["state"], "pending");
 
     let list_output = run_memo_cli(&db_path, &["--json", "list", "--limit", "20"], None);
     assert_eq!(
@@ -53,25 +51,20 @@ fn json_contract() {
         list_output.stderr_text()
     );
     let list_json = parse_json_stdout(&list_output);
-    assert_eq!(list_json["schema_version"], "memo-cli.list.v1");
-    assert_eq!(list_json["command"], "memo-cli list");
+    assert_eq!(list_json["schema_version"], "cli.memo-cli.list.v1");
     assert_eq!(list_json["ok"], true);
     assert!(
-        list_json.get("result").is_none(),
-        "result key should not exist"
+        list_json["data"]["items"].is_array(),
+        "data.items key should exist"
     );
     assert!(
-        list_json.get("results").is_some(),
-        "results key should exist"
+        list_json["data"].get("pagination").is_some(),
+        "data.pagination key should exist"
     );
-    assert!(
-        list_json.get("pagination").is_some(),
-        "pagination key should exist"
-    );
-    assert_eq!(list_json["pagination"]["limit"], 20);
-    assert_eq!(list_json["pagination"]["offset"], 0);
-    assert_eq!(list_json["pagination"]["returned"], 1);
-    let first_list_item = &list_json["results"][0];
+    assert_eq!(list_json["data"]["pagination"]["limit"], 20);
+    assert_eq!(list_json["data"]["pagination"]["offset"], 0);
+    assert_eq!(list_json["data"]["pagination"]["returned"], 1);
+    let first_list_item = &list_json["data"]["items"][0];
     assert!(
         first_list_item.get("content_type").is_some(),
         "list item should include content_type key"
@@ -89,20 +82,22 @@ fn json_contract() {
         search_output.stderr_text()
     );
     let search_json = parse_json_stdout(&search_output);
-    assert_eq!(search_json["schema_version"], "memo-cli.search.v1");
-    assert_eq!(search_json["command"], "memo-cli search");
+    assert_eq!(search_json["schema_version"], "cli.memo-cli.search.v1");
     assert_eq!(search_json["ok"], true);
     assert!(
-        search_json.get("results").is_some(),
-        "results key should exist"
+        search_json["data"]["items"].is_array(),
+        "data.items key should exist"
     );
-    assert!(search_json.get("meta").is_some(), "meta key should exist");
-    assert_eq!(search_json["meta"]["query"], "ssd");
-    assert_eq!(search_json["meta"]["limit"], 5);
-    assert_eq!(search_json["meta"]["state"], "all");
-    assert_eq!(search_json["meta"]["match"], "fts");
+    assert!(
+        search_json["data"].get("meta").is_some(),
+        "data.meta key should exist"
+    );
+    assert_eq!(search_json["data"]["meta"]["query"], "ssd");
+    assert_eq!(search_json["data"]["meta"]["limit"], 5);
+    assert_eq!(search_json["data"]["meta"]["state"], "all");
+    assert_eq!(search_json["data"]["meta"]["match"], "fts");
     assert_eq!(
-        search_json["meta"]["fields"],
+        search_json["data"]["meta"]["fields"],
         json!(["raw_text", "derived_text", "tags_text"])
     );
 
@@ -114,16 +109,16 @@ fn json_contract() {
         fetch_output.stderr_text()
     );
     let fetch_json = parse_json_stdout(&fetch_output);
-    assert_eq!(fetch_json["schema_version"], "memo-cli.fetch.v1");
+    assert_eq!(fetch_json["schema_version"], "cli.memo-cli.fetch.v1");
     assert!(
-        fetch_json.get("results").is_some(),
-        "results key should exist"
+        fetch_json["data"]["items"].is_array(),
+        "data.items key should exist"
     );
     assert!(
-        fetch_json.get("pagination").is_some(),
-        "pagination key should exist"
+        fetch_json["data"].get("pagination").is_some(),
+        "data.pagination key should exist"
     );
-    let first_fetch_item = &fetch_json["results"][0];
+    let first_fetch_item = &fetch_json["data"]["items"][0];
     assert!(
         first_fetch_item.get("content_type").is_some(),
         "fetch item should include content_type key"
@@ -136,11 +131,15 @@ fn json_contract() {
     let invalid_apply = run_memo_cli(&db_path, &["--json", "apply", "--stdin"], Some("{}"));
     assert_eq!(invalid_apply.code, 65, "apply should fail with data error");
     let invalid_apply_json = parse_json_stdout(&invalid_apply);
-    assert_eq!(invalid_apply_json["schema_version"], "memo-cli.apply.v1");
-    assert_eq!(invalid_apply_json["command"], "memo-cli apply");
+    assert_eq!(
+        invalid_apply_json["schema_version"],
+        "cli.memo-cli.apply.v1"
+    );
     assert_eq!(invalid_apply_json["ok"], false);
-    assert!(invalid_apply_json.get("result").is_none());
-    assert!(invalid_apply_json.get("results").is_none());
+    assert!(
+        invalid_apply_json.get("data").is_none(),
+        "failure envelope should omit data"
+    );
     assert_eq!(
         invalid_apply_json["error"]["code"],
         serde_json::Value::String("invalid-apply-payload".to_string())
@@ -162,10 +161,9 @@ fn json_contract() {
         delete_output.stderr_text()
     );
     let delete_json = parse_json_stdout(&delete_output);
-    assert_eq!(delete_json["schema_version"], "memo-cli.delete.v1");
-    assert_eq!(delete_json["command"], "memo-cli delete");
+    assert_eq!(delete_json["schema_version"], "cli.memo-cli.delete.v1");
     assert_eq!(delete_json["ok"], true);
-    assert_eq!(delete_json["result"]["deleted"], true);
+    assert_eq!(delete_json["data"]["deleted"], true);
 }
 
 #[test]
@@ -185,7 +183,7 @@ fn json_no_secret_leak() {
         add_output.stderr_text()
     );
     let add_json = parse_json_stdout(&add_output);
-    let item_id = add_json["result"]["item_id"]
+    let item_id = add_json["data"]["item_id"]
         .as_str()
         .expect("item_id should be a string");
 

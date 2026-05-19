@@ -20,7 +20,7 @@ fn hard_delete_cleans_anchor_and_typed_workflow_rows() {
         add_output.stderr_text()
     );
     let add_json = parse_json_stdout(&add_output);
-    let item_id_str = add_json["result"]["item_id"]
+    let item_id_str = add_json["data"]["item_id"]
         .as_str()
         .expect("item_id should be string");
     let item_id = parse_item_id(item_id_str).expect("item_id should parse");

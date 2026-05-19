@@ -1,4 +1,4 @@
-use serde::Serialize;
+use nils_common::cli_contract::exit;
 use serde_json::json;
 
 #[derive(Debug)]
@@ -9,18 +9,10 @@ pub struct AppError {
     details: Option<Box<serde_json::Value>>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct JsonError<'a> {
-    pub code: &'a str,
-    pub message: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<&'a serde_json::Value>,
-}
-
 impl AppError {
     pub fn usage(message: impl Into<String>) -> Self {
         Self {
-            exit_code: 64,
+            exit_code: exit::USAGE,
             code: "invalid-arguments".into(),
             message: message.into().into_boxed_str(),
             details: None,
@@ -29,7 +21,7 @@ impl AppError {
 
     pub fn data(message: impl Into<String>) -> Self {
         Self {
-            exit_code: 65,
+            exit_code: exit::DATA,
             code: "invalid-input".into(),
             message: message.into().into_boxed_str(),
             details: None,
@@ -38,7 +30,7 @@ impl AppError {
 
     pub fn runtime(message: impl Into<String>) -> Self {
         Self {
-            exit_code: 1,
+            exit_code: exit::RUNTIME,
             code: "runtime-failure".into(),
             message: message.into().into_boxed_str(),
             details: None,
@@ -97,12 +89,8 @@ impl AppError {
         self.message.as_ref()
     }
 
-    pub fn json_error(&self) -> JsonError<'_> {
-        JsonError {
-            code: self.code(),
-            message: self.message(),
-            details: self.details.as_deref(),
-        }
+    pub fn details(&self) -> Option<&serde_json::Value> {
+        self.details.as_deref()
     }
 }
 
