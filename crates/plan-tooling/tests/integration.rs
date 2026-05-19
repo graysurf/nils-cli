@@ -13,6 +13,8 @@ pub mod common;
 mod completion_outside_repo;
 #[path = "integration/scaffold.rs"]
 mod scaffold;
+#[path = "integration/spec.rs"]
+mod spec;
 #[path = "integration/split_prs.rs"]
 mod split_prs;
 #[path = "integration/to_json.rs"]

@@ -31,6 +31,9 @@ _plan-tooling() {
             plan__tooling,scaffold)
                 cmd="plan__tooling__scaffold"
                 ;;
+            plan__tooling,spec)
+                cmd="plan__tooling__spec"
+                ;;
             plan__tooling,split-prs)
                 cmd="plan__tooling__split__prs"
                 ;;
@@ -47,7 +50,7 @@ _plan-tooling() {
 
     case "${cmd}" in
         plan__tooling)
-            opts="-h -V --help --version to-json validate batches artifact-audit split-prs scaffold completion help"
+            opts="-h -V --help --version to-json validate batches artifact-audit split-prs scaffold spec completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -170,6 +173,24 @@ _plan-tooling() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        plan__tooling__spec)
+            opts="-h --format --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         plan__tooling__split__prs)
             opts="-h --file --scope --sprint --pr-grouping --default-pr-grouping --pr-group --strategy --owner-prefix --branch-prefix --worktree-prefix --format --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
@@ -251,7 +272,7 @@ _plan-tooling() {
             return 0
             ;;
         plan__tooling__validate)
-            opts="-h --file --format --help"
+            opts="-h --file --format --explain --no-group --fix --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

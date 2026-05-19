@@ -478,9 +478,7 @@ mod tests {
     #[test]
     fn markdown_field_accepts_continuation_value_with_backtick() {
         // Continuation form: label on one line, value on the next.
-        let text = format!(
-            "- {RECOMMENDED_PLAN_LABEL}:\n  `docs/plans/demo/demo-plan.md`\n",
-        );
+        let text = format!("- {RECOMMENDED_PLAN_LABEL}:\n  `docs/plans/demo/demo-plan.md`\n",);
         assert_eq!(
             markdown_field(&text, RECOMMENDED_PLAN_LABEL),
             Some("docs/plans/demo/demo-plan.md".to_string()),

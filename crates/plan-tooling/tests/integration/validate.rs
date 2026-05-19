@@ -158,6 +158,67 @@ fn validate_missing_dependencies_is_error() {
 }
 
 #[test]
+fn validate_fix_rewrites_inline_comma_dep_list_and_passes() {
+    let repo = init_repo();
+    write_file(&repo.path().join("fixable.md"), FIXABLE_INLINE_COMMA_PLAN);
+    let plan_path = repo.path().join("fixable.md");
+
+    // Before --fix: validation fails because the inline-comma form yields
+    // an "invalid dependency" entry for the second comma-separated token
+    // (the parser today splits on commas but the value `1.1, 1.2` reaches
+    // it as a single list item that the user wrote inline).
+    let before = run_plan_tooling(repo.path(), &["validate", "--file", "fixable.md"]);
+    // Then run --fix and re-validate via the same invocation.
+    let fix_out = run_plan_tooling(repo.path(), &["validate", "--file", "fixable.md", "--fix"]);
+    assert_eq!(
+        fix_out.code, 0,
+        "fixable plan should validate after --fix; stdout:{} stderr:{}",
+        fix_out.stdout, fix_out.stderr,
+    );
+    // Disk content must match canonical form.
+    let after_disk = std::fs::read_to_string(&plan_path).expect("plan exists");
+    assert!(
+        after_disk.contains("  - Task 1.1\n  - Task 1.2"),
+        "rewritten plan must split into canonical bullets, got:\n{after_disk}",
+    );
+    // Running --fix again must be a fixed point (no second rewrite).
+    let after_disk_again = std::fs::read_to_string(&plan_path).expect("plan exists");
+    let twice = run_plan_tooling(repo.path(), &["validate", "--file", "fixable.md", "--fix"]);
+    assert_eq!(twice.code, 0);
+    let after_twice_disk = std::fs::read_to_string(&plan_path).expect("plan exists");
+    assert_eq!(
+        after_disk_again, after_twice_disk,
+        "--fix must be idempotent"
+    );
+
+    // Sanity check the pre-fix run produced the dependency error.
+    assert_eq!(before.code, 1);
+}
+
+#[test]
+fn validate_fix_strips_backtick_wrapped_primary_source() {
+    let repo = init_repo();
+    std::fs::create_dir_all(repo.path().join("docs/source")).expect("create_dir_all");
+    write_file(&repo.path().join("docs/source/spec.md"), "# Spec\n");
+    write_file(
+        &repo.path().join("backtick.md"),
+        BACKTICK_PRIMARY_SOURCE_PLAN,
+    );
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "backtick.md", "--fix"]);
+    assert_eq!(
+        out.code, 0,
+        "should validate after stripping backticks; stderr: {}",
+        out.stderr,
+    );
+    let after = std::fs::read_to_string(repo.path().join("backtick.md")).expect("plan exists");
+    assert!(
+        after.contains("- Primary source: docs/source/spec.md\n"),
+        "expected stripped Primary source, got:\n{after}",
+    );
+}
+
+#[test]
 fn validate_text_groups_errors_when_three_or_more_share_class() {
     let repo = init_repo();
     write_file(&repo.path().join("group.md"), GROUPED_DEP_PLAN);
@@ -837,6 +898,72 @@ const BACKTICK_DESCRIPTION_PLAN: &str = r#"# Plan: Backtick description
   - none
 - **Acceptance criteria**:
   - Slot resolves
+- **Validation**:
+  - cargo test
+"#;
+
+const FIXABLE_INLINE_COMMA_PLAN: &str = r#"# Plan: Fixable inline-comma
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Anchor
+- **Location**:
+  - `src/a.rs`
+- **Description**: Anchor task
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test
+
+### Task 1.2: B
+- **Location**:
+  - `src/b.rs`
+- **Description**: B
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - B works
+- **Validation**:
+  - cargo test
+
+### Task 1.3: C inline-comma deps
+- **Location**:
+  - `src/c.rs`
+- **Description**: Depends on 1.1 and 1.2 written inline.
+- **Dependencies**:
+  - 1.1, 1.2
+- **Acceptance criteria**:
+  - C works
+- **Validation**:
+  - cargo test
+"#;
+
+const BACKTICK_PRIMARY_SOURCE_PLAN: &str = r#"# Plan: Backtick primary source
+
+## Read First
+
+- Primary source: `docs/source/spec.md`
+- Source type: existing issue/spec
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
 - **Validation**:
   - cargo test
 "#;

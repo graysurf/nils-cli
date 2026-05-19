@@ -161,7 +161,7 @@ impl RuntimeMetadataMaterializer {
                     .clone()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|dep| dep.trim().to_string())
+                    .map(|dep| dep.id.trim().to_string())
                     .filter(|dep| !dep.is_empty())
                     .filter(|dep| !is_plan_placeholder(dep))
                     .collect::<Vec<_>>();

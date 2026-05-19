@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::parse::{Plan, Sprint, Task, parse_plan_with_display};
 
 const USAGE: &str = r#"Usage:
-  validate_plans.sh [--file <path>]... [--format text|json] [--explain] [--no-group]
+  validate_plans.sh [--file <path>]... [--format text|json] [--explain] [--no-group] [--fix]
 
 Purpose:
   Lint plan markdown files under docs/plans/ against Plan Format v1.
@@ -20,7 +20,11 @@ Options:
   --explain      Append canonical accepted-shape examples per error class.
                  Output is independent of exit code (also prints on success).
   --no-group     Disable class-grouped text output. Print one `error:` line per
-                 occurrence, matching the legacy (pre-0.9.0) flat shape.
+                 occurrence, matching the pre-0.9.0 flat shape.
+  --fix          Rewrite mechanical violations in-place across the plan and
+                 its bundle siblings (source doc + execution state), then
+                 re-validate and report any remaining errors. Safe rewrites
+                 only — ambiguous violations remain as errors.
   -h, --help     Show help
 
 Defaults:
@@ -53,10 +57,10 @@ struct ValidateOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ExplainEntry {
-    class: &'static str,
-    rule: &'static str,
-    example: &'static str,
+pub(crate) struct ExplainEntry {
+    pub(crate) class: &'static str,
+    pub(crate) rule: &'static str,
+    pub(crate) example: &'static str,
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +74,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut format = "text".to_string();
     let mut explain = false;
     let mut no_group = false;
+    let mut do_fix = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -94,6 +99,10 @@ pub fn run(args: &[String]) -> i32 {
             }
             "--no-group" => {
                 no_group = true;
+                i += 1;
+            }
+            "--fix" => {
+                do_fix = true;
                 i += 1;
             }
             "-h" | "--help" => {
@@ -165,6 +174,9 @@ pub fn run(args: &[String]) -> i32 {
                 p.set_position((idx + 1) as u64);
             }
             continue;
+        }
+        if do_fix {
+            apply_fix_to_bundle(&read_path, &repo_root, &mut errors, &display_path);
         }
         errors.extend(validate_plan(&display_path, &read_path, &repo_root));
 
@@ -353,6 +365,53 @@ fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
         return path.to_path_buf();
     }
     repo_root.join(path)
+}
+
+/// Apply mechanical fixers to the plan and, when discoverable, the sibling
+/// bundle files (discussion / review source doc and execution state). I/O
+/// failures are surfaced as `error:` lines so authors notice them after the
+/// fix run.
+fn apply_fix_to_bundle(
+    plan_read_path: &Path,
+    repo_root: &Path,
+    errors: &mut Vec<String>,
+    plan_display_path: &str,
+) {
+    apply_fix_to_file(plan_read_path, plan_display_path, errors);
+    let Some(bundle) = crate::bundle::bundle_for_plan(plan_read_path, repo_root) else {
+        return;
+    };
+    let candidates = [
+        bundle.discussion_source_path.clone(),
+        bundle.review_source_path.clone(),
+        bundle.execution_state_path.clone(),
+    ];
+    for rel in candidates {
+        let abs = repo_root.join(&rel);
+        if !abs.is_file() {
+            continue;
+        }
+        apply_fix_to_file(&abs, &rel, errors);
+    }
+}
+
+fn apply_fix_to_file(path: &Path, display_path: &str, errors: &mut Vec<String>) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(err) => {
+            errors.push(format!("{display_path}: failed to read for --fix: {err}"));
+            return;
+        }
+    };
+    let fixed = crate::fix::fix_text(&text);
+    if fixed == text {
+        return;
+    }
+    if let Err(err) = std::fs::write(path, fixed) {
+        errors.push(format!(
+            "{display_path}: failed to write --fix output: {err}"
+        ));
+    }
 }
 
 fn validate_plan(display_path: &str, read_path: &Path, repo_root: &Path) -> Vec<String> {
@@ -571,7 +630,7 @@ fn validate_task(
                 // Trailing `/` opts into directory mode; the path must exist as a
                 // directory under repo_root or we flag a "directory not found"
                 // diagnostic (separate class so authors don't confuse it with
-                // the legacy file-only error).
+                // the file-only error class).
                 let stripped = loc.trim_end_matches('/');
                 let dir_path = repo_root.join(stripped);
                 if !dir_path.is_dir() {
@@ -784,14 +843,14 @@ fn is_task_id(s: &str) -> bool {
     a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit())
 }
 
-struct ExplainCatalogEntry {
+pub(crate) struct ExplainCatalogEntry {
     /// Substring used to detect that this error class fired. Must appear in
     /// the matching error message and be unique across the catalog.
-    pattern: &'static str,
-    explain: ExplainEntry,
+    pub(crate) pattern: &'static str,
+    pub(crate) explain: ExplainEntry,
 }
 
-const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
+pub(crate) const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
     ExplainCatalogEntry {
         pattern: "missing Read First",
         explain: ExplainEntry {
@@ -1250,7 +1309,10 @@ fn explanations_for(errors: &[String]) -> ExplainResult {
         }
     }
 
-    ExplainResult { matched, uncatalogued }
+    ExplainResult {
+        matched,
+        uncatalogued,
+    }
 }
 
 fn print_explanations_text(result: &ExplainResult) {
@@ -1290,8 +1352,8 @@ mod tests {
     use super::{
         ALL_EMITTED_ERROR_PATTERNS, EXPLAIN_CATALOG, KNOWN_UNCATALOGUED, clean_source_value,
         contains_angle_placeholder, contains_word_case_insensitive, explanations_for,
-        format_errors_text, has_placeholder, is_allowed_source_type, is_non_empty_list,
-        is_task_id, strip_backtick_spans, validate_task,
+        format_errors_text, has_placeholder, is_allowed_source_type, is_non_empty_list, is_task_id,
+        strip_backtick_spans, validate_task,
     };
 
     #[test]
@@ -1528,7 +1590,9 @@ mod tests {
             let matched_catalog = EXPLAIN_CATALOG
                 .iter()
                 .any(|entry| pattern.contains(entry.pattern));
-            let matched_optout = KNOWN_UNCATALOGUED.iter().any(|frag| pattern.contains(*frag));
+            let matched_optout = KNOWN_UNCATALOGUED
+                .iter()
+                .any(|frag| pattern.contains(*frag));
             assert!(
                 matched_catalog || matched_optout,
                 "emitted error pattern is neither catalogued nor opted out: {pattern}",
@@ -1559,7 +1623,10 @@ mod tests {
         ];
         let result = explanations_for(&errors);
         assert!(
-            result.matched.iter().any(|e| e.class == "location-absolute"),
+            result
+                .matched
+                .iter()
+                .any(|e| e.class == "location-absolute"),
             "expected location-absolute, got: {:?}",
             result.matched,
         );
@@ -1600,12 +1667,12 @@ mod tests {
         let out = format_errors_text(&errors, false);
         // No group header.
         assert!(!out.contains("[dependency-invalid]"));
-        assert!(out.contains(
-            "error: plan.md:Task 1.1: invalid dependency (expected ...): 'foo'\n"
-        ));
-        assert!(out.contains(
-            "error: plan.md:Task 1.2: invalid dependency (expected ...): 'bar'\n"
-        ));
+        assert!(
+            out.contains("error: plan.md:Task 1.1: invalid dependency (expected ...): 'foo'\n")
+        );
+        assert!(
+            out.contains("error: plan.md:Task 1.2: invalid dependency (expected ...): 'bar'\n")
+        );
     }
 
     #[test]
