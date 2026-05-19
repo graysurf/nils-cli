@@ -313,6 +313,11 @@ json\:"Single-record JSON envelope (snake_case)"))' \
         case $line[1] in
             (create)
 _arguments "${_arguments_options[@]}" : \
+'--title=[Issue title (≤70 chars per \`title_length\` rule)]:TITLE:_default' \
+'(--body-file)--body=[Issue body (inline). Mutually exclusive with \`--body-file\`]:BODY:_default' \
+'--body-file=[Read body from a file. Use \`-\` for stdin]:BODY_FILE:_default' \
+'*--label=[Add a label. Repeat to apply multiple labels]:NAME:_default' \
+'*--assignee=[Assign a user. Repeat to assign multiple]:LOGIN:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -338,6 +343,12 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (edit)
 _arguments "${_arguments_options[@]}" : \
+'--title=[New title (re-validated against \`title_length\`)]:TITLE:_default' \
+'(--body-file)--body=[New body. Mutually exclusive with \`--body-file\`]:BODY:_default' \
+'--body-file=[Read body from a file. Use \`-\` for stdin]:BODY_FILE:_default' \
+'*--add-label=[Add a label. Repeat to add multiple]:NAME:_default' \
+'*--remove-label=[Remove a label. Repeat to remove multiple]:NAME:_default' \
+'*--add-assignee=[Add an assignee. Repeat to assign multiple]:LOGIN:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -346,11 +357,13 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':id -- Numeric id:_default' \
+':id -- Numeric issue id:_default' \
 && ret=0
 ;;
 (comment)
 _arguments "${_arguments_options[@]}" : \
+'(--body-file)--body=[Comment body. Mutually exclusive with \`--body-file\`]:BODY:_default' \
+'--body-file=[Read body from a file. Use \`-\` for stdin]:BODY_FILE:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -359,7 +372,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':id -- Numeric id:_default' \
+':id -- Numeric issue id:_default' \
 && ret=0
 ;;
 (close)

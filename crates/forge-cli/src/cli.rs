@@ -428,22 +428,16 @@ pub enum PrCommand {
 #[derive(Subcommand, Debug)]
 pub enum IssueCommand {
     /// Open a new issue.
-    Create,
+    Create(IssueCreateArgs),
     /// Fetch a single issue.
     View {
         /// Numeric id.
         id: u64,
     },
     /// Mutate an issue.
-    Edit {
-        /// Numeric id.
-        id: u64,
-    },
+    Edit(IssueEditArgs),
     /// Append a comment to an issue.
-    Comment {
-        /// Numeric id.
-        id: u64,
-    },
+    Comment(IssueCommentArgs),
     /// Close an issue.
     Close {
         /// Numeric id.
@@ -454,6 +448,64 @@ pub enum IssueCommand {
         /// Numeric id.
         id: u64,
     },
+}
+
+/// `issue create` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct IssueCreateArgs {
+    /// Issue title (≤70 chars per `title_length` rule).
+    #[arg(long)]
+    pub title: String,
+    /// Issue body (inline). Mutually exclusive with `--body-file`.
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read body from a file. Use `-` for stdin.
+    #[arg(long = "body-file")]
+    pub body_file: Option<String>,
+    /// Add a label. Repeat to apply multiple labels.
+    #[arg(long = "label", value_name = "NAME")]
+    pub labels: Vec<String>,
+    /// Assign a user. Repeat to assign multiple.
+    #[arg(long = "assignee", value_name = "LOGIN")]
+    pub assignees: Vec<String>,
+}
+
+/// `issue edit` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct IssueEditArgs {
+    /// Numeric issue id.
+    pub id: u64,
+    /// New title (re-validated against `title_length`).
+    #[arg(long)]
+    pub title: Option<String>,
+    /// New body. Mutually exclusive with `--body-file`.
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read body from a file. Use `-` for stdin.
+    #[arg(long = "body-file")]
+    pub body_file: Option<String>,
+    /// Add a label. Repeat to add multiple.
+    #[arg(long = "add-label", value_name = "NAME")]
+    pub add_label: Vec<String>,
+    /// Remove a label. Repeat to remove multiple.
+    #[arg(long = "remove-label", value_name = "NAME")]
+    pub remove_label: Vec<String>,
+    /// Add an assignee. Repeat to assign multiple.
+    #[arg(long = "add-assignee", value_name = "LOGIN")]
+    pub add_assignee: Vec<String>,
+}
+
+/// `issue comment` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct IssueCommentArgs {
+    /// Numeric issue id.
+    pub id: u64,
+    /// Comment body. Mutually exclusive with `--body-file`.
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read body from a file. Use `-` for stdin.
+    #[arg(long = "body-file")]
+    pub body_file: Option<String>,
 }
 
 /// `repo` subtree.
@@ -532,6 +584,24 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Merge(args)),
         })) => ops::pr_merge::run(&global, args, format),
+        Some(Command::Issue(IssueArgs {
+            command: Some(IssueCommand::Create(args)),
+        })) => ops::issue_create::run(&global, args, format),
+        Some(Command::Issue(IssueArgs {
+            command: Some(IssueCommand::View { id }),
+        })) => ops::issue_view::run(&global, id, format),
+        Some(Command::Issue(IssueArgs {
+            command: Some(IssueCommand::Edit(args)),
+        })) => ops::issue_edit::run(&global, args, format),
+        Some(Command::Issue(IssueArgs {
+            command: Some(IssueCommand::Comment(args)),
+        })) => ops::issue_comment::run(&global, args, format),
+        Some(Command::Issue(IssueArgs {
+            command: Some(IssueCommand::Close { id }),
+        })) => ops::issue_close::run(&global, id, format),
+        Some(Command::Issue(IssueArgs {
+            command: Some(IssueCommand::Reopen { id }),
+        })) => ops::issue_reopen::run(&global, id, format),
         Some(Command::Completion(CompletionArgs { shell })) => emit_completion(shell),
         None
         | Some(Command::Auth(AuthArgs { command: None }))
@@ -809,10 +879,11 @@ mod tests {
     #[test]
     fn lists_every_issue_v1_subcommand() {
         for sub in ["create", "view", "edit", "comment", "close", "reopen"] {
-            let mut argv = vec!["issue", sub];
-            if sub != "create" {
-                argv.push("1");
-            }
+            let argv: Vec<&str> = match sub {
+                "create" => vec!["issue", "create", "--title", "demo"],
+                "comment" | "edit" => vec!["issue", sub, "1"],
+                _ => vec!["issue", sub, "1"],
+            };
             let result = parse(&argv);
             assert!(result.is_ok(), "issue {sub} should parse, got {result:?}");
         }
