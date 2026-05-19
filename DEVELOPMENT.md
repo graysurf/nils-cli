@@ -80,6 +80,18 @@ This also validates touched `docs/plans/**` bundles with:
 bash scripts/ci/plan-bundle-validate.sh --strict
 ```
 
+The docs-only entrypoint additionally runs the CLI output contract lint
+(`docs/specs/cli-output-contract-v1.md`) so envelope and exit-code drift gets
+caught even on PRs that only touch documentation:
+
+```bash
+bash scripts/ci/cli-output-contract-lint.sh --strict
+```
+
+The lint has a self-test under
+`scripts/ci/tests/cli-output-contract-lint.test.sh` that exercises every
+regression class against synthetic fixtures.
+
 ### 3.2 CI-like required checks (recommended before push)
 
 ```bash
@@ -124,6 +136,7 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/docs-hygiene-audit.sh --strict`
 - `bash scripts/ci/markdownlint-audit.sh --strict`
 - `bash scripts/ci/plan-bundle-validate.sh --strict`
+- `bash scripts/ci/cli-output-contract-lint.sh --strict`
 - `bash scripts/ci/test-stale-audit.sh --strict`
 - `bash scripts/ci/third-party-artifacts-audit.sh --strict`
 - `bash scripts/ci/completion-asset-audit.sh --strict`
