@@ -278,7 +278,7 @@ pub struct PrWaitChecksArgs {
 
 /// Parse a duration string like `30m`, `20s`, `5h`, `500ms`. Accepts bare
 /// integers as seconds.
-fn parse_duration(s: &str) -> Result<Duration, String> {
+pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("duration cannot be empty".into());
