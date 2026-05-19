@@ -10,6 +10,7 @@
 //! - APIs stay domain-neutral and must not encode crate-specific UX policies.
 //! - Quoting and ANSI differences are expressed via explicit mode/policy parameters.
 //!
+pub mod cli_contract;
 pub mod clipboard;
 pub mod env;
 pub mod fs;

@@ -1877,6 +1877,8 @@ dependencies = [
  "nils-term",
  "nils-test-support",
  "pretty_assertions",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1905,8 +1907,10 @@ name = "nils-common"
 version = "0.10.2"
 dependencies = [
  "base64",
+ "clap",
  "nils-test-support",
  "pretty_assertions",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
