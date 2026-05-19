@@ -27,6 +27,12 @@ fn deterministic_env(path: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
+fn deterministic_env_with_pager(path: &str, pager: &str) -> Vec<(&'static str, String)> {
+    let mut env = deterministic_env(path);
+    env.push(("GIT_PAGER", pager.to_string()));
+    env
+}
+
 fn env_refs<'a>(envs: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
     envs.iter()
         .map(|(key, value)| (*key, value.as_str()))
@@ -395,6 +401,42 @@ fn commit_no_summary_suppresses_summary_output() {
 }
 
 #[test]
+fn commit_quiet_suppresses_progress_and_summary_output() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+
+    let envs_owned = deterministic_env("/usr/bin:/bin:/usr/sbin:/sbin");
+    let envs = env_refs(&envs_owned);
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &["commit", "--message", "feat(core): add thing", "--quiet"],
+        &envs,
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(as_str(&output.stdout).trim().is_empty());
+    assert!(!as_str(&output.stderr).contains("semantic-commit"));
+    assert!(!as_str(&output.stderr).contains("git-scope summary unavailable"));
+}
+
+#[test]
+fn commit_git_show_summary_overrides_git_pager() {
+    let env_without_pager = deterministic_env("/usr/bin:/bin:/usr/sbin:/sbin");
+    let env_without_pager = env_refs(&env_without_pager);
+    let without_pager =
+        run_git_show_summary_commit(&env_without_pager, "without-pager.txt", "hello\n");
+
+    let env_with_pager = deterministic_env_with_pager("/usr/bin:/bin:/usr/sbin:/sbin", "less");
+    let env_with_pager = env_refs(&env_with_pager);
+    let with_pager = run_git_show_summary_commit(&env_with_pager, "without-pager.txt", "hello\n");
+
+    assert_eq!(without_pager.status.code(), Some(0));
+    assert_eq!(with_pager.status.code(), Some(0));
+    assert_eq!(as_str(&with_pager.stdout), as_str(&without_pager.stdout));
+}
+
+#[test]
 fn commit_git_show_summary_mode_works_without_git_scope() {
     let repo = common::init_repo();
     stage_file(repo.path(), "a.txt", "hello\n");
@@ -418,6 +460,29 @@ fn commit_git_show_summary_mode_works_without_git_scope() {
     assert_eq!(output.status.code(), Some(0));
     assert!(as_str(&output.stdout).contains("feat(core): add thing"));
     assert!(!as_str(&output.stderr).contains("warning: git-scope"));
+}
+
+fn run_git_show_summary_commit(
+    envs: &[(&'static str, &str)],
+    file_name: &str,
+    contents: &str,
+) -> std::process::Output {
+    let repo = common::init_repo();
+    stage_file(repo.path(), file_name, contents);
+
+    common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): add thing",
+            "--summary",
+            "git-show",
+            "--no-progress",
+        ],
+        envs,
+        None,
+    )
 }
 
 #[test]

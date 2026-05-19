@@ -55,6 +55,64 @@ The shared exit-code contract is defined in
 `docs/specs/cli-output-contract-v1.md`; help text should summarize the codes
 used by the binary rather than redefining that spec.
 
+## Global Flags
+
+Flags that affect the whole command invocation should be available before and
+after subcommands when the binary has subcommands. Mark these as
+`global = true` in clap definitions when the parser owns them:
+
+- `--format` for output shape.
+- `--quiet` and `--verbose` for output volume.
+- repo-locating flags such as `--repo`, `--repo-root`, or `--cwd`.
+
+Good:
+
+```rust
+#[arg(long, global = true)]
+repo: Option<PathBuf>,
+```
+
+Bad:
+
+```rust
+#[arg(long)]
+repo: Option<PathBuf>,
+```
+
+Keep workflow-specific options subcommand-scoped. For example,
+`semantic-commit commit --message <text>` belongs to the `commit` subcommand,
+not the root parser.
+
+## Short Flags
+
+Use consistent short flags across user-facing CLIs:
+
+- `-V` is version.
+- `-v` is verbose.
+- `-h` and `--help` are clap-generated help.
+
+Good:
+
+```rust
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+```
+
+Bad:
+
+```rust
+#[arg(short = 'V', long)]
+verbose: bool,
+```
+
+`disable_help_flag = true` requires a documented binary-wide rationale. Do not
+disable clap help only to keep a hand-rolled `help` branch alive; move that
+behavior to clap or document why the binary cannot.
+
 ## Subcommands
 
 Subcommands should have clear one-line help and, for complex flows, a

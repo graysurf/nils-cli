@@ -2,10 +2,10 @@ use crate::common;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn unknown_subcommand_exits_one() {
+fn unknown_subcommand_exits_usage() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let output = common::run_semantic_commit_output(dir.path(), &["bogus"], &[], None);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(64));
 }
 
 #[test]

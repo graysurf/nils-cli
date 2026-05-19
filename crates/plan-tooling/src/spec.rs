@@ -58,7 +58,7 @@ pub fn run(args: &[String]) -> i32 {
                 return 0;
             }
             "-V" | "--version" => {
-                crate::usage::print_version_stdout();
+                crate::cli::print_version_stdout();
                 return 0;
             }
             other => return die(&format!("unknown argument: {other}")),
