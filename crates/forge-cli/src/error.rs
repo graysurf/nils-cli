@@ -52,6 +52,16 @@ pub enum ForgeError {
         message: String,
         detail: Option<String>,
     },
+    /// Lock-down policy violation (branch / title / body / worktree / push
+    /// state). Maps to `DATA 65` with the rule-specific `error.kind`
+    /// discriminator declared in spec §"Lock-down policy".
+    #[error("{message}")]
+    Validation {
+        schema_version: String,
+        kind: &'static str,
+        message: String,
+        detail: Option<String>,
+    },
 }
 
 impl ForgeError {
@@ -130,6 +140,23 @@ impl ForgeError {
         }
     }
 
+    /// Build a `DATA 65` validation error with the given rule-specific kind.
+    /// The `kind` literal MUST match one of the entries in spec §"Lock-down
+    /// policy" so callers can branch on `error.kind`.
+    pub fn validation(
+        schema_version: impl Into<String>,
+        kind: &'static str,
+        message: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::Validation {
+            schema_version: schema_version.into(),
+            kind,
+            message: message.into(),
+            detail,
+        }
+    }
+
     /// Map the error to its exit-code constant.
     pub fn exit_code(&self) -> i32 {
         match self {
@@ -138,6 +165,7 @@ impl ForgeError {
             Self::BackendError { .. } => exit::RUNTIME,
             Self::ProviderUnsupported { .. } => exit::USAGE,
             Self::SoftwareError { .. } => exit::SOFTWARE,
+            Self::Validation { .. } => exit::DATA,
         }
     }
 
@@ -149,6 +177,7 @@ impl ForgeError {
             Self::BackendError { .. } => "backend_error",
             Self::ProviderUnsupported { .. } => "provider_unsupported",
             Self::SoftwareError { .. } => "software_error",
+            Self::Validation { kind, .. } => kind,
         }
     }
 
@@ -158,7 +187,8 @@ impl ForgeError {
             | Self::BackendUnavailable { schema_version, .. }
             | Self::BackendError { schema_version, .. }
             | Self::ProviderUnsupported { schema_version, .. }
-            | Self::SoftwareError { schema_version, .. } => schema_version,
+            | Self::SoftwareError { schema_version, .. }
+            | Self::Validation { schema_version, .. } => schema_version,
         }
     }
 
@@ -168,7 +198,8 @@ impl ForgeError {
             | Self::BackendUnavailable { message, .. }
             | Self::BackendError { message, .. }
             | Self::ProviderUnsupported { message, .. }
-            | Self::SoftwareError { message, .. } => message,
+            | Self::SoftwareError { message, .. }
+            | Self::Validation { message, .. } => message,
         }
     }
 
@@ -178,7 +209,8 @@ impl ForgeError {
             Self::BackendUnavailable { detail, .. }
             | Self::BackendError { detail, .. }
             | Self::ProviderUnsupported { detail, .. }
-            | Self::SoftwareError { detail, .. } => detail.as_deref(),
+            | Self::SoftwareError { detail, .. }
+            | Self::Validation { detail, .. } => detail.as_deref(),
         }
     }
 
@@ -252,6 +284,10 @@ mod tests {
             (
                 ForgeError::software("cli.forge-cli.error.v1", "x", None),
                 exit::SOFTWARE,
+            ),
+            (
+                ForgeError::validation("cli.forge-cli.error.v1", "branch_name_invalid", "x", None),
+                exit::DATA,
             ),
         ];
         for (err, expected) in cases {

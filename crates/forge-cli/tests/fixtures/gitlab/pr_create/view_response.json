@@ -1,0 +1,8 @@
+{
+  "iid": 77,
+  "web_url": "https://gitlab.com/sympoies/nils-cli/-/merge_requests/77",
+  "source_branch": "feat/sample",
+  "target_branch": "main",
+  "draft": true,
+  "title": "feat: sample feature"
+}

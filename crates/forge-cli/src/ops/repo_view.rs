@@ -98,6 +98,12 @@ fn build_call(ctx: &ProviderContext, repo_override: Option<&str>) -> BackendCall
     BackendCall::new(program, argv)
 }
 
+/// Re-export of the internal builder so `pr create` (and later atoms) can
+/// resolve the repo's default branch without duplicating the argv shape.
+pub fn build_call_for_default_branch(ctx: &ProviderContext) -> BackendCall {
+    build_call(ctx, None)
+}
+
 /// Parse the backend stdout into the normalized payload.
 pub fn parse_backend_output(
     ctx: &ProviderContext,

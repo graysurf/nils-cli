@@ -1,0 +1,8 @@
+{
+  "number": 123,
+  "url": "https://github.com/sympoies/nils-cli/pull/123",
+  "headRefName": "feat/sample",
+  "baseRefName": "main",
+  "isDraft": true,
+  "title": "feat: sample feature"
+}
