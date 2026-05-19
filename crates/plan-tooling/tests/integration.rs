@@ -11,6 +11,8 @@ mod batches;
 pub mod common;
 #[path = "integration/completion_outside_repo.rs"]
 mod completion_outside_repo;
+#[path = "integration/exit_codes.rs"]
+mod exit_codes;
 #[path = "integration/scaffold.rs"]
 mod scaffold;
 #[path = "integration/spec.rs"]

@@ -13,6 +13,8 @@ mod commit_mode;
 pub mod common;
 #[path = "integration/edge_cases.rs"]
 mod edge_cases;
+#[path = "integration/exit_codes.rs"]
+mod exit_codes;
 #[path = "integration/help_outside_repo.rs"]
 mod help_outside_repo;
 #[path = "integration/print_sources.rs"]

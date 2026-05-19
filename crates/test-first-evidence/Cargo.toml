@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
+nils-common = { version = "0.10.2", path = "../nils-common", package = "nils-common" }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }

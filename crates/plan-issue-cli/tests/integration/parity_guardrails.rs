@@ -136,7 +136,7 @@ fn parity_shell_multi_sprint_guide_matches_shell_fixture_after_normalization() {
 #[test]
 fn command_guardrails_local_issue_path_error_contains_subcommand_specific_guidance() {
     let out = common::run_plan_issue_local(&["--format", "json", "status-plan", "--issue", "217"]);
-    assert_eq!(out.code, 2, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 64, "stderr: {}", out.stderr);
 
     let payload = parse_json(&out.stdout);
     assert_eq!(payload["status"], "error");
@@ -268,7 +268,7 @@ fn command_guardrails_close_plan_requires_github_comment_url_format() {
         "https://example.com/not-github-comment",
     ]);
 
-    assert_eq!(out.code, 2, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 64, "stderr: {}", out.stderr);
     let payload = parse_json(&out.stdout);
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "invalid-approval-comment-url");

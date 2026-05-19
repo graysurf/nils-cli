@@ -1,19 +1,20 @@
 use crate::{artifact_audit, batches, scaffold, spec, validate};
+use nils_common::cli_contract::exit;
 
 pub fn dispatch(args: &[String]) -> i32 {
     if args.len() <= 1 {
         print_help_stdout();
-        return 0;
+        return exit::SUCCESS;
     }
 
     let subcommand = args[1].as_str();
     if is_help(subcommand) || subcommand == "help" {
         print_help_stdout();
-        return 0;
+        return exit::SUCCESS;
     }
     if is_version(subcommand) {
         print_version_stdout();
-        return 0;
+        return exit::SUCCESS;
     }
 
     match subcommand {
@@ -28,7 +29,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         other => {
             eprintln!("error: unknown argument: {other}");
             print_help_stderr();
-            1
+            exit::USAGE
         }
     }
 }
@@ -121,8 +122,8 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_unknown_command_exits_one() {
+    fn dispatch_unknown_command_exits_usage() {
         let code = dispatch(&["plan-tooling".to_string(), "nope".to_string()]);
-        assert_eq!(code, 1);
+        assert_eq!(code, exit::USAGE);
     }
 }

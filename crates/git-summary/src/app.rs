@@ -1,5 +1,7 @@
 use std::env;
 
+use nils_common::cli_contract::exit;
+
 use crate::cli::{print_header, print_help};
 use crate::dates::{
     last_month_range, last_week_range, this_month_range, this_week_range, today_range,
@@ -17,11 +19,11 @@ pub fn run() -> i32 {
 
     if args.is_empty() || is_help(&args[0]) {
         print_help();
-        return 0;
+        return exit::SUCCESS;
     }
     if is_version(&args[0]) {
         println!("git-summary {}", env!("CARGO_PKG_VERSION"));
-        return 0;
+        return exit::SUCCESS;
     }
 
     let cmd = args[0].as_str();
@@ -29,7 +31,7 @@ pub fn run() -> i32 {
         "all" => {
             if let Err(msg) = require_git() {
                 println!("{msg}");
-                return 1;
+                return exit::RUNTIME;
             }
             print_header("all commits");
             summary(None, None)
@@ -37,7 +39,7 @@ pub fn run() -> i32 {
         "today" => {
             if let Err(msg) = require_git() {
                 println!("{msg}");
-                return 1;
+                return exit::RUNTIME;
             }
             let range = today_range();
             print_header(&range.label);
@@ -46,7 +48,7 @@ pub fn run() -> i32 {
         "yesterday" => {
             if let Err(msg) = require_git() {
                 println!("{msg}");
-                return 1;
+                return exit::RUNTIME;
             }
             let range = yesterday_range();
             print_header(&range.label);
@@ -55,7 +57,7 @@ pub fn run() -> i32 {
         "this-month" => {
             if let Err(msg) = require_git() {
                 println!("{msg}");
-                return 1;
+                return exit::RUNTIME;
             }
             let range = this_month_range();
             print_header(&range.label);
@@ -64,7 +66,7 @@ pub fn run() -> i32 {
         "last-month" => {
             if let Err(msg) = require_git() {
                 println!("{msg}");
-                return 1;
+                return exit::RUNTIME;
             }
             let range = last_month_range();
             print_header(&range.label);
@@ -73,7 +75,7 @@ pub fn run() -> i32 {
         "this-week" => {
             if let Err(msg) = require_git() {
                 println!("{msg}");
-                return 1;
+                return exit::RUNTIME;
             }
             let range = this_week_range();
             print_header(&range.label);
@@ -82,7 +84,7 @@ pub fn run() -> i32 {
         "last-week" => {
             if let Err(msg) = require_git() {
                 println!("{msg}");
-                return 1;
+                return exit::RUNTIME;
             }
             let range = last_week_range();
             print_header(&range.label);
@@ -92,12 +94,12 @@ pub fn run() -> i32 {
             if args.len() >= 2 {
                 if let Err(msg) = require_git() {
                     println!("{msg}");
-                    return 1;
+                    return exit::RUNTIME;
                 }
                 summary(Some(&args[0]), Some(&args[1]))
             } else {
                 println!("❌ Invalid usage. Try: git-summary help");
-                1
+                exit::USAGE
             }
         }
     }

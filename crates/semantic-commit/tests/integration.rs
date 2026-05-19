@@ -9,5 +9,7 @@ mod commit;
 pub mod common;
 #[path = "integration/completion_outside_repo.rs"]
 mod completion_outside_repo;
+#[path = "integration/exit_codes.rs"]
+mod exit_codes;
 #[path = "integration/staged_context.rs"]
 mod staged_context;

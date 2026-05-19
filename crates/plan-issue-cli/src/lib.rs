@@ -14,14 +14,15 @@ mod task_spec;
 use std::ffi::OsString;
 
 use clap::Parser;
+use nils_common::cli_contract::exit;
 use serde_json::json;
 
 use crate::cli::Cli;
 use crate::commands::Command;
 
-pub const EXIT_SUCCESS: i32 = 0;
-pub const EXIT_FAILURE: i32 = 1;
-pub const EXIT_USAGE: i32 = 2;
+pub const EXIT_SUCCESS: i32 = exit::SUCCESS;
+pub const EXIT_FAILURE: i32 = exit::RUNTIME;
+pub const EXIT_USAGE: i32 = exit::USAGE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryFlavor {

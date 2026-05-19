@@ -15,9 +15,11 @@ use serde_json::{Value, json};
 
 use cli::{ChangeMode, Cli, Command, CommonArgs, CreateArgs, OutputFormat, ValidateArgs};
 
-const EXIT_OK: i32 = 0;
-const EXIT_RUNTIME_OR_SCOPE: i32 = 1;
-const EXIT_USAGE: i32 = 64;
+use nils_common::cli_contract::exit;
+
+const EXIT_OK: i32 = exit::SUCCESS;
+const EXIT_RUNTIME_OR_SCOPE: i32 = exit::RUNTIME;
+const EXIT_USAGE: i32 = exit::USAGE;
 
 const LOCK_DOCUMENT_VERSION: &str = "agent-scope-lock.v1";
 const LOCK_FILE_NAME: &str = "agent-scope-lock.json";

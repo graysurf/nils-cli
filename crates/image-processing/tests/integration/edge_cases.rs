@@ -19,7 +19,7 @@ fn removed_subcommands_are_usage_errors() {
         "optimize",
     ] {
         let out = common::run_image_processing(dir.path(), &[removed], &[]);
-        assert_eq!(out.code, 2, "subcommand={removed}, stderr: {}", out.stderr);
+        assert_eq!(out.code, 64, "subcommand={removed}, stderr: {}", out.stderr);
         assert!(
             out.stderr.contains("invalid value")
                 || out.stderr.contains("unrecognized subcommand")
@@ -40,7 +40,7 @@ fn convert_requires_in() {
         &["convert", "--to", "png", "--out", "out/a.png"],
         &[],
     );
-    assert_eq!(out.code, 2);
+    assert_eq!(out.code, 64);
     assert!(
         out.stderr.contains("convert requires exactly one --in"),
         "stderr: {}",
@@ -73,7 +73,7 @@ fn convert_invalid_target_format_is_usage_error() {
         ],
         &[],
     );
-    assert_eq!(out.code, 2);
+    assert_eq!(out.code, 64);
     assert!(
         out.stderr.contains("png|webp|jpg"),
         "stderr: {}",
@@ -100,7 +100,7 @@ fn convert_unsupported_input_format_lists_jpeg() {
         ],
         &[],
     );
-    assert_eq!(out.code, 2);
+    assert_eq!(out.code, 64);
     assert!(
         out.stderr
             .contains("unsupported convert input format (expected svg|png|jpg|jpeg|webp)"),
@@ -137,7 +137,7 @@ fn convert_rejects_multiple_inputs() {
         ],
         &[],
     );
-    assert_eq!(out.code, 2);
+    assert_eq!(out.code, 64);
     assert!(
         out.stderr.contains("convert requires exactly one --in"),
         "stderr: {}",
@@ -161,7 +161,7 @@ fn convert_rejects_missing_out_or_extension_mismatch() {
         &["convert", "--in", "icon.svg", "--to", "png", "--json"],
         &[],
     );
-    assert_eq!(missing_out.code, 2);
+    assert_eq!(missing_out.code, 64);
     assert!(
         missing_out.stderr.contains("convert requires --out"),
         "stderr: {}",
@@ -182,7 +182,7 @@ fn convert_rejects_missing_out_or_extension_mismatch() {
         ],
         &[],
     );
-    assert_eq!(mismatch.code, 2);
+    assert_eq!(mismatch.code, 64);
     assert!(
         mismatch
             .stderr
@@ -219,7 +219,7 @@ fn convert_rejects_invalid_dimension_contracts() {
         ],
         &[],
     );
-    assert_eq!(with_zero_width.code, 2);
+    assert_eq!(with_zero_width.code, 64);
     assert!(
         with_zero_width.stderr.contains("--width must be > 0"),
         "stderr: {}",
@@ -242,7 +242,7 @@ fn convert_rejects_invalid_dimension_contracts() {
         ],
         &[],
     );
-    assert_eq!(with_zero_height.code, 2);
+    assert_eq!(with_zero_height.code, 64);
     assert!(
         with_zero_height.stderr.contains("--height must be > 0"),
         "stderr: {}",
@@ -258,7 +258,7 @@ fn svg_validate_requires_single_input_and_out() {
 
     let missing_out =
         common::run_image_processing(dir.path(), &["svg-validate", "--in", "one.svg"], &[]);
-    assert_eq!(missing_out.code, 2);
+    assert_eq!(missing_out.code, 64);
     assert!(
         missing_out.stderr.contains("svg-validate requires --out"),
         "stderr: {}",
@@ -278,7 +278,7 @@ fn svg_validate_requires_single_input_and_out() {
         ],
         &[],
     );
-    assert_eq!(many_inputs.code, 2);
+    assert_eq!(many_inputs.code, 64);
     assert!(
         many_inputs.stderr.contains("requires exactly one --in"),
         "stderr: {}",
@@ -346,7 +346,7 @@ fn convert_overwrite_flag_controls_existing_output_replacement() {
         ],
         &[],
     );
-    assert_eq!(blocked.code, 2);
+    assert_eq!(blocked.code, 64);
     assert!(
         blocked
             .stderr
