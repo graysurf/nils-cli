@@ -1,6 +1,6 @@
 [package]
 name = "nils-api-testing-core"
-version = "0.8.9"
+version = "0.9.0"
 edition.workspace = true
 license.workspace = true
 
@@ -23,10 +23,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
-nils-common = { version = "0.8.9", path = "../nils-common", package = "nils-common" }
-nils-term = { version = "0.8.9", path = "../nils-term", package = "nils-term" }
+nils-common = { version = "0.9.0", path = "../nils-common", package = "nils-common" }
+nils-term = { version = "0.9.0", path = "../nils-term", package = "nils-term" }
 
 [dev-dependencies]
-nils-test-support = { version = "0.8.9", path = "../nils-test-support" }
+nils-test-support = { version = "0.9.0", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
