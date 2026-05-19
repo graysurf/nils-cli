@@ -103,6 +103,27 @@ fn to_json_rejects_near_miss_metadata_field_name() {
 }
 
 #[test]
+fn to_json_dependency_objects_carry_id_and_notes() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let plan_path = dir.path().join("plan.md");
+    write_file(&plan_path, DEPENDENCY_ANNOTATION_PLAN);
+
+    let out = run_plan_tooling(dir.path(), &["to-json", "--file", "plan.md"]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    let deps_t1_2 = v["sprints"][0]["tasks"][1]["dependencies"]
+        .as_array()
+        .expect("dependencies array on Task 1.2");
+    assert_eq!(deps_t1_2.len(), 1);
+    assert_eq!(deps_t1_2[0]["id"], "Task 1.1");
+    assert_eq!(deps_t1_2[0]["notes"], "(only when X flagged)");
+    let deps_t1_1 = v["sprints"][0]["tasks"][0]["dependencies"]
+        .as_array()
+        .expect("dependencies array on Task 1.1 (none → empty array)");
+    assert!(deps_t1_1.is_empty());
+}
+
+#[test]
 fn to_json_invalid_sprint_is_usage_error() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let plan_path = dir.path().join("plan.md");
@@ -265,6 +286,39 @@ const METADATA_BAD_FIELD_PLAN: &str = r#"# Plan: Metadata Bad Field
   - A works
 - **Validation**:
   - cargo test -p plan-tooling
+"#;
+
+const DEPENDENCY_ANNOTATION_PLAN: &str = r#"# Plan: Annotated deps
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Anchor
+- **Location**:
+  - `src/a.rs`
+- **Description**: Anchor task
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test
+
+### Task 1.2: Annotated
+- **Location**:
+  - `src/b.rs`
+- **Description**: Depends on 1.1 with a note.
+- **Dependencies**:
+  - Task 1.1 (only when X flagged)
+- **Acceptance criteria**:
+  - B works
+- **Validation**:
+  - cargo test
 "#;
 
 const CONTINUATION_PLAN: &str = r#"# Plan: Continuation Example

@@ -178,13 +178,14 @@ pub fn run(args: &[String]) -> i32 {
     let mut external_deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for tid in &task_ids {
-        let deps_list = tasks_map
+        let deps_list: Vec<String> = tasks_map
             .get(tid)
             .and_then(|t| t.dependencies.clone())
             .unwrap_or_default()
             .into_iter()
+            .map(|d| d.id)
             .filter(|d| !d.trim().is_empty())
-            .collect::<Vec<_>>();
+            .collect();
 
         let mut in_sprint: Vec<String> = deps_list
             .iter()

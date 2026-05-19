@@ -158,6 +158,122 @@ fn validate_missing_dependencies_is_error() {
 }
 
 #[test]
+fn validate_text_groups_errors_when_three_or_more_share_class() {
+    let repo = init_repo();
+    write_file(&repo.path().join("group.md"), GROUPED_DEP_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "group.md"]);
+    assert_eq!(out.code, 1);
+    assert!(
+        out.stderr.contains("[dependency-invalid] (x3)"),
+        "stderr should contain grouped header, got:\n{}",
+        out.stderr,
+    );
+    assert!(
+        out.stderr.contains("  - "),
+        "stderr should contain indented occurrence lines, got:\n{}",
+        out.stderr,
+    );
+}
+
+#[test]
+fn validate_no_group_flag_restores_flat_text_output() {
+    let repo = init_repo();
+    write_file(&repo.path().join("group.md"), GROUPED_DEP_PLAN);
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "group.md", "--no-group"],
+    );
+    assert_eq!(out.code, 1);
+    assert!(
+        !out.stderr.contains("[dependency-invalid] (x3)"),
+        "--no-group should suppress grouped headers, got:\n{}",
+        out.stderr,
+    );
+    // Each occurrence still emitted on its own `error:` line.
+    let dep_invalid_lines = out
+        .stderr
+        .lines()
+        .filter(|l| l.contains("invalid dependency"))
+        .count();
+    assert!(
+        dep_invalid_lines >= 3,
+        "expected >=3 invalid-dependency `error:` lines, got:\n{}",
+        out.stderr,
+    );
+}
+
+#[test]
+fn validate_json_output_unaffected_by_grouping() {
+    let repo = init_repo();
+    write_file(&repo.path().join("group.md"), GROUPED_DEP_PLAN);
+
+    let default_out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "group.md", "--format", "json"],
+    );
+    let no_group_out = run_plan_tooling(
+        repo.path(),
+        &[
+            "validate",
+            "--file",
+            "group.md",
+            "--format",
+            "json",
+            "--no-group",
+        ],
+    );
+    assert_eq!(default_out.code, 1);
+    assert_eq!(no_group_out.code, 1);
+    // Byte-for-byte identical JSON regardless of --no-group.
+    assert_eq!(default_out.stdout, no_group_out.stdout);
+}
+
+#[test]
+fn validate_accepts_directory_location_when_dir_exists() {
+    let repo = init_repo();
+    std::fs::create_dir_all(repo.path().join("sip_automation/results/rounds"))
+        .expect("create_dir_all");
+    write_file(&repo.path().join("dir-loc.md"), DIRECTORY_LOCATION_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "dir-loc.md"]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+}
+
+#[test]
+fn validate_rejects_missing_directory_location() {
+    let repo = init_repo();
+    // Do NOT create the directory — directory missing should fail.
+    write_file(&repo.path().join("dir-loc.md"), DIRECTORY_LOCATION_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "dir-loc.md"]);
+    assert_eq!(out.code, 1);
+    assert!(
+        out.stderr.contains("Location directory not found"),
+        "stderr: {}",
+        out.stderr,
+    );
+}
+
+#[test]
+fn validate_accepts_dependency_with_trailing_note() {
+    let repo = init_repo();
+    write_file(&repo.path().join("annotated.md"), ANNOTATED_DEP_PLAN);
+
+    let out = run_plan_tooling(repo.path(), &["validate", "--file", "annotated.md"]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+}
+
+#[test]
 fn validate_redirect_command_is_not_placeholder() {
     let repo = init_repo();
     write_file(&repo.path().join("redirect.md"), REDIRECT_VALIDATION_PLAN);
@@ -721,6 +837,105 @@ const BACKTICK_DESCRIPTION_PLAN: &str = r#"# Plan: Backtick description
   - none
 - **Acceptance criteria**:
   - Slot resolves
+- **Validation**:
+  - cargo test
+"#;
+
+const GROUPED_DEP_PLAN: &str = r#"# Plan: Grouped deps
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Bad dep A
+- **Location**:
+  - `src/a.rs`
+- **Description**: Bad dep A
+- **Dependencies**:
+  - bad-a
+- **Acceptance criteria**:
+  - Done
+- **Validation**:
+  - cargo test
+
+### Task 1.2: Bad dep B
+- **Location**:
+  - `src/b.rs`
+- **Description**: Bad dep B
+- **Dependencies**:
+  - bad-b
+- **Acceptance criteria**:
+  - Done
+- **Validation**:
+  - cargo test
+
+### Task 1.3: Bad dep C
+- **Location**:
+  - `src/c.rs`
+- **Description**: Bad dep C
+- **Dependencies**:
+  - bad-c
+- **Acceptance criteria**:
+  - Done
+- **Validation**:
+  - cargo test
+"#;
+
+const DIRECTORY_LOCATION_PLAN: &str = r#"# Plan: Directory location
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Anchor on directory
+- **Location**:
+  - `sip_automation/results/rounds/`
+- **Description**: Round-baseline results live under this dir.
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - Anchored on directory tree
+- **Validation**:
+  - cargo test
+"#;
+
+const ANNOTATED_DEP_PLAN: &str = r#"# Plan: Annotated deps
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+
+### Task 1.1: Anchor task
+- **Location**:
+  - `src/a.rs`
+- **Description**: Anchor for downstream tasks
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test
+
+### Task 1.2: Annotated dependency
+- **Location**:
+  - `src/b.rs`
+- **Description**: Depends on 1.1 with a free-form note.
+- **Dependencies**:
+  - Task 1.1 (only when feature flag is set)
+- **Acceptance criteria**:
+  - B works
 - **Validation**:
   - cargo test
 "#;

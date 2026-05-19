@@ -577,7 +577,7 @@ pub fn build_split_plan_records(
                 .clone()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|d| d.trim().to_string())
+                .map(|d| d.id.trim().to_string())
                 .filter(|d| !d.is_empty())
                 .filter(|d| !is_placeholder(d))
                 .collect();
