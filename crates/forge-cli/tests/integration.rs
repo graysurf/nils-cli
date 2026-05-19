@@ -8,6 +8,7 @@ mod integration {
     mod pr_checks_github;
     mod pr_checks_gitlab;
     mod pr_create;
+    mod pr_merge;
     mod pr_wait_checks;
     mod repo_view;
     mod required_check_gate;

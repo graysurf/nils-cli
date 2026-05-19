@@ -1612,12 +1612,16 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__merge)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --method --keep-branch --allow-non-default-base --format --remote --provider --repo --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --method)
+                    COMPREPLY=($(compgen -W "squash merge rebase" -- "${cur}"))
+                    return 0
+                    ;;
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0

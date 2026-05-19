@@ -10,6 +10,7 @@ pub mod pr_comment;
 pub mod pr_create;
 pub mod pr_edit;
 pub mod pr_list;
+pub mod pr_merge;
 pub mod pr_ready;
 pub mod pr_state;
 pub mod pr_view;
