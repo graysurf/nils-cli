@@ -11,14 +11,12 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-/// Resolve the compiled `forge-cli` binary. Cargo exposes this via
-/// `CARGO_BIN_EXE_forge-cli` to integration tests.
+/// Resolve the compiled `forge-cli` binary. Uses the shared
+/// `nils_test_support::bin::resolve` helper which handles both the hyphen and
+/// underscore env-var variants Cargo exposes plus the `target/<profile>/`
+/// fallback that `cargo nextest run --workspace` requires.
 pub fn forge_cli_bin() -> PathBuf {
-    let env_name = "CARGO_BIN_EXE_forge-cli";
-    if let Ok(path) = std::env::var(env_name) {
-        return PathBuf::from(path);
-    }
-    panic!("{env_name} not set by cargo; run via `cargo test -p nils-forge-cli`");
+    nils_test_support::bin::resolve("forge-cli")
 }
 
 /// Build context for an integration call.
