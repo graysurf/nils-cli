@@ -19,8 +19,8 @@ release.
 - Primary source: docs/plans/forge-cli/forge-cli-discussion-source.md
 - Source type: discussion-to-implementation-doc
 - Companion sources (authoritative for contract / catalog / envelope):
-  - docs/specs/forge-cli-spec-v1.md
-  - docs/specs/forge-cli-ops-v1.yaml
+  - crates/forge-cli/docs/specs/forge-cli-spec-v1.md
+  - crates/forge-cli/docs/specs/forge-cli-ops-v1.yaml
   - docs/specs/cli-output-contract-v1.md
 - Open questions carried into execution:
   - Wrapper + Homebrew tap formula land in this v1 (Sprint 8).
@@ -153,7 +153,7 @@ plumbing, and the subprocess wrapper layer.
   version). Wire it into the workspace `members`. `main.rs` is a thin
   wrapper that calls `forge_cli::run()` and exits with its returned
   code. `README.md` is a one-paragraph pointer to
-  `docs/specs/forge-cli-spec-v1.md`.
+  `crates/forge-cli/docs/specs/forge-cli-spec-v1.md`.
 - **Dependencies**:
   - none
 - **Complexity**:

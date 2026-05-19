@@ -1,0 +1,1198 @@
+#compdef forge-cli
+
+autoload -U is-at-least
+
+_forge-cli() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_forge-cli_commands" \
+"*::: :->forge-cli" \
+&& ret=0
+    case $state in
+    (forge-cli)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-command-$line[1]:"
+        case $line[1] in
+            (pr)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_forge-cli__subcmd__pr_commands" \
+"*::: :->pr" \
+&& ret=0
+
+    case $state in
+    (pr)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-pr-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(view)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id or branch name:_default' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(edit)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(comment)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(ready)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(merge)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(checks)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id or branch name:_default' \
+&& ret=0
+;;
+(wait-checks)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id or branch name:_default' \
+&& ret=0
+;;
+(deliver)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__pr__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-pr-help-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(edit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(comment)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ready)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(merge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(checks)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(wait-checks)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(deliver)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(issue)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_forge-cli__subcmd__issue_commands" \
+"*::: :->issue" \
+&& ret=0
+
+    case $state in
+    (issue)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-issue-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(view)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(edit)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(comment)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(reopen)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric id:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__issue__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-issue-help-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(edit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(comment)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(reopen)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(repo)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_forge-cli__subcmd__repo_commands" \
+"*::: :->repo" \
+&& ret=0
+
+    case $state in
+    (repo)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-repo-command-$line[1]:"
+        case $line[1] in
+            (view)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__repo__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-repo-help-command-$line[1]:"
+        case $line[1] in
+            (view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(auth)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_forge-cli__subcmd__auth_commands" \
+"*::: :->auth" \
+&& ret=0
+
+    case $state in
+    (auth)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-auth-command-$line[1]:"
+        case $line[1] in
+            (status)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__auth__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-auth-help-command-$line[1]:"
+        case $line[1] in
+            (status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':shell -- Target shell:(bash elvish fish powershell zsh)' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-help-command-$line[1]:"
+        case $line[1] in
+            (pr)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__help__subcmd__pr_commands" \
+"*::: :->pr" \
+&& ret=0
+
+    case $state in
+    (pr)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-help-pr-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(edit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(comment)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ready)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(merge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(checks)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(wait-checks)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(deliver)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(issue)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__help__subcmd__issue_commands" \
+"*::: :->issue" \
+&& ret=0
+
+    case $state in
+    (issue)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-help-issue-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(edit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(comment)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(reopen)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(repo)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__help__subcmd__repo_commands" \
+"*::: :->repo" \
+&& ret=0
+
+    case $state in
+    (repo)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-help-repo-command-$line[1]:"
+        case $line[1] in
+            (view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(auth)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__help__subcmd__auth_commands" \
+"*::: :->auth" \
+&& ret=0
+
+    case $state in
+    (auth)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-help-auth-command-$line[1]:"
+        case $line[1] in
+            (status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_forge-cli_commands] )) ||
+_forge-cli_commands() {
+    local commands; commands=(
+'pr:Pull / merge request lifecycle' \
+'issue:Issue lifecycle' \
+'repo:Repository helpers' \
+'auth:Backend authentication helpers' \
+'completion:Emit shell-completion scripts' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__auth_commands] )) ||
+_forge-cli__subcmd__auth_commands() {
+    local commands; commands=(
+'status:Verify backend auth (gh / glab)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli auth commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__auth__subcmd__help_commands] )) ||
+_forge-cli__subcmd__auth__subcmd__help_commands() {
+    local commands; commands=(
+'status:Verify backend auth (gh / glab)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli auth help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__auth__subcmd__help__subcmd__help_commands] )) ||
+_forge-cli__subcmd__auth__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli auth help help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__auth__subcmd__help__subcmd__status_commands] )) ||
+_forge-cli__subcmd__auth__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli auth help status commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__auth__subcmd__status_commands] )) ||
+_forge-cli__subcmd__auth__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli auth status commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__completion_commands] )) ||
+_forge-cli__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli completion commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help_commands] )) ||
+_forge-cli__subcmd__help_commands() {
+    local commands; commands=(
+'pr:Pull / merge request lifecycle' \
+'issue:Issue lifecycle' \
+'repo:Repository helpers' \
+'auth:Backend authentication helpers' \
+'completion:Emit shell-completion scripts' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__auth_commands] )) ||
+_forge-cli__subcmd__help__subcmd__auth_commands() {
+    local commands; commands=(
+'status:Verify backend auth (gh / glab)' \
+    )
+    _describe -t commands 'forge-cli help auth commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__auth__subcmd__status_commands] )) ||
+_forge-cli__subcmd__help__subcmd__auth__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help auth status commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__completion_commands] )) ||
+_forge-cli__subcmd__help__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help completion commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__help_commands] )) ||
+_forge-cli__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__issue_commands] )) ||
+_forge-cli__subcmd__help__subcmd__issue_commands() {
+    local commands; commands=(
+'create:Open a new issue' \
+'view:Fetch a single issue' \
+'edit:Mutate an issue' \
+'comment:Append a comment to an issue' \
+'close:Close an issue' \
+'reopen:Reopen a closed issue' \
+    )
+    _describe -t commands 'forge-cli help issue commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__issue__subcmd__close_commands] )) ||
+_forge-cli__subcmd__help__subcmd__issue__subcmd__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help issue close commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__issue__subcmd__comment_commands] )) ||
+_forge-cli__subcmd__help__subcmd__issue__subcmd__comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help issue comment commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__issue__subcmd__create_commands] )) ||
+_forge-cli__subcmd__help__subcmd__issue__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help issue create commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__issue__subcmd__edit_commands] )) ||
+_forge-cli__subcmd__help__subcmd__issue__subcmd__edit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help issue edit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__issue__subcmd__reopen_commands] )) ||
+_forge-cli__subcmd__help__subcmd__issue__subcmd__reopen_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help issue reopen commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__issue__subcmd__view_commands] )) ||
+_forge-cli__subcmd__help__subcmd__issue__subcmd__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help issue view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr_commands() {
+    local commands; commands=(
+'create:Open a draft pull / merge request from the current branch' \
+'view:Fetch a single PR / MR with normalised fields' \
+'list:List PRs / MRs' \
+'edit:Mutate PR / MR title, body, base, labels, reviewers' \
+'comment:Append a comment to a PR / MR' \
+'ready:Promote a draft PR / MR to ready-for-review' \
+'merge:Merge a ready PR / MR' \
+'close:Close a PR / MR without merging' \
+'checks:One-shot snapshot of PR / MR check state' \
+'wait-checks:Block until every required check reaches a terminal state' \
+'deliver:End-to-end "open draft → CI green → ready → merge" macro' \
+    )
+    _describe -t commands 'forge-cli help pr commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__checks_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__checks_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr checks commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__close_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr close commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__comment_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr comment commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__create_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr create commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__deliver_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__deliver_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr deliver commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__edit_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__edit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr edit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__list_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr list commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__merge_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__merge_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr merge commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__ready_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__ready_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr ready commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__view_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__wait-checks_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__wait-checks_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr wait-checks commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__repo_commands] )) ||
+_forge-cli__subcmd__help__subcmd__repo_commands() {
+    local commands; commands=(
+'view:Resolve the repo slug, default branch, and supported merge methods' \
+    )
+    _describe -t commands 'forge-cli help repo commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__repo__subcmd__view_commands] )) ||
+_forge-cli__subcmd__help__subcmd__repo__subcmd__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help repo view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue_commands] )) ||
+_forge-cli__subcmd__issue_commands() {
+    local commands; commands=(
+'create:Open a new issue' \
+'view:Fetch a single issue' \
+'edit:Mutate an issue' \
+'comment:Append a comment to an issue' \
+'close:Close an issue' \
+'reopen:Reopen a closed issue' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli issue commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__close_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue close commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__comment_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue comment commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__create_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue create commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__edit_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__edit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue edit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__help_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__help_commands() {
+    local commands; commands=(
+'create:Open a new issue' \
+'view:Fetch a single issue' \
+'edit:Mutate an issue' \
+'comment:Append a comment to an issue' \
+'close:Close an issue' \
+'reopen:Reopen a closed issue' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli issue help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__help__subcmd__close_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__help__subcmd__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue help close commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__help__subcmd__comment_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__help__subcmd__comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue help comment commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__help__subcmd__create_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__help__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue help create commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__help__subcmd__edit_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__help__subcmd__edit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue help edit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__help__subcmd__help_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue help help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__help__subcmd__reopen_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__help__subcmd__reopen_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue help reopen commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__help__subcmd__view_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__help__subcmd__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue help view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__reopen_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__reopen_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue reopen commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__view_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr_commands] )) ||
+_forge-cli__subcmd__pr_commands() {
+    local commands; commands=(
+'create:Open a draft pull / merge request from the current branch' \
+'view:Fetch a single PR / MR with normalised fields' \
+'list:List PRs / MRs' \
+'edit:Mutate PR / MR title, body, base, labels, reviewers' \
+'comment:Append a comment to a PR / MR' \
+'ready:Promote a draft PR / MR to ready-for-review' \
+'merge:Merge a ready PR / MR' \
+'close:Close a PR / MR without merging' \
+'checks:One-shot snapshot of PR / MR check state' \
+'wait-checks:Block until every required check reaches a terminal state' \
+'deliver:End-to-end "open draft → CI green → ready → merge" macro' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli pr commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__checks_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__checks_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr checks commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__close_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr close commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__comment_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr comment commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__create_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr create commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__deliver_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__deliver_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr deliver commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__edit_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__edit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr edit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help_commands() {
+    local commands; commands=(
+'create:Open a draft pull / merge request from the current branch' \
+'view:Fetch a single PR / MR with normalised fields' \
+'list:List PRs / MRs' \
+'edit:Mutate PR / MR title, body, base, labels, reviewers' \
+'comment:Append a comment to a PR / MR' \
+'ready:Promote a draft PR / MR to ready-for-review' \
+'merge:Merge a ready PR / MR' \
+'close:Close a PR / MR without merging' \
+'checks:One-shot snapshot of PR / MR check state' \
+'wait-checks:Block until every required check reaches a terminal state' \
+'deliver:End-to-end "open draft → CI green → ready → merge" macro' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli pr help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__checks_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__checks_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help checks commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__close_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help close commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__comment_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help comment commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__create_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help create commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__deliver_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__deliver_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help deliver commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__edit_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__edit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help edit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__help_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__list_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help list commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__merge_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__merge_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help merge commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__ready_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__ready_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help ready commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__view_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__wait-checks_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__wait-checks_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help wait-checks commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__list_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr list commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__merge_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__merge_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr merge commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__ready_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__ready_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr ready commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__view_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__wait-checks_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__wait-checks_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr wait-checks commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__repo_commands] )) ||
+_forge-cli__subcmd__repo_commands() {
+    local commands; commands=(
+'view:Resolve the repo slug, default branch, and supported merge methods' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli repo commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__repo__subcmd__help_commands] )) ||
+_forge-cli__subcmd__repo__subcmd__help_commands() {
+    local commands; commands=(
+'view:Resolve the repo slug, default branch, and supported merge methods' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli repo help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__repo__subcmd__help__subcmd__help_commands] )) ||
+_forge-cli__subcmd__repo__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli repo help help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__repo__subcmd__help__subcmd__view_commands] )) ||
+_forge-cli__subcmd__repo__subcmd__help__subcmd__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli repo help view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__repo__subcmd__view_commands] )) ||
+_forge-cli__subcmd__repo__subcmd__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli repo view commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_forge-cli" ]; then
+    _forge-cli "$@"
+else
+    compdef _forge-cli forge-cli
+fi

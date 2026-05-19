@@ -4,8 +4,8 @@
 
 Captures the converged decisions handed off to dispatch planning for
 `forge-cli` v1. Pairs with the authoritative contract at
-`docs/specs/forge-cli-spec-v1.md` and the machine-readable op catalog at
-`docs/specs/forge-cli-ops-v1.yaml`. The plan at
+`crates/forge-cli/docs/specs/forge-cli-spec-v1.md` and the machine-readable op catalog at
+`crates/forge-cli/docs/specs/forge-cli-ops-v1.yaml`. The plan at
 `docs/plans/forge-cli/forge-cli-plan.md` consumes this doc as its
 primary source.
 
@@ -62,8 +62,8 @@ for every op. `scripts/ci/cli-output-contract-lint.sh` passes.
 
 ## Read-first companions
 
-- Contract: `docs/specs/forge-cli-spec-v1.md`
-- Op catalog: `docs/specs/forge-cli-ops-v1.yaml`
+- Contract: `crates/forge-cli/docs/specs/forge-cli-spec-v1.md`
+- Op catalog: `crates/forge-cli/docs/specs/forge-cli-ops-v1.yaml`
 - Workspace envelope contract: `docs/specs/cli-output-contract-v1.md`
 - Crate layout precedent: `crates/git-cli/`
 - Workspace rules: `AGENTS.md`, `DEVELOPMENT.md`,

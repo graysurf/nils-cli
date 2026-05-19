@@ -1,0 +1,24 @@
+# forge-cli
+
+Provider-neutral CLI for remote forge operations (PR/MR lifecycle, Issue
+lifecycle, CI wait). Two backends ship together: GitHub (wraps `gh`) and
+GitLab (wraps `glab`). Adopts `cli-output-contract-v1` from day one.
+
+## Read first
+
+- Contract: [docs/specs/forge-cli-spec-v1.md](docs/specs/forge-cli-spec-v1.md)
+- Op catalog: [docs/specs/forge-cli-ops-v1.yaml](docs/specs/forge-cli-ops-v1.yaml)
+- Plan: [`/docs/plans/forge-cli/forge-cli-plan.md`](../../docs/plans/forge-cli/forge-cli-plan.md)
+- Workspace envelope contract:
+  [`/docs/specs/cli-output-contract-v1.md`](../../docs/specs/cli-output-contract-v1.md)
+
+## Quick start
+
+```sh
+cargo run -p nils-forge-cli -- --help
+cargo run -p nils-forge-cli -- auth status --format json
+cargo run -p nils-forge-cli -- pr deliver --kind feature --dry-run --format json
+```
+
+`forge-cli` does NOT introduce a `--json` boolean flag. Use
+`--format text|json` exclusively.

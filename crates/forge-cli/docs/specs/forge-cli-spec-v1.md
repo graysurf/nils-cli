@@ -334,8 +334,8 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 ## CLI output contract conformance
 
 `forge-cli` follows
-[`cli-output-contract-v1`](cli-output-contract-v1.md) without
-exception:
+[`cli-output-contract-v1`](../../../../docs/specs/cli-output-contract-v1.md)
+without exception:
 
 - Canonical flag is `--format text|json`. No `--json` boolean alias
   is introduced (new binary, no migration debt).

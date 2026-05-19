@@ -1922,6 +1922,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-forge-cli"
+version = "0.10.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_complete",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "nils-fzf-cli"
 version = "0.10.2"
 dependencies = [

@@ -27,6 +27,7 @@ members = [
   "crates/test-first-evidence",
   "crates/agent-workflow-primitives",
   "crates/gemini-cli",
+  "crates/forge-cli",
 ]
 resolver = "2"
 
