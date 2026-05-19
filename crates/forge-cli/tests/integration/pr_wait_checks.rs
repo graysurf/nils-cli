@@ -13,10 +13,12 @@ use pretty_assertions::assert_eq;
 use super::support::{StubEnv, parse_envelope, run_forge_cli};
 
 /// Build a dispatching gh stub that maintains a per-invocation counter file
-/// and returns the Nth element of a JSON-array-of-arrays sequence each time
-/// `pr checks` is invoked.
+/// and returns the Nth element of a snapshot sequence each time `pr checks`
+/// is invoked. Once the counter passes the last in-range index it clamps to
+/// the final snapshot, so callers that poll longer than the prepared
+/// sequence keep seeing the trailing snapshot (essential for timeout tests).
 fn gh_sequence_stub(stub: &StubEnv, sequence: &[&str]) {
-    // Materialise each snapshot to disk so the script reads them by index.
+    assert!(!sequence.is_empty(), "sequence must have at least one snap");
     for (idx, snap) in sequence.iter().enumerate() {
         let path = stub.tempdir.path().join(format!("snap-{idx}.json"));
         std::fs::write(&path, snap).expect("write snap");
@@ -24,6 +26,7 @@ fn gh_sequence_stub(stub: &StubEnv, sequence: &[&str]) {
     let counter = stub.tempdir.path().join("counter");
     std::fs::write(&counter, "0").expect("write counter");
     let dir = stub.tempdir.path().to_string_lossy().to_string();
+    let max_idx = sequence.len() - 1;
     let body = format!(
         r#"#!/bin/sh
 set -e
@@ -31,15 +34,14 @@ case "$1 $2" in
   "pr checks")
     counter="{dir}/counter"
     idx=$(cat "$counter")
+    if [ "$idx" -ge "{max_idx}" ]; then
+        eff="{max_idx}"
+    else
+        eff="$idx"
+    fi
     next=$((idx + 1))
     echo "$next" > "$counter"
-    file="{dir}/snap-$idx.json"
-    if [ ! -f "$file" ]; then
-        # Past the end of the sequence: keep returning the last snapshot.
-        last=$((next - 1))
-        file="{dir}/snap-$last.json"
-    fi
-    cat "$file"
+    cat "{dir}/snap-$eff.json"
     ;;
   *)
     echo "stub: unexpected gh args: $*" >&2
