@@ -64,10 +64,7 @@ fn exit_usage_for_unknown_provider_host() {
 
 #[test]
 fn exit_unavailable_for_missing_gh_backend() {
-    let stub = StubEnv::new().env(
-        "FORGE_CLI_GH_BIN",
-        "/tmp/forge-cli-nonexistent-binary-xyz",
-    );
+    let stub = StubEnv::new().env("FORGE_CLI_GH_BIN", "/tmp/forge-cli-nonexistent-binary-xyz");
     let out = run_forge_cli(
         &stub,
         &["--provider", "github", "--format", "json", "auth", "status"],

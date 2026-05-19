@@ -17,7 +17,10 @@ fn help_lists_every_top_level_subcommand() {
             out.stdout
         );
     }
-    assert!(!out.stdout.contains("--json"), "must not surface --json flag");
+    assert!(
+        !out.stdout.contains("--json"),
+        "must not surface --json flag"
+    );
 }
 
 #[test]

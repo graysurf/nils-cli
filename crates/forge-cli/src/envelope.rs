@@ -45,15 +45,13 @@ where
 {
     let envelope = Envelope::success(schema_version, data);
     match format {
-        OutputFormat::Json => {
-            match serde_json::to_string(&envelope) {
-                Ok(serialized) => {
-                    let _ = writeln!(json_sink, "{serialized}");
-                    exit::SUCCESS
-                }
-                Err(_) => exit::SOFTWARE,
+        OutputFormat::Json => match serde_json::to_string(&envelope) {
+            Ok(serialized) => {
+                let _ = writeln!(json_sink, "{serialized}");
+                exit::SUCCESS
             }
-        }
+            Err(_) => exit::SOFTWARE,
+        },
         OutputFormat::Text => {
             if let Some(payload) = envelope.data.as_ref() {
                 render_text(payload);

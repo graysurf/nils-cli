@@ -194,10 +194,7 @@ mod tests {
 
     #[test]
     fn classify_host_recognises_ghe_host() {
-        assert_eq!(
-            classify_host("internal.ghe.com"),
-            Some(Provider::GitHub)
-        );
+        assert_eq!(classify_host("internal.ghe.com"), Some(Provider::GitHub));
     }
 
     #[test]
@@ -207,10 +204,7 @@ mod tests {
 
     #[test]
     fn classify_host_recognises_self_hosted_gitlab() {
-        assert_eq!(
-            classify_host("gitlab.example.com"),
-            Some(Provider::GitLab)
-        );
+        assert_eq!(classify_host("gitlab.example.com"), Some(Provider::GitLab));
     }
 
     #[test]
@@ -256,12 +250,8 @@ mod tests {
             counter.set(counter.get() + 1);
             None
         };
-        let ctx = detect(
-            ProviderHint::Forced(Provider::GitHub),
-            "origin",
-            lookup,
-        )
-        .expect("forced provider");
+        let ctx = detect(ProviderHint::Forced(Provider::GitHub), "origin", lookup)
+            .expect("forced provider");
         assert_eq!(ctx.provider, Provider::GitHub);
         assert_eq!(ctx.source, DetectionSource::Flag);
         assert_eq!(counter.get(), 0, "remote lookup must not run when forced");
@@ -269,11 +259,9 @@ mod tests {
 
     #[test]
     fn detect_from_remote_url() {
-        let ctx = detect(
-            ProviderHint::Auto,
-            "origin",
-            |_| Some("git@gitlab.com:owner/repo.git".to_string()),
-        )
+        let ctx = detect(ProviderHint::Auto, "origin", |_| {
+            Some("git@gitlab.com:owner/repo.git".to_string())
+        })
         .expect("auto from remote");
         assert_eq!(ctx.provider, Provider::GitLab);
         assert_eq!(ctx.host, "gitlab.com");
@@ -282,19 +270,16 @@ mod tests {
 
     #[test]
     fn detect_unknown_host_errors() {
-        let err = detect(
-            ProviderHint::Auto,
-            "origin",
-            |_| Some("https://bitbucket.org/owner/repo.git".to_string()),
-        )
+        let err = detect(ProviderHint::Auto, "origin", |_| {
+            Some("https://bitbucket.org/owner/repo.git".to_string())
+        })
         .expect_err("unknown host");
         assert_eq!(err.kind(), "provider_unsupported");
     }
 
     #[test]
     fn detect_no_remote_errors() {
-        let err = detect(ProviderHint::Auto, "origin", |_| None)
-            .expect_err("no remote");
+        let err = detect(ProviderHint::Auto, "origin", |_| None).expect_err("no remote");
         assert_eq!(err.kind(), "provider_unsupported");
     }
 }

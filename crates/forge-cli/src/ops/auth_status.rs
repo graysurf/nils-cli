@@ -211,7 +211,10 @@ mod tests {
         assert_eq!(payload.provider, "github");
         assert_eq!(payload.host, "github.com");
         assert_eq!(payload.user.as_deref(), Some("graysurf"));
-        assert_eq!(payload.scopes, vec!["repo".to_string(), "read:org".to_string()]);
+        assert_eq!(
+            payload.scopes,
+            vec!["repo".to_string(), "read:org".to_string()]
+        );
     }
 
     #[test]

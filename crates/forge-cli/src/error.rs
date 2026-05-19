@@ -56,10 +56,7 @@ pub enum ForgeError {
 
 impl ForgeError {
     /// Build a `not_implemented` error.
-    pub fn not_implemented(
-        schema_version: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn not_implemented(schema_version: impl Into<String>, message: impl Into<String>) -> Self {
         Self::NotImplemented {
             schema_version: schema_version.into(),
             message: message.into(),

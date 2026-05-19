@@ -133,10 +133,7 @@ impl BackendRunner for ProcessRunner {
                 }
                 return Err(ForgeError::backend_missing(
                     schema(),
-                    format!(
-                        "failed to launch {exe}: {err}",
-                        exe = exe.to_string_lossy()
-                    ),
+                    format!("failed to launch {exe}: {err}", exe = exe.to_string_lossy()),
                     Some(err.to_string()),
                 ));
             }
@@ -157,8 +154,7 @@ impl BackendRunner for ProcessRunner {
             || lower.contains("not authenticated")
             || lower.contains("could not prompt")
             || lower.contains("auth login")
-            || lower.contains("token")
-                && (lower.contains("invalid") || lower.contains("expired"))
+            || lower.contains("token") && (lower.contains("invalid") || lower.contains("expired"))
         {
             return Err(ForgeError::backend_unauthenticated(
                 schema(),
@@ -351,19 +347,13 @@ mod tests {
     #[test]
     fn redact_replaces_bearer_token() {
         let s = "Authorization: Bearer abcd.efgh-12345";
-        assert_eq!(
-            redact_tokens(s),
-            "Authorization: Bearer <redacted-token>"
-        );
+        assert_eq!(redact_tokens(s), "Authorization: Bearer <redacted-token>");
     }
 
     #[test]
     fn redact_keeps_innocent_strings() {
         let s = "hello world ghp not_a_token";
-        assert_eq!(
-            redact_tokens(s),
-            "hello world ghp not_a_token"
-        );
+        assert_eq!(redact_tokens(s), "hello world ghp not_a_token");
     }
 
     #[test]
@@ -375,10 +365,7 @@ mod tests {
 
     #[test]
     fn dry_run_payload_renders_plan() {
-        let call = BackendCall::new(
-            BackendProgram::Gh,
-            ["repo", "view", "--json", "name"],
-        );
+        let call = BackendCall::new(BackendProgram::Gh, ["repo", "view", "--json", "name"]);
         let payload = DryRunPayload::new(Provider::GitHub, &call);
         assert_eq!(payload.provider, "github");
         assert_eq!(payload.plan[1..], ["repo", "view", "--json", "name"]);

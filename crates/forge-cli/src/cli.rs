@@ -375,14 +375,13 @@ fn emit_completion(shell: Shell) -> Result<i32, ForgeError> {
     if matches!(shell, Shell::Bash) {
         let mut out: Vec<u8> = Vec::new();
         clap_complete::generate(shell, &mut cmd, bin, &mut out);
-        let normalized = normalize_bash_completion(
-            String::from_utf8(out)
-                .map_err(|e| ForgeError::software(
-                    nils_common::cli_contract::schema_version_for(BINARY, "error", 1),
-                    "bash completion output not UTF-8",
-                    Some(e.to_string()),
-                ))?,
-        );
+        let normalized = normalize_bash_completion(String::from_utf8(out).map_err(|e| {
+            ForgeError::software(
+                nils_common::cli_contract::schema_version_for(BINARY, "error", 1),
+                "bash completion output not UTF-8",
+                Some(e.to_string()),
+            )
+        })?);
         let _ = std::io::stdout().write_all(normalized.as_bytes());
     } else {
         clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());

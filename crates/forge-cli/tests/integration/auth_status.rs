@@ -30,14 +30,7 @@ fn auth_status_github_returns_normalized_envelope() {
     let stub = StubEnv::new().gh_stub(&gh_stub_script(GH_AUTH_STDERR));
     let out = run_forge_cli(
         &stub,
-        &[
-            "--provider",
-            "github",
-            "--format",
-            "json",
-            "auth",
-            "status",
-        ],
+        &["--provider", "github", "--format", "json", "auth", "status"],
     );
     assert_eq!(out.code, 0, "stderr={}", out.stderr);
     let envelope = parse_envelope(&out.stdout);
@@ -46,10 +39,7 @@ fn auth_status_github_returns_normalized_envelope() {
     assert_eq!(envelope["data"]["provider"], "github");
     assert_eq!(envelope["data"]["host"], "github.com");
     assert_eq!(envelope["data"]["user"], "graysurf");
-    assert_eq!(
-        envelope["data"]["scopes"].as_array().unwrap().len(),
-        2
-    );
+    assert_eq!(envelope["data"]["scopes"].as_array().unwrap().len(), 2);
 }
 
 #[test]
@@ -57,14 +47,7 @@ fn auth_status_gitlab_returns_normalized_envelope() {
     let stub = StubEnv::new().glab_stub(&gh_stub_script(GLAB_AUTH_STDERR));
     let out = run_forge_cli(
         &stub,
-        &[
-            "--provider",
-            "gitlab",
-            "--format",
-            "json",
-            "auth",
-            "status",
-        ],
+        &["--provider", "gitlab", "--format", "json", "auth", "status"],
     );
     assert_eq!(out.code, 0, "stderr={}", out.stderr);
     let envelope = parse_envelope(&out.stdout);
@@ -73,10 +56,7 @@ fn auth_status_gitlab_returns_normalized_envelope() {
     assert_eq!(envelope["data"]["host"], "gitlab.com");
     assert_eq!(envelope["data"]["user"], "graysurf");
     // glab auth status does not surface scopes.
-    assert_eq!(
-        envelope["data"]["scopes"].as_array().unwrap().len(),
-        0
-    );
+    assert_eq!(envelope["data"]["scopes"].as_array().unwrap().len(), 0);
 }
 
 #[test]

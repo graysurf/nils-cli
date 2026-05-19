@@ -34,14 +34,7 @@ fn repo_view_github_normalizes_envelope() {
     let stub = StubEnv::new().gh_stub(&stdout_stub(GH_REPO_VIEW_JSON));
     let out = run_forge_cli(
         &stub,
-        &[
-            "--provider",
-            "github",
-            "--format",
-            "json",
-            "repo",
-            "view",
-        ],
+        &["--provider", "github", "--format", "json", "repo", "view"],
     );
     assert_eq!(out.code, 0, "stderr={}", out.stderr);
     let envelope = parse_envelope(&out.stdout);
@@ -60,14 +53,7 @@ fn repo_view_gitlab_normalizes_envelope() {
     let stub = StubEnv::new().glab_stub(&stdout_stub(GLAB_REPO_VIEW_JSON));
     let out = run_forge_cli(
         &stub,
-        &[
-            "--provider",
-            "gitlab",
-            "--format",
-            "json",
-            "repo",
-            "view",
-        ],
+        &["--provider", "gitlab", "--format", "json", "repo", "view"],
     );
     assert_eq!(out.code, 0, "stderr={}", out.stderr);
     let envelope = parse_envelope(&out.stdout);
