@@ -154,15 +154,18 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (merge)
 _arguments "${_arguments_options[@]}" : \
+'--method=[Merge method override. When omitted, falls back to \`.forge-cli.toml \[merge\].method\` then the spec default \`squash\`]:METHOD:(squash merge rebase)' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--keep-branch[Skip the post-merge branch deletion (\`--delete-branch\` on gh, \`--remove-source-branch\` on glab). Mutually exclusive with the implicit-true default; flagging both is \`keep_branch_conflict\`]' \
+'--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch. Without this flag, mismatched bases trigger \`default_branch_protected\`]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':id -- Numeric id:_default' \
+':id -- Numeric PR / MR id:_default' \
 && ret=0
 ;;
 (close)

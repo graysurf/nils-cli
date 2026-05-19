@@ -9,6 +9,7 @@
 
 pub mod backend;
 pub mod cli;
+pub mod config;
 pub mod envelope;
 pub mod error;
 pub mod glab_version;

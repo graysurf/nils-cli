@@ -234,6 +234,47 @@ pub struct PrReadyArgs {
     pub id: u64,
 }
 
+/// `pr merge` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.merge` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrMergeArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+    /// Merge method override. When omitted, falls back to
+    /// `.forge-cli.toml [merge].method` then the spec default `squash`.
+    #[arg(long, value_enum)]
+    pub method: Option<MergeMethodFlag>,
+    /// Skip the post-merge branch deletion (`--delete-branch` on gh,
+    /// `--remove-source-branch` on glab). Mutually exclusive with the
+    /// implicit-true default; flagging both is `keep_branch_conflict`.
+    #[arg(long = "keep-branch", action = ArgAction::SetTrue)]
+    pub keep_branch: bool,
+    /// Allow merges where the PR's base is not the repo's default branch.
+    /// Without this flag, mismatched bases trigger `default_branch_protected`.
+    #[arg(long = "allow-non-default-base", action = ArgAction::SetTrue)]
+    pub allow_non_default_base: bool,
+}
+
+/// CLI-facing merge method enum so clap can render `--method squash|merge|rebase`
+/// without leaking the config crate's `MergeMethod` into the CLI layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum MergeMethodFlag {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeMethodFlag {
+    pub fn into_method(self) -> crate::config::MergeMethod {
+        match self {
+            Self::Squash => crate::config::MergeMethod::Squash,
+            Self::Merge => crate::config::MergeMethod::Merge,
+            Self::Rebase => crate::config::MergeMethod::Rebase,
+        }
+    }
+}
+
 /// `pr checks` arguments. Maps to
 /// `forge-cli-ops-v1.yaml::operations.pr.checks` inputs.
 #[derive(Args, Debug, Clone)]
@@ -278,7 +319,7 @@ pub struct PrWaitChecksArgs {
 
 /// Parse a duration string like `30m`, `20s`, `5h`, `500ms`. Accepts bare
 /// integers as seconds.
-fn parse_duration(s: &str) -> Result<Duration, String> {
+pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("duration cannot be empty".into());
@@ -369,10 +410,7 @@ pub enum PrCommand {
     /// Promote a draft PR / MR to ready-for-review.
     Ready(PrReadyArgs),
     /// Merge a ready PR / MR.
-    Merge {
-        /// Numeric id.
-        id: u64,
-    },
+    Merge(PrMergeArgs),
     /// Close a PR / MR without merging.
     Close {
         /// Numeric id.
@@ -491,6 +529,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::WaitChecks(args)),
         })) => ops::pr_wait_checks::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Merge(args)),
+        })) => ops::pr_merge::run(&global, args, format),
         Some(Command::Completion(CompletionArgs { shell })) => emit_completion(shell),
         None
         | Some(Command::Auth(AuthArgs { command: None }))
