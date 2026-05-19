@@ -95,8 +95,8 @@ pub struct OutputModeArgs {
     /// Output format (`text` or `json`)
     #[arg(long = "format", value_enum, value_name = "format")]
     pub format: Option<OutputFormat>,
-    /// Output machine-readable JSON
-    #[arg(long = "json", conflicts_with = "format")]
+    /// Hidden alias for `--format json` (kept for backwards compatibility).
+    #[arg(long = "json", hide = true, conflicts_with = "format")]
     pub json: bool,
 }
 
@@ -199,8 +199,8 @@ pub struct RateLimitsArgs {
     /// Output format (`text` or `json`)
     #[arg(long = "format", value_enum, value_name = "format")]
     pub format: Option<OutputFormat>,
-    /// Output raw JSON
-    #[arg(long = "json", conflicts_with = "format")]
+    /// Hidden alias for `--format json` (kept for backwards compatibility).
+    #[arg(long = "json", hide = true, conflicts_with = "format")]
     pub json: bool,
     /// Output a one-line summary
     #[arg(long = "one-line")]

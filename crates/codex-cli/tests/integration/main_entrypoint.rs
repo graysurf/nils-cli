@@ -99,19 +99,25 @@ fn main_help_excludes_provider_neutral_groups() {
 }
 
 #[test]
-fn main_help_includes_json_output_modes_for_diag_and_auth() {
+fn main_help_advertises_format_and_hides_json_alias_for_diag_and_auth() {
     let diag_help = run(&["diag", "rate-limits", "--help"]);
     assert_exit(&diag_help, 0);
     let diag_text = stdout(&diag_help);
-    assert!(diag_text.contains("--json"));
     assert!(diag_text.contains("--format"));
     assert!(diag_text.contains("--clear-cache"));
+    assert!(
+        !diag_text.contains("--json"),
+        "diag rate-limits --help leaked the hidden --json alias: {diag_text}"
+    );
 
     let auth_help = run(&["auth", "current", "--help"]);
     assert_exit(&auth_help, 0);
     let auth_text = stdout(&auth_help);
-    assert!(auth_text.contains("--json"));
     assert!(auth_text.contains("--format"));
+    assert!(
+        !auth_text.contains("--json"),
+        "auth current --help leaked the hidden --json alias: {auth_text}"
+    );
 }
 
 #[test]

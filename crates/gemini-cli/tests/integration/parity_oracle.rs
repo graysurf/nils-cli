@@ -64,17 +64,17 @@ fn parity_oracle_topology_matches_codex() {
 }
 
 #[test]
-fn parity_oracle_json_flags_match_codex_for_auth_and_diag_help() {
+fn parity_oracle_format_flag_visibility_matches_codex_for_auth_and_diag_help() {
     let gemini_auth = run_gemini(&["auth", "current", "--help"]);
     let codex_auth = run_codex(&["auth", "current", "--help"]);
     assert_eq!(gemini_auth.code, 0);
     assert_eq!(codex_auth.code, 0);
     let gemini_auth_text = gemini_auth.stdout_text();
     let codex_auth_text = codex_auth.stdout_text();
-    for token in ["--format", "--json"] {
-        assert!(gemini_auth_text.contains(token));
-        assert!(codex_auth_text.contains(token));
-    }
+    assert!(gemini_auth_text.contains("--format"));
+    assert!(codex_auth_text.contains("--format"));
+    assert!(!gemini_auth_text.contains("--json"));
+    assert!(!codex_auth_text.contains("--json"));
 
     let gemini_diag = run_gemini(&["diag", "rate-limits", "--help"]);
     let codex_diag = run_codex(&["diag", "rate-limits", "--help"]);
@@ -82,10 +82,12 @@ fn parity_oracle_json_flags_match_codex_for_auth_and_diag_help() {
     assert_eq!(codex_diag.code, 0);
     let gemini_diag_text = gemini_diag.stdout_text();
     let codex_diag_text = codex_diag.stdout_text();
-    for token in ["--format", "--json", "--cached", "--async"] {
+    for token in ["--format", "--cached", "--async"] {
         assert!(gemini_diag_text.contains(token));
         assert!(codex_diag_text.contains(token));
     }
+    assert!(!gemini_diag_text.contains("--json"));
+    assert!(!codex_diag_text.contains("--json"));
 }
 
 #[test]

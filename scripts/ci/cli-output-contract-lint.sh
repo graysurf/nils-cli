@@ -71,14 +71,10 @@ fi
 # ----------------------------------------------------------------------------
 
 # Files with grandfathered `--json` boolean flags lacking `hide = true`.
-# These predate the contract's hidden-alias requirement; remove once their
-# one-minor-cycle migration completes.
-declare -a JSON_ALLOWED_FILES=(
-  "crates/codex-cli/src/cli.rs"
-  "crates/gemini-cli/src/cli.rs"
-  "crates/image-processing/src/cli.rs"
-  "crates/plan-issue-cli/src/cli.rs"
-)
+# Empty post-migration: every `--json` flag in the workspace now carries
+# `hide = true`. Re-introductions are caught by check (a) and require an
+# explicit entry here with justification.
+declare -a JSON_ALLOWED_FILES=()
 
 # Files where camelCase serde renames are intentional (non-CLI-envelope
 # persistent records: AWP, JUnit-compat suite schemas, documented v2 alias).
