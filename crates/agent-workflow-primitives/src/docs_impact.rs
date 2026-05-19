@@ -4,13 +4,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueHint};
 use serde::Serialize;
 use serde_json::json;
 
 use crate::common::{
-    CliError, EXIT_USAGE, OutputFormat, absolute_path, display_path, render_error, render_success,
+    CliError, OutputFormat, absolute_path, display_path, render_error, render_success,
 };
 use crate::completion::{self, CompletionShell};
 
@@ -26,16 +25,10 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
+    let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cli = match Cli::try_parse_from(argv.clone()) {
         Ok(cli) => cli,
-        Err(err) => {
-            let code = match err.kind() {
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit_code(),
-                _ => EXIT_USAGE,
-            };
-            let _ = err.print();
-            return code;
-        }
+        Err(err) => return crate::common::handle_parse_error("docs-impact", argv, err),
     };
 
     match cli.command {

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use regex::Regex;
 use serde::Serialize;
@@ -14,7 +13,7 @@ use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Duration, Month, OffsetDateTime};
 
-use crate::common::{CliError, EXIT_USAGE, OutputFormat, display_path, render_error};
+use crate::common::{CliError, OutputFormat, display_path, render_error};
 use crate::completion::{self, CompletionShell};
 
 const REPORT_ENVELOPE_SCHEMA_VERSION: &str = "cli.repo-retro.report.v1";
@@ -34,16 +33,10 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
+    let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cli = match Cli::try_parse_from(argv.clone()) {
         Ok(cli) => cli,
-        Err(err) => {
-            let code = match err.kind() {
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit_code(),
-                _ => EXIT_USAGE,
-            };
-            let _ = err.print();
-            return code;
-        }
+        Err(err) => return crate::common::handle_parse_error("repo-retro", argv, err),
     };
 
     match cli.command {
@@ -60,15 +53,14 @@ fn report(args: ReportArgs) -> i32 {
     }) {
         Ok(report) => match format {
             ReportFormat::Json => {
+                let envelope = nils_common::cli_contract::Envelope::success(
+                    REPORT_ENVELOPE_SCHEMA_VERSION,
+                    &report,
+                );
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&SuccessEnvelope {
-                        schema_version: REPORT_ENVELOPE_SCHEMA_VERSION,
-                        command: REPORT_COMMAND,
-                        ok: true,
-                        result: &report,
-                    })
-                    .expect("report envelope should serialize")
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("report envelope should serialize")
                 );
                 0
             }
@@ -194,14 +186,6 @@ impl ReviewMode {
             Self::Maintainer => "Maintainer",
         }
     }
-}
-
-#[derive(Serialize)]
-struct SuccessEnvelope<'a, T: Serialize> {
-    schema_version: &'a str,
-    command: &'a str,
-    ok: bool,
-    result: &'a T,
 }
 
 #[derive(Clone, Debug)]

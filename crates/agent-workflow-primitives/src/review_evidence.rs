@@ -2,14 +2,13 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::common::{
-    CliError, EXIT_USAGE, OutputFormat, display_path, ensure_non_empty, normalized_paths,
-    record_path, redact_text, render_error, render_success, write_json_pretty,
+    CliError, OutputFormat, display_path, ensure_non_empty, normalized_paths, record_path,
+    redact_text, render_error, render_success, write_json_pretty,
 };
 use crate::completion::{self, CompletionShell};
 
@@ -35,16 +34,10 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
+    let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cli = match Cli::try_parse_from(argv.clone()) {
         Ok(cli) => cli,
-        Err(err) => {
-            let code = match err.kind() {
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit_code(),
-                _ => EXIT_USAGE,
-            };
-            let _ = err.print();
-            return code;
-        }
+        Err(err) => return crate::common::handle_parse_error("review-evidence", argv, err),
     };
 
     match cli.command {

@@ -1,22 +1,23 @@
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
-use clap::ValueEnum;
+use clap::error::ErrorKind;
+pub use nils_common::cli_contract::OutputFormat;
+use nils_common::cli_contract::{Envelope, EnvelopeError, emit_parse_error, exit};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const EXIT_OK: i32 = 0;
-pub const EXIT_RUNTIME: i32 = 1;
-pub const EXIT_USAGE: i32 = 64;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "kebab-case")]
-pub enum OutputFormat {
-    Text,
-    Json,
-}
+// Re-export exit-code constants under the historical names so the eight
+// binaries can keep importing `EXIT_USAGE` / `EXIT_RUNTIME` while the values
+// come from the shared `nils_common::cli_contract::exit` module.
+pub const EXIT_OK: i32 = exit::SUCCESS;
+pub const EXIT_RUNTIME: i32 = exit::RUNTIME;
+pub const EXIT_USAGE: i32 = exit::USAGE;
+#[allow(dead_code)]
+pub const EXIT_DATA: i32 = exit::DATA;
 
 #[derive(Debug)]
 pub struct CliError(Box<CliErrorData>);
@@ -43,6 +44,20 @@ impl CliError {
         }))
     }
 
+    #[allow(dead_code)]
+    pub fn data(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<Value>,
+    ) -> Self {
+        Self(Box::new(CliErrorData {
+            code: code.into(),
+            message: message.into(),
+            details,
+            exit_code: EXIT_DATA,
+        }))
+    }
+
     pub fn runtime(
         code: impl Into<String>,
         message: impl Into<String>,
@@ -57,33 +72,9 @@ impl CliError {
     }
 }
 
-#[derive(Serialize)]
-struct SuccessEnvelope<'a, T: Serialize> {
-    schema_version: &'a str,
-    command: &'a str,
-    ok: bool,
-    result: &'a T,
-}
-
-#[derive(Serialize)]
-struct ErrorEnvelope<'a> {
-    schema_version: &'a str,
-    command: &'a str,
-    ok: bool,
-    error: ErrorView<'a>,
-}
-
-#[derive(Serialize)]
-struct ErrorView<'a> {
-    code: &'a str,
-    message: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<Value>,
-}
-
 pub fn render_success<T: Serialize>(
     schema_version: &'static str,
-    command: &'static str,
+    _command: &'static str,
     format: OutputFormat,
     text: impl FnOnce() -> String,
     result: &T,
@@ -92,13 +83,8 @@ pub fn render_success<T: Serialize>(
         OutputFormat::Text => println!("{}", text()),
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&SuccessEnvelope {
-                schema_version,
-                command,
-                ok: true,
-                result,
-            })
-            .expect("success envelope should serialize")
+            serde_json::to_string_pretty(&Envelope::success(schema_version, result))
+                .expect("success envelope should serialize")
         ),
     }
     EXIT_OK
@@ -106,7 +92,7 @@ pub fn render_success<T: Serialize>(
 
 pub fn render_error(
     schema_version: &'static str,
-    command: &'static str,
+    _command: &'static str,
     format: OutputFormat,
     err: CliError,
 ) -> i32 {
@@ -119,22 +105,85 @@ pub fn render_error(
                 eprintln!("details: {details}");
             }
         }
-        OutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&ErrorEnvelope {
-                schema_version,
-                command,
-                ok: false,
-                error: ErrorView {
-                    code: &err.code,
-                    message: &err.message,
-                    details: err.details,
-                },
-            })
-            .expect("error envelope should serialize")
-        ),
+        OutputFormat::Json => {
+            let mut envelope_error = EnvelopeError::new(&err.code, &err.message);
+            if let Some(details) = err.details {
+                envelope_error = envelope_error.with_details(details);
+            }
+            let envelope: Envelope<()> = Envelope::failure(schema_version, envelope_error);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&envelope).expect("error envelope should serialize")
+            );
+        }
     }
     exit_code
+}
+
+/// Route a clap parse error through the shared output contract.
+///
+/// `binary` should match the binary name advertised in `clap`'s `#[command(name)]`.
+/// Help and version exits keep clap's native behavior; everything else lands
+/// through `emit_parse_error` so `--format json` consumers see a JSON envelope.
+pub fn handle_parse_error<I>(binary: &str, argv: I, err: clap::Error) -> i32
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let kind = err.kind();
+    if matches!(
+        kind,
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        let _ = err.print();
+        return err.exit_code();
+    }
+
+    let argv: Vec<OsString> = argv.into_iter().collect();
+    let format = detect_format_from_argv(&argv);
+    let code = match kind {
+        ErrorKind::InvalidSubcommand => "unknown-subcommand",
+        _ => "parse-error",
+    };
+    let message = render_clap_message(&err);
+    emit_parse_error(binary, format, code, &message)
+}
+
+fn detect_format_from_argv(argv: &[OsString]) -> OutputFormat {
+    let mut iter = argv.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        let arg = arg.to_string_lossy();
+        if arg == "--json" {
+            return OutputFormat::Json;
+        }
+        if arg == "--format"
+            && let Some(next) = iter.next()
+            && next.to_string_lossy().eq_ignore_ascii_case("json")
+        {
+            return OutputFormat::Json;
+        }
+        if let Some(rest) = arg.strip_prefix("--format=")
+            && rest.eq_ignore_ascii_case("json")
+        {
+            return OutputFormat::Json;
+        }
+    }
+    OutputFormat::Text
+}
+
+fn render_clap_message(err: &clap::Error) -> String {
+    err.to_string()
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix("error:")
+                .map(str::trim)
+                .unwrap_or(line)
+                .to_string()
+        })
+        .unwrap_or_else(|| "command-line parse failed".to_string())
 }
 
 pub fn ensure_non_empty(flag: &str, value: &str) -> Result<(), CliError> {
