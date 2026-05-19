@@ -17,9 +17,11 @@ use output::{
     render_baseline, render_contexts, render_resolve, render_scaffold_baseline, render_stub,
 };
 
-const EXIT_OK: i32 = 0;
-const EXIT_STRICT_MISSING_REQUIRED: i32 = 1;
-const EXIT_USAGE: i32 = 2;
+use nils_common::cli_contract::exit;
+
+const EXIT_OK: i32 = exit::SUCCESS;
+const EXIT_STRICT_MISSING_REQUIRED: i32 = exit::RUNTIME;
+const EXIT_USAGE: i32 = exit::USAGE;
 const EXIT_CONFIG: i32 = 3;
 const EXIT_RUNTIME: i32 = 4;
 
@@ -35,7 +37,13 @@ where
     let cli = match Cli::try_parse_from(args) {
         Ok(parsed) => parsed,
         Err(err) => {
-            let code = err.exit_code();
+            use clap::error::ErrorKind;
+            let code = match err.kind() {
+                ErrorKind::DisplayHelp
+                | ErrorKind::DisplayVersion
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => err.exit_code(),
+                _ => EXIT_USAGE,
+            };
             let _ = err.print();
             return code;
         }

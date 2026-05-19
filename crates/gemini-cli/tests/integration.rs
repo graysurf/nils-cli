@@ -41,6 +41,8 @@ mod config;
 mod diag_json_contract;
 #[path = "integration/dispatch.rs"]
 mod dispatch;
+#[path = "integration/exit_codes.rs"]
+mod exit_codes;
 #[path = "integration/fs.rs"]
 mod fs;
 #[path = "integration/json.rs"]

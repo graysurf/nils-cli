@@ -16,10 +16,12 @@ use serde_json::{Value, json};
 
 use cli::{AuditArgs, AuditFormat, Cli, Command, ProjectArgs, ProjectFormat};
 
-const EXIT_OK: i32 = 0;
-const EXIT_AUDIT_VIOLATIONS: i32 = 1;
-const EXIT_RUNTIME: i32 = 1;
-const EXIT_USAGE: i32 = 64;
+use nils_common::cli_contract::exit;
+
+const EXIT_OK: i32 = exit::SUCCESS;
+const EXIT_AUDIT_VIOLATIONS: i32 = exit::RUNTIME;
+const EXIT_RUNTIME: i32 = exit::RUNTIME;
+const EXIT_USAGE: i32 = exit::USAGE;
 
 const PROJECT_SCHEMA_VERSION: &str = "cli.agent-out.project.v1";
 const AUDIT_SCHEMA_VERSION: &str = "cli.agent-out.audit.v1";

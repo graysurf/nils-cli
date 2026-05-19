@@ -11,5 +11,7 @@ mod core_flows;
 mod dry_run_paths;
 #[path = "integration/edge_cases.rs"]
 mod edge_cases;
+#[path = "integration/exit_codes.rs"]
+mod exit_codes;
 #[path = "integration/version.rs"]
 mod version;

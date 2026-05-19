@@ -4,6 +4,7 @@ mod completion;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use gemini_cli::{agent, auth, config};
+use nils_common::cli_contract::exit;
 
 fn main() {
     let exit_code = run();
@@ -19,8 +20,8 @@ fn run() -> i32 {
         Ok(cli) => cli,
         Err(err) => {
             let code = match err.kind() {
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
-                _ => 64,
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => exit::SUCCESS,
+                _ => exit::USAGE,
             };
             let _ = err.print();
             return code;

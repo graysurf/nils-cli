@@ -1,4 +1,5 @@
 use clap::{CommandFactory, Parser};
+use nils_common::cli_contract::exit;
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
 use std::path::PathBuf;
 use std::process;
@@ -28,7 +29,13 @@ fn run() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(err) => {
-            let code = err.exit_code();
+            use clap::error::ErrorKind;
+            let code = match err.kind() {
+                ErrorKind::DisplayHelp
+                | ErrorKind::DisplayVersion
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => err.exit_code(),
+                _ => exit::USAGE,
+            };
             let _ = err.print();
             return code;
         }
@@ -235,7 +242,7 @@ fn usage_error(msg: &str) -> ! {
     let usage = cmd.render_usage().to_string();
     eprintln!("{usage}");
     eprintln!("image-processing: error: {msg}");
-    process::exit(2);
+    process::exit(exit::USAGE);
 }
 
 #[cfg(test)]

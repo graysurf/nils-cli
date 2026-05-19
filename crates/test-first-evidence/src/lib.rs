@@ -18,10 +18,11 @@ use cli::{
     Cli, Command, CommonArgs, InitArgs, OutputFormat, RecordFailingArgs, RecordFinalArgs,
     RecordWaiverArgs,
 };
+use nils_common::cli_contract::exit;
 
-const EXIT_OK: i32 = 0;
-const EXIT_RUNTIME: i32 = 1;
-const EXIT_USAGE: i32 = 64;
+const EXIT_OK: i32 = exit::SUCCESS;
+const EXIT_RUNTIME: i32 = exit::RUNTIME;
+const EXIT_USAGE: i32 = exit::USAGE;
 
 const RECORD_SCHEMA_VERSION: &str = "test-first-evidence.record.v1";
 const RECORD_FILE_NAME: &str = "test-first-evidence.json";

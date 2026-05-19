@@ -19,10 +19,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use cli::{CaptureArgs, Cli, Command, HttpMethod, OutputFormat};
+use nils_common::cli_contract::exit;
 
-const EXIT_OK: i32 = 0;
-const EXIT_RUNTIME: i32 = 1;
-const EXIT_USAGE: i32 = 64;
+const EXIT_OK: i32 = exit::SUCCESS;
+const EXIT_RUNTIME: i32 = exit::RUNTIME;
+const EXIT_USAGE: i32 = exit::USAGE;
 
 const CAPTURE_SCHEMA_VERSION: &str = "cli.web-evidence.capture.v1";
 const SUMMARY_SCHEMA_VERSION: &str = "web-evidence.summary.v1";

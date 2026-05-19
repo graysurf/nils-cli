@@ -1,4 +1,5 @@
 use crate::git;
+use nils_common::cli_contract::exit;
 use nils_common::git as common_git;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -8,10 +9,11 @@ use std::process::Output;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const EXIT_ERROR: i32 = 1;
+const EXIT_ERROR: i32 = exit::RUNTIME;
 const EXIT_NO_STAGED_CHANGES: i32 = 2;
 const EXIT_DEPENDENCY_ERROR: i32 = 5;
 const CAT_PAGER_ENV: [(&str, &str); 2] = [("GIT_PAGER", "cat"), ("PAGER", "cat")];
+const STAGED_CONTEXT_SCHEMA_VERSION: &str = "cli.semantic-commit.staged-context.v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputFormat {
@@ -251,6 +253,7 @@ fn build_bundle(repo: Option<&Path>) -> anyhow::Result<Bundle> {
             obj.insert("score".to_string(), json!(score));
         }
         if let Some(old_path) = entry.old_path {
+            obj.insert("old_path".to_string(), json!(old_path));
             obj.insert("oldPath".to_string(), json!(old_path));
         }
         obj.insert(
@@ -276,24 +279,37 @@ fn build_bundle(repo: Option<&Path>) -> anyhow::Result<Bundle> {
         .map(|(name, count)| json!({ "name": name, "count": count }))
         .collect();
 
+    let top_level_dir_count = top_level_dirs.len();
+    let status_counts_alias = status_counts.clone();
+    let top_level_dirs_alias = top_level_dirs.clone();
+    let generated_at_alias = generated_at.clone();
     let context = json!({
+        "schema_version": STAGED_CONTEXT_SCHEMA_VERSION,
         "schemaVersion": 1,
-        "generatedAt": generated_at,
+        "generated_at": generated_at,
+        "generatedAt": generated_at_alias,
         "repo": { "name": repo_name },
         "git": { "branch": branch, "head": head },
         "staged": {
             "summary": {
+                "file_count": file_count,
                 "fileCount": file_count,
                 "insertions": insertions,
                 "deletions": deletions,
+                "binary_file_count": binary_file_count,
                 "binaryFileCount": binary_file_count,
+                "lockfile_count": lockfile_count,
                 "lockfileCount": lockfile_count,
+                "root_file_count": root_file_count,
                 "rootFileCount": root_file_count,
-                "topLevelDirCount": top_level_dirs.len(),
+                "top_level_dir_count": top_level_dir_count,
+                "topLevelDirCount": top_level_dir_count,
             },
-            "statusCounts": status_counts,
+            "status_counts": status_counts,
+            "statusCounts": status_counts_alias,
             "structure": {
-                "topLevelDirs": top_level_dirs,
+                "top_level_dirs": top_level_dirs,
+                "topLevelDirs": top_level_dirs_alias,
             },
             "files": files,
             "patch": { "path": "staged.patch", "format": "git diff --cached" }

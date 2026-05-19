@@ -11,5 +11,7 @@ pub mod common;
 mod completion_outside_repo;
 #[path = "integration/edge_cases.rs"]
 mod edge_cases;
+#[path = "integration/exit_codes.rs"]
+mod exit_codes;
 #[path = "integration/summary_counts.rs"]
 mod summary_counts;

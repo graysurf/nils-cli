@@ -2,37 +2,36 @@
 
 ## Current State
 
-- Status: in-progress (Sprint 1 + Sprint 2 + Tasks 3.1 + 3.2 complete; Tasks 3.3 / 3.4 pending)
-- Target scope: Task 3.2 (api-rest / api-gql / api-grpc / api-websocket / api-test)
-- Execution window: Task 3.2 only — Task 3.3 (remaining single-binary crates)
-  stays in a follow-up PR; Task 3.4 (lint script) lands after 3.3
+- Status: in-progress (Sprint 1 + Sprint 2 + Tasks 3.1 + 3.2 + 3.3 complete; Task 3.4 pending)
+- Target scope: Task 3.3 (remaining 14 single-binary crates)
+- Execution window: Task 3.3 only — Task 3.4 (workspace lint script) lands in a follow-up PR
 - Staged execution confirmation: confirmed(Sprint 1 PR #375, Sprint 2 PR #376,
-  Task 3.1 PR #377 merged; Task 3.2 in this PR; Tasks 3.3 / 3.4 to come)
-- Current task: Task 3.2 complete
-- Next task: Task 3.3 (migrate remaining single-binary crates)
-- Last updated: 2026-05-19
-- Branch/commit: feat/cli-output-contract-api-testing-stack (pending push)
+  Task 3.1 PR #377, Task 3.2 PR #378 merged; Task 3.3 in this PR; Task 3.4 to come)
+- Current task: Task 3.3 complete
+- Next task: Task 3.4 (workspace lint script for legacy contract usage)
+- Last updated: 2026-05-20
+- Branch/commit: feat/cli-output-contract-fan-out-3-3 (pending push)
 - Source document:
   docs/plans/cli-output-contract-unification/cli-output-contract-unification-plan.md
 - Direct source-doc execution waiver: not applicable
 
 ## Task Ledger
 
-| ID       | Status  | Task                                                              | Evidence                                                                                                 | Notes                                                                                                                                                                                                                                                            |
-| -------- | ------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Task 1.1 | done    | Add `cli_contract` module to `nils-common`                        | crates/nils-common/src/cli_contract.rs; PR #375                                                          | Plus additive `EnvelopeError::details` field in Sprint 2                                                                                                                                                                                                         |
-| Task 1.2 | done    | Add parse-error JSON helper                                       | crates/nils-common/tests/integration/cli_contract.rs; PR #375                                            |                                                                                                                                                                                                                                                                  |
-| Task 1.3 | done    | Migrate `cli-template` as reference implementation                | crates/cli-template/src/main.rs; PR #375                                                                 |                                                                                                                                                                                                                                                                  |
-| Task 1.4 | done    | Write `cli-output-contract-v1.md` spec                            | docs/specs/cli-output-contract-v1.md; PR #375                                                            | Sprint 2 extended with `details` field                                                                                                                                                                                                                           |
-| Task 2.1 | done    | Replace memo-cli exit-code constants with shared module           | crates/memo-cli/src/errors.rs                                                                            | exit::USAGE/DATA/RUNTIME replaces 64/65/1 literals                                                                                                                                                                                                               |
-| Task 2.2 | done    | Migrate memo-cli to `OutputFormat` and hidden `--json` alias      | crates/memo-cli/src/cli.rs                                                                               | shared `nils_common::cli_contract::OutputFormat`; `--json` `hide=true conflicts_with=format`                                                                                                                                                                     |
-| Task 2.3 | done    | Migrate memo-cli JSON output to shared envelope and `warnings`    | crates/memo-cli/src/output/json.rs + commands/*                                                          | schema_version moved to `cli.memo-cli.<cmd>.v1`; collections nest `items` + `pagination`/`meta` under `data`; apply per-item errors surface in `warnings`                                                                                                        |
-| Task 2.4 | done    | Route memo-cli parse and unknown-subcommand errors through helper | crates/memo-cli/src/app.rs                                                                               | argv-scan detect of `--format json` / `--json`; calls `emit_parse_error`                                                                                                                                                                                         |
-| Task 2.5 | done    | Add memo-cli exit-code matrix test                                | crates/memo-cli/tests/integration/exit_codes.rs                                                          | 5 tests covering SUCCESS / USAGE (arg + unknown subcmd) / DATA / RUNTIME                                                                                                                                                                                         |
-| Task 3.1 | done    | Migrate `agent-workflow-primitives` binaries                      | crates/agent-workflow-primitives/src/common.rs + per-binary entrypoints; tests/integration/exit_codes.rs | shared `Envelope<T>` via refactored `common.rs`; `handle_parse_error` routes parse errors; 50 cli tests + 3 matrix tests; `RECORD_SCHEMA_VERSION` literals stay byte-stable                                                                                      |
-| Task 3.2 | done    | Migrate API testing stack                                         | crates/api-testing-core/src/cli_contract.rs + per-binary main.rs; cli_smoke matrix tests                 | shared `handle_parse_error` helper in api-testing-core; api-websocket envelope drops `command` / renames `result` → `data`; api-test stdout + `--out` both ship `cli.api-test.run.v1` envelope; `render_summary_from_json_str` accepts both wrapped + raw shapes |
-| Task 3.3 | pending | Migrate remaining single-binary crates and run the full gate      | n/a                                                                                                      | next sprint                                                                                                                                                                                                                                                      |
-| Task 3.4 | pending | Workspace lint script for legacy contract usage                   | n/a                                                                                                      | depends on 3.1, 3.2, 3.3                                                                                                                                                                                                                                         |
+| ID       | Status  | Task                                                              | Evidence                                                                                                                                                                                                                                              | Notes                                                                                                                                                                                                                                                                                                                                                                                        |
+| -------- | ------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Task 1.1 | done    | Add `cli_contract` module to `nils-common`                        | crates/nils-common/src/cli_contract.rs; PR #375                                                                                                                                                                                                       | Plus additive `EnvelopeError::details` field in Sprint 2                                                                                                                                                                                                                                                                                                                                     |
+| Task 1.2 | done    | Add parse-error JSON helper                                       | crates/nils-common/tests/integration/cli_contract.rs; PR #375                                                                                                                                                                                         |                                                                                                                                                                                                                                                                                                                                                                                              |
+| Task 1.3 | done    | Migrate `cli-template` as reference implementation                | crates/cli-template/src/main.rs; PR #375                                                                                                                                                                                                              |                                                                                                                                                                                                                                                                                                                                                                                              |
+| Task 1.4 | done    | Write `cli-output-contract-v1.md` spec                            | docs/specs/cli-output-contract-v1.md; PR #375                                                                                                                                                                                                         | Sprint 2 extended with `details` field                                                                                                                                                                                                                                                                                                                                                       |
+| Task 2.1 | done    | Replace memo-cli exit-code constants with shared module           | crates/memo-cli/src/errors.rs                                                                                                                                                                                                                         | exit::USAGE/DATA/RUNTIME replaces 64/65/1 literals                                                                                                                                                                                                                                                                                                                                           |
+| Task 2.2 | done    | Migrate memo-cli to `OutputFormat` and hidden `--json` alias      | crates/memo-cli/src/cli.rs                                                                                                                                                                                                                            | shared `nils_common::cli_contract::OutputFormat`; `--json` `hide=true conflicts_with=format`                                                                                                                                                                                                                                                                                                 |
+| Task 2.3 | done    | Migrate memo-cli JSON output to shared envelope and `warnings`    | crates/memo-cli/src/output/json.rs + commands/*                                                                                                                                                                                                       | schema_version moved to `cli.memo-cli.<cmd>.v1`; collections nest `items` + `pagination`/`meta` under `data`; apply per-item errors surface in `warnings`                                                                                                                                                                                                                                    |
+| Task 2.4 | done    | Route memo-cli parse and unknown-subcommand errors through helper | crates/memo-cli/src/app.rs                                                                                                                                                                                                                            | argv-scan detect of `--format json` / `--json`; calls `emit_parse_error`                                                                                                                                                                                                                                                                                                                     |
+| Task 2.5 | done    | Add memo-cli exit-code matrix test                                | crates/memo-cli/tests/integration/exit_codes.rs                                                                                                                                                                                                       | 5 tests covering SUCCESS / USAGE (arg + unknown subcmd) / DATA / RUNTIME                                                                                                                                                                                                                                                                                                                     |
+| Task 3.1 | done    | Migrate `agent-workflow-primitives` binaries                      | crates/agent-workflow-primitives/src/common.rs + per-binary entrypoints; tests/integration/exit_codes.rs                                                                                                                                              | shared `Envelope<T>` via refactored `common.rs`; `handle_parse_error` routes parse errors; 50 cli tests + 3 matrix tests; `RECORD_SCHEMA_VERSION` literals stay byte-stable                                                                                                                                                                                                                  |
+| Task 3.2 | done    | Migrate API testing stack                                         | crates/api-testing-core/src/cli_contract.rs + per-binary main.rs; cli_smoke matrix tests                                                                                                                                                              | shared `handle_parse_error` helper in api-testing-core; api-websocket envelope drops `command` / renames `result` → `data`; api-test stdout + `--out` both ship `cli.api-test.run.v1` envelope; `render_summary_from_json_str` accepts both wrapped + raw shapes                                                                                                                             |
+| Task 3.3 | done    | Migrate remaining single-binary crates and run the full gate      | 14 crates: semantic-commit / git-scope / git-summary / git-lock / agent-out / agent-docs / agent-scope-lock / web-evidence / test-first-evidence / image-processing / codex-cli / gemini-cli / plan-tooling / plan-issue-cli; matrix tests per binary | semantic-commit staged-context emits `schema_version: "cli.semantic-commit.staged-context.v2"` plus all camelCase fields (`schemaVersion`, `generatedAt`, `fileCount`, `oldPath`, …) as deprecated aliases; agent-docs / image-processing / plan-issue-cli usage exits realigned 2 → 64; remaining crates wire `nils_common::cli_contract::exit::*` constants; 14 new exit-code matrix tests |
+| Task 3.4 | pending | Workspace lint script for legacy contract usage                   | n/a                                                                                                                                                                                                                                                   | depends on 3.1, 3.2, 3.3 (all done)                                                                                                                                                                                                                                                                                                                                                          |
 
 ## Validation
 
@@ -40,6 +39,8 @@
 | --- | --- | --- | --- |
 | `cargo test -p nils-common cli_contract` | pass | 10 tests (`EnvelopeError::details` additive change covered) | terminal log |
 | `cargo test -p nils-memo-cli` | pass | 34 tests (29 integration incl. 5 new exit-code matrix + 32 unit) | terminal log |
+| `cargo nextest run --workspace` | pass | 2801/2801 pass after Task 3.3 fan-out | terminal log |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass | zero warnings after Task 3.3 | terminal log |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | docs hygiene + plan-bundle validate green | terminal log |
 | `NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh` | pass | cargo fmt + clippy -D warnings + nextest workspace + doctests + third-party audit green | terminal log |
 
@@ -53,6 +54,78 @@
 
 - See prior turn's notes. Sprint 1 foundation landed; this entry kept as
   context for Sprint 2.
+
+### 2026-05-20 (Task 3.3 → feat/cli-output-contract-fan-out-3-3)
+
+- Read:
+  - docs/plans/cli-output-contract-unification/cli-output-contract-unification-plan.md
+  - crates/cli-template/src/main.rs (reference impl)
+  - crates/semantic-commit/{src/lib.rs, src/usage.rs, src/staged_context.rs,
+    src/commit.rs, tests/integration/staged_context.rs}
+  - crates/git-scope/src/main.rs; crates/git-summary/{src/main.rs, src/app.rs};
+    crates/git-lock/src/main.rs
+  - crates/agent-out/{Cargo.toml, src/lib.rs}; crates/agent-docs/{Cargo.toml,
+    src/lib.rs}; crates/agent-scope-lock/{Cargo.toml, src/lib.rs}
+  - crates/web-evidence/{Cargo.toml, src/lib.rs};
+    crates/test-first-evidence/{Cargo.toml, src/lib.rs};
+    crates/image-processing/{Cargo.toml, src/main.rs}
+  - crates/codex-cli/src/main.rs; crates/gemini-cli/src/main.rs
+  - crates/plan-tooling/{src/lib.rs, src/usage.rs};
+    crates/plan-issue-cli/src/lib.rs
+- Changed:
+  - crates/semantic-commit/src/staged_context.rs (new `schema_version:
+    "cli.semantic-commit.staged-context.v2"`; duplicates camelCase fields —
+    `schemaVersion`, `generatedAt`, `fileCount`, `insertions`, `deletions`,
+    `binaryFileCount`, `lockfileCount`, `rootFileCount`, `topLevelDirCount`,
+    `statusCounts`, `topLevelDirs`, `oldPath` — as deprecated aliases for one
+    minor cycle; switches inline EXIT_ERROR=1 onto shared `exit::RUNTIME`)
+  - crates/semantic-commit/tests/integration/exit_codes.rs (new — 6 tests:
+    unknown subcommand → 1 / staged-context outside repo → 1 / no staged → 2
+    / commit missing message → 3 / commit invalid message → 4 / staged-context
+    v2 schema + camelCase alias assertions)
+  - crates/git-scope/src/main.rs (process::exit(1|2) → exit::RUNTIME / USAGE
+    via `nils_common::cli_contract::exit`); new exit-code matrix test
+  - crates/git-summary/src/app.rs (invalid usage → exit::USAGE; runtime →
+    exit::RUNTIME); new exit-code matrix test
+  - crates/git-lock/src/main.rs (unknown command → exit::USAGE; runtime →
+    exit::RUNTIME); new exit-code matrix test
+  - crates/agent-out/{Cargo.toml, src/lib.rs} (add nils-common dep + nils-test-support dev-dep;
+    inline EXIT_USAGE/RUNTIME/AUDIT_VIOLATIONS now point at shared `exit::*`); new exit-code
+    matrix test
+  - crates/agent-docs/src/lib.rs (EXIT_USAGE realigned 2 → 64 via shared
+    constant; clap parse-error path now routes non-help/version errors through
+    EXIT_USAGE explicitly); new exit-code matrix test
+  - crates/agent-scope-lock/{Cargo.toml, src/lib.rs} (add nils-common dep;
+    inline constants reuse `exit::*`); new exit-code matrix test
+  - crates/web-evidence/{Cargo.toml, src/lib.rs} (add nils-common dep; reuse
+    `exit::*`); new exit-code matrix test
+  - crates/test-first-evidence/{Cargo.toml, src/lib.rs} (add nils-common dep;
+    reuse `exit::*`); new exit-code matrix test
+  - crates/image-processing/src/main.rs (usage_error realigned 2 → 64 via
+    `exit::USAGE`; clap parse-error path narrows USAGE mapping for non-help/
+    version errors); existing edge_cases tests updated 2 → 64; new exit-code
+    matrix test
+  - crates/codex-cli/src/main.rs; crates/gemini-cli/src/main.rs (inline 64
+    literals replaced with `exit::USAGE`; help-path uses `exit::SUCCESS`); new
+    exit-code matrix tests per binary
+  - crates/plan-tooling/src/usage.rs (unknown command → `exit::USAGE`; unit
+    test renamed `dispatch_unknown_command_exits_usage`, asserts
+    `exit::USAGE`); new exit-code matrix test
+  - crates/plan-issue-cli/src/lib.rs (EXIT_USAGE realigned 2 → 64 via shared
+    constant; EXIT_FAILURE / EXIT_SUCCESS routed through `exit::*`); existing
+    parity_guardrails tests updated 2 → 64; new exit-code matrix test
+  - THIRD_PARTY_LICENSES.md / THIRD_PARTY_NOTICES.md (regenerated for new
+    nils-common dep edges in agent-out / agent-scope-lock / web-evidence /
+    test-first-evidence)
+- Validated:
+  - `cargo build --workspace` (clean)
+  - `cargo nextest run --workspace` (2801 / 2801 pass)
+  - `cargo clippy --workspace --all-targets -- -D warnings` (zero warnings)
+  - Per-binary `cargo test -p <crate> --test integration exit_codes` for all
+    14 crates: green
+- Blocked by: none
+- Next: open feature PR with `/deliver-feature-pr`; Task 3.4 (workspace lint
+  script for legacy contract usage) lands as the final follow-up PR.
 
 ### 2026-05-19 (Task 3.2 → feat/cli-output-contract-api-testing-stack)
 

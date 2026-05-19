@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use nils_common::cli_contract::exit;
 
 mod completion;
 mod copy;
@@ -80,12 +81,12 @@ fn run() -> i32 {
 
     if args.len() > 1 && is_help(&args[1]) {
         messages::print_help();
-        return 0;
+        return exit::SUCCESS;
     }
 
     if args.len() > 1 && is_version(&args[1]) {
         println!("git-lock {}", env!("CARGO_PKG_VERSION"));
-        return 0;
+        return exit::SUCCESS;
     }
 
     if args.len() > 2
@@ -94,7 +95,7 @@ fn run() -> i32 {
         && let Some(text) = messages::subcommand_help(&args[1])
     {
         println!("{text}");
-        return 0;
+        return exit::SUCCESS;
     }
 
     if args.len() > 1 && args[1] == "completion" {
@@ -104,25 +105,25 @@ fn run() -> i32 {
             Command::Completion { shell } => completion::run(shell),
             _ => {
                 messages::print_help();
-                1
+                exit::USAGE
             }
         };
     }
 
     if !nils_common::git::is_git_repo().unwrap_or(false) {
         println!("{}", messages::NOT_GIT_REPO);
-        return 1;
+        return exit::RUNTIME;
     }
 
     if args.len() <= 1 {
         messages::print_help();
-        return 0;
+        return exit::SUCCESS;
     }
 
     if !is_known_command(&args[1]) {
         println!("{}", messages::unknown_command(&args[1]));
         println!("{}", messages::UNKNOWN_COMMAND_HINT);
-        return 1;
+        return exit::USAGE;
     }
 
     let cli = Cli::parse_from(&args);
@@ -138,7 +139,7 @@ fn run() -> i32 {
         Command::Completion { shell } => Ok(completion::run(shell)),
         Command::Help => {
             messages::print_help();
-            Ok(0)
+            Ok(exit::SUCCESS)
         }
     };
 
@@ -146,7 +147,7 @@ fn run() -> i32 {
         Ok(code) => code,
         Err(err) => {
             eprintln!("{err:#}");
-            1
+            exit::RUNTIME
         }
     }
 }

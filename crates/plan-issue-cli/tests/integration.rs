@@ -9,6 +9,8 @@ mod auto_single_lane_runtime_truth;
 mod cli_contract;
 #[path = "integration/common.rs"]
 pub mod common;
+#[path = "integration/exit_codes.rs"]
+mod exit_codes;
 #[path = "integration/grouping_default.rs"]
 mod grouping_default;
 #[path = "integration/link_pr_flow.rs"]

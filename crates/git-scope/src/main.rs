@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use nils_common::cli_contract::exit;
 use nils_common::env as shared_env;
 use std::process;
 
@@ -150,7 +151,7 @@ fn print_subcommand_help(command: &Command) -> bool {
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err:#}");
-        process::exit(1);
+        process::exit(exit::RUNTIME);
     }
 }
 
@@ -181,7 +182,7 @@ fn run() -> Result<()> {
 
     if !git::is_git_repo() {
         println!("⚠️ Not a Git repository. Run this command inside a Git project.");
-        process::exit(1);
+        process::exit(exit::RUNTIME);
     }
 
     let no_color = cli.no_color || shared_env::no_color_enabled();
@@ -253,7 +254,7 @@ fn run() -> Result<()> {
                 eprintln!("Usage: git-scope commit [OPTIONS] <COMMIT>");
                 eprintln!();
                 eprintln!("For more information, try '--help commit <COMMIT>'.");
-                process::exit(2);
+                process::exit(exit::USAGE);
             };
             commit::render_commit(&commit, parent.as_deref(), no_color, print, progress_opt_in)
                 .with_context(|| format!("git-scope commit {commit}"))?;

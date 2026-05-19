@@ -4,6 +4,7 @@ mod completion;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use codex_cli::{agent, auth, config};
+use nils_common::cli_contract::exit;
 
 fn main() {
     let exit_code = run();
@@ -15,17 +16,17 @@ fn run() -> i32 {
         let mut cmd = cli::Cli::command();
         if cmd.print_help().is_ok() {
             println!();
-            return 0;
+            return exit::SUCCESS;
         }
-        return 1;
+        return exit::RUNTIME;
     }
 
     let cli = match cli::Cli::try_parse_from(std::env::args()) {
         Ok(cli) => cli,
         Err(err) => {
             let code = match err.kind() {
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
-                _ => 64,
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => exit::SUCCESS,
+                _ => exit::USAGE,
             };
             let _ = err.print();
             return code;
