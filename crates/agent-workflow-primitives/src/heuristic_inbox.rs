@@ -17,7 +17,7 @@ use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use regex::Regex;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::common::{
     CliError, EXIT_USAGE, OutputFormat, display_path, render_error, render_success,
@@ -1697,6 +1697,196 @@ fn run_ingest(args: &IngestArgs) -> Result<Result<IngestResult, IngestFailure>, 
 // Invocation logging
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+struct SnapshotTarget {
+    label: &'static str,
+    path: PathBuf,
+}
+
+fn redacted_path(path: &Path) -> String {
+    normalize_home_paths(&display_path(path))
+}
+
+fn redacted_fields(fields: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    fields
+        .iter()
+        .map(|(key, value)| (key.clone(), normalize_home_paths(value)))
+        .collect()
+}
+
+fn evidence_metadata(case: &Case) -> Vec<Value> {
+    iter_evidence_files(case)
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(&case.folder)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| path.clone());
+            json!({
+                "path": redacted_path(&rel),
+                "bytes": fs::metadata(&path).ok().map(|metadata| metadata.len()),
+            })
+        })
+        .collect()
+}
+
+fn case_snapshot(case: &Case) -> Value {
+    let mut obj = Map::new();
+    obj.insert("kind".to_string(), json!(case.kind.as_str()));
+    obj.insert("folder".to_string(), json!(redacted_path(&case.folder)));
+    obj.insert("doc_path".to_string(), json!(redacted_path(&case.doc_path)));
+    obj.insert("doc_exists".to_string(), json!(case.doc_path.is_file()));
+    obj.insert(
+        "evidence".to_string(),
+        Value::Array(evidence_metadata(case)),
+    );
+
+    match parse_entry(&case.doc_path) {
+        Ok(parsed) => {
+            obj.insert(
+                "title".to_string(),
+                json!(normalize_home_paths(&parsed.title)),
+            );
+            obj.insert("fields".to_string(), json!(redacted_fields(&parsed.fields)));
+            obj.insert(
+                "raw_records".to_string(),
+                json!(
+                    parsed
+                        .raw_records
+                        .iter()
+                        .map(|value| normalize_home_paths(value))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        Err(err) => {
+            obj.insert(
+                "parse_error".to_string(),
+                json!(normalize_home_paths(&format!("{err:?}"))),
+            );
+        }
+    }
+
+    Value::Object(obj)
+}
+
+fn path_snapshot(label: &str, path: &Path) -> Value {
+    let mut obj = Map::new();
+    obj.insert("label".to_string(), json!(label));
+    obj.insert("path".to_string(), json!(redacted_path(path)));
+    obj.insert("exists".to_string(), json!(path.exists()));
+
+    if let Ok(metadata) = fs::metadata(path) {
+        let kind = if metadata.is_dir() {
+            "dir"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        obj.insert("path_kind".to_string(), json!(kind));
+        obj.insert("bytes".to_string(), json!(metadata.len()));
+    } else {
+        obj.insert("path_kind".to_string(), json!("missing"));
+    }
+
+    if let Ok(case) = resolve_case(path) {
+        obj.insert("case".to_string(), case_snapshot(&case));
+    }
+
+    Value::Object(obj)
+}
+
+fn snapshot_targets(targets: &[SnapshotTarget]) -> Value {
+    json!({
+        "schema_version": "cli.heuristic-inbox.state-snapshot.v1",
+        "captured_at": now_rfc3339(),
+        "targets": targets
+            .iter()
+            .map(|target| path_snapshot(target.label, &target.path))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn new_log_targets(args: &NewArgs) -> Vec<SnapshotTarget> {
+    let slug = args.slug.trim();
+    if !slug_regex().is_match(slug) {
+        return Vec::new();
+    }
+    let out_dir = args.out_dir.clone().unwrap_or_else(default_inbox_dir);
+    vec![SnapshotTarget {
+        label: "case",
+        path: out_dir.join(slug),
+    }]
+}
+
+fn set_status_log_targets(args: &SetStatusArgs) -> Vec<SnapshotTarget> {
+    vec![SnapshotTarget {
+        label: "case",
+        path: args.entry.clone(),
+    }]
+}
+
+fn archive_log_targets(args: &ArchiveArgs) -> Vec<SnapshotTarget> {
+    let mut targets = vec![SnapshotTarget {
+        label: "source",
+        path: args.entry.clone(),
+    }];
+    if let Ok(case) = resolve_case(&args.entry)
+        && let Ok(archive_date) = normalize_archive_date(&args.date)
+    {
+        let archive_root = args
+            .archive_root
+            .clone()
+            .unwrap_or_else(|| args.inbox_dir.join("archive"));
+        targets.push(SnapshotTarget {
+            label: "destination",
+            path: archive_destination(&case.folder, &archive_root, &archive_date),
+        });
+    }
+    targets
+}
+
+fn normalized_evidence_suffix(raw: &str) -> Option<String> {
+    let suffix = if raw.is_empty() {
+        ".md".to_string()
+    } else if raw.starts_with('.') {
+        raw.to_string()
+    } else {
+        format!(".{raw}")
+    };
+    suffix_regex().is_match(&suffix).then_some(suffix)
+}
+
+fn ingest_log_targets(args: &IngestArgs) -> Vec<SnapshotTarget> {
+    let mut targets = vec![SnapshotTarget {
+        label: "case",
+        path: args.case.clone(),
+    }];
+    let Ok(case) = resolve_case(&args.case) else {
+        return targets;
+    };
+    let label = if args.label.is_empty() {
+        args.source
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("evidence")
+            .to_string()
+    } else {
+        args.label.clone()
+    };
+    let Some(suffix) = normalized_evidence_suffix(&args.suffix) else {
+        return targets;
+    };
+    if label_regex().is_match(&label) {
+        targets.push(SnapshotTarget {
+            label: "evidence",
+            path: case.evidence_dir().join(format!("{label}{suffix}")),
+        });
+    }
+    targets
+}
+
 fn now_rfc3339() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1711,15 +1901,31 @@ fn now_rfc3339() -> String {
     format!("{date}T{h:02}:{m:02}:{s:02}Z")
 }
 
-fn write_invocation_log(
+fn execution_log_dir(out_dir: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = out_dir {
+        return Some(dir.to_path_buf());
+    }
+    agent_out::project_dir_for_current_repo("heuristic-inbox", true)
+        .ok()
+        .map(|result| PathBuf::from(result.path))
+}
+
+fn write_json_best_effort(path: &Path, value: &Value) {
+    let body = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string());
+    let _ = fs::write(path, format!("{body}\n"));
+}
+
+fn write_execution_log(
     out_dir: Option<&Path>,
     command: &str,
     argv: &[String],
     exit_code: i32,
     started_at: &str,
+    before: Option<Value>,
+    after: Option<Value>,
 ) -> Option<PathBuf> {
-    let dir = out_dir?;
-    if fs::create_dir_all(dir).is_err() {
+    let dir = execution_log_dir(out_dir)?;
+    if fs::create_dir_all(&dir).is_err() {
         return None;
     }
     let redacted_argv: Vec<String> = argv.iter().map(|s| normalize_home_paths(s)).collect();
@@ -1737,8 +1943,13 @@ fn write_invocation_log(
         "cwd": cwd,
     });
     let path = dir.join("invocation.json");
-    let body = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
-    let _ = fs::write(&path, format!("{body}\n"));
+    write_json_best_effort(&path, &payload);
+    if let Some(snapshot) = before {
+        write_json_best_effort(&dir.join("before.json"), &snapshot);
+    }
+    if let Some(snapshot) = after {
+        write_json_best_effort(&dir.join("after.json"), &snapshot);
+    }
     Some(path)
 }
 
@@ -1845,6 +2056,8 @@ fn dispatch_verify(args: VerifyArgs) -> i32 {
 fn dispatch_new(args: NewArgs, argv: &[String], started_at: &str) -> i32 {
     let format = args.format;
     let out_log = args.log_dir.clone();
+    let log_targets = new_log_targets(&args);
+    let before = snapshot_targets(&log_targets);
     let code = match run_new(&args) {
         Ok(result) => render_success(
             NEW_SCHEMA_VERSION,
@@ -1855,13 +2068,24 @@ fn dispatch_new(args: NewArgs, argv: &[String], started_at: &str) -> i32 {
         ),
         Err(err) => render_error(NEW_SCHEMA_VERSION, NEW_COMMAND, format, err),
     };
-    write_invocation_log(out_log.as_deref(), NEW_COMMAND, argv, code, started_at);
+    let after = snapshot_targets(&log_targets);
+    write_execution_log(
+        out_log.as_deref(),
+        NEW_COMMAND,
+        argv,
+        code,
+        started_at,
+        Some(before),
+        Some(after),
+    );
     code
 }
 
 fn dispatch_set_status(args: SetStatusArgs, argv: &[String], started_at: &str) -> i32 {
     let format = args.format;
     let out_log = args.log_dir.clone();
+    let log_targets = set_status_log_targets(&args);
+    let before = snapshot_targets(&log_targets);
     let code = match run_set_status(&args) {
         Ok(result) => render_success(
             SET_STATUS_SCHEMA_VERSION,
@@ -1872,12 +2096,15 @@ fn dispatch_set_status(args: SetStatusArgs, argv: &[String], started_at: &str) -
         ),
         Err(err) => render_error(SET_STATUS_SCHEMA_VERSION, SET_STATUS_COMMAND, format, err),
     };
-    write_invocation_log(
+    let after = snapshot_targets(&log_targets);
+    write_execution_log(
         out_log.as_deref(),
         SET_STATUS_COMMAND,
         argv,
         code,
         started_at,
+        Some(before),
+        Some(after),
     );
     code
 }
@@ -1885,6 +2112,8 @@ fn dispatch_set_status(args: SetStatusArgs, argv: &[String], started_at: &str) -
 fn dispatch_archive(args: ArchiveArgs, argv: &[String], started_at: &str) -> i32 {
     let format = args.format;
     let out_log = args.log_dir.clone();
+    let log_targets = archive_log_targets(&args);
+    let before = snapshot_targets(&log_targets);
     let code = match run_archive(&args) {
         Ok(result) if result.ok => render_success(
             ARCHIVE_SCHEMA_VERSION,
@@ -1905,13 +2134,24 @@ fn dispatch_archive(args: ArchiveArgs, argv: &[String], started_at: &str) -> i32
         ),
         Err(err) => render_error(ARCHIVE_SCHEMA_VERSION, ARCHIVE_COMMAND, format, err),
     };
-    write_invocation_log(out_log.as_deref(), ARCHIVE_COMMAND, argv, code, started_at);
+    let after = snapshot_targets(&log_targets);
+    write_execution_log(
+        out_log.as_deref(),
+        ARCHIVE_COMMAND,
+        argv,
+        code,
+        started_at,
+        Some(before),
+        Some(after),
+    );
     code
 }
 
 fn dispatch_ingest(args: IngestArgs, argv: &[String], started_at: &str) -> i32 {
     let format = args.format;
     let out_log = args.log_dir.clone();
+    let log_targets = ingest_log_targets(&args);
+    let before = snapshot_targets(&log_targets);
     let code = match run_ingest(&args) {
         Ok(Ok(result)) => render_success(
             INGEST_SCHEMA_VERSION,
@@ -1932,7 +2172,16 @@ fn dispatch_ingest(args: IngestArgs, argv: &[String], started_at: &str) -> i32 {
         ),
         Err(err) => render_error(INGEST_SCHEMA_VERSION, INGEST_COMMAND, format, err),
     };
-    write_invocation_log(out_log.as_deref(), INGEST_COMMAND, argv, code, started_at);
+    let after = snapshot_targets(&log_targets);
+    write_execution_log(
+        out_log.as_deref(),
+        INGEST_COMMAND,
+        argv,
+        code,
+        started_at,
+        Some(before),
+        Some(after),
+    );
     code
 }
 
@@ -2036,7 +2285,7 @@ struct NewArgs {
     #[arg(long = "next-action", default_value = "")]
     next_action: String,
 
-    /// Optional execution log directory.
+    /// Execution log directory override (defaults to agent-out topic heuristic-inbox).
     #[arg(long = "log-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     log_dir: Option<PathBuf>,
 
@@ -2064,7 +2313,7 @@ struct SetStatusArgs {
     #[arg(long = "next-action", default_value = "")]
     next_action: String,
 
-    /// Optional execution log directory.
+    /// Execution log directory override (defaults to agent-out topic heuristic-inbox).
     #[arg(long = "log-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     log_dir: Option<PathBuf>,
 
@@ -2103,7 +2352,7 @@ struct ArchiveArgs {
     #[arg(long = "dry-run")]
     dry_run: bool,
 
-    /// Optional execution log directory.
+    /// Execution log directory override (defaults to agent-out topic heuristic-inbox).
     #[arg(long = "log-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     log_dir: Option<PathBuf>,
 
@@ -2138,7 +2387,7 @@ struct IngestArgs {
     #[arg(long)]
     force: bool,
 
-    /// Optional execution log directory.
+    /// Execution log directory override (defaults to agent-out topic heuristic-inbox).
     #[arg(long = "log-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     log_dir: Option<PathBuf>,
 

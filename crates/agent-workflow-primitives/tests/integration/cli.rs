@@ -7,7 +7,9 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 
 fn run(bin: &str, dir: &Path, args: &[&str]) -> CmdOutput {
-    run_resolved_in_dir(bin, dir, args, &[], None)
+    let agent_home = dir.join(".agent-home");
+    let agent_home_value = agent_home.to_string_lossy().to_string();
+    run_resolved_in_dir(bin, dir, args, &[("AGENT_HOME", &agent_home_value)], None)
 }
 
 fn json_stdout(output: &CmdOutput) -> Value {
@@ -1087,6 +1089,30 @@ Promote after a durable fix and validation are linked.\n\n\
         inbox
     }
 
+    fn collect_files_named(root: &Path, name: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().and_then(|s| s.to_str()) == Some(name) {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
     #[test]
     fn help_lists_canonical_subcommands() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -2062,10 +2088,110 @@ All gates green.\n",
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let invocation = log_dir.join("invocation.json");
         assert!(invocation.exists(), "invocation.json not written");
-        let log: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&invocation).unwrap()).unwrap();
+        assert!(
+            log_dir.join("before.json").exists(),
+            "before.json not written"
+        );
+        assert!(
+            log_dir.join("after.json").exists(),
+            "after.json not written"
+        );
+        let log = read_json(&invocation);
         assert_eq!(log["command"], "heuristic-inbox set-status");
         assert_eq!(log["exit_code"], 0);
         assert!(log["argv"].as_array().unwrap().len() >= 3);
+        let before = read_json(&log_dir.join("before.json"));
+        let after = read_json(&log_dir.join("after.json"));
+        assert_eq!(before["targets"][0]["case"]["fields"]["status"], "open");
+        assert_eq!(after["targets"][0]["case"]["fields"]["status"], "promoted");
+    }
+
+    #[test]
+    fn write_op_auto_logs_to_agent_out_topic() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("fixture-gap"), EntryOpts::default());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "set-status",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--status",
+                "promoted",
+                "--link",
+                "docs/plans/example.md",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+
+        let agent_home = tmp.path().join(".agent-home");
+        let invocations =
+            collect_files_named(&agent_home.join("out").join("projects"), "invocation.json");
+        assert_eq!(
+            invocations.len(),
+            1,
+            "expected one auto log: {invocations:?}"
+        );
+        let log_dir = invocations[0].parent().unwrap();
+        let run_id = log_dir.file_name().unwrap().to_string_lossy();
+        assert!(
+            run_id.ends_with("-heuristic-inbox"),
+            "unexpected run id: {run_id}"
+        );
+        assert!(
+            log_dir.join("before.json").exists(),
+            "before.json not written"
+        );
+        assert!(
+            log_dir.join("after.json").exists(),
+            "after.json not written"
+        );
+        let log = read_json(&invocations[0]);
+        assert_eq!(log["command"], "heuristic-inbox set-status");
+        assert_eq!(log["exit_code"], 0);
+        let before = read_json(&log_dir.join("before.json"));
+        let after = read_json(&log_dir.join("after.json"));
+        assert_eq!(before["targets"][0]["case"]["fields"]["status"], "open");
+        assert_eq!(after["targets"][0]["case"]["fields"]["status"], "promoted");
+    }
+
+    #[test]
+    fn write_op_logs_failure_to_agent_out_topic() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("fixture-gap"), EntryOpts::default());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "set-status",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--status",
+                "planned",
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+
+        let agent_home = tmp.path().join(".agent-home");
+        let invocations =
+            collect_files_named(&agent_home.join("out").join("projects"), "invocation.json");
+        assert_eq!(
+            invocations.len(),
+            1,
+            "expected one failure log: {invocations:?}"
+        );
+        let log_dir = invocations[0].parent().unwrap();
+        let log = read_json(&invocations[0]);
+        assert_eq!(log["command"], "heuristic-inbox set-status");
+        assert_ne!(log["exit_code"], 0);
+        let before = read_json(&log_dir.join("before.json"));
+        let after = read_json(&log_dir.join("after.json"));
+        assert_eq!(before["targets"][0]["case"]["fields"]["status"], "open");
+        assert_eq!(after["targets"][0]["case"]["fields"]["status"], "open");
     }
 }

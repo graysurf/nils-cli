@@ -68,6 +68,20 @@ where
     dispatch(cli)
 }
 
+pub fn project_dir_for_current_repo(topic: &str, mkdir: bool) -> Result<ProjectResult, String> {
+    let agent_home = resolve_agent_home(None).map_err(|err| err.message)?;
+    let repo = resolve_repo(None).map_err(|err| err.message)?;
+    let input = ProjectPathInput {
+        agent_home,
+        repo,
+        explicit_repo_slug: None,
+        topic: topic.to_string(),
+        timestamp: current_timestamp(),
+        mkdir,
+    };
+    build_project_path(input).map_err(|err| err.message)
+}
+
 fn dispatch(cli: Cli) -> i32 {
     match cli.command {
         Command::Project(args) => run_project(args),

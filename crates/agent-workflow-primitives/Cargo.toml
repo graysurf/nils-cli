@@ -46,6 +46,7 @@ path = "src/bin/skill-usage.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
+nils-agent-out = { version = "0.10.0", path = "../agent-out" }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
