@@ -1,9 +1,10 @@
 //! Provider detection and host-classification.
 //!
-//! Spec: `crates/forge-cli/docs/specs/forge-cli-spec-v1.md` §"Provider detection". The ladder
-//! is: explicit `--provider` flag > `git remote get-url <--remote>` host parse
-//! > cached `gh auth status` / `glab auth status` host match. Unknown host
-//! produces `USAGE 64` with `error.kind = "provider_unsupported"`.
+//! Spec: `crates/forge-cli/docs/specs/forge-cli-spec-v1.md` §"Provider
+//! detection". The ladder is: explicit `--provider` flag, then
+//! `git remote get-url <--remote>` host parse, then cached `gh auth status`
+//! / `glab auth status` host match. Unknown host produces `USAGE 64` with
+//! `error.kind = "provider_unsupported"`.
 
 use std::process::Command;
 

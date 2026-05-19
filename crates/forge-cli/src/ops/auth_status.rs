@@ -149,10 +149,10 @@ where
     for line in text.lines() {
         if let Some(idx) = line.find(marker) {
             let after = &line[idx + marker.len()..];
-            if let Some(value) = extract(after.trim()) {
-                if !value.is_empty() {
-                    return Some(value);
-                }
+            if let Some(value) = extract(after.trim())
+                && !value.is_empty()
+            {
+                return Some(value);
             }
         }
     }
