@@ -145,33 +145,163 @@ pub struct CompletionArgs {
     pub shell: Shell,
 }
 
+/// Clap-facing `--kind` enum. Maps 1:1 to [`crate::validations::PrKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum PrKindFlag {
+    Feature,
+    Bug,
+}
+
+impl PrKindFlag {
+    pub fn into_kind(self) -> crate::validations::PrKind {
+        match self {
+            PrKindFlag::Feature => crate::validations::PrKind::Feature,
+            PrKindFlag::Bug => crate::validations::PrKind::Bug,
+        }
+    }
+}
+
+/// `--state` filter shared by `pr list` and the close payload normaliser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum PrStateFilter {
+    Open,
+    Closed,
+    Merged,
+    All,
+}
+
+impl PrStateFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrStateFilter::Open => "open",
+            PrStateFilter::Closed => "closed",
+            PrStateFilter::Merged => "merged",
+            PrStateFilter::All => "all",
+        }
+    }
+}
+
+/// `pr edit` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.edit` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrEditArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+    /// Replace the title (revalidates `title_length`).
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Replace the body / description (revalidates body sections).
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read replacement body from a file. Use `-` for stdin.
+    #[arg(long = "body-file", value_name = "PATH")]
+    pub body_file: Option<String>,
+    /// Re-target the PR / MR to this base branch.
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Add a label (repeatable).
+    #[arg(long = "add-label", value_name = "LABEL")]
+    pub add_labels: Vec<String>,
+    /// Remove a label (repeatable).
+    #[arg(long = "remove-label", value_name = "LABEL")]
+    pub remove_labels: Vec<String>,
+    /// Add a reviewer (repeatable).
+    #[arg(long = "add-reviewer", value_name = "USER")]
+    pub add_reviewers: Vec<String>,
+}
+
+/// `pr comment` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.comment` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrCommentArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+    /// Comment body. Mutually exclusive with `--body-file`.
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read comment body from a file. Use `-` for stdin.
+    #[arg(long = "body-file", value_name = "PATH")]
+    pub body_file: Option<String>,
+}
+
+/// `pr ready` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct PrReadyArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+}
+
+/// `pr list` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.list` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrListArgs {
+    /// Filter by state (default: open).
+    #[arg(long, value_enum, default_value_t = PrStateFilter::Open)]
+    pub state: PrStateFilter,
+    /// Filter by author handle.
+    #[arg(long)]
+    pub author: Option<String>,
+    /// Filter by head / source branch.
+    #[arg(long)]
+    pub head: Option<String>,
+    /// Cap the number of returned PRs (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub limit: u32,
+}
+
+/// `pr create` arguments. Maps to the inputs declared in
+/// `crates/forge-cli/docs/specs/forge-cli-ops-v1.yaml::operations.pr.create`.
+#[derive(Args, Debug, Clone)]
+pub struct PrCreateArgs {
+    /// Source branch (defaults to the current branch).
+    #[arg(long)]
+    pub head: Option<String>,
+    /// Target / base branch (defaults to the repo's default branch).
+    #[arg(long)]
+    pub base: Option<String>,
+    /// PR / MR title (required).
+    #[arg(long)]
+    pub title: String,
+    /// PR / MR body / description text. Mutually exclusive with `--body-file`.
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read PR / MR body from a file. Use `-` to read from stdin.
+    #[arg(long = "body-file", value_name = "PATH")]
+    pub body_file: Option<String>,
+    /// PR / MR kind (selects branch-prefix rule). Required.
+    #[arg(long, value_enum)]
+    pub kind: PrKindFlag,
+    /// Open as ready-for-review instead of draft (default: open as draft).
+    #[arg(long = "no-draft", action = ArgAction::SetTrue)]
+    pub no_draft: bool,
+    /// Add a reviewer (repeatable).
+    #[arg(long = "reviewer", value_name = "USER")]
+    pub reviewers: Vec<String>,
+    /// Add a label (repeatable).
+    #[arg(long = "label", value_name = "LABEL")]
+    pub labels: Vec<String>,
+}
+
 /// `pr` subtree.
 #[derive(Subcommand, Debug)]
 pub enum PrCommand {
     /// Open a draft pull / merge request from the current branch.
-    Create,
+    Create(PrCreateArgs),
     /// Fetch a single PR / MR with normalised fields.
     View {
         /// Numeric id or branch name.
         id: String,
     },
     /// List PRs / MRs.
-    List,
+    List(PrListArgs),
     /// Mutate PR / MR title, body, base, labels, reviewers.
-    Edit {
-        /// Numeric id.
-        id: u64,
-    },
+    Edit(PrEditArgs),
     /// Append a comment to a PR / MR.
-    Comment {
-        /// Numeric id.
-        id: u64,
-    },
+    Comment(PrCommentArgs),
     /// Promote a draft PR / MR to ready-for-review.
-    Ready {
-        /// Numeric id.
-        id: u64,
-    },
+    Ready(PrReadyArgs),
     /// Merge a ready PR / MR.
     Merge {
         /// Numeric id.
@@ -259,6 +389,27 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Repo(RepoArgs {
             command: Some(RepoCommand::View),
         })) => ops::repo_view::run(&global, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Create(args)),
+        })) => ops::pr_create::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::View { id }),
+        })) => ops::pr_view::run(&global, id, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::List(args)),
+        })) => ops::pr_list::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Close { id }),
+        })) => ops::pr_close::run(&global, id, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Edit(args)),
+        })) => ops::pr_edit::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Comment(args)),
+        })) => ops::pr_comment::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Ready(args)),
+        })) => ops::pr_ready::run(&global, args, format),
         Some(Command::Completion(CompletionArgs { shell })) => emit_completion(shell),
         None
         | Some(Command::Auth(AuthArgs { command: None }))
@@ -472,10 +623,64 @@ mod tests {
             match sub {
                 "view" | "checks" | "wait-checks" => argv.push("1"),
                 "edit" | "comment" | "ready" | "merge" | "close" => argv.push("1"),
+                "create" => {
+                    argv.extend(["--title", "demo", "--kind", "feature", "--body", "x"]);
+                }
                 _ => {}
             }
             let result = parse(&argv);
             assert!(result.is_ok(), "pr {sub} should parse, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn pr_create_rejects_both_body_and_body_file() {
+        let result = parse(&[
+            "pr",
+            "create",
+            "--title",
+            "demo",
+            "--kind",
+            "feature",
+            "--body",
+            "inline",
+            "--body-file",
+            "-",
+        ]);
+        assert!(result.is_err(), "--body + --body-file must conflict");
+    }
+
+    #[test]
+    fn pr_create_parses_reviewer_and_label_lists() {
+        let cli = parse(&[
+            "pr",
+            "create",
+            "--title",
+            "demo",
+            "--kind",
+            "bug",
+            "--body",
+            "x",
+            "--reviewer",
+            "alice",
+            "--reviewer",
+            "bob",
+            "--label",
+            "p1",
+            "--label",
+            "needs-review",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Pr(PrArgs {
+                command: Some(PrCommand::Create(args)),
+            })) => {
+                assert_eq!(args.kind, PrKindFlag::Bug);
+                assert_eq!(args.reviewers, vec!["alice", "bob"]);
+                assert_eq!(args.labels, vec!["p1", "needs-review"]);
+                assert!(!args.no_draft);
+            }
+            other => panic!("expected pr create, got {other:?}"),
         }
     }
 

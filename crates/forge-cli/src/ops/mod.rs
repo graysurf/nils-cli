@@ -3,4 +3,12 @@
 //! returns `Result<i32, ForgeError>`.
 
 pub mod auth_status;
+pub mod pr_close;
+pub mod pr_comment;
+pub mod pr_create;
+pub mod pr_edit;
+pub mod pr_list;
+pub mod pr_ready;
+pub mod pr_state;
+pub mod pr_view;
 pub mod repo_view;

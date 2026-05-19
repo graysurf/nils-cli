@@ -13,6 +13,7 @@ pub mod envelope;
 pub mod error;
 pub mod ops;
 pub mod provider;
+pub mod validations;
 
 use std::ffi::OsString;
 

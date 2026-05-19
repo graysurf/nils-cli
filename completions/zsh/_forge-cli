@@ -56,11 +56,20 @@ json\:"Single-record JSON envelope (snake_case)"))' \
         case $line[1] in
             (create)
 _arguments "${_arguments_options[@]}" : \
+'--head=[Source branch (defaults to the current branch)]:HEAD:_default' \
+'--base=[Target / base branch (defaults to the repo'\''s default branch)]:BASE:_default' \
+'--title=[PR / MR title (required)]:TITLE:_default' \
+'(--body-file)--body=[PR / MR body / description text. Mutually exclusive with \`--body-file\`]:BODY:_default' \
+'--body-file=[Read PR / MR body from a file. Use \`-\` to read from stdin]:PATH:_default' \
+'--kind=[PR / MR kind (selects branch-prefix rule). Required]:KIND:(feature bug)' \
+'*--reviewer=[Add a reviewer (repeatable)]:USER:_default' \
+'*--label=[Add a label (repeatable)]:LABEL:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--no-draft[Open as ready-for-review instead of draft (default\: open as draft)]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -81,6 +90,10 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (list)
 _arguments "${_arguments_options[@]}" : \
+'--state=[Filter by state (default\: open)]:STATE:(open closed merged all)' \
+'--author=[Filter by author handle]:AUTHOR:_default' \
+'--head=[Filter by head / source branch]:HEAD:_default' \
+'--limit=[Cap the number of returned PRs (default\: 30)]:LIMIT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -93,6 +106,13 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (edit)
 _arguments "${_arguments_options[@]}" : \
+'--title=[Replace the title (revalidates \`title_length\`)]:TITLE:_default' \
+'(--body-file)--body=[Replace the body / description (revalidates body sections)]:BODY:_default' \
+'--body-file=[Read replacement body from a file. Use \`-\` for stdin]:PATH:_default' \
+'--base=[Re-target the PR / MR to this base branch]:BASE:_default' \
+'*--add-label=[Add a label (repeatable)]:LABEL:_default' \
+'*--remove-label=[Remove a label (repeatable)]:LABEL:_default' \
+'*--add-reviewer=[Add a reviewer (repeatable)]:USER:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -101,11 +121,13 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':id -- Numeric id:_default' \
+':id -- Numeric PR / MR id:_default' \
 && ret=0
 ;;
 (comment)
 _arguments "${_arguments_options[@]}" : \
+'(--body-file)--body=[Comment body. Mutually exclusive with \`--body-file\`]:BODY:_default' \
+'--body-file=[Read comment body from a file. Use \`-\` for stdin]:PATH:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -114,7 +136,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':id -- Numeric id:_default' \
+':id -- Numeric PR / MR id:_default' \
 && ret=0
 ;;
 (ready)
@@ -127,7 +149,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':id -- Numeric id:_default' \
+':id -- Numeric PR / MR id:_default' \
 && ret=0
 ;;
 (merge)
