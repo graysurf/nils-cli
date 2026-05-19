@@ -25,6 +25,7 @@ fn all_binaries_export_zsh_completion() {
         "browser-session",
         "canary-check",
         "docs-impact",
+        "heuristic-inbox",
         "model-cross-check",
         "repo-retro",
         "review-evidence",
@@ -967,4 +968,1104 @@ fn create_repo_retro_fixture(tmp: &Path) -> std::path::PathBuf {
         ],
     );
     repo
+}
+
+// ---------------------------------------------------------------------------
+// heuristic-inbox integration tests (parity with agent-kit reference helper).
+// ---------------------------------------------------------------------------
+
+mod heuristic_inbox {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
+
+    const ENTRY_TEMPLATE: &str = "# {title}\n\n\
+## Status\n\n\
+- Status: {status}\n\
+- First observed: 2026-05-18\n\
+- Area: fixture skill\n\
+- Severity: {severity}\n\n\
+## Signal\n\n\
+The fixture workflow gap was observed and needs triage.\n\n\
+## Evidence\n\n\
+- Raw record: `{raw_record}`\n\
+- Summary: fixture evidence summary\n\
+{evidence_extra}\
+## Impact\n\n\
+Future agents need a retained tracker for this gap.\n\n\
+## Current Workaround\n\n\
+Use the documented manual workaround.\n\n\
+## Promotion Criteria\n\n\
+Promote after a durable fix and validation are linked.\n\n\
+## Next Action\n\n\
+{next_action}\n";
+
+    struct EntryOpts<'a> {
+        title: &'a str,
+        status: &'a str,
+        severity: &'a str,
+        raw_record: &'a str,
+        evidence_extra: &'a str,
+        next_action: &'a str,
+        create_evidence_dir: bool,
+    }
+
+    impl<'a> Default for EntryOpts<'a> {
+        fn default() -> Self {
+            Self {
+                title: "Fixture Gap",
+                status: "open",
+                severity: "medium",
+                raw_record: "out/projects/example/skill-usage.record.json",
+                evidence_extra: "- Durable fix: `docs/fix.md`\n",
+                next_action: "Create a focused implementation plan.",
+                create_evidence_dir: true,
+            }
+        }
+    }
+
+    fn write_entry(folder: &Path, opts: EntryOpts<'_>) -> PathBuf {
+        fs::create_dir_all(folder).expect("entry folder");
+        if opts.create_evidence_dir {
+            fs::create_dir_all(folder.join("evidence")).expect("evidence dir");
+        }
+        let entry = folder.join("ENTRY.md");
+        let body = ENTRY_TEMPLATE
+            .replace("{title}", opts.title)
+            .replace("{status}", opts.status)
+            .replace("{severity}", opts.severity)
+            .replace("{raw_record}", opts.raw_record)
+            .replace("{evidence_extra}", opts.evidence_extra)
+            .replace("{next_action}", opts.next_action);
+        fs::write(&entry, body).expect("write entry");
+        entry
+    }
+
+    fn write_skill_usage_record(dir: &Path) -> PathBuf {
+        fs::create_dir_all(dir).expect("record dir");
+        let path = dir.join("skill-usage.record.json");
+        let body = serde_json::json!({
+            "schema": "skill-usage.record.v1",
+            "skill": "skills/workflows/mr/gitlab/deliver-gitlab-mr",
+            "started_at": "2026-05-18T07:00:00Z",
+            "cwd": "/tmp/project",
+            "trigger": "user_explicit",
+            "intent": "deliver MR",
+            "inputs": {
+                "user_request_summary": "Deliver a GitLab MR",
+                "referenced_files": [],
+                "external_sources": []
+            },
+            "outcome": {
+                "status": "fail",
+                "summary": "Pipeline status parsing failed."
+            },
+            "failures": [{
+                "phase": "validation",
+                "classification": "script_bug",
+                "symptom": "Pipeline status parsing failed. SECRET_TOKEN_SHOULD_NOT_COPY",
+                "diagnosis": "The script did not read pipeline.status.",
+                "handling": "Recorded an inbox entry.",
+                "result": "blocked"
+            }],
+            "artifacts": [],
+            "linked_records": [],
+            "validation": [],
+            "follow_up": []
+        });
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&body).unwrap()),
+        )
+        .expect("write record");
+        path
+    }
+
+    fn inbox_root(tmp: &Path) -> PathBuf {
+        let inbox = tmp.join("heuristic-system").join("error-inbox");
+        fs::create_dir_all(&inbox).expect("inbox dir");
+        inbox
+    }
+
+    #[test]
+    fn help_lists_canonical_subcommands() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let out = run("heuristic-inbox", tmp.path(), &["--help"]);
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let stdout = out.stdout_text();
+        for keyword in [
+            "list",
+            "verify",
+            "new",
+            "set-status",
+            "archive",
+            "ingest-evidence",
+        ] {
+            assert!(
+                stdout.contains(keyword),
+                "missing subcommand '{keyword}' in help: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_valid_entry_returns_ok() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("fixture-gap"), EntryOpts::default());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        assert_eq!(payload["result"]["ok"], true);
+        assert_eq!(payload["result"]["kind"], "inbox");
+        assert_eq!(payload["result"]["fields"]["status"], "open");
+    }
+
+    #[test]
+    fn verify_rejects_invalid_status() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("bad-status"),
+            EntryOpts {
+                status: "done",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .expect("violations array");
+        assert!(violations.iter().any(|v| {
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("invalid status")
+        }));
+    }
+
+    #[test]
+    fn verify_rejects_missing_raw_evidence() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("missing-evidence"), EntryOpts::default());
+        let text = fs::read_to_string(&entry).unwrap();
+        let stripped = text.replace(
+            "- Raw record: `out/projects/example/skill-usage.record.json`\n",
+            "",
+        );
+        fs::write(&entry, stripped).unwrap();
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .expect("violations array");
+        assert!(violations.iter().any(|v| {
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("missing raw evidence pointer")
+        }));
+    }
+
+    #[test]
+    fn verify_detects_duplicate_entries() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let first = write_entry(
+            &inbox.join("fixture-gap"),
+            EntryOpts {
+                title: "Duplicate Gap",
+                raw_record: "out/projects/shared/skill-usage.record.json",
+                ..EntryOpts::default()
+            },
+        );
+        write_entry(
+            &inbox.join("fixture-gap-copy"),
+            EntryOpts {
+                title: "Duplicate Gap",
+                raw_record: "out/projects/shared/skill-usage.record.json",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                first.to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let duplicates = payload["error"]["details"]["duplicates"]
+            .as_array()
+            .expect("duplicates array");
+        assert!(!duplicates.is_empty());
+    }
+
+    #[test]
+    fn list_outputs_active_entries_in_json() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        write_entry(
+            &inbox.join("fixture-gap"),
+            EntryOpts {
+                severity: "high",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "list",
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let entries = payload["result"]["entries"]
+            .as_array()
+            .expect("entries array");
+        assert_eq!(entries[0]["status"], "open");
+        assert_eq!(entries[0]["severity"], "high");
+        assert_eq!(entries[0]["archived"], false);
+        let path = entries[0]["path"].as_str().unwrap();
+        assert!(
+            path.ends_with("fixture-gap/ENTRY.md"),
+            "unexpected path: {path}"
+        );
+    }
+
+    #[test]
+    fn list_reads_retired_planned_status() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        write_entry(
+            &inbox.join("retired-gap"),
+            EntryOpts {
+                status: "planned",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "list",
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--status",
+                "planned",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let entries = payload["result"]["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["status"], "planned");
+    }
+
+    #[test]
+    fn verify_reads_retired_triaged_status() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("retired-gap"),
+            EntryOpts {
+                status: "triaged",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        assert_eq!(payload["result"]["ok"], true);
+        assert_eq!(payload["result"]["fields"]["status"], "triaged");
+    }
+
+    #[test]
+    fn list_excludes_archived_by_default() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        write_entry(&inbox.join("active-gap"), EntryOpts::default());
+        let archive_dir = inbox.join("archive").join("2026");
+        write_entry(
+            &archive_dir.join("archived-gap"),
+            EntryOpts {
+                status: "promoted",
+                next_action: "None. Done.",
+                ..EntryOpts::default()
+            },
+        );
+        let active = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "list",
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        let with_archive = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "list",
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--include-archived",
+                "--format",
+                "json",
+            ],
+        );
+        let active_paths: Vec<String> = json_stdout(&active)["result"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap().to_string())
+            .collect();
+        let archive_paths: Vec<String> = json_stdout(&with_archive)["result"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(active_paths.len(), 1);
+        assert!(active_paths[0].contains("active-gap"));
+        assert!(archive_paths.iter().any(|p| p.contains("archived-gap")));
+    }
+
+    #[test]
+    fn new_from_skill_usage_redacts_summary() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let record_dir = tmp.path().join("out").join("skill-usage");
+        write_skill_usage_record(&record_dir);
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "new",
+                "--from-skill-usage",
+                record_dir.to_str().unwrap(),
+                "--slug",
+                "pipeline-status-gap",
+                "--out-dir",
+                inbox.to_str().unwrap(),
+                "--severity",
+                "high",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let entry = PathBuf::from(payload["result"]["path"].as_str().unwrap());
+        let entry_text = fs::read_to_string(&entry).unwrap();
+        assert!(entry_text.contains("- Status: open"));
+        assert!(entry_text.contains("- Severity: high"));
+        assert!(entry_text.contains("skill-usage.record.json"));
+        assert!(
+            !entry_text.contains("SECRET_TOKEN_SHOULD_NOT_COPY"),
+            "raw secret leaked into ENTRY.md"
+        );
+    }
+
+    #[test]
+    fn set_status_updates_status_and_link() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("fixture-gap"), EntryOpts::default());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "set-status",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--status",
+                "promoted",
+                "--link",
+                "docs/plans/example/example-plan.md",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        assert_eq!(payload["result"]["status"], "promoted");
+        let text = fs::read_to_string(&entry).unwrap();
+        assert!(text.contains("- Status: promoted"));
+        assert!(text.contains("docs/plans/example/example-plan.md"));
+    }
+
+    #[test]
+    fn set_status_rejects_retired_value() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("fixture-gap"), EntryOpts::default());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "set-status",
+                entry.to_str().unwrap(),
+                "--status",
+                "planned",
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let msg = payload["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("retired lifecycle status"));
+        assert!(msg.contains("open|promoted|wontfix"));
+        let after = fs::read_to_string(&entry).unwrap();
+        assert!(after.contains("- Status: open"));
+    }
+
+    #[test]
+    fn archive_dry_run_reports_destination() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("fixture-gap"),
+            EntryOpts {
+                status: "promoted",
+                next_action: "None. Fixed and validated.",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--date",
+                "2026-05-18",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let destination = payload["result"]["destination"].as_str().unwrap();
+        assert!(destination.ends_with("archive/2026/fixture-gap/ENTRY.md"));
+        assert_eq!(payload["result"]["dry_run"], true);
+        assert!(entry.exists());
+    }
+
+    #[test]
+    fn archive_moves_promoted_entry_with_evidence() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("fixture-gap"),
+            EntryOpts {
+                status: "promoted",
+                next_action: "None. Fixed and validated.",
+                ..EntryOpts::default()
+            },
+        );
+        fs::write(
+            entry
+                .parent()
+                .unwrap()
+                .join("evidence")
+                .join("validation.md"),
+            "Local validation: `scripts/check.sh --all` pass.\n",
+        )
+        .unwrap();
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--date",
+                "2026-05-18",
+                "--reason",
+                "Fixed and compressed into docs.",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let destination = PathBuf::from(payload["result"]["destination"].as_str().unwrap());
+        assert!(!entry.exists());
+        assert!(destination.exists());
+        assert!(
+            destination
+                .parent()
+                .unwrap()
+                .join("evidence/validation.md")
+                .exists()
+        );
+        let text = fs::read_to_string(&destination).unwrap();
+        assert!(text.contains("## Archive"));
+        assert!(text.contains("- Archived: 2026-05-18"));
+        assert!(text.contains("- Reason: Fixed and compressed into docs."));
+    }
+
+    #[test]
+    fn archive_accepts_wontfix_with_durable_link() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("accepted-risk"),
+            EntryOpts {
+                status: "wontfix",
+                evidence_extra: "",
+                next_action: "None. Risk accepted.",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--date",
+                "2026-05-18",
+                "--link",
+                "docs/accepted-risk.md",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let destination = PathBuf::from(payload["result"]["destination"].as_str().unwrap());
+        let text = fs::read_to_string(&destination).unwrap();
+        assert!(text.contains("- Durable link: `docs/accepted-risk.md`"));
+    }
+
+    #[test]
+    fn archive_rejects_active_status() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("active-gap"), EntryOpts::default());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(violations.iter().any(|v| {
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("closed status")
+        }));
+        assert!(entry.exists());
+    }
+
+    #[test]
+    fn archive_rejects_actionable_next_action() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("actionable-gap"),
+            EntryOpts {
+                status: "promoted",
+                next_action: "Create a follow-up plan.",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v["message"].as_str().unwrap_or("").contains("Next Action"))
+        );
+    }
+
+    #[test]
+    fn archive_rejects_missing_durable_link() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("missing-link"),
+            EntryOpts {
+                status: "promoted",
+                evidence_extra: "",
+                next_action: "None. Fixed.",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(violations.iter().any(|v| {
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("durable outcome link")
+        }));
+    }
+
+    #[test]
+    fn archive_rejects_existing_destination() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("fixture-gap"),
+            EntryOpts {
+                status: "promoted",
+                next_action: "None. Fixed.",
+                ..EntryOpts::default()
+            },
+        );
+        write_entry(
+            &inbox.join("archive").join("2026").join("fixture-gap"),
+            EntryOpts {
+                status: "promoted",
+                next_action: "None. Already archived.",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--date",
+                "2026-05-18",
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(violations.iter().any(|v| {
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("archive target already exists")
+        }));
+    }
+
+    #[test]
+    fn verify_rejects_raw_skill_usage_evidence() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("raw-evidence"), EntryOpts::default());
+        let raw = entry
+            .parent()
+            .unwrap()
+            .join("evidence")
+            .join("skill-usage.record.json");
+        fs::write(
+            &raw,
+            r#"{"schema":"skill-usage.record.v1","outcome":{"status":"ok"}}"#,
+        )
+        .unwrap();
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(violations.iter().any(|v| {
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("raw skill-usage record")
+        }));
+    }
+
+    #[test]
+    fn verify_rejects_bearer_token_in_evidence() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("token-evidence"), EntryOpts::default());
+        let leaky = entry.parent().unwrap().join("evidence").join("auth.md");
+        fs::write(&leaky, "Bearer abcdefghijklmnopqrstuvwxyz1234567890\n").unwrap();
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(violations.iter().any(|v| {
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("redacted-secret pattern")
+        }));
+    }
+
+    #[test]
+    fn verify_rejects_oversize_evidence() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("huge-evidence"), EntryOpts::default());
+        let huge = entry.parent().unwrap().join("evidence").join("huge.md");
+        fs::write(&huge, "x".repeat(64 * 1024 + 8)).unwrap();
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v["message"].as_str().unwrap_or("").contains("limit is"))
+        );
+    }
+
+    #[test]
+    fn ingest_evidence_rejects_raw_skill_usage_record() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("ingest-raw"), EntryOpts::default());
+        let record_dir = tmp.path().join("out").join("skill-usage");
+        let raw_record = write_skill_usage_record(&record_dir);
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "ingest-evidence",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--from",
+                raw_record.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(violations.iter().any(|v| {
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("raw skill-usage record")
+        }));
+    }
+
+    #[test]
+    fn ingest_evidence_rejects_token_pattern_source() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("ingest-token"), EntryOpts::default());
+        let source = tmp.path().join("out").join("leaky.md");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "Bearer abcdefghijklmnopqrstuvwxyz1234567890\n").unwrap();
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "ingest-evidence",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--from",
+                source.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(violations.iter().any(|v| {
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("redacted-secret pattern")
+        }));
+    }
+
+    #[test]
+    fn ingest_evidence_accepts_redacted_excerpt() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("ingest-clean"), EntryOpts::default());
+        let source = tmp.path().join("out").join("validation.md");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            &source,
+            "Validation summary: `scripts/check.sh --all` pass.\n",
+        )
+        .unwrap();
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "ingest-evidence",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--from",
+                source.to_str().unwrap(),
+                "--label",
+                "validation-summary",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let target = PathBuf::from(payload["result"]["path"].as_str().unwrap());
+        assert_eq!(target.file_name().unwrap(), "validation-summary.md");
+        let text = fs::read_to_string(&target).unwrap();
+        assert!(text.contains("scripts/check.sh --all"));
+    }
+
+    #[test]
+    fn ingest_evidence_normalizes_home_paths() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("ingest-paths"), EntryOpts::default());
+        let source = tmp.path().join("out").join("paths.md");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            &source,
+            "Run from /Users/example/project succeeded; log at /home/example/build.log.\n",
+        )
+        .unwrap();
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "ingest-evidence",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--from",
+                source.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let target = PathBuf::from(payload["result"]["path"].as_str().unwrap());
+        let text = fs::read_to_string(&target).unwrap();
+        assert!(!text.contains("/Users/example"));
+        assert!(!text.contains("/home/example"));
+        assert!(text.contains("<workspace>"));
+    }
+
+    #[test]
+    fn verify_accepts_operation_record_folder() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let record_root = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records")
+            .join("sample-record");
+        fs::create_dir_all(record_root.join("evidence")).unwrap();
+        fs::write(
+            record_root.join("RECORD.md"),
+            "# Sample Operation Record\n\n\
+## Status\n\n\
+- Date: 2026-05-19\n\
+- Status: implemented and validated\n\
+- System area: sample area\n\n\
+## Signal\n\n\
+A real workflow exercised the system.\n\n\
+## Evidence\n\n\
+- Local validation: see `evidence/validation.md`.\n\n\
+## Diagnosis\n\n\
+Root cause identified.\n\n\
+## Promotion Decision\n\n\
+Promoted for cross-skill audit value.\n\n\
+## Durable Fix\n\n\
+Fix landed in maintained code.\n\n\
+## Validation\n\n\
+All gates green.\n",
+        )
+        .unwrap();
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &["verify", record_root.to_str().unwrap(), "--format", "json"],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        assert_eq!(payload["result"]["ok"], true);
+        assert_eq!(payload["result"]["kind"], "record");
+    }
+
+    #[test]
+    fn write_op_emits_invocation_log_when_log_dir_set() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(&inbox.join("fixture-gap"), EntryOpts::default());
+        let log_dir = tmp.path().join("logs");
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "set-status",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--status",
+                "promoted",
+                "--link",
+                "docs/plans/example.md",
+                "--log-dir",
+                log_dir.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let invocation = log_dir.join("invocation.json");
+        assert!(invocation.exists(), "invocation.json not written");
+        let log: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&invocation).unwrap()).unwrap();
+        assert_eq!(log["command"], "heuristic-inbox set-status");
+        assert_eq!(log["exit_code"], 0);
+        assert!(log["argv"].as_array().unwrap().len() >= 3);
+    }
 }

@@ -23,7 +23,7 @@ Completion obligations for those binaries are tracked in
 | ---- | -------- | -------- |
 | API testing | `api-rest`, `api-gql`, `api-grpc`, `api-websocket`, `api-test` | Run protocol-specific API checks or orchestrate a mixed API test suite. |
 | Git tooling | `git-scope`, `git-cli`, `git-summary`, `git-lock` | Inspect changes, run Git helper flows, summarize commits, or manage repo-local commit locks. |
-| Agent policy and evidence | `agent-docs`, `agent-out`, `agent-scope-lock`, `test-first-evidence`, `web-evidence`, `browser-session`, `canary-check`, `docs-impact`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage` | Resolve agent policy docs, allocate artifact paths, enforce edit scope, inspect repo retrospectives, or persist deterministic workflow evidence. |
+| Agent policy and evidence | `agent-docs`, `agent-out`, `agent-scope-lock`, `test-first-evidence`, `web-evidence`, `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage` | Resolve agent policy docs, allocate artifact paths, enforce edit scope, inspect repo retrospectives, or persist deterministic workflow evidence. |
 | Planning and delivery | `plan-tooling`, `plan-issue`, `plan-issue-local`, `semantic-commit` | Validate/split implementation plans, orchestrate issue delivery, rehearse local plan flows, or create semantic commits. |
 | Provider lanes | `codex-cli`, `gemini-cli` | Run provider-specific diagnostics, auth checks, and workflow adapters. |
 | Desktop, media, and local utilities | `macos-agent`, `screen-record`, `image-processing`, `fzf-cli`, `memo-cli` | Automate local desktop tasks, capture media, convert images, use interactive shell helpers, or record/search local memos. |
@@ -80,7 +80,7 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 - [crates/test-first-evidence](crates/test-first-evidence): Deterministic failing-test/waiver/final-validation evidence records for
   test-first workflow gates.
 - [crates/agent-workflow-primitives](crates/agent-workflow-primitives): Multi-binary local-first agent workflow primitives
-  (`browser-session`, `canary-check`, `docs-impact`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage`).
+  (`browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage`).
 
 ### Planning, delivery, and provider lanes
 

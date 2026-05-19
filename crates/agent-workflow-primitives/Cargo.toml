@@ -24,6 +24,10 @@ name = "docs-impact"
 path = "src/bin/docs-impact.rs"
 
 [[bin]]
+name = "heuristic-inbox"
+path = "src/bin/heuristic-inbox.rs"
+
+[[bin]]
 name = "model-cross-check"
 path = "src/bin/model-cross-check.rs"
 

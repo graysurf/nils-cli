@@ -1,0 +1,172 @@
+#compdef heuristic-inbox
+
+autoload -U is-at-least
+
+_heuristic-inbox() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_heuristic-inbox_commands" \
+"*::: :->heuristic-inbox" \
+&& ret=0
+    case $state in
+    (heuristic-inbox)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:heuristic-inbox-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'--inbox-dir=[Inbox directory]:DIR:_files -/' \
+'--status=[Comma-separated lifecycle status filter]:STATUS:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--include-archived[Include archived entries]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(verify)
+_arguments "${_arguments_options[@]}" : \
+'--inbox-dir=[Inbox directory used for duplicate detection]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+':entry -- Case folder or ENTRY.md/RECORD.md path:_files' \
+&& ret=0
+;;
+(new)
+_arguments "${_arguments_options[@]}" : \
+'--from-skill-usage=[Path to a skill-usage record file or its containing directory]:PATH:_files' \
+'--slug=[Slug for the new inbox case]:SLUG:_default' \
+'--out-dir=[Output inbox directory (defaults to heuristic-system/error-inbox)]:DIR:_files -/' \
+'--title=[Optional title override]:TITLE:_default' \
+'--area=[Optional area override (defaults to the skill name)]:AREA:_default' \
+'--status=[Lifecycle status for the new entry]:STATUS:(open promoted wontfix)' \
+'--severity=[Severity for the new entry]:SEVERITY:(low medium high)' \
+'--next-action=[Optional Next Action override]:NEXT_ACTION:_default' \
+'--log-dir=[Optional execution log directory]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(set-status)
+_arguments "${_arguments_options[@]}" : \
+'--status=[New lifecycle status\: open|promoted|wontfix. Legacy values triaged|planned cannot be re-set]:STATUS:_default' \
+'--link=[Optional durable link to append to Next Action]:LINK:_default' \
+'--next-action=[Optional Next Action override]:NEXT_ACTION:_default' \
+'--log-dir=[Optional execution log directory]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+':entry -- Case folder or ENTRY.md path:_files' \
+&& ret=0
+;;
+(archive)
+_arguments "${_arguments_options[@]}" : \
+'--inbox-dir=[Inbox directory used for duplicate detection]:DIR:_files -/' \
+'--archive-root=[Override archive root (defaults to <inbox-dir>/archive)]:DIR:_files -/' \
+'--date=[Archive date (YYYY-MM-DD). Defaults to today]:DATE:_default' \
+'--link=[Optional durable outcome link]:LINK:_default' \
+'--reason=[Optional archive reason]:REASON:_default' \
+'--log-dir=[Optional execution log directory]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--dry-run[Report destination without moving the case folder]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':entry -- Case folder or ENTRY.md path:_files' \
+&& ret=0
+;;
+(ingest-evidence)
+_arguments "${_arguments_options[@]}" : \
+'--from=[Source evidence file]:PATH:_files' \
+'--label=[Evidence label (default\: source stem)]:LABEL:_default' \
+'--suffix=[Evidence file suffix (default\: .md)]:SUFFIX:_default' \
+'--max-bytes=[Reject sources larger than this many bytes]:MAX_BYTES:_default' \
+'--log-dir=[Optional execution log directory]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--force[Overwrite existing evidence with same label]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':case -- Case folder or ENTRY.md/RECORD.md path:_files' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_heuristic-inbox_commands] )) ||
+_heuristic-inbox_commands() {
+    local commands; commands=(
+'list:List inbox entries' \
+'verify:Verify one inbox or operation-record case folder' \
+'new:Create a curated entry from a skill usage record' \
+'set-status:Update an inbox entry lifecycle status' \
+'archive:Move a completed inbox case folder out of the active inbox' \
+'ingest-evidence:Redact and write an evidence file inside a case folder' \
+'completion:Print shell completion script' \
+    )
+    _describe -t commands 'heuristic-inbox commands' commands "$@"
+}
+(( $+functions[_heuristic-inbox__subcmd__archive_commands] )) ||
+_heuristic-inbox__subcmd__archive_commands() {
+    local commands; commands=()
+    _describe -t commands 'heuristic-inbox archive commands' commands "$@"
+}
+(( $+functions[_heuristic-inbox__subcmd__completion_commands] )) ||
+_heuristic-inbox__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'heuristic-inbox completion commands' commands "$@"
+}
+(( $+functions[_heuristic-inbox__subcmd__ingest-evidence_commands] )) ||
+_heuristic-inbox__subcmd__ingest-evidence_commands() {
+    local commands; commands=()
+    _describe -t commands 'heuristic-inbox ingest-evidence commands' commands "$@"
+}
+(( $+functions[_heuristic-inbox__subcmd__list_commands] )) ||
+_heuristic-inbox__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'heuristic-inbox list commands' commands "$@"
+}
+(( $+functions[_heuristic-inbox__subcmd__new_commands] )) ||
+_heuristic-inbox__subcmd__new_commands() {
+    local commands; commands=()
+    _describe -t commands 'heuristic-inbox new commands' commands "$@"
+}
+(( $+functions[_heuristic-inbox__subcmd__set-status_commands] )) ||
+_heuristic-inbox__subcmd__set-status_commands() {
+    local commands; commands=()
+    _describe -t commands 'heuristic-inbox set-status commands' commands "$@"
+}
+(( $+functions[_heuristic-inbox__subcmd__verify_commands] )) ||
+_heuristic-inbox__subcmd__verify_commands() {
+    local commands; commands=()
+    _describe -t commands 'heuristic-inbox verify commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_heuristic-inbox" ]; then
+    _heuristic-inbox "$@"
+else
+    compdef _heuristic-inbox heuristic-inbox
+fi

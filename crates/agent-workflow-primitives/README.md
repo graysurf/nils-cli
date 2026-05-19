@@ -11,7 +11,7 @@ provider credentials.
 | Field | Value |
 | ----- | ----- |
 | Package name | `nils-agent-workflow-primitives` |
-| Binary names | `browser-session`, `canary-check`, `docs-impact`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage` |
+| Binary names | `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage` |
 
 Each binary supports `--version` and `completion <bash|zsh>`.
 
@@ -22,6 +22,7 @@ Each binary supports `--version` and `completion <bash|zsh>`.
 | `browser-session` | Record browser goals, steps, statuses, and evidence artifacts. | `browser-session.json` under `--out DIR` |
 | `canary-check` | Run one local command and persist a redacted pass/fail result. | `canary-check.json` under `--out DIR` |
 | `docs-impact` | Classify changed Git paths as docs or non-docs and suggest documentation review. | stdout/JSON only |
+| `heuristic-inbox` | Manage curated HEURISTIC_SYSTEM inbox + operation-record case folders with redaction-enforced evidence ingestion. | `<inbox-dir>/<slug>/ENTRY.md` (+ optional `invocation.json` under `--log-dir DIR`) |
 | `model-cross-check` | Record primary/checker model observations without owning provider calls. | `model-cross-check.json` under `--out DIR` |
 | `repo-retro` | Generate deterministic repo-local implementation retrospectives from local Git, HEURISTIC_SYSTEM records, and explicit JSONL inputs. | stdout by default; optional Markdown/raw JSON/index under `--history-dir DIR --write` |
 | `review-evidence` | Record review findings and passing validation evidence. | `review-evidence.json` under `--out DIR` |
