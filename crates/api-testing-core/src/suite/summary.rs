@@ -354,18 +354,29 @@ pub fn render_summary_from_json_str(
         );
     }
 
-    let results: SuiteRunResults = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => {
-            return format!(
-                "## API test summary\n\n- {}\n",
-                if let Some(label) = input_label {
-                    format!("invalid JSON in: `{label}`")
-                } else {
-                    "invalid JSON from stdin".to_string()
-                }
-            );
-        }
+    // Accept both the raw `SuiteRunResults` shape (pre-Sprint-3.2 callers) and
+    // the new `cli.api-test.run.v1` envelope-wrapped shape. Try envelope first
+    // so post-migration callers parse cleanly without a fallback fail.
+    #[derive(serde::Deserialize)]
+    struct EnvelopeShape {
+        data: Option<SuiteRunResults>,
+    }
+
+    let results: SuiteRunResults = match serde_json::from_str::<EnvelopeShape>(raw) {
+        Ok(envelope) if envelope.data.is_some() => envelope.data.expect("checked above"),
+        _ => match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(_) => {
+                return format!(
+                    "## API test summary\n\n- {}\n",
+                    if let Some(label) = input_label {
+                        format!("invalid JSON in: `{label}`")
+                    } else {
+                        "invalid JSON from stdin".to_string()
+                    }
+                );
+            }
+        },
     };
 
     render_summary_markdown(&results, options)

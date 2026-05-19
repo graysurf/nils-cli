@@ -160,18 +160,18 @@ fn run_e2e_suite_smoke_passes_and_does_not_leak_secrets() {
 
     let results_json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("results json");
-    assert_eq!(results_json["summary"]["total"], 3);
-    assert_eq!(results_json["summary"]["passed"], 3);
-    assert_eq!(results_json["summary"]["failed"], 0);
-    assert_eq!(results_json["summary"]["skipped"], 0);
+    assert_eq!(results_json["data"]["summary"]["total"], 3);
+    assert_eq!(results_json["data"]["summary"]["passed"], 3);
+    assert_eq!(results_json["data"]["summary"]["failed"], 0);
+    assert_eq!(results_json["data"]["summary"]["skipped"], 0);
 
-    let output_dir_rel = results_json["outputDir"].as_str().unwrap_or("");
+    let output_dir_rel = results_json["data"]["outputDir"].as_str().unwrap_or("");
     assert!(!output_dir_rel.is_empty());
     let output_dir_abs = root.join(output_dir_rel);
     assert!(output_dir_abs.is_dir());
 
     // Ensure referenced artifacts exist and do not contain secrets.
-    if let Some(cases) = results_json["cases"].as_array() {
+    if let Some(cases) = results_json["data"]["cases"].as_array() {
         for c in cases {
             if let Some(stdout_rel) = c.get("stdoutFile").and_then(|v| v.as_str()) {
                 let p = root.join(stdout_rel);
@@ -286,12 +286,14 @@ fn run_e2e_suite_guardrails_fails_with_expected_messages() {
 
     let results_json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("results json");
-    assert_eq!(results_json["summary"]["total"], 3);
-    assert_eq!(results_json["summary"]["passed"], 0);
-    assert_eq!(results_json["summary"]["failed"], 2);
-    assert_eq!(results_json["summary"]["skipped"], 1);
+    assert_eq!(results_json["data"]["summary"]["total"], 3);
+    assert_eq!(results_json["data"]["summary"]["passed"], 0);
+    assert_eq!(results_json["data"]["summary"]["failed"], 2);
+    assert_eq!(results_json["data"]["summary"]["skipped"], 1);
 
-    let cases = results_json["cases"].as_array().expect("cases array");
+    let cases = results_json["data"]["cases"]
+        .as_array()
+        .expect("cases array");
     let mut by_id: std::collections::BTreeMap<String, serde_json::Value> =
         std::collections::BTreeMap::new();
     for c in cases {
@@ -315,7 +317,7 @@ fn run_e2e_suite_guardrails_fails_with_expected_messages() {
     assert_eq!(by_id["rest.write_skip"]["status"], "skipped");
     assert_eq!(by_id["rest.write_skip"]["message"], "write_cases_disabled");
 
-    let output_dir_rel = results_json["outputDir"].as_str().unwrap_or("");
+    let output_dir_rel = results_json["data"]["outputDir"].as_str().unwrap_or("");
     assert!(!output_dir_rel.is_empty());
     let output_dir_abs = root.join(output_dir_rel);
     assert!(output_dir_abs.is_dir());

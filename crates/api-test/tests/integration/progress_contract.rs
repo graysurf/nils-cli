@@ -114,7 +114,7 @@ fn progress_auto_and_on_are_silent_in_non_tty_and_keep_stdout_json_clean() {
     let auto_stderr = auto.stderr_text();
     let auto_json: serde_json::Value =
         serde_json::from_slice(&auto.stdout).expect("auto stdout json");
-    assert_eq!(auto_json["summary"]["total"], 1);
+    assert_eq!(auto_json["data"]["summary"]["total"], 1);
     assert!(!auto_stdout.contains("api-test "), "stdout leaked progress");
     assert!(
         !auto_stderr.contains("api-test "),
@@ -140,7 +140,7 @@ fn progress_auto_and_on_are_silent_in_non_tty_and_keep_stdout_json_clean() {
     let on_stdout = on.stdout_text();
     let on_stderr = on.stderr_text();
     let on_json: serde_json::Value = serde_json::from_slice(&on.stdout).expect("on stdout json");
-    assert_eq!(on_json["summary"]["total"], 1);
+    assert_eq!(on_json["data"]["summary"]["total"], 1);
     assert!(!on_stdout.contains("api-test "), "stdout leaked progress");
     assert!(
         !on_stderr.contains("api-test "),
@@ -174,7 +174,7 @@ fn progress_off_disables_progress_output() {
     let stdout = out.stdout_text();
     let stderr = out.stderr_text();
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout json");
-    assert_eq!(json["summary"]["total"], 1);
+    assert_eq!(json["data"]["summary"]["total"], 1);
     assert!(!stdout.contains("api-test "), "stdout leaked progress");
     assert!(
         !stderr.contains("api-test "),
@@ -204,7 +204,7 @@ fn progress_with_no_color_keeps_json_clean_and_avoids_sgr_color_sequences() {
     let stdout = out.stdout_text();
     let stderr = out.stderr_text();
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout json");
-    assert_eq!(json["summary"]["total"], 1);
+    assert_eq!(json["data"]["summary"]["total"], 1);
     assert!(!stdout.contains("api-test "), "stdout leaked progress");
     assert!(
         !has_sgr_color_sequence(&stderr),

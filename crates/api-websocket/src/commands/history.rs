@@ -101,9 +101,8 @@ pub(crate) fn cmd_history(
     if matches!(args.format, OutputFormat::Json) {
         let payload = serde_json::json!({
             "schema_version": HISTORY_SCHEMA_VERSION,
-            "command": "api-websocket history",
             "ok": true,
-            "result": {
+            "data": {
                 "history_file": history_file.to_string_lossy(),
                 "count": selected.len(),
                 "records": selected,
@@ -157,7 +156,6 @@ fn fail_history(
         }
         let payload = serde_json::json!({
             "schema_version": HISTORY_SCHEMA_VERSION,
-            "command": "api-websocket history",
             "ok": false,
             "error": error,
         });

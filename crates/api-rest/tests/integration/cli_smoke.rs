@@ -39,3 +39,21 @@ fn report_from_cmd_dry_run_exits_zero_and_prints_report_command() {
     assert!(out.stdout_text().contains("health"));
     assert!(out.stdout_text().contains("staging"));
 }
+
+#[test]
+fn unknown_arg_returns_usage_exit_code() {
+    let out = run_api_rest(&["--definitely-not-a-real-flag"]);
+    assert_eq!(out.code, 64, "stderr={}", out.stderr_text());
+}
+
+#[test]
+fn unknown_flag_emits_json_envelope_when_format_json_present() {
+    let out = run_api_rest(&["--format", "json", "--definitely-not-a-real-flag"]);
+    assert_eq!(out.code, 64, "stderr={}", out.stderr_text());
+    let stdout = out.stdout_text();
+    assert!(
+        stdout.contains("\"schema_version\":\"cli.api-rest.error.v1\""),
+        "expected error envelope on stdout, got: {stdout}"
+    );
+    assert!(stdout.contains("\"ok\":false"), "stdout={stdout}");
+}

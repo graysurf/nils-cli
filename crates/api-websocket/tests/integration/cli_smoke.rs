@@ -48,7 +48,6 @@ fn call_json_failure_uses_contract_envelope() {
 
     let json: serde_json::Value = serde_json::from_str(&out.stdout_text()).expect("json stdout");
     assert_eq!(json["schema_version"], "cli.api-websocket.call.v1");
-    assert_eq!(json["command"], "api-websocket call");
     assert_eq!(json["ok"], false);
     assert_eq!(json["error"]["code"], "request_not_found");
     assert!(
@@ -57,4 +56,22 @@ fn call_json_failure_uses_contract_envelope() {
             .unwrap_or_default()
             .contains("Request file not found")
     );
+}
+
+#[test]
+fn unknown_arg_returns_usage_exit_code() {
+    let out = run_api_websocket(&["--definitely-not-a-real-flag"]);
+    assert_eq!(out.code, 64, "stderr={}", out.stderr_text());
+}
+
+#[test]
+fn unknown_flag_emits_json_envelope_when_format_json_present() {
+    let out = run_api_websocket(&["--format", "json", "--definitely-not-a-real-flag"]);
+    assert_eq!(out.code, 64, "stderr={}", out.stderr_text());
+    let stdout = out.stdout_text();
+    assert!(
+        stdout.contains("\"schema_version\":\"cli.api-websocket.error.v1\""),
+        "expected error envelope on stdout, got: {stdout}"
+    );
+    assert!(stdout.contains("\"ok\":false"), "stdout={stdout}");
 }

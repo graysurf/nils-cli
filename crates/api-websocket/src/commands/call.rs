@@ -401,9 +401,8 @@ pub(crate) fn cmd_call_internal(
     if json_mode {
         let payload = serde_json::json!({
             "schema_version": CALL_SCHEMA_VERSION,
-            "command": "api-websocket call",
             "ok": true,
-            "result": {
+            "data": {
                 "target": executed.target,
                 "last_received": executed.last_received,
                 "transcript": executed.transcript,
@@ -451,7 +450,6 @@ fn write_json_failure(
 
     let payload = serde_json::json!({
         "schema_version": CALL_SCHEMA_VERSION,
-        "command": "api-websocket call",
         "ok": false,
         "error": error,
     });

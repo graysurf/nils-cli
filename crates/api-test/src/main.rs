@@ -1,8 +1,9 @@
+use std::ffi::OsString;
 use std::io::{Read, Write};
 
-use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
 
+use api_testing_core::cli_contract::{Envelope, handle_parse_error};
 use api_testing_core::cli_util;
 use api_testing_core::suite::filter::parse_csv_list;
 use api_testing_core::suite::resolve::{
@@ -222,21 +223,11 @@ fn run() -> i32 {
     }
 
     let argv = argv_with_default_command(&raw_args);
+    let argv_os: Vec<OsString> = argv.iter().map(OsString::from).collect();
 
-    let cli = match Cli::try_parse_from(argv) {
+    let cli = match Cli::try_parse_from(argv_os.iter()) {
         Ok(v) => v,
-        Err(err) => {
-            let code = err.exit_code();
-            if matches!(
-                err.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-            ) {
-                let _ = err.print();
-                return 0;
-            }
-            let _ = err.print();
-            return code;
-        }
+        Err(err) => return handle_parse_error("api-test", argv_os, err),
     };
 
     match cli.command {
@@ -345,7 +336,12 @@ fn cmd_run(args: &RunArgs) -> i32 {
         }
     };
 
-    let json_line = match serde_json::to_string(&run_output.results) {
+    // Wrap suite results in the shared CLI envelope; both stdout and the
+    // optional `--out` file emit the byte-identical envelope so consumers see
+    // one shape (`render_summary_from_json_str` transparently unwraps the
+    // envelope so old summary callers keep working).
+    let envelope = Envelope::success("cli.api-test.run.v1", &run_output.results);
+    let json_line = match serde_json::to_string(&envelope) {
         Ok(v) => v,
         Err(err) => {
             eprintln!("error: failed to serialize results JSON: {err}");

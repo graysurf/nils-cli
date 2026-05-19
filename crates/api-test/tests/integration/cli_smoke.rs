@@ -28,3 +28,21 @@ fn invalid_flag_exits_nonzero() {
     let out = run_api_test(&["--definitely-not-a-flag"]);
     assert_ne!(out.code, 0);
 }
+
+#[test]
+fn unknown_arg_returns_usage_exit_code() {
+    let out = run_api_test(&["definitely-not-a-real-subcommand"]);
+    assert_eq!(out.code, 64, "stderr={}", out.stderr_text());
+}
+
+#[test]
+fn unknown_flag_emits_json_envelope_when_format_json_present() {
+    let out = run_api_test(&["--format", "json", "--definitely-not-a-real-flag"]);
+    assert_eq!(out.code, 64, "stderr={}", out.stderr_text());
+    let stdout = out.stdout_text();
+    assert!(
+        stdout.contains("\"schema_version\":\"cli.api-test.error.v1\""),
+        "expected error envelope on stdout, got: {stdout}"
+    );
+    assert!(stdout.contains("\"ok\":false"), "stdout={stdout}");
+}

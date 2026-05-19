@@ -75,7 +75,7 @@ fn api_test_run_supports_grpc_case() {
     assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
 
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("results json");
-    assert_eq!(json["summary"]["total"], 1);
-    assert_eq!(json["summary"]["passed"], 1);
-    assert_eq!(json["summary"]["failed"], 0);
+    assert_eq!(json["data"]["summary"]["total"], 1);
+    assert_eq!(json["data"]["summary"]["passed"], 1);
+    assert_eq!(json["data"]["summary"]["failed"], 0);
 }
