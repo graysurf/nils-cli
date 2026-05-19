@@ -11,5 +11,7 @@ mod completion_outside_repo;
 mod e2e;
 #[path = "integration/grpc_integration.rs"]
 mod grpc_integration;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/progress_contract.rs"]
 mod progress_contract;

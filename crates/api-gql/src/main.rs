@@ -37,7 +37,10 @@ fn argv_with_default_command(raw_args: &[String]) -> Vec<String> {
 }
 
 fn print_root_help() {
+    println!("GraphQL runner with implicit `call` default for operation files.");
+    println!();
     println!("Usage: api-gql <command> [args]");
+    println!("       api-gql <operation.graphql> [variables.json]");
     println!();
     println!("Commands:");
     println!(
@@ -53,7 +56,38 @@ fn print_root_help() {
     println!("  --config-dir <dir>   Seed setup/graphql discovery (call/history/report/schema)");
     println!("  --list-envs          List available endpoint presets and exit 0 (call)");
     println!("  --list-jwts          List available JWT profiles and exit 0 (call)");
+    println!("  --env, --url, --jwt  Call-specific endpoint/auth overrides");
     println!("  -h, --help           Print help");
+    println!("  -V, --version        Print version");
+    println!();
+    println!("EXAMPLES:");
+    println!("  api-gql ops/health.graphql vars.json");
+    println!("  api-gql call --env staging ops/health.graphql");
+    println!("  api-gql report --case health --op ops/health.graphql --run");
+    println!("  api-gql schema --cat");
+    println!("  api-gql completion zsh");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  GQL_URL, GQL_ENV_DEFAULT, GQL_URL_*");
+    println!("  GQL_JWT_NAME, GQL_JWT_*, ACCESS_TOKEN, SERVICE_TOKEN");
+    println!("  GQL_SCHEMA_FILE");
+    println!(
+        "  GQL_JWT_VALIDATE_ENABLED, GQL_JWT_VALIDATE_STRICT, GQL_JWT_VALIDATE_LEEWAY_SECONDS"
+    );
+    println!(
+        "  GQL_HISTORY_ENABLED, GQL_HISTORY_FILE, GQL_HISTORY_MAX_MB, GQL_HISTORY_ROTATE_COUNT"
+    );
+    println!("  GQL_HISTORY_LOG_URL_ENABLED, GQL_VARS_MIN_LIMIT");
+    println!(
+        "  GQL_REPORT_DIR, GQL_REPORT_INCLUDE_COMMAND_ENABLED, GQL_REPORT_COMMAND_LOG_URL_ENABLED"
+    );
+    println!("  GQL_ALLOW_EMPTY_ENABLED");
+    println!();
+    println!("EXIT CODES:");
+    println!("  0   success");
+    println!("  1   runtime error");
+    println!("  64  command-line usage error");
+    println!("  65  invalid input data");
 }
 
 fn main() {

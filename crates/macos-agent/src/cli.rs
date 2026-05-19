@@ -37,7 +37,8 @@ pub enum ImageFormat {
     name = "macos-agent",
     version,
     about = "Automate macOS desktop actions for agent workflows.",
-    after_help = "Decision guide (AX-first):\n\
+    long_about = "Automate macOS desktop observation, window management, input, AX inspection, waits, and profiles with deterministic command output.",
+    after_help = "EXAMPLES:\n  macos-agent preflight\n  macos-agent windows list --format json\n  macos-agent window activate --app Finder\n  macos-agent input key --key Enter\n\nENVIRONMENT:\n  AGENT_HOME, HOME\n  AGENTS_MACOS_AGENT_TEST_MODE, AGENTS_MACOS_AGENT_TEST_TIMESTAMP\n  AGENTS_MACOS_AGENT_AX_BACKEND, AGENTS_MACOS_AGENT_AX_WATCH_POLL_JSON\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data\n\nDECISION GUIDE (AX-first):\n\
 1) Prefer `ax` commands for element-targeted interaction.\n\
 2) If AX is flaky, enable fallback flags (`--allow-coordinate-fallback`, `--allow-keyboard-fallback`).\n\
 3) If AX is unavailable, use `window activate` + `input` commands.\n\

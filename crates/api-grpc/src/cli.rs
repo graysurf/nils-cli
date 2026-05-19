@@ -1,10 +1,32 @@
 use clap::{Args, Parser, Subcommand};
 
+const ROOT_AFTER_HELP: &str = "\
+EXAMPLES:
+  api-grpc requests/health.grpc.json
+  api-grpc call --env staging requests/health.grpc.json
+  api-grpc report --case health --request requests/health.grpc.json --run
+
+ENVIRONMENT:
+  GRPC_URL, GRPC_ENV_DEFAULT, GRPC_URL_*
+  GRPC_TOKEN_NAME, GRPC_TOKEN_*, ACCESS_TOKEN, SERVICE_TOKEN
+  GRPC_JWT_VALIDATE_ENABLED, GRPC_JWT_VALIDATE_STRICT, GRPC_JWT_VALIDATE_LEEWAY_SECONDS
+  GRPC_HISTORY_ENABLED, GRPC_HISTORY_FILE, GRPC_HISTORY_MAX_MB, GRPC_HISTORY_ROTATE_COUNT
+  GRPC_HISTORY_LOG_URL_ENABLED
+  GRPC_REPORT_DIR, GRPC_REPORT_INCLUDE_COMMAND_ENABLED, GRPC_REPORT_COMMAND_LOG_URL_ENABLED
+
+EXIT CODES:
+  0   success
+  1   runtime error
+  64  command-line usage error
+  65  invalid input data";
+
 #[derive(Parser)]
 #[command(
     name = "api-grpc",
     version,
     about = "GRPC API runner (call/history/report)",
+    long_about = "Run GRPC request files, inspect history, and generate Markdown reports. A bare request file is treated as the `call` subcommand.",
+    after_help = ROOT_AFTER_HELP,
     disable_help_subcommand = true
 )]
 pub(crate) struct Cli {

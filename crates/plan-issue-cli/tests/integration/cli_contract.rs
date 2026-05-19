@@ -29,7 +29,7 @@ fn cli_help_lists_full_surface_for_live_and_local_bins() {
         // Task 1.5
         "resolve-approval",
         "-V, --version",
-        "Usage paths",
+        "USAGE PATHS",
         "plan-issue-local",
     ] {
         assert!(
@@ -46,13 +46,13 @@ fn cli_help_lists_full_surface_for_live_and_local_bins() {
         "{}",
         local.stdout
     );
-    assert!(local.stdout.contains("Usage paths"), "{}", local.stdout);
+    assert!(local.stdout.contains("USAGE PATHS"), "{}", local.stdout);
     assert!(
-        local.stdout.contains("Unsupported in plan-issue-local"),
+        local.stdout.contains("UNSUPPORTED IN PLAN-ISSUE-LOCAL"),
         "{}",
         local.stdout
     );
-    assert!(local.stdout.contains("Use instead"), "{}", local.stdout);
+    assert!(local.stdout.contains("USE INSTEAD"), "{}", local.stdout);
     assert!(
         local.stdout.contains("plan-issue <command>"),
         "{}",

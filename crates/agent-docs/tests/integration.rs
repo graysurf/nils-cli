@@ -19,6 +19,8 @@ mod contexts_checklist;
 mod env_paths;
 #[path = "integration/exit_codes.rs"]
 mod exit_codes;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/resolve_builtin.rs"]
 mod resolve_builtin;
 #[path = "integration/resolve_checklist.rs"]

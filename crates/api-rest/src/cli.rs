@@ -1,10 +1,32 @@
 use clap::{Args, Parser, Subcommand};
 
+const ROOT_AFTER_HELP: &str = "\
+EXAMPLES:
+  api-rest requests/health.request.json
+  api-rest call --env staging requests/health.request.json
+  api-rest report --case health --request requests/health.request.json --run
+
+ENVIRONMENT:
+  REST_URL, REST_ENV_DEFAULT, REST_URL_*
+  REST_TOKEN_NAME, REST_TOKEN_*, ACCESS_TOKEN, SERVICE_TOKEN
+  REST_JWT_VALIDATE_ENABLED, REST_JWT_VALIDATE_STRICT, REST_JWT_VALIDATE_LEEWAY_SECONDS
+  REST_HISTORY_ENABLED, REST_HISTORY_FILE, REST_HISTORY_MAX_MB, REST_HISTORY_ROTATE_COUNT
+  REST_HISTORY_LOG_URL_ENABLED
+  REST_REPORT_DIR, REST_REPORT_INCLUDE_COMMAND_ENABLED, REST_REPORT_COMMAND_LOG_URL_ENABLED
+
+EXIT CODES:
+  0   success
+  1   runtime error
+  64  command-line usage error
+  65  invalid input data";
+
 #[derive(Parser)]
 #[command(
     name = "api-rest",
     version,
     about = "REST API runner (call/history/report)",
+    long_about = "Run REST request files, inspect history, and generate Markdown reports. A bare request file is treated as the `call` subcommand.",
+    after_help = ROOT_AFTER_HELP,
     disable_help_subcommand = true
 )]
 pub(crate) struct Cli {

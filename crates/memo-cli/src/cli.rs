@@ -5,6 +5,22 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub use nils_common::cli_contract::OutputFormat;
 
+const MEMO_AFTER_HELP: &str = "\
+EXAMPLES:
+  memo-cli add 'Follow up with the release note'
+  memo-cli list --state pending --limit 10
+  memo-cli report week --tz Asia/Taipei
+
+ENVIRONMENT:
+  XDG_DATA_HOME  Base directory for the default SQLite database path.
+  HOME           Fallback base directory for the default SQLite database path.
+
+EXIT CODES:
+  0   success
+  1   runtime error
+  64  command-line usage error
+  65  invalid input data";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ItemState {
     All,
@@ -41,7 +57,9 @@ pub enum FetchState {
 #[command(
     name = "memo-cli",
     version,
-    about = "Capture-first memo CLI with agent enrichment"
+    about = "Capture-first memo CLI with agent enrichment",
+    long_about = "Capture, search, report, fetch, and apply memo records through a local SQLite database with text or JSON output.",
+    after_help = MEMO_AFTER_HELP
 )]
 pub struct Cli {
     /// SQLite file path
@@ -63,22 +81,33 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum MemoCommand {
     /// Capture one raw memo entry
+    #[command(long_about = "Capture one raw memo entry with source and timestamp metadata.")]
     Add(AddArgs),
     /// Update one memo entry and reset derived workflow state
+    #[command(long_about = "Update one memo entry and reset derived enrichment workflow state.")]
     Update(UpdateArgs),
     /// Hard-delete one memo entry and all dependent data
+    #[command(long_about = "Hard-delete one memo entry and all dependent derived data.")]
     Delete(DeleteArgs),
     /// List memo entries in deterministic order
+    #[command(
+        long_about = "List memo entries in deterministic order with paging and state filters."
+    )]
     List(ListArgs),
     /// Search memo entries with selectable match mode
+    #[command(long_about = "Search memo entries across raw text, derived text, and tags.")]
     Search(SearchArgs),
     /// Show weekly or monthly summary report
+    #[command(long_about = "Show weekly or monthly summary reports over captured memo entries.")]
     Report(ReportArgs),
     /// Fetch pending items for agent enrichment
+    #[command(long_about = "Fetch pending memo entries for external agent enrichment.")]
     Fetch(FetchArgs),
     /// Apply enrichment payloads
+    #[command(long_about = "Apply validated enrichment payloads to memo entries.")]
     Apply(ApplyArgs),
     /// Print shell completion script
+    #[command(long_about = "Print a shell completion script for memo-cli.")]
     Completion(CompletionArgs),
 }
 

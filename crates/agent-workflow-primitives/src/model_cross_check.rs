@@ -210,8 +210,9 @@ fn missing_fields(record: &CrossCheckRecord) -> Vec<String> {
     name = "model-cross-check",
     version,
     about = "Record cross-model review evidence without owning provider calls.",
+    long_about = "Persist primary and checker model observations, linked artifacts, and verification status without invoking model providers.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  model-cross-check init --out /tmp/model-check --prompt 'review this patch' --primary-model gpt-5.5 --checker-model gemini-2.5-pro\n  model-cross-check record-observation --out /tmp/model-check --role primary --model gpt-5.5 --verdict pass --summary 'implementation is coherent'\n  model-cross-check record-observation --out /tmp/model-check --role checker --model gemini-2.5-pro --verdict pass --summary 'no blocker found'\n  model-cross-check verify --out /tmp/model-check --format json\n  model-cross-check completion zsh"
+    after_help = "EXAMPLES:\n  model-cross-check init --out /tmp/model-check --prompt 'review this patch' --primary-model gpt-5.5 --checker-model gemini-2.5-pro\n  model-cross-check record-observation --out /tmp/model-check --role primary --model gpt-5.5 --verdict pass --summary 'implementation is coherent'\n  model-cross-check record-observation --out /tmp/model-check --role checker --model gemini-2.5-pro --verdict pass --summary 'no blocker found'\n  model-cross-check verify --out /tmp/model-check --format json\n  model-cross-check completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]

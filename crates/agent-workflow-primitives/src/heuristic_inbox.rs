@@ -2249,8 +2249,9 @@ fn dispatch_ingest(args: IngestArgs, argv: &[String], started_at: &str) -> i32 {
     name = "heuristic-inbox",
     version,
     about = "Manage curated HEURISTIC_SYSTEM error-inbox and operation-record case folders.",
+    long_about = "Manage curated heuristic-system inbox cases, operation records, evidence ingestion, and archival transitions.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  heuristic-inbox list --format json\n  heuristic-inbox verify heuristic-system/error-inbox/<slug>/ --format json\n  heuristic-inbox new --from-skill-usage out/.../skill-usage.record.json --slug pipeline-gap\n  heuristic-inbox set-status heuristic-system/error-inbox/<slug>/ --status promoted --link docs/plans/foo.md\n  heuristic-inbox archive heuristic-system/error-inbox/<slug>/ --date 2026-05-18\n  heuristic-inbox ingest-evidence heuristic-system/error-inbox/<slug>/ --from validation.md\n  heuristic-inbox completion zsh"
+    after_help = "EXAMPLES:\n  heuristic-inbox list --format json\n  heuristic-inbox verify heuristic-system/error-inbox/<slug>/ --format json\n  heuristic-inbox new --from-skill-usage out/.../skill-usage.record.json --slug pipeline-gap\n  heuristic-inbox set-status heuristic-system/error-inbox/<slug>/ --status promoted --link docs/plans/foo.md\n  heuristic-inbox archive heuristic-system/error-inbox/<slug>/ --date 2026-05-18\n  heuristic-inbox ingest-evidence heuristic-system/error-inbox/<slug>/ --from validation.md\n  heuristic-inbox completion zsh\n\nENVIRONMENT:\n  HOME  Fallback base path when expanding home-relative paths.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]

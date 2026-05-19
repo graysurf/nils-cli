@@ -17,6 +17,8 @@ mod edge_cases;
 mod exit_codes;
 #[path = "integration/help_outside_repo.rs"]
 mod help_outside_repo;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/print_sources.rs"]
 mod print_sources;
 #[path = "integration/progress_opt_in.rs"]

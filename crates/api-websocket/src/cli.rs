@@ -1,10 +1,32 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+const ROOT_AFTER_HELP: &str = "\
+EXAMPLES:
+  api-websocket requests/health.ws.json
+  api-websocket call --env staging requests/health.ws.json
+  api-websocket report --case health --request requests/health.ws.json --run
+
+ENVIRONMENT:
+  WS_URL, WS_ENV_DEFAULT, WS_URL_*
+  WS_TOKEN_NAME, WS_TOKEN_*, ACCESS_TOKEN, SERVICE_TOKEN
+  WS_JWT_VALIDATE_ENABLED, WS_JWT_VALIDATE_STRICT, WS_JWT_VALIDATE_LEEWAY_SECONDS
+  WS_HISTORY_ENABLED, WS_HISTORY_FILE, WS_HISTORY_MAX_MB, WS_HISTORY_ROTATE_COUNT
+  WS_HISTORY_LOG_URL_ENABLED
+  WS_REPORT_DIR, WS_REPORT_INCLUDE_COMMAND_ENABLED, WS_REPORT_COMMAND_LOG_URL_ENABLED
+
+EXIT CODES:
+  0   success
+  1   runtime error
+  64  command-line usage error
+  65  invalid input data";
+
 #[derive(Parser)]
 #[command(
     name = "api-websocket",
     version,
     about = "WebSocket API runner (call/history/report)",
+    long_about = "Run WebSocket request files, inspect history, and generate Markdown reports. A bare request file is treated as the `call` subcommand.",
+    after_help = ROOT_AFTER_HELP,
     disable_help_subcommand = true
 )]
 pub(crate) struct Cli {

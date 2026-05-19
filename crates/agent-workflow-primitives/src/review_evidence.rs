@@ -224,8 +224,9 @@ fn missing_fields(record: &ReviewRecord) -> Vec<String> {
     name = "review-evidence",
     version,
     about = "Record review findings and validation evidence.",
+    long_about = "Persist review findings, validation commands, artifacts, and verification status for agent workflows.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  review-evidence init --out /tmp/review --subject 'PR #12'\n  review-evidence record-finding --out /tmp/review --severity medium --path src/lib.rs --line 42 --summary 'missing error path'\n  review-evidence record-validation --out /tmp/review --command 'cargo test' --status pass\n  review-evidence verify --out /tmp/review --format json\n  review-evidence completion zsh"
+    after_help = "EXAMPLES:\n  review-evidence init --out /tmp/review --subject 'PR #12'\n  review-evidence record-finding --out /tmp/review --severity medium --path src/lib.rs --line 42 --summary 'missing error path'\n  review-evidence record-validation --out /tmp/review --command 'cargo test' --status pass\n  review-evidence verify --out /tmp/review --format json\n  review-evidence completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]

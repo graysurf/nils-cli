@@ -17,6 +17,8 @@ mod exit_codes;
 mod extension_cleanup_contract;
 #[path = "integration/fetch_apply_flow.rs"]
 mod fetch_apply_flow;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/item_id_allocator.rs"]
 mod item_id_allocator;
 #[path = "integration/json_contract.rs"]

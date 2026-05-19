@@ -8,6 +8,7 @@ pub mod cmd;
 pub mod fixtures;
 pub mod fs;
 pub mod git;
+pub mod help;
 pub mod http;
 pub mod stubs;
 

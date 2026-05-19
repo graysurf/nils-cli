@@ -82,7 +82,9 @@ fn report(args: ReportArgs) -> i32 {
 #[command(
     name = "repo-retro",
     version,
-    about = "Generate deterministic local repository retrospectives"
+    about = "Generate deterministic local repository retrospectives",
+    long_about = "Generate source-grounded repository retrospectives from Git history and optional structured evidence inputs.",
+    after_help = "EXAMPLES:\n  repo-retro report --repo . --from 2026-05-01 --to 2026-05-07 --mode team\n  repo-retro report --repo . --since 7d --format json --write\n  repo-retro completion zsh\n\nENVIRONMENT:\n  HOME  Fallback base path for local history expansion.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]

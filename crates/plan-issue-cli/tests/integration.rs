@@ -13,6 +13,8 @@ pub mod common;
 mod exit_codes;
 #[path = "integration/grouping_default.rs"]
 mod grouping_default;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/link_pr_flow.rs"]
 mod link_pr_flow;
 #[path = "integration/live_issue_ops.rs"]

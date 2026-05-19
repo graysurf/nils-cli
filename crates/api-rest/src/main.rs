@@ -37,6 +37,8 @@ fn argv_with_default_command(raw_args: &[String]) -> Vec<String> {
 }
 
 fn print_root_help() {
+    println!("REST API runner with implicit `call` default for request files.");
+    println!();
     println!("Usage: api-rest <command> [args]");
     println!();
     println!("Commands:");
@@ -49,13 +51,35 @@ fn print_root_help() {
     println!("Common options (see subcommand help for full details):");
     println!("  --config-dir <dir>   Seed setup/rest discovery (call/history/report)");
     println!("  -h, --help           Print help");
+    println!("  -V, --version        Print version");
     println!();
-    println!("Examples:");
+    println!("EXAMPLES:");
     println!("  api-rest --help");
+    println!("  api-rest requests/health.request.json");
     println!("  api-rest call --help");
     println!("  api-rest report --help");
     println!("  api-rest report-from-cmd --help");
     println!("  api-rest completion zsh");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  REST_URL, REST_ENV_DEFAULT, REST_URL_*");
+    println!("  REST_TOKEN_NAME, REST_TOKEN_*, ACCESS_TOKEN, SERVICE_TOKEN");
+    println!(
+        "  REST_JWT_VALIDATE_ENABLED, REST_JWT_VALIDATE_STRICT, REST_JWT_VALIDATE_LEEWAY_SECONDS"
+    );
+    println!(
+        "  REST_HISTORY_ENABLED, REST_HISTORY_FILE, REST_HISTORY_MAX_MB, REST_HISTORY_ROTATE_COUNT"
+    );
+    println!("  REST_HISTORY_LOG_URL_ENABLED");
+    println!(
+        "  REST_REPORT_DIR, REST_REPORT_INCLUDE_COMMAND_ENABLED, REST_REPORT_COMMAND_LOG_URL_ENABLED"
+    );
+    println!();
+    println!("EXIT CODES:");
+    println!("  0   success");
+    println!("  1   runtime error");
+    println!("  64  command-line usage error");
+    println!("  65  invalid input data");
 }
 
 fn main() {

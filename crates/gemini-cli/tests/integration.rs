@@ -45,6 +45,8 @@ mod dispatch;
 mod exit_codes;
 #[path = "integration/fs.rs"]
 mod fs;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/json.rs"]
 mod json;
 #[path = "integration/jwt.rs"]

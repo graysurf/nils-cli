@@ -18,8 +18,11 @@ mod tree;
 #[command(
     name = "git-scope",
     version,
+    about = "Inspect Git-tracked file scopes and selected content.",
+    long_about = "Inspect tracked, staged, unstaged, untracked, and commit-scoped paths with optional file-content printing.",
     disable_help_flag = true,
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    after_help = "EXAMPLES:\n  git-scope tracked crates/agent-docs\n  git-scope staged -p\n  git-scope commit HEAD~1\n  git-scope completion zsh\n\nENVIRONMENT:\n  GIT_SCOPE_PROGRESS  Opt in or out of progress output.\n  NO_COLOR            Disable ANSI colors.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error"
 )]
 struct Cli {
     /// Disable ANSI colors (also via NO_COLOR)
@@ -97,6 +100,8 @@ enum CompletionShell {
 }
 
 fn print_help() {
+    println!("Inspect Git-tracked file scopes and selected content.");
+    println!();
     println!("Usage: git-scope <command> [args]");
     println!();
     println!("Commands:");
@@ -122,7 +127,23 @@ fn print_help() {
         "  {:<16}  Disable ANSI colors (also via NO_COLOR)",
         "--no-color"
     );
+    println!("  {:<16}  Print help", "-h, --help");
     println!("  {:<16}  Show version", "-V, --version");
+    println!();
+    println!("EXAMPLES:");
+    println!("  git-scope tracked crates/agent-docs");
+    println!("  git-scope staged -p");
+    println!("  git-scope commit HEAD~1");
+    println!("  git-scope completion zsh");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  GIT_SCOPE_PROGRESS  Opt in or out of progress output.");
+    println!("  NO_COLOR            Disable ANSI colors.");
+    println!();
+    println!("EXIT CODES:");
+    println!("  0   success");
+    println!("  1   runtime error");
+    println!("  64  command-line usage error");
 }
 
 fn print_subcommand_help(command: &Command) -> bool {
