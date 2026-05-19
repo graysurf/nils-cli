@@ -1,15 +1,15 @@
 use serde_json::json;
 
-use crate::cli::{OutputMode, SearchField as CliSearchField};
+use crate::cli::{OutputFormat, SearchField as CliSearchField};
 use crate::errors::AppError;
-use crate::output::{emit_json_results_with_meta, format_item_id, text};
+use crate::output::{emit_data, format_item_id, text};
 use crate::storage::Storage;
 use crate::storage::repository::QueryState;
 use crate::storage::search;
 
 pub fn run(
     storage: &Storage,
-    output_mode: OutputMode,
+    format: OutputFormat,
     state: QueryState,
     query: &str,
     fields: &[CliSearchField],
@@ -26,8 +26,8 @@ pub fn run(
         search::search_items(conn, query, state, &search_fields, match_mode, limit)
     })?;
 
-    if output_mode.is_json() {
-        let results = rows
+    if format.is_json() {
+        let items = rows
             .iter()
             .map(|row| {
                 json!({
@@ -41,18 +41,18 @@ pub fn run(
                 })
             })
             .collect::<Vec<_>>();
-        return emit_json_results_with_meta(
-            "memo-cli.search.v1",
-            "memo-cli search",
-            results,
-            None,
-            Some(json!({
-                "query": query,
-                "limit": limit,
-                "state": query_state_label(state),
-                "fields": search_field_labels(&search_fields),
-                "match": search_match_mode_label(match_mode),
-            })),
+        return emit_data(
+            "cli.memo-cli.search.v1",
+            json!({
+                "items": items,
+                "meta": {
+                    "query": query,
+                    "limit": limit,
+                    "state": query_state_label(state),
+                    "fields": search_field_labels(&search_fields),
+                    "match": search_match_mode_label(match_mode),
+                },
+            }),
         );
     }
 

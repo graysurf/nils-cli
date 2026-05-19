@@ -16,12 +16,12 @@ fn agent_roundtrip_empty_dataset_fetch_is_stable() {
         fetch_output.stderr_text()
     );
     let fetch_json = parse_json_stdout(&fetch_output);
-    let rows = fetch_json["results"]
+    let rows = fetch_json["data"]["items"]
         .as_array()
         .expect("fetch results should be an array");
     assert_eq!(rows.len(), 0, "empty dataset should return no fetch rows");
-    assert_eq!(fetch_json["pagination"]["returned"], 0);
-    assert_eq!(fetch_json["pagination"]["has_more"], false);
+    assert_eq!(fetch_json["data"]["pagination"]["returned"], 0);
+    assert_eq!(fetch_json["data"]["pagination"]["has_more"], false);
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn agent_roundtrip_duplicate_apply_is_idempotent() {
         fetch_output.stderr_text()
     );
     let fetch_json = parse_json_stdout(&fetch_output);
-    let item_id = fetch_json["results"][0]["item_id"]
+    let item_id = fetch_json["data"]["items"][0]["item_id"]
         .as_str()
         .expect("fetched item should include item_id");
 
@@ -103,8 +103,8 @@ fn agent_roundtrip_duplicate_apply_is_idempotent() {
         apply_first.stderr_text()
     );
     let apply_first_json = parse_json_stdout(&apply_first);
-    assert_eq!(apply_first_json["result"]["accepted"], 1);
-    assert_eq!(apply_first_json["result"]["skipped"], 0);
+    assert_eq!(apply_first_json["data"]["accepted"], 1);
+    assert_eq!(apply_first_json["data"]["skipped"], 0);
 
     let apply_second = run_memo_cli(
         &db_path,
@@ -118,7 +118,7 @@ fn agent_roundtrip_duplicate_apply_is_idempotent() {
         apply_second.stderr_text()
     );
     let apply_second_json = parse_json_stdout(&apply_second);
-    assert_eq!(apply_second_json["result"]["accepted"], 0);
-    assert_eq!(apply_second_json["result"]["skipped"], 1);
-    assert_eq!(apply_second_json["result"]["failed"], 0);
+    assert_eq!(apply_second_json["data"]["accepted"], 0);
+    assert_eq!(apply_second_json["data"]["skipped"], 1);
+    assert_eq!(apply_second_json["data"]["failed"], 0);
 }

@@ -1,12 +1,12 @@
 use serde_json::json;
 
-use crate::cli::{DeleteArgs, OutputMode};
+use crate::cli::{DeleteArgs, OutputFormat};
 use crate::errors::AppError;
-use crate::output::{emit_json_result, format_item_id, parse_item_id, text};
+use crate::output::{emit_data, format_item_id, parse_item_id, text};
 use crate::storage::Storage;
 use crate::storage::repository;
 
-pub fn run(storage: &Storage, args: &DeleteArgs, output_mode: OutputMode) -> Result<(), AppError> {
+pub fn run(storage: &Storage, args: &DeleteArgs, format: OutputFormat) -> Result<(), AppError> {
     if !args.hard {
         return Err(AppError::usage(
             "delete requires --hard because only hard delete is supported",
@@ -18,10 +18,9 @@ pub fn run(storage: &Storage, args: &DeleteArgs, output_mode: OutputMode) -> Res
 
     let deleted = storage.with_transaction(|tx| repository::delete_item_hard(tx, item_id))?;
 
-    if output_mode.is_json() {
-        return emit_json_result(
-            "memo-cli.delete.v1",
-            "memo-cli delete",
+    if format.is_json() {
+        return emit_data(
+            "cli.memo-cli.delete.v1",
             json!({
                 "item_id": format_item_id(deleted.item_id),
                 "deleted": true,

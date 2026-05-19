@@ -28,7 +28,7 @@ fn apply_metadata_validation() {
         fetch_output.stderr_text()
     );
     let fetch_json = parse_json_stdout(&fetch_output);
-    let item_id = fetch_json["results"][0]["item_id"]
+    let item_id = fetch_json["data"]["items"][0]["item_id"]
         .as_str()
         .expect("item_id should be a string");
 
@@ -83,13 +83,13 @@ fn apply_metadata_validation() {
     );
     let valid_json = parse_json_stdout(&valid_apply);
     assert_eq!(valid_json["ok"], true);
-    assert_eq!(valid_json["result"]["items"][0]["content_type"], "json");
+    assert_eq!(valid_json["data"]["items"][0]["content_type"], "json");
     assert_eq!(
-        valid_json["result"]["items"][0]["validation_status"],
+        valid_json["data"]["items"][0]["validation_status"],
         "invalid"
     );
     assert_eq!(
-        valid_json["result"]["items"][0]["validation_errors"][0]["code"],
+        valid_json["data"]["items"][0]["validation_errors"][0]["code"],
         "json.syntax.trailing-comma"
     );
 }

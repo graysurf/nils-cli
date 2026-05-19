@@ -59,7 +59,7 @@ fn report_custom_window() {
     assert_eq!(report.code, 0, "report failed: {}", report.stderr_text());
     let report_json = parse_json_stdout(&report);
     assert_eq!(report_json["ok"], true);
-    assert_eq!(report_json["result"]["totals"]["captured"], 1);
+    assert_eq!(report_json["data"]["totals"]["captured"], 1);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn report_timezone() {
     assert_eq!(report.code, 0, "report failed: {}", report.stderr_text());
     let report_json = parse_json_stdout(&report);
     assert_eq!(report_json["ok"], true);
-    assert_eq!(report_json["result"]["range"]["timezone"], "Asia/Taipei");
+    assert_eq!(report_json["data"]["range"]["timezone"], "Asia/Taipei");
 }
 
 #[test]

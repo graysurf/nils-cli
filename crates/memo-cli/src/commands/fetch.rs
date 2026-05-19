@@ -1,14 +1,14 @@
 use serde_json::json;
 
-use crate::cli::OutputMode;
+use crate::cli::OutputFormat;
 use crate::errors::AppError;
-use crate::output::{emit_json_results_with_meta, format_item_id, parse_item_id, text};
+use crate::output::{emit_data, format_item_id, parse_item_id, text};
 use crate::storage::Storage;
 use crate::storage::repository;
 
 pub fn run(
     storage: &Storage,
-    output_mode: OutputMode,
+    format: OutputFormat,
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<(), AppError> {
@@ -45,8 +45,8 @@ pub fn run(
             .unwrap_or_default()
     });
 
-    if output_mode.is_json() {
-        let results = rows
+    if format.is_json() {
+        let items = rows
             .iter()
             .map(|row| {
                 json!({
@@ -61,17 +61,17 @@ pub fn run(
             })
             .collect::<Vec<_>>();
 
-        return emit_json_results_with_meta(
-            "memo-cli.fetch.v1",
-            "memo-cli fetch",
-            results,
-            Some(json!({
-                "limit": limit,
-                "returned": rows.len(),
-                "next_cursor": next_cursor,
-                "has_more": has_more
-            })),
-            None,
+        return emit_data(
+            "cli.memo-cli.fetch.v1",
+            json!({
+                "items": items,
+                "pagination": {
+                    "limit": limit,
+                    "returned": rows.len(),
+                    "next_cursor": next_cursor,
+                    "has_more": has_more,
+                },
+            }),
         );
     }
 

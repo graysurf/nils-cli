@@ -1,22 +1,21 @@
 use chrono::{Datelike, Duration, TimeZone, Utc};
 use serde_json::json;
 
-use crate::cli::{OutputMode, ReportArgs, ReportPeriod};
+use crate::cli::{OutputFormat, ReportArgs, ReportPeriod};
 use crate::errors::AppError;
-use crate::output::{emit_json_result, text};
+use crate::output::{emit_data, text};
 use crate::storage::Storage;
 use crate::storage::search::{self, ReportRangeQuery};
 use crate::timestamps::{format_utc, parse_rfc3339_utc, parse_timezone};
 
-pub fn run(storage: &Storage, output_mode: OutputMode, args: &ReportArgs) -> Result<(), AppError> {
+pub fn run(storage: &Storage, format: OutputFormat, args: &ReportArgs) -> Result<(), AppError> {
     let query = resolve_report_range(args)?;
     let summary =
         storage.with_connection(|conn| search::report_summary_with_range(conn, &query))?;
 
-    if output_mode.is_json() {
-        return emit_json_result(
-            "memo-cli.report.v1",
-            "memo-cli report",
+    if format.is_json() {
+        return emit_data(
+            "cli.memo-cli.report.v1",
             json!({
                 "period": summary.period,
                 "range": summary.range,

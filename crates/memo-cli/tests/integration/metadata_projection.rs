@@ -44,7 +44,7 @@ fn metadata_projection_search() {
         fetch_output.stderr_text()
     );
     let fetch_json = parse_json_stdout(&fetch_output);
-    let item_id = fetch_json["results"][0]["item_id"]
+    let item_id = fetch_json["data"]["items"][0]["item_id"]
         .as_str()
         .expect("item_id should exist");
 
@@ -76,7 +76,7 @@ fn metadata_projection_search() {
         search_output.stderr_text()
     );
     let search_json = parse_json_stdout(&search_output);
-    let first = &search_json["results"][0];
+    let first = &search_json["data"]["items"][0];
     assert_eq!(first["content_type"], "json");
     assert_eq!(first["validation_status"], "invalid");
 }
@@ -105,7 +105,7 @@ fn metadata_projection_report() {
         fetch_output.stderr_text()
     );
     let fetch_json = parse_json_stdout(&fetch_output);
-    let rows = fetch_json["results"]
+    let rows = fetch_json["data"]["items"]
         .as_array()
         .expect("fetch results should be an array");
 
@@ -150,7 +150,7 @@ fn metadata_projection_report() {
         list_output.stderr_text()
     );
     let list_json = parse_json_stdout(&list_output);
-    let list_rows = list_json["results"]
+    let list_rows = list_json["data"]["items"]
         .as_array()
         .expect("list results should be an array");
     let mut seen_pairs = HashMap::new();
@@ -187,7 +187,7 @@ fn metadata_projection_report() {
     );
     let report_json = parse_json_stdout(&report_output);
 
-    let content_types = report_json["result"]["top_content_types"]
+    let content_types = report_json["data"]["top_content_types"]
         .as_array()
         .expect("top_content_types should be an array");
     let mut content_type_names = Vec::new();
@@ -203,7 +203,7 @@ fn metadata_projection_report() {
         );
     }
 
-    let status_totals = report_json["result"]["validation_status_totals"]
+    let status_totals = report_json["data"]["validation_status_totals"]
         .as_array()
         .expect("validation_status_totals should be an array");
     let mut status_names = Vec::new();

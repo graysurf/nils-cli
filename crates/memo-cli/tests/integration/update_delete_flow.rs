@@ -17,7 +17,7 @@ fn update_and_delete_keep_layers_consistent() {
         add_output.stderr_text()
     );
     let add_json = parse_json_stdout(&add_output);
-    let item_id_str = add_json["result"]["item_id"]
+    let item_id_str = add_json["data"]["item_id"]
         .as_str()
         .expect("item_id should be a string");
     let item_id = parse_item_id(item_id_str).expect("item_id should parse");
@@ -80,8 +80,8 @@ fn update_and_delete_keep_layers_consistent() {
         update_output.stderr_text()
     );
     let update_json = parse_json_stdout(&update_output);
-    assert_eq!(update_json["schema_version"], "memo-cli.update.v1");
-    assert_eq!(update_json["result"]["state"], "pending");
+    assert_eq!(update_json["schema_version"], "cli.memo-cli.update.v1");
+    assert_eq!(update_json["data"]["state"], "pending");
 
     let fetch_after_update = run_memo_cli(&db_path, &["--json", "fetch", "--limit", "20"], None);
     assert_eq!(
@@ -91,7 +91,7 @@ fn update_and_delete_keep_layers_consistent() {
         fetch_after_update.stderr_text()
     );
     let fetch_after_update_json = parse_json_stdout(&fetch_after_update);
-    let rows = fetch_after_update_json["results"]
+    let rows = fetch_after_update_json["data"]["items"]
         .as_array()
         .expect("results array should exist");
     assert_eq!(rows.len(), 1);
@@ -109,7 +109,7 @@ fn update_and_delete_keep_layers_consistent() {
         search_old.stderr_text()
     );
     let search_old_json = parse_json_stdout(&search_old);
-    let search_old_rows = search_old_json["results"]
+    let search_old_rows = search_old_json["data"]["items"]
         .as_array()
         .expect("search results should be array");
     assert!(
@@ -153,8 +153,8 @@ fn update_and_delete_keep_layers_consistent() {
         delete_output.stderr_text()
     );
     let delete_json = parse_json_stdout(&delete_output);
-    assert_eq!(delete_json["schema_version"], "memo-cli.delete.v1");
-    assert_eq!(delete_json["result"]["deleted"], true);
+    assert_eq!(delete_json["schema_version"], "cli.memo-cli.delete.v1");
+    assert_eq!(delete_json["data"]["deleted"], true);
 
     let list_after_delete = run_memo_cli(&db_path, &["--json", "list", "--limit", "20"], None);
     assert_eq!(
@@ -165,7 +165,7 @@ fn update_and_delete_keep_layers_consistent() {
     );
     let list_after_delete_json = parse_json_stdout(&list_after_delete);
     assert_eq!(
-        list_after_delete_json["results"]
+        list_after_delete_json["data"]["items"]
             .as_array()
             .expect("list results array")
             .len(),

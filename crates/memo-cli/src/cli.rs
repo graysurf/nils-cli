@@ -3,25 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::errors::AppError;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum OutputFormat {
-    Text,
-    Json,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputMode {
-    Text,
-    Json,
-}
-
-impl OutputMode {
-    pub fn is_json(self) -> bool {
-        matches!(self, Self::Json)
-    }
-}
+pub use nils_common::cli_contract::OutputFormat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ItemState {
@@ -66,8 +48,8 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "path", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
-    /// Output JSON (shorthand for --format json)
-    #[arg(long, global = true)]
+    /// Hidden alias for `--format json` (kept for backwards compatibility).
+    #[arg(long, global = true, hide = true, conflicts_with = "format")]
     pub json: bool,
 
     /// Output format
@@ -230,18 +212,12 @@ pub struct ApplyArgs {
 }
 
 impl Cli {
-    pub fn resolve_output_mode(&self) -> Result<OutputMode, AppError> {
-        if self.json && matches!(self.format, Some(OutputFormat::Text)) {
-            return Err(AppError::usage(
-                "invalid output mode: --json cannot be combined with --format text",
-            ));
+    pub fn output_format(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            self.format.unwrap_or_default()
         }
-
-        if self.json || matches!(self.format, Some(OutputFormat::Json)) {
-            return Ok(OutputMode::Json);
-        }
-
-        Ok(OutputMode::Text)
     }
 
     pub fn command_id(&self) -> &'static str {
@@ -260,15 +236,15 @@ impl Cli {
 
     pub fn schema_version(&self) -> &'static str {
         match self.command {
-            MemoCommand::Add(_) => "memo-cli.add.v1",
-            MemoCommand::Update(_) => "memo-cli.update.v1",
-            MemoCommand::Delete(_) => "memo-cli.delete.v1",
-            MemoCommand::List(_) => "memo-cli.list.v1",
-            MemoCommand::Search(_) => "memo-cli.search.v1",
-            MemoCommand::Report(_) => "memo-cli.report.v1",
-            MemoCommand::Fetch(_) => "memo-cli.fetch.v1",
-            MemoCommand::Apply(_) => "memo-cli.apply.v1",
-            MemoCommand::Completion(_) => "memo-cli.completion.v1",
+            MemoCommand::Add(_) => "cli.memo-cli.add.v1",
+            MemoCommand::Update(_) => "cli.memo-cli.update.v1",
+            MemoCommand::Delete(_) => "cli.memo-cli.delete.v1",
+            MemoCommand::List(_) => "cli.memo-cli.list.v1",
+            MemoCommand::Search(_) => "cli.memo-cli.search.v1",
+            MemoCommand::Report(_) => "cli.memo-cli.report.v1",
+            MemoCommand::Fetch(_) => "cli.memo-cli.fetch.v1",
+            MemoCommand::Apply(_) => "cli.memo-cli.apply.v1",
+            MemoCommand::Completion(_) => "cli.memo-cli.completion.v1",
         }
     }
 }
@@ -293,34 +269,31 @@ fn default_db_path() -> PathBuf {
 pub(crate) mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, MemoCommand, OutputMode, SearchField, SearchMatch};
+    use super::{Cli, MemoCommand, OutputFormat, SearchField, SearchMatch};
 
     #[test]
-    fn output_mode_defaults_to_text() {
+    fn output_format_defaults_to_text() {
         let cli = Cli::parse_from(["memo-cli", "list"]);
-        let mode = cli.resolve_output_mode().expect("mode should resolve");
-        assert_eq!(mode, OutputMode::Text);
+        assert_eq!(cli.output_format(), OutputFormat::Text);
     }
 
     #[test]
-    fn output_mode_json_flag_wins() {
+    fn output_format_json_flag_wins() {
         let cli = Cli::parse_from(["memo-cli", "--json", "list"]);
-        let mode = cli.resolve_output_mode().expect("mode should resolve");
-        assert_eq!(mode, OutputMode::Json);
+        assert_eq!(cli.output_format(), OutputFormat::Json);
     }
 
     #[test]
-    fn output_mode_format_json_is_supported() {
+    fn output_format_format_json_is_supported() {
         let cli = Cli::parse_from(["memo-cli", "--format", "json", "list"]);
-        let mode = cli.resolve_output_mode().expect("mode should resolve");
-        assert_eq!(mode, OutputMode::Json);
+        assert_eq!(cli.output_format(), OutputFormat::Json);
     }
 
     #[test]
-    fn output_mode_rejects_conflict() {
-        let cli = Cli::parse_from(["memo-cli", "--json", "--format", "text", "list"]);
-        let err = cli.resolve_output_mode().expect_err("conflict should fail");
-        assert_eq!(err.exit_code(), 64);
+    fn output_format_rejects_conflict_at_parse_time() {
+        let err = Cli::try_parse_from(["memo-cli", "--json", "--format", "text", "list"])
+            .expect_err("clap should reject --json + --format conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

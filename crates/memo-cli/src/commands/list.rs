@@ -1,14 +1,14 @@
 use serde_json::json;
 
-use crate::cli::OutputMode;
+use crate::cli::OutputFormat;
 use crate::errors::AppError;
-use crate::output::{emit_json_results_with_meta, format_item_id, text};
+use crate::output::{emit_data, format_item_id, text};
 use crate::storage::Storage;
 use crate::storage::repository::{self, QueryState};
 
 pub fn run(
     storage: &Storage,
-    output_mode: OutputMode,
+    format: OutputFormat,
     state: QueryState,
     limit: usize,
     offset: usize,
@@ -16,8 +16,8 @@ pub fn run(
     let rows =
         storage.with_connection(|conn| repository::list_items(conn, state, limit, offset))?;
 
-    if output_mode.is_json() {
-        let results = rows
+    if format.is_json() {
+        let items = rows
             .iter()
             .map(|row| {
                 json!({
@@ -30,16 +30,16 @@ pub fn run(
                 })
             })
             .collect::<Vec<_>>();
-        return emit_json_results_with_meta(
-            "memo-cli.list.v1",
-            "memo-cli list",
-            results,
-            Some(json!({
-                "limit": limit,
-                "offset": offset,
-                "returned": rows.len(),
-            })),
-            None,
+        return emit_data(
+            "cli.memo-cli.list.v1",
+            json!({
+                "items": items,
+                "pagination": {
+                    "limit": limit,
+                    "offset": offset,
+                    "returned": rows.len(),
+                },
+            }),
         );
     }
 
