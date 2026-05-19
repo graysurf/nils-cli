@@ -24,19 +24,19 @@ fn help_prints_usage_and_commands() {
 }
 
 #[test]
-fn unknown_command_prints_message_and_exits_1() {
+fn unknown_command_uses_clap_usage_error() {
     let temp = tempfile::TempDir::new().unwrap();
     let out = common::run_fzf_cli(temp.path(), &["nope"], &[], None);
-    assert_eq!(out.code, 1);
+    assert_eq!(out.code, 64);
     assert!(
-        out.stdout.contains("❗ Unknown command: nope"),
-        "missing unknown command line: {}",
-        out.stdout
+        out.stderr.contains("unrecognized subcommand 'nope'"),
+        "missing clap parse error: {}",
+        out.stderr
     );
     assert!(
-        out.stdout.contains("Run 'fzf-cli help' for usage."),
-        "missing usage hint: {}",
-        out.stdout
+        out.stderr.contains("Usage: fzf-cli <command> [args]"),
+        "missing usage: {}",
+        out.stderr
     );
 }
 

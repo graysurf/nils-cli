@@ -8,31 +8,27 @@ enum CompletionShell {
     Zsh,
 }
 
-pub fn maybe_handle_completion_export(args: &[String]) -> Option<i32> {
-    if args.first().map(String::as_str) != Some("completion") {
-        return None;
-    }
-
-    match args.get(1).map(String::as_str) {
+pub fn run(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
         None => {
             eprintln!("usage: git-summary completion <bash|zsh>");
-            Some(1)
+            1
         }
-        Some("bash") if args.len() == 2 => Some(run(CompletionShell::Bash)),
-        Some("zsh") if args.len() == 2 => Some(run(CompletionShell::Zsh)),
-        Some(shell) if args.len() == 2 => {
+        Some("bash") if args.len() == 1 => run_shell(CompletionShell::Bash),
+        Some("zsh") if args.len() == 1 => run_shell(CompletionShell::Zsh),
+        Some(shell) if args.len() == 1 => {
             eprintln!("git-summary: error: unsupported completion shell '{shell}'");
             eprintln!("usage: git-summary completion <bash|zsh>");
-            Some(1)
+            1
         }
         _ => {
             eprintln!("git-summary: error: expected `git-summary completion <bash|zsh>`");
-            Some(1)
+            1
         }
     }
 }
 
-fn run(shell: CompletionShell) -> i32 {
+fn run_shell(shell: CompletionShell) -> i32 {
     match shell {
         CompletionShell::Bash => generate_script(Shell::Bash),
         CompletionShell::Zsh => generate_script(Shell::Zsh),
