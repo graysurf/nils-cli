@@ -1,0 +1,499 @@
+# forge-cli Spec v1
+
+## Purpose
+
+This spec is the canonical contract for `forge-cli`, a new binary in the
+`nils-cli` workspace. `forge-cli` provides a provider-neutral surface for
+the remote forge operations that today are run directly against `gh` and
+`glab` from agent-kit skills (PR/MR lifecycle, Issue lifecycle, CI
+wait). Two backends ship together: GitHub (wraps `gh`) and GitLab
+(wraps `glab`). Behaviour, validation, and exit semantics are identical
+across backends; only the underlying subprocess and the rendered help
+text differ.
+
+Goals:
+
+- Replace ad-hoc `gh`/`glab` invocations scattered across agent-kit
+  skills with one binary that enforces branch / body / state policy at
+  the type level.
+- Make the GitHub and GitLab lanes byte-identical from the caller's
+  point of view (same flags, same envelope, same exit codes).
+- Codify defaults that were previously only described in skill
+  Markdown (PR body sections, branch naming, required-check gating,
+  draft → ready → merge ordering).
+- Stay a thin wrapper: every action delegates to `gh` or `glab` as a
+  subprocess. No direct REST client, no extra auth surface, no separate
+  rate-limit handling. Auth / SSO / enterprise hosts come from the
+  user's existing `gh auth login` and `glab auth login` state.
+
+Non-goals (v1):
+
+- Release management (`gh release`, GitLab releases).
+- Label management.
+- Arbitrary `gh api` / GitLab REST passthrough — no escape hatch in v1
+  on purpose; if a workflow needs it, the call belongs in a focused
+  follow-up op, not a generic shim. **Deferred to v2** — see "Open
+  questions / v2 candidates" for the re-evaluation criteria. v1
+  callers that need a non-CRUD call must keep using `gh api` / `glab
+  api` directly from the bash shell until then.
+- Issue *macros* beyond create/view/edit/comment/close/reopen — the
+  full plan-issue / dispatch-pr-review orchestration stays in
+  agent-kit skills for now.
+
+## Scope
+
+In scope (v1):
+
+- PR/MR lifecycle: `create`, `view`, `list`, `edit`, `comment`,
+  `ready`, `merge`, `close`.
+- PR/MR checks: `pr checks` (one-shot snapshot) and `pr wait-checks`
+  (blocking poll until terminal).
+- Issue lifecycle: `issue create`, `view`, `edit`, `comment`, `close`,
+  `reopen`.
+- Read-only helpers used by the macros: `auth status`, `repo view`.
+- Macro ops: `pr deliver` (kind = `feature` | `bug`), composing the
+  atoms above into the agent-kit standard "open draft → wait CI →
+  ready → merge → cleanup" flow.
+
+Out of scope (v1): release management, labels, raw REST passthrough,
+issue macros, repo creation, branch protection management, code review
+state mutation beyond `pr ready`. Each of these would either widen the
+parity gap (GitLab has no equivalent today) or remove the "lock down
+behaviour" value (REST passthrough = same as `gh api` + rename).
+
+## Provider parity model
+
+`forge-cli` is a *router + wrapper*, not a client.
+
+- Provider is auto-detected from the working tree's remote URL
+  (`origin` by default, configurable via `--remote`):
+  - `github.com` or matches `gh auth status` hosts → backend `github`,
+    subprocess `gh`.
+  - `gitlab.com` or matches `glab auth status` hosts → backend
+    `gitlab`, subprocess `glab`.
+  - Other hosts → `USAGE 64` with `error.kind = "provider_unsupported"`
+    and a hint to file a follow-up; v1 does not auto-fall-back to
+    HTTPS-only Gitea/Forgejo even though the URL shape would allow it.
+- All remote calls go through the backend subprocess. `forge-cli` does
+  not open HTTP sockets, does not hold tokens, and does not write to
+  the user's `~/.config/gh` or `~/.config/glab`.
+- Backend stdout (typically `--json` from `gh`/`glab`) is parsed and
+  re-rendered through the workspace's `cli_contract` envelope. Backend
+  stderr is captured; on failure the relevant tail is included in
+  `data.error.detail` with secrets redacted (see "Output contract"
+  below).
+- Backend invocations always force `--json <fields>` (gh) or
+  equivalent JSON-bearing flags (glab) where supported. When a `glab`
+  subcommand does not support `--json` in the installed version,
+  `forge-cli` falls back to text parsing wrapped behind a typed parser
+  module so that the brittle bit is isolated.
+
+Parity matrix (v1):
+
+| forge-cli op          | github backend                                                  | gitlab backend                                       | Parity                               |
+| --------------------- | --------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------ |
+| `pr create`           | `gh pr create --draft`                                          | `glab mr create --draft`                             | exact                                |
+| `pr view <id>`        | `gh pr view <id> --json …`                                      | `glab mr view <id> -F json`                          | exact                                |
+| `pr list`             | `gh pr list --json …`                                           | `glab mr list -F json`                               | exact                                |
+| `pr edit <id>`        | `gh pr edit <id> …`                                             | `glab mr update <id> …`                              | exact                                |
+| `pr comment <id>`     | `gh pr comment <id> --body …`                                   | `glab mr note <id> --message …`                      | exact                                |
+| `pr ready <id>`       | `gh pr ready <id>`                                              | `glab mr update <id> --ready`                        | exact                                |
+| `pr merge <id>`       | `gh pr merge <id> --squash --delete-branch`                     | `glab mr merge <id> --squash --remove-source-branch` | exact (method honoured per repo cfg) |
+| `pr close <id>`       | `gh pr close <id>`                                              | `glab mr close <id>`                                 | exact                                |
+| `pr checks <id>`      | `gh pr checks <id> --json …`                                    | `glab ci status -b <branch>` parsed                  | emulated on GitLab                   |
+| `pr wait-checks <id>` | poll `gh pr checks` + `gh run view`                             | poll `glab ci status` / pipeline view                | emulated; same envelope              |
+| `issue create`        | `gh issue create …`                                             | `glab issue create …`                                | exact                                |
+| `issue view <id>`     | `gh issue view <id> --json …`                                   | `glab issue view <id> -F json`                       | exact                                |
+| `issue edit <id>`     | `gh issue edit <id> …`                                          | `glab issue update <id> …`                           | exact                                |
+| `issue comment <id>`  | `gh issue comment <id> --body …`                                | `glab issue note <id> --message …`                   | exact                                |
+| `issue close <id>`    | `gh issue close <id>`                                           | `glab issue close <id>`                              | exact                                |
+| `issue reopen <id>`   | `gh issue reopen <id>`                                          | `glab issue reopen <id>`                             | exact                                |
+| `auth status`         | `gh auth status`                                                | `glab auth status`                                   | exact (text → typed)                 |
+| `repo view`           | `gh repo view --json …`                                         | `glab repo view -F json`                             | exact                                |
+| `pr deliver`          | macro: `pr create` → `pr wait-checks` → `pr ready` → `pr merge` | same composition with gitlab atoms                   | exact (same macro logic on both)     |
+
+"emulated" means the backend's native command differs in shape, but
+`forge-cli` normalises both into the same `cli.forge-cli.pr.checks.v1`
+payload so callers can branch on `data.state` regardless of host.
+
+## Naming and topology
+
+- Crate: `nils-forge-cli` (matches the `nils-*` package convention).
+- Binary: `forge-cli`.
+- Library entry: `crates/forge-cli/src/lib.rs`.
+- Wrapper (Homebrew formula bin): `wrappers/forge-cli`.
+- Completions: `completions/_forge-cli`, `completions/forge-cli.bash`.
+
+Command tree:
+
+```text
+forge-cli
+├── pr
+│   ├── create
+│   ├── view
+│   ├── list
+│   ├── edit
+│   ├── comment
+│   ├── ready
+│   ├── merge
+│   ├── close
+│   ├── checks
+│   ├── wait-checks
+│   └── deliver           (macro)
+├── issue
+│   ├── create
+│   ├── view
+│   ├── edit
+│   ├── comment
+│   ├── close
+│   └── reopen
+├── repo
+│   └── view
+├── auth
+│   └── status
+└── completion              (workspace standard)
+```
+
+Global flags (every subcommand):
+
+- `--format text|json` (workspace standard).
+- `--remote <name>` (default `origin`).
+- `--provider github|gitlab` (override auto-detect).
+- `--repo <owner/name>` (override remote-derived repo slug; passed to
+  backend's `--repo` / `-R` equivalent).
+- `--dry-run` — render the backend command that *would* run plus all
+  validation checks, but do not invoke it. Output envelope carries the
+  exact argv under `data.plan`.
+
+`forge-cli` itself does not expose `--token`, `--host`, or any auth
+override. Those belong to `gh`/`glab` and are configured there.
+
+## Atomic op surface
+
+The full machine-readable list lives in
+[`forge-cli-ops-v1.yaml`](forge-cli-ops-v1.yaml). The Markdown table
+below is the human-readable summary; the YAML is authoritative for
+backend mapping, validation rules, and output schema versions.
+
+### `pr create`
+
+- Input: `--head <branch>` (default current branch), `--base <branch>`
+  (default repo default branch), `--title <str>`, `--body-file <path>`
+  or `--body <str>`, `--kind feature|bug`, `--draft` (default `true`),
+  `--reviewer <user>...`, `--label <name>...`.
+- Validation (see "Lock-down policy" for the full list):
+  - branch name MUST match `^(feat|fix)/[a-z0-9][a-z0-9-]{1,63}$` and
+    align with `--kind`;
+  - title length ≤ 70 chars, no trailing whitespace;
+  - body MUST contain non-empty `## Summary` and `## Test plan`
+    sections;
+  - working tree MUST be clean (`git status --porcelain` empty);
+  - HEAD MUST be pushed and remote-tracked.
+- Output schema: `cli.forge-cli.pr.create.v1`,
+  `data = { number, url, head, base, draft, title, kind, provider }`.
+
+### `pr wait-checks`
+
+- Input: `<id>` (or `--head <branch>` to resolve PR by branch),
+  `--timeout <duration>` (default `30m`), `--interval <duration>`
+  (default `20s`), `--required-only` (default `true`).
+- Behaviour: polls the backend until every required check is in a
+  terminal state (`success`, `failure`, `cancelled`, `skipped`,
+  `neutral`). `--required-only=true` ignores non-required checks for
+  the gating decision but still reports them in `data.checks`.
+- Terminal states map to envelope `ok`:
+  - all required `success` → `ok = true`.
+  - any required `failure`/`cancelled`/`timed_out` → `ok = false`,
+    exit `RUNTIME 1`, `error.kind = "checks_failed"`.
+  - timeout reached → `ok = false`, exit `UNAVAILABLE 69`,
+    `error.kind = "checks_timeout"`.
+- Output schema: `cli.forge-cli.pr.checks.v1`,
+  `data = { state, required_count, success_count, failed:[…], pending:[…], duration_ms }`.
+
+### `pr merge`
+
+- Preconditions enforced before invoking the backend:
+  - PR exists and is not draft (call `pr ready` first if needed);
+  - working tree clean;
+  - required checks all green (re-checked even if `pr wait-checks`
+    succeeded earlier — TTL-zero gate);
+  - target branch is the repo default branch OR explicitly approved
+    via `--allow-non-default-base`;
+  - `--method squash|merge|rebase` (default `squash`, configurable
+    per repo).
+- Post-merge: deletes the remote branch (default `true`, disable via
+  `--keep-branch`).
+- Output schema: `cli.forge-cli.pr.merge.v1`,
+  `data = { number, url, merge_sha, method, deleted_branch }`.
+
+(See `forge-cli-ops-v1.yaml` for the remaining ops.)
+
+## Macro: `pr deliver`
+
+`pr deliver` is the canonical end-to-end flow agent-kit's
+`deliver-{feature,bug}-pr` skills compose today. It is implemented in
+Rust so behaviour is fixed at the type level and identical across
+providers.
+
+Synopsis:
+
+```text
+forge-cli pr deliver \
+  --kind feature|bug \
+  [--title <str>] [--body-file <path>] \
+  [--base <branch>] [--head <branch>] \
+  [--method squash|merge|rebase] \
+  [--reviewer <user>...] \
+  [--timeout <duration>] \
+  [--no-merge]        # stop after wait-checks; useful in CI
+```
+
+Steps:
+
+1. `auth status` — fail-fast on missing auth.
+2. `repo view` — resolve default branch, repo slug, default merge
+   method override.
+3. `pr create --draft` — atom; validates branch / title / body.
+4. `pr wait-checks` — atom; blocks until terminal.
+5. `pr ready` — atom; only if previous step is `success`.
+6. `pr merge` — atom; honours `--method` and repo override.
+7. Emit single envelope summarising all five sub-step outputs under
+   `data.steps[]`. The macro's own schema is
+   `cli.forge-cli.pr.deliver.v1`.
+
+Failure semantics:
+
+- A failing step short-circuits the macro. The envelope still lists
+  every step attempted, with the failing one's `ok = false` and the
+  remaining ones omitted (not present in the array).
+- The macro's outer exit code is the failing atom's exit code, not
+  remapped. So `checks_failed` propagates as `RUNTIME 1`, `policy`
+  violations propagate as `DATA 65`, and so on.
+
+## Lock-down policy
+
+These rules are enforced regardless of which backend runs. They are
+declared in `forge-cli-ops-v1.yaml` (`validations:` per op) so the
+backend implementations cannot diverge.
+
+1. **Branch naming.** Feature work MUST be on `feat/<slug>`, bug work
+   on `fix/<slug>`. Slug is `[a-z0-9][a-z0-9-]{1,63}`. Ticket prefix
+   `abc-123-` is allowed inside the slug. `--kind` and the branch
+   prefix MUST agree.
+2. **Body schema.** PR/MR body MUST contain non-empty `## Summary` and
+   `## Test plan` sections. Order is not enforced; presence and
+   non-emptiness are.
+3. **Title length.** ≤ 70 characters, no trailing whitespace, no
+   trailing punctuation other than `?`.
+4. **Working tree.** `git status --porcelain` MUST be empty for
+   `create`, `merge`, and `deliver`. (`view`/`list`/`comment` are
+   read/append-only and do not check.)
+5. **Push state.** HEAD MUST be pushed to a remote-tracking branch
+   before `create` runs.
+6. **Default-branch protection.** `forge-cli` refuses any operation
+   that would force-push, delete, or merge directly into the repo
+   default branch except via a merged PR/MR. `--allow-non-default-base`
+   exists for non-default *base* branches (e.g. release lanes); there
+   is no flag to bypass the default-branch force-push refusal.
+7. **Draft → ready → merge ordering.** `pr merge` refuses to merge a
+   draft. There is no `--merge-as-draft`. Callers MUST run `pr ready`
+   first (or use `pr deliver`, which sequences them).
+8. **Required-check gating.** `pr merge` re-checks required-check
+   state immediately before invoking the backend, even if
+   `pr wait-checks` was called earlier in the macro. This is the
+   TTL-zero re-check that addresses the
+   `github-pr-required-check-gating` operation record.
+9. **Merge method.** Default `squash`. Repo override allowed via
+   `.forge-cli.toml` `[merge] method = "squash" | "merge" | "rebase"`.
+   Per-invocation `--method` overrides the repo override; both are
+   logged in `data.method`.
+10. **Branch cleanup.** `pr merge` deletes the remote branch by
+    default (`--delete-branch` on `gh`, `--remove-source-branch` on
+    `glab`). Disable with `--keep-branch`. Local branch cleanup is
+    out of scope for `forge-cli` and remains the bash wrapper's job
+    in agent-kit skills.
+
+Violations map to `DATA 65` with one of these `data.error.kind` values:
+
+| `error.kind`               | Triggered by rule |
+| -------------------------- | ----------------- |
+| `branch_name_invalid`      | 1                 |
+| `branch_kind_mismatch`     | 1                 |
+| `body_missing_summary`     | 2                 |
+| `body_missing_test_plan`   | 2                 |
+| `title_too_long`           | 3                 |
+| `dirty_worktree`           | 4                 |
+| `head_not_pushed`          | 5                 |
+| `default_branch_protected` | 6                 |
+| `draft_merge_refused`      | 7                 |
+| `checks_pending`           | 8                 |
+| `checks_failed`            | 8 (`RUNTIME 1`)   |
+| `merge_method_unsupported` | 9                 |
+| `keep_branch_conflict`     | 10                |
+
+## CLI output contract conformance
+
+`forge-cli` follows
+[`cli-output-contract-v1`](cli-output-contract-v1.md) without
+exception:
+
+- Canonical flag is `--format text|json`. No `--json` boolean alias
+  is introduced (new binary, no migration debt).
+- Envelope: `{schema_version, ok, data, warnings}`. Snake_case
+  throughout. `data` omitted when no payload. `warnings` omitted when
+  empty.
+- Schema version literals follow `cli.forge-cli.<command>.v1`. Macro
+  steps embed their own atom schema versions inside `data.steps[].
+  payload.schema_version`.
+- Parse / unknown-subcommand errors go through
+  `nils_common::cli_contract::emit_parse_error` so `--format json`
+  works at the parse-error layer too.
+- Sensitive data: backend stderr is captured and tail-trimmed to 2 KiB
+  before being placed under `data.error.detail`. Token-shaped strings
+  (`gh[ps]_*`, `glpat-*`, `ghr_*`, `gho_*`) are redacted before
+  rendering. URLs are kept as-is — they are not secrets and the user
+  wants click-through.
+
+## Exit code map
+
+`forge-cli` uses only the six BSD sysexits-aligned constants from
+`nils_common::cli_contract::exit`. Discriminators go in
+`data.error.kind`, not in numeric exit codes.
+
+| Constant      | Value | `forge-cli` triggers                                                                  |
+| ------------- | ----- | ------------------------------------------------------------------------------------- |
+| `SUCCESS`     | `0`   | Op completed; required state achieved.                                                |
+| `RUNTIME`     | `1`   | Remote semantic failure: required checks failed, merge conflict, draft already ready. |
+| `USAGE`       | `64`  | Bad CLI syntax, unknown subcommand, unsupported provider.                             |
+| `DATA`        | `65`  | Lock-down policy violation (any rule above); body parse failure.                      |
+| `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks timeout.    |
+| `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).             |
+
+Callers (agent-kit skills, CI scripts) MUST branch on `error.kind`
+when finer granularity is needed. Numeric exit codes alone are
+intentionally not enough to distinguish "branch name invalid" from
+"missing Test plan section" — both are `DATA 65` because both are
+"the input did not meet the documented contract". The discriminator
+is in the envelope, where consumers parse it deliberately.
+
+## Configuration
+
+Per-repo overrides live in `.forge-cli.toml` at the repo root:
+
+```toml
+[merge]
+method = "squash"            # squash | merge | rebase
+delete_branch = true
+
+[body]
+summary_heading = "## Summary"
+test_plan_heading = "## Test plan"
+
+[branch]
+feature_prefix = "feat/"
+bug_prefix = "fix/"
+
+[checks]
+timeout = "30m"
+interval = "20s"
+required_only = true
+```
+
+Resolution order for any setting: explicit flag > `.forge-cli.toml` >
+spec default. Unknown keys produce a `warnings[]` entry, not an
+error — forward-compatibility for v2 fields.
+
+Environment variables (read once at startup, all optional):
+
+- `FORGE_CLI_GH_BIN` — override `gh` discovery path (testing).
+- `FORGE_CLI_GLAB_BIN` — override `glab` discovery path (testing).
+- `FORGE_CLI_DEFAULT_PROVIDER` — fallback provider when remote URL
+  doesn't auto-detect.
+
+## Provider detection
+
+```text
+explicit --provider flag
+  ↓ (else)
+remote URL parse from `git remote get-url <--remote>`
+  ↓
+host classification:
+  github.com OR matches `gh auth status` host  → github
+  gitlab.com OR matches `glab auth status` host → gitlab
+  any other host                                → USAGE 64
+                                                  error.kind=provider_unsupported
+```
+
+`gh auth status` and `glab auth status` are *cached* per `forge-cli`
+invocation (single call per provider, memoised). They are not refreshed
+mid-run.
+
+## Migration plan: agent-kit skills → forge-cli
+
+This is the v1 acceptance target. Every row below MUST be reachable
+through `forge-cli` before agent-kit can adopt the new CLI:
+
+| agent-kit skill                                | forge-cli op                                            |
+| ---------------------------------------------- | ------------------------------------------------------- |
+| `create-github-pr` / `create-feature-pr`       | `forge-cli pr create --kind feature`                    |
+| `create-bug-pr`                                | `forge-cli pr create --kind bug`                        |
+| `close-feature-pr` / `close-github-pr` feature | `forge-cli pr merge` (+ optional `pr ready`)            |
+| `close-bug-pr`                                 | `forge-cli pr merge`                                    |
+| `deliver-feature-pr` / `deliver-github-pr`     | `forge-cli pr deliver --kind feature`                   |
+| `deliver-bug-pr`                               | `forge-cli pr deliver --kind bug`                       |
+| `gh-fix-ci`                                    | `forge-cli pr wait-checks` + skill's fix-and-push loop  |
+| `gamania:create-feature-mr` / `-bug-mr`        | `forge-cli pr create` (provider auto-detected gitlab)   |
+| `gamania:close-*-mr` / `deliver-*-mr`          | same as github counterparts                             |
+| `issue-lifecycle`                              | `forge-cli issue create|view|edit|comment|close|reopen` |
+| `issue-follow-up`                              | `forge-cli issue create` (+ subsequent comments)        |
+
+Skills keep their bash shells. The shells:
+
+- Resolve / construct branch names, body content, ticket slugs.
+- Call `forge-cli`.
+- React to `forge-cli`'s envelope (parse `error.kind`, retry on
+  `UNAVAILABLE`, surface `policy` violations to the user verbatim).
+- Handle local git operations: `git push`, `git checkout`, branch
+  deletion locally, post-merge cleanup.
+
+The shells stop wrapping `gh` / `glab` directly. The `gh pr create …`
+and `glab mr create …` invocations are removed.
+
+## Testing strategy
+
+- **Atom unit tests.** Each op has a unit test pair: one against a
+  recorded `gh --json …` fixture and one against a recorded `glab …
+  -F json` fixture. Fixtures live under
+  `crates/forge-cli/tests/fixtures/{github,gitlab}/<op>/`.
+- **Exit-code matrix.** Per workspace policy, every binary ships an
+  exit-code matrix test covering `success`, `usage`, `data`, and
+  `runtime` paths. `forge-cli` extends it to cover `unavailable`
+  (forced via `FORGE_CLI_GH_BIN=/bin/false`) and one `software` path
+  (mangled fixture).
+- **Parity test.** A single test harness drives both backends through
+  the same op + the same logical input, then asserts the envelope is
+  byte-identical except for `data.provider` and `data.url` host.
+- **Dry-run smoke.** Every op supports `--dry-run`; integration tests
+  use `--dry-run` to verify the constructed backend argv without
+  actually contacting `github.com` or `gitlab.com`.
+- **End-to-end is opt-in.** Tests that hit real GitHub / GitLab are
+  gated behind `FORGE_CLI_E2E=1` and a designated sandbox repo.
+  Default CI does not run them.
+
+## Open questions / v2 candidates
+
+- Releases (`gh release create / view / edit`) — GitLab requires
+  glab + tag flow; could fit a `forge-cli release …` tree later.
+- Labels (`gh label create`) — currently used once in agent-kit
+  (label bootstrap on a new repo). Either v2 op or one-off script.
+- `gh api` passthrough — explicitly out of v1 because it defeats the
+  lock-down value. Re-evaluate if a real workflow needs a non-CRUD
+  call (e.g. CODEOWNERS, branch protection) and only then.
+- Repo creation (`gh repo create`) — out of v1; rarely called from
+  skills.
+- Issue macros (`issue deliver`, `issue close-when-prs-merged`,
+  `issue cross-link`) — depend on plan-issue / dispatch-pr-review
+  skills converging first; tracked separately.
+- Gitea / Forgejo backend — would require a new third backend or a
+  Forge-API client. Deliberately deferred until a concrete user
+  surfaces.
