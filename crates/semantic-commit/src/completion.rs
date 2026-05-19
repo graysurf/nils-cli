@@ -140,7 +140,7 @@ fn build_completion_command() -> Command {
                 .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
-                        .help("Print commit plan without running git commit")
+                        .help("Validate message and staged changes without running git commit")
                         .action(ArgAction::SetTrue),
                 )
                 .arg(
