@@ -1,4 +1,4 @@
-use crate::{artifact_audit, batches, scaffold, validate};
+use crate::{artifact_audit, batches, scaffold, spec, validate};
 
 pub fn dispatch(args: &[String]) -> i32 {
     if args.len() <= 1 {
@@ -23,6 +23,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         "artifact-audit" => artifact_audit::run(&args[2..]),
         "split-prs" => crate::split_prs::run(&args[2..]),
         "scaffold" => scaffold::run(&args[2..]),
+        "spec" => spec::run(&args[2..]),
         "completion" => crate::completion::run(&args[2..]),
         other => {
             eprintln!("error: unknown argument: {other}");
@@ -84,6 +85,11 @@ fn print_help(stderr: bool) {
         "split-prs"
     );
     let _ = writeln!(out, "  {:<14}  Create a new plan from template", "scaffold");
+    let _ = writeln!(
+        out,
+        "  {:<14}  Dump the validate catalog (every error class, pattern, rule, example)",
+        "spec"
+    );
     let _ = writeln!(
         out,
         "  {:<14}  Export shell completion script",

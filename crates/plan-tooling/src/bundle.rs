@@ -196,30 +196,50 @@ pub(crate) fn clean_link_value(value: &str) -> String {
     } else {
         trimmed
     };
-    unwrapped.trim().to_string()
+    let unwrapped = unwrapped.trim();
+    if let Some(href) = strip_markdown_link(unwrapped) {
+        return href.trim().to_string();
+    }
+    unwrapped.to_string()
+}
+
+/// Returns the href portion of a `[text](href)` markdown link, or `None` if the
+/// value is not a single, well-formed inline link wrapping the entire value.
+fn strip_markdown_link(value: &str) -> Option<&str> {
+    let s = value.trim();
+    if !s.starts_with('[') || !s.ends_with(')') {
+        return None;
+    }
+    // Find the ](`,`) split. Require it to not be preceded by an escape and
+    // require nothing after the closing `)`.
+    let split = s.find("](")?;
+    // No nested `]` inside the label portion.
+    if s[1..split].contains(']') {
+        return None;
+    }
+    let href = &s[split + 2..s.len() - 1];
+    // Guard against multi-link lines like `[a](x) and [b](y)`.
+    if href.contains(')') {
+        return None;
+    }
+    Some(href)
 }
 
 pub(crate) fn markdown_field(text: &str, label: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
-    let prefix = format!("{label}:");
     for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        let Some(item) = trimmed.strip_prefix("- ") else {
+        let Some(rest) = label_line_value(line, label) else {
             continue;
         };
-        let Some(rest) = item.strip_prefix(&prefix) else {
-            continue;
-        };
-        let rest = rest.trim();
         if !rest.is_empty() {
-            return Some(clean_link_value(rest));
+            return Some(clean_link_value(&rest));
         }
         for next in lines.iter().skip(idx + 1) {
             let candidate = next.trim();
             if candidate.is_empty() {
                 continue;
             }
-            if candidate.starts_with("- ") {
+            if is_list_item_start(candidate) {
                 break;
             }
             return Some(clean_link_value(candidate));
@@ -227,6 +247,44 @@ pub(crate) fn markdown_field(text: &str, label: &str) -> Option<String> {
         return Some(String::new());
     }
     None
+}
+
+/// Returns the trimmed value portion of a `label:` line, accepting all of:
+/// - leading list markers (`-`, `*`, `+`) and no marker at all
+/// - `**bold**` wrappers around the label
+/// - any combination of the above (e.g. `**Recommended plan**: `path``)
+///
+/// Returns `None` when the line does not declare the requested label.
+fn label_line_value(line: &str, label: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let after_marker = strip_list_marker(trimmed);
+    let prefix_bold = format!("**{label}**:");
+    let prefix_plain = format!("{label}:");
+    if let Some(rest) = after_marker.strip_prefix(&prefix_bold) {
+        return Some(rest.trim().to_string());
+    }
+    if let Some(rest) = after_marker.strip_prefix(&prefix_plain) {
+        return Some(rest.trim().to_string());
+    }
+    None
+}
+
+fn strip_list_marker(text: &str) -> &str {
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = text.strip_prefix(marker) {
+            return rest.trim_start();
+        }
+    }
+    text
+}
+
+fn is_list_item_start(text: &str) -> bool {
+    for marker in ["- ", "* ", "+ "] {
+        if text.starts_with(marker) {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_source_links(
@@ -312,8 +370,8 @@ fn component_eq(component: Option<Component<'_>>, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DIRECT_SOURCE_DOC_EXECUTION_WAIVER_LABEL, bundle_for_plan, markdown_field,
-        normalize_repo_path,
+        DIRECT_SOURCE_DOC_EXECUTION_WAIVER_LABEL, RECOMMENDED_PLAN_LABEL, bundle_for_plan,
+        clean_link_value, markdown_field, normalize_repo_path, strip_markdown_link,
     };
     use std::path::Path;
 
@@ -362,5 +420,93 @@ mod tests {
             normalize_repo_path("`docs/plans/demo/../demo/demo-plan.md`"),
             "docs/plans/demo/demo-plan.md"
         );
+    }
+
+    #[test]
+    fn markdown_field_accepts_legacy_shape() {
+        // Regression: the canonical accepted shape must keep parsing after F2.
+        let text = format!("- {RECOMMENDED_PLAN_LABEL}: docs/plans/demo/demo-plan.md\n");
+        assert_eq!(
+            markdown_field(&text, RECOMMENDED_PLAN_LABEL),
+            Some("docs/plans/demo/demo-plan.md".to_string()),
+        );
+    }
+
+    #[test]
+    fn markdown_field_accepts_markdown_link_value() {
+        // Variant 1 from review source: `[path](path)` value.
+        let text = format!(
+            "- {RECOMMENDED_PLAN_LABEL}: [docs/plans/demo/demo-plan.md](docs/plans/demo/demo-plan.md)\n",
+        );
+        assert_eq!(
+            markdown_field(&text, RECOMMENDED_PLAN_LABEL),
+            Some("docs/plans/demo/demo-plan.md".to_string()),
+        );
+    }
+
+    #[test]
+    fn markdown_field_accepts_no_list_marker() {
+        // Variant 2: bare label line (no `- ` prefix).
+        let text = format!("{RECOMMENDED_PLAN_LABEL}: docs/plans/demo/demo-plan.md\n");
+        assert_eq!(
+            markdown_field(&text, RECOMMENDED_PLAN_LABEL),
+            Some("docs/plans/demo/demo-plan.md".to_string()),
+        );
+    }
+
+    #[test]
+    fn markdown_field_accepts_bold_label_with_backtick_value() {
+        // Variant 3: `**Recommended plan**:` `path`
+        let text = format!("**{RECOMMENDED_PLAN_LABEL}**: `docs/plans/demo/demo-plan.md`\n");
+        assert_eq!(
+            markdown_field(&text, RECOMMENDED_PLAN_LABEL),
+            Some("docs/plans/demo/demo-plan.md".to_string()),
+        );
+    }
+
+    #[test]
+    fn markdown_field_accepts_bold_label_with_markdown_link_value() {
+        let text = format!(
+            "* **{RECOMMENDED_PLAN_LABEL}**: [docs/plans/demo/demo-plan.md](docs/plans/demo/demo-plan.md)\n",
+        );
+        assert_eq!(
+            markdown_field(&text, RECOMMENDED_PLAN_LABEL),
+            Some("docs/plans/demo/demo-plan.md".to_string()),
+        );
+    }
+
+    #[test]
+    fn markdown_field_accepts_continuation_value_with_backtick() {
+        // Continuation form: label on one line, value on the next.
+        let text = format!("- {RECOMMENDED_PLAN_LABEL}:\n  `docs/plans/demo/demo-plan.md`\n",);
+        assert_eq!(
+            markdown_field(&text, RECOMMENDED_PLAN_LABEL),
+            Some("docs/plans/demo/demo-plan.md".to_string()),
+        );
+    }
+
+    #[test]
+    fn markdown_field_rejects_label_without_colon() {
+        let text = format!("- {RECOMMENDED_PLAN_LABEL} docs/plans/demo/demo-plan.md\n");
+        assert_eq!(markdown_field(&text, RECOMMENDED_PLAN_LABEL), None);
+    }
+
+    #[test]
+    fn clean_link_value_strips_markdown_link() {
+        assert_eq!(
+            clean_link_value("[docs/x.md](docs/x.md)"),
+            "docs/x.md".to_string(),
+        );
+        assert_eq!(
+            clean_link_value("  `[docs/x.md](docs/x.md)`  "),
+            "docs/x.md".to_string(),
+        );
+    }
+
+    #[test]
+    fn strip_markdown_link_rejects_multi_link_lines() {
+        assert_eq!(strip_markdown_link("[a](x) and [b](y)"), None);
+        assert_eq!(strip_markdown_link("not a link"), None);
+        assert_eq!(strip_markdown_link("[a]docs/x.md"), None);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::parse::{Plan, Sprint, Task, parse_plan_with_display};
 
 const USAGE: &str = r#"Usage:
-  validate_plans.sh [--file <path>]... [--format text|json] [--explain]
+  validate_plans.sh [--file <path>]... [--format text|json] [--explain] [--no-group] [--fix]
 
 Purpose:
   Lint plan markdown files under docs/plans/ against Plan Format v1.
@@ -19,6 +19,12 @@ Options:
   --format <fmt> text (default) or json
   --explain      Append canonical accepted-shape examples per error class.
                  Output is independent of exit code (also prints on success).
+  --no-group     Disable class-grouped text output. Print one `error:` line per
+                 occurrence, matching the pre-0.9.0 flat shape.
+  --fix          Rewrite mechanical violations in-place across the plan and
+                 its bundle siblings (source doc + execution state), then
+                 re-validate and report any remaining errors. Safe rewrites
+                 only — ambiguous violations remain as errors.
   -h, --help     Show help
 
 Defaults:
@@ -46,19 +52,29 @@ struct ValidateOutput {
     errors: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     explanations: Option<Vec<ExplainEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uncatalogued: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ExplainEntry {
-    class: &'static str,
-    rule: &'static str,
-    example: &'static str,
+pub(crate) struct ExplainEntry {
+    pub(crate) class: &'static str,
+    pub(crate) rule: &'static str,
+    pub(crate) example: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct ExplainResult {
+    matched: Vec<ExplainEntry>,
+    uncatalogued: Vec<String>,
 }
 
 pub fn run(args: &[String]) -> i32 {
     let mut files: Vec<String> = Vec::new();
     let mut format = "text".to_string();
     let mut explain = false;
+    let mut no_group = false;
+    let mut do_fix = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -79,6 +95,14 @@ pub fn run(args: &[String]) -> i32 {
             }
             "--explain" => {
                 explain = true;
+                i += 1;
+            }
+            "--no-group" => {
+                no_group = true;
+                i += 1;
+            }
+            "--fix" => {
+                do_fix = true;
                 i += 1;
             }
             "-h" | "--help" => {
@@ -115,11 +139,15 @@ pub fn run(args: &[String]) -> i32 {
                 } else {
                     None
                 },
+                uncatalogued: None,
             };
             return print_json_output(output, 0);
         }
         if explain {
-            print_explanations_text(&all_explanations());
+            print_explanations_text(&ExplainResult {
+                matched: all_explanations(),
+                uncatalogued: Vec::new(),
+            });
         }
         return 0;
     }
@@ -147,6 +175,9 @@ pub fn run(args: &[String]) -> i32 {
             }
             continue;
         }
+        if do_fix {
+            apply_fix_to_bundle(&read_path, &repo_root, &mut errors, &display_path);
+        }
         errors.extend(validate_plan(&display_path, &read_path, &repo_root));
 
         if let Some(p) = progress.as_ref() {
@@ -160,34 +191,105 @@ pub fn run(args: &[String]) -> i32 {
 
     if format == "json" {
         let code = if errors.is_empty() { 0 } else { 1 };
-        let explanations = if explain {
-            Some(explanations_for(&errors))
+        let (explanations, uncatalogued) = if explain {
+            let result = explanations_for(&errors);
+            (
+                Some(result.matched),
+                if result.uncatalogued.is_empty() {
+                    None
+                } else {
+                    Some(result.uncatalogued)
+                },
+            )
         } else {
-            None
+            (None, None)
         };
         let output = ValidateOutput {
             ok: errors.is_empty(),
             files: discovered_for_output,
             errors,
             explanations,
+            uncatalogued,
         };
         return print_json_output(output, code);
     }
 
     if errors.is_empty() {
         if explain {
-            print_explanations_text(&all_explanations());
+            print_explanations_text(&ExplainResult {
+                matched: all_explanations(),
+                uncatalogued: Vec::new(),
+            });
         }
         return 0;
     }
 
-    for err in &errors {
-        eprintln!("error: {err}");
-    }
+    eprint!("{}", format_errors_text(&errors, no_group));
     if explain {
         print_explanations_text(&explanations_for(&errors));
     }
     1
+}
+
+/// Render the `error:` portion of the text-mode failure output. When
+/// `no_group` is false (the default) and at least one error class fires more
+/// than twice, those classes are collapsed under a single `error: [class]
+/// (xN)` header followed by per-occurrence indented lines. Singletons, pairs,
+/// and uncatalogued errors are kept on their own `error:` line. Returns a
+/// string that ends with a newline.
+pub(crate) fn format_errors_text(errors: &[String], no_group: bool) -> String {
+    let mut out = String::new();
+    if no_group {
+        for err in errors {
+            out.push_str("error: ");
+            out.push_str(err);
+            out.push('\n');
+        }
+        return out;
+    }
+
+    // Classify each error against the catalog so we can count occurrences per
+    // class without losing the original order.
+    let classified: Vec<(Option<&'static str>, &String)> = errors
+        .iter()
+        .map(|err| (classify_error(err), err))
+        .collect();
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    for (cls, _) in &classified {
+        if let Some(c) = cls {
+            *counts.entry(*c).or_insert(0) += 1;
+        }
+    }
+
+    let mut printed_groups: HashSet<&'static str> = HashSet::new();
+    for (cls, err) in &classified {
+        match cls {
+            Some(c) if counts.get(c).copied().unwrap_or(0) > 2 => {
+                if printed_groups.insert(*c) {
+                    let count = counts[c];
+                    out.push_str(&format!("error: [{c}] (x{count})\n"));
+                }
+                out.push_str("  - ");
+                out.push_str(err);
+                out.push('\n');
+            }
+            _ => {
+                out.push_str("error: ");
+                out.push_str(err);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn classify_error(err: &str) -> Option<&'static str> {
+    for entry in EXPLAIN_CATALOG {
+        if err.contains(entry.pattern) {
+            return Some(entry.explain.class);
+        }
+    }
+    None
 }
 
 fn print_json_output(output: ValidateOutput, code: i32) -> i32 {
@@ -265,6 +367,53 @@ fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
     repo_root.join(path)
 }
 
+/// Apply mechanical fixers to the plan and, when discoverable, the sibling
+/// bundle files (discussion / review source doc and execution state). I/O
+/// failures are surfaced as `error:` lines so authors notice them after the
+/// fix run.
+fn apply_fix_to_bundle(
+    plan_read_path: &Path,
+    repo_root: &Path,
+    errors: &mut Vec<String>,
+    plan_display_path: &str,
+) {
+    apply_fix_to_file(plan_read_path, plan_display_path, errors);
+    let Some(bundle) = crate::bundle::bundle_for_plan(plan_read_path, repo_root) else {
+        return;
+    };
+    let candidates = [
+        bundle.discussion_source_path.clone(),
+        bundle.review_source_path.clone(),
+        bundle.execution_state_path.clone(),
+    ];
+    for rel in candidates {
+        let abs = repo_root.join(&rel);
+        if !abs.is_file() {
+            continue;
+        }
+        apply_fix_to_file(&abs, &rel, errors);
+    }
+}
+
+fn apply_fix_to_file(path: &Path, display_path: &str, errors: &mut Vec<String>) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(err) => {
+            errors.push(format!("{display_path}: failed to read for --fix: {err}"));
+            return;
+        }
+    };
+    let fixed = crate::fix::fix_text(&text);
+    if fixed == text {
+        return;
+    }
+    if let Err(err) = std::fs::write(path, fixed) {
+        errors.push(format!(
+            "{display_path}: failed to write --fix output: {err}"
+        ));
+    }
+}
+
 fn validate_plan(display_path: &str, read_path: &Path, repo_root: &Path) -> Vec<String> {
     let plan: Plan;
     let parse_errors: Vec<String>;
@@ -306,7 +455,7 @@ fn validate_plan(display_path: &str, read_path: &Path, repo_root: &Path) -> Vec<
     let mut errs: Vec<String> = validate_read_first(display_path, &plan, repo_root);
     errs.extend(validate_sprint_metadata(display_path, &plan.sprints));
     for task in tasks {
-        errs.extend(validate_task(display_path, task, &all_task_ids));
+        errs.extend(validate_task(display_path, task, &all_task_ids, repo_root));
     }
     errs.extend(crate::bundle::validate_plan_bundle(
         display_path,
@@ -443,7 +592,12 @@ fn validate_sprint_metadata(plan_path: &str, sprints: &[Sprint]) -> Vec<String> 
     errs
 }
 
-fn validate_task(plan_path: &str, task: &Task, all_task_ids: &HashSet<String>) -> Vec<String> {
+fn validate_task(
+    plan_path: &str,
+    task: &Task,
+    all_task_ids: &HashSet<String>,
+    repo_root: &Path,
+) -> Vec<String> {
     let mut errs: Vec<String> = Vec::new();
 
     let task_id = task.id.trim();
@@ -473,10 +627,18 @@ fn validate_task(plan_path: &str, task: &Task, all_task_ids: &HashSet<String>) -
                 ));
             }
             if loc.ends_with('/') {
-                errs.push(format!(
-                    "{prefix}: Location must be a file path (not a directory): {}",
-                    crate::repr::py_repr(loc)
-                ));
+                // Trailing `/` opts into directory mode; the path must exist as a
+                // directory under repo_root or we flag a "directory not found"
+                // diagnostic (separate class so authors don't confuse it with
+                // the file-only error class).
+                let stripped = loc.trim_end_matches('/');
+                let dir_path = repo_root.join(stripped);
+                if !dir_path.is_dir() {
+                    errs.push(format!(
+                        "{prefix}: Location directory not found: {}",
+                        crate::repr::py_repr(loc)
+                    ));
+                }
             }
             if ["*", "?", "{", "}"].iter().any(|ch| loc.contains(ch)) {
                 errs.push(format!(
@@ -515,12 +677,12 @@ fn validate_task(plan_path: &str, task: &Task, all_task_ids: &HashSet<String>) -
             let mut invalid: Vec<String> = Vec::new();
             let mut unknown: Vec<String> = Vec::new();
             for dep in deps {
-                let d = dep.trim();
+                let d = dep.id.trim();
                 if d.is_empty() {
                     continue;
                 }
                 if !is_task_id(d) {
-                    invalid.push(crate::repr::py_repr(dep));
+                    invalid.push(crate::repr::py_repr(&dep.id));
                 } else if !all_task_ids.contains(d) {
                     unknown.push(crate::repr::py_repr(d));
                 }
@@ -681,20 +843,116 @@ fn is_task_id(s: &str) -> bool {
     a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit())
 }
 
-struct ExplainCatalogEntry {
+pub(crate) struct ExplainCatalogEntry {
     /// Substring used to detect that this error class fired. Must appear in
     /// the matching error message and be unique across the catalog.
-    pattern: &'static str,
-    explain: ExplainEntry,
+    pub(crate) pattern: &'static str,
+    pub(crate) explain: ExplainEntry,
 }
 
-const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
+pub(crate) const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
     ExplainCatalogEntry {
         pattern: "missing Read First",
         explain: ExplainEntry {
             class: "read-first-missing",
             rule: "Plans must start with a Read First section that names the primary source artifact.",
             example: "## Read First\n\n- Primary source: docs/runbooks/example-source.md\n- Source type: review-to-improvement-doc\n- Open questions carried into execution: none",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Read First missing Primary source",
+        explain: ExplainEntry {
+            class: "read-first-primary-source-missing",
+            rule: "Read First must declare a `Primary source` value.",
+            example: "- Primary source: docs/runbooks/example-source.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Read First missing Source type",
+        explain: ExplainEntry {
+            class: "read-first-source-type-missing",
+            rule: "Read First must declare a `Source type` value.",
+            example: "- Source type: review-to-improvement-doc",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Read First missing Open questions carried into execution",
+        explain: ExplainEntry {
+            class: "read-first-open-questions-missing",
+            rule: "Read First must declare `Open questions carried into execution` (use 'none' when empty).",
+            example: "- Open questions carried into execution: none",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "plan-only waiver requires Primary source to state an explicit waiver",
+        explain: ExplainEntry {
+            class: "read-first-plan-only-waiver-implicit",
+            rule: "When `Source type: plan-only waiver`, the `Primary source` must say so explicitly.",
+            example: "- Primary source: plan-only waiver: bounded follow-up to issue #123\n- Source type: plan-only waiver",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Primary source must be repo-relative or a URL",
+        explain: ExplainEntry {
+            class: "read-first-primary-source-absolute",
+            rule: "Primary source must be a repo-relative path, an `http(s)://` URL, an anchor (`#...`), or an explicit `plan-only waiver:` string.",
+            example: "- Primary source: docs/runbooks/example-source.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing sprints",
+        explain: ExplainEntry {
+            class: "plan-missing-sprints",
+            rule: "Plans must contain at least one `## Sprint N: name` heading.",
+            example: "## Sprint 1: Bootstrap\n\n### Task 1.1: ...",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "no tasks found",
+        explain: ExplainEntry {
+            class: "plan-missing-tasks",
+            rule: "Every plan must contain at least one `### Task N.M: name` heading under a sprint.",
+            example: "### Task 1.1: Validate sprint metadata",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "task outside of any sprint",
+        explain: ExplainEntry {
+            class: "task-orphaned",
+            rule: "Tasks must appear under a preceding `## Sprint N:` heading.",
+            example: "## Sprint 1: First sprint\n\n### Task 1.1: Do thing",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Location",
+        explain: ExplainEntry {
+            class: "location-missing",
+            rule: "Each task must declare a non-empty `Location` list.",
+            example: "- **Location**:\n  - `crates/foo/src/bar.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid PR grouping intent",
+        explain: ExplainEntry {
+            class: "sprint-metadata-pr-grouping-invalid",
+            rule: "Sprint `PR grouping intent` accepts `per-sprint` or `group`.",
+            example: "**PR grouping intent**: `group`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid Execution Profile",
+        explain: ExplainEntry {
+            class: "sprint-metadata-execution-profile-invalid",
+            rule: "Sprint `Execution Profile` accepts `serial` or `parallel-xN` (where N is a positive integer).",
+            example: "**Execution Profile**: `parallel-x2`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid metadata field",
+        explain: ExplainEntry {
+            class: "sprint-metadata-field-typo",
+            rule: "Sprint metadata field name must use the exact canonical spelling (`PR grouping intent`, `Execution Profile`).",
+            example: "**PR grouping intent**: `group`\n**Execution Profile**: `parallel-x2`",
         },
     },
     ExplainCatalogEntry {
@@ -722,11 +980,11 @@ const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
         },
     },
     ExplainCatalogEntry {
-        pattern: "Location must be a file path",
+        pattern: "Location directory not found",
         explain: ExplainEntry {
-            class: "location-directory",
-            rule: "Location entries must point at files, not directories.",
-            example: "- **Location**:\n  - `crates/foo/src/lib.rs`",
+            class: "location-directory-missing",
+            rule: "Location entries opt into directory mode by ending with `/`; the directory must exist relative to the repo root.",
+            example: "- **Location**:\n  - `crates/foo/src/lib.rs`\n  - `crates/foo/results/rounds/`  # trailing `/` accepts an existing directory",
         },
     },
     ExplainCatalogEntry {
@@ -774,8 +1032,10 @@ const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
         pattern: "invalid dependency",
         explain: ExplainEntry {
             class: "dependency-invalid",
-            rule: "Dependency entries must use the canonical `Task N.M` form.",
-            example: "- **Dependencies**:\n  - Task 1.2\n  - Task 2.1",
+            rule: "Dependency entries must use the canonical `Task N.M` form. \
+                   A free-form trailing note is allowed after the ID and is \
+                   surfaced in `to-json` as the `notes` field.",
+            example: "- **Dependencies**:\n  - Task 1.2\n  - Task 2.1 (only when feature flag is set)",
         },
     },
     ExplainCatalogEntry {
@@ -799,6 +1059,14 @@ const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
         explain: ExplainEntry {
             class: "complexity-range",
             rule: "Complexity is a 1-10 integer.",
+            example: "- **Complexity**: 5",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid Complexity",
+        explain: ExplainEntry {
+            class: "complexity-non-integer",
+            rule: "Complexity must be an integer; omit the field entirely when no estimate exists.",
             example: "- **Complexity**: 5",
         },
     },
@@ -858,33 +1126,209 @@ const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
             example: "### Task 2.1: Validate sprint metadata",
         },
     },
+    ExplainCatalogEntry {
+        pattern: "bundle Primary source must be an accepted sibling source doc",
+        explain: ExplainEntry {
+            class: "bundle-primary-source-mismatch",
+            rule: "Plan `Primary source` must point at the sibling `-discussion-source.md` \
+                   or `-review-source.md` doc under the same `docs/plans/<slug>/` directory.",
+            example: "- Primary source: docs/plans/demo/demo-discussion-source.md\n  # or\n- Primary source: docs/plans/demo/demo-review-source.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing `Recommended plan`",
+        explain: ExplainEntry {
+            class: "bundle-source-doc-missing-plan-label",
+            rule: "Source doc paired with a plan must declare the canonical `Recommended plan` \
+                   pointer so plan-tooling can verify the bundle.",
+            example: "## Execution\n\n- Recommended plan: docs/plans/demo/demo-plan.md\n- Recommended execution state: docs/plans/demo/demo-execution-state.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing `Recommended execution state`",
+        explain: ExplainEntry {
+            class: "bundle-source-doc-missing-execution-state-label",
+            rule: "Source doc paired with a plan must declare the canonical \
+                   `Recommended execution state` pointer so plan-tooling can verify the bundle.",
+            example: "## Execution\n\n- Recommended plan: docs/plans/demo/demo-plan.md\n- Recommended execution state: docs/plans/demo/demo-execution-state.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "recommends wrong plan",
+        explain: ExplainEntry {
+            class: "bundle-source-doc-wrong-plan",
+            rule: "The source doc's `Recommended plan` value must equal the sibling `*-plan.md` path.",
+            example: "- Recommended plan: docs/plans/demo/demo-plan.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "recommends wrong execution state",
+        explain: ExplainEntry {
+            class: "bundle-source-doc-wrong-execution-state",
+            rule: "The source doc's `Recommended execution state` value must equal the sibling `*-execution-state.md` path.",
+            example: "- Recommended execution state: docs/plans/demo/demo-execution-state.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing `Source document`",
+        explain: ExplainEntry {
+            class: "bundle-execution-state-missing-source-document",
+            rule: "Execution state must declare a `Source document` pointer back to the plan (or to the source doc when waived).",
+            example: "## Current State\n\n- Source document: `docs/plans/demo/demo-plan.md`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "points to wrong source document",
+        explain: ExplainEntry {
+            class: "bundle-execution-state-wrong-source-document",
+            rule: "Execution state `Source document` must point at the plan, or at the source doc with an explicit `Direct source-doc execution waiver`.",
+            example: "- Source document: `docs/plans/demo/demo-plan.md`\n- Direct source-doc execution waiver: not applicable",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "without `Direct source-doc execution waiver`",
+        explain: ExplainEntry {
+            class: "bundle-direct-source-execution-waiver-missing",
+            rule: "When execution state points at the source doc instead of the plan, set an explicit \
+                   `Direct source-doc execution waiver` value (e.g. `bounded single-step source execution`).",
+            example: "- Source document: `docs/plans/demo/demo-discussion-source.md`\n- Direct source-doc execution waiver: bounded single-step source execution",
+        },
+    },
+];
+
+/// Error fragments that are intentionally not paired with an `EXPLAIN_CATALOG` entry.
+///
+/// These cover I/O / parse failures and similar conditions where a canonical
+/// authoring example would not be actionable. A new emitted error must either
+/// match an `EXPLAIN_CATALOG.pattern` or appear here.
+const KNOWN_UNCATALOGUED: &[&str] = &[
+    "file not found",
+    "failed to parse plan",
+    "failed to read source doc",
+    "failed to read execution state",
+];
+
+/// Static registry of every literal substring guaranteed to appear in an error
+/// emitted by this crate's validators (and by parse.rs in `error:` form). The
+/// completeness test asserts each fragment is either in `EXPLAIN_CATALOG` or
+/// in `KNOWN_UNCATALOGUED` — so adding a new emitter without updating one of
+/// those two arrays will fail CI.
+#[cfg(test)]
+const ALL_EMITTED_ERROR_PATTERNS: &[&str] = &[
+    // I/O and parse
+    "file not found",
+    "failed to parse plan",
+    // Top-level structure (validate.rs)
+    "missing sprints",
+    "no tasks found",
+    // Read First
+    "missing Read First section",
+    "Read First missing Primary source",
+    "Read First missing Source type",
+    "invalid Read First Source type",
+    "Read First missing Open questions carried into execution",
+    "plan-only waiver requires Primary source to state an explicit waiver",
+    "Primary source must be repo-relative or a URL",
+    "Primary source path not found",
+    // Sprint metadata
+    "must include both `PR grouping intent` and `Execution Profile`",
+    "is per-sprint but `Execution Profile` indicates parallel width",
+    // Task fields
+    "invalid or missing task id",
+    "missing Location",
+    "Location must be repo-relative",
+    "Location directory not found",
+    "must not use globs",
+    "Location contains placeholder",
+    "missing Description",
+    "Description contains placeholder",
+    "missing Dependencies",
+    "invalid dependency",
+    "unknown dependency",
+    "Complexity out of range",
+    "missing Acceptance criteria",
+    "Acceptance criteria contains placeholder",
+    "missing Validation",
+    "Validation contains placeholder",
+    // parse.rs errors (rendered as `error: <msg>`)
+    "missing Complexity value",
+    "invalid Complexity",
+    "invalid PR grouping intent",
+    "invalid Execution Profile",
+    "invalid metadata field",
+    "task outside of any sprint",
+    // bundle.rs errors
+    "bundle Primary source must be an accepted sibling source doc",
+    "failed to read source doc",
+    "recommends wrong plan",
+    "missing `Recommended plan`",
+    "recommends wrong execution state",
+    "missing `Recommended execution state`",
+    "failed to read execution state",
+    "points to wrong source document",
+    "missing `Source document`",
+    "without `Direct source-doc execution waiver`",
 ];
 
 fn all_explanations() -> Vec<ExplainEntry> {
     EXPLAIN_CATALOG.iter().map(|e| e.explain.clone()).collect()
 }
 
-fn explanations_for(errors: &[String]) -> Vec<ExplainEntry> {
-    let mut hits: Vec<ExplainEntry> = Vec::new();
-    for entry in EXPLAIN_CATALOG {
-        if errors.iter().any(|err| err.contains(entry.pattern)) {
-            hits.push(entry.explain.clone());
+fn explanations_for(errors: &[String]) -> ExplainResult {
+    let mut matched: Vec<ExplainEntry> = Vec::new();
+    let mut seen_classes: HashSet<&'static str> = HashSet::new();
+    let mut uncatalogued: Vec<String> = Vec::new();
+    let mut uncatalogued_seen: HashSet<String> = HashSet::new();
+
+    for err in errors {
+        let mut matched_any = false;
+        for entry in EXPLAIN_CATALOG {
+            if err.contains(entry.pattern) {
+                matched_any = true;
+                if seen_classes.insert(entry.explain.class) {
+                    matched.push(entry.explain.clone());
+                }
+                break;
+            }
+        }
+        if matched_any {
+            continue;
+        }
+        if KNOWN_UNCATALOGUED.iter().any(|frag| err.contains(*frag)) {
+            continue;
+        }
+        // Strip the leading `<display_path>: ` (or `<display_path>:<task>: `) prefix so the
+        // surfaced note focuses on the message body, which is what authors and LLM agents
+        // need to recognize. Falls back to the raw error if no `:` is present.
+        let body = err
+            .split_once(':')
+            .map(|(_, rest)| rest.trim().to_string())
+            .unwrap_or_else(|| err.clone());
+        if uncatalogued_seen.insert(body.clone()) {
+            uncatalogued.push(body);
         }
     }
-    hits
+
+    ExplainResult {
+        matched,
+        uncatalogued,
+    }
 }
 
-fn print_explanations_text(entries: &[ExplainEntry]) {
-    if entries.is_empty() {
+fn print_explanations_text(result: &ExplainResult) {
+    if result.matched.is_empty() && result.uncatalogued.is_empty() {
         return;
     }
     eprintln!();
     eprintln!("Examples:");
-    for entry in entries {
+    for entry in &result.matched {
         eprintln!("  [{}] {}", entry.class, entry.rule);
         for line in entry.example.lines() {
             eprintln!("      {line}");
         }
+    }
+    for note in &result.uncatalogued {
+        eprintln!("  note: no canonical example registered for error class: {note}");
     }
 }
 
@@ -903,11 +1347,12 @@ fn parse_parallel_width_from_execution_profile(profile: &str) -> Option<usize> {
 mod tests {
     use std::collections::HashSet;
 
-    use crate::parse::Task;
+    use crate::parse::{Dependency, Task};
 
     use super::{
-        clean_source_value, contains_angle_placeholder, contains_word_case_insensitive,
-        has_placeholder, is_allowed_source_type, is_non_empty_list, is_task_id,
+        ALL_EMITTED_ERROR_PATTERNS, EXPLAIN_CATALOG, KNOWN_UNCATALOGUED, clean_source_value,
+        contains_angle_placeholder, contains_word_case_insensitive, explanations_for,
+        format_errors_text, has_placeholder, is_allowed_source_type, is_non_empty_list, is_task_id,
         strip_backtick_spans, validate_task,
     };
 
@@ -986,20 +1431,28 @@ mod tests {
             start_line: 42,
             location: vec![
                 "/abs/path.rs".to_string(),
-                "dir/".to_string(),
+                "missing-dir/".to_string(),
                 "src/*/x.rs".to_string(),
                 "src/<name>.rs".to_string(),
             ],
             description: Some("TODO".to_string()),
-            dependencies: Some(vec!["Task x.y".to_string(), "Task 9.9".to_string()]),
+            dependencies: Some(vec![
+                Dependency::bare("Task x.y"),
+                Dependency::bare("Task 9.9"),
+            ]),
             complexity: Some(11),
             acceptance_criteria: vec!["<TBD>".to_string()],
             validation: vec!["TBD".to_string()],
         };
         let all_ids = HashSet::from(["Task 1.1".to_string()]);
-        let errs = validate_task("plan.md", &task, &all_ids);
+        let repo_root = std::path::Path::new("/nonexistent");
+        let errs = validate_task("plan.md", &task, &all_ids, repo_root);
         assert!(errs.iter().any(|e| e.contains("repo-relative")));
-        assert!(errs.iter().any(|e| e.contains("not a directory")));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("Location directory not found")),
+            "expected directory-not-found, got: {errs:?}",
+        );
         assert!(errs.iter().any(|e| e.contains("must not use globs")));
         assert!(errs.iter().any(|e| e.contains("contains placeholder")));
         assert!(errs.iter().any(|e| e.contains("invalid dependency")));
@@ -1013,6 +1466,54 @@ mod tests {
     }
 
     #[test]
+    fn validate_task_accepts_existing_directory_location() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("sub/dir")).expect("create_dir_all");
+        let task = Task {
+            id: "Task 1.1".to_string(),
+            name: "dir-anchor".to_string(),
+            sprint: 1,
+            start_line: 10,
+            location: vec!["sub/dir/".to_string()],
+            description: Some("anchor on a directory".to_string()),
+            dependencies: Some(vec![Dependency::bare("Task 1.1")]),
+            complexity: Some(2),
+            acceptance_criteria: vec!["dir is the anchor".to_string()],
+            validation: vec!["cargo test".to_string()],
+        };
+        let all_ids = HashSet::from(["Task 1.1".to_string()]);
+        let errs = validate_task("plan.md", &task, &all_ids, tmp.path());
+        assert!(
+            errs.iter().all(|e| !e.contains("Location")),
+            "expected no Location errors, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn validate_task_rejects_missing_directory_location() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let task = Task {
+            id: "Task 1.1".to_string(),
+            name: "dir-anchor".to_string(),
+            sprint: 1,
+            start_line: 10,
+            location: vec!["does/not/exist/".to_string()],
+            description: Some("anchor on a missing dir".to_string()),
+            dependencies: Some(vec![Dependency::bare("Task 1.1")]),
+            complexity: Some(2),
+            acceptance_criteria: vec!["dir missing flagged".to_string()],
+            validation: vec!["cargo test".to_string()],
+        };
+        let all_ids = HashSet::from(["Task 1.1".to_string()]);
+        let errs = validate_task("plan.md", &task, &all_ids, tmp.path());
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("Location directory not found")),
+            "expected directory-not-found, got: {errs:?}",
+        );
+    }
+
+    #[test]
     fn validate_task_groups_invalid_deps_into_single_error() {
         let task = Task {
             id: "Task 2.5".to_string(),
@@ -1022,16 +1523,16 @@ mod tests {
             location: vec!["src/lib.rs".to_string()],
             description: Some("Ship feature".to_string()),
             dependencies: Some(vec![
-                "Task x.y".to_string(),
-                "1.1".to_string(),
-                "Task 1".to_string(),
+                Dependency::bare("Task x.y"),
+                Dependency::bare("1.1"),
+                Dependency::bare("Task 1"),
             ]),
             complexity: Some(3),
             acceptance_criteria: vec!["Done".to_string()],
             validation: vec!["cargo test".to_string()],
         };
         let all_ids = HashSet::from(["Task 2.5".to_string()]);
-        let errs = validate_task("plan.md", &task, &all_ids);
+        let errs = validate_task("plan.md", &task, &all_ids, std::path::Path::new("."));
         let invalid: Vec<&String> = errs
             .iter()
             .filter(|e| e.contains("invalid dependency"))
@@ -1058,13 +1559,13 @@ mod tests {
             start_line: 10,
             location: vec!["src/lib.rs".to_string()],
             description: Some("Ship feature".to_string()),
-            dependencies: Some(vec!["Task 2.1".to_string()]),
+            dependencies: Some(vec![Dependency::bare("Task 2.1")]),
             complexity: Some(5),
             acceptance_criteria: vec!["Done".to_string()],
             validation: vec!["cargo test".to_string()],
         };
         let all_ids = HashSet::from(["Task 2.1".to_string(), "Task 2.3".to_string()]);
-        let errs = validate_task("plan.md", &task, &all_ids);
+        let errs = validate_task("plan.md", &task, &all_ids, std::path::Path::new("."));
         assert!(errs.is_empty(), "{errs:?}");
     }
 
@@ -1081,5 +1582,175 @@ mod tests {
         assert!(is_allowed_source_type("existing issue/spec"));
         assert!(is_allowed_source_type("plan-only waiver"));
         assert!(!is_allowed_source_type("review"));
+    }
+
+    #[test]
+    fn every_emitted_pattern_is_catalogued_or_explicitly_opted_out() {
+        for pattern in ALL_EMITTED_ERROR_PATTERNS {
+            let matched_catalog = EXPLAIN_CATALOG
+                .iter()
+                .any(|entry| pattern.contains(entry.pattern));
+            let matched_optout = KNOWN_UNCATALOGUED
+                .iter()
+                .any(|frag| pattern.contains(*frag));
+            assert!(
+                matched_catalog || matched_optout,
+                "emitted error pattern is neither catalogued nor opted out: {pattern}",
+            );
+        }
+    }
+
+    #[test]
+    fn known_uncatalogued_does_not_shadow_catalog_patterns() {
+        for entry in EXPLAIN_CATALOG {
+            for opt in KNOWN_UNCATALOGUED {
+                assert!(
+                    !entry.pattern.contains(opt),
+                    "EXPLAIN_CATALOG pattern '{}' overlaps KNOWN_UNCATALOGUED fragment '{}'",
+                    entry.pattern,
+                    opt,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explanations_for_returns_matched_and_uncatalogued() {
+        let errors = vec![
+            "plan.md: Location must be repo-relative (no leading '/'): '/abs'".to_string(),
+            "plan.md: failed to read source doc 'docs/x.md': io error".to_string(),
+            "plan.md: something brand new that nobody indexed".to_string(),
+        ];
+        let result = explanations_for(&errors);
+        assert!(
+            result
+                .matched
+                .iter()
+                .any(|e| e.class == "location-absolute"),
+            "expected location-absolute, got: {:?}",
+            result.matched,
+        );
+        // KNOWN_UNCATALOGUED fragment "failed to read source doc" silences this one.
+        assert!(
+            result
+                .uncatalogued
+                .iter()
+                .all(|note| !note.contains("failed to read source doc")),
+            "KNOWN_UNCATALOGUED entry leaked into uncatalogued: {:?}",
+            result.uncatalogued,
+        );
+        // The brand-new error must surface as an uncatalogued note.
+        assert!(
+            result
+                .uncatalogued
+                .iter()
+                .any(|note| note.contains("brand new that nobody indexed")),
+            "uncatalogued: {:?}",
+            result.uncatalogued,
+        );
+    }
+
+    #[test]
+    fn format_errors_text_keeps_singleton_flat() {
+        let errors = vec!["plan.md:Task 1.1: missing Description".to_string()];
+        let out = format_errors_text(&errors, false);
+        assert_eq!(out, "error: plan.md:Task 1.1: missing Description\n");
+    }
+
+    #[test]
+    fn format_errors_text_keeps_pair_flat() {
+        // Per spec: "more than two" triggers grouping; two stays flat.
+        let errors = vec![
+            "plan.md:Task 1.1: invalid dependency (expected ...): 'foo'".to_string(),
+            "plan.md:Task 1.2: invalid dependency (expected ...): 'bar'".to_string(),
+        ];
+        let out = format_errors_text(&errors, false);
+        // No group header.
+        assert!(!out.contains("[dependency-invalid]"));
+        assert!(
+            out.contains("error: plan.md:Task 1.1: invalid dependency (expected ...): 'foo'\n")
+        );
+        assert!(
+            out.contains("error: plan.md:Task 1.2: invalid dependency (expected ...): 'bar'\n")
+        );
+    }
+
+    #[test]
+    fn format_errors_text_groups_three_or_more_under_class_header() {
+        let errors = vec![
+            "plan.md:Task 1.1: invalid dependency (expected ...): 'a'".to_string(),
+            "plan.md:Task 1.2: invalid dependency (expected ...): 'b'".to_string(),
+            "plan.md:Task 1.3: invalid dependency (expected ...): 'c'".to_string(),
+            "plan.md:Task 1.4: missing Description".to_string(),
+        ];
+        let out = format_errors_text(&errors, false);
+        assert!(
+            out.contains("error: [dependency-invalid] (x3)\n"),
+            "expected grouped header, got:\n{out}",
+        );
+        assert!(out.contains("  - plan.md:Task 1.1: invalid dependency"));
+        assert!(out.contains("  - plan.md:Task 1.2: invalid dependency"));
+        assert!(out.contains("  - plan.md:Task 1.3: invalid dependency"));
+        // Singleton stays flat.
+        assert!(out.contains("error: plan.md:Task 1.4: missing Description\n"));
+    }
+
+    #[test]
+    fn format_errors_text_no_group_restores_flat_output() {
+        let errors = vec![
+            "plan.md:Task 1.1: invalid dependency (expected ...): 'a'".to_string(),
+            "plan.md:Task 1.2: invalid dependency (expected ...): 'b'".to_string(),
+            "plan.md:Task 1.3: invalid dependency (expected ...): 'c'".to_string(),
+        ];
+        let out = format_errors_text(&errors, true);
+        assert_eq!(
+            out,
+            "error: plan.md:Task 1.1: invalid dependency (expected ...): 'a'\n\
+             error: plan.md:Task 1.2: invalid dependency (expected ...): 'b'\n\
+             error: plan.md:Task 1.3: invalid dependency (expected ...): 'c'\n",
+        );
+    }
+
+    #[test]
+    fn format_errors_text_preserves_first_class_anchor_order() {
+        // The grouped header should appear at the position of the first
+        // occurrence of that class — not alphabetical, not bucketed.
+        let errors = vec![
+            "plan.md:Task 1.1: missing Description".to_string(),
+            "plan.md:Task 2.1: invalid dependency: 'a'".to_string(),
+            "plan.md:Task 2.2: invalid dependency: 'b'".to_string(),
+            "plan.md:Task 2.3: invalid dependency: 'c'".to_string(),
+            "plan.md:Task 3.1: missing Validation".to_string(),
+        ];
+        let out = format_errors_text(&errors, false);
+        let lines: Vec<&str> = out.lines().collect();
+        // First line: the singleton missing-Description error.
+        assert!(lines[0].contains("missing Description"), "got: {lines:?}");
+        // Second line: the grouped header.
+        assert!(
+            lines[1].starts_with("error: [dependency-invalid]"),
+            "got: {lines:?}",
+        );
+        // Indented occurrences follow.
+        assert!(lines[2].starts_with("  - "), "got: {lines:?}");
+        assert!(lines[3].starts_with("  - "), "got: {lines:?}");
+        assert!(lines[4].starts_with("  - "), "got: {lines:?}");
+        // Final line: the singleton missing-Validation error.
+        assert!(lines[5].contains("missing Validation"), "got: {lines:?}");
+    }
+
+    #[test]
+    fn explain_catalog_contains_bundle_source_doc_classes() {
+        let classes: Vec<&str> = EXPLAIN_CATALOG.iter().map(|e| e.explain.class).collect();
+        for required in [
+            "bundle-primary-source-mismatch",
+            "bundle-source-doc-missing-plan-label",
+            "bundle-source-doc-missing-execution-state-label",
+        ] {
+            assert!(
+                classes.contains(&required),
+                "missing required catalog class: {required}",
+            );
+        }
     }
 }

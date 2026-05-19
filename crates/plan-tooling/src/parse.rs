@@ -56,10 +56,29 @@ pub struct Task {
     pub start_line: u32,
     pub location: Vec<String>,
     pub description: Option<String>,
-    pub dependencies: Option<Vec<String>>,
+    pub dependencies: Option<Vec<Dependency>>,
     pub complexity: Option<i32>,
     pub acceptance_criteria: Vec<String>,
     pub validation: Vec<String>,
+}
+
+/// A parsed dependency entry. `id` is the canonical `Task N.M` token (or the
+/// raw input when the entry does not parse as a task ID — leaving validation
+/// to flag it). `notes` is the free-form trailing annotation, empty when the
+/// entry has no annotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Dependency {
+    pub id: String,
+    pub notes: String,
+}
+
+impl Dependency {
+    pub fn bare(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            notes: String::new(),
+        }
+    }
 }
 
 pub fn parse_plan_with_display(
@@ -267,7 +286,27 @@ pub fn parse_plan_with_display(
                         items.into_iter().filter(|x| !x.trim().is_empty()).collect();
                     match field.as_str() {
                         "Location" => task.location.extend(cleaned),
-                        "Dependencies" => task.dependencies = Some(cleaned),
+                        "Dependencies" => {
+                            let mut deps: Vec<Dependency> = Vec::new();
+                            let mut saw_value = false;
+                            for entry in &cleaned {
+                                let trimmed = entry.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                saw_value = true;
+                                if trimmed.eq_ignore_ascii_case("none") {
+                                    continue;
+                                }
+                                for part in trimmed.split(',') {
+                                    let p = part.trim();
+                                    if !p.is_empty() {
+                                        deps.push(parse_dependency_entry(p));
+                                    }
+                                }
+                            }
+                            task.dependencies = if saw_value { Some(deps) } else { None };
+                        }
                         "Acceptance criteria" => task.acceptance_criteria.extend(cleaned),
                         "Validation" => task.validation.extend(cleaned),
                         _ => {}
@@ -290,38 +329,6 @@ pub fn parse_plan_with_display(
     );
     finish_sprint(&mut current_sprint, &mut sprints);
 
-    for sprint in &mut sprints {
-        for task in &mut sprint.tasks {
-            let Some(deps) = task.dependencies.clone() else {
-                continue;
-            };
-
-            let mut normalized: Vec<String> = Vec::new();
-            let mut saw_value = false;
-            for d in deps {
-                let trimmed = d.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                saw_value = true;
-                if trimmed.eq_ignore_ascii_case("none") {
-                    continue;
-                }
-                for part in trimmed.split(',') {
-                    let p = part.trim();
-                    if !p.is_empty() {
-                        normalized.push(p.to_string());
-                    }
-                }
-            }
-            if !saw_value {
-                task.dependencies = None;
-            } else {
-                task.dependencies = Some(normalized);
-            }
-        }
-    }
-
     Ok((
         Plan {
             title: plan_title,
@@ -335,6 +342,48 @@ pub fn parse_plan_with_display(
 
 fn normalize_task_id(sprint: i32, seq: i32) -> String {
     format!("Task {sprint}.{seq}")
+}
+
+/// Parse a single dependency entry into a `Dependency` struct, capturing any
+/// free-form trailing annotation. Entries that do not begin with the canonical
+/// `Task N.M` shape preserve the raw input as `id` so `validate` can flag them.
+fn parse_dependency_entry(raw: &str) -> Dependency {
+    let trimmed = raw.trim();
+    let bare = Dependency::bare(trimmed.to_string());
+    // The list-block parser strips the leading `- ` already, but inline-list
+    // values reach us with the leading dash still attached.
+    let stripped = trimmed.trim_start_matches('-').trim_start();
+    let Some(after_task) = stripped.strip_prefix("Task ") else {
+        return bare;
+    };
+    let after_task = after_task.trim_start();
+    let (sprint_digits, rest) = take_ascii_digits(after_task);
+    if sprint_digits.is_empty() {
+        return bare;
+    }
+    let Some(rest) = rest.strip_prefix('.') else {
+        return bare;
+    };
+    let (seq_digits, rest) = take_ascii_digits(rest);
+    if seq_digits.is_empty() {
+        return bare;
+    }
+    // Require a word boundary after the seq number so e.g. `Task 1.1.5` or
+    // `Task 1.1abc` falls through to the invalid branch.
+    if let Some(c) = rest.chars().next()
+        && (c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        return bare;
+    }
+    Dependency {
+        id: format!("Task {sprint_digits}.{seq_digits}"),
+        notes: rest.trim().to_string(),
+    }
+}
+
+fn take_ascii_digits(s: &str) -> (&str, &str) {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    (&s[..end], &s[end..])
 }
 
 fn parse_sprint_heading(line: &str) -> Option<(i32, String)> {
@@ -674,4 +723,81 @@ fn parse_list_block(
     }
 
     (items, i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Dependency, parse_dependency_entry};
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parse_dependency_entry_bare_form() {
+        assert_eq!(
+            parse_dependency_entry("Task 1.1"),
+            Dependency::bare("Task 1.1"),
+        );
+    }
+
+    #[test]
+    fn parse_dependency_entry_captures_paren_annotation() {
+        assert_eq!(
+            parse_dependency_entry("Task 1.1 (only when X flagged)"),
+            Dependency {
+                id: "Task 1.1".to_string(),
+                notes: "(only when X flagged)".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_dependency_entry_captures_em_dash_annotation() {
+        assert_eq!(
+            parse_dependency_entry("Task 2.3 — blocks API surface"),
+            Dependency {
+                id: "Task 2.3".to_string(),
+                notes: "— blocks API surface".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_dependency_entry_strips_leading_dash() {
+        assert_eq!(
+            parse_dependency_entry("- Task 1.1 (note)"),
+            Dependency {
+                id: "Task 1.1".to_string(),
+                notes: "(note)".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_dependency_entry_rejects_missing_task_prefix() {
+        // "1.1" preserves raw input so validate flags it as invalid dependency.
+        assert_eq!(parse_dependency_entry("1.1"), Dependency::bare("1.1"));
+    }
+
+    #[test]
+    fn parse_dependency_entry_rejects_non_digit_id() {
+        assert_eq!(
+            parse_dependency_entry("Task X.Y"),
+            Dependency::bare("Task X.Y"),
+        );
+    }
+
+    #[test]
+    fn parse_dependency_entry_rejects_extra_dot_segment() {
+        assert_eq!(
+            parse_dependency_entry("Task 1.1.5"),
+            Dependency::bare("Task 1.1.5"),
+        );
+    }
+
+    #[test]
+    fn parse_dependency_entry_rejects_alnum_run_on() {
+        assert_eq!(
+            parse_dependency_entry("Task 1.1abc"),
+            Dependency::bare("Task 1.1abc"),
+        );
+    }
 }

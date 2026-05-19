@@ -90,6 +90,24 @@ fn build_completion_command() -> Command {
                         .help("Validation output format")
                         .value_name("fmt")
                         .value_parser(["text", "json"]),
+                )
+                .arg(
+                    Arg::new("explain")
+                        .long("explain")
+                        .help("Append canonical accepted-shape examples per error class")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no-group")
+                        .long("no-group")
+                        .help("Disable class-grouped text output")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("fix")
+                        .long("fix")
+                        .help("Rewrite mechanical violations in-place across the plan bundle")
+                        .action(ArgAction::SetTrue),
                 ),
         )
         .subcommand(
@@ -259,6 +277,17 @@ fn build_completion_command() -> Command {
                         .long("force")
                         .help("Overwrite existing output file")
                         .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("spec")
+                .about("Dump the validate catalog (class, pattern, rule, example)")
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .help("Spec output format")
+                        .value_name("fmt")
+                        .value_parser(["text", "json"]),
                 ),
         )
         .subcommand(

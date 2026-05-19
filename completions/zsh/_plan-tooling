@@ -41,6 +41,9 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '*--file=[Plan markdown file path (repeatable)]:path:_default' \
 '--format=[Validation output format]:fmt:(text json)' \
+'--explain[Append canonical accepted-shape examples per error class]' \
+'--no-group[Disable class-grouped text output]' \
+'--fix[Rewrite mechanical violations in-place across the plan bundle]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -92,6 +95,13 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(spec)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Spec output format]:fmt:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -119,6 +129,7 @@ _plan-tooling_commands() {
 'artifact-audit:Classify durable coordination artifacts without side effects' \
 'split-prs:Build task-to-PR split records (deterministic/auto)' \
 'scaffold:Create a new plan from template' \
+'spec:Dump the validate catalog (class, pattern, rule, example)' \
 'completion:Export shell completion script' \
 'help:Display help message' \
     )
@@ -148,6 +159,11 @@ _plan-tooling__subcmd__help_commands() {
 _plan-tooling__subcmd__scaffold_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling scaffold commands' commands "$@"
+}
+(( $+functions[_plan-tooling__subcmd__spec_commands] )) ||
+_plan-tooling__subcmd__spec_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-tooling spec commands' commands "$@"
 }
 (( $+functions[_plan-tooling__subcmd__split-prs_commands] )) ||
 _plan-tooling__subcmd__split-prs_commands() {
