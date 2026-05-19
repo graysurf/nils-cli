@@ -191,8 +191,9 @@ fn missing_fields(record: &BrowserRecord) -> Vec<String> {
     name = "browser-session",
     version,
     about = "Record browser-session evidence for agent workflows.",
+    long_about = "Record browser QA goals, steps, artifacts, and verification status in a deterministic evidence file.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  browser-session init --out /tmp/browser --target http://localhost:3000 --goal 'verify checkout flow'\n  browser-session record-step --out /tmp/browser --action 'opened checkout page' --status pass --artifact screenshot.png\n  browser-session verify --out /tmp/browser --format json\n  browser-session completion zsh"
+    after_help = "EXAMPLES:\n  browser-session init --out /tmp/browser --target http://localhost:3000 --goal 'verify checkout flow'\n  browser-session record-step --out /tmp/browser --action 'opened checkout page' --status pass --artifact screenshot.png\n  browser-session verify --out /tmp/browser --format json\n  browser-session completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]

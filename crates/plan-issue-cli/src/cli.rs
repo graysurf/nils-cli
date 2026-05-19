@@ -15,7 +15,8 @@ pub enum OutputFormat {
 #[command(
     version,
     about = "Rust implementation of the plan-issue orchestration workflow.",
-    after_help = "Usage paths:\n  - plan-issue: live GitHub-backed orchestration\n  - plan-issue-local: local-first rehearsal and dry-run flow\n\nUnsupported in plan-issue-local:\n  - Any --issue path that requires live GitHub reads/writes (for example: status-plan/ready-plan with --issue, close-plan with --issue-only, cleanup-worktrees).\n\nUse instead:\n  - plan-issue <command> ...        (live GitHub path)\n  - --body-file + --dry-run flows   (local rehearsal path where supported)\n\nRuntime workspace:\n  - Pass --state-dir <PATH> to override the workspace root, or export PLAN_ISSUE_HOME.\n  - Default: ${XDG_STATE_HOME:-$HOME/.local/state}/plan-issue.\n\nBoth binaries share the same typed command contract.",
+    long_about = "Run live or local plan-issue orchestration flows with a typed command contract and deterministic runtime workspace.",
+    after_help = "EXAMPLES:\n  plan-issue start-plan --issue 123 --repo owner/repo\n  plan-issue-local build-task-spec --plan docs/plans/example/example-plan.md --sprint 1\n  plan-issue status-plan --issue 123 --format json\n\nENVIRONMENT:\n  PLAN_ISSUE_HOME  Runtime workspace override.\n  XDG_STATE_HOME   Base state directory when PLAN_ISSUE_HOME is unset.\n  HOME             Fallback base state directory.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data\n\nUSAGE PATHS:\n  - plan-issue: live GitHub-backed orchestration\n  - plan-issue-local: local-first rehearsal and dry-run flow\n\nUNSUPPORTED IN PLAN-ISSUE-LOCAL:\n  - Any --issue path that requires live GitHub reads/writes (for example: status-plan/ready-plan with --issue, close-plan with --issue-only, cleanup-worktrees).\n\nUSE INSTEAD:\n  - plan-issue <command> ...        (live GitHub path)\n  - --body-file + --dry-run flows   (local rehearsal path where supported)\n\nRUNTIME WORKSPACE:\n  - Pass --state-dir <PATH> to override the workspace root, or export PLAN_ISSUE_HOME.\n  - Default: ${XDG_STATE_HOME:-$HOME/.local/state}/plan-issue.\n\nBoth binaries share the same typed command contract.",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -32,7 +33,7 @@ pub struct Cli {
     pub force: bool,
 
     /// Hidden alias for `--format json` (kept for backwards compatibility).
-    #[arg(long, global = true, hide = true)]
+    #[arg(long, global = true, hide = true, conflicts_with = "format")]
     pub json: bool,
 
     /// Output format.
@@ -51,13 +52,6 @@ pub struct Cli {
 
 impl Cli {
     pub fn resolve_output_format(&self) -> Result<OutputFormat, ValidationError> {
-        if self.json && matches!(self.format, Some(OutputFormat::Text)) {
-            return Err(ValidationError::new(
-                "invalid-output-mode",
-                "--json cannot be combined with --format text",
-            ));
-        }
-
         if self.json || matches!(self.format, Some(OutputFormat::Json)) {
             return Ok(OutputFormat::Json);
         }

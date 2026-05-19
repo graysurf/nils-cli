@@ -7,8 +7,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
     name = "test-first-evidence",
     version,
     about = "Record test-first evidence and waivers for agent workflows.",
+    long_about = "Create and verify test-first evidence records that capture failing tests, waivers, and final validation.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  test-first-evidence init --out /tmp/evidence --classification behavior-change --production-path src/lib.rs\n  test-first-evidence record-failing --out /tmp/evidence --command 'cargo test bug_repro' --exit-code 101 --summary 'bug reproduced'\n  test-first-evidence record-waiver --out /tmp/evidence --reason 'docs-only change'\n  test-first-evidence record-final --out /tmp/evidence --command 'cargo test bug_repro' --status pass\n  test-first-evidence verify --out /tmp/evidence --format json\n  test-first-evidence completion zsh"
+    after_help = "EXAMPLES:\n  test-first-evidence init --out /tmp/evidence --classification behavior-change --production-path src/lib.rs\n  test-first-evidence record-failing --out /tmp/evidence --command 'cargo test bug_repro' --exit-code 101 --summary 'bug reproduced'\n  test-first-evidence record-waiver --out /tmp/evidence --reason 'docs-only change'\n  test-first-evidence record-final --out /tmp/evidence --command 'cargo test bug_repro' --status pass\n  test-first-evidence verify --out /tmp/evidence --format json\n  test-first-evidence completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 pub struct Cli {
     #[command(subcommand)]

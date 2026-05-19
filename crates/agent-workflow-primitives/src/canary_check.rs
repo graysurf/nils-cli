@@ -159,8 +159,9 @@ fn read_record(out_dir: &Path) -> Result<CanaryRecord, CliError> {
     name = "canary-check",
     version,
     about = "Run and verify local canary checks for agent workflows.",
+    long_about = "Run a local command as a canary, persist redacted evidence, and verify the latest run status.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  canary-check run --out /tmp/canary --name smoke --command 'cargo test smoke'\n  canary-check verify --out /tmp/canary --format json\n  canary-check completion zsh"
+    after_help = "EXAMPLES:\n  canary-check run --out /tmp/canary --name smoke --command 'cargo test smoke'\n  canary-check verify --out /tmp/canary --format json\n  canary-check completion zsh\n\nENVIRONMENT:\n  SHELL  Shell used to execute canary commands; defaults to /bin/sh.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]

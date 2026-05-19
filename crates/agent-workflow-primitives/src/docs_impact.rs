@@ -191,8 +191,9 @@ fn is_docs_path(path: &str) -> bool {
     name = "docs-impact",
     version,
     about = "Scan Git changes for documentation impact.",
+    long_about = "Scan Git changes and classify whether implementation work requires documentation updates.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  docs-impact scan --include-untracked\n  docs-impact scan --repo . --base origin/main --format json\n  docs-impact completion zsh"
+    after_help = "EXAMPLES:\n  docs-impact scan --include-untracked\n  docs-impact scan --repo . --base origin/main --format json\n  docs-impact completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]

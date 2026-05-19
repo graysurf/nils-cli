@@ -7,8 +7,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
     name = "agent-scope-lock",
     version,
     about = "Create and validate deterministic agent edit-scope locks.",
+    long_about = "Create, read, validate, and clear repository edit-scope locks so agent changes stay within declared path prefixes.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  agent-scope-lock create --path crates/agent-scope-lock --path Cargo.toml --owner T3\n  agent-scope-lock read\n  agent-scope-lock validate --changes all\n  agent-scope-lock validate --format json\n  agent-scope-lock clear"
+    after_help = "EXAMPLES:\n  agent-scope-lock create --path crates/agent-scope-lock --path Cargo.toml --owner T3\n  agent-scope-lock read\n  agent-scope-lock validate --changes all\n  agent-scope-lock validate --format json\n  agent-scope-lock clear\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 pub struct Cli {
     #[command(subcommand)]

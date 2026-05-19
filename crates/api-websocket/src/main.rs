@@ -37,6 +37,8 @@ fn argv_with_default_command(raw_args: &[String]) -> Vec<String> {
 }
 
 fn print_root_help() {
+    println!("WebSocket API runner with implicit `call` default for request files.");
+    println!();
     println!("Usage: api-websocket <command> [args]");
     println!();
     println!("Commands:");
@@ -52,13 +54,31 @@ fn print_root_help() {
     println!("  --config-dir <dir>   Seed setup/websocket discovery (call/history/report)");
     println!("  --format <text|json> Structured output for call/history");
     println!("  -h, --help           Print help");
+    println!("  -V, --version        Print version");
     println!();
-    println!("Examples:");
+    println!("EXAMPLES:");
     println!("  api-websocket --help");
+    println!("  api-websocket requests/health.ws.json");
     println!("  api-websocket call --help");
     println!("  api-websocket report --help");
     println!("  api-websocket report-from-cmd --help");
     println!("  api-websocket completion zsh");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  WS_URL, WS_ENV_DEFAULT, WS_URL_*");
+    println!("  WS_TOKEN_NAME, WS_TOKEN_*, ACCESS_TOKEN, SERVICE_TOKEN");
+    println!("  WS_JWT_VALIDATE_ENABLED, WS_JWT_VALIDATE_STRICT, WS_JWT_VALIDATE_LEEWAY_SECONDS");
+    println!("  WS_HISTORY_ENABLED, WS_HISTORY_FILE, WS_HISTORY_MAX_MB, WS_HISTORY_ROTATE_COUNT");
+    println!("  WS_HISTORY_LOG_URL_ENABLED");
+    println!(
+        "  WS_REPORT_DIR, WS_REPORT_INCLUDE_COMMAND_ENABLED, WS_REPORT_COMMAND_LOG_URL_ENABLED"
+    );
+    println!();
+    println!("EXIT CODES:");
+    println!("  0   success");
+    println!("  1   runtime error");
+    println!("  64  command-line usage error");
+    println!("  65  invalid input data");
 }
 
 fn main() {

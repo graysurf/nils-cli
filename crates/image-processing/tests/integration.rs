@@ -13,5 +13,7 @@ mod dry_run_paths;
 mod edge_cases;
 #[path = "integration/exit_codes.rs"]
 mod exit_codes;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/version.rs"]
 mod version;

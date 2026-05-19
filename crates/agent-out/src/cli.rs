@@ -7,6 +7,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
     name = "agent-out",
     version,
     about = "Generate and audit canonical AGENT_HOME/out artifact paths.",
+    long_about = "Generate canonical project-scoped AGENT_HOME/out run directories and audit existing out entries for workflow artifact hygiene.",
+    after_help = "EXAMPLES:\n  agent-out project --topic browser-qa --mkdir\n  agent-out project --repo . --topic release-notes --format json\n  agent-out audit --strict\n  agent-out completion zsh\n\nENVIRONMENT:\n  AGENT_HOME  Default agent home root when --agent-home is omitted.\n  AGENT_OUT_PATH, AGENT_OUT_ROOT, AGENT_OUT_PROJECT_SLUG, AGENT_OUT_TOPIC, AGENT_OUT_RUN_ID  Exported by --format env.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data",
     disable_help_subcommand = true
 )]
 pub struct Cli {

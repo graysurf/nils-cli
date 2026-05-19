@@ -17,6 +17,8 @@ mod contracts;
 mod e2e_real_apps;
 #[path = "integration/e2e_real_macos.rs"]
 mod e2e_real_macos;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/input_click.rs"]
 mod input_click;
 #[path = "integration/input_keyboard.rs"]

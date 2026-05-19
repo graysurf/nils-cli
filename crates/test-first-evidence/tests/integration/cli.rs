@@ -32,7 +32,7 @@ fn help_includes_version_flag_and_examples() {
         stdout.contains("-V, --version"),
         "missing version flag: {stdout}"
     );
-    assert!(stdout.contains("Examples:"), "missing examples: {stdout}");
+    assert!(stdout.contains("EXAMPLES:"), "missing examples: {stdout}");
 }
 
 #[test]

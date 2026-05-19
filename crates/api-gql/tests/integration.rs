@@ -9,6 +9,8 @@ mod cli_smoke;
 mod completion_outside_repo;
 #[path = "integration/env_and_auth_resolution.rs"]
 mod env_and_auth_resolution;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/history.rs"]
 mod history;
 #[path = "integration/integration.rs"]

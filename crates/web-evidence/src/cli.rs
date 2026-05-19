@@ -7,8 +7,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
     name = "web-evidence",
     version,
     about = "Capture redacted static HTTP evidence for agent workflows.",
+    long_about = "Capture redacted HTTP metadata, previews, and manifests into deterministic artifact directories for workflow evidence.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  web-evidence capture https://example.com --out /tmp/web-evidence\n  web-evidence capture https://example.com --out /tmp/web-evidence --format json\n  web-evidence capture https://example.com --out /tmp/web-evidence --method head\n  web-evidence completion zsh"
+    after_help = "EXAMPLES:\n  web-evidence capture https://example.com --out /tmp/web-evidence\n  web-evidence capture https://example.com --out /tmp/web-evidence --format json\n  web-evidence capture https://example.com --out /tmp/web-evidence --method head\n  web-evidence completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 pub struct Cli {
     #[command(subcommand)]

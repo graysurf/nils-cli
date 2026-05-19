@@ -7,6 +7,8 @@
 mod cli_smoke;
 #[path = "integration/completion_outside_repo.rs"]
 mod completion_outside_repo;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/integration.rs"]
 mod integration;
 #[path = "integration/json_contract.rs"]

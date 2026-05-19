@@ -1,10 +1,35 @@
 use clap::{Args, Parser, Subcommand};
 
+const ROOT_AFTER_HELP: &str = "\
+EXAMPLES:
+  api-gql ops/health.graphql vars.json
+  api-gql call --env staging ops/health.graphql
+  api-gql report --case health --op ops/health.graphql --run
+  api-gql schema --cat
+
+ENVIRONMENT:
+  GQL_URL, GQL_ENV_DEFAULT, GQL_URL_*
+  GQL_JWT_NAME, GQL_JWT_*, ACCESS_TOKEN, SERVICE_TOKEN
+  GQL_SCHEMA_FILE
+  GQL_JWT_VALIDATE_ENABLED, GQL_JWT_VALIDATE_STRICT, GQL_JWT_VALIDATE_LEEWAY_SECONDS
+  GQL_HISTORY_ENABLED, GQL_HISTORY_FILE, GQL_HISTORY_MAX_MB, GQL_HISTORY_ROTATE_COUNT
+  GQL_HISTORY_LOG_URL_ENABLED, GQL_VARS_MIN_LIMIT
+  GQL_REPORT_DIR, GQL_REPORT_INCLUDE_COMMAND_ENABLED, GQL_REPORT_COMMAND_LOG_URL_ENABLED
+  GQL_ALLOW_EMPTY_ENABLED
+
+EXIT CODES:
+  0   success
+  1   runtime error
+  64  command-line usage error
+  65  invalid input data";
+
 #[derive(Parser)]
 #[command(
     name = "api-gql",
     version,
-    about = "GraphQL runner (call/history/report/schema)",
+    about = "GraphQL runner (default subcommand: call)",
+    long_about = "Run GraphQL operation files, inspect history, generate Markdown reports, and resolve schemas. A bare operation file is treated as the `call` subcommand.",
+    after_help = ROOT_AFTER_HELP,
     disable_help_subcommand = true
 )]
 pub(crate) struct Cli {

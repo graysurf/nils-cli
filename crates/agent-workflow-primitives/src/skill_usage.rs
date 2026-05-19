@@ -725,8 +725,9 @@ fn scan_secret_like_values(violations: &mut Vec<Violation>, value: &Value, path:
     name = "skill-usage",
     version,
     about = "Record and verify skill-usage evidence for agent workflows.",
+    long_about = "Record skill invocation intent, linked evidence, validation, failures, outcome, and verification status.",
     disable_help_subcommand = true,
-    after_help = "Examples:\n  skill-usage init --out /tmp/skill --skill skills/tools/devex/review-evidence --intent 'record review evidence' --user-request-summary 'Review PR #12'\n  skill-usage record-validation --out /tmp/skill --command 'scripts/check.sh --docs' --status pass --summary 'docs passed'\n  skill-usage record-outcome --out /tmp/skill --status pass --summary 'skill completed'\n  skill-usage verify --out /tmp/skill --format json\n  skill-usage completion zsh"
+    after_help = "EXAMPLES:\n  skill-usage init --out /tmp/skill --skill skills/tools/devex/review-evidence --intent 'record review evidence' --user-request-summary 'Review PR #12'\n  skill-usage record-validation --out /tmp/skill --command 'scripts/check.sh --docs' --status pass --summary 'docs passed'\n  skill-usage record-outcome --out /tmp/skill --status pass --summary 'skill completed'\n  skill-usage verify --out /tmp/skill --format json\n  skill-usage completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]

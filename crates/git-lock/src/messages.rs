@@ -41,6 +41,8 @@ pub fn unknown_command(cmd: &str) -> String {
 }
 
 pub fn print_help() {
+    println!("Save and restore named Git commit locks.");
+    println!();
     println!("Usage: git-lock <command> [args]");
     println!();
     println!("Commands:");
@@ -65,5 +67,19 @@ pub fn print_help() {
         "completion <shell>"
     );
     println!("  {:<16}  Show version", "-V, --version");
+    println!();
+    println!("EXAMPLES:");
+    println!("  git-lock lock release-point");
+    println!("  git-lock list");
+    println!("  git-lock diff before after");
+    println!("  git-lock completion zsh");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  ZSH_CACHE_DIR  Base cache directory for lock storage.");
+    println!();
+    println!("EXIT CODES:");
+    println!("  0   success");
+    println!("  1   runtime error");
+    println!("  64  command-line usage error");
     println!();
 }

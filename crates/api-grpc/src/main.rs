@@ -37,6 +37,8 @@ fn argv_with_default_command(raw_args: &[String]) -> Vec<String> {
 }
 
 fn print_root_help() {
+    println!("GRPC API runner with implicit `call` default for request files.");
+    println!();
     println!("Usage: api-grpc <command> [args]");
     println!();
     println!("Commands:");
@@ -49,13 +51,35 @@ fn print_root_help() {
     println!("Common options (see subcommand help for full details):");
     println!("  --config-dir <dir>   Seed setup/grpc discovery (call/history/report)");
     println!("  -h, --help           Print help");
+    println!("  -V, --version        Print version");
     println!();
-    println!("Examples:");
+    println!("EXAMPLES:");
     println!("  api-grpc --help");
+    println!("  api-grpc requests/health.grpc.json");
     println!("  api-grpc call --help");
     println!("  api-grpc report --help");
     println!("  api-grpc report-from-cmd --help");
     println!("  api-grpc completion zsh");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  GRPC_URL, GRPC_ENV_DEFAULT, GRPC_URL_*");
+    println!("  GRPC_TOKEN_NAME, GRPC_TOKEN_*, ACCESS_TOKEN, SERVICE_TOKEN");
+    println!(
+        "  GRPC_JWT_VALIDATE_ENABLED, GRPC_JWT_VALIDATE_STRICT, GRPC_JWT_VALIDATE_LEEWAY_SECONDS"
+    );
+    println!(
+        "  GRPC_HISTORY_ENABLED, GRPC_HISTORY_FILE, GRPC_HISTORY_MAX_MB, GRPC_HISTORY_ROTATE_COUNT"
+    );
+    println!("  GRPC_HISTORY_LOG_URL_ENABLED");
+    println!(
+        "  GRPC_REPORT_DIR, GRPC_REPORT_INCLUDE_COMMAND_ENABLED, GRPC_REPORT_COMMAND_LOG_URL_ENABLED"
+    );
+    println!();
+    println!("EXIT CODES:");
+    println!("  0   success");
+    println!("  1   runtime error");
+    println!("  64  command-line usage error");
+    println!("  65  invalid input data");
 }
 
 fn main() {

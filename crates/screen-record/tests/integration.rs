@@ -13,6 +13,8 @@ mod completion_outside_repo;
 mod coverage_stubs;
 #[path = "integration/error.rs"]
 mod error;
+#[path = "integration/help_snapshot.rs"]
+mod help_snapshot;
 #[path = "integration/linux_portal_unit.rs"]
 mod linux_portal_unit;
 #[path = "integration/linux_request_permission.rs"]

@@ -6,7 +6,9 @@ use clap::{Parser, ValueEnum};
 #[command(
     name = "screen-record",
     version,
-    about = "Record a single window or display on macOS (12+) or Linux (X11/Wayland portal)."
+    about = "Record a single window or display on macOS (12+) or Linux (X11/Wayland portal).",
+    long_about = "Capture screenshots or recordings from a selected window/display with optional diagnostics metadata for agent workflows.",
+    after_help = "EXAMPLES:\n  screen-record --screenshot --active-window --path screenshot.png\n  screen-record --display --duration 5 --path capture.mp4\n  screen-record --preflight\n\nENVIRONMENT:\n  DISPLAY, WAYLAND_DISPLAY\n  AGENTS_SCREEN_RECORD_PORTAL_FORCE_AVAILABLE, AGENTS_SCREEN_RECORD_PORTAL_FORCE_MISSING\n  AGENTS_SCREEN_RECORD_TEST_MODE, AGENTS_SCREEN_RECORD_TEST_MODE_REALTIME, AGENTS_SCREEN_RECORD_TEST_MODE_FAIL_APPEND, AGENTS_SCREEN_RECORD_TEST_TIMESTAMP\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 pub struct Cli {
     /// Capture a single window screenshot and exit.

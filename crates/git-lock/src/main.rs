@@ -20,8 +20,11 @@ mod unlock;
 #[command(
     name = "git-lock",
     version,
+    about = "Save and restore named Git commit locks.",
+    long_about = "Save, list, copy, diff, tag, and restore named Git commit locks using a repository-local cache.",
     disable_help_flag = true,
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    after_help = "EXAMPLES:\n  git-lock lock release-point\n  git-lock list\n  git-lock diff before after\n  git-lock completion zsh\n\nENVIRONMENT:\n  ZSH_CACHE_DIR  Base cache directory for lock storage.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error"
 )]
 struct Cli {
     #[command(subcommand)]

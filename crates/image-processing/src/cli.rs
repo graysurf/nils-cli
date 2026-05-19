@@ -21,7 +21,8 @@ impl Operation {
     name = "image-processing",
     version,
     about = "Convert SVG or raster inputs to png/webp/jpg outputs and validate SVG inputs.",
-    after_help = "Notes:\n  - convert requires exactly one --in + --to png|webp|jpg + --out.\n  - convert accepts svg|png|jpg|jpeg|webp inputs.\n  - convert supports optional --width/--height for raster output sizing.\n  - svg-validate requires exactly one --in + --out.\n  - Use --json for machine-readable output (stdout JSON only; logs go to stderr).\n"
+    long_about = "Convert SVG, PNG, JPEG, or WebP inputs into raster outputs, or validate SVG inputs with deterministic JSON-friendly reports.",
+    after_help = "EXAMPLES:\n  image-processing convert --in icon.svg --to png --out icon.png\n  image-processing convert --in photo.jpg --to webp --out photo.webp --width 1200\n  image-processing svg-validate --in icon.svg --out report.json --json\n\nENVIRONMENT:\n  HOME  Fallback base path for user-relative paths.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data\n\nNOTES:\n  - convert requires exactly one --in + --to png|webp|jpg + --out.\n  - convert accepts svg|png|jpg|jpeg|webp inputs.\n  - convert supports optional --width/--height for raster output sizing.\n  - svg-validate requires exactly one --in + --out.\n  - Use --json for machine-readable output (stdout JSON only; logs go to stderr).\n"
 )]
 pub struct Cli {
     #[arg(value_enum)]

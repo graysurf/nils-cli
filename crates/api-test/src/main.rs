@@ -16,11 +16,33 @@ use nils_term::progress::{Progress, ProgressEnabled, ProgressOptions};
 
 mod completion;
 
+const ROOT_AFTER_HELP: &str = "\
+EXAMPLES:
+  api-test run --suite smoke --out results.json
+  api-test summary --in results.json --out summary.md
+  api-test completion zsh
+
+ENVIRONMENT:
+  API_TEST_PROGRESS
+  API_TEST_OUTPUT_DIR
+  API_TEST_ALLOW_WRITES_ENABLED
+  API_TEST_REST_URL, API_TEST_GQL_URL, API_TEST_GRPC_URL, API_TEST_WS_URL
+  API_TEST_AUTH_JSON
+  GITHUB_STEP_SUMMARY
+
+EXIT CODES:
+  0   success
+  1   runtime error
+  64  command-line usage error
+  65  invalid input data";
+
 #[derive(Parser)]
 #[command(
     name = "api-test",
     version,
     about = "API suite runner (run + summary)",
+    long_about = "Run API suite manifests, write structured results, and render Markdown summaries. Bare run flags are treated as the `run` subcommand.",
+    after_help = ROOT_AFTER_HELP,
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -147,6 +169,8 @@ fn argv_with_default_command(raw_args: &[String]) -> Vec<String> {
 }
 
 fn print_root_help() {
+    println!("API suite runner with implicit `run` default for suite execution.");
+    println!();
     println!("Usage: api-test <command> [args]");
     println!();
     println!("Commands:");
@@ -164,12 +188,28 @@ fn print_root_help() {
     println!("  --out <path>          Write results JSON to a file (stdout still emits JSON)");
     println!("  --junit <path>        Write optional JUnit XML to a file");
     println!("  -h, --help            Print help");
+    println!("  -V, --version         Print version");
     println!();
-    println!("Examples:");
+    println!("EXAMPLES:");
     println!("  api-test --help");
     println!("  api-test --suite smoke --help");
     println!("  api-test run --suite smoke --out results.json");
+    println!("  api-test summary --in results.json --out summary.md");
     println!("  api-test completion zsh");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  API_TEST_PROGRESS");
+    println!("  API_TEST_OUTPUT_DIR");
+    println!("  API_TEST_ALLOW_WRITES_ENABLED");
+    println!("  API_TEST_REST_URL, API_TEST_GQL_URL, API_TEST_GRPC_URL, API_TEST_WS_URL");
+    println!("  API_TEST_AUTH_JSON");
+    println!("  GITHUB_STEP_SUMMARY");
+    println!();
+    println!("EXIT CODES:");
+    println!("  0   success");
+    println!("  1   runtime error");
+    println!("  64  command-line usage error");
+    println!("  65  invalid input data");
 }
 
 fn progress_enabled_from_env(raw: Option<&str>) -> ProgressEnabled {
