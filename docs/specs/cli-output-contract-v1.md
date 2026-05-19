@@ -109,14 +109,14 @@ and the worked example in
 Every binary returns one of the BSD sysexits-aligned constants exposed by
 `nils_common::cli_contract::exit`:
 
-| Constant      | Value | When                                                                |
-| ------------- | ----- | ------------------------------------------------------------------- |
-| `SUCCESS`     | `0`   | Subcommand finished without error.                                  |
-| `RUNTIME`     | `1`   | Generic runtime failure (the historic catch-all).                   |
-| `USAGE`       | `64`  | `EX_USAGE`: bad CLI syntax, missing arg, unknown subcommand.        |
-| `DATA`        | `65`  | `EX_DATAERR`: input data malformed or otherwise invalid.            |
-| `UNAVAILABLE` | `69`  | `EX_UNAVAILABLE`: a required service or resource is unavailable.    |
-| `SOFTWARE`    | `70`  | `EX_SOFTWARE`: internal software error / invariant violation.       |
+| Constant      | Value | When                                                             |
+| ------------- | ----- | ---------------------------------------------------------------- |
+| `SUCCESS`     | `0`   | Subcommand finished without error.                               |
+| `RUNTIME`     | `1`   | Generic runtime failure (the historic catch-all).                |
+| `USAGE`       | `64`  | `EX_USAGE`: bad CLI syntax, missing arg, unknown subcommand.     |
+| `DATA`        | `65`  | `EX_DATAERR`: input data malformed or otherwise invalid.         |
+| `UNAVAILABLE` | `69`  | `EX_UNAVAILABLE`: a required service or resource is unavailable. |
+| `SOFTWARE`    | `70`  | `EX_SOFTWARE`: internal software error / invariant violation.    |
 
 Rules:
 
@@ -154,10 +154,10 @@ pattern:
 
 Stable error codes for the parse path:
 
-| `error.code`           | Trigger                                                       |
-| ---------------------- | ------------------------------------------------------------- |
-| `parse-error`          | Any clap error that is not an unknown-subcommand or info exit. |
-| `unknown-subcommand`   | `ErrorKind::InvalidSubcommand`.                               |
+| `error.code`         | Trigger                                                        |
+| -------------------- | -------------------------------------------------------------- |
+| `parse-error`        | Any clap error that is not an unknown-subcommand or info exit. |
+| `unknown-subcommand` | `ErrorKind::InvalidSubcommand`.                                |
 
 The worked example is in
 [`crates/cli-template/src/main.rs`](../../crates/cli-template/src/main.rs)

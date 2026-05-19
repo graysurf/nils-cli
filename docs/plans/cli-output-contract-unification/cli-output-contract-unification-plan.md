@@ -17,12 +17,15 @@ remaining binaries in three batches grouped by ownership.
 - Open questions carried into execution:
   - Whether `cli-template` migrates before or after `memo-cli` (default: `cli-template` first as a contract reference implementation).
   - Whether the parse-error envelope ships as a `nils-common` helper or a per-binary copy (default: shared helper to ensure shape parity).
-  - Whether `staged-context` camelCase fields stay as a versioned alias or are removed at the same minor bump (default: versioned alias for one minor cycle).
+  - Whether `staged-context` camelCase fields stay as a versioned alias or are
+    removed at the same minor bump (default: versioned alias for one minor cycle).
 
 ## Scope
 
 - In scope:
-  - New `crates/nils-common/src/cli_contract.rs` (or `cli/` submodule) with the envelope type, `schema_version` helpers, exit-code constants, parse-error JSON helper, and shared `OutputFormat` enum.
+  - New `crates/nils-common/src/cli_contract.rs` (or `cli/` submodule) with the
+    envelope type, `schema_version` helpers, exit-code constants, parse-error
+    JSON helper, and shared `OutputFormat` enum.
   - Updated `crates/cli-template` as the reference implementation.
   - Per-binary clap-layer changes to introduce `--format text|json` and keep `--json` as a hidden alias where it already exists.
   - Per-binary exit-code call-site updates to consume the shared constants.
@@ -309,7 +312,9 @@ binaries with shared crates can be reviewed together.
 - Commands:
   - `cargo test --workspace`
   - `bash scripts/ci/nils-cli-checks-entrypoint.sh`
-  - Per binary: `<binary> --format json <cmd>` (envelope present), `<binary> bogus --format json` (parse-error envelope), `<binary> bogus` (exit 64).
+  - Per binary: `<binary> --format json <cmd>` (envelope present),
+    `<binary> bogus --format json` (parse-error envelope), `<binary> bogus`
+    (exit 64).
 - Verify: every JSON-emitting subcommand has a `schema_version` snapshot
   test; every binary has an exit-code matrix test; no binary still ships
   ad-hoc `1`/`2` exit codes for usage errors.

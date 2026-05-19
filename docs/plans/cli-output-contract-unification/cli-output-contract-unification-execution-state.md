@@ -4,7 +4,8 @@
 
 - Status: in-progress (Sprint 1 complete, Sprint 2 and 3 pending)
 - Target scope: Sprint 1 (Tasks 1.1–1.4)
-- Execution window: Sprint 1 only — confirmed by user; Sprint 2 and Sprint 3 stay open in separate PRs to honor the plan's `parallel-x3` PR strategy
+- Execution window: Sprint 1 only — confirmed by user; Sprint 2 and Sprint 3
+  stay open in separate PRs to honor the plan's `parallel-x3` PR strategy
 - Staged execution confirmation: confirmed(Sprint 1 only PR; Sprint 2/3 follow separately)
 - Current task: Sprint 1 complete
 - Next task: Task 2.1 (replace memo-cli exit-code constants with shared module)
