@@ -46,6 +46,8 @@ struct ValidateOutput {
     errors: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     explanations: Option<Vec<ExplainEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uncatalogued: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +55,12 @@ struct ExplainEntry {
     class: &'static str,
     rule: &'static str,
     example: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct ExplainResult {
+    matched: Vec<ExplainEntry>,
+    uncatalogued: Vec<String>,
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -115,11 +123,15 @@ pub fn run(args: &[String]) -> i32 {
                 } else {
                     None
                 },
+                uncatalogued: None,
             };
             return print_json_output(output, 0);
         }
         if explain {
-            print_explanations_text(&all_explanations());
+            print_explanations_text(&ExplainResult {
+                matched: all_explanations(),
+                uncatalogued: Vec::new(),
+            });
         }
         return 0;
     }
@@ -160,23 +172,35 @@ pub fn run(args: &[String]) -> i32 {
 
     if format == "json" {
         let code = if errors.is_empty() { 0 } else { 1 };
-        let explanations = if explain {
-            Some(explanations_for(&errors))
+        let (explanations, uncatalogued) = if explain {
+            let result = explanations_for(&errors);
+            (
+                Some(result.matched),
+                if result.uncatalogued.is_empty() {
+                    None
+                } else {
+                    Some(result.uncatalogued)
+                },
+            )
         } else {
-            None
+            (None, None)
         };
         let output = ValidateOutput {
             ok: errors.is_empty(),
             files: discovered_for_output,
             errors,
             explanations,
+            uncatalogued,
         };
         return print_json_output(output, code);
     }
 
     if errors.is_empty() {
         if explain {
-            print_explanations_text(&all_explanations());
+            print_explanations_text(&ExplainResult {
+                matched: all_explanations(),
+                uncatalogued: Vec::new(),
+            });
         }
         return 0;
     }
@@ -698,6 +722,102 @@ const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
         },
     },
     ExplainCatalogEntry {
+        pattern: "Read First missing Primary source",
+        explain: ExplainEntry {
+            class: "read-first-primary-source-missing",
+            rule: "Read First must declare a `Primary source` value.",
+            example: "- Primary source: docs/runbooks/example-source.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Read First missing Source type",
+        explain: ExplainEntry {
+            class: "read-first-source-type-missing",
+            rule: "Read First must declare a `Source type` value.",
+            example: "- Source type: review-to-improvement-doc",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Read First missing Open questions carried into execution",
+        explain: ExplainEntry {
+            class: "read-first-open-questions-missing",
+            rule: "Read First must declare `Open questions carried into execution` (use 'none' when empty).",
+            example: "- Open questions carried into execution: none",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "plan-only waiver requires Primary source to state an explicit waiver",
+        explain: ExplainEntry {
+            class: "read-first-plan-only-waiver-implicit",
+            rule: "When `Source type: plan-only waiver`, the `Primary source` must say so explicitly.",
+            example: "- Primary source: plan-only waiver: bounded follow-up to issue #123\n- Source type: plan-only waiver",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "Primary source must be repo-relative or a URL",
+        explain: ExplainEntry {
+            class: "read-first-primary-source-absolute",
+            rule: "Primary source must be a repo-relative path, an `http(s)://` URL, an anchor (`#...`), or an explicit `plan-only waiver:` string.",
+            example: "- Primary source: docs/runbooks/example-source.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing sprints",
+        explain: ExplainEntry {
+            class: "plan-missing-sprints",
+            rule: "Plans must contain at least one `## Sprint N: name` heading.",
+            example: "## Sprint 1: Bootstrap\n\n### Task 1.1: ...",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "no tasks found",
+        explain: ExplainEntry {
+            class: "plan-missing-tasks",
+            rule: "Every plan must contain at least one `### Task N.M: name` heading under a sprint.",
+            example: "### Task 1.1: Validate sprint metadata",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "task outside of any sprint",
+        explain: ExplainEntry {
+            class: "task-orphaned",
+            rule: "Tasks must appear under a preceding `## Sprint N:` heading.",
+            example: "## Sprint 1: First sprint\n\n### Task 1.1: Do thing",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing Location",
+        explain: ExplainEntry {
+            class: "location-missing",
+            rule: "Each task must declare a non-empty `Location` list.",
+            example: "- **Location**:\n  - `crates/foo/src/bar.rs`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid PR grouping intent",
+        explain: ExplainEntry {
+            class: "sprint-metadata-pr-grouping-invalid",
+            rule: "Sprint `PR grouping intent` accepts `per-sprint` or `group`.",
+            example: "**PR grouping intent**: `group`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid Execution Profile",
+        explain: ExplainEntry {
+            class: "sprint-metadata-execution-profile-invalid",
+            rule: "Sprint `Execution Profile` accepts `serial` or `parallel-xN` (where N is a positive integer).",
+            example: "**Execution Profile**: `parallel-x2`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "invalid metadata field",
+        explain: ExplainEntry {
+            class: "sprint-metadata-field-typo",
+            rule: "Sprint metadata field name must use the exact canonical spelling (`PR grouping intent`, `Execution Profile`).",
+            example: "**PR grouping intent**: `group`\n**Execution Profile**: `parallel-x2`",
+        },
+    },
+    ExplainCatalogEntry {
         pattern: "Primary source path not found",
         explain: ExplainEntry {
             class: "read-first-source-missing",
@@ -803,6 +923,14 @@ const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
         },
     },
     ExplainCatalogEntry {
+        pattern: "invalid Complexity",
+        explain: ExplainEntry {
+            class: "complexity-non-integer",
+            rule: "Complexity must be an integer; omit the field entirely when no estimate exists.",
+            example: "- **Complexity**: 5",
+        },
+    },
+    ExplainCatalogEntry {
         pattern: "missing Acceptance criteria",
         explain: ExplainEntry {
             class: "acceptance-missing",
@@ -858,33 +986,206 @@ const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
             example: "### Task 2.1: Validate sprint metadata",
         },
     },
+    ExplainCatalogEntry {
+        pattern: "bundle Primary source must be an accepted sibling source doc",
+        explain: ExplainEntry {
+            class: "bundle-primary-source-mismatch",
+            rule: "Plan `Primary source` must point at the sibling `-discussion-source.md` \
+                   or `-review-source.md` doc under the same `docs/plans/<slug>/` directory.",
+            example: "- Primary source: docs/plans/demo/demo-discussion-source.md\n  # or\n- Primary source: docs/plans/demo/demo-review-source.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing `Recommended plan`",
+        explain: ExplainEntry {
+            class: "bundle-source-doc-missing-plan-label",
+            rule: "Source doc paired with a plan must declare the canonical `Recommended plan` \
+                   pointer so plan-tooling can verify the bundle.",
+            example: "## Execution\n\n- Recommended plan: docs/plans/demo/demo-plan.md\n- Recommended execution state: docs/plans/demo/demo-execution-state.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing `Recommended execution state`",
+        explain: ExplainEntry {
+            class: "bundle-source-doc-missing-execution-state-label",
+            rule: "Source doc paired with a plan must declare the canonical \
+                   `Recommended execution state` pointer so plan-tooling can verify the bundle.",
+            example: "## Execution\n\n- Recommended plan: docs/plans/demo/demo-plan.md\n- Recommended execution state: docs/plans/demo/demo-execution-state.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "recommends wrong plan",
+        explain: ExplainEntry {
+            class: "bundle-source-doc-wrong-plan",
+            rule: "The source doc's `Recommended plan` value must equal the sibling `*-plan.md` path.",
+            example: "- Recommended plan: docs/plans/demo/demo-plan.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "recommends wrong execution state",
+        explain: ExplainEntry {
+            class: "bundle-source-doc-wrong-execution-state",
+            rule: "The source doc's `Recommended execution state` value must equal the sibling `*-execution-state.md` path.",
+            example: "- Recommended execution state: docs/plans/demo/demo-execution-state.md",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "missing `Source document`",
+        explain: ExplainEntry {
+            class: "bundle-execution-state-missing-source-document",
+            rule: "Execution state must declare a `Source document` pointer back to the plan (or to the source doc when waived).",
+            example: "## Current State\n\n- Source document: `docs/plans/demo/demo-plan.md`",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "points to wrong source document",
+        explain: ExplainEntry {
+            class: "bundle-execution-state-wrong-source-document",
+            rule: "Execution state `Source document` must point at the plan, or at the source doc with an explicit `Direct source-doc execution waiver`.",
+            example: "- Source document: `docs/plans/demo/demo-plan.md`\n- Direct source-doc execution waiver: not applicable",
+        },
+    },
+    ExplainCatalogEntry {
+        pattern: "without `Direct source-doc execution waiver`",
+        explain: ExplainEntry {
+            class: "bundle-direct-source-execution-waiver-missing",
+            rule: "When execution state points at the source doc instead of the plan, set an explicit \
+                   `Direct source-doc execution waiver` value (e.g. `bounded single-step source execution`).",
+            example: "- Source document: `docs/plans/demo/demo-discussion-source.md`\n- Direct source-doc execution waiver: bounded single-step source execution",
+        },
+    },
+];
+
+/// Error fragments that are intentionally not paired with an `EXPLAIN_CATALOG` entry.
+///
+/// These cover I/O / parse failures and similar conditions where a canonical
+/// authoring example would not be actionable. A new emitted error must either
+/// match an `EXPLAIN_CATALOG.pattern` or appear here.
+const KNOWN_UNCATALOGUED: &[&str] = &[
+    "file not found",
+    "failed to parse plan",
+    "failed to read source doc",
+    "failed to read execution state",
+];
+
+/// Static registry of every literal substring guaranteed to appear in an error
+/// emitted by this crate's validators (and by parse.rs in `error:` form). The
+/// completeness test asserts each fragment is either in `EXPLAIN_CATALOG` or
+/// in `KNOWN_UNCATALOGUED` — so adding a new emitter without updating one of
+/// those two arrays will fail CI.
+#[cfg(test)]
+const ALL_EMITTED_ERROR_PATTERNS: &[&str] = &[
+    // I/O and parse
+    "file not found",
+    "failed to parse plan",
+    // Top-level structure (validate.rs)
+    "missing sprints",
+    "no tasks found",
+    // Read First
+    "missing Read First section",
+    "Read First missing Primary source",
+    "Read First missing Source type",
+    "invalid Read First Source type",
+    "Read First missing Open questions carried into execution",
+    "plan-only waiver requires Primary source to state an explicit waiver",
+    "Primary source must be repo-relative or a URL",
+    "Primary source path not found",
+    // Sprint metadata
+    "must include both `PR grouping intent` and `Execution Profile`",
+    "is per-sprint but `Execution Profile` indicates parallel width",
+    // Task fields
+    "invalid or missing task id",
+    "missing Location",
+    "Location must be repo-relative",
+    "Location must be a file path",
+    "must not use globs",
+    "Location contains placeholder",
+    "missing Description",
+    "Description contains placeholder",
+    "missing Dependencies",
+    "invalid dependency",
+    "unknown dependency",
+    "Complexity out of range",
+    "missing Acceptance criteria",
+    "Acceptance criteria contains placeholder",
+    "missing Validation",
+    "Validation contains placeholder",
+    // parse.rs errors (rendered as `error: <msg>`)
+    "missing Complexity value",
+    "invalid Complexity",
+    "invalid PR grouping intent",
+    "invalid Execution Profile",
+    "invalid metadata field",
+    "task outside of any sprint",
+    // bundle.rs errors
+    "bundle Primary source must be an accepted sibling source doc",
+    "failed to read source doc",
+    "recommends wrong plan",
+    "missing `Recommended plan`",
+    "recommends wrong execution state",
+    "missing `Recommended execution state`",
+    "failed to read execution state",
+    "points to wrong source document",
+    "missing `Source document`",
+    "without `Direct source-doc execution waiver`",
 ];
 
 fn all_explanations() -> Vec<ExplainEntry> {
     EXPLAIN_CATALOG.iter().map(|e| e.explain.clone()).collect()
 }
 
-fn explanations_for(errors: &[String]) -> Vec<ExplainEntry> {
-    let mut hits: Vec<ExplainEntry> = Vec::new();
-    for entry in EXPLAIN_CATALOG {
-        if errors.iter().any(|err| err.contains(entry.pattern)) {
-            hits.push(entry.explain.clone());
+fn explanations_for(errors: &[String]) -> ExplainResult {
+    let mut matched: Vec<ExplainEntry> = Vec::new();
+    let mut seen_classes: HashSet<&'static str> = HashSet::new();
+    let mut uncatalogued: Vec<String> = Vec::new();
+    let mut uncatalogued_seen: HashSet<String> = HashSet::new();
+
+    for err in errors {
+        let mut matched_any = false;
+        for entry in EXPLAIN_CATALOG {
+            if err.contains(entry.pattern) {
+                matched_any = true;
+                if seen_classes.insert(entry.explain.class) {
+                    matched.push(entry.explain.clone());
+                }
+                break;
+            }
+        }
+        if matched_any {
+            continue;
+        }
+        if KNOWN_UNCATALOGUED.iter().any(|frag| err.contains(*frag)) {
+            continue;
+        }
+        // Strip the leading `<display_path>: ` (or `<display_path>:<task>: `) prefix so the
+        // surfaced note focuses on the message body, which is what authors and LLM agents
+        // need to recognize. Falls back to the raw error if no `:` is present.
+        let body = err
+            .split_once(':')
+            .map(|(_, rest)| rest.trim().to_string())
+            .unwrap_or_else(|| err.clone());
+        if uncatalogued_seen.insert(body.clone()) {
+            uncatalogued.push(body);
         }
     }
-    hits
+
+    ExplainResult { matched, uncatalogued }
 }
 
-fn print_explanations_text(entries: &[ExplainEntry]) {
-    if entries.is_empty() {
+fn print_explanations_text(result: &ExplainResult) {
+    if result.matched.is_empty() && result.uncatalogued.is_empty() {
         return;
     }
     eprintln!();
     eprintln!("Examples:");
-    for entry in entries {
+    for entry in &result.matched {
         eprintln!("  [{}] {}", entry.class, entry.rule);
         for line in entry.example.lines() {
             eprintln!("      {line}");
         }
+    }
+    for note in &result.uncatalogued {
+        eprintln!("  note: no canonical example registered for error class: {note}");
     }
 }
 
@@ -906,7 +1207,8 @@ mod tests {
     use crate::parse::Task;
 
     use super::{
-        clean_source_value, contains_angle_placeholder, contains_word_case_insensitive,
+        ALL_EMITTED_ERROR_PATTERNS, EXPLAIN_CATALOG, KNOWN_UNCATALOGUED, clean_source_value,
+        contains_angle_placeholder, contains_word_case_insensitive, explanations_for,
         has_placeholder, is_allowed_source_type, is_non_empty_list, is_task_id,
         strip_backtick_spans, validate_task,
     };
@@ -1081,5 +1383,81 @@ mod tests {
         assert!(is_allowed_source_type("existing issue/spec"));
         assert!(is_allowed_source_type("plan-only waiver"));
         assert!(!is_allowed_source_type("review"));
+    }
+
+    #[test]
+    fn every_emitted_pattern_is_catalogued_or_explicitly_opted_out() {
+        for pattern in ALL_EMITTED_ERROR_PATTERNS {
+            let matched_catalog = EXPLAIN_CATALOG
+                .iter()
+                .any(|entry| pattern.contains(entry.pattern));
+            let matched_optout = KNOWN_UNCATALOGUED.iter().any(|frag| pattern.contains(*frag));
+            assert!(
+                matched_catalog || matched_optout,
+                "emitted error pattern is neither catalogued nor opted out: {pattern}",
+            );
+        }
+    }
+
+    #[test]
+    fn known_uncatalogued_does_not_shadow_catalog_patterns() {
+        for entry in EXPLAIN_CATALOG {
+            for opt in KNOWN_UNCATALOGUED {
+                assert!(
+                    !entry.pattern.contains(opt),
+                    "EXPLAIN_CATALOG pattern '{}' overlaps KNOWN_UNCATALOGUED fragment '{}'",
+                    entry.pattern,
+                    opt,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explanations_for_returns_matched_and_uncatalogued() {
+        let errors = vec![
+            "plan.md: Location must be repo-relative (no leading '/'): '/abs'".to_string(),
+            "plan.md: failed to read source doc 'docs/x.md': io error".to_string(),
+            "plan.md: something brand new that nobody indexed".to_string(),
+        ];
+        let result = explanations_for(&errors);
+        assert!(
+            result.matched.iter().any(|e| e.class == "location-absolute"),
+            "expected location-absolute, got: {:?}",
+            result.matched,
+        );
+        // KNOWN_UNCATALOGUED fragment "failed to read source doc" silences this one.
+        assert!(
+            result
+                .uncatalogued
+                .iter()
+                .all(|note| !note.contains("failed to read source doc")),
+            "KNOWN_UNCATALOGUED entry leaked into uncatalogued: {:?}",
+            result.uncatalogued,
+        );
+        // The brand-new error must surface as an uncatalogued note.
+        assert!(
+            result
+                .uncatalogued
+                .iter()
+                .any(|note| note.contains("brand new that nobody indexed")),
+            "uncatalogued: {:?}",
+            result.uncatalogued,
+        );
+    }
+
+    #[test]
+    fn explain_catalog_contains_bundle_source_doc_classes() {
+        let classes: Vec<&str> = EXPLAIN_CATALOG.iter().map(|e| e.explain.class).collect();
+        for required in [
+            "bundle-primary-source-mismatch",
+            "bundle-source-doc-missing-plan-label",
+            "bundle-source-doc-missing-execution-state-label",
+        ] {
+            assert!(
+                classes.contains(&required),
+                "missing required catalog class: {required}",
+            );
+        }
     }
 }
