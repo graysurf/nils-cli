@@ -62,6 +62,16 @@ pub enum ForgeError {
         message: String,
         detail: Option<String>,
     },
+    /// Op-specific `RUNTIME 1` failure with a rule-specific `error.kind`.
+    /// Currently used by `pr wait-checks` for `checks_failed`; future ops
+    /// (e.g. `pr merge` conflict) can reuse the variant.
+    #[error("{message}")]
+    RuntimeFailure {
+        schema_version: String,
+        kind: &'static str,
+        message: String,
+        detail: Option<String>,
+    },
 }
 
 impl ForgeError {
@@ -96,6 +106,40 @@ impl ForgeError {
         Self::BackendUnavailable {
             schema_version: schema_version.into(),
             kind: "backend_unauthenticated",
+            message: message.into(),
+            detail,
+        }
+    }
+
+    /// Build an `UNAVAILABLE 69` error with a custom rule-specific kind.
+    /// Used for op-specific unavailability (e.g. `checks_timeout`,
+    /// `glab_version_unsupported`) that share exit code 69 but need their
+    /// own `error.kind` discriminator per spec.
+    pub fn unavailable(
+        schema_version: impl Into<String>,
+        kind: &'static str,
+        message: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::BackendUnavailable {
+            schema_version: schema_version.into(),
+            kind,
+            message: message.into(),
+            detail,
+        }
+    }
+
+    /// Build a `RUNTIME 1` failure with a rule-specific kind (e.g.
+    /// `checks_failed`).
+    pub fn runtime_failure(
+        schema_version: impl Into<String>,
+        kind: &'static str,
+        message: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::RuntimeFailure {
+            schema_version: schema_version.into(),
+            kind,
             message: message.into(),
             detail,
         }
@@ -166,6 +210,7 @@ impl ForgeError {
             Self::ProviderUnsupported { .. } => exit::USAGE,
             Self::SoftwareError { .. } => exit::SOFTWARE,
             Self::Validation { .. } => exit::DATA,
+            Self::RuntimeFailure { .. } => exit::RUNTIME,
         }
     }
 
@@ -178,6 +223,7 @@ impl ForgeError {
             Self::ProviderUnsupported { .. } => "provider_unsupported",
             Self::SoftwareError { .. } => "software_error",
             Self::Validation { kind, .. } => kind,
+            Self::RuntimeFailure { kind, .. } => kind,
         }
     }
 
@@ -188,7 +234,8 @@ impl ForgeError {
             | Self::BackendError { schema_version, .. }
             | Self::ProviderUnsupported { schema_version, .. }
             | Self::SoftwareError { schema_version, .. }
-            | Self::Validation { schema_version, .. } => schema_version,
+            | Self::Validation { schema_version, .. }
+            | Self::RuntimeFailure { schema_version, .. } => schema_version,
         }
     }
 
@@ -199,7 +246,8 @@ impl ForgeError {
             | Self::BackendError { message, .. }
             | Self::ProviderUnsupported { message, .. }
             | Self::SoftwareError { message, .. }
-            | Self::Validation { message, .. } => message,
+            | Self::Validation { message, .. }
+            | Self::RuntimeFailure { message, .. } => message,
         }
     }
 
@@ -210,7 +258,8 @@ impl ForgeError {
             | Self::BackendError { detail, .. }
             | Self::ProviderUnsupported { detail, .. }
             | Self::SoftwareError { detail, .. }
-            | Self::Validation { detail, .. } => detail.as_deref(),
+            | Self::Validation { detail, .. }
+            | Self::RuntimeFailure { detail, .. } => detail.as_deref(),
         }
     }
 
@@ -289,6 +338,14 @@ mod tests {
                 ForgeError::validation("cli.forge-cli.error.v1", "branch_name_invalid", "x", None),
                 exit::DATA,
             ),
+            (
+                ForgeError::unavailable("cli.forge-cli.error.v1", "checks_timeout", "x", None),
+                exit::UNAVAILABLE,
+            ),
+            (
+                ForgeError::runtime_failure("cli.forge-cli.error.v1", "checks_failed", "x", None),
+                exit::RUNTIME,
+            ),
         ];
         for (err, expected) in cases {
             assert_eq!(err.exit_code(), expected, "{}", err.kind());
@@ -320,6 +377,18 @@ mod tests {
         assert_eq!(
             ForgeError::not_implemented("v1", "x").kind(),
             "not_implemented"
+        );
+        assert_eq!(
+            ForgeError::unavailable("v1", "checks_timeout", "x", None).kind(),
+            "checks_timeout"
+        );
+        assert_eq!(
+            ForgeError::unavailable("v1", "glab_version_unsupported", "x", None).kind(),
+            "glab_version_unsupported"
+        );
+        assert_eq!(
+            ForgeError::runtime_failure("v1", "checks_failed", "x", None).kind(),
+            "checks_failed"
         );
     }
 }

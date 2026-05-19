@@ -1,0 +1,38 @@
+[
+  {
+    "name": "build",
+    "state": "COMPLETED",
+    "conclusion": "success",
+    "bucket": "pass",
+    "workflow": "CI",
+    "link": "https://github.com/sympoies/nils-cli/actions/runs/1001",
+    "startedAt": "2026-05-19T10:00:00Z",
+    "completedAt": "2026-05-19T10:05:00Z",
+    "description": "Build the workspace",
+    "isRequired": true
+  },
+  {
+    "name": "test",
+    "state": "COMPLETED",
+    "conclusion": "success",
+    "bucket": "pass",
+    "workflow": "CI",
+    "link": "https://github.com/sympoies/nils-cli/actions/runs/1002",
+    "startedAt": "2026-05-19T10:00:00Z",
+    "completedAt": "2026-05-19T10:07:00Z",
+    "description": "Run cargo test",
+    "isRequired": true
+  },
+  {
+    "name": "lint",
+    "state": "COMPLETED",
+    "conclusion": "success",
+    "bucket": "pass",
+    "workflow": "CI",
+    "link": "https://github.com/sympoies/nils-cli/actions/runs/1003",
+    "startedAt": "2026-05-19T10:00:00Z",
+    "completedAt": "2026-05-19T10:01:30Z",
+    "description": "rumdl + rustfmt",
+    "isRequired": true
+  }
+]

@@ -1,0 +1,4 @@
+Showing status for branch feat/sample
+build  success (2m 12s)
+test   success (4m 04s)
+lint   success (40s)

@@ -1132,12 +1132,16 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__checks)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --required-only --format --remote --provider --repo --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --required-only)
+                    COMPREPLY=($(compgen -W "true false" -- "${cur}"))
+                    return 0
+                    ;;
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0
@@ -1698,12 +1702,24 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__wait__checks)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --timeout --interval --required-only --format --remote --provider --repo --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --interval)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --required-only)
+                    COMPREPLY=($(compgen -W "true false" -- "${cur}"))
+                    return 0
+                    ;;
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0
