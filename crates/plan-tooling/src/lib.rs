@@ -1,6 +1,7 @@
 mod artifact_audit;
 mod batches;
 mod bundle;
+mod cli;
 mod completion;
 mod fix;
 pub mod parse;
@@ -9,10 +10,8 @@ mod repr;
 mod scaffold;
 mod spec;
 pub mod split_prs;
-mod usage;
 mod validate;
 
 pub fn run() -> i32 {
-    let args: Vec<String> = std::env::args().collect();
-    usage::dispatch(&args)
+    cli::run()
 }
