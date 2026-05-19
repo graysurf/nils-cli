@@ -16,18 +16,18 @@
 
 ## Task Ledger
 
-| ID | Status | Task | Evidence | Notes |
-| --- | --- | --- | --- | --- |
-| Task 1.1 | pending | Add `--dry-run` to `git-lock unlock` | n/a | highest blast-radius safety fix |
-| Task 1.2 | pending | Strengthen `git-lock delete` warning and add `--force` | n/a | |
-| Task 1.3 | pending | Wrap `git-lock` errors with remediation hints | n/a | |
-| Task 2.1 | pending | Redefine `memo-cli delete` semantics | n/a | breaking change; needs release note |
-| Task 2.2 | pending | Fail fast on `memo-cli apply --stdin` with TTY stdin | n/a | |
-| Task 2.3 | pending | Add change preview to `memo-cli apply --dry-run` | n/a | depends on 2.2 (same PR scope) |
-| Task 3.1 | pending | TTY confirmation for `heuristic-inbox archive` | n/a | |
-| Task 3.2 | pending | Move `codex-rate-limits --watch` guard into clap | n/a | |
-| Task 3.3 | pending | `codex-remove` non-interactive without `--yes` is a usage error | n/a | |
-| Task 3.4 | pending | Add `nils-term::prompt::confirm` shared helper | n/a | depends on 1.2, 2.1, 3.1 |
+| ID       | Status  | Task                                                            | Evidence | Notes                               |
+| -------- | ------- | --------------------------------------------------------------- | -------- | ----------------------------------- |
+| Task 1.1 | pending | Add `--dry-run` to `git-lock unlock`                            | n/a      | highest blast-radius safety fix     |
+| Task 1.2 | pending | Strengthen `git-lock delete` warning and add `--force`          | n/a      |                                     |
+| Task 1.3 | pending | Wrap `git-lock` errors with remediation hints                   | n/a      |                                     |
+| Task 2.1 | pending | Redefine `memo-cli delete` semantics                            | n/a      | breaking change; needs release note |
+| Task 2.2 | pending | Fail fast on `memo-cli apply --stdin` with TTY stdin            | n/a      |                                     |
+| Task 2.3 | pending | Add change preview to `memo-cli apply --dry-run`                | n/a      | depends on 2.2 (same PR scope)      |
+| Task 3.1 | pending | TTY confirmation for `heuristic-inbox archive`                  | n/a      |                                     |
+| Task 3.2 | pending | Move `codex-rate-limits --watch` guard into clap                | n/a      |                                     |
+| Task 3.3 | pending | `codex-remove` non-interactive without `--yes` is a usage error | n/a      |                                     |
+| Task 3.4 | pending | Add `nils-term::prompt::confirm` shared helper                  | n/a      | depends on 1.2, 2.1, 3.1            |
 
 ## Validation
 

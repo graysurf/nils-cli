@@ -22,8 +22,11 @@ appears, not before.
 ## Scope
 
 - In scope:
-  - `git-lock unlock` gets `--dry-run` and a richer prompt; `git-lock delete` gets a warning preface and `--force`; `git-lock` error catch-all gains remediation hints.
-  - `memo-cli delete` gets TTY-aware confirmation + `--yes`; `--hard` is reinterpreted as a real mode flag (soft vs. hard) with a documented migration; `memo-cli apply` learns to fail fast on TTY-stdin and gain a diff preview in dry-run.
+  - `git-lock unlock` gets `--dry-run` and a richer prompt; `git-lock delete` gets a warning preface and
+    `--force`; `git-lock` error catch-all gains remediation hints.
+  - `memo-cli delete` gets TTY-aware confirmation + `--yes`; `--hard` is reinterpreted as a real mode flag
+    (soft vs. hard) with a documented migration; `memo-cli apply` learns to fail fast on TTY-stdin and gain a diff
+    preview in dry-run.
   - `heuristic-inbox archive` gains TTY-aware confirmation + `--yes`.
   - `codex-cli` gets parse-time `requires` on `--watch` and a strict usage-error path for non-interactive `--yes`-less removal.
   - A shared TTY-prompt helper in `nils-term` once three call sites exist.

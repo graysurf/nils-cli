@@ -16,12 +16,12 @@
 
 ## Task Ledger
 
-| ID | Status | Task | Evidence | Notes |
-| --- | --- | --- | --- | --- |
-| Task 1.1 | pending | Add `nils-term::progress` TTY-pipe integration test | n/a | regression coverage for the helper |
-| Task 1.2 | pending | Audit inline `is_terminal()` callers and replace with helper | n/a | depends on 1.1 |
-| Task 2.1 | pending | Add truncation footer to `memo-cli list` and `search` | n/a | |
-| Task 2.2 | pending | Add `--max-header-width` flag and env override to `semantic-commit commit` | n/a | better if `semantic-commit` already migrated to clap derive |
+| ID       | Status  | Task                                                                       | Evidence | Notes                                                       |
+| -------- | ------- | -------------------------------------------------------------------------- | -------- | ----------------------------------------------------------- |
+| Task 1.1 | pending | Add `nils-term::progress` TTY-pipe integration test                        | n/a      | regression coverage for the helper                          |
+| Task 1.2 | pending | Audit inline `is_terminal()` callers and replace with helper               | n/a      | depends on 1.1                                              |
+| Task 2.1 | pending | Add truncation footer to `memo-cli list` and `search`                      | n/a      |                                                             |
+| Task 2.2 | pending | Add `--max-header-width` flag and env override to `semantic-commit commit` | n/a      | better if `semantic-commit` already migrated to clap derive |
 
 ## Validation
 

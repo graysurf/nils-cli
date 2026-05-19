@@ -21,11 +21,13 @@ binary and resolves the `api-gql` implicit-default UX decision.
 
 - In scope:
   - `docs/runbooks/cli-help-style-guide.md` (new) — the style guide.
-  - Per-binary clap-layer updates: `#[arg(env = ...)]` on env-backed flags, `long_about`, `after_help` (with EXAMPLES and EXIT CODES / ENVIRONMENT sections), and `conflicts_with` for `--json` ↔ `--format` overlap.
+  - Per-binary clap-layer updates: `#[arg(env = ...)]` on env-backed flags, `long_about`, `after_help` (with
+    EXAMPLES and EXIT CODES / ENVIRONMENT sections), and `conflicts_with` for `--json` ↔ `--format` overlap.
   - Per-binary help-structure snapshot tests under `tests/integration/help_snapshot.rs` for clap-derive binaries.
   - `api-gql` implicit-default UX fix.
 - Out of scope:
-  - Hand-rolled-dispatch binaries (`semantic-commit`, `git-cli`, `plan-tooling`, `git-summary`, `fzf-cli`) — covered by the `cli-dispatch-modernization` plan.
+  - Hand-rolled-dispatch binaries (`semantic-commit`, `git-cli`, `plan-tooling`, `git-summary`, `fzf-cli`) —
+    covered by the `cli-dispatch-modernization` plan.
   - JSON envelope / exit-code consolidation — covered by the `cli-output-contract-unification` plan.
   - Adding new subcommands or behaviours.
 

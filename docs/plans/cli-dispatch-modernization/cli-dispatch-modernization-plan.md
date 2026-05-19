@@ -23,7 +23,8 @@ migration. Sprint 1 lands the smallest migrations (`semantic-commit`,
 ## Scope
 
 - In scope:
-  - Replace `usage.rs` / `app.rs` hand-rolled dispatch with clap derive definitions for `semantic-commit`, `plan-tooling`, `git-summary`, `fzf-cli`, `git-cli`.
+  - Replace `usage.rs` / `app.rs` hand-rolled dispatch with clap derive definitions for `semantic-commit`,
+    `plan-tooling`, `git-summary`, `fzf-cli`, `git-cli`.
   - Style-guide additions in `docs/runbooks/cli-help-style-guide.md` covering global-flag rules and `-V`/`-v`/`-h` conventions.
   - Audit and (where unjustified) remove `disable_help_flag = true` from `git-scope` and `git-lock` clap definitions.
   - New tests covering `semantic-commit --quiet` and `CAT_PAGER_ENV` behaviour.
@@ -59,7 +60,8 @@ on `semantic-commit` while the binary is being touched anyway.
   - `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`
   - `cargo test -p semantic-commit`
   - `cargo test -p plan-tooling`
-  - Manual: `semantic-commit --help`, `semantic-commit -V`, `semantic-commit nope` (clap parse error, exit 64), `semantic-commit --quiet commit` (suppressed output).
+  - Manual: `semantic-commit --help`, `semantic-commit -V`, `semantic-commit nope` (clap parse error, exit 64),
+    `semantic-commit --quiet commit` (suppressed output).
   - Manual: `plan-tooling --help`, `plan-tooling -V`.
 - Verify: both binaries report help/version through clap; unknown
   subcommands exit 64; new tests cover `--quiet` and `CAT_PAGER_ENV`.
@@ -111,7 +113,8 @@ on `semantic-commit` while the binary is being touched anyway.
 - **Complexity**:
   - 6
 - **Acceptance criteria**:
-  - `semantic-commit --help`, `-V`, `help`, `staged-context`, `commit`, `completion` all match prior behaviour byte-for-byte where they can (allowing clap's default help template formatting).
+  - `semantic-commit --help`, `-V`, `help`, `staged-context`, `commit`, `completion` all match prior behaviour
+    byte-for-byte where they can (allowing clap's default help template formatting).
   - `semantic-commit nope` exits `64` (clap default usage error).
   - Hand-rolled `usage.rs` is deleted.
   - Existing `semantic-commit` integration tests pass; the `dispatch_*` unit tests are replaced with clap parse tests.
@@ -137,7 +140,8 @@ on `semantic-commit` while the binary is being touched anyway.
   - Both tests pass on the current code base.
   - Reverting either guard makes the corresponding test fail.
 - **Validation**:
-  - `cargo test -p semantic-commit -- --include-ignored` (or whatever runner the project conventionally uses for end-to-end commit tests; default to nextest if available).
+  - `cargo test -p semantic-commit -- --include-ignored` (or whatever runner the project conventionally uses for
+    end-to-end commit tests; default to nextest if available).
 
 ### Task 1.4: Migrate `plan-tooling` to clap derive
 
@@ -234,7 +238,8 @@ parsing/dispatch layer moves.
 
 - Commands:
   - `cargo test -p git-cli`
-  - Manual: `git-cli --help`, `git-cli utils <sub>`, `git-cli reset <args>`, `git-cli commit <args>`, `git-cli branch <args>`, `git-cli ci <args>`, `git-cli open <args>`, `git-cli -V`.
+  - Manual: `git-cli --help`, `git-cli utils <sub>`, `git-cli reset <args>`, `git-cli commit <args>`,
+    `git-cli branch <args>`, `git-cli ci <args>`, `git-cli open <args>`, `git-cli -V`.
 - Verify: every Group and every subcommand still works; help is
   clap-generated; unknown subcommands exit `64`.
 
