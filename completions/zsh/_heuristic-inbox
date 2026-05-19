@@ -42,6 +42,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--inbox-dir=[Inbox directory used for duplicate detection]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--strict[Escalate ENTRY.md/RECORD.md body redaction findings to ok=false]' \
 '-h[Print help]' \
 '--help[Print help]' \
 ':entry -- Case folder or ENTRY.md/RECORD.md path:_files' \
@@ -57,7 +58,7 @@ _arguments "${_arguments_options[@]}" : \
 '--status=[Lifecycle status for the new entry]:STATUS:(open promoted wontfix)' \
 '--severity=[Severity for the new entry]:SEVERITY:(low medium high)' \
 '--next-action=[Optional Next Action override]:NEXT_ACTION:_default' \
-'--log-dir=[Optional execution log directory]:DIR:_files -/' \
+'--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -65,10 +66,10 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (set-status)
 _arguments "${_arguments_options[@]}" : \
-'--status=[New lifecycle status\: open|promoted|wontfix. Legacy values triaged|planned cannot be re-set]:STATUS:_default' \
+'--status=[New lifecycle status\: open|promoted|wontfix. Retired values triaged|planned cannot be re-set]:STATUS:_default' \
 '--link=[Optional durable link to append to Next Action]:LINK:_default' \
 '--next-action=[Optional Next Action override]:NEXT_ACTION:_default' \
-'--log-dir=[Optional execution log directory]:DIR:_files -/' \
+'--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -82,7 +83,7 @@ _arguments "${_arguments_options[@]}" : \
 '--date=[Archive date (YYYY-MM-DD). Defaults to today]:DATE:_default' \
 '--link=[Optional durable outcome link]:LINK:_default' \
 '--reason=[Optional archive reason]:REASON:_default' \
-'--log-dir=[Optional execution log directory]:DIR:_files -/' \
+'--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
 '--dry-run[Report destination without moving the case folder]' \
 '-h[Print help]' \
@@ -96,7 +97,7 @@ _arguments "${_arguments_options[@]}" : \
 '--label=[Evidence label (default\: source stem)]:LABEL:_default' \
 '--suffix=[Evidence file suffix (default\: .md)]:SUFFIX:_default' \
 '--max-bytes=[Reject sources larger than this many bytes]:MAX_BYTES:_default' \
-'--log-dir=[Optional execution log directory]:DIR:_files -/' \
+'--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
 '--force[Overwrite existing evidence with same label]' \
 '-h[Print help]' \

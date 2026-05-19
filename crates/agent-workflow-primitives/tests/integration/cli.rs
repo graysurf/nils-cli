@@ -1891,6 +1891,168 @@ Promote after a durable fix and validation are linked.\n\n\
     }
 
     #[test]
+    fn verify_warns_on_body_home_path_without_strict() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("body-home-path"),
+            EntryOpts {
+                raw_record: "/Users/example/project/out/skill-usage.record.json",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        assert_eq!(payload["result"]["ok"], true);
+        assert_eq!(payload["result"]["strict"], false);
+        let body_violations = payload["result"]["body_violations"]
+            .as_array()
+            .expect("body_violations array");
+        assert!(
+            body_violations
+                .iter()
+                .any(|v| { v["kind"].as_str().unwrap_or("") == "body_absolute_home_path" })
+        );
+        let warnings = payload["result"]["warnings"]
+            .as_array()
+            .expect("warnings array");
+        assert!(warnings.iter().any(|w| {
+            w.as_str()
+                .unwrap_or("")
+                .contains("body warning: body contains absolute home path")
+        }));
+    }
+
+    #[test]
+    fn verify_strict_fails_on_body_home_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("body-home-path-strict"),
+            EntryOpts {
+                raw_record: "/Users/example/project/out/skill-usage.record.json",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--strict",
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        assert_eq!(payload["error"]["details"]["strict"], true);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .expect("violations array");
+        assert!(
+            violations
+                .iter()
+                .any(|v| { v["kind"].as_str().unwrap_or("") == "body_absolute_home_path" })
+        );
+        let body_violations = payload["error"]["details"]["body_violations"]
+            .as_array()
+            .expect("body_violations array");
+        assert!(
+            body_violations
+                .iter()
+                .any(|v| { v["kind"].as_str().unwrap_or("") == "body_absolute_home_path" })
+        );
+    }
+
+    #[test]
+    fn verify_strict_fails_on_body_token_pattern() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("body-token-strict"),
+            EntryOpts {
+                evidence_extra: "- Auth: Bearer abcdefghijklmnopqrstuvwxyz1234567890\n",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--strict",
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .expect("violations array");
+        assert!(
+            violations
+                .iter()
+                .any(|v| { v["kind"].as_str().unwrap_or("") == "body_token_pattern" })
+        );
+    }
+
+    #[test]
+    fn verify_strict_fails_on_body_raw_skill_usage_schema() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("body-raw-schema-strict"),
+            EntryOpts {
+                evidence_extra: "- Inline raw JSON: `{\"schema\":\"skill-usage.record.v1\"}`\n",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--strict",
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .expect("violations array");
+        assert!(
+            violations
+                .iter()
+                .any(|v| { v["kind"].as_str().unwrap_or("") == "body_raw_skill_usage" })
+        );
+    }
+
+    #[test]
     fn ingest_evidence_rejects_raw_skill_usage_record() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let inbox = inbox_root(tmp.path());

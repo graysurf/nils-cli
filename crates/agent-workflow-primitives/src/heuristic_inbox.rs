@@ -376,17 +376,21 @@ struct ParsedEntry {
 
 fn parse_entry(path: &Path) -> Result<ParsedEntry, CliError> {
     let text = read_text(path)?;
-    let sections = extract_sections(&text);
+    Ok(parse_entry_from_text(path, &text))
+}
+
+fn parse_entry_from_text(path: &Path, text: &str) -> ParsedEntry {
+    let sections = extract_sections(text);
     let fields = extract_status_fields(sections.get("Status").map(String::as_str).unwrap_or(""));
     let raw_records =
         extract_raw_records(sections.get("Evidence").map(String::as_str).unwrap_or(""));
-    Ok(ParsedEntry {
+    ParsedEntry {
         path: path.to_path_buf(),
-        title: extract_title(&text),
+        title: extract_title(text),
         sections,
         fields,
         raw_records,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +593,50 @@ fn evidence_violations(name: &str, text: &str, max_bytes: u64) -> Vec<Violation>
     violations
 }
 
+fn raw_skill_usage_json_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#""schema"\s*:\s*"skill-usage\.record\.v1""#)
+            .expect("raw skill usage json regex")
+    })
+}
+
+fn body_violations(text: &str, max_bytes: u64) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let byte_size = text.len() as u64;
+    if byte_size > max_bytes {
+        violations.push(Violation::new(
+            "body_too_large",
+            format!("body is {byte_size} bytes; limit is {max_bytes}"),
+        ));
+    }
+    for pattern in token_regexes() {
+        if pattern.is_match(text) {
+            violations.push(Violation::new(
+                "body_token_pattern",
+                format!(
+                    "body matches redacted-secret pattern '{}'",
+                    pattern.as_str()
+                ),
+            ));
+            break;
+        }
+    }
+    if home_path_regex().is_match(text) {
+        violations.push(Violation::new(
+            "body_absolute_home_path",
+            "body contains absolute home path; rewrite to <workspace>",
+        ));
+    }
+    if raw_skill_usage_json_regex().is_match(text) {
+        violations.push(Violation::new(
+            "body_raw_skill_usage",
+            "body contains raw skill-usage record JSON shape; extract curated fields instead",
+        ));
+    }
+    violations
+}
+
 fn is_raw_skill_usage_record(src: &Path, sniff: bool) -> bool {
     if src.file_name().and_then(|s| s.to_str()) == Some(RAW_RECORD_FILENAME) {
         return true;
@@ -718,6 +766,7 @@ struct EvidenceFile {
 #[derive(Debug, Serialize)]
 struct VerifyResult {
     ok: bool,
+    strict: bool,
     path: String,
     folder: String,
     kind: &'static str,
@@ -727,6 +776,7 @@ struct VerifyResult {
     duplicates: Vec<DuplicateRef>,
     evidence: Vec<EvidenceFile>,
     violations: Vec<Violation>,
+    body_violations: Vec<Violation>,
     warnings: Vec<String>,
 }
 
@@ -803,8 +853,11 @@ fn verify_case(
     case: &Case,
     inbox_dir: Option<&Path>,
     max_bytes: u64,
+    strict: bool,
 ) -> Result<VerifyResult, CliError> {
-    let parsed = parse_entry(&case.doc_path)?;
+    let body_text = read_text(&case.doc_path)?;
+    let parsed = parse_entry_from_text(&case.doc_path, &body_text);
+    let body_findings = body_violations(&body_text, max_bytes);
     let mut violations: Vec<Violation> = Vec::new();
 
     if parsed.title.is_empty() {
@@ -947,8 +1000,18 @@ fn verify_case(
         }
     }
 
+    if strict {
+        violations.extend(body_findings.clone());
+    }
+    let mut warnings: Vec<String> = Vec::new();
+    if !strict {
+        for finding in &body_findings {
+            warnings.push(format!("body warning: {}", finding.message));
+        }
+    }
     Ok(VerifyResult {
         ok: violations.is_empty(),
+        strict,
         path: display_path(&case.doc_path),
         folder: display_path(&case.folder),
         kind: case.kind.as_str(),
@@ -958,7 +1021,8 @@ fn verify_case(
         duplicates,
         evidence: evidence_files,
         violations,
-        warnings: Vec::new(),
+        body_violations: body_findings,
+        warnings,
     })
 }
 
@@ -1517,7 +1581,12 @@ fn run_archive(args: &ArchiveArgs) -> Result<ArchiveResult, CliError> {
     } else {
         args.reason.clone()
     };
-    let verification = verify_case(&case, Some(&args.inbox_dir), DEFAULT_EVIDENCE_MAX_BYTES)?;
+    let verification = verify_case(
+        &case,
+        Some(&args.inbox_dir),
+        DEFAULT_EVIDENCE_MAX_BYTES,
+        false,
+    )?;
     let parsed = parse_entry(&case.doc_path)?;
     let sections = parsed.sections.clone();
     let fields = parsed.fields.clone();
@@ -2031,7 +2100,7 @@ fn dispatch_verify(args: VerifyArgs) -> i32 {
         Err(err) => return render_error(VERIFY_SCHEMA_VERSION, VERIFY_COMMAND, format, err),
     };
     let inbox_dir = args.inbox_dir.as_deref();
-    match verify_case(&case, inbox_dir, DEFAULT_EVIDENCE_MAX_BYTES) {
+    match verify_case(&case, inbox_dir, DEFAULT_EVIDENCE_MAX_BYTES, args.strict) {
         Ok(result) if result.ok => render_success(
             VERIFY_SCHEMA_VERSION,
             VERIFY_COMMAND,
@@ -2245,6 +2314,10 @@ struct VerifyArgs {
     /// Inbox directory used for duplicate detection.
     #[arg(long = "inbox-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     inbox_dir: Option<PathBuf>,
+
+    /// Escalate ENTRY.md/RECORD.md body redaction findings to ok=false.
+    #[arg(long)]
+    strict: bool,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
