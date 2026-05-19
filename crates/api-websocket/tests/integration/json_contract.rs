@@ -95,11 +95,10 @@ fn call_json_success_contains_required_envelope_fields() {
     let value: serde_json::Value = serde_json::from_str(&out.stdout_text()).expect("json output");
 
     assert_eq!(value["schema_version"], "cli.api-websocket.call.v1");
-    assert_eq!(value["command"], "api-websocket call");
     assert_eq!(value["ok"], true);
-    assert!(value.get("result").is_some());
-    assert!(value["result"]["transcript"].is_array());
-    assert_eq!(value["result"]["last_received"], "{\"ok\":true}");
+    assert!(value.get("data").is_some());
+    assert!(value["data"]["transcript"].is_array());
+    assert_eq!(value["data"]["last_received"], "{\"ok\":true}");
 
     handle.join().expect("join websocket server");
 }
@@ -113,7 +112,6 @@ fn call_json_failure_contains_stable_error_envelope() {
     let value: serde_json::Value = serde_json::from_str(&out.stdout_text()).expect("json output");
 
     assert_eq!(value["schema_version"], "cli.api-websocket.call.v1");
-    assert_eq!(value["command"], "api-websocket call");
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "request_not_found");
     assert!(
@@ -153,12 +151,11 @@ fn history_json_success_uses_results_contract() {
     let value: serde_json::Value = serde_json::from_str(&out.stdout_text()).expect("json output");
 
     assert_eq!(value["schema_version"], "cli.api-websocket.history.v1");
-    assert_eq!(value["command"], "api-websocket history");
     assert_eq!(value["ok"], true);
-    assert!(value.get("result").is_some());
-    assert_eq!(value["result"]["count"], 1);
+    assert!(value.get("data").is_some());
+    assert_eq!(value["data"]["count"], 1);
     assert_eq!(
-        value["result"]["records"].as_array().map(|v| v.len()),
+        value["data"]["records"].as_array().map(|v| v.len()),
         Some(1)
     );
 }

@@ -387,7 +387,6 @@ fn call_json_expectation_failure_returns_stable_error_code() {
         serde_json::from_str(&out.stdout_text()).expect("json failure envelope");
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "expectation_failed");
-    assert_eq!(value["command"], "api-websocket call");
 
     handle.join().expect("join websocket server");
 }
@@ -683,10 +682,9 @@ fn call_json_success_returns_schema_payload() {
     let value: serde_json::Value =
         serde_json::from_str(&out.stdout_text()).expect("json success envelope");
     assert_eq!(value["schema_version"], "cli.api-websocket.call.v1");
-    assert_eq!(value["command"], "api-websocket call");
     assert_eq!(value["ok"], true);
-    assert_eq!(value["result"]["target"], url);
-    assert_eq!(value["result"]["last_received"], "{\"ok\":true}");
+    assert_eq!(value["data"]["target"], url);
+    assert_eq!(value["data"]["last_received"], "{\"ok\":true}");
 
     handle.join().expect("join websocket server");
 }

@@ -1835,6 +1835,7 @@ version = "0.10.2"
 dependencies = [
  "anyhow",
  "base64",
+ "clap",
  "jaq-core",
  "jaq-json",
  "jaq-std",

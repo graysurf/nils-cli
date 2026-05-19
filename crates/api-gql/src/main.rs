@@ -5,8 +5,10 @@ mod completion;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+use std::ffi::OsString;
+
+use api_testing_core::cli_contract::handle_parse_error;
 use clap::Parser;
-use clap::error::ErrorKind;
 
 use crate::cli::{Cli, Command};
 use crate::commands::{cmd_call, cmd_history, cmd_report, cmd_report_from_cmd, cmd_schema};
@@ -67,20 +69,10 @@ fn run() -> i32 {
     }
 
     let argv = argv_with_default_command(&raw_args);
-    let cli = match Cli::try_parse_from(argv) {
+    let argv_os: Vec<OsString> = argv.iter().map(OsString::from).collect();
+    let cli = match Cli::try_parse_from(argv_os.iter()) {
         Ok(v) => v,
-        Err(err) => {
-            let code = err.exit_code();
-            if matches!(
-                err.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-            ) {
-                let _ = err.print();
-                return 0;
-            }
-            let _ = err.print();
-            return code;
-        }
+        Err(err) => return handle_parse_error("api-gql", argv_os, err),
     };
 
     let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
