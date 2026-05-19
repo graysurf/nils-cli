@@ -52,6 +52,25 @@ model-cross-check init --out /tmp/cross-check --prompt "review patch" --primary-
 skill-usage init --out /tmp/skill --skill tools/devex/review-evidence --intent "record review" --user-request-summary "review this PR"
 ```
 
+## `heuristic-inbox verify` redaction guardrail
+
+`verify` scans both the case body (`ENTRY.md` / `RECORD.md`) and any
+`evidence/` files using the same four redaction rules:
+
+1. token-like patterns (Bearer / `sk-` / `api_key=` / `-----BEGIN ...`)
+2. body / file byte size against the `--max-bytes` (default 64 KiB) limit
+3. raw `skill-usage.record.v1` JSON shape (matches `"schema":"skill-usage.record.v1"`)
+4. absolute `$HOME` paths (`/Users/...` or `/home/...`)
+
+Findings on the body are surfaced under the `body_violations` array and a
+`body warning:` line in `warnings`. By default they do **not** flip `ok` to
+`false` so migrated cases that preserve absolute audit paths keep passing
+`verify`. Use `--strict` to escalate body findings to `ok=false`; downstream
+tooling can opt in once collaborators have rotated their cases.
+
+`evidence/` files keep the existing strict behaviour: any violation fails
+`verify` regardless of `--strict`.
+
 ## `skill-usage` flow
 
 `skill-usage` is the broadest recorder in this crate. It links the rest of the evidence records back to one skill invocation.
