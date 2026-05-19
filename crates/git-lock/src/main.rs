@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use nils_common::cli_contract::exit;
 
 mod completion;
@@ -22,7 +23,6 @@ mod unlock;
     version,
     about = "Save and restore named Git commit locks.",
     long_about = "Save, list, copy, diff, tag, and restore named Git commit locks using a repository-local cache.",
-    disable_help_flag = true,
     disable_help_subcommand = true,
     after_help = "EXAMPLES:\n  git-lock lock release-point\n  git-lock list\n  git-lock diff before after\n  git-lock completion zsh\n\nENVIRONMENT:\n  ZSH_CACHE_DIR  Base cache directory for lock storage.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error"
 )]
@@ -81,36 +81,30 @@ fn main() {
 
 fn run() -> i32 {
     let args: Vec<String> = std::env::args().collect();
-
-    if args.len() > 1 && is_help(&args[1]) {
-        messages::print_help();
-        return exit::SUCCESS;
-    }
-
-    if args.len() > 1 && is_version(&args[1]) {
-        println!("git-lock {}", env!("CARGO_PKG_VERSION"));
-        return exit::SUCCESS;
-    }
-
-    if args.len() > 2
-        && is_known_command(&args[1])
-        && is_help(&args[2])
-        && let Some(text) = messages::subcommand_help(&args[1])
-    {
-        println!("{text}");
-        return exit::SUCCESS;
-    }
-
-    if args.len() > 1 && args[1] == "completion" {
-        let cli = Cli::parse_from(&args);
-        let command = cli.command.unwrap_or(Command::Help);
-        return match command {
-            Command::Completion { shell } => completion::run(shell),
-            _ => {
-                messages::print_help();
-                exit::USAGE
+    let parsed = match Cli::try_parse_from(&args) {
+        Ok(cli) => Some(cli),
+        Err(err) => {
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                return print_parse_error(err);
             }
-        };
+            if args.get(1).is_some_and(|arg| arg == "completion") {
+                return print_parse_error(err);
+            }
+            None
+        }
+    };
+
+    if let Some(Command::Completion { shell }) =
+        parsed.as_ref().and_then(|cli| cli.command.as_ref())
+    {
+        return completion::run(*shell);
+    }
+
+    if let Some(Command::Help) = parsed.as_ref().and_then(|cli| cli.command.as_ref()) {
+        return print_root_help();
     }
 
     if !nils_common::git::is_git_repo().unwrap_or(false) {
@@ -119,8 +113,7 @@ fn run() -> i32 {
     }
 
     if args.len() <= 1 {
-        messages::print_help();
-        return exit::SUCCESS;
+        return print_root_help();
     }
 
     if !is_known_command(&args[1]) {
@@ -129,7 +122,7 @@ fn run() -> i32 {
         return exit::USAGE;
     }
 
-    let cli = Cli::parse_from(&args);
+    let cli = parsed.unwrap_or_else(|| Cli::parse_from(&args));
 
     let result = match cli.command.unwrap_or(Command::Help) {
         Command::Lock { args } => lock::run(&args),
@@ -140,10 +133,7 @@ fn run() -> i32 {
         Command::Diff { args } => diff::run(&args),
         Command::Tag { args } => tag::run(&args),
         Command::Completion { shell } => Ok(completion::run(shell)),
-        Command::Help => {
-            messages::print_help();
-            Ok(exit::SUCCESS)
-        }
+        Command::Help => Ok(print_root_help()),
     };
 
     match result {
@@ -155,12 +145,28 @@ fn run() -> i32 {
     }
 }
 
-fn is_help(arg: &str) -> bool {
-    matches!(arg, "help" | "--help" | "-h")
+fn print_parse_error(err: clap::Error) -> i32 {
+    let kind = err.kind();
+    if let Err(print_err) = err.print() {
+        eprintln!("{print_err}");
+        return exit::RUNTIME;
+    }
+
+    if matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        exit::SUCCESS
+    } else {
+        exit::USAGE
+    }
 }
 
-fn is_version(arg: &str) -> bool {
-    matches!(arg, "--version" | "-V")
+fn print_root_help() -> i32 {
+    let mut command = Cli::command();
+    if let Err(err) = command.print_help() {
+        eprintln!("{err}");
+        return exit::RUNTIME;
+    }
+    println!();
+    exit::SUCCESS
 }
 
 fn is_known_command(arg: &str) -> bool {
@@ -172,22 +178,7 @@ fn is_known_command(arg: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_help, is_known_command, is_version};
-
-    #[test]
-    fn is_help_matches_expected_flags() {
-        assert!(is_help("help"));
-        assert!(is_help("--help"));
-        assert!(is_help("-h"));
-        assert!(!is_help("lock"));
-    }
-
-    #[test]
-    fn is_version_matches_expected_flags() {
-        assert!(is_version("--version"));
-        assert!(is_version("-V"));
-        assert!(!is_version("lock"));
-    }
+    use super::is_known_command;
 
     #[test]
     fn is_known_command_accepts_known() {

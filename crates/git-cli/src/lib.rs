@@ -1,5 +1,6 @@
 pub mod branch;
 pub mod ci;
+pub mod cli;
 pub mod clipboard;
 pub mod commit;
 pub mod commit_json;
@@ -8,5 +9,4 @@ pub mod completion;
 pub mod open;
 pub mod prompt;
 pub mod reset;
-pub mod usage;
 pub mod utils;

@@ -100,7 +100,7 @@ fn subcommand_help_uses_subcommand_scope() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Usage: all [OPTIONS]"),
+        stdout.contains("Usage: git-scope all [OPTIONS]"),
         "expected subcommand usage in help output: {stdout}"
     );
     assert!(
