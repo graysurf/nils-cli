@@ -3,27 +3,20 @@ use pretty_assertions::assert_eq;
 
 use common::GitCliHarness;
 
-fn top_level_usage() -> &'static str {
-    r#"Usage:
-  git-cli <group> <command> [args]
+fn assert_contains(text: &str, needle: &str) {
+    assert!(
+        text.contains(needle),
+        "expected output to contain {needle:?}\n\n{text}"
+    );
+}
 
-Groups:
-  utils    zip | copy-staged | root | commit-hash
-  reset    soft | mixed | hard | undo | back-head | back-checkout | remote
-  commit   context | context-json | to-stash
-  branch   cleanup
-  ci       pick
-  open     repo | branch | default-branch | commit | compare | pr | pulls | issues | actions | releases | tags | commits | file | blame
-  completion  bash | zsh
-
-Help:
-  git-cli help
-  git-cli <group> help
-
-Examples:
-  git-cli utils zip
-  git-cli reset hard 3
-"#
+fn assert_top_level_help(stdout: &str) {
+    assert_contains(stdout, "Git helper CLI");
+    assert_contains(stdout, "Usage: git-cli <group> <command> [args]");
+    assert_contains(stdout, "Commands:");
+    assert_contains(stdout, "utils       Utility helpers");
+    assert_contains(stdout, "completion  Export shell completion script");
+    assert_contains(stdout, "-V, --version  Print version");
 }
 
 #[test]
@@ -35,7 +28,7 @@ fn no_args_prints_top_level_usage() {
 
     assert_eq!(output.code, 0);
     assert_eq!(output.stderr_text(), "");
-    assert_eq!(output.stdout_text(), top_level_usage());
+    assert_top_level_help(&output.stdout_text());
 }
 
 #[test]
@@ -47,7 +40,7 @@ fn help_prints_top_level_usage() {
 
     assert_eq!(output.code, 0);
     assert_eq!(output.stderr_text(), "");
-    assert_eq!(output.stdout_text(), top_level_usage());
+    assert_top_level_help(&output.stdout_text());
 }
 
 #[test]
@@ -57,9 +50,11 @@ fn unknown_group_prints_error_and_usage() {
 
     let output = harness.run(dir.path(), &["nope"]);
 
-    assert_eq!(output.code, 2);
-    assert_eq!(output.stderr_text(), "Unknown group: nope\n");
-    assert_eq!(output.stdout_text(), top_level_usage());
+    assert_eq!(output.code, 64);
+    assert_eq!(output.stdout_text(), "");
+    let stderr = output.stderr_text();
+    assert_contains(&stderr, "error: unrecognized subcommand 'nope'");
+    assert_contains(&stderr, "Usage: git-cli <group> <command> [args]");
 }
 
 #[test]
@@ -71,10 +66,11 @@ fn group_usage_prints_help_for_group() {
 
     assert_eq!(output.code, 0);
     assert_eq!(output.stderr_text(), "");
-    assert_eq!(
-        output.stdout_text(),
-        "Usage: git-cli utils <command> [args]\n  zip | copy-staged | root | commit-hash\n"
-    );
+    let stdout = output.stdout_text();
+    assert_contains(&stdout, "Utility helpers");
+    assert_contains(&stdout, "Usage: utils [COMMAND]");
+    assert_contains(&stdout, "zip          Create zip archive from HEAD");
+    assert_contains(&stdout, "copy-staged  Copy staged diff to clipboard");
 }
 
 #[test]
@@ -86,10 +82,10 @@ fn group_help_token_prints_group_usage() {
 
     assert_eq!(output.code, 0);
     assert_eq!(output.stderr_text(), "");
-    assert_eq!(
-        output.stdout_text(),
-        "Usage: git-cli ci <command> [args]\n  pick\n"
-    );
+    let stdout = output.stdout_text();
+    assert_contains(&stdout, "CI helpers");
+    assert_contains(&stdout, "Usage: git-cli ci [COMMAND]");
+    assert_contains(&stdout, "pick  Cherry-pick into CI branch");
 }
 
 #[test]
@@ -101,10 +97,11 @@ fn open_group_usage_prints_help_for_group() {
 
     assert_eq!(output.code, 0);
     assert_eq!(output.stderr_text(), "");
-    assert_eq!(
-        output.stdout_text(),
-        "Usage: git-cli open <command> [args]\n  repo | branch | default-branch | commit | compare | pr | pulls | issues | actions | releases | tags | commits | file | blame\n"
-    );
+    let stdout = output.stdout_text();
+    assert_contains(&stdout, "Open remote pages");
+    assert_contains(&stdout, "Usage: open [COMMAND]");
+    assert_contains(&stdout, "default-branch  Open default branch tree page");
+    assert_contains(&stdout, "pulls           Open pull or merge request list");
 }
 
 #[test]
@@ -114,12 +111,11 @@ fn unknown_command_prints_error_and_group_usage() {
 
     let output = harness.run(dir.path(), &["utils", "nope"]);
 
-    assert_eq!(output.code, 2);
-    assert_eq!(output.stderr_text(), "Unknown utils command: nope\n");
-    assert_eq!(
-        output.stdout_text(),
-        "Usage: git-cli utils <command> [args]\n  zip | copy-staged | root | commit-hash\n"
-    );
+    assert_eq!(output.code, 64);
+    assert_eq!(output.stdout_text(), "");
+    let stderr = output.stderr_text();
+    assert_contains(&stderr, "error: unrecognized subcommand 'nope'");
+    assert_contains(&stderr, "Usage: git-cli utils [COMMAND]");
 }
 
 #[test]
@@ -129,12 +125,11 @@ fn commit_unknown_command_prints_error_and_usage() {
 
     let output = harness.run(dir.path(), &["commit", "nope"]);
 
-    assert_eq!(output.code, 2);
-    assert_eq!(output.stderr_text(), "Unknown commit command: nope\n");
-    assert_eq!(
-        output.stdout_text(),
-        "Usage: git-cli commit <command> [args]\n  context | context-json | to-stash\n"
-    );
+    assert_eq!(output.code, 64);
+    assert_eq!(output.stdout_text(), "");
+    let stderr = output.stderr_text();
+    assert_contains(&stderr, "error: unrecognized subcommand 'nope'");
+    assert_contains(&stderr, "Usage: git-cli commit [COMMAND]");
 }
 
 #[test]
@@ -144,9 +139,11 @@ fn unknown_group_help_prints_error_and_usage() {
 
     let output = harness.run(dir.path(), &["nope", "help"]);
 
-    assert_eq!(output.code, 2);
-    assert_eq!(output.stderr_text(), "Unknown group: nope\n");
-    assert_eq!(output.stdout_text(), top_level_usage());
+    assert_eq!(output.code, 64);
+    assert_eq!(output.stdout_text(), "");
+    let stderr = output.stderr_text();
+    assert_contains(&stderr, "error: unrecognized subcommand 'nope'");
+    assert_contains(&stderr, "Usage: git-cli <group> <command> [args]");
 }
 
 #[test]

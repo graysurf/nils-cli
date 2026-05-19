@@ -20,7 +20,6 @@ mod tree;
     version,
     about = "Inspect Git-tracked file scopes and selected content.",
     long_about = "Inspect tracked, staged, unstaged, untracked, and commit-scoped paths with optional file-content printing.",
-    disable_help_flag = true,
     disable_help_subcommand = true,
     after_help = "EXAMPLES:\n  git-scope tracked crates/agent-docs\n  git-scope staged -p\n  git-scope commit HEAD~1\n  git-scope completion zsh\n\nENVIRONMENT:\n  GIT_SCOPE_PROGRESS  Opt in or out of progress output.\n  NO_COLOR            Disable ANSI colors.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error"
 )]
@@ -28,10 +27,6 @@ struct Cli {
     /// Disable ANSI colors (also via NO_COLOR)
     #[arg(long, global = true)]
     no_color: bool,
-
-    /// Display help message for git-scope
-    #[arg(short = 'h', long = "help", global = true)]
-    help: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -99,76 +94,6 @@ enum CompletionShell {
     Zsh,
 }
 
-fn print_help() {
-    println!("Inspect Git-tracked file scopes and selected content.");
-    println!();
-    println!("Usage: git-scope <command> [args]");
-    println!();
-    println!("Commands:");
-    println!(
-        "  {:<16}  Show files tracked by Git (prefix filter optional)",
-        "tracked"
-    );
-    println!("  {:<16}  Show files staged for commit", "staged");
-    println!("  {:<16}  Show modified files not yet staged", "unstaged");
-    println!("  {:<16}  Show all changes (staged and unstaged)", "all");
-    println!("  {:<16}  Show untracked files", "untracked");
-    println!(
-        "  {:<16}  Show commit details (use -p to print content)",
-        "commit <id>"
-    );
-    println!(
-        "  {:<16}  Export shell completion script",
-        "completion <shell>"
-    );
-    println!();
-    println!("Options:");
-    println!(
-        "  {:<16}  Disable ANSI colors (also via NO_COLOR)",
-        "--no-color"
-    );
-    println!("  {:<16}  Print help", "-h, --help");
-    println!("  {:<16}  Show version", "-V, --version");
-    println!();
-    println!("EXAMPLES:");
-    println!("  git-scope tracked crates/agent-docs");
-    println!("  git-scope staged -p");
-    println!("  git-scope commit HEAD~1");
-    println!("  git-scope completion zsh");
-    println!();
-    println!("ENVIRONMENT:");
-    println!("  GIT_SCOPE_PROGRESS  Opt in or out of progress output.");
-    println!("  NO_COLOR            Disable ANSI colors.");
-    println!();
-    println!("EXIT CODES:");
-    println!("  0   success");
-    println!("  1   runtime error");
-    println!("  64  command-line usage error");
-}
-
-fn print_subcommand_help(command: &Command) -> bool {
-    let subcommand = match command {
-        Command::Tracked { .. } => "tracked",
-        Command::Staged { .. } => "staged",
-        Command::Unstaged { .. } => "unstaged",
-        Command::All { .. } => "all",
-        Command::Untracked { .. } => "untracked",
-        Command::Commit { .. } => "commit",
-        Command::Completion { .. } => "completion",
-        Command::Help => return false,
-    };
-
-    let mut root = Cli::command();
-    let Some(subcommand) = root.find_subcommand_mut(subcommand) else {
-        return false;
-    };
-    if subcommand.print_help().is_err() {
-        return false;
-    }
-    println!();
-    true
-}
-
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err:#}");
@@ -179,20 +104,10 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    if cli.help {
-        if let Some(command) = cli.command.as_ref()
-            && print_subcommand_help(command)
-        {
-            return Ok(());
-        }
-        print_help();
-        return Ok(());
-    }
-
     let command = cli.command.unwrap_or(Command::Help);
     match command {
         Command::Help => {
-            print_help();
+            print_root_help()?;
             return Ok(());
         }
         Command::Completion { shell } => {
@@ -285,6 +200,12 @@ fn run() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn print_root_help() -> Result<()> {
+    Cli::command().print_help()?;
+    println!();
     Ok(())
 }
 
