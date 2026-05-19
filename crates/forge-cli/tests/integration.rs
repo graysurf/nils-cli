@@ -10,6 +10,7 @@ mod integration {
     mod pr_create;
     mod pr_wait_checks;
     mod repo_view;
+    mod required_check_gate;
     mod support;
     mod validations;
 }
