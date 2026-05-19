@@ -15,7 +15,8 @@
 /// preserves the trailing-newline shape of the input.
 pub(crate) fn fix_text(text: &str) -> String {
     let stage_a = fix_label_values(text);
-    fix_dependencies(&stage_a)
+    let stage_b = fix_sprint_metadata_pairs(&stage_a);
+    fix_dependencies(&stage_b)
 }
 
 /// Strip mechanical wrappers (backticks, single-link `[label](href)`) from the
@@ -44,6 +45,57 @@ fn fix_label_values(text: &str) -> String {
         out_lines.push(new_line);
     }
     join_lines(&out_lines, trailing_newline)
+}
+
+/// Split formatter-collapsed sprint metadata back into the canonical two-line
+/// shape. This is intentionally limited to the two canonical sprint metadata
+/// labels and only when the line starts with `PR grouping intent`.
+fn fix_sprint_metadata_pairs(text: &str) -> String {
+    let trailing_newline = text.ends_with('\n');
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if let Some(replacement) = split_same_line_sprint_metadata(line) {
+            out_lines.extend(replacement);
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    join_lines(&out_lines, trailing_newline)
+}
+
+fn split_same_line_sprint_metadata(line: &str) -> Option<Vec<String>> {
+    const INTENT_LABEL: &str = "**PR grouping intent**:";
+    const PROFILE_LABEL: &str = "**Execution Profile**:";
+
+    let indent = leading_spaces(line);
+    let after_indent = &line[indent..];
+    let (marker, after_marker) = split_one_marker(after_indent);
+    let after_intent = after_marker.strip_prefix(INTENT_LABEL)?;
+    let profile_idx = after_intent.find(PROFILE_LABEL)?;
+    let intent_value = clean_sprint_metadata_separator(&after_intent[..profile_idx]);
+    let profile_value = after_intent[profile_idx + PROFILE_LABEL.len()..].trim();
+    if intent_value.is_empty() || profile_value.is_empty() {
+        return None;
+    }
+
+    let prefix = format!("{}{}", " ".repeat(indent), marker);
+    Some(vec![
+        format!("{prefix}{INTENT_LABEL} {intent_value}"),
+        format!("{prefix}{PROFILE_LABEL} {profile_value}"),
+    ])
+}
+
+fn split_one_marker(text: &str) -> (&str, &str) {
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = text.strip_prefix(marker) {
+            return (marker, rest);
+        }
+    }
+    ("", text)
+}
+
+fn clean_sprint_metadata_separator(value: &str) -> &str {
+    value.trim().trim_end_matches(['-', '|', ';', ',']).trim()
 }
 
 /// Walk Dependencies blocks and rewrite each list item:
@@ -264,8 +316,8 @@ fn strip_one_markdown_link(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        fix_dependencies, fix_dependency_list_item, fix_label_values, fix_text,
-        has_inline_comma_task_list, is_bare_digits_form, normalize_dependency_value,
+        fix_dependencies, fix_dependency_list_item, fix_label_values, fix_sprint_metadata_pairs,
+        fix_text, has_inline_comma_task_list, is_bare_digits_form, normalize_dependency_value,
         strip_value_wrappers,
     };
     use pretty_assertions::assert_eq;
@@ -349,6 +401,26 @@ mod tests {
     }
 
     #[test]
+    fn fix_text_splits_same_line_sprint_metadata() {
+        let before = "- **PR grouping intent**: `group` - **Execution Profile**: `parallel-x2`\n";
+        let after = fix_text(before);
+        assert_eq!(
+            after,
+            "- **PR grouping intent**: `group`\n- **Execution Profile**: `parallel-x2`\n"
+        );
+    }
+
+    #[test]
+    fn fix_text_splits_unbulleted_same_line_sprint_metadata() {
+        let before = "  **PR grouping intent**: `group` **Execution Profile**: `serial`\n";
+        let after = fix_text(before);
+        assert_eq!(
+            after,
+            "  **PR grouping intent**: `group`\n  **Execution Profile**: `serial`\n"
+        );
+    }
+
+    #[test]
     fn fix_text_preserves_trailing_newline_shape() {
         // No trailing newline.
         let before = "- Primary source: `docs/source/spec.md`";
@@ -417,6 +489,13 @@ mod tests {
     }
 
     #[test]
+    fn fix_sprint_metadata_pairs_leaves_noncanonical_labels_alone() {
+        let before = "- **PR Grouping Intent**: `group` - **Execution Profile**: `serial`\n";
+        let after = fix_sprint_metadata_pairs(before);
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn fix_dependency_list_item_returns_none_for_already_canonical() {
         assert_eq!(fix_dependency_list_item("  - Task 1.1"), None);
         assert_eq!(fix_dependency_list_item("  - Task 1.1 (note)"), None);
@@ -446,6 +525,8 @@ mod tests {
         "**Source document**: `docs/plans/demo/demo-plan.md`\n",
         // Plain plan-only line (no-op expected).
         "- Primary source: plan-only waiver: bounded change\n",
+        // Same-line sprint metadata needs canonicalization.
+        "- **PR grouping intent**: `group` - **Execution Profile**: `parallel-x2`\n",
         // Empty.
         "",
         // Unrelated content.

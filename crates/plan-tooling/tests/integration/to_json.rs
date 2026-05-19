@@ -91,6 +91,23 @@ fn to_json_includes_sprint_metadata_when_present() {
 }
 
 #[test]
+fn to_json_parses_same_line_sprint_metadata_like_canonical_metadata() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let plan_path = dir.path().join("plan.md");
+    write_file(&plan_path, SAME_LINE_METADATA_PLAN);
+
+    let out = run_plan_tooling(dir.path(), &["to-json", "--file", "plan.md"]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(v["sprints"][0]["metadata"]["pr_grouping_intent"], "group");
+    assert_eq!(
+        v["sprints"][0]["metadata"]["execution_profile"],
+        "parallel-x2"
+    );
+    assert_eq!(v["sprints"][0]["metadata"]["parallel_width"], 2);
+}
+
+#[test]
 fn to_json_rejects_near_miss_metadata_field_name() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let plan_path = dir.path().join("plan.md");
@@ -249,6 +266,30 @@ const METADATA_PLAN: &str = r#"# Plan: Metadata Example
 ## Sprint 1: First sprint
 - **PR grouping intent**: `group`
 - **Execution Profile**: `parallel-x2` (parallel width 2)
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Complexity**: 3
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test -p plan-tooling
+"#;
+
+const SAME_LINE_METADATA_PLAN: &str = r#"# Plan: Same-line Metadata Example
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+- **PR grouping intent**: `group` - **Execution Profile**: `parallel-x2` (parallel width 2)
 
 ### Task 1.1: Do thing
 - **Location**:

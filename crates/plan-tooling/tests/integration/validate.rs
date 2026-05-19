@@ -752,6 +752,132 @@ fn validate_fails_when_sprint_metadata_is_partial() {
     );
 }
 
+#[test]
+fn validate_accepts_same_line_sprint_metadata_pair() {
+    let repo = init_repo();
+    write_file(
+        &repo.path().join("same-line-metadata.md"),
+        SAME_LINE_METADATA_PLAN,
+    );
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "same-line-metadata.md"],
+    );
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+}
+
+#[test]
+fn validate_same_line_metadata_still_enforces_coherence() {
+    let repo = init_repo();
+    write_file(
+        &repo.path().join("same-line-metadata-mismatch.md"),
+        SAME_LINE_METADATA_MISMATCH_PLAN,
+    );
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "same-line-metadata-mismatch.md"],
+    );
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("PR grouping intent"));
+    assert!(out.stderr.contains("parallel width 2"));
+}
+
+#[test]
+fn validate_same_line_misspelled_metadata_label_keeps_diagnostic() {
+    let repo = init_repo();
+    write_file(
+        &repo.path().join("same-line-metadata-bad-field.md"),
+        SAME_LINE_METADATA_BAD_FIELD_PLAN,
+    );
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "same-line-metadata-bad-field.md"],
+    );
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("invalid metadata field"));
+    assert!(out.stderr.contains("PR grouping intent"));
+}
+
+#[test]
+fn validate_fix_splits_same_line_sprint_metadata() {
+    let repo = init_repo();
+    let plan_path = repo.path().join("same-line-metadata.md");
+    write_file(&plan_path, SAME_LINE_METADATA_PLAN);
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "same-line-metadata.md", "--fix"],
+    );
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    let once = std::fs::read_to_string(&plan_path).expect("read fixed plan");
+    assert!(once.contains("- **PR grouping intent**: `group`\n"));
+    assert!(once.contains("- **Execution Profile**: `parallel-x2` (parallel width 2)\n"));
+    assert!(!once.contains("`group` - **Execution Profile**"));
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "same-line-metadata.md", "--fix"],
+    );
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    let twice = std::fs::read_to_string(&plan_path).expect("read fixed plan twice");
+    assert_eq!(once, twice, "--fix should be a fixed point");
+}
+
+#[test]
+fn validate_same_line_metadata_fixture_round_trips_through_fix() {
+    let repo = init_repo();
+    let fixture = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/plan_bundle/same-line-metadata-plan.md"
+    ))
+    .expect("same-line metadata fixture");
+    let plan_path = repo.path().join("same-line-metadata-fixture.md");
+    write_file(&plan_path, &fixture);
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &["validate", "--file", "same-line-metadata-fixture.md"],
+    );
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+
+    let out = run_plan_tooling(
+        repo.path(),
+        &[
+            "validate",
+            "--file",
+            "same-line-metadata-fixture.md",
+            "--fix",
+        ],
+    );
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    let fixed = std::fs::read_to_string(&plan_path).expect("read fixed fixture");
+    assert!(fixed.contains("- **PR grouping intent**: `group`\n"));
+    assert!(fixed.contains("- **Execution Profile**: `parallel-x2` (parallel width 2)\n"));
+}
+
 fn write_valid_bundle_source_and_plan(repo: &std::path::Path, slug: &str) {
     write_file(
         &repo.join(format!("docs/plans/{slug}/{slug}-discussion-source.md")),
@@ -1124,6 +1250,75 @@ const METADATA_PARTIAL_PLAN: &str = r#"# Plan: Metadata partial
 
 ## Sprint 1: First sprint
 - **PR grouping intent**: `group`
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test -p plan-tooling
+"#;
+
+const SAME_LINE_METADATA_PLAN: &str = r#"# Plan: Same-line metadata
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+- **PR grouping intent**: `group` - **Execution Profile**: `parallel-x2` (parallel width 2)
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test -p plan-tooling
+"#;
+
+const SAME_LINE_METADATA_MISMATCH_PLAN: &str = r#"# Plan: Same-line metadata mismatch
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+- **PR grouping intent**: `per-sprint` - **Execution Profile**: `parallel-x2` (parallel width 2)
+
+### Task 1.1: Do thing
+- **Location**:
+  - `src/a.rs`
+- **Description**: Do A
+- **Dependencies**:
+  - none
+- **Acceptance criteria**:
+  - A works
+- **Validation**:
+  - cargo test -p plan-tooling
+"#;
+
+const SAME_LINE_METADATA_BAD_FIELD_PLAN: &str = r#"# Plan: Same-line metadata bad field
+
+## Read First
+
+- Primary source: plan-only waiver: integration fixture
+- Source type: plan-only waiver
+- Open questions carried into execution: none
+
+## Sprint 1: First sprint
+- **PR Grouping Intent**: `group` - **Execution Profile**: `serial` (parallel width 1)
 
 ### Task 1.1: Do thing
 - **Location**:

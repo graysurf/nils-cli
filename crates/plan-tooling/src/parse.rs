@@ -177,44 +177,49 @@ pub fn parse_plan_with_display(
         }
 
         if current_task.is_none() {
-            if let Some((_, field, rest)) = parse_any_field_line(line)
+            if let Some(fields) = parse_any_field_segments(line)
                 && let Some(sprint) = current_sprint.as_mut()
             {
-                let value = rest.unwrap_or_default();
-                match field.as_str() {
-                    "PR grouping intent" => {
-                        sprint.metadata.pr_grouping_intent = parse_pr_grouping_intent(&value);
-                        if sprint.metadata.pr_grouping_intent.is_none() && !value.trim().is_empty()
-                        {
-                            errors.push(format!(
-                                "{display_path}:{}: invalid PR grouping intent (expected per-sprint|group): {}",
-                                i + 1,
-                                crate::repr::py_repr(value.trim())
-                            ));
+                for (_, field, rest) in fields {
+                    let value = rest.unwrap_or_default();
+                    match field.as_str() {
+                        "PR grouping intent" => {
+                            sprint.metadata.pr_grouping_intent = parse_pr_grouping_intent(&value);
+                            if sprint.metadata.pr_grouping_intent.is_none()
+                                && !value.trim().is_empty()
+                            {
+                                errors.push(format!(
+                                    "{display_path}:{}: invalid PR grouping intent (expected per-sprint|group): {}",
+                                    i + 1,
+                                    crate::repr::py_repr(value.trim())
+                                ));
+                            }
                         }
-                    }
-                    "Execution Profile" => {
-                        sprint.metadata.execution_profile = parse_execution_profile(&value);
-                        if sprint.metadata.execution_profile.is_none() && !value.trim().is_empty() {
-                            errors.push(format!(
-                                "{display_path}:{}: invalid Execution Profile (expected serial|parallel-xN): {}",
-                                i + 1,
-                                crate::repr::py_repr(value.trim())
-                            ));
+                        "Execution Profile" => {
+                            sprint.metadata.execution_profile = parse_execution_profile(&value);
+                            if sprint.metadata.execution_profile.is_none()
+                                && !value.trim().is_empty()
+                            {
+                                errors.push(format!(
+                                    "{display_path}:{}: invalid Execution Profile (expected serial|parallel-xN): {}",
+                                    i + 1,
+                                    crate::repr::py_repr(value.trim())
+                                ));
+                            }
+                            sprint.metadata.parallel_width = parse_parallel_width(
+                                &value,
+                                sprint.metadata.execution_profile.as_deref(),
+                            );
                         }
-                        sprint.metadata.parallel_width = parse_parallel_width(
-                            &value,
-                            sprint.metadata.execution_profile.as_deref(),
-                        );
-                    }
-                    _ => {
-                        if let Some(expected) = canonical_metadata_field_name(&field) {
-                            errors.push(format!(
-                                "{display_path}:{}: invalid metadata field {}; use '{}'",
-                                i + 1,
-                                crate::repr::py_repr(&field),
-                                expected
-                            ));
+                        _ => {
+                            if let Some(expected) = canonical_metadata_field_name(&field) {
+                                errors.push(format!(
+                                    "{display_path}:{}: invalid metadata field {}; use '{}'",
+                                    i + 1,
+                                    crate::repr::py_repr(&field),
+                                    expected
+                                ));
+                            }
                         }
                     }
                 }
@@ -446,6 +451,61 @@ fn parse_any_field_line(line: &str) -> Option<(usize, String, Option<String>)> {
     let (field, rest) = after_star.split_once("**:")?;
     let field = field.to_string();
     Some((base_indent, field, Some(rest.trim().to_string())))
+}
+
+fn parse_any_field_segments(line: &str) -> Option<Vec<(usize, String, Option<String>)>> {
+    let base_indent = line.chars().take_while(|c| *c == ' ').count();
+    let trimmed = line.trim_start_matches(' ');
+    let after_space = if let Some(after_dash) = trimmed.strip_prefix('-') {
+        after_dash.trim_start()
+    } else {
+        trimmed
+    };
+    let mut rest = after_space;
+    let mut fields = Vec::new();
+    loop {
+        let after_star = rest.strip_prefix("**")?;
+        let (field, value_and_tail) = after_star.split_once("**:")?;
+        if field.trim().is_empty() {
+            return None;
+        }
+        let next_field_start = find_next_bold_field_start(value_and_tail);
+        let (value, tail) = match next_field_start {
+            Some(idx) => (&value_and_tail[..idx], &value_and_tail[idx..]),
+            None => (value_and_tail, ""),
+        };
+        fields.push((
+            base_indent,
+            field.trim().to_string(),
+            Some(clean_same_line_field_value(value).to_string()),
+        ));
+        if tail.is_empty() {
+            break;
+        }
+        rest = tail.trim_start();
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields)
+    }
+}
+
+fn find_next_bold_field_start(text: &str) -> Option<usize> {
+    for (idx, _) in text.match_indices("**") {
+        let after_start = &text[idx + 2..];
+        let Some((field, _)) = after_start.split_once("**:") else {
+            continue;
+        };
+        if !field.trim().is_empty() && !field.contains('*') {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn clean_same_line_field_value(value: &str) -> &str {
+    value.trim().trim_end_matches(['-', '|', ';', ',']).trim()
 }
 
 fn parse_read_first(lines: &[String]) -> Option<ReadFirst> {

@@ -756,6 +756,59 @@ fn split_prs_auto_uses_execution_profile_parallel_width_as_target() {
 }
 
 #[test]
+fn split_prs_auto_uses_same_line_sprint_metadata() {
+    let dir = TempDir::new().expect("tempdir");
+    let plan = r#"# Plan: same-line metadata split
+
+## Sprint 1: Parallel lane
+- **PR grouping intent**: `group` - **Execution Profile**: `parallel-x2` (parallel width 2).
+
+### Task 1.1: API slice A
+- **Location**:
+  - crates/plan-issue-cli/src/a.rs
+- **Dependencies**:
+  - none
+- **Complexity**: 2
+
+### Task 1.2: API slice B
+- **Location**:
+  - crates/plan-issue-cli/src/b.rs
+- **Dependencies**:
+  - none
+- **Complexity**: 2
+"#;
+    common::write_file(&dir.path().join("plan.md"), plan);
+
+    let out = common::run_plan_tooling(
+        dir.path(),
+        &[
+            "split-prs",
+            "--file",
+            "plan.md",
+            "--scope",
+            "sprint",
+            "--sprint",
+            "1",
+            "--strategy",
+            "auto",
+            "--format",
+            "json",
+            "--explain",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let value: Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(value["strategy"], "auto");
+    assert_eq!(value["pr_grouping"], "group");
+    assert_eq!(value["explain"][0]["target_parallel_width"], 2);
+    assert_eq!(
+        value["explain"][0]["pr_grouping_intent_source"],
+        "plan-metadata"
+    );
+}
+
+#[test]
 fn split_prs_non_regression_auto_sparse_plan_scaffold() {
     let dir = TempDir::new().expect("tempdir");
     common::write_file(

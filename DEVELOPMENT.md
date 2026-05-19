@@ -33,6 +33,7 @@ Docs-only checks require:
 
 - `git`
 - `npx`
+- `plan-tooling`
 
 Full required checks also require:
 
@@ -71,6 +72,12 @@ If all changed files are documentation-only (`*.md`, `docs/**`, `crates/*/docs/*
 
 ```bash
 bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only
+```
+
+This also validates touched `docs/plans/**` bundles with:
+
+```bash
+bash scripts/ci/plan-bundle-validate.sh --strict
 ```
 
 ### 3.2 CI-like required checks (recommended before push)
@@ -116,6 +123,7 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/docs-placement-audit.sh --strict`
 - `bash scripts/ci/docs-hygiene-audit.sh --strict`
 - `bash scripts/ci/markdownlint-audit.sh --strict`
+- `bash scripts/ci/plan-bundle-validate.sh --strict`
 - `bash scripts/ci/test-stale-audit.sh --strict`
 - `bash scripts/ci/third-party-artifacts-audit.sh --strict`
 - `bash scripts/ci/completion-asset-audit.sh --strict`
