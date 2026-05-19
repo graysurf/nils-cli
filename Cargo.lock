@@ -1756,6 +1756,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "nils-agent-out",
+ "nils-common",
  "nils-test-support",
  "pretty_assertions",
  "regex",

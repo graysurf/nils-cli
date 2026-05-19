@@ -98,52 +98,51 @@ fn repo_retro_reports_git_heuristic_analysis_and_sources() {
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
     let value = json_stdout(&output);
     assert_eq!(value["schema_version"], "cli.repo-retro.report.v1");
-    assert_eq!(value["command"], "repo-retro report");
-    assert_eq!(value["result"]["schema"], "repo-retro.report.v1");
-    assert_eq!(value["result"]["mode"], "team");
-    assert_eq!(value["result"]["repo"]["slug"], "repo");
-    assert_eq!(value["result"]["window"]["mode"], "fixed");
-    assert_eq!(value["result"]["git"]["summary"]["commitCount"], 5);
-    assert_eq!(value["result"]["git"]["commitTypes"]["feat"], 1);
-    assert_eq!(value["result"]["git"]["commitTypes"]["test"], 1);
-    assert_eq!(value["result"]["git"]["commitTypes"]["fix"], 1);
+    assert_eq!(value["data"]["schema"], "repo-retro.report.v1");
+    assert_eq!(value["data"]["mode"], "team");
+    assert_eq!(value["data"]["repo"]["slug"], "repo");
+    assert_eq!(value["data"]["window"]["mode"], "fixed");
+    assert_eq!(value["data"]["git"]["summary"]["commitCount"], 5);
+    assert_eq!(value["data"]["git"]["commitTypes"]["feat"], 1);
+    assert_eq!(value["data"]["git"]["commitTypes"]["test"], 1);
+    assert_eq!(value["data"]["git"]["commitTypes"]["fix"], 1);
     assert_eq!(
-        value["result"]["git"]["testSignals"]["changedTestFileCount"],
+        value["data"]["git"]["testSignals"]["changedTestFileCount"],
         1
     );
     assert_eq!(
-        value["result"]["heuristicSystem"]["activeInbox"]["byStatus"]["triaged"],
+        value["data"]["heuristicSystem"]["activeInbox"]["byStatus"]["triaged"],
         1
     );
     assert_eq!(
-        value["result"]["heuristicSystem"]["activeInbox"]["bySeverity"]["medium"],
+        value["data"]["heuristicSystem"]["activeInbox"]["bySeverity"]["medium"],
         1
     );
     assert_eq!(
-        value["result"]["heuristicSystem"]["errorInboxMovement"]["archived"]["count"],
+        value["data"]["heuristicSystem"]["errorInboxMovement"]["archived"]["count"],
         1
     );
     assert_eq!(
-        value["result"]["heuristicSystem"]["operationRecords"]["changedCount"],
+        value["data"]["heuristicSystem"]["operationRecords"]["changedCount"],
         1
     );
-    assert_eq!(value["result"]["history"]["write"], false);
+    assert_eq!(value["data"]["history"]["write"], false);
     assert!(
-        value["result"]["analysis"]["themes"]
+        value["data"]["analysis"]["themes"]
             .as_array()
             .expect("themes")
             .iter()
             .any(|item| item.as_str().unwrap_or("").contains("feat work"))
     );
     assert!(
-        value["result"]["analysis"]["followUpQuestions"]
+        value["data"]["analysis"]["followUpQuestions"]
             .as_array()
             .expect("follow up")
             .iter()
             .any(|item| item.as_str().unwrap_or("").contains("HEURISTIC_SYSTEM"))
     );
     assert!(
-        value["result"]["sources"]["commands"]
+        value["data"]["sources"]["commands"]
             .as_array()
             .expect("commands")
             .iter()
@@ -204,24 +203,24 @@ fn repo_retro_loads_all_typed_jsonl_inputs_and_warns_on_malformed_lines() {
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
     let value = json_stdout(&output);
     assert_eq!(
-        value["result"]["optionalInputs"]["timeline"]["malformedLines"],
+        value["data"]["optionalInputs"]["timeline"]["malformedLines"],
         1
     );
     assert_eq!(
-        value["result"]["optionalInputs"]["validation"]["validLines"],
+        value["data"]["optionalInputs"]["validation"]["validLines"],
         1
     );
-    assert_eq!(value["result"]["optionalInputs"]["review"]["validLines"], 1);
+    assert_eq!(value["data"]["optionalInputs"]["review"]["validLines"], 1);
     assert_eq!(
-        value["result"]["optionalInputs"]["incidents"]["validLines"],
+        value["data"]["optionalInputs"]["incidents"]["validLines"],
         1
     );
     assert_eq!(
-        value["result"]["optionalInputs"]["decisions"]["validLines"],
+        value["data"]["optionalInputs"]["decisions"]["validLines"],
         1
     );
     assert!(
-        value["result"]["warnings"]
+        value["data"]["warnings"]
             .as_array()
             .expect("warnings")
             .iter()
@@ -255,10 +254,10 @@ fn repo_retro_history_dir_without_write_does_not_create_files() {
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
     let value = json_stdout(&output);
-    assert_eq!(value["result"]["history"]["enabled"], true);
-    assert_eq!(value["result"]["history"]["write"], false);
+    assert_eq!(value["data"]["history"]["enabled"], true);
+    assert_eq!(value["data"]["history"]["write"], false);
     assert!(
-        value["result"]["history"]["intended"]["markdown"]
+        value["data"]["history"]["intended"]["markdown"]
             .as_str()
             .expect("markdown path")
             .ends_with("retros/2026/2026-05-16-repo-repo-retro.md")
@@ -294,17 +293,17 @@ fn repo_retro_history_write_creates_index_raw_and_markdown() {
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
     let value = json_stdout(&output);
     let markdown_path = Path::new(
-        value["result"]["history"]["intended"]["markdown"]
+        value["data"]["history"]["intended"]["markdown"]
             .as_str()
             .expect("markdown"),
     );
     let json_path = Path::new(
-        value["result"]["history"]["intended"]["json"]
+        value["data"]["history"]["intended"]["json"]
             .as_str()
             .expect("json"),
     );
     let index_path = Path::new(
-        value["result"]["history"]["intended"]["index"]
+        value["data"]["history"]["intended"]["index"]
             .as_str()
             .expect("index"),
     );
@@ -384,10 +383,10 @@ fn docs_impact_scans_docs_and_non_docs_changes() {
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
     let value = json_stdout(&output);
     assert_eq!(value["schema_version"], "cli.docs-impact.scan.v1");
-    assert_eq!(value["result"]["docs_changed"], true);
-    assert_eq!(value["result"]["non_docs_changed"], true);
+    assert_eq!(value["data"]["docs_changed"], true);
+    assert_eq!(value["data"]["non_docs_changed"], true);
     assert!(
-        value["result"]["docs_files"]
+        value["data"]["docs_files"]
             .as_array()
             .expect("docs array")
             .iter()
@@ -419,7 +418,7 @@ fn canary_check_records_passing_command() {
     assert_eq!(run_output.code, 0, "stderr={}", run_output.stderr_text());
     let run_json = json_stdout(&run_output);
     assert_eq!(run_json["schema_version"], "cli.canary-check.run.v1");
-    assert_eq!(run_json["result"]["record"]["last_run"]["status"], "pass");
+    assert_eq!(run_json["data"]["record"]["last_run"]["status"], "pass");
 
     let verify = run(
         "canary-check",
@@ -428,7 +427,7 @@ fn canary_check_records_passing_command() {
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
     assert_eq!(
-        json_stdout(&verify)["result"]["last_run"]["stdout_preview"],
+        json_stdout(&verify)["data"]["last_run"]["stdout_preview"],
         "ok"
     );
 }
@@ -493,7 +492,7 @@ fn review_evidence_requires_no_open_medium_or_high_findings() {
         &["verify", "--out", &out, "--format", "json"],
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-    assert_eq!(json_stdout(&verify)["result"]["complete"], true);
+    assert_eq!(json_stdout(&verify)["data"]["complete"], true);
 }
 
 #[test]
@@ -589,11 +588,11 @@ fn skill_usage_records_successful_skill_invocation() {
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
     let value = json_stdout(&verify);
     assert_eq!(value["schema_version"], "cli.skill-usage.verify.v1");
-    assert_eq!(value["result"]["complete"], true);
-    assert_eq!(value["result"]["record"]["schema"], "skill-usage.record.v1");
-    assert_eq!(value["result"]["record"]["outcome"]["status"], "pass");
+    assert_eq!(value["data"]["complete"], true);
+    assert_eq!(value["data"]["record"]["schema"], "skill-usage.record.v1");
+    assert_eq!(value["data"]["record"]["outcome"]["status"], "pass");
     assert_eq!(
-        value["result"]["record"]["linked_records"][0]["type"],
+        value["data"]["record"]["linked_records"][0]["type"],
         "review-evidence"
     );
 }
@@ -777,7 +776,7 @@ fn browser_session_records_steps_and_verifies() {
         &["verify", "--out", &out, "--format", "json"],
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-    assert_eq!(json_stdout(&verify)["result"]["complete"], true);
+    assert_eq!(json_stdout(&verify)["data"]["complete"], true);
 }
 
 #[test]
@@ -832,7 +831,7 @@ fn model_cross_check_requires_primary_and_checker_observations() {
         &["verify", "--out", &out, "--format", "json"],
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-    assert_eq!(json_stdout(&verify)["result"]["complete"], true);
+    assert_eq!(json_stdout(&verify)["data"]["complete"], true);
 }
 
 #[test]
@@ -1153,9 +1152,9 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        assert_eq!(payload["result"]["ok"], true);
-        assert_eq!(payload["result"]["kind"], "inbox");
-        assert_eq!(payload["result"]["fields"]["status"], "open");
+        assert_eq!(payload["data"]["ok"], true);
+        assert_eq!(payload["data"]["kind"], "inbox");
+        assert_eq!(payload["data"]["fields"]["status"], "open");
     }
 
     #[test]
@@ -1294,7 +1293,7 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        let entries = payload["result"]["entries"]
+        let entries = payload["data"]["entries"]
             .as_array()
             .expect("entries array");
         assert_eq!(entries[0]["status"], "open");
@@ -1333,7 +1332,7 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        let entries = payload["result"]["entries"].as_array().unwrap();
+        let entries = payload["data"]["entries"].as_array().unwrap();
         assert_eq!(entries[0]["status"], "planned");
     }
 
@@ -1362,8 +1361,8 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        assert_eq!(payload["result"]["ok"], true);
-        assert_eq!(payload["result"]["fields"]["status"], "triaged");
+        assert_eq!(payload["data"]["ok"], true);
+        assert_eq!(payload["data"]["fields"]["status"], "triaged");
     }
 
     #[test]
@@ -1403,13 +1402,13 @@ Promote after a durable fix and validation are linked.\n\n\
                 "json",
             ],
         );
-        let active_paths: Vec<String> = json_stdout(&active)["result"]["entries"]
+        let active_paths: Vec<String> = json_stdout(&active)["data"]["entries"]
             .as_array()
             .unwrap()
             .iter()
             .map(|e| e["path"].as_str().unwrap().to_string())
             .collect();
-        let archive_paths: Vec<String> = json_stdout(&with_archive)["result"]["entries"]
+        let archive_paths: Vec<String> = json_stdout(&with_archive)["data"]["entries"]
             .as_array()
             .unwrap()
             .iter()
@@ -1445,7 +1444,7 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        let entry = PathBuf::from(payload["result"]["path"].as_str().unwrap());
+        let entry = PathBuf::from(payload["data"]["path"].as_str().unwrap());
         let entry_text = fs::read_to_string(&entry).unwrap();
         assert!(entry_text.contains("- Status: open"));
         assert!(entry_text.contains("- Severity: high"));
@@ -1477,7 +1476,7 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        assert_eq!(payload["result"]["status"], "promoted");
+        assert_eq!(payload["data"]["status"], "promoted");
         let text = fs::read_to_string(&entry).unwrap();
         assert!(text.contains("- Status: promoted"));
         assert!(text.contains("docs/plans/example/example-plan.md"));
@@ -1538,9 +1537,9 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        let destination = payload["result"]["destination"].as_str().unwrap();
+        let destination = payload["data"]["destination"].as_str().unwrap();
         assert!(destination.ends_with("archive/2026/fixture-gap/ENTRY.md"));
-        assert_eq!(payload["result"]["dry_run"], true);
+        assert_eq!(payload["data"]["dry_run"], true);
         assert!(entry.exists());
     }
 
@@ -1583,7 +1582,7 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        let destination = PathBuf::from(payload["result"]["destination"].as_str().unwrap());
+        let destination = PathBuf::from(payload["data"]["destination"].as_str().unwrap());
         assert!(!entry.exists());
         assert!(destination.exists());
         assert!(
@@ -1630,7 +1629,7 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        let destination = PathBuf::from(payload["result"]["destination"].as_str().unwrap());
+        let destination = PathBuf::from(payload["data"]["destination"].as_str().unwrap());
         let text = fs::read_to_string(&destination).unwrap();
         assert!(text.contains("- Durable link: `docs/accepted-risk.md`"));
     }
@@ -1915,9 +1914,9 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        assert_eq!(payload["result"]["ok"], true);
-        assert_eq!(payload["result"]["strict"], false);
-        let body_violations = payload["result"]["body_violations"]
+        assert_eq!(payload["data"]["ok"], true);
+        assert_eq!(payload["data"]["strict"], false);
+        let body_violations = payload["data"]["body_violations"]
             .as_array()
             .expect("body_violations array");
         assert!(
@@ -1925,7 +1924,7 @@ Promote after a durable fix and validation are linked.\n\n\
                 .iter()
                 .any(|v| { v["kind"].as_str().unwrap_or("") == "body_absolute_home_path" })
         );
-        let warnings = payload["result"]["warnings"]
+        let warnings = payload["data"]["warnings"]
             .as_array()
             .expect("warnings array");
         assert!(warnings.iter().any(|w| {
@@ -2145,7 +2144,7 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        let target = PathBuf::from(payload["result"]["path"].as_str().unwrap());
+        let target = PathBuf::from(payload["data"]["path"].as_str().unwrap());
         assert_eq!(target.file_name().unwrap(), "validation-summary.md");
         let text = fs::read_to_string(&target).unwrap();
         assert!(text.contains("scripts/check.sh --all"));
@@ -2177,7 +2176,7 @@ Promote after a durable fix and validation are linked.\n\n\
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        let target = PathBuf::from(payload["result"]["path"].as_str().unwrap());
+        let target = PathBuf::from(payload["data"]["path"].as_str().unwrap());
         let text = fs::read_to_string(&target).unwrap();
         assert!(!text.contains("/Users/example"));
         assert!(!text.contains("/home/example"));
@@ -2221,8 +2220,8 @@ All gates green.\n",
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
         let payload = json_stdout(&out);
-        assert_eq!(payload["result"]["ok"], true);
-        assert_eq!(payload["result"]["kind"], "record");
+        assert_eq!(payload["data"]["ok"], true);
+        assert_eq!(payload["data"]["kind"], "record");
     }
 
     #[test]
@@ -2259,7 +2258,6 @@ All gates green.\n",
             "after.json not written"
         );
         let log = read_json(&invocation);
-        assert_eq!(log["command"], "heuristic-inbox set-status");
         assert_eq!(log["exit_code"], 0);
         assert!(log["argv"].as_array().unwrap().len() >= 3);
         let before = read_json(&log_dir.join("before.json"));
@@ -2312,7 +2310,6 @@ All gates green.\n",
             "after.json not written"
         );
         let log = read_json(&invocations[0]);
-        assert_eq!(log["command"], "heuristic-inbox set-status");
         assert_eq!(log["exit_code"], 0);
         let before = read_json(&log_dir.join("before.json"));
         let after = read_json(&log_dir.join("after.json"));
@@ -2349,7 +2346,6 @@ All gates green.\n",
         );
         let log_dir = invocations[0].parent().unwrap();
         let log = read_json(&invocations[0]);
-        assert_eq!(log["command"], "heuristic-inbox set-status");
         assert_ne!(log["exit_code"], 0);
         let before = read_json(&log_dir.join("before.json"));
         let after = read_json(&log_dir.join("after.json"));

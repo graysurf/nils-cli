@@ -13,15 +13,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::common::{
-    CliError, EXIT_USAGE, OutputFormat, display_path, render_error, render_success,
-};
+use crate::common::{CliError, OutputFormat, display_path, render_error, render_success};
 use crate::completion::{self, CompletionShell};
 
 const LIST_SCHEMA_VERSION: &str = "cli.heuristic-inbox.list.v1";
@@ -2043,14 +2040,7 @@ where
         .collect();
     let cli = match Cli::try_parse_from(argv.iter()) {
         Ok(cli) => cli,
-        Err(err) => {
-            let code = match err.kind() {
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit_code(),
-                _ => EXIT_USAGE,
-            };
-            let _ = err.print();
-            return code;
-        }
+        Err(err) => return crate::common::handle_parse_error("heuristic-inbox", argv.clone(), err),
     };
     match cli.command {
         Command::List(args) => dispatch_list(args),
