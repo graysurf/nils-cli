@@ -1,0 +1,459 @@
+# forge-cli operation catalog v1.
+#
+# Machine-readable companion to `forge-cli-spec-v1.md`. The spec is
+# the source of truth for prose, rationale, and contract conformance;
+# this file enumerates every atom + macro for the v1 surface so the
+# Rust implementation, the backend wrappers, and the test fixtures
+# can be generated from a single declaration.
+#
+# Validation rule names referenced from `validations:` are defined
+# at the top of the file under `validations_catalog`. The spec
+# describes their semantics; the names below are the keys an
+# implementation can match on.
+
+version: 1
+binary: forge-cli
+schema_prefix: cli.forge-cli
+
+# ---------------------------------------------------------------------------
+# Shared validation catalog. Each op picks the subset it enforces.
+# ---------------------------------------------------------------------------
+validations_catalog:
+  branch_name:
+    rule: "^(feat|fix)/[a-z0-9][a-z0-9-]{1,63}$"
+    error_kind: branch_name_invalid
+    exit: DATA
+  branch_kind_matches:
+    rule: "feature -> feat/*, bug -> fix/*"
+    error_kind: branch_kind_mismatch
+    exit: DATA
+  body_summary:
+    rule: "non-empty H2 `## Summary` section"
+    error_kind: body_missing_summary
+    exit: DATA
+  body_test_plan:
+    rule: "non-empty H2 `## Test plan` section"
+    error_kind: body_missing_test_plan
+    exit: DATA
+  title_length:
+    rule: "len(title) <= 70 and no trailing whitespace"
+    error_kind: title_too_long
+    exit: DATA
+  worktree_clean:
+    rule: "git status --porcelain is empty"
+    error_kind: dirty_worktree
+    exit: DATA
+  head_pushed:
+    rule: "HEAD has upstream and matches remote-tracking ref"
+    error_kind: head_not_pushed
+    exit: DATA
+  default_branch_protected:
+    rule: "refuse force-push / direct merge to repo default branch"
+    error_kind: default_branch_protected
+    exit: DATA
+  draft_merge_refused:
+    rule: "pr.draft == false at merge time"
+    error_kind: draft_merge_refused
+    exit: DATA
+  required_checks_green:
+    rule: "every required check is success at merge time"
+    error_kind: checks_pending     # exit DATA when pending
+    failed_error_kind: checks_failed  # exit RUNTIME when failed
+  merge_method_supported:
+    rule: "method in {squash, merge, rebase} and backend supports it"
+    error_kind: merge_method_unsupported
+    exit: DATA
+  keep_branch_conflict:
+    rule: "--keep-branch and --delete-branch are mutually exclusive"
+    error_kind: keep_branch_conflict
+    exit: DATA
+
+# ---------------------------------------------------------------------------
+# Global flags every subcommand inherits.
+# ---------------------------------------------------------------------------
+global_flags:
+  - name: --format
+    type: enum<text|json>
+    default: text
+  - name: --remote
+    type: string
+    default: origin
+  - name: --provider
+    type: enum<github|gitlab>
+    default: auto
+  - name: --repo
+    type: string  # owner/name slug
+    default: derived-from-remote
+  - name: --dry-run
+    type: bool
+    default: false
+
+# ---------------------------------------------------------------------------
+# Atomic operations.
+# ---------------------------------------------------------------------------
+operations:
+
+  - id: pr.create
+    schema_version: cli.forge-cli.pr.create.v1
+    summary: Open a draft pull/merge request from the current branch.
+    inputs:
+      - { name: --head,        type: string,         default: current-branch }
+      - { name: --base,        type: string,         default: repo-default-branch }
+      - { name: --title,       type: string,         required: true }
+      - { name: --body,        type: string,         required: false }
+      - { name: --body-file,   type: path,           required: false }
+      - { name: --kind,        type: enum<feature|bug>, required: true }
+      - { name: --draft,       type: bool,           default: true }
+      - { name: --reviewer,    type: list<string>,   default: [] }
+      - { name: --label,       type: list<string>,   default: [] }
+    validations:
+      - branch_name
+      - branch_kind_matches
+      - title_length
+      - body_summary
+      - body_test_plan
+      - worktree_clean
+      - head_pushed
+    backends:
+      github:
+        program: gh
+        argv: [pr, create, "--draft", "--head", "{head}", "--base", "{base}", "--title", "{title}", "--body-file", "{body_file_or_temp}"]
+        json: { read_after: true, command: [pr, view, "{number}", --json, "number,url,headRefName,baseRefName,isDraft,title"] }
+      gitlab:
+        program: glab
+        argv: [mr, create, "--draft", "--source-branch", "{head}", "--target-branch", "{base}", "--title", "{title}", "--description", "{body_or_body_file}"]
+        json: { read_after: true, command: [mr, view, "{iid}", -F, json] }
+    output:
+      data:
+        number: integer
+        url: string
+        head: string
+        base: string
+        draft: bool
+        title: string
+        kind: enum<feature|bug>
+        provider: enum<github|gitlab>
+
+  - id: pr.view
+    schema_version: cli.forge-cli.pr.view.v1
+    summary: Fetch a single PR/MR with normalised fields.
+    inputs:
+      - { name: <id>, type: integer-or-branch, required: true }
+    validations: []
+    backends:
+      github: { program: gh,   argv: [pr,   view, "{id}", --json, "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,labels"] }
+      gitlab: { program: glab, argv: [mr,   view, "{id}", -F, json] }
+    output:
+      data:
+        number: integer
+        url: string
+        state: enum<open|closed|merged>
+        draft: bool
+        title: string
+        head: string
+        base: string
+        mergeable: enum<yes|no|unknown>
+        merged_at: optional<string>
+        labels: list<string>
+
+  - id: pr.list
+    schema_version: cli.forge-cli.pr.list.v1
+    summary: List PRs/MRs filtered by author / state / branch.
+    inputs:
+      - { name: --state,  type: enum<open|closed|merged|all>, default: open }
+      - { name: --author, type: string,                       required: false }
+      - { name: --head,   type: string,                       required: false }
+      - { name: --limit,  type: integer,                      default: 30 }
+    validations: []
+    backends:
+      github: { program: gh,   argv: [pr, list, --json, "number,url,state,title,headRefName,author"] }
+      gitlab: { program: glab, argv: [mr, list, -F, json] }
+    output:
+      data:
+        items: list<{ number, url, state, title, head, author }>
+
+  - id: pr.edit
+    schema_version: cli.forge-cli.pr.edit.v1
+    summary: Mutate PR/MR title, body, base, labels, reviewers.
+    inputs:
+      - { name: <id>,        type: integer, required: true }
+      - { name: --title,     type: string,  required: false }
+      - { name: --body,      type: string,  required: false }
+      - { name: --body-file, type: path,    required: false }
+      - { name: --base,      type: string,  required: false }
+      - { name: --add-label,    type: list<string>, default: [] }
+      - { name: --remove-label, type: list<string>, default: [] }
+      - { name: --add-reviewer, type: list<string>, default: [] }
+    validations:
+      - title_length   # when --title supplied
+      - body_summary   # when --body or --body-file supplied
+      - body_test_plan # when --body or --body-file supplied
+    backends:
+      github: { program: gh,   argv: [pr, edit,   "{id}"] }
+      gitlab: { program: glab, argv: [mr, update, "{id}"] }
+
+  - id: pr.comment
+    schema_version: cli.forge-cli.pr.comment.v1
+    summary: Append a comment to a PR/MR.
+    inputs:
+      - { name: <id>,        type: integer, required: true }
+      - { name: --body,      type: string,  required: false }
+      - { name: --body-file, type: path,    required: false }
+    validations: []
+    backends:
+      github: { program: gh,   argv: [pr, comment, "{id}", --body, "{body_or_file}"] }
+      gitlab: { program: glab, argv: [mr, note,    "{id}", --message, "{body_or_file}"] }
+
+  - id: pr.ready
+    schema_version: cli.forge-cli.pr.ready.v1
+    summary: Promote a draft PR/MR to ready-for-review.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+    validations:
+      - worktree_clean
+    backends:
+      github: { program: gh,   argv: [pr, ready,  "{id}"] }
+      gitlab: { program: glab, argv: [mr, update, "{id}", "--ready"] }
+
+  - id: pr.merge
+    schema_version: cli.forge-cli.pr.merge.v1
+    summary: Merge a ready PR/MR with the configured method.
+    inputs:
+      - { name: <id>,                       type: integer,                       required: true }
+      - { name: --method,                   type: enum<squash|merge|rebase>,     default: squash }
+      - { name: --keep-branch,              type: bool,                          default: false }
+      - { name: --allow-non-default-base,   type: bool,                          default: false }
+    validations:
+      - worktree_clean
+      - draft_merge_refused
+      - default_branch_protected
+      - required_checks_green   # TTL-zero re-check
+      - merge_method_supported
+      - keep_branch_conflict
+    backends:
+      github: { program: gh,   argv: [pr, merge, "{id}", "--{method}", "--delete-branch?"] }
+      gitlab: { program: glab, argv: [mr, merge, "{id}", "--squash?", "--remove-source-branch?"] }
+    output:
+      data:
+        number: integer
+        url: string
+        merge_sha: string
+        method: enum<squash|merge|rebase>
+        deleted_branch: bool
+
+  - id: pr.close
+    schema_version: cli.forge-cli.pr.close.v1
+    summary: Close a PR/MR without merging.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+    validations: []
+    backends:
+      github: { program: gh,   argv: [pr, close, "{id}"] }
+      gitlab: { program: glab, argv: [mr, close, "{id}"] }
+
+  - id: pr.checks
+    schema_version: cli.forge-cli.pr.checks.v1
+    summary: One-shot snapshot of PR/MR check state.
+    inputs:
+      - { name: <id>,           type: integer-or-branch, required: true }
+      - { name: --required-only, type: bool,             default: true }
+    validations: []
+    backends:
+      github: { program: gh,   argv: [pr, checks, "{id}", --json, "name,state,conclusion,bucket,workflow,link,startedAt,completedAt,description,isRequired"] }
+      gitlab: { program: glab, argv: [ci, status,  "-b", "{branch}"] }   # text fallback parsed
+    output:
+      data:
+        state: enum<success|failure|pending|cancelled|neutral|skipped|timed_out>
+        required_count: integer
+        success_count: integer
+        failed: list<{ name, url, conclusion }>
+        pending: list<{ name, url }>
+
+  - id: pr.wait-checks
+    schema_version: cli.forge-cli.pr.checks.v1   # shares schema with pr.checks
+    summary: Block until every required check reaches a terminal state.
+    inputs:
+      - { name: <id>,            type: integer-or-branch, required: true }
+      - { name: --timeout,       type: duration,          default: 30m }
+      - { name: --interval,      type: duration,          default: 20s }
+      - { name: --required-only, type: bool,              default: true }
+    validations: []
+    behaviour: |
+      Polls pr.checks until every required check is terminal. Emits
+      a single envelope at the end. Maps results to exit code:
+        all success         -> SUCCESS 0
+        any failure         -> RUNTIME 1, error.kind=checks_failed
+        cancelled/timed_out -> RUNTIME 1, error.kind=checks_failed
+        deadline reached    -> UNAVAILABLE 69, error.kind=checks_timeout
+    backends: inherits-from-pr.checks
+    output: inherits-from-pr.checks
+
+  - id: issue.create
+    schema_version: cli.forge-cli.issue.create.v1
+    summary: Open a new issue.
+    inputs:
+      - { name: --title,     type: string, required: true }
+      - { name: --body,      type: string, required: false }
+      - { name: --body-file, type: path,   required: false }
+      - { name: --label,     type: list<string>, default: [] }
+      - { name: --assignee,  type: list<string>, default: [] }
+    validations:
+      - title_length
+    backends:
+      github: { program: gh,   argv: [issue, create, --title, "{title}", --body-file, "{body_file_or_temp}"] }
+      gitlab: { program: glab, argv: [issue, create, --title, "{title}", --description, "{body_or_file}"] }
+    output:
+      data: { number, url, title, state, provider }
+
+  - id: issue.view
+    schema_version: cli.forge-cli.issue.view.v1
+    summary: Fetch a single issue.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+    backends:
+      github: { program: gh,   argv: [issue, view, "{id}", --json, "number,url,state,title,labels,assignees,body"] }
+      gitlab: { program: glab, argv: [issue, view, "{id}", -F, json] }
+
+  - id: issue.edit
+    schema_version: cli.forge-cli.issue.edit.v1
+    summary: Mutate issue title / body / labels / assignees.
+    inputs:
+      - { name: <id>,             type: integer,      required: true }
+      - { name: --title,          type: string,       required: false }
+      - { name: --body,           type: string,       required: false }
+      - { name: --body-file,      type: path,         required: false }
+      - { name: --add-label,      type: list<string>, default: [] }
+      - { name: --remove-label,   type: list<string>, default: [] }
+      - { name: --add-assignee,   type: list<string>, default: [] }
+    validations:
+      - title_length   # when --title supplied
+    backends:
+      github: { program: gh,   argv: [issue, edit,   "{id}"] }
+      gitlab: { program: glab, argv: [issue, update, "{id}"] }
+
+  - id: issue.comment
+    schema_version: cli.forge-cli.issue.comment.v1
+    summary: Append a comment to an issue.
+    inputs:
+      - { name: <id>,        type: integer, required: true }
+      - { name: --body,      type: string,  required: false }
+      - { name: --body-file, type: path,    required: false }
+    backends:
+      github: { program: gh,   argv: [issue, comment, "{id}", --body, "{body_or_file}"] }
+      gitlab: { program: glab, argv: [issue, note,    "{id}", --message, "{body_or_file}"] }
+
+  - id: issue.close
+    schema_version: cli.forge-cli.issue.close.v1
+    summary: Close an issue.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+    backends:
+      github: { program: gh,   argv: [issue, close, "{id}"] }
+      gitlab: { program: glab, argv: [issue, close, "{id}"] }
+
+  - id: issue.reopen
+    schema_version: cli.forge-cli.issue.reopen.v1
+    summary: Reopen a closed issue.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+    backends:
+      github: { program: gh,   argv: [issue, reopen, "{id}"] }
+      gitlab: { program: glab, argv: [issue, reopen, "{id}"] }
+
+  - id: repo.view
+    schema_version: cli.forge-cli.repo.view.v1
+    summary: Resolve repo slug, default branch, default merge method.
+    inputs: []
+    backends:
+      github: { program: gh,   argv: [repo, view, --json, "name,owner,defaultBranchRef,mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,url"] }
+      gitlab: { program: glab, argv: [repo, view, -F, json] }
+    output:
+      data:
+        owner: string
+        name: string
+        url: string
+        default_branch: string
+        merge_methods_allowed: list<enum<squash|merge|rebase>>
+
+  - id: auth.status
+    schema_version: cli.forge-cli.auth.status.v1
+    summary: Verify backend auth (gh / glab).
+    inputs: []
+    backends:
+      github: { program: gh,   argv: [auth, status] }
+      gitlab: { program: glab, argv: [auth, status] }
+    output:
+      data:
+        provider: enum<github|gitlab>
+        host: string
+        user: optional<string>
+        scopes: list<string>
+    notes: "Backend output is text, parsed into the structured envelope."
+
+# ---------------------------------------------------------------------------
+# Macro operations.
+# ---------------------------------------------------------------------------
+macros:
+
+  - id: pr.deliver
+    schema_version: cli.forge-cli.pr.deliver.v1
+    summary: End-to-end "open draft → CI green → ready → merge" flow.
+    inputs:
+      - { name: --kind,                     type: enum<feature|bug>,            required: true }
+      - { name: --title,                    type: string,                       required: false }
+      - { name: --body,                     type: string,                       required: false }
+      - { name: --body-file,                type: path,                         required: false }
+      - { name: --head,                     type: string,                       default: current-branch }
+      - { name: --base,                     type: string,                       default: repo-default-branch }
+      - { name: --method,                   type: enum<squash|merge|rebase>,    default: squash }
+      - { name: --reviewer,                 type: list<string>,                 default: [] }
+      - { name: --timeout,                  type: duration,                     default: 30m }
+      - { name: --no-merge,                 type: bool,                         default: false }
+      - { name: --allow-non-default-base,   type: bool,                         default: false }
+    sequence:
+      - { step: auth_status,        op: auth.status }
+      - { step: repo_view,          op: repo.view }
+      - { step: create,             op: pr.create }
+      - { step: wait_checks,        op: pr.wait-checks }
+      - { step: ready,              op: pr.ready,  skip_when: "--no-merge" }
+      - { step: merge,              op: pr.merge,  skip_when: "--no-merge" }
+    output:
+      data:
+        kind: enum<feature|bug>
+        provider: enum<github|gitlab>
+        pr:
+          number: integer
+          url: string
+          merged: bool
+          merge_sha: optional<string>
+        steps: "list of { step, ok, schema_version, payload }"
+    notes: |
+      Failure of any step short-circuits the macro. The outer exit
+      code is the failing step's exit code (no remapping). Steps
+      that did not run are omitted from `data.steps`.
+
+# ---------------------------------------------------------------------------
+# Output envelope (matches cli-output-contract-v1).
+# ---------------------------------------------------------------------------
+envelope:
+  fields:
+    schema_version: "cli.forge-cli.<op>.v<N>"
+    ok: bool
+    data: optional<object>
+    warnings: optional<list<string>>
+  error_extension:
+    data.error:
+      kind: string          # discriminator, e.g. branch_name_invalid
+      message: string       # short, human-readable
+      detail: optional<string>  # backend stderr tail, redacted, <=2 KiB
+
+# ---------------------------------------------------------------------------
+# Exit code map (aligned with cli-output-contract-v1 sysexits).
+# ---------------------------------------------------------------------------
+exit_codes:
+  SUCCESS:     { value: 0,  triggers: ["op completed; required state achieved"] }
+  RUNTIME:     { value: 1,  triggers: ["required checks failed", "merge conflict", "remote semantic failure"] }
+  USAGE:       { value: 64, triggers: ["bad CLI syntax", "unknown subcommand", "provider_unsupported"] }
+  DATA:        { value: 65, triggers: ["any lock-down policy violation", "body parse failed"] }
+  UNAVAILABLE: { value: 69, triggers: ["gh/glab missing", "auth required", "remote 5xx", "wait-checks timeout"] }
+  SOFTWARE:    { value: 70, triggers: ["backend JSON shape mismatch", "internal invariant violation"] }
