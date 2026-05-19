@@ -5,7 +5,10 @@ mod integration {
     mod auth_status;
     mod cli;
     mod exit_codes;
+    mod pr_checks_github;
+    mod pr_checks_gitlab;
     mod pr_create;
+    mod pr_wait_checks;
     mod repo_view;
     mod support;
     mod validations;

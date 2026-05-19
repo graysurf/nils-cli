@@ -1,0 +1,26 @@
+[
+  {
+    "name": "build",
+    "state": "COMPLETED",
+    "conclusion": "success",
+    "bucket": "pass",
+    "workflow": "CI",
+    "link": "https://github.com/sympoies/nils-cli/actions/runs/4001",
+    "startedAt": "2026-05-19T10:00:00Z",
+    "completedAt": "2026-05-19T10:05:00Z",
+    "description": "",
+    "isRequired": true
+  },
+  {
+    "name": "test",
+    "state": "COMPLETED",
+    "conclusion": "cancelled",
+    "bucket": "cancel",
+    "workflow": "CI",
+    "link": "https://github.com/sympoies/nils-cli/actions/runs/4002",
+    "startedAt": "2026-05-19T10:00:00Z",
+    "completedAt": "2026-05-19T10:03:00Z",
+    "description": "cancelled by user",
+    "isRequired": true
+  }
+]

@@ -7,6 +7,7 @@
 //! catalog" reference that downstream sprints can grep when wiring new
 //! atoms.
 
+use forge_cli::error::ForgeError;
 use forge_cli::validations::{
     BodyHeadings, BranchPrefix, HeadState, PrKind, body_summary, body_test_plan,
     branch_kind_matches, branch_name, head_pushed, title_length, worktree_clean,
@@ -55,4 +56,27 @@ fn validation_kinds_match_spec_catalog() {
     for ((label, expected), got) in cases.iter().zip(errs.iter()) {
         assert_eq!(*got, *expected, "case={label}");
     }
+}
+
+#[test]
+fn sprint3_runtime_and_unavailable_kinds_match_spec() {
+    // Sprint 3 introduces three new typed kinds that do NOT live in the
+    // lock-down validation chain but still belong in the catalog so future
+    // contract regressions get flagged here.
+    let runtime = ForgeError::runtime_failure("cli.forge-cli.error.v1", "checks_failed", "x", None);
+    assert_eq!(runtime.kind(), "checks_failed");
+    assert_eq!(runtime.exit_code(), 1);
+
+    let timeout = ForgeError::unavailable("cli.forge-cli.error.v1", "checks_timeout", "x", None);
+    assert_eq!(timeout.kind(), "checks_timeout");
+    assert_eq!(timeout.exit_code(), 69);
+
+    let version = ForgeError::unavailable(
+        "cli.forge-cli.error.v1",
+        "glab_version_unsupported",
+        "x",
+        None,
+    );
+    assert_eq!(version.kind(), "glab_version_unsupported");
+    assert_eq!(version.exit_code(), 69);
 }

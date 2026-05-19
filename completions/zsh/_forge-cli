@@ -180,6 +180,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (checks)
 _arguments "${_arguments_options[@]}" : \
+'--required-only=[Restrict the gating decision to required checks (default \`true\`). Non-required checks are always reported in \`data.checks\` regardless]::REQUIRED_ONLY:(true false)' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -188,11 +189,14 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':id -- Numeric id or branch name:_default' \
+':id -- Numeric id or branch name (GitHub accepts both natively; GitLab resolves numeric ids via `mr view` to fetch the source branch):_default' \
 && ret=0
 ;;
 (wait-checks)
 _arguments "${_arguments_options[@]}" : \
+'--timeout=[Total budget before declaring \`checks_timeout\` (default \`30m\`)]:TIMEOUT:_default' \
+'--interval=[Pause between polls (default \`20s\`)]:INTERVAL:_default' \
+'--required-only=[Restrict the gating decision to required checks (default \`true\`)]::REQUIRED_ONLY:(true false)' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \

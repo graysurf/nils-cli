@@ -7,6 +7,7 @@
 //! `SOFTWARE 70` so callers see a stable failure shape rather than a panic.
 
 use std::ffi::OsString;
+use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
@@ -233,6 +234,71 @@ pub struct PrReadyArgs {
     pub id: u64,
 }
 
+/// `pr checks` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.checks` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrChecksArgs {
+    /// Numeric id or branch name (GitHub accepts both natively; GitLab
+    /// resolves numeric ids via `mr view` to fetch the source branch).
+    pub id: String,
+    /// Restrict the gating decision to required checks (default `true`).
+    /// Non-required checks are always reported in `data.checks` regardless.
+    #[arg(
+        long = "required-only",
+        action = ArgAction::Set,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    pub required_only: bool,
+}
+
+/// `pr wait-checks` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.wait-checks` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrWaitChecksArgs {
+    /// Numeric id or branch name.
+    pub id: String,
+    /// Total budget before declaring `checks_timeout` (default `30m`).
+    #[arg(long, value_parser = parse_duration, default_value = "30m")]
+    pub timeout: Duration,
+    /// Pause between polls (default `20s`).
+    #[arg(long, value_parser = parse_duration, default_value = "20s")]
+    pub interval: Duration,
+    /// Restrict the gating decision to required checks (default `true`).
+    #[arg(
+        long = "required-only",
+        action = ArgAction::Set,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    pub required_only: bool,
+}
+
+/// Parse a duration string like `30m`, `20s`, `5h`, `500ms`. Accepts bare
+/// integers as seconds.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("duration cannot be empty".into());
+    }
+    // Split numeric prefix from unit suffix.
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let value: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid number in {s:?}"))?;
+    let dur = match unit {
+        "" | "s" => Duration::from_secs(value),
+        "ms" => Duration::from_millis(value),
+        "m" => Duration::from_secs(value * 60),
+        "h" => Duration::from_secs(value * 3600),
+        other => return Err(format!("unknown duration unit {other:?} in {s:?}")),
+    };
+    Ok(dur)
+}
+
 /// `pr list` arguments. Maps to
 /// `forge-cli-ops-v1.yaml::operations.pr.list` inputs.
 #[derive(Args, Debug, Clone)]
@@ -313,15 +379,9 @@ pub enum PrCommand {
         id: u64,
     },
     /// One-shot snapshot of PR / MR check state.
-    Checks {
-        /// Numeric id or branch name.
-        id: String,
-    },
+    Checks(PrChecksArgs),
     /// Block until every required check reaches a terminal state.
-    WaitChecks {
-        /// Numeric id or branch name.
-        id: String,
-    },
+    WaitChecks(PrWaitChecksArgs),
     /// End-to-end "open draft → CI green → ready → merge" macro.
     Deliver,
 }
@@ -410,6 +470,27 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Ready(args)),
         })) => ops::pr_ready::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Checks(args)),
+        })) => {
+            if global.dry_run {
+                let ctx = match crate::provider::detect(
+                    global.provider_hint(),
+                    &global.remote,
+                    crate::provider::git_remote_url,
+                ) {
+                    Ok(ctx) => ctx,
+                    Err(err) => return err.emit(format),
+                };
+                let runner = crate::backend::ProcessRunner;
+                let code = ops::pr_checks::emit_dry_run(&runner, &ctx, &args, format);
+                return code;
+            }
+            ops::pr_checks::run(&global, args, format)
+        }
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::WaitChecks(args)),
+        })) => ops::pr_wait_checks::run(&global, args, format),
         Some(Command::Completion(CompletionArgs { shell })) => emit_completion(shell),
         None
         | Some(Command::Auth(AuthArgs { command: None }))
