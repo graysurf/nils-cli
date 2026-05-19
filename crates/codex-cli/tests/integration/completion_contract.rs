@@ -81,8 +81,7 @@ fn completion_contract_format_values_include_text_and_json() {
         script,
         &[
             "'--format=[Output format (\\`text\\` or \\`json\\`)]:format:(text json)' \\",
-            "'(--format)--json[Output machine-readable JSON]' \\",
-            "'(--format)--json[Output raw JSON]' \\",
+            "'(--format)--json[Hidden alias for \\`--format json\\` (kept for backwards compatibility)]' \\",
         ],
     );
 }

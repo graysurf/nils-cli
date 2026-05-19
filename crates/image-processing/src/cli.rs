@@ -43,7 +43,11 @@ pub struct Cli {
     pub overwrite: bool,
     #[arg(long = "dry-run", help = "Validate and plan without writing output")]
     pub dry_run: bool,
-    #[arg(long, help = "Emit machine-readable JSON to stdout")]
+    #[arg(
+        long,
+        hide = true,
+        help = "Hidden alias for `--format json` (kept for backwards compatibility)"
+    )]
     pub json: bool,
     #[arg(long, help = "Print per-item processing report")]
     pub report: bool,

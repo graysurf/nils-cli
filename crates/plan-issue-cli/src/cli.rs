@@ -31,8 +31,8 @@ pub struct Cli {
     #[arg(short = 'f', long, global = true)]
     pub force: bool,
 
-    /// Output machine-readable JSON (alias for --format json).
-    #[arg(long, global = true)]
+    /// Hidden alias for `--format json` (kept for backwards compatibility).
+    #[arg(long, global = true, hide = true)]
     pub json: bool,
 
     /// Output format.
