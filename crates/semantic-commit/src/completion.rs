@@ -144,6 +144,12 @@ fn build_completion_command() -> Command {
                         .action(ArgAction::SetTrue),
                 )
                 .arg(
+                    Arg::new("auto-fix")
+                        .long("auto-fix")
+                        .help("Normalize body wrap, bullet/type/scope case before validation")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
                     Arg::new("no-progress")
                         .long("no-progress")
                         .help("Disable progress UI")
