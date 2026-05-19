@@ -1,6 +1,6 @@
 [package]
 name = "nils-agent-workflow-primitives"
-version = "0.10.0"
+version = "0.10.1"
 edition.workspace = true
 license.workspace = true
 
@@ -46,13 +46,13 @@ path = "src/bin/skill-usage.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-agent-out = { version = "0.10.0", path = "../agent-out" }
+nils-agent-out = { version = "0.10.1", path = "../agent-out" }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 
 [dev-dependencies]
-nils-test-support = { version = "0.10.0", path = "../nils-test-support" }
+nils-test-support = { version = "0.10.1", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
