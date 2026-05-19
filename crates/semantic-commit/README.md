@@ -64,6 +64,11 @@ Flags:
 - `--automation` (alias: `--non-interactive`) — disallow stdin message fallback
 - `--validate-only` — validate the commit message format and exit without committing
 - `--dry-run` — run validation and staged-change checks, then skip `git commit`
+- `--auto-fix` — normalize the message before validation: wrap body lines at `<= 100` columns
+  (whitespace breaks preferred; CJK / unbreakable runs use a codepoint hard-break), uppercase the
+  first character of `-` + space bullets, lowercase the header type and `(scope)`, insert a missing
+  blank line between header and body, and drop empty lines inside the body. Does **not** shorten
+  an over-length header or repair structural header errors — those still exit `4`.
 - `--no-progress` — disable the progress spinner
 - `--quiet` — suppress progress and summary output (implies `--no-progress` and `--no-summary`)
 

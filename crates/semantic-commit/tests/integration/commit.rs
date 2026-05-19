@@ -520,6 +520,109 @@ fn commit_falls_back_when_git_scope_is_not_executable() {
 }
 
 #[test]
+fn commit_auto_fix_wraps_overlength_body_line() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+
+    let long_word_run = "word ".repeat(30);
+    let long_bullet = long_word_run.trim_end();
+    let message = format!("feat: test\n\n- {long_bullet}\n");
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &["commit", "--auto-fix", "--validate-only"],
+        &[],
+        Some(&message),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_auto_fix_lowercases_uppercase_type_and_bullet() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--auto-fix",
+            "--validate-only",
+            "--message",
+            "Feat(Core): add thing",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_auto_fix_does_not_truncate_overlength_header() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let header = format!("feat: {}", "a".repeat(120));
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--auto-fix",
+            "--validate-only",
+            "--message",
+            &header,
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        as_str(&output.stderr).contains("commit header exceeds 100 characters"),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_auto_fix_message_out_captures_normalized_message() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+    let out_path = repo.path().join("commit-message.txt");
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--auto-fix",
+            "--dry-run",
+            "--message",
+            "Feat(Core): add thing",
+            "--message-out",
+            "commit-message.txt",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    let saved = fs::read_to_string(out_path).expect("read message-out file");
+    assert_eq!(saved, "feat(core): add thing");
+}
+
+#[test]
 fn commit_repo_flag_commits_from_external_cwd() {
     let outer = tempfile::TempDir::new().expect("tempdir");
     let repo = common::init_repo();

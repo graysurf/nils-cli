@@ -42,6 +42,7 @@ struct CommitOptions {
     automation: bool,
     validate_only: bool,
     dry_run: bool,
+    auto_fix: bool,
     repo: Option<PathBuf>,
 }
 
@@ -57,6 +58,7 @@ impl Default for CommitOptions {
             automation: false,
             validate_only: false,
             dry_run: false,
+            auto_fix: false,
             repo: None,
         }
     }
@@ -78,10 +80,14 @@ pub fn run(args: &[String]) -> i32 {
         options.summary_mode = SummaryMode::None;
     }
 
-    let message_contents = match read_message_contents(&options) {
+    let mut message_contents = match read_message_contents(&options) {
         Ok(contents) => contents,
         Err(code) => return code,
     };
+
+    if options.auto_fix {
+        message_contents = normalize_message(&message_contents);
+    }
 
     if let Some(path) = options.message_out.as_deref()
         && let Err(err) = write_message_file(path, &message_contents)
@@ -259,6 +265,10 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
             }
             "--dry-run" => {
                 options.dry_run = true;
+                i += 1;
+            }
+            "--auto-fix" => {
+                options.auto_fix = true;
                 i += 1;
             }
             "--repo" => {
@@ -469,7 +479,7 @@ fn validate_commit_message(path: &Path) -> Result<(), i32> {
     if header.is_empty() {
         return fail_validation("commit header is empty");
     }
-    if header.chars().count() > 100 {
+    if header.chars().count() > MAX_LINE_WIDTH {
         return fail_validation("commit header exceeds 100 characters (max 100)");
     }
     if !is_valid_header(header) {
@@ -492,7 +502,7 @@ fn validate_commit_message(path: &Path) -> Result<(), i32> {
                     "commit body line {line_no} is empty; body lines must start with '- ' followed by uppercase letter (or '  ' to continue the previous bullet)"
                 ));
             }
-            if line.chars().count() > 100 {
+            if line.chars().count() > MAX_LINE_WIDTH {
                 return fail_validation(&format!(
                     "commit body line {line_no} exceeds 100 characters (max 100)"
                 ));
@@ -564,6 +574,140 @@ fn is_valid_header(header: &str) -> bool {
     true
 }
 
+const MAX_LINE_WIDTH: usize = 100;
+
+fn normalize_message(input: &str) -> String {
+    let lines: Vec<&str> = input.lines().collect();
+    if lines.is_empty() {
+        return input.to_string();
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
+    out.push(normalize_header(lines[0]));
+
+    let body: Vec<&str> = lines
+        .iter()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .copied()
+        .collect();
+
+    if !body.is_empty() {
+        out.push(String::new());
+        for line in body {
+            let cased = capitalize_bullet_first_char(line);
+            for wrapped in wrap_body_line(&cased, MAX_LINE_WIDTH) {
+                out.push(wrapped);
+            }
+        }
+    }
+
+    let mut result = out.join("\n");
+    if input.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+fn normalize_header(header: &str) -> String {
+    let Some((prefix, subject)) = header.split_once(": ") else {
+        return header.to_string();
+    };
+
+    let (typ, scope) = if let Some((t, rest)) = prefix.split_once('(') {
+        let Some(scope_inner) = rest.strip_suffix(')') else {
+            return header.to_string();
+        };
+        (t, Some(scope_inner))
+    } else {
+        (prefix, None)
+    };
+
+    let prefix_norm = match scope {
+        Some(s) => format!("{}({})", typ.to_ascii_lowercase(), s.to_ascii_lowercase()),
+        None => typ.to_ascii_lowercase(),
+    };
+
+    format!("{prefix_norm}: {subject}")
+}
+
+fn capitalize_bullet_first_char(line: &str) -> String {
+    if !line.starts_with("- ") {
+        return line.to_string();
+    }
+    let mut chars = line.chars();
+    let _ = chars.next();
+    let _ = chars.next();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {
+            let rest: String = chars.collect();
+            format!("- {}{rest}", c.to_ascii_uppercase())
+        }
+        _ => line.to_string(),
+    }
+}
+
+fn wrap_body_line(line: &str, max: usize) -> Vec<String> {
+    if line.chars().count() <= max {
+        return vec![line.to_string()];
+    }
+
+    let (first_prefix, cont_prefix, content): (&str, &str, String) = if line.starts_with("- ") {
+        ("- ", "  ", line.chars().skip(2).collect())
+    } else if line.starts_with("  ") {
+        ("  ", "  ", line.chars().skip(2).collect())
+    } else {
+        ("", "", line.to_string())
+    };
+
+    let chars: Vec<char> = content.chars().collect();
+    let first_budget = max.saturating_sub(first_prefix.chars().count());
+    let cont_budget = max.saturating_sub(cont_prefix.chars().count());
+
+    if first_budget == 0 || cont_budget == 0 {
+        return vec![line.to_string()];
+    }
+
+    let mut result: Vec<String> = Vec::new();
+    let mut idx = 0;
+    let mut is_first = true;
+
+    while idx < chars.len() {
+        let budget = if is_first { first_budget } else { cont_budget };
+        let prefix = if is_first { first_prefix } else { cont_prefix };
+        let window_end = (idx + budget).min(chars.len());
+
+        let break_at = if window_end == chars.len() {
+            window_end
+        } else {
+            (idx..window_end)
+                .rev()
+                .find(|&i| chars[i] == ' ' && i > idx)
+                .unwrap_or(window_end)
+        };
+
+        let chunk: String = chars[idx..break_at].iter().collect();
+        result.push(format!("{prefix}{}", chunk.trim_end()));
+
+        idx = if break_at < chars.len() && chars[break_at] == ' ' {
+            let mut next = break_at + 1;
+            while next < chars.len() && chars[next] == ' ' {
+                next += 1;
+            }
+            next
+        } else {
+            break_at
+        };
+        is_first = false;
+    }
+
+    if result.is_empty() {
+        result.push(first_prefix.to_string());
+    }
+
+    result
+}
+
 fn print_usage_stdout() {
     print_usage(false);
 }
@@ -618,6 +762,10 @@ fn print_usage(stderr: bool) {
     let _ = writeln!(
         out,
         "      --dry-run                Validate + staged checks, skip git commit"
+    );
+    let _ = writeln!(
+        out,
+        "      --auto-fix               Normalize body wrap, bullet/type/scope case before validation"
     );
     let _ = writeln!(
         out,
@@ -722,5 +870,150 @@ mod tests {
         assert!(!is_valid_header("fix(scope):"));
         assert!(!is_valid_header("fix(scope): "));
         assert!(!is_valid_header("fix(scope) missing colon"));
+    }
+
+    #[test]
+    fn normalize_header_lowercases_type_and_scope() {
+        assert_eq!(
+            normalize_header("Feat(Core): add thing"),
+            "feat(core): add thing"
+        );
+        assert_eq!(normalize_header("FIX: bug"), "fix: bug");
+    }
+
+    #[test]
+    fn normalize_header_preserves_subject_case() {
+        assert_eq!(
+            normalize_header("feat(core): Add THING with MixedCase"),
+            "feat(core): Add THING with MixedCase"
+        );
+    }
+
+    #[test]
+    fn normalize_header_passes_through_invalid_shape() {
+        assert_eq!(normalize_header("no colon here"), "no colon here");
+        assert_eq!(
+            normalize_header("feat(unclosed: subj"),
+            "feat(unclosed: subj"
+        );
+    }
+
+    #[test]
+    fn capitalize_bullet_first_char_upcases_lowercase_ascii() {
+        assert_eq!(capitalize_bullet_first_char("- add thing"), "- Add thing");
+    }
+
+    #[test]
+    fn capitalize_bullet_first_char_leaves_already_uppercase() {
+        assert_eq!(capitalize_bullet_first_char("- Add thing"), "- Add thing");
+    }
+
+    #[test]
+    fn capitalize_bullet_first_char_leaves_non_bullets() {
+        assert_eq!(capitalize_bullet_first_char("  cont"), "  cont");
+        assert_eq!(capitalize_bullet_first_char("plain"), "plain");
+        assert_eq!(
+            capitalize_bullet_first_char("- 1.0 release"),
+            "- 1.0 release"
+        );
+    }
+
+    #[test]
+    fn wrap_body_line_short_unchanged() {
+        assert_eq!(
+            wrap_body_line("- Short bullet", 100),
+            vec!["- Short bullet"]
+        );
+    }
+
+    #[test]
+    fn wrap_body_line_breaks_bullet_at_last_space() {
+        let line = format!("- {}", "word ".repeat(30).trim_end());
+        let out = wrap_body_line(&line, 40);
+        assert!(out.len() > 1, "expected wrapping, got {out:?}");
+        assert!(out[0].starts_with("- "));
+        for cont in &out[1..] {
+            assert!(
+                cont.starts_with("  "),
+                "continuation must start with two spaces: {cont:?}"
+            );
+            assert!(
+                cont.chars().nth(2).is_some_and(|c| !c.is_whitespace()),
+                "continuation third char must be non-whitespace: {cont:?}"
+            );
+        }
+        for l in &out {
+            assert!(l.chars().count() <= 40, "line exceeds budget: {l:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_body_line_continuation_keeps_two_space_prefix() {
+        let line = format!("  {}", "word ".repeat(30).trim_end());
+        let out = wrap_body_line(&line, 40);
+        for cont in &out {
+            assert!(
+                cont.starts_with("  "),
+                "expected two-space prefix: {cont:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_body_line_hard_breaks_when_no_whitespace() {
+        let line = format!("- {}", "a".repeat(120));
+        let out = wrap_body_line(&line, 100);
+        assert!(out.len() >= 2, "expected hard break, got {out:?}");
+        for l in &out {
+            assert!(l.chars().count() <= 100, "line exceeds budget: {l:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_body_line_handles_cjk_codepoint_break() {
+        let line = format!("- {}", "字".repeat(110));
+        let out = wrap_body_line(&line, 100);
+        assert!(out.len() >= 2, "expected wrap for long CJK, got {out:?}");
+        for l in &out {
+            assert!(l.chars().count() <= 100, "line exceeds budget: {l:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_message_inserts_missing_blank_separator() {
+        let out = normalize_message("feat: add thing\n- Add thing\n");
+        assert_eq!(out, "feat: add thing\n\n- Add thing\n");
+    }
+
+    #[test]
+    fn normalize_message_drops_empty_body_lines() {
+        let out = normalize_message("feat: add thing\n\n- First\n\n- Second\n");
+        assert_eq!(out, "feat: add thing\n\n- First\n- Second\n");
+    }
+
+    #[test]
+    fn normalize_message_passes_through_already_valid() {
+        let input = "feat(core): add thing\n\n- Add thing\n";
+        assert_eq!(normalize_message(input), input);
+    }
+
+    #[test]
+    fn normalize_message_does_not_truncate_overlength_header() {
+        let header = format!("feat: {}", "a".repeat(120));
+        let input = format!("{header}\n");
+        let out = normalize_message(&input);
+        let header_line = out.lines().next().unwrap();
+        assert_eq!(header_line.chars().count(), header.chars().count());
+    }
+
+    #[test]
+    fn normalize_message_makes_invalid_input_pass_validator() {
+        let input = "Feat(Core): subject\n- lowercase bullet that is way too long because it has many words and exceeds the limit by a lot of chars\n";
+        let normalized = normalize_message(input);
+        let file = message_file(&normalized);
+        assert!(
+            validate_commit_message(file.path()).is_ok(),
+            "normalized message failed validation:\n{normalized}"
+        );
     }
 }
