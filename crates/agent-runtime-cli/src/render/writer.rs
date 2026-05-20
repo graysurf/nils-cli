@@ -55,12 +55,23 @@ pub fn write_product(
         ..RenderReport::default()
     };
 
+    let canonical_source_root = root.path().to_path_buf();
+    let canonical_output_root = output_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize output root {}", output_root.display()))?;
+
     for skill in &manifests.skills.skills {
         let Some(render) = skill.products.get(product) else {
             report.skipped.push(skill.id.clone());
             continue;
         };
         let template_path = sandboxed_join(root.path(), &skill.source)?.join(SKILL_TEMPLATE_FILE);
+        // Defeat symlink escape: a hostile `core/skills/<x>/SKILL.md.tera`
+        // could be a symlink pointing outside the source root (e.g. to
+        // `/etc/passwd`). `fs::read_to_string` follows symlinks, so we
+        // resolve the real path first and verify it stays beneath the
+        // canonical source root before opening it.
+        let template_path = canonicalize_under(&canonical_source_root, &template_path)?;
         let template_body = fs::read_to_string(&template_path).with_context(|| {
             format!(
                 "read template {} for skill {}",
@@ -96,6 +107,12 @@ pub fn write_product(
                 fs::create_dir_all(parent)
                     .with_context(|| format!("create_dir_all {}", parent.display()))?;
             }
+            // Same symlink-escape guard for writes: canonicalize the
+            // parent (which we just ensured exists) and verify it stays
+            // beneath `<source-root>/build/<product>/`. A hostile
+            // `render_to` of `../../etc/passwd` is already rejected by
+            // sandboxed_join; this also catches `dir-that-is-a-symlink/foo`.
+            let output_path = guard_write_under(&canonical_output_root, &output_path)?;
             fs::write(&output_path, rendered.as_bytes())
                 .with_context(|| format!("write {}", output_path.display()))?;
             report.rendered.push(skill.id.clone());
@@ -201,6 +218,57 @@ fn input_hash(
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+/// Resolve a candidate read path and assert the canonical result is
+/// still under `canonical_base`. Defeats symlink-based sandbox escape
+/// where a hostile `core/skills/<x>/SKILL.md.tera` symlinks to a file
+/// outside the source root (e.g. `/etc/passwd`). The path must exist;
+/// the caller is reading it.
+pub(crate) fn canonicalize_under(canonical_base: &Path, candidate: &Path) -> Result<PathBuf> {
+    let resolved = candidate
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", candidate.display()))?;
+    if !resolved.starts_with(canonical_base) {
+        return Err(anyhow!(
+            "path {candidate} resolves outside the source root \
+             ({resolved} not under {canonical_base}) — likely a symlink escape",
+            candidate = candidate.display(),
+            resolved = resolved.display(),
+            canonical_base = canonical_base.display(),
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Resolve a candidate write path. The file itself may not exist yet,
+/// so we canonicalize the parent (which the caller created via
+/// `create_dir_all`) and assert it sits under `canonical_base`. A
+/// hostile parent symlink — e.g. `build/<product>/foo` is a symlink to
+/// `/etc/` — gets rejected before we open the file for write.
+pub(crate) fn guard_write_under(canonical_base: &Path, candidate: &Path) -> Result<PathBuf> {
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| anyhow!("render output path {} has no parent", candidate.display()))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .with_context(|| format!("canonicalize parent of {}", candidate.display()))?;
+    if !canonical_parent.starts_with(canonical_base) {
+        return Err(anyhow!(
+            "render output {} resolves outside the build root \
+             ({} not under {}) — likely a symlink escape",
+            candidate.display(),
+            canonical_parent.display(),
+            canonical_base.display(),
+        ));
+    }
+    let file_name = candidate.file_name().ok_or_else(|| {
+        anyhow!(
+            "render output path {} has no file name",
+            candidate.display()
+        )
+    })?;
+    Ok(canonical_parent.join(file_name))
 }
 
 /// Join `relative` onto `base` after rejecting any `..` segments. Used
@@ -557,6 +625,66 @@ skills:
         assert!(format!("{err}").contains(".."));
         let err = sandboxed_join(base, "/etc/passwd").unwrap_err();
         assert!(format!("{err}").contains("absolute"));
+    }
+
+    /// A hostile `skill.source` directory could contain a symlinked
+    /// SKILL.md.tera that points outside the source root. The lexical
+    /// `sandboxed_join` accepts the path (no `..`, not absolute), so
+    /// `canonicalize_under` catches the escape just before the read.
+    /// Without that guard the renderer would expose `/etc/passwd` (or
+    /// any readable file) into rendered output.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_skill_template_outside_source_root_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let root = fixture_source_root(&tmp);
+        let set = load_set(&root);
+        // Replace the legitimate template with a symlink pointing at
+        // a file outside the source root.
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("hostile.tera");
+        fs::write(&target, "# captured from outside\n").unwrap();
+        let template_path = root
+            .path()
+            .join("core/skills/market/favorites/SKILL.md.tera");
+        fs::remove_file(&template_path).unwrap();
+        std::os::unix::fs::symlink(&target, &template_path).unwrap();
+
+        let err = write_product(&root, set, "codex").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("symlink") || msg.contains("outside the source root"),
+            "{msg}",
+        );
+    }
+
+    /// Same threat surface as the read-path test, but for the write
+    /// path: a hostile `build/<product>/` symlink could redirect render
+    /// output into the user's home directory. `guard_write_under`
+    /// canonicalizes the parent before fs::write opens it.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_build_dir_outside_root_is_rejected_for_writes() {
+        let tmp = TempDir::new().unwrap();
+        let root = fixture_source_root(&tmp);
+        let set = load_set(&root);
+        // Pre-create build/<product>/, then swap one nested dir for a
+        // symlink pointing outside the canonical build root.
+        let build = root.path().join("build/codex");
+        fs::create_dir_all(&build).unwrap();
+        let dest = build.join("skills/market/favorites");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let outside = TempDir::new().unwrap();
+        let exfil = outside.path().join("favorites");
+        fs::create_dir(&exfil).unwrap();
+        std::os::unix::fs::symlink(&exfil, &dest).unwrap();
+
+        let err = write_product(&root, set, "codex").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("outside the build root") || msg.contains("symlink"),
+            "{msg}",
+        );
     }
 
     #[test]

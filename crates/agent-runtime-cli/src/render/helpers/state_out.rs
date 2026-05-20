@@ -16,9 +16,10 @@ use tera::{Function, Value};
 
 pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
     move |args: &HashMap<String, Value>| -> tera::Result<Value> {
-        let domain = string_arg(args, "domain")?;
-        let topic = optional_string_arg(args, "topic")?;
-        let repo = optional_string_arg(args, "repo")?;
+        let domain = validated_arg(args, "domain", /* required */ true)?
+            .expect("required arg returned None unexpectedly");
+        let topic = validated_arg(args, "topic", false)?;
+        let repo = validated_arg(args, "repo", false)?;
         match ctx.current_skill_state_out_mode {
             StateOutMode::Runtime => {
                 let mut cmd = format!("agent-out path-for --domain {domain}");
@@ -39,29 +40,45 @@ pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
     }
 }
 
-fn string_arg(args: &HashMap<String, Value>, name: &'static str) -> tera::Result<String> {
-    let raw = args
-        .get(name)
-        .ok_or_else(|| tera::Error::msg(format!("state_out(): required arg `{name}` (string)")))?;
-    raw.as_str().map(str::to_string).ok_or_else(|| {
-        tera::Error::msg(format!(
-            "state_out(): arg `{name}` must be a string, got {raw:?}"
-        ))
-    })
+/// Allowed character set for `state_out` args. The rendered output is a
+/// command string that downstream agent runtimes feed to a shell, so the
+/// helper rejects anything that could break out of the argv slot:
+/// shell metacharacters (` ; | & $ \` < > * ? \n` etc.), shell quote
+/// characters, and any whitespace. Identifiers in the source doc are
+/// kebab-case slugs (`market`, `favorites`, `nils-cli`); this charset
+/// is intentionally narrow.
+fn arg_charset_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
 }
 
-fn optional_string_arg(
+fn validated_arg(
     args: &HashMap<String, Value>,
     name: &'static str,
+    required: bool,
 ) -> tera::Result<Option<String>> {
     let Some(raw) = args.get(name) else {
+        if required {
+            return Err(tera::Error::msg(format!(
+                "state_out(): required arg `{name}` (string)"
+            )));
+        }
         return Ok(None);
     };
-    raw.as_str().map(|s| Some(s.to_string())).ok_or_else(|| {
+    let value = raw.as_str().ok_or_else(|| {
         tera::Error::msg(format!(
             "state_out(): arg `{name}` must be a string, got {raw:?}"
         ))
-    })
+    })?;
+    if !arg_charset_ok(value) {
+        return Err(tera::Error::msg(format!(
+            "state_out(): arg `{name}` {value:?} contains characters outside \
+             the allowed set [A-Za-z0-9._:/-]; the rendered command is \
+             shell-executed downstream and must stay quote-free",
+        )));
+    }
+    Ok(Some(value.to_string()))
 }
 
 #[cfg(test)]
@@ -117,5 +134,60 @@ mod tests {
         let err = render(r#"{{ state_out() }}"#, ctx).unwrap_err();
         let msg = format_err(&err);
         assert!(msg.contains("required arg `domain`"), "{msg}");
+    }
+
+    /// Shell-meta injection attempt — the rendered command string is
+    /// shell-executed downstream, so a `domain=; rm -rf $HOME` literal
+    /// would propagate. The charset gate rejects it before render.
+    #[test]
+    fn rejects_shell_metacharacters_in_args() {
+        let ctx = fixture_context("codex");
+        let err = render(r#"{{ state_out(domain="market; rm -rf $HOME") }}"#, ctx).unwrap_err();
+        let msg = format_err(&err);
+        assert!(msg.contains("characters outside the allowed set"), "{msg}");
+        assert!(msg.contains("rm -rf"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_whitespace_in_args() {
+        let ctx = fixture_context("codex");
+        let err = render(
+            r#"{{ state_out(domain="market", topic="favorites bar") }}"#,
+            ctx,
+        )
+        .unwrap_err();
+        assert!(format_err(&err).contains("favorites bar"));
+    }
+
+    #[test]
+    fn rejects_dollar_sign_in_args() {
+        let ctx = fixture_context("codex");
+        let err = render(r#"{{ state_out(domain="market", topic="$HOME") }}"#, ctx).unwrap_err();
+        let msg = format_err(&err);
+        assert!(msg.contains("state_out()"), "{msg}");
+        assert!(msg.contains("$HOME"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_empty_string_arg() {
+        let ctx = fixture_context("codex");
+        let err = render(r#"{{ state_out(domain="") }}"#, ctx).unwrap_err();
+        assert!(format_err(&err).contains("allowed set"));
+    }
+
+    #[test]
+    fn accepts_kebab_case_and_slashes() {
+        // Real source-doc identifiers include kebab-case slugs (`nils-cli`),
+        // dotted scopes (`market.favorites`), and a few slash-bearing repos.
+        let ctx = fixture_context("codex");
+        let out = render(
+            r#"{{ state_out(domain="market", topic="market.favorites", repo="sympoies/nils-cli") }}"#,
+            ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "agent-out path-for --domain market --topic market.favorites --repo sympoies/nils-cli",
+        );
     }
 }

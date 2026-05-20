@@ -30,14 +30,22 @@ impl RenderCache {
     }
 
     /// Load the cache from `path`, returning an empty cache when the
-    /// file is missing or unreadable. An unparsable cache file is
-    /// silently treated as empty so a corrupted cache forces a full
-    /// re-render instead of failing the run.
+    /// file is missing or unreadable. An unparsable cache file or one
+    /// with a `schema_version` that we don't know how to interpret is
+    /// silently treated as empty so a corrupted or future-format cache
+    /// forces a full re-render instead of failing the run or silently
+    /// trusting cache entries from a different version.
     pub fn load_or_empty(path: &Path) -> Self {
-        match fs::read_to_string(path) {
-            Ok(body) => serde_json::from_str(&body).unwrap_or_else(|_| Self::empty()),
-            Err(_) => Self::empty(),
+        let Ok(body) = fs::read_to_string(path) else {
+            return Self::empty();
+        };
+        let Ok(parsed) = serde_json::from_str::<Self>(&body) else {
+            return Self::empty();
+        };
+        if parsed.schema_version != CACHE_SCHEMA_VERSION {
+            return Self::empty();
         }
+        parsed
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -90,6 +98,23 @@ mod tests {
         fs::write(&path, "this is not json").unwrap();
         let loaded = RenderCache::load_or_empty(&path);
         assert!(loaded.skills.is_empty());
+    }
+
+    /// A cache file written by a future agent-runtime-cli with a newer
+    /// `schema_version` should be ignored rather than half-trusted —
+    /// the entries' shape might have changed.
+    #[test]
+    fn schema_version_mismatch_loads_as_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".render-cache.json");
+        fs::write(
+            &path,
+            r#"{"schema_version": 99, "skills": {"old.skill": {"hash": "sha256:0", "output": "x"}}}"#,
+        )
+        .unwrap();
+        let loaded = RenderCache::load_or_empty(&path);
+        assert!(loaded.skills.is_empty());
+        assert_eq!(loaded.schema_version, CACHE_SCHEMA_VERSION);
     }
 
     #[test]

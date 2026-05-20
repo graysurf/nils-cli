@@ -161,8 +161,10 @@ pub struct Skill {
     pub id: String,
     pub domain: String,
     pub source: String,
-    #[serde(default)]
-    pub products: IndexMap<String, ProductRender>,
+    // `products` is required per the upstream schema. The map is closed
+    // to the known products (`codex`, `claude`) — an unknown key in
+    // skills.yaml is a typo, not a silent skip.
+    pub products: SkillProducts,
     pub required_clis: IndexMap<String, String>,
     #[serde(default)]
     pub state_out_mode: StateOutMode,
@@ -172,6 +174,33 @@ pub struct Skill {
     pub divergent: bool,
     #[serde(default)]
     pub portability_notes: Option<String>,
+}
+
+/// Per-product render config for a skill. Mirrors the upstream
+/// `productRender` schema: `additionalProperties: false`, with both
+/// product keys optional. An unknown key (`code:`, `cluade:`) fails
+/// deserialization via `deny_unknown_fields` instead of being silently
+/// ignored as a "skill that supports neither product".
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillProducts {
+    #[serde(default)]
+    pub codex: Option<ProductRender>,
+    #[serde(default)]
+    pub claude: Option<ProductRender>,
+}
+
+impl SkillProducts {
+    /// Return the per-product entry for `product`. Unknown product
+    /// names always return `None`; callers should validate `product`
+    /// against the runtime-roots set before reaching this helper.
+    pub fn get(&self, product: &str) -> Option<&ProductRender> {
+        match product {
+            "codex" => self.codex.as_ref(),
+            "claude" => self.claude.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -215,11 +244,23 @@ pub struct Plugin {
     pub id: String,
     pub domain: String,
     pub contained_skills: Vec<String>,
-    pub product_manifests: IndexMap<String, String>,
+    pub product_manifests: PluginProductManifests,
     #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub install_policy: InstallPolicy,
+}
+
+/// Per-product manifest paths. Mirrors the upstream schema's closed
+/// `additionalProperties: false` shape; unknown product keys (typos)
+/// fail deserialization instead of being silently dropped.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginProductManifests {
+    #[serde(default)]
+    pub codex: Option<String>,
+    #[serde(default)]
+    pub claude: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -626,5 +667,63 @@ plugins:
             ManifestError::SourceRoot { path, .. } => assert_eq!(path, bogus),
             other => panic!("expected ManifestError::SourceRoot, got {other:?}"),
         }
+    }
+
+    /// A typo in a product key (`code:` instead of `codex:`) used to be
+    /// silently dropped because `Skill.products` was an open
+    /// `IndexMap<String, _>`. The closed `SkillProducts` struct rejects
+    /// it as a parse error — the skill should not silently support
+    /// neither product.
+    #[test]
+    fn typo_in_product_key_is_rejected_at_parse_time() {
+        let yaml = r#"
+schema_version: 1
+skills:
+  - id: domain.skill
+    domain: domain
+    source: core/skills/domain/skill
+    products:
+      code:
+        render_to: skills/domain/skill/SKILL.md
+    required_clis:
+      agent-runtime: ">=0.13.0"
+"#;
+        let err = serde_yml::from_str::<SkillsManifest>(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("code"), "{msg}");
+    }
+
+    /// `Skill.products` is required per the upstream JSON schema. A
+    /// skill that omits the key should fail parse, not silently
+    /// default to an empty product map.
+    #[test]
+    fn skill_without_products_key_is_rejected() {
+        let yaml = r#"
+schema_version: 1
+skills:
+  - id: domain.skill
+    domain: domain
+    source: core/skills/domain/skill
+    required_clis:
+      agent-runtime: ">=0.13.0"
+"#;
+        let err = serde_yml::from_str::<SkillsManifest>(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("products"), "{msg}");
+    }
+
+    #[test]
+    fn typo_in_plugin_product_manifest_key_is_rejected() {
+        let yaml = r#"
+schema_version: 1
+plugins:
+  - id: domain
+    domain: domain
+    contained_skills: []
+    product_manifests:
+      cluade: "targets/claude/.claude-plugin/plugin.json"
+"#;
+        let err = serde_yml::from_str::<PluginsManifest>(yaml).unwrap_err();
+        assert!(format!("{err}").contains("cluade"));
     }
 }

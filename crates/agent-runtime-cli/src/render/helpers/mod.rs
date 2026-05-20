@@ -49,7 +49,7 @@ mod test_support {
         CliToolFormula, CliToolsManifest, CliToolsProfiles, HooksModel, PluginManifestSpec,
         PluginsManifest, ProductCapabilitiesManifest, ProductCapabilitiesProducts,
         ProductCapability, ProductRender, ProductRoot, RuntimeRootsManifest, RuntimeRootsProducts,
-        RuntimeState, Skill, SkillsManifest, StateOutMode,
+        RuntimeState, Skill, SkillProducts, SkillsManifest, StateOutMode,
     };
 
     fn product_capability() -> ProductCapability {
@@ -90,23 +90,18 @@ mod test_support {
     }
 
     pub fn fixture_manifests() -> ManifestSet {
-        let mut products = IndexMap::new();
-        products.insert(
-            "codex".to_string(),
-            ProductRender {
+        let products = SkillProducts {
+            codex: Some(ProductRender {
                 name: Some("/codex-name".to_string()),
                 render_to: "build/codex/skills/sample/SKILL.md".to_string(),
                 path_override: None,
-            },
-        );
-        products.insert(
-            "claude".to_string(),
-            ProductRender {
+            }),
+            claude: Some(ProductRender {
                 name: Some("market:favorites".to_string()),
                 render_to: "build/claude/plugins/market/skills/favorites/SKILL.md".to_string(),
                 path_override: None,
-            },
-        );
+            }),
+        };
         let mut required_clis = IndexMap::new();
         required_clis.insert("agent-out".to_string(), ">=0.5.0".to_string());
         required_clis.insert("market-cli".to_string(), ">=0.4.0".to_string());
