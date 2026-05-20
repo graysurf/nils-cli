@@ -7,10 +7,10 @@
 - Execution window: sprint-by-sprint (one feature PR per sprint, `/code-review-specialists`
   review between sprints, merge before next sprint)
 - Staged execution confirmation: confirmed 2026-05-20 (Sprint 1 only first, then 2/3/4 in order)
-- Current task: Sprint 2 close (PR open + review)
-- Next task: Sprint 3 — audit-drift body (after Sprint 2 PR merges)
+- Current task: Sprint 3 close (PR open + review)
+- Next task: Sprint 4 — release 0.13.0 + tap bump + cross-repo floor (after Sprint 3 PR merges)
 - Last updated: 2026-05-21
-- Branch/commit: `feat/agent-runtime-determinism-lints`
+- Branch/commit: `feat/agent-runtime-audit-drift`
 - Source document: docs/plans/02-nils-cli-render-and-drift-audit/02-nils-cli-render-and-drift-audit-plan.md
 - Direct source-doc execution waiver: not applicable
 
@@ -42,10 +42,10 @@
 | 2.1 | done    | Add determinism clippy lints to affected crates                 | clippy.toml + `#![deny(clippy::disallowed_types, clippy::disallowed_methods)]`     |
 | 2.2 | done    | Add cross-process render determinism integration test           | Two separate `agent-runtime` invocations, cache deleted between, byte-equal walk   |
 | 2.3 | done    | Document the only sanctioned time value                         | `render::time::source_commit_timestamp` + `docs/determinism.md` contract           |
-| 3.1 | pending | Source-manifest validity and rendered-target diff classes       | depends on 1.3                                                                     |
-| 3.2 | pending | `$AGENT_HOME` leak class (blocking, exit 2)                     | depends on 3.1                                                                     |
-| 3.3 | pending | Docs-home per product class (blocking, exit 2)                  | depends on 3.1                                                                     |
-| 3.4 | pending | Audit-drift fixture set                                         | depends on 3.1/3.2/3.3                                                             |
+| 3.1 | done    | Source-manifest validity and rendered-target diff classes       | `audit_drift::{source_manifest,rendered_target}`; warn-tier (exit 1)               |
+| 3.2 | done    | `$AGENT_HOME` leak class (blocking, exit 2)                     | `audit_drift::agent_home_leak`; product-build + source-tree scans; allowlist       |
+| 3.3 | done    | Docs-home per product class (blocking, exit 2)                  | `audit_drift::docs_home`; table-driven product → expected docs-home                |
+| 3.4 | done    | Audit-drift fixture set                                         | 5 integration tests off render-determinism fixture; one per class + clean baseline |
 | 4.1 | pending | Workspace bump 0.12.0 → 0.13.0; publish order + release.yml bin | reshaped per Sprint 4 drift decision                                               |
 | 4.2 | pending | Bump `homebrew-tap` formula                                     | depends on 4.1                                                                     |
 | 4.3 | pending | Cross-repo: `required_clis['agent-runtime']` → `">=0.13.0"`     | PR against `graysurf/agent-runtime-kit`; depends on 4.2                            |
@@ -110,6 +110,28 @@ audit-drift body + fixtures, release/tap/cross-repo floor bump.
   Deferred items: helper-arg dedup, `Command::name` catch-all → Sprint 2
   cleanup; remaining api-contract / testing low+info items tracked on
   the issue.
+- 2026-05-21 — Sprint 3 lands on branch
+  `feat/agent-runtime-audit-drift`: Task 3.1 wires
+  `audit_drift::source_manifest` (typed `manifest::load_all` re-validation
+  + `<TBD` placeholder scan over the five manifest files; warn-tier)
+  and `audit_drift::rendered_target` (re-render into a `TempDir` scratch
+  and BTreeMap-keyed byte diff vs live `build/<product>/`; warn-tier).
+  Writer refactored with `write_product_to(root, manifests, product,
+  output_root)` so the diff class can redirect output without touching
+  the live build tree. Tasks 3.2 + 3.3 add the block-tier classes:
+  `audit_drift::agent_home_leak` scans `build/<product>/`, `core/`,
+  `targets/`, `manifests/` for the literal `$AGENT_HOME` substring
+  (hard-coded allowlist for `docs/source/inventory-target-architecture.md`),
+  and `audit_drift::docs_home` matches `--docs-home` args per product
+  against the table-driven expected value
+  (`"$CODEX_HOME"` / `"$HOME/.claude"`). Task 3.4 lands
+  `tests/integration/audit_drift_classes.rs` (5 tests) driving each
+  fixture variant off the `render-determinism` fixture as base
+  (renders both products, then mutates one surface per test before
+  invoking `agent-runtime audit-drift`). The render-determinism
+  fixture's `runtime-roots.yaml` Phase 1 `<TBD>` placeholders are
+  pinned to 0.12.0 / 2026-05-21 so the clean baseline truly exits 0.
+  Test counts: lib 59 → 70, integration 16 → 21.
 - 2026-05-21 — Sprint 2 lands on branch
   `feat/agent-runtime-determinism-lints`: Task 2.1 introduces
   `clippy.toml` for `agent-runtime-cli` + `nils-common` (disallowed

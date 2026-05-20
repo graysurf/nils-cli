@@ -33,15 +33,32 @@ pub struct RenderReport {
 }
 
 /// Render every skill declared for `product` from manifests rooted at
-/// `root`. Returns a summary describing which skills were rendered,
-/// served from cache, or skipped.
+/// `root` into the default `<source-root>/build/<product>/` tree.
+///
+/// For renders that need a custom output destination (the
+/// audit-drift rendered-target diff class renders into a scratch
+/// dir to diff against the live build), use [`write_product_to`].
 pub fn write_product(
     root: &SourceRoot,
     manifests: Arc<ManifestSet>,
     product: &str,
 ) -> Result<RenderReport> {
-    require_known_product(&manifests, product)?;
     let output_root = root.path().join("build").join(product);
+    write_product_to(root, manifests, product, &output_root)
+}
+
+/// Render variant that writes into `output_root` rather than the
+/// default `<source-root>/build/<product>/`. The output root must
+/// exist or be creatable; symlink-escape and `..`-traversal guards
+/// still apply.
+pub fn write_product_to(
+    root: &SourceRoot,
+    manifests: Arc<ManifestSet>,
+    product: &str,
+    output_root: &Path,
+) -> Result<RenderReport> {
+    require_known_product(&manifests, product)?;
+    let output_root = output_root.to_path_buf();
     fs::create_dir_all(&output_root)
         .with_context(|| format!("create_dir_all {}", output_root.display()))?;
 
