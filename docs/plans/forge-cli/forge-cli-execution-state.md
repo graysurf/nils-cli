@@ -7,12 +7,13 @@
 - Execution window: 2026-05-19 → ongoing
 - Staged execution confirmation: not applicable (default-continue
   authorization: "默認就一直做下去")
-- Current task: Sprint 6 review (PR pending)
-- Next task: Task 7.1
+- Current task: Sprint 7 review (PR pending)
+- Next task: Task 8.1
 - Last updated: 2026-05-20
-- Branch/commit: `feat/forge-cli-v1-sprint6-deliver` cut from
-  `origin/main@718b7dd` (Sprint 5 PR #395 merge); Sprint 6 macro and
-  per-atom compute helpers complete locally, PR pending push and CI
+- Branch/commit: `feat/forge-cli-v1-sprint7-parity` cut from
+  `origin/main@15fcc73` (Sprint 6 PR #397 merge); parity harness,
+  exit-code matrix, and fixture redaction audit complete locally,
+  PR pending push and CI
 - Source document: docs/plans/forge-cli/forge-cli-plan.md
 - Direct source-doc execution waiver: not applicable
 
@@ -41,9 +42,9 @@
 | Task 5.2 | completed | `issue edit`, `issue comment`                               | branch `feat/forge-cli-v1-sprint5-issues`  | Sprint 5 — partial mutation + body-file stdin                  |
 | Task 6.1 | completed | `pr deliver` macro composition + step envelope              | branch `feat/forge-cli-v1-sprint6-deliver` | Sprint 6 — atom compute helpers + WaitOutcome enum, 6-step seq |
 | Task 6.2 | completed | Macro CLI surface + dry-run plan rendering                  | branch `feat/forge-cli-v1-sprint6-deliver` | Sprint 6 — 4 integration tests pin dry-run / no-merge / method |
-| Task 7.1 | pending   | Parity harness                                              | n/a                                        | Sprint 7                                                       |
-| Task 7.2 | pending   | Exit-code matrix completion                                 | n/a                                        | Sprint 7                                                       |
-| Task 7.3 | pending   | Fixture redaction audit                                     | n/a                                        | Sprint 7                                                       |
+| Task 7.1 | completed | Parity harness                                              | branch `feat/forge-cli-v1-sprint7-parity`  | Sprint 7 — 11-row table + 5 cross-provider envelope assertions |
+| Task 7.2 | completed | Exit-code matrix completion                                 | branch `feat/forge-cli-v1-sprint7-parity`  | Sprint 7 — 12 tests covering every documented (exit, kind)     |
+| Task 7.3 | completed | Fixture redaction audit                                     | branch `feat/forge-cli-v1-sprint7-parity`  | Sprint 7 — lint script + planted-token regression test         |
 | Task 8.1 | pending   | `wrappers/forge-cli` + shell completions                    | n/a                                        | Sprint 8                                                       |
 | Task 8.2 | pending   | Homebrew tap formula update                                 | n/a                                        | Sprint 8                                                       |
 | Task 8.3 | pending   | `nils-cli` minor bump + tag + tap formula bump              | n/a                                        | Sprint 8                                                       |
@@ -110,3 +111,18 @@
   `pr_wait_checks::WaitOutcome`, and landed the `pr deliver` macro at
   `crates/forge-cli/src/macros/pr_deliver.rs`. Test surface grows to
   219 lib + 67 integration. PR pending push + CI green.
+- 2026-05-20 — Sprint 6 first CI run tripped `--fail-under-lines 85`
+  because only the dry-run path of the macro had coverage; pushed
+  `59a25a6` adding three full-chain integration tests against a
+  comprehensive gh stub (no-merge / full chain with merge_sha /
+  pr.create title_too_long short-circuit). Re-run came back green.
+- 2026-05-20 — Sprint 6 merged via PR #397 (`15fcc73`); cut Sprint 7
+  branch `feat/forge-cli-v1-sprint7-parity` from updated `origin/main`.
+  Sprint 7 added the parity harness
+  (`crates/forge-cli/tests/integration/parity.rs`, 11-row table,
+  5 cross-provider envelope invariants), the full exit-code matrix
+  (`exit_codes_full.rs`, 12 tests covering every documented
+  `(exit, kind)` pair), and the fixture redaction audit
+  (`scripts/ci/forge-cli-fixture-lint.sh` + planted-token regression
+  in `fixture_lint.rs`, wired into the docs-only entrypoint). Test
+  surface grows to 219 lib + 89 integration.
