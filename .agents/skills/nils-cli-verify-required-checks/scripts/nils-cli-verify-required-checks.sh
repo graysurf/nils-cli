@@ -119,6 +119,7 @@ run bash scripts/ci/docs-hygiene-audit.sh --strict
 run bash scripts/ci/markdownlint-audit.sh --strict
 run bash scripts/ci/plan-bundle-validate.sh --strict
 run bash scripts/ci/cli-output-contract-lint.sh --strict
+run bash scripts/ci/forge-cli-fixture-lint.sh --strict
 if [[ "$docs_only" -eq 1 ]]; then
   echo "ok: docs-only nils-cli checks passed"
   exit 0
