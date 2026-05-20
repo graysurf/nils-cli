@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
-use nils_common::cli_contract::{OutputFormat, emit_parse_error, exit, schema_version_for};
+use nils_common::cli_contract::{OutputFormat, emit_parse_error, exit};
 
 use crate::error::ForgeError;
 use crate::ops;
@@ -159,6 +159,13 @@ impl PrKindFlag {
         match self {
             PrKindFlag::Feature => crate::validations::PrKind::Feature,
             PrKindFlag::Bug => crate::validations::PrKind::Bug,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrKindFlag::Feature => "feature",
+            PrKindFlag::Bug => "bug",
         }
     }
 }
@@ -421,7 +428,46 @@ pub enum PrCommand {
     /// Block until every required check reaches a terminal state.
     WaitChecks(PrWaitChecksArgs),
     /// End-to-end "open draft → CI green → ready → merge" macro.
-    Deliver,
+    Deliver(PrDeliverArgs),
+}
+
+/// `pr deliver` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.deliver` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrDeliverArgs {
+    /// PR / MR kind (selects branch-prefix rule). Required.
+    #[arg(long, value_enum)]
+    pub kind: PrKindFlag,
+    /// PR / MR title (required).
+    #[arg(long)]
+    pub title: String,
+    /// PR / MR body / description text. Mutually exclusive with `--body-file`.
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read PR / MR body from a file. Use `-` to read from stdin.
+    #[arg(long = "body-file", value_name = "PATH")]
+    pub body_file: Option<String>,
+    /// Source branch (defaults to the current branch).
+    #[arg(long)]
+    pub head: Option<String>,
+    /// Target / base branch (defaults to the repo's default branch).
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Merge method (default: squash).
+    #[arg(long, value_enum, default_value_t = MergeMethodFlag::Squash)]
+    pub method: MergeMethodFlag,
+    /// Add a reviewer (repeatable).
+    #[arg(long = "reviewer", value_name = "USER")]
+    pub reviewers: Vec<String>,
+    /// CI-wait budget before declaring `checks_timeout` (default `30m`).
+    #[arg(long, value_parser = parse_duration, default_value = "30m")]
+    pub timeout: Duration,
+    /// Stop after `pr.wait-checks` — do not promote to ready or merge.
+    #[arg(long = "no-merge", action = ArgAction::SetTrue)]
+    pub no_merge: bool,
+    /// Allow merges where the PR's base is not the repo's default branch.
+    #[arg(long = "allow-non-default-base", action = ArgAction::SetTrue)]
+    pub allow_non_default_base: bool,
 }
 
 /// `issue` subtree.
@@ -584,6 +630,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Merge(args)),
         })) => ops::pr_merge::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Deliver(args)),
+        })) => crate::macros::pr_deliver::run(&global, args, format),
         Some(Command::Issue(IssueArgs {
             command: Some(IssueCommand::Create(args)),
         })) => ops::issue_create::run(&global, args, format),
@@ -613,13 +662,6 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             let _ = <Cli as clap::CommandFactory>::command().print_help();
             return exit::USAGE;
         }
-        // Every other subcommand declared above is part of the v1 surface but
-        // not implemented in Sprint 1. The structured failure keeps callers on
-        // the contract instead of panicking on `todo!()`.
-        _ => Err(ForgeError::not_implemented(
-            schema_version_for(BINARY, "error", 1),
-            "subcommand not implemented in this sprint",
-        )),
     };
 
     match result {
@@ -817,6 +859,9 @@ mod tests {
                 "edit" | "comment" | "ready" | "merge" | "close" => argv.push("1"),
                 "create" => {
                     argv.extend(["--title", "demo", "--kind", "feature", "--body", "x"]);
+                }
+                "deliver" => {
+                    argv.extend(["--kind", "feature", "--title", "demo"]);
                 }
                 _ => {}
             }

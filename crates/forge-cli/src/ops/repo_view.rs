@@ -50,9 +50,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
     let ctx = crate::provider::detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
-    let call = build_call(&ctx, global.repo.as_deref());
 
     if global.dry_run {
+        let call = build_call(&ctx, global.repo.as_deref());
         let payload = DryRunPayload::new(ctx.provider, &call);
         return Ok(emit_success(
             schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
@@ -62,14 +62,26 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
-    let output = runner.run(&call)?;
-    let payload = parse_backend_output(&ctx, &output)?;
+    let payload = compute(runner, &ctx, global.repo.as_deref())?;
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
         payload,
         format,
         render_text,
     ))
+}
+
+/// Macro-facing entry point: compute the payload without emitting. Used by
+/// `pr deliver` to capture the repo view step's typed output for the
+/// composite envelope.
+pub fn compute<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    repo_override: Option<&str>,
+) -> Result<RepoViewPayload, ForgeError> {
+    let call = build_call(ctx, repo_override);
+    let output = runner.run(&call)?;
+    parse_backend_output(ctx, &output)
 }
 
 fn build_call(ctx: &ProviderContext, repo_override: Option<&str>) -> BackendCall {

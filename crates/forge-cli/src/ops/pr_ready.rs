@@ -66,17 +66,41 @@ where
             |p| println!("would run: {plan}", plan = p.plan.join(" ")),
         ));
     }
-    let _ = runner.run(&call)?;
-
-    let view_call = pr_view_call(&ctx, args.id);
-    let view_output = runner.run(&view_call)?;
-    let payload: PrViewPayload = pr_view::parse_view_output(&ctx, &view_output)?;
+    let payload = run_backend_and_fetch(runner, &ctx, args.id)?;
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
         payload,
         format,
         render_text,
     ))
+}
+
+/// Macro-facing entry point: validate worktree, mark ready, re-fetch view,
+/// return the typed payload without emitting an envelope. Used by
+/// `pr deliver` to capture this step's typed output.
+pub fn compute<R, G>(
+    runner: &R,
+    ctx: &ProviderContext,
+    id: u64,
+    workdir: &std::path::Path,
+    git_status: G,
+) -> Result<PrViewPayload, ForgeError>
+where
+    R: BackendRunner,
+    G: FnOnce(&std::path::Path) -> Result<String, ForgeError>,
+{
+    worktree_clean(workdir, git_status)?;
+    run_backend_and_fetch(runner, ctx, id)
+}
+
+fn run_backend_and_fetch<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    id: u64,
+) -> Result<PrViewPayload, ForgeError> {
+    let _ = runner.run(&build_ready_call(ctx, id))?;
+    let view_output = runner.run(&pr_view_call(ctx, id))?;
+    pr_view::parse_view_output(ctx, &view_output)
 }
 
 fn build_ready_call(ctx: &ProviderContext, id: u64) -> BackendCall {

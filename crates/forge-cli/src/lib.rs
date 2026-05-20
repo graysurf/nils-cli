@@ -13,6 +13,7 @@ pub mod config;
 pub mod envelope;
 pub mod error;
 pub mod glab_version;
+pub mod macros;
 pub mod ops;
 pub mod provider;
 pub mod validations;

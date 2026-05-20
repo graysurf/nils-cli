@@ -45,9 +45,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
     let ctx = crate::provider::detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
-    let call = build_call(&ctx);
 
     if global.dry_run {
+        let call = build_call(&ctx);
         let payload = DryRunPayload::new(ctx.provider, &call);
         return Ok(emit_success(
             schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
@@ -57,14 +57,33 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
-    let output = runner.run(&call)?;
-    let payload = parse_backend_output(&ctx, &output)?;
+    let payload = compute_with_ctx(runner, &ctx)?;
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
         payload,
         format,
         render_text,
     ))
+}
+
+/// Macro-facing entry point: compute the payload without emitting an
+/// envelope. Used by `pr deliver` to capture each step's typed output.
+pub fn compute<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    remote_url_lookup: F,
+) -> Result<AuthStatusPayload, ForgeError> {
+    let ctx = crate::provider::detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    compute_with_ctx(runner, &ctx)
+}
+
+fn compute_with_ctx<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+) -> Result<AuthStatusPayload, ForgeError> {
+    let call = build_call(ctx);
+    let output = runner.run(&call)?;
+    parse_backend_output(ctx, &output)
 }
 
 fn build_call(ctx: &ProviderContext) -> BackendCall {
