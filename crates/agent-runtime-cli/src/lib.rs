@@ -1,3 +1,22 @@
+//! `agent-runtime` CLI library. Render / install / doctor /
+//! audit-drift for graysurf/agent-runtime-kit.
+//!
+//! ## Determinism contract (Resolved Decision #9)
+//!
+//! Render output must be a pure function of the source-root contents:
+//! no wall-clock time, no hash-randomized iteration. The crate-wide
+//! `#![deny(...)]` attribute below pairs with `clippy.toml` to make
+//! `std::collections::HashMap`, `std::time::SystemTime::now`, and
+//! `chrono::Utc::now` build failures. The single sanctioned time
+//! value is `render::time::source_commit_timestamp()`. Helpers under
+//! `render::helpers` are the only sanctioned `HashMap` site — Tera's
+//! `Function` trait forces the signature, and the lint is silenced
+//! exactly there.
+//!
+//! Source: `agent-runtime-kit/docs/source/inventory-target-architecture.md`
+//! → Resolved Decision #9.
+#![deny(clippy::disallowed_types, clippy::disallowed_methods)]
+
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 

@@ -1,0 +1,34 @@
+schema_version: 1
+products:
+  codex:
+    nested_skill_support: true
+    plugin_manifest:
+      path_pattern: "$CODEX_HOME/plugins/<domain>/.codex-plugin/plugin.json"
+      loaded_at_runtime: false
+      schema_ref: "core/docs/schemas/codex-plugin.schema.json"
+    hooks_model:
+      config_surface: "$CODEX_HOME/config.toml"
+      payload_shape: "codex-toml-managed-block"
+      supports_inline_python: false
+    config_activation:
+      - "$CODEX_HOME/AGENTS.md"
+    runtime_state:
+      state_home_env: "CODEX_AGENT_STATE_HOME"
+      default_path: "${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit/codex"
+    marketplace_concept: false
+  claude:
+    nested_skill_support: true
+    plugin_manifest:
+      path_pattern: "${CLAUDE_PLUGIN_ROOT}/<plugin>/.claude-plugin/plugin.json"
+      loaded_at_runtime: true
+      schema_ref: "core/docs/schemas/claude-plugin.schema.json"
+    hooks_model:
+      config_surface: "$HOME/.claude/settings.json"
+      payload_shape: "claude-pretool-v1"
+      supports_inline_python: true
+    config_activation:
+      - "$HOME/.claude/settings.json"
+    runtime_state:
+      state_home_env: "CLAUDE_KIT_STATE_HOME"
+      default_path: "${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit/claude"
+    marketplace_concept: true

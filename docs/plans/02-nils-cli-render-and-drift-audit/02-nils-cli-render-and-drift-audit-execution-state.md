@@ -7,10 +7,10 @@
 - Execution window: sprint-by-sprint (one feature PR per sprint, `/code-review-specialists`
   review between sprints, merge before next sprint)
 - Staged execution confirmation: confirmed 2026-05-20 (Sprint 1 only first, then 2/3/4 in order)
-- Current task: Sprint 1 close (PR open + review)
-- Next task: Task 2.1 (after Sprint 1 PR merges)
+- Current task: Sprint 2 close (PR open + review)
+- Next task: Sprint 3 — audit-drift body (after Sprint 2 PR merges)
 - Last updated: 2026-05-21
-- Branch/commit: `feat/agent-runtime-render-engine`
+- Branch/commit: `feat/agent-runtime-determinism-lints`
 - Source document: docs/plans/02-nils-cli-render-and-drift-audit/02-nils-cli-render-and-drift-audit-plan.md
 - Direct source-doc execution waiver: not applicable
 
@@ -39,9 +39,9 @@
 | 1.2 | done    | Register the four Tera helpers                                  | script / skill_ref / state_out (runtime) / cli_ref; literal-mode errors to Plan 04 |
 | 1.3 | done    | Write `build/<product>/` output and per-skill cache             | SHA-256 keyed `.render-cache.json`; cache hit byte-identical to cache miss         |
 | 1.4 | done    | Add `--update-golden` flag                                      | Per-product subtree scope; sentinel test confirms no writes outside active product |
-| 2.1 | pending | Add determinism clippy lints to affected crates                 | scoped per Open Question default                                                   |
-| 2.2 | pending | Add cross-process render determinism integration test           | depends on 1.3 and 2.1                                                             |
-| 2.3 | pending | Document the only sanctioned time value                         | depends on 2.1                                                                     |
+| 2.1 | done    | Add determinism clippy lints to affected crates                 | clippy.toml + `#![deny(clippy::disallowed_types, clippy::disallowed_methods)]`     |
+| 2.2 | done    | Add cross-process render determinism integration test           | Two separate `agent-runtime` invocations, cache deleted between, byte-equal walk   |
+| 2.3 | done    | Document the only sanctioned time value                         | `render::time::source_commit_timestamp` + `docs/determinism.md` contract           |
 | 3.1 | pending | Source-manifest validity and rendered-target diff classes       | depends on 1.3                                                                     |
 | 3.2 | pending | `$AGENT_HOME` leak class (blocking, exit 2)                     | depends on 3.1                                                                     |
 | 3.3 | pending | Docs-home per product class (blocking, exit 2)                  | depends on 3.1                                                                     |
@@ -110,3 +110,27 @@ audit-drift body + fixtures, release/tap/cross-repo floor bump.
   Deferred items: helper-arg dedup, `Command::name` catch-all → Sprint 2
   cleanup; remaining api-contract / testing low+info items tracked on
   the issue.
+- 2026-05-21 — Sprint 2 lands on branch
+  `feat/agent-runtime-determinism-lints`: Task 2.1 introduces
+  `clippy.toml` for `agent-runtime-cli` + `nils-common` (disallowed
+  `HashMap` + `SystemTime::now` + `chrono::{Utc,Local}::now`) plus
+  crate-level `#![deny(clippy::disallowed_types,
+  clippy::disallowed_methods)]`. The Tera helper module gets a
+  scoped `allow` (Tera forces `&HashMap` at its trait surface);
+  `nils-common::fs::temp_path` gets a scoped `allow` with a comment
+  marking it off the render path. Task 2.2 adds
+  `tests/integration/render_determinism.rs` — two
+  `std::process::Command` invocations of `agent-runtime render`
+  with `.render-cache.json` deleted between runs, walking
+  `build/<product>/` with `BTreeMap` and asserting byte-equal for
+  both `codex` and `claude`. Fixture lives under
+  `tests/fixtures/render-determinism/` (5 manifests + one
+  Tera template exercising every helper). Task 2.3 adds
+  `render::time::source_commit_timestamp(source_root)` (shells out
+  to `git -C <root> log -1 --format=%cI HEAD`; 3 unit tests) plus
+  `docs/determinism.md` documenting the 3 rules + the single
+  sanctioned wall-clock escape hatch + the single sanctioned
+  `HashMap` exemption. Test counts: lib 54 → 57, integration 8 →
+  10. Determinism gate verified to actually fire on a temporary
+  HashMap injection. `bash scripts/ci/nils-cli-checks-entrypoint.sh`
+  exits 0.

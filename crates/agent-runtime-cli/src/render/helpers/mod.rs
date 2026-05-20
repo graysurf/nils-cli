@@ -9,7 +9,10 @@
 //! Tera's `Function` trait signature forces `&HashMap<String, Value>` on
 //! us — that's the only sanctioned `HashMap` import inside `src/render/`
 //! and it stays scoped to this module (the context fed to Tera lives in
-//! [`IndexMap`] / `BTreeMap` per Resolved Decision #9).
+//! [`IndexMap`] / `BTreeMap` per Resolved Decision #9). The crate-wide
+//! `clippy::disallowed_types` gate on `HashMap` is silenced exactly here
+//! and nowhere else.
+#![allow(clippy::disallowed_types)]
 
 use crate::render::manifest::{ManifestSet, StateOutMode};
 use indexmap::IndexMap;

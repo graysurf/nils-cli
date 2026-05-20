@@ -10,6 +10,18 @@
 //! - APIs stay domain-neutral and must not encode crate-specific UX policies.
 //! - Quoting and ANSI differences are expressed via explicit mode/policy parameters.
 //!
+//! ## Determinism contract (Resolved Decision #9)
+//!
+//! `agent-runtime-cli` consumes this crate on its render path, so
+//! `std::collections::HashMap`, `std::time::SystemTime::now`, and
+//! `chrono::Utc::now` are forbidden inside this crate. The crate-wide
+//! `#![deny(...)]` below pairs with `clippy.toml` to make every
+//! violation a build failure. Use `IndexMap` or `BTreeMap` for any map
+//! that wants stable iteration. Source:
+//! `agent-runtime-kit/docs/source/inventory-target-architecture.md`
+//! → Resolved Decision #9.
+#![deny(clippy::disallowed_types, clippy::disallowed_methods)]
+
 pub mod cli_contract;
 pub mod clipboard;
 pub mod env;

@@ -1,0 +1,8 @@
+# {{ skill_ref(id="sample.codex-only") }}
+
+This skill renders only for codex; the claude product render must not
+contain this template's output.
+
+state: {{ state_out(domain="sample", topic="codex-only") }}
+required: {{ cli_ref(name="agent-out") }}
+script: {{ script(path="core/skills/codex_only/SKILL.md.tera") }}
