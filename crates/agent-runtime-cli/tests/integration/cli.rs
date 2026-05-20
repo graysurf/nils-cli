@@ -11,8 +11,21 @@ fn run(args: &[&str]) -> CmdOutput {
     cmd::run(&bin, args, &[], None)
 }
 
-const SUBCOMMANDS: &[&str] = &[
+const ALL_SUBCOMMANDS: &[&str] = &[
     "render",
+    "install",
+    "uninstall",
+    "doctor",
+    "audit-drift",
+    "gc-backups",
+    "restore-backups",
+    "purge-state",
+];
+
+/// Subcommands whose body still prints `not implemented` and exits 1.
+/// `render` is no longer a stub once Task 1.1 lands; later sprints peel
+/// further entries off this list.
+const STUB_SUBCOMMANDS: &[&str] = &[
     "install",
     "uninstall",
     "doctor",
@@ -39,7 +52,7 @@ fn help_lists_every_subcommand() {
     let output = run(&["--help"]);
     assert_eq!(output.code, 0);
     let stdout = output.stdout_text();
-    for sub in SUBCOMMANDS {
+    for sub in ALL_SUBCOMMANDS {
         assert!(
             stdout.contains(sub),
             "help should list `{sub}` subcommand: {stdout}"
@@ -48,8 +61,8 @@ fn help_lists_every_subcommand() {
 }
 
 #[test]
-fn every_subcommand_stub_exits_one_with_not_implemented_stderr() {
-    for sub in SUBCOMMANDS {
+fn every_stub_subcommand_exits_one_with_not_implemented_stderr() {
+    for sub in STUB_SUBCOMMANDS {
         let output = run(&[sub]);
         assert_eq!(output.code, 1, "subcommand `{sub}` should exit 1");
         let stderr = output.stderr_text();
