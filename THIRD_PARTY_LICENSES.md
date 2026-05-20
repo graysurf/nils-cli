@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `8ee4db4c06965010f76731e5a29cf906d9d1653c8eaa72ce99e7867cb94075f4`
+- Cargo.lock SHA256: `a43ced0fc3c5f73e39311264ba2695e8d17fdefc12417e82e3e2df002a29cebc`
 - Third-party crates (`source != null`): 438
 - Workspace crates (`source == null`, excluded below): 31
 
@@ -113,7 +113,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | crc32fast | 1.5.0 | MIT OR Apache-2.0 | crates.io |
 | crossbeam-utils | 0.8.21 | MIT OR Apache-2.0 | crates.io |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 | crates.io |
-| crypto-common | 0.2.1 | MIT OR Apache-2.0 | crates.io |
+| crypto-common | 0.2.2 | MIT OR Apache-2.0 | crates.io |
 | ctrlc | 3.5.2 | MIT/Apache-2.0 | crates.io |
 | data-encoding | 2.11.0 | MIT | crates.io |
 | data-url | 0.3.2 | MIT OR Apache-2.0 | crates.io |
@@ -305,7 +305,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | ring | 0.17.14 | Apache-2.0 AND ISC | crates.io |
 | roxmltree | 0.20.0 | MIT OR Apache-2.0 | crates.io |
 | roxmltree | 0.21.1 | MIT OR Apache-2.0 | crates.io |
-| rsqlite-vfs | 0.1.0 | MIT | crates.io |
+| rsqlite-vfs | 0.1.1 | MIT | crates.io |
 | rusqlite | 0.39.0 | MIT | crates.io |
 | rustc-hash | 2.1.2 | Apache-2.0 OR MIT | crates.io |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 | crates.io |
@@ -347,7 +347,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | slotmap | 1.1.1 | Zlib | crates.io |
 | smallvec | 1.15.1 | MIT OR Apache-2.0 | crates.io |
 | socket2 | 0.6.3 | MIT OR Apache-2.0 | crates.io |
-| sqlite-wasm-rs | 0.5.3 | MIT | crates.io |
+| sqlite-wasm-rs | 0.5.4 | MIT | crates.io |
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 | crates.io |
 | strict-num | 0.1.1 | MIT | crates.io |
 | strsim | 0.11.1 | MIT | crates.io |
