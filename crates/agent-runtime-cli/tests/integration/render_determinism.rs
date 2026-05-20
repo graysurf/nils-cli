@@ -69,13 +69,10 @@ fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
             walk(base, &path, out);
             continue;
         }
-        // The cache file changes between cache-miss and cache-hit runs
-        // by design (the recorded hash and on-disk pretty-print may
-        // shift across versions). The determinism contract covers the
-        // rendered output tree, not the cache scratchpad.
-        if path.file_name().and_then(|n| n.to_str()) == Some(".render-cache.json") {
-            continue;
-        }
+        // `.render-cache.json` is included in the comparison. The cache
+        // is BTreeMap-backed (see `render::cache`) and its on-disk form
+        // is documented as byte-stable, so two cold processes must emit
+        // byte-equal cache files when the source tree is unchanged.
         let bytes = fs::read(&path).unwrap();
         let rel = path
             .strip_prefix(base)

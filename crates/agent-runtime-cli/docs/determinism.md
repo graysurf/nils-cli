@@ -10,23 +10,32 @@ the engine is allowed to take.
 Source: [`agent-runtime-kit/docs/source/inventory-target-architecture.md`
 → Resolved Decision #9](https://github.com/graysurf/agent-runtime-kit/blob/main/docs/source/inventory-target-architecture.md#resolved-decisions).
 
-## Rule 1 — no `HashMap` at the Tera context entry point
+## Rule 1 — no hash-randomized iteration on the render path
 
-Rust's `std::collections::HashMap` randomises iteration order, so a
-context fed to Tera via `HashMap` would render the same source to
-different bytes on different processes (and on the same process across
-runs, when the underlying hasher seeds differ).
+Rust's `std::collections::HashMap` (and its `HashSet` sibling,
+`hash_map::DefaultHasher`, `hash_map::RandomState`) randomises
+iteration order, so a context fed to Tera via any of these would
+render the same source to different bytes on different processes
+(and on the same process across runs, when the underlying hasher
+seeds differ).
 
 Enforcement:
 
 - `crates/agent-runtime-cli/clippy.toml` and
-  `crates/nils-common/clippy.toml` list `std::collections::HashMap`
-  under `disallowed-types`.
+  `crates/nils-common/clippy.toml` list `std::collections::HashMap`,
+  `std::collections::HashSet`,
+  `std::collections::hash_map::DefaultHasher`, and
+  `std::collections::hash_map::RandomState` under `disallowed-types`.
 - The `#![deny(clippy::disallowed_types, clippy::disallowed_methods)]`
   attribute at the top of each crate's `lib.rs` makes a violation a
   build failure under `cargo clippy --all-targets -- -D warnings`.
 - The render code uses `IndexMap` (insertion-ordered) or `BTreeMap`
   (key-sorted) for every map that crosses into Tera.
+- Filesystem directory walks (`std::fs::read_dir`) sort their entries
+  before consumption — the OS returns them in arbitrary order on
+  most filesystems. The integration test in
+  `tests/integration/render_determinism.rs` and the production walk
+  in `render::golden::update_golden` both sort before iterating.
 
 Single exemption: `crates/agent-runtime-cli/src/render/helpers/` —
 Tera's `Function` trait signature is
@@ -34,14 +43,16 @@ Tera's `Function` trait signature is
 the helper closures cannot avoid the type. The module-level
 `#![allow(clippy::disallowed_types)]` in `helpers/mod.rs` scopes the
 silence to exactly those files; no other module under `src/render/`
-imports `HashMap`.
+imports `HashMap`. The `allowlist_is_exact` integration test asserts
+this scope cannot drift silently — adding `#[allow(...)]` to another
+module fails the test.
 
-## Rule 2 — no wall-clock time
+## Rule 2 — no wall-clock or monotonic time
 
-`std::time::SystemTime::now()`, `chrono::Utc::now()`, and
-`chrono::Local::now()` all produce values that change on every call.
-If any of these landed in rendered output the determinism contract
-would break immediately.
+`std::time::SystemTime::now()`, `std::time::Instant::now()`,
+`chrono::Utc::now()`, and `chrono::Local::now()` all produce values
+that change on every call. If any of these landed in rendered output
+the determinism contract would break immediately.
 
 Enforcement: same clippy.toml + `#![deny(...)]` mechanism as Rule 1.
 

@@ -115,13 +115,65 @@ mod tests {
         (tmp, root)
     }
 
+    /// Strict RFC 3339 / ISO 8601 check. Matches `YYYY-MM-DDTHH:MM:SS`
+    /// followed by either `Z` or `±HH:MM`. This is what `--format=%cI`
+    /// produces and what downstream Tera helpers will assume.
+    fn is_strict_iso8601(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        // Minimum length: "YYYY-MM-DDTHH:MM:SSZ" = 20.
+        if bytes.len() < 20 {
+            return false;
+        }
+        let digit = |i: usize| bytes[i].is_ascii_digit();
+        let sep = |i: usize, c: u8| bytes[i] == c;
+        if !(digit(0)
+            && digit(1)
+            && digit(2)
+            && digit(3)
+            && sep(4, b'-')
+            && digit(5)
+            && digit(6)
+            && sep(7, b'-')
+            && digit(8)
+            && digit(9)
+            && sep(10, b'T')
+            && digit(11)
+            && digit(12)
+            && sep(13, b':')
+            && digit(14)
+            && digit(15)
+            && sep(16, b':')
+            && digit(17)
+            && digit(18))
+        {
+            return false;
+        }
+        let tz = &bytes[19..];
+        match tz {
+            [b'Z'] => true,
+            [sign, h1, h2, b':', m1, m2]
+                if (*sign == b'+' || *sign == b'-')
+                    && h1.is_ascii_digit()
+                    && h2.is_ascii_digit()
+                    && m1.is_ascii_digit()
+                    && m2.is_ascii_digit() =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
     #[test]
     fn returns_iso8601_timestamp_for_head() {
         let (_tmp, root) = init_git_repo();
         let ts = source_commit_timestamp(&root).unwrap();
-        // ISO-8601 with timezone offset, e.g. "2026-05-21T00:00:00+00:00".
+        assert!(
+            is_strict_iso8601(&ts),
+            "expected strict ISO-8601 (YYYY-MM-DDTHH:MM:SS[Z|±HH:MM]), got {ts:?}",
+        );
+        // The fixed committer date pins this exact value.
         assert!(ts.starts_with("2026-05-21T00:00:00"), "got {ts:?}");
-        assert!(ts.ends_with("+00:00") || ts.ends_with("Z"), "got {ts:?}");
     }
 
     #[test]
@@ -143,5 +195,35 @@ mod tests {
             msg.contains("git log") || msg.contains("not a git"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn errors_when_repo_has_no_head_yet() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        run("git", &["init", "--quiet", "--initial-branch=main"], &root);
+        // No commits — `HEAD` is unborn.
+        let err = source_commit_timestamp(&root).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git log") && !msg.is_empty(),
+            "expected git log error for unborn HEAD, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn iso8601_strictness_rejects_obvious_garbage() {
+        // Self-test for the matcher — protects against the matcher
+        // silently accepting non-ISO output if git ever changes its
+        // `%cI` format.
+        assert!(is_strict_iso8601("2026-05-21T00:00:00Z"));
+        assert!(is_strict_iso8601("2026-05-21T00:00:00+08:00"));
+        assert!(is_strict_iso8601("2026-05-21T00:00:00-05:30"));
+        assert!(!is_strict_iso8601(""));
+        assert!(!is_strict_iso8601("2026-05-21"));
+        assert!(!is_strict_iso8601("2026-05-21 00:00:00Z"));
+        assert!(!is_strict_iso8601("2026/05/21T00:00:00Z"));
+        assert!(!is_strict_iso8601("2026-05-21T00:00:00"));
+        assert!(!is_strict_iso8601("2026-05-21T00:00:00+0000"));
     }
 }

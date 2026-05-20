@@ -13,10 +13,14 @@
 
 disallowed-types = [
     { path = "std::collections::HashMap", reason = "Use IndexMap or BTreeMap for deterministic iteration; render output must be byte-stable across cold processes. See Resolved Decision #9." },
+    { path = "std::collections::HashSet", reason = "Use BTreeSet or IndexSet for deterministic iteration; render output must be byte-stable across cold processes. See Resolved Decision #9." },
+    { path = "std::collections::hash_map::DefaultHasher", reason = "DefaultHasher is randomly seeded per-process; render must not depend on per-process hash state. See Resolved Decision #9." },
+    { path = "std::collections::hash_map::RandomState", reason = "RandomState is per-process randomness; render must not depend on per-process hash state. See Resolved Decision #9." },
 ]
 
 disallowed-methods = [
     { path = "std::time::SystemTime::now", reason = "Render must not depend on wall-clock time; the only sanctioned time value is `render::time::source_commit_timestamp()`. See Resolved Decision #9." },
+    { path = "std::time::Instant::now", reason = "Render must not depend on monotonic-clock time; the only sanctioned time value is `render::time::source_commit_timestamp()`. See Resolved Decision #9." },
     { path = "chrono::Utc::now", reason = "Render must not depend on wall-clock time; the only sanctioned time value is `render::time::source_commit_timestamp()`. See Resolved Decision #9." },
     { path = "chrono::Local::now", reason = "Render must not depend on wall-clock time; the only sanctioned time value is `render::time::source_commit_timestamp()`. See Resolved Decision #9." },
 ]

@@ -5,6 +5,8 @@
 
 #[path = "integration/cli.rs"]
 mod cli;
+#[path = "integration/determinism_gate.rs"]
+mod determinism_gate;
 #[path = "integration/render.rs"]
 mod render;
 #[path = "integration/render_determinism.rs"]
