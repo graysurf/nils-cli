@@ -24,6 +24,7 @@ pub mod agent_home_leak;
 pub mod docs_home;
 pub mod rendered_target;
 pub mod source_manifest;
+pub mod walk;
 
 pub const PRODUCTS: &[&str] = &["codex", "claude"];
 
@@ -121,4 +122,67 @@ pub fn run(root: &SourceRoot) -> Result<DriftReport> {
 
     report.sort();
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Severity aggregation + exit-code policy. The integration tests
+    //! cover each class firing in isolation; these unit tests prove
+    //! the `.max()` aggregation when multiple severities are
+    //! present, which no integration test would otherwise exercise.
+
+    use super::*;
+    use std::path::PathBuf;
+
+    fn finding(class: &'static str, severity: Severity) -> Finding {
+        Finding {
+            class,
+            severity,
+            product: None,
+            path: PathBuf::from("test"),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn empty_report_exits_zero() {
+        let report = DriftReport::default();
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[test]
+    fn only_warn_findings_exit_one() {
+        let mut report = DriftReport::default();
+        report.push(finding("source-manifest", Severity::Warn));
+        report.push(finding("rendered-target", Severity::Warn));
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn any_block_finding_exits_two() {
+        let mut report = DriftReport::default();
+        report.push(finding("agent-home-leak", Severity::Block));
+        assert_eq!(report.exit_code(), 2);
+    }
+
+    #[test]
+    fn mixed_severities_take_the_max() {
+        // Block must win over Warn — the `.max()` aggregation in
+        // `DriftReport::exit_code()` is the contract Phase 2 reporting
+        // pins against; a regression to first-wins or warn-priority
+        // would break the reporting POC's gating policy.
+        let mut report = DriftReport::default();
+        report.push(finding("source-manifest", Severity::Warn));
+        report.push(finding("agent-home-leak", Severity::Block));
+        report.push(finding("rendered-target", Severity::Warn));
+        assert_eq!(report.exit_code(), 2);
+    }
+
+    #[test]
+    fn severity_exit_codes_match_documented_policy() {
+        assert_eq!(Severity::Warn.exit_code(), 1);
+        assert_eq!(Severity::Block.exit_code(), 2);
+        assert_eq!(Severity::Warn.label(), "warn");
+        assert_eq!(Severity::Block.label(), "block");
+    }
 }

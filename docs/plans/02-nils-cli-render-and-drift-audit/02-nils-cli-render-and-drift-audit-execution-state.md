@@ -113,7 +113,7 @@ audit-drift body + fixtures, release/tap/cross-repo floor bump.
 - 2026-05-21 — Sprint 3 lands on branch
   `feat/agent-runtime-audit-drift`: Task 3.1 wires
   `audit_drift::source_manifest` (typed `manifest::load_all` re-validation
-  + `<TBD` placeholder scan over the five manifest files; warn-tier)
+  plus `<TBD` placeholder scan over the five manifest files; warn-tier)
   and `audit_drift::rendered_target` (re-render into a `TempDir` scratch
   and BTreeMap-keyed byte diff vs live `build/<product>/`; warn-tier).
   Writer refactored with `write_product_to(root, manifests, product,

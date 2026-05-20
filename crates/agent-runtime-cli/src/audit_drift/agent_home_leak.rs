@@ -7,30 +7,32 @@
 //! templates, or manifest content is a `block`-tier finding — Phase 2
 //! must not ship a build that re-introduces it.
 //!
-//! Scope:
+//! Scope (Phase 1.5):
 //! - `build/<product>/**` per product
 //! - `core/**`
 //! - `targets/**`
 //! - `manifests/**`
 //!
-//! Allowlist: `docs/source/inventory-target-architecture.md` is
-//! intentionally excluded (it discusses the removed variable by name).
-//! The allowlist is hard-coded — taking on the broader
-//! `drift-audit.allow.yaml` mechanism is Plan 04's job.
+//! `docs/` is intentionally outside scope here — the source doc
+//! `docs/source/inventory-target-architecture.md` legitimately names
+//! the removed variable. Plan 04 brings the proper
+//! `drift-audit.allow.yaml` mechanism when scope expands to docs/.
+//!
+//! Symlinks: every walk goes through `audit_drift::walk::collect_files_under`,
+//! which uses `render::writer::canonicalize_under` to drop entries
+//! that resolve outside the source root. A hostile
+//! `build/<product>/symlink -> /etc/passwd` cannot make audit-drift
+//! slurp host files.
 
+use crate::audit_drift::walk;
 use crate::audit_drift::{DriftReport, Finding, Severity};
 use crate::render::manifest::SourceRoot;
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const CLASS: &str = "agent-home-leak";
 pub const NEEDLE: &str = "$AGENT_HOME";
-
-/// File paths (relative to the source root) that may legitimately
-/// contain the `$AGENT_HOME` literal. Currently just the architecture
-/// source document, which discusses the removed variable.
-const SOURCE_DOC_ALLOWLIST: &[&str] = &["docs/source/inventory-target-architecture.md"];
 
 /// Walk `build/<product>/` and report every leak as a block-tier finding.
 pub fn check_product_build(
@@ -39,25 +41,14 @@ pub fn check_product_build(
     report: &mut DriftReport,
 ) -> Result<()> {
     let build_dir = root.path().join("build").join(product);
-    scan_tree(
-        root,
-        &build_dir,
-        Some(product.to_string()),
-        report,
-        &[], // allowlist applies to source-doc tree only
-    )
+    scan_tree(root, &build_dir, Some(product.to_string()), report)
 }
 
-/// Walk `core/`, `targets/`, `manifests/` and report leaks. Honors the
-/// hard-coded source-doc allowlist for `docs/source/inventory-target-architecture.md`.
+/// Walk `core/`, `targets/`, `manifests/` and report leaks.
 pub fn check_source_tree(root: &SourceRoot, report: &mut DriftReport) -> Result<()> {
-    let mut allowlist: Vec<PathBuf> = Vec::with_capacity(SOURCE_DOC_ALLOWLIST.len());
-    for entry in SOURCE_DOC_ALLOWLIST {
-        allowlist.push(root.path().join(entry));
-    }
     for sub in ["core", "targets", "manifests"] {
         let dir = root.path().join(sub);
-        scan_tree(root, &dir, None, report, &allowlist)?;
+        scan_tree(root, &dir, None, report)?;
     }
     Ok(())
 }
@@ -67,35 +58,9 @@ fn scan_tree(
     dir: &Path,
     product: Option<String>,
     report: &mut DriftReport,
-    allowlist: &[PathBuf],
 ) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    let mut paths: Vec<PathBuf> = Vec::new();
-    collect_files(dir, &mut paths)?;
-    paths.sort();
-    for path in paths {
-        if allowlist.iter().any(|allow| &path == allow) {
-            continue;
-        }
+    for path in walk::collect_files_under(dir, root.path()) {
         scan_file(root, &path, product.as_deref(), report)?;
-    }
-    Ok(())
-}
-
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let entries =
-        fs::read_dir(dir).with_context(|| format!("audit-drift read_dir {}", dir.display()))?;
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|e| e.path());
-    for entry in entries {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files(&path, out)?;
-        } else {
-            out.push(path);
-        }
     }
     Ok(())
 }
@@ -146,6 +111,7 @@ fn scan_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn write(path: &Path, body: &str) {
@@ -194,7 +160,10 @@ mod tests {
     }
 
     #[test]
-    fn source_doc_allowlist_does_not_fire() {
+    fn docs_tree_is_outside_phase_1_5_scope() {
+        // Phase 1.5 explicitly skips `docs/`; the source doc names
+        // `$AGENT_HOME` legitimately and must not fire a finding.
+        // Plan 04 expands the scope with proper allowlist handling.
         let (tmp, root) = make_root();
         write(
             &tmp.path()
@@ -202,10 +171,6 @@ mod tests {
             "Resolved Decision #5 removed $AGENT_HOME from the runtime.\n",
         );
         let mut report = DriftReport::default();
-        // The allowlist lives in `docs/source/`, not `core/targets/manifests/`,
-        // so `check_source_tree` wouldn't walk it anyway. The test
-        // confirms that explicitly: the source-tree scan returns clean
-        // for this fixture even though the doc contains the needle.
         check_source_tree(&root, &mut report).unwrap();
         assert_eq!(report.findings, Vec::new());
     }
@@ -225,5 +190,24 @@ mod tests {
         check_product_build(&root, "codex", &mut report).unwrap();
         check_source_tree(&root, &mut report).unwrap();
         assert_eq!(report.findings, Vec::new());
+    }
+
+    #[test]
+    fn only_first_hit_per_file_is_reported() {
+        // The class records one finding per file even when multiple
+        // occurrences exist on different lines. The reporting POC
+        // counts file-level hits, not byte-level, so this is the
+        // contract — but it deserves an explicit test so a future
+        // refactor doesn't silently change it.
+        let (tmp, root) = make_root();
+        write(
+            &tmp.path().join("build/codex/skills/sample/SKILL.md"),
+            "leak one: $AGENT_HOME\nleak two: $AGENT_HOME also\nleak three: $AGENT_HOME end\n",
+        );
+        let mut report = DriftReport::default();
+        check_product_build(&root, "codex", &mut report).unwrap();
+        assert_eq!(report.findings.len(), 1);
+        // First hit is on line 1; later hits are implied.
+        assert!(report.findings[0].message.contains("line 1"));
     }
 }

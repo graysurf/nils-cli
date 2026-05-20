@@ -9,6 +9,7 @@
 //! render hasn't happened yet); reporting POC consumers compute that
 //! state from the per-product skipped/rendered counts separately.
 
+use crate::audit_drift::walk;
 use crate::audit_drift::{DriftReport, Finding, Severity};
 use crate::render::cache::CACHE_FILE;
 use crate::render::manifest::{self, ManifestSet, SourceRoot};
@@ -36,7 +37,7 @@ pub fn check(
     }
 
     let live_dir = root.path().join("build").join(product);
-    let live = snapshot_dir(&live_dir);
+    let live = snapshot_dir(&live_dir, root.path());
     if live.is_empty() {
         // No live render yet for this product. The reporting POC
         // covers the "no build yet" state via the render command's
@@ -54,7 +55,7 @@ pub fn check(
     // source_manifest::check and this call.
     let reloaded = Arc::new(manifest::load_all(root)?);
     writer::write_product_to(root, reloaded, product, &scratch_path)?;
-    let scratch_snapshot = snapshot_dir(&scratch_path);
+    let scratch_snapshot = snapshot_dir(&scratch_path, &scratch_path);
 
     let diffs = diff_trees(&live, &scratch_snapshot);
     for path in diffs {
@@ -69,44 +70,42 @@ pub fn check(
     Ok(())
 }
 
-/// Walk a directory into a `BTreeMap<RelPath, Vec<u8>>`. Returns an
-/// empty map when the directory does not exist (first-render case).
-/// Skips `.render-cache.json` because the cache file is a scratchpad
-/// — diffing the *rendered output* tree is the contract, not the
-/// cache content.
-pub(crate) fn snapshot_dir(root: &Path) -> BTreeMap<String, Vec<u8>> {
+/// Walk `dir` into a `BTreeMap<RelPath, Vec<u8>>`. Returns an empty
+/// map when the directory does not exist (first-render case). Skips
+/// `.render-cache.json` because the cache file is a scratchpad — the
+/// determinism contract covers it via the render_determinism
+/// integration test, not via audit-drift's source-vs-build diff.
+///
+/// The walk goes through the shared `audit_drift::walk` helper, so
+/// symlinks that escape `containing_root` are silently dropped (no
+/// host file slurp).
+pub(crate) fn snapshot_dir(dir: &Path, containing_root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut out = BTreeMap::new();
-    if !root.exists() {
-        return out;
-    }
-    walk(root, root, &mut out);
-    out
-}
-
-fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let canonical_root = match containing_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return out,
     };
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|e| e.path());
-    for entry in entries {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(base, &path, out);
-            continue;
-        }
+    // The walker returns canonical paths (via `canonicalize_under`).
+    // We strip against the canonical form of `dir` so the relative
+    // keys come out clean on macOS where `/var/` and `/private/var/`
+    // resolve to each other.
+    let Ok(canonical_dir) = dir.canonicalize() else {
+        return out;
+    };
+    for path in walk::collect_files_under(&canonical_dir, &canonical_root) {
         if path.file_name().and_then(|n| n.to_str()) == Some(CACHE_FILE) {
             continue;
         }
         if let Ok(bytes) = fs::read(&path) {
             let rel = path
-                .strip_prefix(base)
+                .strip_prefix(&canonical_dir)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
             out.insert(rel, bytes);
         }
     }
+    out
 }
 
 fn diff_trees(
@@ -120,4 +119,54 @@ fn diff_trees(
         .filter(|p| live.get(*p) != scratch.get(*p))
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn snapshot_dir_returns_empty_for_missing_root() {
+        let tmp = TempDir::new().unwrap();
+        let canon = tmp.path().canonicalize().unwrap();
+        let snap = snapshot_dir(&canon.join("nonexistent"), &canon);
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn snapshot_dir_skips_render_cache_file() {
+        // The cache file lives at the root of build/<product>/; the
+        // diff class deliberately ignores it because cache equality is
+        // owned by the render_determinism test, not audit-drift.
+        let tmp = TempDir::new().unwrap();
+        let canon = tmp.path().canonicalize().unwrap();
+        let build = canon.join("build/codex");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("skills/SKILL.md"), "hello").ok();
+        fs::create_dir_all(build.join("skills")).unwrap();
+        fs::write(build.join("skills/SKILL.md"), "hello").unwrap();
+        fs::write(build.join(CACHE_FILE), "{}").unwrap();
+        let snap = snapshot_dir(&build, &canon);
+        assert_eq!(snap.len(), 1, "{snap:?}");
+        assert!(snap.contains_key("skills/SKILL.md"));
+        assert!(!snap.contains_key(CACHE_FILE));
+    }
+
+    #[test]
+    fn diff_trees_flags_added_removed_and_changed_paths() {
+        let mut live = BTreeMap::new();
+        live.insert("same.md".to_string(), b"x".to_vec());
+        live.insert("changed.md".to_string(), b"old".to_vec());
+        live.insert("removed.md".to_string(), b"gone".to_vec());
+
+        let mut fresh = BTreeMap::new();
+        fresh.insert("same.md".to_string(), b"x".to_vec());
+        fresh.insert("changed.md".to_string(), b"new".to_vec());
+        fresh.insert("added.md".to_string(), b"new".to_vec());
+
+        let mut diffs = diff_trees(&live, &fresh);
+        diffs.sort();
+        assert_eq!(diffs, vec!["added.md", "changed.md", "removed.md"]);
+    }
 }

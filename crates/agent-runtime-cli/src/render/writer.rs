@@ -49,9 +49,11 @@ pub fn write_product(
 
 /// Render variant that writes into `output_root` rather than the
 /// default `<source-root>/build/<product>/`. The output root must
-/// exist or be creatable; symlink-escape and `..`-traversal guards
-/// still apply.
-pub fn write_product_to(
+/// exist or be creatable; the symlink-escape and `..`-traversal
+/// guards apply *relative to* the caller-provided `output_root`, so
+/// the caller is responsible for choosing a safe root (audit-drift
+/// uses a fresh `TempDir`).
+pub(crate) fn write_product_to(
     root: &SourceRoot,
     manifests: Arc<ManifestSet>,
     product: &str,

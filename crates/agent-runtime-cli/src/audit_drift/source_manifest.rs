@@ -9,7 +9,7 @@
 
 use crate::audit_drift::{DriftReport, Finding, Severity};
 use crate::render::manifest::{self, ManifestSet, SourceRoot};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
@@ -115,28 +115,13 @@ fn failing_manifest_path(err: &manifest::ManifestError, root: &SourceRoot) -> st
         .unwrap_or(file)
 }
 
-/// Read the five manifests' raw bytes for downstream classes (rendered
-/// target diff re-hashes them; the placeholder scan above also reads
-/// them, but the bytes are short and re-reading keeps the modules
-/// independent).
-pub fn read_manifest_bytes(root: &SourceRoot) -> Result<Vec<(String, Vec<u8>)>> {
-    let mut out = Vec::with_capacity(MANIFEST_FILES.len());
-    for name in MANIFEST_FILES {
-        let path = root.manifests_dir().join(name);
-        let bytes =
-            fs::read(&path).with_context(|| format!("audit-drift read {}", path.display()))?;
-        out.push((name.to_string(), bytes));
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     //! Per-class unit tests cover the `<TBD>` placeholder scan and the
     //! schema-version mismatch path against tiny inline fixtures. The
     //! full happy-path (valid manifest set yields no findings) lives
-    //! in `tests/drift/audit_drift_classes.rs` against the shared
-    //! fixture set so we don't duplicate the manifest body here.
+    //! in `tests/integration/audit_drift_classes.rs` against the
+    //! shared fixture set so we don't duplicate the manifest body here.
 
     use super::*;
     use tempfile::TempDir;

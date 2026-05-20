@@ -17,6 +17,14 @@
 //! | rendered-stale              | rendered-target      | 1             |
 //! | agent-home-leak             | agent-home-leak      | 2             |
 //! | docs-home-mismatch          | docs-home            | 2             |
+//!
+//! Fixture coupling: this file shares
+//! `tests/fixtures/render-determinism/` with Sprint 2's cross-process
+//! determinism test. The two tests intentionally co-own the fixture
+//! so updates stay coherent — modifying the fixture's manifests would
+//! shift both classes simultaneously. Plan 04's expanded drift matrix
+//! may want a dedicated `audit-drift-base/` copy; for now the
+//! coupling is desired.
 
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
@@ -102,22 +110,15 @@ fn manifest_placeholder_pin_exits_one() {
     // output for our fixture).
     let manifest = tmp.path().join("manifests/runtime-roots.yaml");
     let body = fs::read_to_string(&manifest).unwrap();
-    let mutated = body.replace(
-        "min_version: \"0.1.0\"",
-        "min_version: \"<TBD: pin during Phase 1>\"",
-    );
-    // The fixture currently uses placeholder text already — to be sure
-    // we have an injection, write a body that definitely contains the
-    // needle whether or not the original did.
-    if mutated == body {
-        fs::write(
-            &manifest,
-            format!("{body}\n# audit-drift: <TBD: pin during Phase 1>\n"),
-        )
-        .unwrap();
-    } else {
-        fs::write(&manifest, mutated).unwrap();
-    }
+    // Append a YAML comment carrying the `<TBD>` literal. Comments
+    // don't affect the typed deserializer (no `deny_unknown_fields`
+    // violation), so the manifest still parses cleanly — only the
+    // placeholder scan fires.
+    fs::write(
+        &manifest,
+        format!("{body}\n# audit-drift: <TBD: pin during Phase 1>\n"),
+    )
+    .unwrap();
     let out = audit(tmp.path());
     assert_eq!(
         out.code,
