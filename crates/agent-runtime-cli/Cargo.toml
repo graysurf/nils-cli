@@ -1,0 +1,19 @@
+[package]
+name = "agent-runtime-cli"
+version = "0.0.1-dev"
+edition.workspace = true
+license.workspace = true
+
+description = "Stub CLI for graysurf/agent-runtime-kit. Subcommands are intentionally not implemented until Plan 02 (render + audit-drift) lands."
+repository = "https://github.com/sympoies/nils-cli"
+
+[[bin]]
+name = "agent-runtime"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+nils-test-support = { version = "0.11.0", path = "../nils-test-support" }

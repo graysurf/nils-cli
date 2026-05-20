@@ -6,6 +6,12 @@
 - Obligation rule for this matrix: all workspace binaries are `required` unless explicitly `excluded` as internal/example binaries.
 - Explicit exclusion: `cli-template` is `excluded` because it is an example/template CLI and is out of scope for user-facing release
   contract migration (`docs/plans/repo-completion-standard-rollout-plan.md`).
+- Explicit exclusion: `agent-runtime` is `excluded` while the crate ships as the Plan 01 stub for the consuming repo
+  [`graysurf/agent-runtime-kit`](https://github.com/graysurf/agent-runtime-kit) — every subcommand exits `1` with
+  `not implemented`, so generated completions would advertise unimplemented surface. Completion assets are deferred to
+  Plan 02 (`render` / `audit-drift`) and Plan 04 (`install` / `uninstall` / `doctor` / `gc-backups` / `restore-backups` /
+  `purge-state`), at which point this row flips to `required` and the crate begins exporting `completion <bash|zsh>` via
+  clap. Tracking: [`graysurf/agent-runtime-kit#1`](https://github.com/graysurf/agent-runtime-kit/issues/1).
 - Explicit treatment: `image-processing` is `required` (user-facing CLI in `README.md`) and must ship clap-first thin completion adapters in
   both shells.
 - Alias policy: alias families are required only for `git-scope` (`gs*`), `git-cli` (`gx*`), `codex-cli` (`cx*`), and `fzf-cli` (`fx*`) per
@@ -28,6 +34,7 @@
 | --------------------- | ---------- | ---------------------------------- | ------------------------------------ | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `agent-docs`          | `required` | `present` (`_agent-docs`)          | `present` (`agent-docs`)             | not required                                                   | `completion_mode=clap-first; completion_mode_toggles=forbidden; alternate_completion_dispatch=forbidden; generated_load_failure=fail-closed` | Workspace binary; completion files exist in both shell directories.                                                                                                                     |
 | `agent-out`           | `required` | `present` (`_agent-out`)           | `present` (`agent-out`)              | not required                                                   | `completion_mode=clap-first; completion_mode_toggles=forbidden; alternate_completion_dispatch=forbidden; generated_load_failure=fail-closed` | Workspace binary; completion files exist in both shell directories.                                                                                                                     |
+| `agent-runtime`       | `excluded` | `missing`                          | `missing`                            | not required                                                   | `not required (excluded)`                                                                                                                    | Plan 01 stub from `graysurf/agent-runtime-kit`; every subcommand exits `1` with `not implemented`, so completions are deferred until Plan 02 / Plan 04 land real bodies.                |
 | `agent-scope-lock`    | `required` | `present` (`_agent-scope-lock`)    | `present` (`agent-scope-lock`)       | not required                                                   | `completion_mode=clap-first; completion_mode_toggles=forbidden; alternate_completion_dispatch=forbidden; generated_load_failure=fail-closed` | Workspace binary; completion is exported by `agent-scope-lock completion <bash\|zsh>` and generated from clap metadata.                                                                 |
 | `api-gql`             | `required` | `present` (`_api-gql`)             | `present` (`api-gql`)                | not required                                                   | `completion_mode=clap-first; completion_mode_toggles=forbidden; alternate_completion_dispatch=forbidden; generated_load_failure=fail-closed` | Workspace binary; completion files exist in both shell directories.                                                                                                                     |
 | `api-grpc`            | `required` | `present` (`_api-grpc`)            | `present` (`api-grpc`)               | not required                                                   | `completion_mode=clap-first; completion_mode_toggles=forbidden; alternate_completion_dispatch=forbidden; generated_load_failure=fail-closed` | Workspace binary; completion files exist in both shell directories.                                                                                                                     |
@@ -64,5 +71,5 @@
 
 ## Exclusion summary
 
-- `excluded`: `cli-template` (explicit staged exclusion).
-- No other workspace binary is excluded in this matrix.
+- `excluded`: `cli-template` (explicit staged exclusion), `agent-runtime` (Plan 01 stub from `graysurf/agent-runtime-kit`; completion
+  assets land in Plan 02 / Plan 04).
