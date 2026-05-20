@@ -7,12 +7,13 @@
 - Execution window: 2026-05-19 → ongoing
 - Staged execution confirmation: not applicable (default-continue
   authorization: "默認就一直做下去")
-- Current task: Sprint 7 review (PR pending)
-- Next task: Task 8.1
+- Current task: Sprint 8 review (PR pending)
+- Next task: Task 8.3 (release flow — runs after PR merges via
+  `nils-cli-bump-version-tag-release`, not in this PR)
 - Last updated: 2026-05-20
-- Branch/commit: `feat/forge-cli-v1-sprint7-parity` cut from
-  `origin/main@15fcc73` (Sprint 6 PR #397 merge); parity harness,
-  exit-code matrix, and fixture redaction audit complete locally,
+- Branch/commit: `feat/forge-cli-v1-sprint8-wrapper` cut from
+  `origin/main@3474555` (Sprint 7 PR #398 merge); Task 8.1 wrapper +
+  completion sync test and Task 8.2 README cross-link complete locally,
   PR pending push and CI
 - Source document: docs/plans/forge-cli/forge-cli-plan.md
 - Direct source-doc execution waiver: not applicable
@@ -45,9 +46,9 @@
 | Task 7.1 | completed | Parity harness                                              | branch `feat/forge-cli-v1-sprint7-parity`  | Sprint 7 — 11-row table + 5 cross-provider envelope assertions |
 | Task 7.2 | completed | Exit-code matrix completion                                 | branch `feat/forge-cli-v1-sprint7-parity`  | Sprint 7 — 12 tests covering every documented (exit, kind)     |
 | Task 7.3 | completed | Fixture redaction audit                                     | branch `feat/forge-cli-v1-sprint7-parity`  | Sprint 7 — lint script + planted-token regression test         |
-| Task 8.1 | pending   | `wrappers/forge-cli` + shell completions                    | n/a                                        | Sprint 8                                                       |
-| Task 8.2 | pending   | Homebrew tap formula update                                 | n/a                                        | Sprint 8                                                       |
-| Task 8.3 | pending   | `nils-cli` minor bump + tag + tap formula bump              | n/a                                        | Sprint 8                                                       |
+| Task 8.1 | completed | `wrappers/forge-cli` + shell completions                    | branch `feat/forge-cli-v1-sprint8-wrapper` | Sprint 8 — wrapper mirrors git-cli, 4 completion-sync tests    |
+| Task 8.2 | completed | Homebrew tap formula update                                 | branch `feat/forge-cli-v1-sprint8-wrapper` | Sprint 8 — workspace README cross-link + wrapper ready for tap |
+| Task 8.3 | pending   | `nils-cli` minor bump + tag + tap formula bump              | post-merge release flow                    | Runs via nils-cli-bump-version-tag-release after PR merges     |
 
 ## Validation
 
@@ -126,3 +127,16 @@
   (`scripts/ci/forge-cli-fixture-lint.sh` + planted-token regression
   in `fixture_lint.rs`, wired into the docs-only entrypoint). Test
   surface grows to 219 lib + 89 integration.
+- 2026-05-20 — Sprint 7 merged via PR #398 (`3474555`); cut Sprint 8
+  branch `feat/forge-cli-v1-sprint8-wrapper` from updated `origin/main`.
+  Task 8.1 added `wrappers/forge-cli` (bash wrapper mirroring
+  `wrappers/git-cli` — auto/debug/installed modes with cargo-fallback)
+  and four completion-sync tests
+  (`crates/forge-cli/tests/integration/completion_sync.rs`) that pin
+  byte-equality between the binary's `forge-cli completion bash|zsh`
+  output and the checked-in `completions/{bash,zsh}/` snapshots.
+  Task 8.2 added the workspace README cross-link (CLI surface map +
+  Git-tooling section). Task 8.3 (`nils-cli` minor bump + tap formula
+  bump) runs post-merge via the `nils-cli-bump-version-tag-release`
+  skill and is not part of this PR. Test surface grows to 219 lib +
+  93 integration.
