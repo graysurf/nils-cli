@@ -5,3 +5,5 @@
 
 #[path = "integration/cli.rs"]
 mod cli;
+#[path = "integration/render.rs"]
+mod render;

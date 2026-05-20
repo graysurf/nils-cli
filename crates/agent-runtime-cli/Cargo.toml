@@ -4,8 +4,12 @@ version = "0.12.0"
 edition.workspace = true
 license.workspace = true
 
-description = "Stub CLI for graysurf/agent-runtime-kit. Subcommands are intentionally not implemented until Plan 02 (render + audit-drift) lands."
+description = "Render / install / doctor / audit-drift CLI for graysurf/agent-runtime-kit."
 repository = "https://github.com/sympoies/nils-cli"
+
+[lib]
+name = "agent_runtime_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "agent-runtime"
@@ -14,6 +18,14 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+indexmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+sha2 = { workspace = true }
+tera = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 nils-test-support = { version = "0.12.0", path = "../nils-test-support" }
+tempfile = "3"
