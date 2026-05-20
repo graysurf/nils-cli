@@ -29,7 +29,6 @@ const STUB_SUBCOMMANDS: &[&str] = &[
     "install",
     "uninstall",
     "doctor",
-    "audit-drift",
     "gc-backups",
     "restore-backups",
     "purge-state",

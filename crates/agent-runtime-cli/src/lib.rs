@@ -20,6 +20,7 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
+pub mod audit_drift;
 pub mod commands;
 pub mod render;
 
@@ -45,7 +46,7 @@ pub enum Command {
     /// Diagnose host setup, runtime roots, and required CLI floors.
     Doctor,
     /// Detect source-vs-rendered, rendered-vs-live, and unsafe drift.
-    AuditDrift,
+    AuditDrift(commands::audit_drift::AuditDriftArgs),
     /// Prune old backups under `<state_home>/backups/`.
     GcBackups,
     /// Restore a runtime home from a recorded backup snapshot.
@@ -61,7 +62,7 @@ impl Command {
             Command::Install => "install",
             Command::Uninstall => "uninstall",
             Command::Doctor => "doctor",
-            Command::AuditDrift => "audit-drift",
+            Command::AuditDrift(_) => "audit-drift",
             Command::GcBackups => "gc-backups",
             Command::RestoreBackups => "restore-backups",
             Command::PurgeState => "purge-state",
@@ -77,6 +78,13 @@ pub fn run() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(err) => {
                 eprintln!("agent-runtime render: {err:#}");
+                ExitCode::from(2)
+            }
+        },
+        Command::AuditDrift(args) => match commands::audit_drift::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime audit-drift: {err:#}");
                 ExitCode::from(2)
             }
         },
