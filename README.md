@@ -58,7 +58,9 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 - [crates/git-cli](crates/git-cli): Git tools dispatcher (utils/reset/commit/branch/ci/open).
 - [crates/git-summary](crates/git-summary): Per-author contribution summaries over a date range (adds/dels/net/commits).
 - [crates/git-lock](crates/git-lock): Label-based commit locks per repo (lock/list/diff/unlock/tag).
-- [crates/forge-cli](crates/forge-cli): Provider-neutral forge CLI wrapping `gh` / `glab` for PR/MR + Issue lifecycle, CI wait-checks, and the `pr deliver` macro (open draft → CI green → ready → merge).
+- [crates/forge-cli](crates/forge-cli): Provider-neutral forge CLI wrapping `gh` / `glab` for
+  PR/MR + Issue lifecycle, CI wait-checks, and the `pr deliver` macro
+  (open draft → CI green → ready → merge).
 
 ### Desktop, media, and local utility CLIs
 
