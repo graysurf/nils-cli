@@ -1,0 +1,22 @@
+# Determinism gate for the render engine. Per Resolved Decision #9 in
+# `agent-runtime-kit/docs/source/inventory-target-architecture.md`, render
+# output must be a pure function of the source-root contents — no
+# wall-clock time and no hash-randomized iteration order. The lints
+# below catch the two common sources of nondeterminism at compile time;
+# the matching `#![deny(...)]` attributes in `src/lib.rs` make every
+# violation a build failure.
+#
+# Tera's `Function` trait signature forces `&HashMap<String, Value>` on
+# helper closures, so `src/render/helpers/` opts out via a scoped
+# `#![allow(clippy::disallowed_types)]` and is the only place the lint
+# is silenced. See `docs/determinism.md` for the full contract.
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "Use IndexMap or BTreeMap for deterministic iteration; render output must be byte-stable across cold processes. See Resolved Decision #9." },
+]
+
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "Render must not depend on wall-clock time; the only sanctioned time value is `render::time::source_commit_timestamp()`. See Resolved Decision #9." },
+    { path = "chrono::Utc::now", reason = "Render must not depend on wall-clock time; the only sanctioned time value is `render::time::source_commit_timestamp()`. See Resolved Decision #9." },
+    { path = "chrono::Local::now", reason = "Render must not depend on wall-clock time; the only sanctioned time value is `render::time::source_commit_timestamp()`. See Resolved Decision #9." },
+]

@@ -1,0 +1,14 @@
+schema_version: 1
+skills:
+  - id: sample.determinism
+    domain: sample
+    source: core/skills/sample
+    products:
+      codex:
+        name: /sample-determinism
+        render_to: skills/sample/SKILL.md
+      claude:
+        name: sample:determinism
+        render_to: plugins/sample/skills/determinism/SKILL.md
+    required_clis:
+      agent-out: ">=0.5.0"

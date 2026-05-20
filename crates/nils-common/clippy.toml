@@ -1,0 +1,17 @@
+# `nils-common` is on the determinism gate because the render engine in
+# `agent-runtime-cli` reaches into it for path-resolution primitives and
+# shared utilities. Resolved Decision #9 in
+# `agent-runtime-kit/docs/source/inventory-target-architecture.md` requires
+# that any code on the render path stay free of hash-randomized iteration
+# and wall-clock time. Scope is intentionally narrow — only crates whose
+# output Tera consumes — per the plan's Open Question default.
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "Use IndexMap or BTreeMap; agent-runtime-cli consumes this crate on the render path and must stay deterministic. See Resolved Decision #9." },
+]
+
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "Wall-clock time forbidden on the render path. See Resolved Decision #9." },
+    { path = "chrono::Utc::now", reason = "Wall-clock time forbidden on the render path. See Resolved Decision #9." },
+    { path = "chrono::Local::now", reason = "Wall-clock time forbidden on the render path. See Resolved Decision #9." },
+]

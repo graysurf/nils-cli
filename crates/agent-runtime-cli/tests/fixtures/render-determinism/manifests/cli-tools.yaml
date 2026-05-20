@@ -1,0 +1,11 @@
+schema_version: 1
+profiles:
+  core: [ripgrep]
+  recommended: [ripgrep]
+  full: [ripgrep]
+formulas:
+  ripgrep:
+    brew: ripgrep
+    command: rg
+    linux_only_alternative: null
+    categories: [search]

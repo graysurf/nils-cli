@@ -7,3 +7,5 @@
 mod cli;
 #[path = "integration/render.rs"]
 mod render;
+#[path = "integration/render_determinism.rs"]
+mod render_determinism;

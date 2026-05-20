@@ -1,0 +1,22 @@
+schema_version: 1
+products:
+  codex:
+    live_home: "$CODEX_HOME"
+    docs_home: "$CODEX_HOME"
+    state_home: "${CODEX_AGENT_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit/codex}"
+    plugin_root: "$CODEX_HOME/plugins"
+    hook_config_strategy: managed-block
+    min_version: "<TBD: pin during Phase 1>"
+    recommended_version: "<TBD: pin during Phase 1>"
+    min_version_effective_from: "<TBD: pin during Phase 1>"
+    version_probe: "codex --version"
+  claude:
+    live_home: "$HOME/.claude"
+    docs_home: "$HOME/.claude"
+    state_home: "${CLAUDE_KIT_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit/claude}"
+    plugin_root_env: "CLAUDE_PLUGIN_ROOT"
+    hook_config_strategy: settings-json
+    min_version: "<TBD: pin during Phase 1>"
+    recommended_version: "<TBD: pin during Phase 1>"
+    min_version_effective_from: "<TBD: pin during Phase 1>"
+    version_probe: "claude --version"
