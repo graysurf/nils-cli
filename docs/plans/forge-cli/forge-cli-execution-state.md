@@ -6,7 +6,7 @@
 - Target scope: whole plan (Sprints 0–8)
 - Execution window: 2026-05-19 → ongoing
 - Staged execution confirmation: not applicable (default-continue
-  authorization: "默認就一直做下去")
+  authorization: "Just keep doing it by default.")
 - Current task: Sprint 8 review (PR pending)
 - Next task: Task 8.3 (release flow — runs after PR merges via
   `nils-cli-bump-version-tag-release`, not in this PR)
