@@ -10,6 +10,7 @@ mod integration {
     mod pr_checks_gitlab;
     mod pr_create;
     mod pr_deliver;
+    mod pr_deliver_chain;
     mod pr_merge;
     mod pr_wait_checks;
     mod repo_view;
