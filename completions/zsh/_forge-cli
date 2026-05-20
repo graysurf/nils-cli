@@ -213,11 +213,22 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (deliver)
 _arguments "${_arguments_options[@]}" : \
+'--kind=[PR / MR kind (selects branch-prefix rule). Required]:KIND:(feature bug)' \
+'--title=[PR / MR title (required)]:TITLE:_default' \
+'(--body-file)--body=[PR / MR body / description text. Mutually exclusive with \`--body-file\`]:BODY:_default' \
+'--body-file=[Read PR / MR body from a file. Use \`-\` to read from stdin]:PATH:_default' \
+'--head=[Source branch (defaults to the current branch)]:HEAD:_default' \
+'--base=[Target / base branch (defaults to the repo'\''s default branch)]:BASE:_default' \
+'--method=[Merge method (default\: squash)]:METHOD:(squash merge rebase)' \
+'*--reviewer=[Add a reviewer (repeatable)]:USER:_default' \
+'--timeout=[CI-wait budget before declaring \`checks_timeout\` (default \`30m\`)]:TIMEOUT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--no-merge[Stop after \`pr.wait-checks\` — do not promote to ready or merge]' \
+'--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \

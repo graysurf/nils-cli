@@ -200,17 +200,68 @@ pub fn run_with<R: BackendRunner>(
         }));
     }
 
-    // 5. Create + parse the URL the backend prints back.
-    let create_output = runner.run(&create_call)?;
-    let (number, url) = parse_create_output(&ctx, &create_output)?;
-
-    // 6. Re-fetch full metadata via the view follow-up so the envelope
-    //    payload matches the spec's `data` shape exactly.
-    let view_call = build_view_call(&ctx, number);
-    let view_output = runner.run(&view_call)?;
-    let payload = parse_view_output(&ctx, &view_output, number, url, kind)?;
-
+    let payload = create_and_fetch(runner, &ctx, &create_call, kind)?;
     Ok(emit_success(schema_ok(), payload, format, render_text))
+}
+
+/// Macro-facing entry point: run the full validation chain + backend create +
+/// view re-fetch and return the typed payload. The `env` argument supplies
+/// the same hooks that `run_with` uses so the macro can inject test stubs.
+pub fn compute<R: BackendRunner>(
+    runner: &R,
+    global: &GlobalFlags,
+    args: &PrCreateArgs,
+    env: &Environment<'_>,
+) -> Result<PrCreatePayload, ForgeError> {
+    let ctx = detect(global.provider_hint(), &global.remote, |r| {
+        (env.remote_url)(r)
+    })?;
+    let head = match args.head.clone() {
+        Some(h) => h,
+        None => (env.current_branch)()?,
+    };
+    let base = match args.base.clone() {
+        Some(b) => b,
+        None => (env.default_branch)(runner as &dyn BackendRunner, &ctx)?,
+    };
+    let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
+    let prefix = branch_name(&head)?;
+    let kind: PrKind = args.kind.into_kind();
+    branch_kind_matches(prefix, kind)?;
+    title_length(&args.title)?;
+    body_summary(&body, &env.headings)?;
+    body_test_plan(&body, &env.headings)?;
+    worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
+    head_pushed(&env.workdir, |w| (env.head_state)(w))?;
+
+    let draft = !args.no_draft;
+    let body_tempfile = write_body_tempfile(&body)?;
+    let body_path = body_tempfile.path().to_path_buf();
+    let create_call = build_create_call(
+        &ctx,
+        &head,
+        &base,
+        &args.title,
+        &body,
+        &body_path,
+        draft,
+        &args.reviewers,
+        &args.labels,
+    );
+    create_and_fetch(runner, &ctx, &create_call, kind)
+}
+
+fn create_and_fetch<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    create_call: &BackendCall,
+    kind: PrKind,
+) -> Result<PrCreatePayload, ForgeError> {
+    let create_output = runner.run(create_call)?;
+    let (number, url) = parse_create_output(ctx, &create_output)?;
+    let view_call = build_view_call(ctx, number);
+    let view_output = runner.run(&view_call)?;
+    parse_view_output(ctx, &view_output, number, url, kind)
 }
 
 fn render_text(payload: &PrCreatePayload) {

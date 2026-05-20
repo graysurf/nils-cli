@@ -72,21 +72,76 @@ pub fn run_with<R: BackendRunner, C: Clock, F: Fn(&str) -> Option<String>>(
         return Ok(emit_dry_run(&ctx, args, &snapshot_args, format));
     }
 
+    match poll_until_terminal_or_timeout(runner, clock, global, &ctx, args, &snapshot_args)? {
+        WaitOutcome::Success(snapshot) => Ok(emit_success(
+            schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
+            snapshot,
+            format,
+            render_text,
+        )),
+        WaitOutcome::Failed(snapshot) => Ok(emit_failure(
+            snapshot,
+            "checks_failed",
+            "required checks did not reach success",
+            nils_common::cli_contract::exit::RUNTIME,
+            format,
+        )),
+        WaitOutcome::TimedOut(snapshot) => Ok(emit_timeout(snapshot, format)),
+    }
+}
+
+/// Internal outcome enum for the polling loop; the macro consumes the same
+/// data through [`compute`] without going through the envelope emitters.
+pub enum WaitOutcome {
+    Success(PrChecksPayload),
+    Failed(PrChecksPayload),
+    TimedOut(PrChecksPayload),
+}
+
+/// Macro-facing entry point: poll until terminal or timeout and return the
+/// final snapshot tagged with its outcome. Caller (e.g. `pr deliver`) decides
+/// whether the macro continues, short-circuits with `checks_failed`, or
+/// short-circuits with `checks_timeout`.
+pub fn compute<R: BackendRunner, C: Clock>(
+    runner: &R,
+    clock: &C,
+    global: &GlobalFlags,
+    ctx: &ProviderContext,
+    args: &PrWaitChecksArgs,
+) -> Result<WaitOutcome, ForgeError> {
+    let snapshot_args = PrChecksArgs {
+        id: args.id.clone(),
+        required_only: args.required_only,
+    };
+    poll_until_terminal_or_timeout(runner, clock, global, ctx, args, &snapshot_args)
+}
+
+fn poll_until_terminal_or_timeout<R: BackendRunner, C: Clock>(
+    runner: &R,
+    clock: &C,
+    global: &GlobalFlags,
+    ctx: &ProviderContext,
+    args: &PrWaitChecksArgs,
+    snapshot_args: &PrChecksArgs,
+) -> Result<WaitOutcome, ForgeError> {
     let timeout = args.timeout;
     let interval = args.interval;
     let start = clock.now();
     let deadline = start + timeout;
 
     loop {
-        let snapshot = pr_checks::snapshot(runner, global, &ctx, &snapshot_args)?;
+        let snapshot = pr_checks::snapshot(runner, global, ctx, snapshot_args)?;
         let snapshot = with_duration(snapshot, ms_between(start, clock.now()));
         if is_terminal(&snapshot) {
-            return finalise(snapshot, format);
+            if snapshot.state == "success" {
+                return Ok(WaitOutcome::Success(snapshot));
+            }
+            return Ok(WaitOutcome::Failed(snapshot));
         }
         let now = clock.now();
         if now >= deadline {
             let timed_out = with_duration(snapshot, ms_between(start, now));
-            return Ok(emit_timeout(timed_out, format));
+            return Ok(WaitOutcome::TimedOut(timed_out));
         }
         let remaining = deadline.saturating_duration_since(now);
         let sleep_for = std::cmp::min(interval, remaining);
@@ -109,28 +164,6 @@ fn with_duration(mut snapshot: PrChecksPayload, duration_ms: u64) -> PrChecksPay
 fn is_terminal(snapshot: &PrChecksPayload) -> bool {
     // Terminal iff no entries are pending in the gating set.
     snapshot.pending.is_empty()
-}
-
-fn finalise(snapshot: PrChecksPayload, format: OutputFormat) -> Result<i32, ForgeError> {
-    // Distinguish success from failure based on the aggregated state.
-    let state = snapshot.state;
-    let is_success = state == "success";
-    if is_success {
-        Ok(emit_success(
-            schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
-            snapshot,
-            format,
-            render_text,
-        ))
-    } else {
-        Ok(emit_failure(
-            snapshot,
-            "checks_failed",
-            "required checks did not reach success",
-            nils_common::cli_contract::exit::RUNTIME,
-            format,
-        ))
-    }
 }
 
 fn emit_timeout(snapshot: PrChecksPayload, format: OutputFormat) -> i32 {
@@ -384,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_state_marks_terminal_and_finalise_returns_runtime_code() {
+    fn failure_state_marks_terminal_and_emit_failure_returns_runtime_code() {
         let snapshot = PrChecksPayload {
             provider: "github",
             state: "failure",
@@ -400,7 +433,13 @@ mod tests {
             duration_ms: Some(123),
         };
         assert!(is_terminal(&snapshot));
-        let code = finalise(snapshot, OutputFormat::Json).unwrap();
+        let code = emit_failure(
+            snapshot,
+            "checks_failed",
+            "required checks did not reach success",
+            nils_common::cli_contract::exit::RUNTIME,
+            OutputFormat::Json,
+        );
         assert_eq!(code, nils_common::cli_contract::exit::RUNTIME);
     }
 

@@ -102,11 +102,48 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
+    let payload = run_lockdown_chain(runner, global, &ctx, args, workdir, method, delete_branch)?;
+    Ok(emit_success(
+        schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
+        payload,
+        format,
+        render_text,
+    ))
+}
+
+/// Macro-facing entry point: run the entire lock-down chain + merge +
+/// post-merge fetch and return the typed payload without emitting an
+/// envelope. The macro is responsible for surfacing the result through the
+/// composite `data.steps[]` envelope.
+pub fn compute<R: BackendRunner>(
+    runner: &R,
+    global: &GlobalFlags,
+    args: &PrMergeArgs,
+    workdir: &std::path::Path,
+) -> Result<PrMergePayload, ForgeError> {
+    let ctx = detect(global.provider_hint(), &global.remote, git_remote_url)?;
+    let cfg = ForgeConfig::load_from(workdir, find_git_toplevel(workdir).as_deref());
+    let method = cfg.resolve_merge_method(args.method.map(|m| m.into_method()));
+    let cfg_delete = cfg.resolve_delete_branch(None);
+    enforce_keep_branch_conflict(args.keep_branch, &cfg)?;
+    let delete_branch = if args.keep_branch { false } else { cfg_delete };
+    run_lockdown_chain(runner, global, &ctx, args, workdir, method, delete_branch)
+}
+
+fn run_lockdown_chain<R: BackendRunner>(
+    runner: &R,
+    global: &GlobalFlags,
+    ctx: &ProviderContext,
+    args: &PrMergeArgs,
+    workdir: &std::path::Path,
+    method: MergeMethod,
+    delete_branch: bool,
+) -> Result<PrMergePayload, ForgeError> {
     // Rule 4 — clean worktree.
     worktree_clean(workdir, git_status_porcelain)?;
 
     // Rule 7 + base discovery — fetch pr.view once and reuse.
-    let pr = fetch_pr_view(runner, &ctx, args.id)?;
+    let pr = fetch_pr_view(runner, ctx, args.id)?;
     if pr.draft {
         return Err(ForgeError::validation(
             schema_err(),
@@ -117,7 +154,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     }
 
     // Rule 6 — default branch protection (unless explicitly overridden).
-    let repo = fetch_repo_view(runner, &ctx)?;
+    let repo = fetch_repo_view(runner, ctx)?;
     if !args.allow_non_default_base && pr.base != repo.default_branch {
         return Err(ForgeError::validation(
             schema_err(),
@@ -135,16 +172,16 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     enforce_method_supported(method, &repo)?;
 
     // Rule 8 — TTL-zero required-check re-check.
-    ensure_required_checks_green(runner, global, &ctx, &args.id.to_string())?;
+    ensure_required_checks_green(runner, global, ctx, &args.id.to_string())?;
 
     // All gates clear — invoke the backend.
-    let merge_call = build_merge_call(&ctx, args.id, method, delete_branch);
+    let merge_call = build_merge_call(ctx, args.id, method, delete_branch);
     runner.run(&merge_call)?;
 
     // Post-merge re-fetch for merge_sha.
-    let merge_sha = fetch_merge_sha(runner, &ctx, args.id)?;
+    let merge_sha = fetch_merge_sha(runner, ctx, args.id)?;
 
-    let payload = PrMergePayload {
+    Ok(PrMergePayload {
         provider: ctx.provider.as_str(),
         number: pr.number,
         url: pr.url,
@@ -153,14 +190,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         deleted_branch: delete_branch,
         base: pr.base,
         head: pr.head,
-    };
-
-    Ok(emit_success(
-        schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
-        payload,
-        format,
-        render_text,
-    ))
+    })
 }
 
 /// Build the backend merge invocation.
