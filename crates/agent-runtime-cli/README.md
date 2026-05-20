@@ -13,10 +13,10 @@ bodies.
 
 ## Package vs binary name
 
-| Field        | Value                |
-| ------------ | -------------------- |
-| Package name | `agent-runtime-cli`  |
-| Binary name  | `agent-runtime`      |
+| Field        | Value               |
+| ------------ | ------------------- |
+| Package name | `agent-runtime-cli` |
+| Binary name  | `agent-runtime`     |
 
 Use the package name (`-p agent-runtime-cli`) for cargo commands and the
 binary name (`agent-runtime`) for installed-binary invocations.
