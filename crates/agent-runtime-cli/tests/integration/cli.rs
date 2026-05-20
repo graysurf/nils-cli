@@ -23,13 +23,14 @@ const SUBCOMMANDS: &[&str] = &[
 ];
 
 #[test]
-fn version_prints_dev_release() {
+fn version_prints_workspace_version() {
     let output = run(&["--version"]);
     assert_eq!(output.code, 0);
     let stdout = output.stdout_text();
+    let expected = env!("CARGO_PKG_VERSION");
     assert!(
-        stdout.contains("0.0.1-dev"),
-        "version output should include 0.0.1-dev: {stdout}"
+        stdout.contains(expected),
+        "version output should include {expected}: {stdout}"
     );
 }
 
