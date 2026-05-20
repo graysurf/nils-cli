@@ -23,6 +23,7 @@ Completion obligations for those binaries are tracked in
 | ---- | -------- | -------- |
 | API testing | `api-rest`, `api-gql`, `api-grpc`, `api-websocket`, `api-test` | Run protocol-specific API checks or orchestrate a mixed API test suite. |
 | Git tooling | `git-scope`, `git-cli`, `git-summary`, `git-lock` | Inspect changes, run Git helper flows, summarize commits, or manage repo-local commit locks. |
+| Forge automation | `forge-cli` | Drive PR/MR + Issue lifecycle on GitHub (via `gh`) or GitLab (via `glab`) through a single provider-neutral surface; covers create / view / edit / comment / ready / merge / close, CI wait-checks, and the `pr deliver` macro. |
 | Agent policy and evidence | `agent-docs`, `agent-out`, `agent-scope-lock`, `test-first-evidence`, `web-evidence`, `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage` | Resolve agent policy docs, allocate artifact paths, enforce edit scope, inspect repo retrospectives, or persist deterministic workflow evidence. |
 | Planning and delivery | `plan-tooling`, `plan-issue`, `plan-issue-local`, `semantic-commit` | Validate/split implementation plans, orchestrate issue delivery, rehearse local plan flows, or create semantic commits. |
 | Provider lanes | `codex-cli`, `gemini-cli` | Run provider-specific diagnostics, auth checks, and workflow adapters. |
@@ -57,6 +58,7 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 - [crates/git-cli](crates/git-cli): Git tools dispatcher (utils/reset/commit/branch/ci/open).
 - [crates/git-summary](crates/git-summary): Per-author contribution summaries over a date range (adds/dels/net/commits).
 - [crates/git-lock](crates/git-lock): Label-based commit locks per repo (lock/list/diff/unlock/tag).
+- [crates/forge-cli](crates/forge-cli): Provider-neutral forge CLI wrapping `gh` / `glab` for PR/MR + Issue lifecycle, CI wait-checks, and the `pr deliver` macro (open draft → CI green → ready → merge).
 
 ### Desktop, media, and local utility CLIs
 
