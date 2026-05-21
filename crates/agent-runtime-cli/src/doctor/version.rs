@@ -3,8 +3,11 @@
 use super::{DoctorFinding, DoctorSeverity};
 use crate::render::manifest::ProductRoot;
 use std::cmp::Ordering;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const PROBE_TIMEOUT_POLLS: usize = 50;
+const PROBE_TIMEOUT_SLEEP: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionStatus {
@@ -237,23 +240,65 @@ fn finding(
 }
 
 fn run_probe_command(command: &str) -> String {
+    run_probe_command_with_timeout(command, PROBE_TIMEOUT_POLLS, PROBE_TIMEOUT_SLEEP)
+}
+
+fn run_probe_command_with_timeout(command: &str, polls: usize, sleep: Duration) -> String {
     let mut parts = command.split_whitespace();
     let Some(program) = parts.next() else {
         return String::new();
     };
-    let output = Command::new(program).args(parts).output();
-    match output {
-        Ok(output) => {
-            let mut raw = String::new();
-            raw.push_str(&String::from_utf8_lossy(&output.stdout));
-            raw.push_str(&String::from_utf8_lossy(&output.stderr));
-            if !output.status.success() {
-                raw.push_str(&format!("\nexit_status={}", output.status));
+    let mut child = match Command::new(program)
+        .args(parts)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(source) => return format!("failed to run `{command}`: {source}"),
+    };
+
+    for _ in 0..polls {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map(output_to_raw)
+                    .unwrap_or_else(|source| {
+                        format!("failed to read `{command}` output: {source}")
+                    });
             }
-            raw.trim().to_string()
+            Ok(None) => std::thread::sleep(sleep),
+            Err(source) => {
+                let _ = child.kill();
+                return format!("failed to wait for `{command}`: {source}");
+            }
         }
-        Err(source) => format!("failed to run `{command}`: {source}"),
     }
+
+    let timeout_ms = polls as u128 * sleep.as_millis();
+    let _ = child.kill();
+    child
+        .wait_with_output()
+        .map(|output| {
+            let mut raw = output_to_raw(output);
+            if !raw.is_empty() {
+                raw.push('\n');
+            }
+            raw.push_str(&format!("timed_out_after_ms={timeout_ms}"));
+            raw
+        })
+        .unwrap_or_else(|source| format!("timed out running `{command}`; kill failed: {source}"))
+}
+
+fn output_to_raw(output: Output) -> String {
+    let mut raw = String::new();
+    raw.push_str(&String::from_utf8_lossy(&output.stdout));
+    raw.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        raw.push_str(&format!("\nexit_status={}", output.status));
+    }
+    raw.trim().to_string()
 }
 
 fn parse_at(bytes: &[u8], mut i: usize) -> Option<(Version, usize)> {
@@ -346,6 +391,9 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
 
     #[test]
     fn semver_matcher_tolerates_common_prefixes() {
@@ -363,5 +411,23 @@ mod tests {
     fn unix_epoch_date_conversion_is_stable() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_229), (2025, 5, 21));
+    }
+
+    #[test]
+    fn version_probe_timeout_is_loud_and_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("slow-version");
+        fs::write(&script, "#!/usr/bin/env sh\nsleep 10\n").unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let raw =
+            run_probe_command_with_timeout(&script.to_string_lossy(), 0, Duration::from_millis(0));
+
+        assert!(
+            raw.contains("timed_out_after_ms=0"),
+            "timeout should be explicit: {raw}"
+        );
     }
 }
