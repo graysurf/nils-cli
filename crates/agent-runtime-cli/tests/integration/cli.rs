@@ -24,9 +24,10 @@ const ALL_SUBCOMMANDS: &[&str] = &[
 
 /// Subcommands whose body still prints `not implemented` and exits 1.
 /// `render` / `install` left after Plan 04 Sprint 1; `uninstall` after
-/// Sprint 2 Task 2.1; `restore-backups` after Sprint 2 Task 2.2. Later
-/// sprints peel further entries off.
-const STUB_SUBCOMMANDS: &[&str] = &["doctor", "gc-backups", "purge-state"];
+/// Sprint 2 Task 2.1; `restore-backups` after Sprint 2 Task 2.2;
+/// `purge-state` after Sprint 2 Task 2.3. Later sprints peel further
+/// entries off.
+const STUB_SUBCOMMANDS: &[&str] = &["doctor", "gc-backups"];
 
 #[test]
 fn version_prints_workspace_version() {

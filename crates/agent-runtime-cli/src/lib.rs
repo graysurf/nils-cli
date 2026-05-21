@@ -24,6 +24,7 @@ pub mod audit_drift;
 pub mod commands;
 pub mod install;
 pub mod managed_block;
+pub mod purge_state;
 pub mod render;
 pub mod restore_backups;
 pub mod uninstall;
@@ -56,7 +57,7 @@ pub enum Command {
     /// Restore a runtime home from a recorded backup snapshot.
     RestoreBackups(commands::restore_backups::RestoreBackupsArgs),
     /// Purge runtime-managed state (use with caution).
-    PurgeState,
+    PurgeState(commands::purge_state::PurgeStateArgs),
 }
 
 impl Command {
@@ -69,7 +70,7 @@ impl Command {
             Command::AuditDrift(_) => "audit-drift",
             Command::GcBackups => "gc-backups",
             Command::RestoreBackups(_) => "restore-backups",
-            Command::PurgeState => "purge-state",
+            Command::PurgeState(_) => "purge-state",
         }
     }
 }
@@ -110,6 +111,13 @@ pub fn run() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(err) => {
                 eprintln!("agent-runtime restore-backups: {err:#}");
+                ExitCode::from(2)
+            }
+        },
+        Command::PurgeState(args) => match commands::purge_state::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime purge-state: {err:#}");
                 ExitCode::from(2)
             }
         },
