@@ -5,7 +5,7 @@
 //! printer and apply executor both exercise the byte-identical
 //! idempotence guarantee the Plan 04 acceptance criteria require.
 
-use agent_runtime_cli::install::{self, AppliedChange, Mode};
+use agent_runtime_cli::install::{self, AppliedChange, InstallOptions, Mode};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -130,6 +130,7 @@ fn dry_run_does_not_mutate_home() {
         &state_home,
         Mode::DryRun,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
 
@@ -162,6 +163,7 @@ fn apply_writes_symlinks_and_is_byte_identical_on_second_run() {
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
     // First apply: every action is a SymlinkCreated (fresh home).
@@ -194,6 +196,7 @@ fn apply_writes_symlinks_and_is_byte_identical_on_second_run() {
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
     for c in &changes_second {
@@ -228,6 +231,7 @@ fn pre_existing_regular_file_is_backed_up_then_symlinked() {
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
 
@@ -310,6 +314,7 @@ entries:
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
     assert_eq!(changes_first.len(), 1);
@@ -330,6 +335,7 @@ entries:
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
     assert!(matches!(changes_second[0], AppliedChange::NoOp { .. }));
@@ -351,6 +357,7 @@ fn missing_link_map_returns_typed_error() {
         &state_home,
         Mode::DryRun,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap_err();
     let msg = err.to_string();

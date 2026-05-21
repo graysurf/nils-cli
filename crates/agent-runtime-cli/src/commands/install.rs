@@ -1,8 +1,17 @@
-use crate::install::{self, AppliedChange, Mode};
+use crate::install::{self, AppliedChange, InstallOptions, Mode};
 use crate::render::manifest::SourceRoot;
 use clap::Args;
 use std::path::PathBuf;
 use std::time::SystemTime;
+
+/// Tag-name policy. Mirrors the `managed_block::is_trusted_surface` contract
+/// so backup-dir tags share the same ASCII-safe alphabet as managed-block
+/// surfaces. Plan 04 Sprint 1 Task 1.3.
+fn is_trusted_tag(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
 
 #[derive(Args, Debug)]
 pub struct InstallArgs {
@@ -14,13 +23,26 @@ pub struct InstallArgs {
     #[arg(long)]
     pub product: String,
     /// Absolute path of the runtime home (e.g. `~/.codex` / `~/.claude`).
-    /// Plan 04 Sprint 1 Task 1.3 will add `--live-home` as the polished
-    /// alias plus env-var expansion of the runtime-roots template.
+    /// Relative paths are rejected so install never writes outside an
+    /// explicitly-chosen directory.
     #[arg(long)]
-    pub home: PathBuf,
+    pub live_home: PathBuf,
     /// Absolute path of the state home (where backups land).
     #[arg(long)]
     pub state_home: PathBuf,
+    /// Tag the backup-run root with a `tag-<name>` marker file so
+    /// `gc-backups` (Plan 04 Sprint 2 Task 2.4) can preserve it across
+    /// retention sweeps. Tag must be ASCII alphanumeric / `-` / `_`.
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Skip the optional `.private/link-map.overrides.yaml` overlay
+    /// merge. Default: merge if file exists.
+    #[arg(long, default_value_t = false)]
+    pub no_overlay: bool,
+    /// Override the overlay file location. When set, the conventional
+    /// `<source-root>/.private/link-map.overrides.yaml` is ignored.
+    #[arg(long, conflicts_with = "no_overlay")]
+    pub overlay_path: Option<PathBuf>,
     /// Print the resolved plan; do not mutate the filesystem.
     #[arg(long, conflicts_with = "apply")]
     pub dry_run: bool,
@@ -31,16 +53,26 @@ pub struct InstallArgs {
 }
 
 pub fn run(args: InstallArgs) -> anyhow::Result<u8> {
-    if !args.home.is_absolute() {
+    if !args.live_home.is_absolute() {
+        // Open question Q1 default (resolved 2026-05-21): `--live-home`
+        // must be absolute. Relative paths exit non-zero with a usage
+        // error naming the flag so callers can fix their invocation.
         anyhow::bail!(
-            "agent-runtime install: --home must be absolute (got: {})",
-            args.home.display()
+            "agent-runtime install: --live-home must be absolute (got: {}); pass an absolute path such as /tmp/claude-sandbox or $HOME/.claude",
+            args.live_home.display()
         );
     }
     if !args.state_home.is_absolute() {
         anyhow::bail!(
             "agent-runtime install: --state-home must be absolute (got: {})",
             args.state_home.display()
+        );
+    }
+    if let Some(tag) = args.tag.as_deref()
+        && !is_trusted_tag(tag)
+    {
+        anyhow::bail!(
+            "agent-runtime install: --tag `{tag}` is not a trusted tag name (allowed: ASCII alphanumeric / `-` / `_`)"
         );
     }
     if !args.dry_run && !args.apply {
@@ -56,13 +88,20 @@ pub fn run(args: InstallArgs) -> anyhow::Result<u8> {
     #[allow(clippy::disallowed_methods)]
     let now = SystemTime::now();
 
+    let options = InstallOptions {
+        tag: args.tag.clone(),
+        overlay_enabled: !args.no_overlay,
+        overlay_path: args.overlay_path.clone(),
+    };
+
     let (plan, changes) = install::run(
         &args.product,
         root.path(),
-        &args.home,
+        &args.live_home,
         &args.state_home,
         mode,
         now,
+        &options,
     )?;
 
     eprintln!(
@@ -132,5 +171,26 @@ fn print_change(c: &AppliedChange) {
         AppliedChange::NoOp { entry_id, dest } => {
             eprintln!("  = no-op {} ({})", dest.display(), entry_id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_trusted_tag;
+
+    #[test]
+    fn trusted_tag_accepts_alnum_dash_underscore() {
+        assert!(is_trusted_tag("pre-bump"));
+        assert!(is_trusted_tag("rc_1"));
+        assert!(is_trusted_tag("0.2.0".replace('.', "-").as_str()));
+    }
+
+    #[test]
+    fn trusted_tag_rejects_empty_or_unsafe() {
+        assert!(!is_trusted_tag(""));
+        assert!(!is_trusted_tag("../escape"));
+        assert!(!is_trusted_tag("with space"));
+        assert!(!is_trusted_tag("dot.in.name"));
+        assert!(!is_trusted_tag("slash/in/name"));
     }
 }

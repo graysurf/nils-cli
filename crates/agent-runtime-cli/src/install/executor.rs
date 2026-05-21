@@ -77,11 +77,15 @@ pub enum Mode {
 /// Walk `plan.actions` and return the change set. In [`Mode::DryRun`]
 /// the filesystem is untouched. In [`Mode::Apply`] every divergence is
 /// reconciled. `now` is injected so the backup-directory timestamp is
-/// deterministic in tests.
+/// deterministic in tests. When `tag` is set and at least one backup
+/// directory was created during apply, a `tag-<name>` marker file is
+/// written at the backup-run root so `gc-backups` (Task 2.4) can
+/// preserve it across retention sweeps.
 pub fn run(
     plan: &InstallPlan,
     mode: Mode,
     now: SystemTime,
+    tag: Option<&str>,
 ) -> Result<Vec<AppliedChange>, ApplyError> {
     let backup_root = backup_root_for(plan, now);
     let mut changes = Vec::with_capacity(plan.actions.len());
@@ -102,6 +106,27 @@ pub fn run(
             } => handle_managed_block(mode, entry_id, config_file, surface, *comment_style, body)?,
         };
         changes.push(change);
+    }
+
+    // Write the tag marker only when we are in Apply mode AND at least one
+    // backup directory was created during this run. Dry-run never touches
+    // state_home; runs with zero backups produce no run root for the tag
+    // to live in.
+    if let (Mode::Apply, Some(name)) = (mode, tag) {
+        let had_backup = changes
+            .iter()
+            .any(|c| matches!(c, AppliedChange::FileBackedUpThenSymlinked { .. }));
+        if had_backup {
+            let marker = backup_root.join(format!("tag-{name}"));
+            fs::create_dir_all(&backup_root).map_err(|source| ApplyError::Io {
+                path: backup_root.clone(),
+                source,
+            })?;
+            fs::write(&marker, b"").map_err(|source| ApplyError::Io {
+                path: marker,
+                source,
+            })?;
+        }
     }
     Ok(changes)
 }
