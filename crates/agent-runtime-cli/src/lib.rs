@@ -22,6 +22,7 @@ use std::process::ExitCode;
 
 pub mod audit_drift;
 pub mod commands;
+pub mod install;
 pub mod managed_block;
 pub mod render;
 
@@ -41,7 +42,7 @@ pub enum Command {
     /// Render `core/` + `targets/<product>/` into `build/<product>/`.
     Render(commands::render::RenderArgs),
     /// Activate rendered output against a product's runtime home.
-    Install,
+    Install(commands::install::InstallArgs),
     /// Remove installed renderer output from a product's runtime home.
     Uninstall,
     /// Diagnose host setup, runtime roots, and required CLI floors.
@@ -60,7 +61,7 @@ impl Command {
     fn name(&self) -> &'static str {
         match self {
             Command::Render(_) => "render",
-            Command::Install => "install",
+            Command::Install(_) => "install",
             Command::Uninstall => "uninstall",
             Command::Doctor => "doctor",
             Command::AuditDrift(_) => "audit-drift",
@@ -86,6 +87,13 @@ pub fn run() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(err) => {
                 eprintln!("agent-runtime audit-drift: {err:#}");
+                ExitCode::from(2)
+            }
+        },
+        Command::Install(args) => match commands::install::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime install: {err:#}");
                 ExitCode::from(2)
             }
         },
