@@ -35,9 +35,15 @@ Docs-only checks require:
 - `npx`
 - `plan-tooling`
 
+Local fast changed-scope checks also require:
+
+- `python3`
+- `cargo` for non-document changes
+
 Full required checks also require:
 
 - `cargo`
+- `python3`
 - `zsh`
 - `rg`
 - `cargo-nextest` when `NILS_CLI_TEST_RUNNER=nextest`
@@ -58,7 +64,31 @@ For optional runtime tools used by individual CLIs, see `BINARY_DEPENDENCIES.md`
 
 ## 3. Canonical local test flows
 
-Primary local entrypoint:
+Primary local entrypoint for day-to-day implementation work:
+
+```bash
+bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast
+```
+
+This runs changed-scope validation against `origin/main` by default:
+
+- documentation-only changes use the docs-only lane
+- non-shared crate changes run package-scoped `fmt`, `clippy`, and tests
+- shared crates and workspace-level files escalate to the workspace Rust gate
+
+Override the base ref when needed:
+
+```bash
+bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast --base main
+```
+
+Use `--plan-only` to inspect the selected validation scope without running it:
+
+```bash
+bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast --plan-only
+```
+
+The canonical CI/full-check entrypoint remains:
 
 ```bash
 bash scripts/ci/nils-cli-checks-entrypoint.sh
@@ -92,7 +122,24 @@ The lint has a self-test under
 `scripts/ci/tests/cli-output-contract-lint.test.sh` that exercises every
 regression class against synthetic fixtures.
 
-### 3.2 CI-like required checks (recommended before push)
+### 3.2 Local fast changed-scope checks
+
+For most local implementation loops:
+
+```bash
+bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast
+```
+
+Set `NILS_CLI_TEST_RUNNER=nextest` to require `cargo-nextest`; otherwise the
+local fast gate auto-selects `cargo nextest` when available and falls back to
+`cargo test`.
+
+The local fast gate is conservative. Changes to `nils-common`, `nils-term`,
+`nils-test-support`, root manifests, CI scripts, completions, `.agents/`,
+`.github/`, or other workspace-level paths use a workspace Rust gate because
+package-scoped checks can miss reverse-dependency breakage.
+
+### 3.3 CI-like required checks (optional local parity / CI gate)
 
 ```bash
 NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh
@@ -104,9 +151,10 @@ Notes:
 - Because doctests are not included in nextest, the entrypoint also runs
   `cargo test --workspace --doc` when `NILS_CLI_TEST_RUNNER=nextest`.
 
-### 3.3 Full pre-delivery flow (required for non-docs changes)
+### 3.4 Full coverage flow (CI/release gate)
 
-Coverage gate is mandatory for non-doc changes (total line coverage must stay `>= 85.00%`):
+Coverage gate is mandatory in CI and release-quality verification for non-doc
+changes (total line coverage must stay `>= 85.00%`):
 
 ```bash
 NILS_CLI_TEST_RUNNER=nextest \
@@ -137,6 +185,8 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/markdownlint-audit.sh --strict`
 - `bash scripts/ci/plan-bundle-validate.sh --strict`
 - `bash scripts/ci/cli-output-contract-lint.sh --strict`
+- `bash scripts/ci/forge-cli-fixture-lint.sh --strict`
+- `bash scripts/ci/tests/local-fast-checks.test.sh`
 - `bash scripts/ci/tests/shared-helper-adoption-audit.test.sh`
 - `bash scripts/ci/test-stale-audit.sh --strict`
 - `bash scripts/ci/third-party-artifacts-audit.sh --strict`

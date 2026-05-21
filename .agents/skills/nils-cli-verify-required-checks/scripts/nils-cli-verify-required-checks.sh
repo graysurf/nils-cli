@@ -12,6 +12,8 @@ Runs the required pre-delivery checks from DEVELOPMENT.md:
   - bash scripts/ci/markdownlint-audit.sh --strict
   - bash scripts/ci/plan-bundle-validate.sh --strict
   - bash scripts/ci/cli-output-contract-lint.sh --strict
+  - bash scripts/ci/forge-cli-fixture-lint.sh --strict
+  - bash scripts/ci/tests/local-fast-checks.test.sh
   - bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
   - bash scripts/ci/test-stale-audit.sh --strict
   - bash scripts/ci/third-party-artifacts-audit.sh --strict
@@ -67,7 +69,7 @@ done
 
 required_cmds=(git npx)
 if [[ "$docs_only" -eq 0 ]]; then
-  required_cmds+=(cargo zsh rg)
+  required_cmds+=(cargo python3 zsh rg)
 fi
 
 for cmd in "${required_cmds[@]}"; do
@@ -126,6 +128,7 @@ if [[ "$docs_only" -eq 1 ]]; then
   exit 0
 fi
 
+run bash scripts/ci/tests/local-fast-checks.test.sh
 run bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
 run bash scripts/ci/test-stale-audit.sh --strict
 run bash scripts/ci/third-party-artifacts-audit.sh --strict
