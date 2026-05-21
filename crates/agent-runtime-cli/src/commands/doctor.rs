@@ -76,6 +76,20 @@ pub fn run(args: DoctorArgs) -> anyhow::Result<u8> {
         outcome.warn,
         outcome.block,
     );
+    for probe in &outcome.version_probes {
+        let parsed = probe.parsed_version.as_deref().unwrap_or("unparseable");
+        eprintln!(
+            "  {} version-probe status={} parsed={} command=`{}`",
+            match probe.severity {
+                DoctorSeverity::Ok => "ok",
+                DoctorSeverity::Warn => "warn",
+                DoctorSeverity::Block => "block",
+            },
+            probe.status.as_str(),
+            parsed,
+            probe.command,
+        );
+    }
     for finding in &outcome.findings {
         print_finding(finding);
     }

@@ -4,6 +4,7 @@ use agent_runtime_cli::doctor::{self, DoctorOptions, DoctorSeverity};
 use agent_runtime_cli::install::{self, InstallOptions, Mode};
 use agent_runtime_cli::managed_block::{CommentStyle, ManagedBlock};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
@@ -15,6 +16,16 @@ fn fixed_time() -> SystemTime {
 fn build_source_root(tmp: &Path, product: &str, home: &Path, state_home: &Path) -> PathBuf {
     let root = tmp.join("src");
     fs::create_dir_all(root.join("manifests")).unwrap();
+    let bin = root.join("bin").join(format!("{product}-version"));
+    fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    fs::write(
+        &bin,
+        format!("#!/usr/bin/env sh\necho \"{product} 0.0.0\"\n"),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&bin, perms).unwrap();
 
     let skill = root
         .join("build")
@@ -63,7 +74,7 @@ products:
     min_version: \"0.0.0\"
     recommended_version: \"0.0.0\"
     min_version_effective_from: \"2099-01-01\"
-    version_probe: \"codex --version\"
+    version_probe: \"{version_probe}\"
   claude:
     live_home: \"{home}\"
     docs_home: \"{home}\"
@@ -72,10 +83,11 @@ products:
     min_version: \"0.0.0\"
     recommended_version: \"0.0.0\"
     min_version_effective_from: \"2099-01-01\"
-    version_probe: \"claude --version\"
+    version_probe: \"{version_probe}\"
 ",
         home = home.display(),
         state_home = state_home.display(),
+        version_probe = bin.display(),
     );
     fs::write(
         root.join("manifests").join("runtime-roots.yaml"),
