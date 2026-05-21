@@ -24,12 +24,16 @@ pub mod agent_home_leak;
 pub mod docs_home;
 pub mod rendered_target;
 pub mod source_manifest;
+pub mod unsafe_score;
 pub mod walk;
 
 pub const PRODUCTS: &[&str] = &["codex", "claude"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
+    /// Drift that is only visible in verbose output and never affects
+    /// the exit code.
+    Suppressed,
     /// Drift that the reporting POC will surface but not block on.
     Warn,
     /// Drift that breaks an explicit Resolved Decision contract.
@@ -39,6 +43,7 @@ pub enum Severity {
 impl Severity {
     pub fn exit_code(self) -> u8 {
         match self {
+            Severity::Suppressed => 0,
             Severity::Warn => 1,
             Severity::Block => 2,
         }
@@ -46,6 +51,7 @@ impl Severity {
 
     pub fn label(self) -> &'static str {
         match self {
+            Severity::Suppressed => "suppressed",
             Severity::Warn => "warn",
             Severity::Block => "block",
         }
@@ -119,6 +125,7 @@ pub fn run(root: &SourceRoot) -> Result<DriftReport> {
         docs_home::check(root, product, &mut report)?;
     }
     agent_home_leak::check_source_tree(root, &mut report)?;
+    unsafe_score::check(root, &mut report)?;
 
     report.sort();
     Ok(report)
@@ -180,8 +187,10 @@ mod tests {
 
     #[test]
     fn severity_exit_codes_match_documented_policy() {
+        assert_eq!(Severity::Suppressed.exit_code(), 0);
         assert_eq!(Severity::Warn.exit_code(), 1);
         assert_eq!(Severity::Block.exit_code(), 2);
+        assert_eq!(Severity::Suppressed.label(), "suppressed");
         assert_eq!(Severity::Warn.label(), "warn");
         assert_eq!(Severity::Block.label(), "block");
     }
