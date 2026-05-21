@@ -22,6 +22,7 @@ use std::process::ExitCode;
 
 pub mod audit_drift;
 pub mod commands;
+pub mod doctor;
 pub mod gc_backups;
 pub mod install;
 pub mod managed_block;
@@ -50,7 +51,7 @@ pub enum Command {
     /// Remove installed renderer output from a product's runtime home.
     Uninstall(commands::uninstall::UninstallArgs),
     /// Diagnose host setup, runtime roots, and required CLI floors.
-    Doctor,
+    Doctor(commands::doctor::DoctorArgs),
     /// Detect source-vs-rendered, rendered-vs-live, and unsafe drift.
     AuditDrift(commands::audit_drift::AuditDriftArgs),
     /// Prune old backups under `<state_home>/backups/`.
@@ -67,7 +68,7 @@ impl Command {
             Command::Render(_) => "render",
             Command::Install(_) => "install",
             Command::Uninstall(_) => "uninstall",
-            Command::Doctor => "doctor",
+            Command::Doctor(_) => "doctor",
             Command::AuditDrift(_) => "audit-drift",
             Command::GcBackups(_) => "gc-backups",
             Command::RestoreBackups(_) => "restore-backups",
@@ -129,9 +130,12 @@ pub fn run() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        _ => {
-            eprintln!("agent-runtime {name}: not implemented");
-            ExitCode::from(1)
-        }
+        Command::Doctor(args) => match commands::doctor::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime {name}: {err:#}");
+                ExitCode::from(2)
+            }
+        },
     }
 }

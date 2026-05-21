@@ -9,6 +9,8 @@ mod audit_drift_classes;
 mod cli;
 #[path = "integration/determinism_gate.rs"]
 mod determinism_gate;
+#[path = "integration/doctor_filesystem.rs"]
+mod doctor_filesystem;
 #[path = "integration/gc_backups.rs"]
 mod gc_backups;
 #[path = "integration/install_flags.rs"]
