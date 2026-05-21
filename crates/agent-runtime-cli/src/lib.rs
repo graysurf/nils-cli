@@ -25,6 +25,7 @@ pub mod commands;
 pub mod install;
 pub mod managed_block;
 pub mod render;
+pub mod restore_backups;
 pub mod uninstall;
 
 #[derive(Parser)]
@@ -53,7 +54,7 @@ pub enum Command {
     /// Prune old backups under `<state_home>/backups/`.
     GcBackups,
     /// Restore a runtime home from a recorded backup snapshot.
-    RestoreBackups,
+    RestoreBackups(commands::restore_backups::RestoreBackupsArgs),
     /// Purge runtime-managed state (use with caution).
     PurgeState,
 }
@@ -67,7 +68,7 @@ impl Command {
             Command::Doctor => "doctor",
             Command::AuditDrift(_) => "audit-drift",
             Command::GcBackups => "gc-backups",
-            Command::RestoreBackups => "restore-backups",
+            Command::RestoreBackups(_) => "restore-backups",
             Command::PurgeState => "purge-state",
         }
     }
@@ -102,6 +103,13 @@ pub fn run() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(err) => {
                 eprintln!("agent-runtime uninstall: {err:#}");
+                ExitCode::from(2)
+            }
+        },
+        Command::RestoreBackups(args) => match commands::restore_backups::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime restore-backups: {err:#}");
                 ExitCode::from(2)
             }
         },
