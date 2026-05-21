@@ -5,7 +5,7 @@
 //! printer and apply executor both exercise the byte-identical
 //! idempotence guarantee the Plan 04 acceptance criteria require.
 
-use agent_runtime_cli::install::{self, AppliedChange, Mode};
+use agent_runtime_cli::install::{self, AppliedChange, InstallOptions, Mode};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -123,15 +123,18 @@ fn dry_run_does_not_mutate_home() {
     fs::create_dir_all(&home).unwrap();
 
     let before = snapshot(&home);
-    let (plan, changes) = install::run(
+    let __outcome = install::run(
         "claude",
         &source_root,
         &home,
         &state_home,
         Mode::DryRun,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
+    let plan = __outcome.plan;
+    let changes = __outcome.changes;
 
     // Dry-run must not touch the filesystem.
     assert_eq!(snapshot(&home), before, "home was mutated by dry-run");
@@ -155,15 +158,17 @@ fn apply_writes_symlinks_and_is_byte_identical_on_second_run() {
     let home = tmp.path().join("home");
     let state_home = tmp.path().join("state");
 
-    let (_, changes_first) = install::run(
+    let __outcome = install::run(
         "claude",
         &source_root,
         &home,
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
+    let changes_first = __outcome.changes;
     // First apply: every action is a SymlinkCreated (fresh home).
     for c in &changes_first {
         assert!(
@@ -187,15 +192,17 @@ fn apply_writes_symlinks_and_is_byte_identical_on_second_run() {
     assert_eq!(fs::read_to_string(&skill_dest).unwrap(), "# daily-brief\n",);
 
     // Second apply: byte-identical no-op.
-    let (_, changes_second) = install::run(
+    let __outcome = install::run(
         "claude",
         &source_root,
         &home,
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
+    let changes_second = __outcome.changes;
     for c in &changes_second {
         assert!(
             matches!(c, AppliedChange::NoOp { .. }),
@@ -221,15 +228,17 @@ fn pre_existing_regular_file_is_backed_up_then_symlinked() {
     fs::create_dir_all(pre_existing.parent().unwrap()).unwrap();
     fs::write(&pre_existing, b"user-edited content\n").unwrap();
 
-    let (_, changes) = install::run(
+    let __outcome = install::run(
         "claude",
         &source_root,
         &home,
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
+    let changes = __outcome.changes;
 
     let backed_up = changes
         .iter()
@@ -303,15 +312,17 @@ entries:
     let home = tmp.path().join("home");
     let state_home = tmp.path().join("state");
 
-    let (_, changes_first) = install::run(
+    let __outcome = install::run(
         "codex",
         &source_root,
         &home,
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
+    let changes_first = __outcome.changes;
     assert_eq!(changes_first.len(), 1);
     assert!(matches!(
         changes_first[0],
@@ -323,15 +334,17 @@ entries:
     assert!(config_after_first.contains("tag = \"agent-runtime\""));
     assert!(config_after_first.contains("# <<< agent-runtime-kit:install <<<"));
 
-    let (_, changes_second) = install::run(
+    let __outcome = install::run(
         "codex",
         &source_root,
         &home,
         &state_home,
         Mode::Apply,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap();
+    let changes_second = __outcome.changes;
     assert!(matches!(changes_second[0], AppliedChange::NoOp { .. }));
     let config_after_second = fs::read_to_string(home.join("config.toml")).unwrap();
     assert_eq!(config_after_first, config_after_second);
@@ -351,6 +364,7 @@ fn missing_link_map_returns_typed_error() {
         &state_home,
         Mode::DryRun,
         fixed_time(),
+        &InstallOptions::default(),
     )
     .unwrap_err();
     let msg = err.to_string();
