@@ -83,6 +83,16 @@ fn seven_runs_with_default_retention_five_keeps_five_in_apply() {
         stderr.contains("retained=5") && stderr.contains("deleted=2"),
         "summary line missing counts: {stderr}"
     );
+    // Stream discipline (Plan 04 Task 2.4 review T-6, mirror of Task 2.3
+    // R-1): the summary + per-change report must land on stderr only;
+    // stdout is reserved for future structured output.
+    let stdout = out.stdout_text();
+    assert!(
+        !stdout.contains("retained")
+            && !stdout.contains("deleted")
+            && !stdout.contains("would-delete"),
+        "summary leaked to stdout: {stdout}"
+    );
 }
 
 #[test]

@@ -237,8 +237,16 @@ pub fn run(state_home: &Path, mode: Mode, options: &GcOptions) -> Result<GcOutco
     let mut changes = Vec::new();
     for product in products {
         let product_root = state_home.join("backups").join(product);
-        if !product_root.is_dir() {
-            continue;
+        // Defense-in-depth: refuse to enumerate / delete through a
+        // symlinked product_root. `Path::is_dir` follows symlinks, so
+        // without this guard an attacker who can plant a symlink at
+        // `<state_home>/backups/<product>` could redirect the
+        // `fs::remove_dir_all` below to a directory outside state_home.
+        // Mirrors the entry-level `file_type()` discipline in
+        // `enumerate_runs`. (Plan 04 Task 2.4 review S-1 / R-2.)
+        match fs::symlink_metadata(&product_root) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            _ => continue,
         }
         let runs = enumerate_runs(&product_root)?;
         let runs = filter_by_surface(runs, options.surface.as_deref());
@@ -440,6 +448,66 @@ mod tests {
 
         let missing = tmp.path().join("tag-missing");
         assert!(!is_tag_marker(&missing), "non-existent path");
+    }
+
+    #[test]
+    fn is_tag_marker_symlink_to_file_is_not_marker() {
+        // Plan 04 Task 2.4 review T-4 / S-1 positive-control regression
+        // pin. `is_tag_marker` must reject a symlink even when its target
+        // is a regular file — otherwise an attacker with write access at
+        // a run root could symlink `tag-evil -> /anywhere/regular-file`
+        // and force gc-backups to preserve the run.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("real-file");
+        fs::write(&target, b"contents").unwrap();
+        let link = tmp.path().join("tag-evil");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            !is_tag_marker(&link),
+            "symlink to a regular file must NOT be classified as a tag marker"
+        );
+    }
+
+    #[test]
+    fn product_root_symlink_is_refused_not_followed() {
+        // Plan 04 Task 2.4 review S-1 / R-2 regression pin.
+        // <state_home>/backups/<product> must not be a symlink — otherwise
+        // gc-backups would walk and `remove_dir_all` through the symlinked
+        // target. Defense-in-depth: even if the target is a real backup
+        // tree, refusing to traverse it is the safer default.
+        let tmp = TempDir::new().unwrap();
+        let state = tmp.path();
+        // Build a real backup tree elsewhere with one numeric run.
+        let real_tree = state.join("elsewhere");
+        fs::create_dir_all(real_tree.join("100").join("entry")).unwrap();
+        fs::write(real_tree.join("100/entry/plugin.json"), b"BACKUP").unwrap();
+        // Plant the product_root as a symlink at the canonical location.
+        let product_root = state.join("backups").join("claude");
+        fs::create_dir_all(product_root.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_tree, &product_root).unwrap();
+
+        let outcome = run(
+            state,
+            Mode::Apply,
+            &GcOptions {
+                product: ProductFilter::One("claude".into()),
+                retention: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Symlinked product_root yields zero changes, and the real tree
+        // is untouched.
+        assert!(
+            outcome.changes.is_empty(),
+            "symlinked product_root must produce no changes: {:?}",
+            outcome.changes
+        );
+        assert_eq!(
+            fs::read_to_string(real_tree.join("100/entry/plugin.json")).unwrap(),
+            "BACKUP",
+            "symlinked target must survive intact"
+        );
     }
 
     #[test]
