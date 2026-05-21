@@ -19,5 +19,7 @@ mod managed_block;
 mod render;
 #[path = "integration/render_determinism.rs"]
 mod render_determinism;
+#[path = "integration/restore_backups.rs"]
+mod restore_backups;
 #[path = "integration/uninstall.rs"]
 mod uninstall;
