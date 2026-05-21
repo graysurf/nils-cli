@@ -145,15 +145,15 @@ fn json_contract() {
         serde_json::Value::String("invalid-apply-payload".to_string())
     );
 
-    let delete_without_hard = run_memo_cli(&db_path, &["--json", "delete", item_id], None);
+    let delete_without_yes = run_memo_cli(&db_path, &["--json", "delete", item_id], None);
     assert_eq!(
-        delete_without_hard.code, 64,
-        "delete without --hard should fail with usage error"
+        delete_without_yes.code, 64,
+        "delete without --yes should fail with usage error"
     );
-    let delete_without_hard_json = parse_json_stdout(&delete_without_hard);
-    assert_eq!(delete_without_hard_json["ok"], false);
+    let delete_without_yes_json = parse_json_stdout(&delete_without_yes);
+    assert_eq!(delete_without_yes_json["ok"], false);
 
-    let delete_output = run_memo_cli(&db_path, &["--json", "delete", item_id, "--hard"], None);
+    let delete_output = run_memo_cli(&db_path, &["--json", "delete", item_id, "--yes"], None);
     assert_eq!(
         delete_output.code,
         0,

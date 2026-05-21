@@ -25,6 +25,7 @@ rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 nils-common = { version = "0.14.0", path = "../nils-common", package = "nils-common" }
+nils-term = { version = "0.14.0", path = "../nils-term", package = "nils-term" }
 
 [dev-dependencies]
 nils-test-support = { version = "0.14.0", path = "../nils-test-support" }

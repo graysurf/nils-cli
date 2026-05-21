@@ -47,3 +47,4 @@
 //! progress (e.g. interactive vs CI).
 
 pub mod progress;
+pub mod prompt;

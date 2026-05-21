@@ -98,28 +98,13 @@ pub fn run_with_json(target: &str, yes: bool, output_json: bool) -> Result<i32> 
     }
 
     if !yes {
-        if output_json {
-            output::emit_error(
-                "auth remove",
-                "remove-confirmation-required",
-                format!(
-                    "codex-remove: {} exists; rerun with --yes to remove",
-                    target_file.display()
-                ),
-                Some(json!({
-                    "target_file": target_file.display().to_string(),
-                    "removed": false,
-                })),
-            )?;
-            return Ok(1);
-        }
-
         if !interactive_io_available() {
-            eprintln!(
-                "codex-remove: {} exists; rerun with --yes to remove",
-                target_file.display()
-            );
-            return Ok(1);
+            emit_confirmation_usage_error(output_json, &target_file)?;
+            return Ok(64);
+        }
+        if output_json {
+            emit_confirmation_usage_error(true, &target_file)?;
+            return Ok(64);
         }
 
         if !confirm_remove(&target_file)? {
@@ -162,6 +147,29 @@ pub fn run_with_json(target: &str, yes: bool, output_json: bool) -> Result<i32> 
         println!("codex: removed {}", target_file.display());
     }
     Ok(0)
+}
+
+fn emit_confirmation_usage_error(output_json: bool, target_file: &Path) -> Result<()> {
+    if output_json {
+        output::emit_error(
+            "auth remove",
+            "usage-error",
+            format!(
+                "codex-remove: {} exists; rerun with --yes to remove",
+                target_file.display()
+            ),
+            Some(json!({
+                "target_file": target_file.display().to_string(),
+                "removed": false,
+            })),
+        )?;
+    } else {
+        eprintln!(
+            "codex-remove: {} exists; rerun with --yes to remove",
+            target_file.display()
+        );
+    }
+    Ok(())
 }
 
 fn usage_error(output_json: bool, message: &str) -> Result<i32> {

@@ -46,7 +46,7 @@ fn hard_delete_cleans_anchor_and_typed_workflow_rows() {
     .expect("insert game row");
     drop(conn);
 
-    let delete_output = run_memo_cli(&db_path, &["--json", "delete", item_id_str, "--hard"], None);
+    let delete_output = run_memo_cli(&db_path, &["--json", "delete", item_id_str, "--yes"], None);
     assert_eq!(
         delete_output.code,
         0,

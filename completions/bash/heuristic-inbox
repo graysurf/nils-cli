@@ -58,7 +58,7 @@ _heuristic-inbox() {
             return 0
             ;;
         heuristic__inbox__archive)
-            opts="-h --inbox-dir --archive-root --date --link --reason --dry-run --log-dir --format --help <PATH>"
+            opts="-y -h --inbox-dir --archive-root --date --link --reason --yes --dry-run --log-dir --format --help <PATH>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

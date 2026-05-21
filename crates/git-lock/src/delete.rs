@@ -1,12 +1,11 @@
 use anyhow::Result;
 use nils_common::cli_contract::exit;
+use nils_term::prompt::{self, PromptError, PromptOptions};
 use std::fs;
-use std::io::{self, IsTerminal};
 
 use crate::git::DefaultGitBackend;
 use crate::lock_view::LockDetails;
 use crate::messages;
-use crate::prompt;
 use crate::store::LockStore;
 
 pub fn run(args: &[String]) -> Result<i32> {
@@ -64,15 +63,16 @@ pub fn run(args: &[String]) -> Result<i32> {
     println!();
 
     if !options.force {
-        if !io::stdin().is_terminal() {
-            eprintln!("error: git-lock delete requires --force when stdin is not a TTY");
-            return Ok(exit::USAGE);
-        }
-
         println!("{}", delete_warning());
-        let prompt = "⚠️  Delete this git-lock? [y/N] ";
-        if !prompt::confirm(prompt)? {
-            return Ok(1);
+        let prompt_text = "⚠️  Delete this git-lock? [y/N] ";
+        match prompt::confirm(prompt_text, true, PromptOptions::new()) {
+            Ok(true) => {}
+            Ok(false) => return Ok(1),
+            Err(PromptError::NonInteractive) => {
+                eprintln!("error: git-lock delete requires --force when stdin is not a TTY");
+                return Ok(exit::USAGE);
+            }
+            Err(PromptError::Io(err)) => return Err(err.into()),
         }
     }
 

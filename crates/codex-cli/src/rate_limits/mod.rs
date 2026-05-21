@@ -104,23 +104,6 @@ pub fn run(args: &RateLimitsOptions) -> Result<i32> {
         debug_mode = true;
     }
 
-    if args.watch && !args.async_mode {
-        if output_json {
-            diag_output::emit_error(
-                DIAG_SCHEMA_VERSION,
-                DIAG_COMMAND,
-                "invalid-flag-combination",
-                "codex-rate-limits: --watch requires --async",
-                Some(serde_json::json!({
-                    "flags": ["--watch", "--async"],
-                })),
-            )?;
-        } else {
-            eprintln!("codex-rate-limits: --watch requires --async");
-        }
-        return Ok(64);
-    }
-
     if args.async_mode {
         if !args.cached {
             maybe_sync_all_mode_auth_silent(debug_mode);

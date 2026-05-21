@@ -86,8 +86,10 @@ pub enum MemoCommand {
     /// Update one memo entry and reset derived workflow state
     #[command(long_about = "Update one memo entry and reset derived enrichment workflow state.")]
     Update(UpdateArgs),
-    /// Hard-delete one memo entry and all dependent data
-    #[command(long_about = "Hard-delete one memo entry and all dependent derived data.")]
+    /// Delete one memo entry and all dependent data
+    #[command(
+        long_about = "Delete one memo entry and all dependent derived data. Interactive terminals prompt by default; non-interactive deletion requires --yes."
+    )]
     Delete(DeleteArgs),
     /// List memo entries in deterministic order
     #[command(
@@ -145,9 +147,13 @@ pub struct DeleteArgs {
     /// Item identifier (itm_XXXXXXXX or integer id)
     pub item_id: String,
 
-    /// Confirm hard-delete behavior
+    /// Deprecated compatibility confirmation flag; use --yes to confirm deletion.
     #[arg(long)]
     pub hard: bool,
+
+    /// Confirm deletion without prompting
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, clap::Args)]

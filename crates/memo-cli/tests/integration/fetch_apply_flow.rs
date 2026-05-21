@@ -200,3 +200,74 @@ fn apply_idempotency() {
         .expect("active derivation version query");
     assert_eq!(active_version, 2);
 }
+
+#[test]
+fn apply_dry_run_reports_change_preview() {
+    let db_path = test_db_path("apply_dry_run_reports_change_preview");
+
+    let add_output = run_memo_cli(
+        &db_path,
+        &["--json", "add", "renew passport in april"],
+        None,
+    );
+    assert_eq!(
+        add_output.code,
+        0,
+        "add failed: {}",
+        add_output.stderr_text()
+    );
+    let add_json = parse_json_stdout(&add_output);
+    let item_id_str = add_json["data"]["item_id"]
+        .as_str()
+        .expect("item_id should be string");
+
+    let payload = json!({
+        "items": [{
+            "item_id": item_id_str,
+            "derivation_hash": "hash-dry-run-preview",
+            "summary": "renew passport",
+            "category": "admin",
+            "normalized_text": "renew passport in april",
+            "confidence": 0.81,
+            "tags": ["admin"],
+            "payload": {"summary":"renew passport"}
+        }]
+    });
+
+    let json_output = run_memo_cli(
+        &db_path,
+        &["--json", "apply", "--stdin", "--dry-run"],
+        Some(&payload.to_string()),
+    );
+    assert_eq!(
+        json_output.code,
+        0,
+        "dry-run apply failed: {}",
+        json_output.stderr_text()
+    );
+    let json_payload = parse_json_stdout(&json_output);
+    let changes = json_payload["data"]["changes"]
+        .as_array()
+        .expect("changes should be an array");
+    assert!(
+        changes
+            .iter()
+            .any(|change| change["field"] == "summary" && change["new"] == "renew passport"),
+        "changes={changes:?}"
+    );
+
+    let text_output = run_memo_cli(
+        &db_path,
+        &["apply", "--stdin", "--dry-run"],
+        Some(&payload.to_string()),
+    );
+    assert_eq!(
+        text_output.code,
+        0,
+        "text dry-run apply failed: {}",
+        text_output.stderr_text()
+    );
+    let stdout = text_output.stdout_text();
+    assert!(stdout.contains("changes:"), "stdout={stdout}");
+    assert!(stdout.contains("summary"), "stdout={stdout}");
+}

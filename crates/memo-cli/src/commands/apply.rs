@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 
 use serde::Serialize;
 
@@ -20,6 +20,7 @@ struct JsonApplyResult<'a> {
     skipped: i64,
     failed: i64,
     items: Vec<JsonApplyItem<'a>>,
+    changes: &'a [derivations::ApplyChange],
 }
 
 #[derive(Debug, Serialize)]
@@ -54,6 +55,11 @@ pub fn run(storage: &Storage, format: OutputFormat, args: &ApplyArgs) -> Result<
             .with_code("io-read-failed")
         })?
     } else {
+        if io::stdin().is_terminal() {
+            return Err(AppError::usage(
+                "--stdin requires piped input; use --input <file> or pipe content into stdin",
+            ));
+        }
         let mut buffer = String::new();
         io::stdin().read_to_string(&mut buffer).map_err(|err| {
             AppError::runtime(format!("failed to read apply payload from stdin: {err}"))
@@ -101,6 +107,7 @@ pub fn run(storage: &Storage, format: OutputFormat, args: &ApplyArgs) -> Result<
             accepted: summary.accepted,
             skipped: summary.skipped,
             failed: summary.failed,
+            changes: &summary.changes,
             items: summary
                 .items
                 .iter()
