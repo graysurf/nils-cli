@@ -23,10 +23,10 @@ const ALL_SUBCOMMANDS: &[&str] = &[
 ];
 
 /// Subcommands whose body still prints `not implemented` and exits 1.
-/// `render` is no longer a stub once Task 1.1 lands; later sprints peel
-/// further entries off this list.
+/// `render` and `install` are no longer stubs once Plan 04 Sprint 1
+/// Tasks 1.1 / 1.2 land; later sprints peel further entries off this
+/// list.
 const STUB_SUBCOMMANDS: &[&str] = &[
-    "install",
     "uninstall",
     "doctor",
     "gc-backups",
