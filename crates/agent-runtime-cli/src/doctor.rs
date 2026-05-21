@@ -268,7 +268,17 @@ fn resolve_runtime_roots(
     live_home_override: Option<&Path>,
     state_home_override: Option<&Path>,
 ) -> ResolvedRuntimeRoots {
-    let mut env: BTreeMap<String, String> = std::env::vars().collect();
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    resolve_runtime_roots_with_env(product, root, live_home_override, state_home_override, env)
+}
+
+fn resolve_runtime_roots_with_env(
+    product: &str,
+    root: &ProductRoot,
+    live_home_override: Option<&Path>,
+    state_home_override: Option<&Path>,
+    mut env: BTreeMap<String, String>,
+) -> ResolvedRuntimeRoots {
     if let Some(live_home) = live_home_override
         && product == "codex"
     {
@@ -285,10 +295,7 @@ fn resolve_runtime_roots(
     let state_home = state_home_override
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(expand_env_vars(&root.state_home, &env)));
-    let plugin_root = root
-        .plugin_root
-        .as_deref()
-        .map(|raw| resolve_product_path(product, raw, live_home_override, &env));
+    let plugin_root = resolve_plugin_root(product, root, live_home_override, &env);
 
     ResolvedRuntimeRoots {
         product: product.to_string(),
@@ -296,6 +303,24 @@ fn resolve_runtime_roots(
         docs_home,
         state_home,
         plugin_root,
+    }
+}
+
+fn resolve_plugin_root(
+    product: &str,
+    root: &ProductRoot,
+    live_home_override: Option<&Path>,
+    env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    if let Some(raw) = root.plugin_root.as_deref() {
+        return Some(resolve_product_path(product, raw, live_home_override, env));
+    }
+    let name = root.plugin_root_env.as_deref()?;
+    let value = env.get(name)?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
     }
 }
 
@@ -337,11 +362,11 @@ fn expand_env_vars(raw: &str, env: &BTreeMap<String, String>) -> String {
             continue;
         }
         if chars.get(i + 1) == Some(&'{')
-            && let Some(end) = chars[i + 2..].iter().position(|c| *c == '}')
+            && let Some(end) = find_matching_brace(&chars, i + 1)
         {
-            let expr: String = chars[i + 2..i + 2 + end].iter().collect();
+            let expr: String = chars[i + 2..end].iter().collect();
             out.push_str(&expand_braced_expr(&expr, env));
-            i += end + 3;
+            i = end + 1;
             continue;
         }
         let mut end = i + 1;
@@ -358,6 +383,26 @@ fn expand_env_vars(raw: &str, env: &BTreeMap<String, String>) -> String {
         i = end;
     }
     out
+}
+
+fn find_matching_brace(chars: &[char], open_brace: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open_brace + 1;
+    while i < chars.len() {
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'{') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if chars[i] == '}' {
+            if depth == 0 {
+                return Some(i);
+            }
+            depth -= 1;
+        }
+        i += 1;
+    }
+    None
 }
 
 fn expand_braced_expr(expr: &str, env: &BTreeMap<String, String>) -> String {
@@ -384,6 +429,69 @@ mod tests {
         assert_eq!(
             expand_env_vars("${CODEX_AGENT_STATE_HOME:-$HOME/.local/state}", &env),
             "/tmp/home/.local/state"
+        );
+    }
+
+    #[test]
+    fn env_expansion_supports_nested_braced_default_values() {
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), "/tmp/home".to_string());
+        assert_eq!(
+            expand_env_vars(
+                "${CODEX_AGENT_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit/codex}",
+                &env
+            ),
+            "/tmp/home/.local/state/agent-runtime-kit/codex"
+        );
+
+        env.insert("XDG_STATE_HOME".to_string(), "/tmp/state".to_string());
+        assert_eq!(
+            expand_env_vars(
+                "${CODEX_AGENT_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit/codex}",
+                &env
+            ),
+            "/tmp/state/agent-runtime-kit/codex"
+        );
+
+        env.insert(
+            "CODEX_AGENT_STATE_HOME".to_string(),
+            "/tmp/codex-state".to_string(),
+        );
+        assert_eq!(
+            expand_env_vars(
+                "${CODEX_AGENT_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit/codex}",
+                &env
+            ),
+            "/tmp/codex-state"
+        );
+    }
+
+    #[test]
+    fn runtime_root_resolution_uses_plugin_root_env_when_set() {
+        let root = ProductRoot {
+            live_home: "$HOME/.claude".to_string(),
+            docs_home: "$HOME/.claude".to_string(),
+            state_home: "$HOME/.local/state/agent-runtime-kit/claude".to_string(),
+            plugin_root: None,
+            plugin_root_env: Some("CLAUDE_PLUGIN_ROOT".to_string()),
+            hook_config_strategy: None,
+            min_version: "0.0.0".to_string(),
+            recommended_version: "0.0.0".to_string(),
+            min_version_effective_from: "2099-01-01".to_string(),
+            version_probe: "claude --version".to_string(),
+        };
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), "/tmp/home".to_string());
+        env.insert(
+            "CLAUDE_PLUGIN_ROOT".to_string(),
+            "/tmp/claude-plugin".to_string(),
+        );
+
+        let resolved = resolve_runtime_roots_with_env("claude", &root, None, None, env);
+
+        assert_eq!(
+            resolved.plugin_root,
+            Some(PathBuf::from("/tmp/claude-plugin"))
         );
     }
 }
