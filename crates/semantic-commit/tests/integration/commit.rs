@@ -334,6 +334,106 @@ fn commit_validate_only_invalid_message_returns_4() {
     assert_eq!(output.status.code(), Some(4));
 }
 
+fn header_with_total_len(total_len: usize) -> String {
+    let prefix = "feat: ";
+    assert!(total_len > prefix.len());
+    format!("{prefix}{}", "a".repeat(total_len - prefix.len()))
+}
+
+#[test]
+fn commit_max_header_width_flag_rejects_header_over_active_limit() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let message = header_with_total_len(73);
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--max-header-width",
+            "72",
+            "--message",
+            &message,
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        as_str(&output.stderr).contains("commit header exceeds 72 characters (max 72)"),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_max_header_width_env_sets_default_when_flag_absent() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let message = header_with_total_len(81);
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &["commit", "--validate-only", "--message", &message],
+        &[("SEMANTIC_COMMIT_HEADER_WIDTH", "80")],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        as_str(&output.stderr).contains("commit header exceeds 80 characters (max 80)"),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_max_header_width_flag_wins_over_env_default() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let message = header_with_total_len(79);
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--max-header-width",
+            "80",
+            "--message",
+            &message,
+        ],
+        &[("SEMANTIC_COMMIT_HEADER_WIDTH", "72")],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_max_header_width_env_rejects_non_positive_values() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing",
+        ],
+        &[("SEMANTIC_COMMIT_HEADER_WIDTH", "0")],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        as_str(&output.stderr).contains("SEMANTIC_COMMIT_HEADER_WIDTH must be a positive integer"),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
 #[test]
 fn commit_dry_run_validates_and_checks_staged_without_committing() {
     let repo = common::init_repo();

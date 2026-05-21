@@ -127,7 +127,7 @@ Semantics:
   - optional `content_type`
   - optional `validation_status`
 - optional `pagination`:
-  - `limit`, `offset`, `returned`
+  - `limit`, `offset`, `returned`, `truncated`
 
 ### `search` (`results`)
 
@@ -139,7 +139,7 @@ Semantics:
   - optional `content_type`
   - optional `validation_status`
 - optional `meta`:
-  - `query`, `limit`, `state`, `fields`, `match`
+  - `query`, `limit`, `state`, `fields`, `match`, `truncated`
 
 ### `report` (`result`)
 
@@ -274,7 +274,8 @@ Redaction example (conceptual):
   "pagination": {
     "limit": 20,
     "offset": 0,
-    "returned": 2
+    "returned": 2,
+    "truncated": false
   }
 }
 ```
@@ -305,7 +306,8 @@ Redaction example (conceptual):
     "limit": 20,
     "state": "all",
     "fields": ["raw_text", "derived_text", "tags_text"],
-    "match": "fts"
+    "match": "fts",
+    "truncated": false
   }
 }
 ```

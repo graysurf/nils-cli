@@ -1,5 +1,3 @@
-use std::io::IsTerminal;
-
 use anyhow::Result;
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
 
@@ -50,7 +48,7 @@ pub fn summary(since: Option<&str>, until: Option<&str>) -> i32 {
 
 fn render_summary(log_args: &[String]) -> Result<()> {
     let authors = collect_authors(log_args)?;
-    let progress = if !authors.is_empty() && std::io::stderr().is_terminal() {
+    let progress = if !authors.is_empty() {
         Some(Progress::new(
             authors.len() as u64,
             ProgressOptions::default().with_finish(ProgressFinish::Clear),

@@ -23,6 +23,8 @@ mod help_snapshot;
 mod item_id_allocator;
 #[path = "integration/json_contract.rs"]
 mod json_contract;
+#[path = "integration/list_search_footer.rs"]
+mod list_search_footer;
 #[path = "integration/memo_flow.rs"]
 mod memo_flow;
 #[path = "integration/metadata_projection.rs"]

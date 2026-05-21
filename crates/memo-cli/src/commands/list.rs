@@ -15,6 +15,7 @@ pub fn run(
 ) -> Result<(), AppError> {
     let rows =
         storage.with_connection(|conn| repository::list_items(conn, state, limit, offset))?;
+    let truncated = limit > 0 && rows.len() == limit;
 
     if format.is_json() {
         let items = rows
@@ -38,12 +39,13 @@ pub fn run(
                     "limit": limit,
                     "offset": offset,
                     "returned": rows.len(),
+                    "truncated": truncated,
                 },
             }),
         );
     }
 
-    text::print_list(&rows);
+    text::print_list(&rows, limit, offset, truncated);
 
     Ok(())
 }
