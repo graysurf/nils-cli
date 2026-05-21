@@ -23,7 +23,7 @@ fn hard_delete_does_not_reuse_item_ids() {
 
     let delete_first = run_memo_cli(
         &db_path,
-        &["--json", "delete", first_item_id_str, "--hard"],
+        &["--json", "delete", first_item_id_str, "--yes"],
         None,
     );
     assert_eq!(

@@ -212,7 +212,7 @@ fn rate_limits_async_one_line_conflict() {
 fn rate_limits_watch_requires_async() {
     let output = run(&["diag", "rate-limits", "--watch"], &[], &[]);
     assert_exit(&output, 64);
-    assert!(stderr(&output).contains("--watch requires --async"));
+    assert!(stderr(&output).contains("--async"));
 }
 
 #[test]

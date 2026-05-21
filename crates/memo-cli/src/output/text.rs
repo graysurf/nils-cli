@@ -130,6 +130,25 @@ pub fn print_apply(summary: &ApplySummary) {
         summary.processed, summary.accepted, summary.skipped, summary.failed, summary.dry_run
     );
 
+    if summary.dry_run && !summary.changes.is_empty() {
+        println!("changes:");
+        for change in summary.changes.iter().take(10) {
+            println!(
+                "  - {} {}: {} -> {}",
+                format_item_id(change.item_id),
+                change.field,
+                change
+                    .old
+                    .as_ref()
+                    .map_or_else(|| "<none>".to_string(), serde_json::Value::to_string),
+                change.new
+            );
+        }
+        if summary.changes.len() > 10 {
+            println!("  +{} more", summary.changes.len() - 10);
+        }
+    }
+
     for item in &summary.items {
         if let Some(error) = &item.error {
             eprintln!(
@@ -282,6 +301,7 @@ mod tests {
             accepted: 1,
             skipped: 0,
             failed: 1,
+            changes: Vec::new(),
             items: vec![
                 ApplyItemOutcome {
                     item_id: 9,

@@ -105,7 +105,7 @@ fn auth_remove_requires_yes_in_non_tty_mode() {
         &[("CODEX_SECRET_DIR", &secrets)],
         &[],
     );
-    assert_eq!(output.code, 1);
+    assert_eq!(output.code, 64);
     assert!(stderr(&output).contains("rerun with --yes"));
     assert!(target.exists(), "target should still exist");
 }
@@ -192,8 +192,8 @@ fn auth_remove_json_requires_confirmation() {
         &[("CODEX_SECRET_DIR", &secrets)],
         &[],
     );
-    assert_eq!(output.code, 1);
+    assert_eq!(output.code, 64);
     let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
     assert_eq!(payload["ok"], false);
-    assert_eq!(payload["error"]["code"], "remove-confirmation-required");
+    assert_eq!(payload["error"]["code"], "usage-error");
 }

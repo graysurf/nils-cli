@@ -142,10 +142,27 @@ fn update_and_delete_keep_layers_consistent() {
     assert_eq!(game_entry_count, 0);
     drop(conn);
 
-    let delete_without_hard = run_memo_cli(&db_path, &["delete", item_id_str], None);
-    assert_eq!(delete_without_hard.code, 64);
+    let delete_without_yes = run_memo_cli(&db_path, &["delete", item_id_str], None);
+    assert_eq!(delete_without_yes.code, 64);
+    assert!(
+        delete_without_yes
+            .stderr_text()
+            .contains("delete requires --yes"),
+        "stderr={}",
+        delete_without_yes.stderr_text()
+    );
 
-    let delete_output = run_memo_cli(&db_path, &["--json", "delete", item_id_str, "--hard"], None);
+    let delete_with_compat_hard = run_memo_cli(&db_path, &["delete", item_id_str, "--hard"], None);
+    assert_eq!(delete_with_compat_hard.code, 64);
+    assert!(
+        delete_with_compat_hard
+            .stderr_text()
+            .contains("--hard no longer confirms deletion"),
+        "stderr={}",
+        delete_with_compat_hard.stderr_text()
+    );
+
+    let delete_output = run_memo_cli(&db_path, &["--json", "delete", item_id_str, "--yes"], None);
     assert_eq!(
         delete_output.code,
         0,

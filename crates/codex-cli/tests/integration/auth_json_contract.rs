@@ -584,13 +584,13 @@ fn auth_json_contract_remove_requires_confirmation() {
         &["auth", "remove", "--json", "alpha.json"],
         &[("CODEX_SECRET_DIR", &secrets)],
     );
-    assert_eq!(output.code, 1);
+    assert_eq!(output.code, 64);
 
     let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
     assert_eq!(payload["schema_version"], "codex-cli.auth.v1");
     assert_eq!(payload["command"], "auth remove");
     assert_eq!(payload["ok"], false);
-    assert_eq!(payload["error"]["code"], "remove-confirmation-required");
+    assert_eq!(payload["error"]["code"], "usage-error");
 }
 
 #[test]

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use rusqlite::{Transaction, params};
 use serde::Serialize;
+use serde_json::{Value, json};
 
 use crate::errors::AppError;
 use crate::preprocess::{self, ValidationStatus};
@@ -77,6 +78,15 @@ pub struct ApplyItemOutcome {
     pub error: Option<ApplyItemError>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ApplyChange {
+    pub item_id: i64,
+    pub field: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<Value>,
+    pub new: Value,
+}
+
 impl ApplyItemOutcome {
     pub fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
@@ -99,6 +109,7 @@ pub struct ApplySummary {
     pub skipped: i64,
     pub failed: i64,
     pub items: Vec<ApplyItemOutcome>,
+    pub changes: Vec<ApplyChange>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +139,7 @@ pub fn apply_items(
     let mut skipped = 0_i64;
     let mut failed = 0_i64;
     let mut outcomes = Vec::with_capacity(items.len());
+    let mut changes = Vec::new();
 
     for item in items {
         let mut metadata = ResolvedMetadata::from_item(item);
@@ -206,6 +218,7 @@ pub fn apply_items(
         let next_version = next_derivation_version(tx, item.item_id)?;
         if dry_run {
             accepted += 1;
+            changes.extend(collect_dry_run_changes(tx, item, &metadata)?);
             outcomes.push(build_outcome(
                 item.item_id,
                 "accepted",
@@ -324,7 +337,144 @@ pub fn apply_items(
         skipped,
         failed,
         items: outcomes,
+        changes,
     })
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDerivationSnapshot {
+    status: String,
+    summary: Option<String>,
+    category: Option<String>,
+    priority: Option<String>,
+    due_at: Option<String>,
+    normalized_text: Option<String>,
+    confidence: Option<f64>,
+    content_type: Option<String>,
+    validation_status: Option<String>,
+    tags: Vec<String>,
+}
+
+fn collect_dry_run_changes(
+    tx: &Transaction<'_>,
+    item: &ApplyInputItem,
+    metadata: &ResolvedMetadata,
+) -> Result<Vec<ApplyChange>, AppError> {
+    let active = current_active_snapshot(tx, item.item_id)?;
+    let active_ref = active.as_ref();
+    let mut changes = Vec::new();
+    let next_tags = if item.status == IncomingStatus::Accepted {
+        tags_with_metadata(&item.tags, metadata)
+    } else {
+        Vec::new()
+    };
+
+    push_change(
+        &mut changes,
+        item.item_id,
+        "status",
+        active_ref.map(|snapshot| json!(snapshot.status)),
+        json!(status_label(item.status)),
+    );
+    push_change(
+        &mut changes,
+        item.item_id,
+        "summary",
+        active_ref.map(|snapshot| option_string_value(snapshot.summary.as_deref())),
+        option_string_value(item.summary.as_deref()),
+    );
+    push_change(
+        &mut changes,
+        item.item_id,
+        "category",
+        active_ref.map(|snapshot| option_string_value(snapshot.category.as_deref())),
+        option_string_value(item.category.as_deref()),
+    );
+    push_change(
+        &mut changes,
+        item.item_id,
+        "priority",
+        active_ref.map(|snapshot| option_string_value(snapshot.priority.as_deref())),
+        option_string_value(item.priority.as_deref()),
+    );
+    push_change(
+        &mut changes,
+        item.item_id,
+        "due_at",
+        active_ref.map(|snapshot| option_string_value(snapshot.due_at.as_deref())),
+        option_string_value(item.due_at.as_deref()),
+    );
+    push_change(
+        &mut changes,
+        item.item_id,
+        "normalized_text",
+        active_ref.map(|snapshot| option_string_value(snapshot.normalized_text.as_deref())),
+        option_string_value(item.normalized_text.as_deref()),
+    );
+    push_change(
+        &mut changes,
+        item.item_id,
+        "confidence",
+        active_ref.map(|snapshot| option_f64_value(snapshot.confidence)),
+        option_f64_value(item.confidence),
+    );
+    push_change(
+        &mut changes,
+        item.item_id,
+        "content_type",
+        active_ref.map(|snapshot| option_string_value(snapshot.content_type.as_deref())),
+        option_string_value(metadata.content_type.as_deref()),
+    );
+    push_change(
+        &mut changes,
+        item.item_id,
+        "validation_status",
+        active_ref.map(|snapshot| option_string_value(snapshot.validation_status.as_deref())),
+        option_string_value(metadata.validation_status.as_deref()),
+    );
+    push_change(
+        &mut changes,
+        item.item_id,
+        "tags",
+        active_ref.map(|snapshot| json!(snapshot.tags)),
+        json!(next_tags),
+    );
+
+    Ok(changes)
+}
+
+fn push_change(
+    changes: &mut Vec<ApplyChange>,
+    item_id: i64,
+    field: &str,
+    old: Option<Value>,
+    new: Value,
+) {
+    if old.as_ref() == Some(&new) {
+        return;
+    }
+    changes.push(ApplyChange {
+        item_id,
+        field: field.to_string(),
+        old,
+        new,
+    });
+}
+
+fn option_string_value(value: Option<&str>) -> Value {
+    value.map_or(Value::Null, |value| json!(value))
+}
+
+fn option_f64_value(value: Option<f64>) -> Value {
+    value.map_or(Value::Null, |value| json!(value))
+}
+
+fn status_label(status: IncomingStatus) -> &'static str {
+    match status {
+        IncomingStatus::Accepted => "accepted",
+        IncomingStatus::Rejected => "rejected",
+        IncomingStatus::Conflict => "conflict",
+    }
 }
 
 fn build_outcome(
@@ -463,6 +613,96 @@ fn current_active(tx: &Transaction<'_>, item_id: i64) -> Result<Option<(i64, i64
         rusqlite::Error::QueryReturnedNoRows => Ok(None),
         other => Err(AppError::db_query(other)),
     })
+}
+
+fn current_active_snapshot(
+    tx: &Transaction<'_>,
+    item_id: i64,
+) -> Result<Option<ActiveDerivationSnapshot>, AppError> {
+    let row = tx
+        .query_row(
+            "select derivation_id, status, summary, category, priority, due_at, normalized_text,
+                    confidence, payload_json
+             from item_derivations
+             where item_id = ?1 and is_active = 1 and status = 'accepted'
+             order by derivation_version desc, derivation_id desc
+             limit 1",
+            params![item_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(AppError::db_query(other)),
+        })?;
+
+    let Some((
+        derivation_id,
+        status,
+        summary,
+        category,
+        priority,
+        due_at,
+        normalized_text,
+        confidence,
+        payload_json,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+    let content_type = payload
+        .get("content_type")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let validation_status = payload
+        .get("validation_status")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let tags = active_tags(tx, derivation_id)?;
+
+    Ok(Some(ActiveDerivationSnapshot {
+        status,
+        summary,
+        category,
+        priority,
+        due_at,
+        normalized_text,
+        confidence,
+        content_type,
+        validation_status,
+        tags,
+    }))
+}
+
+fn active_tags(tx: &Transaction<'_>, derivation_id: i64) -> Result<Vec<String>, AppError> {
+    let mut stmt = tx
+        .prepare(
+            "select t.tag_name
+             from item_tags it
+             join tags t on t.tag_id = it.tag_id
+             where it.derivation_id = ?1
+             order by t.tag_name_norm",
+        )
+        .map_err(AppError::db_query)?;
+    let rows = stmt
+        .query_map(params![derivation_id], |row| row.get(0))
+        .map_err(AppError::db_query)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::db_query)
 }
 
 fn derivation_version_by_hash(

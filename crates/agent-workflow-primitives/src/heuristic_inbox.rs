@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
+use nils_term::prompt::{self, PromptError, PromptOptions};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -1645,6 +1646,40 @@ fn run_archive(args: &ArchiveArgs) -> Result<ArchiveResult, CliError> {
     if args.dry_run {
         return Ok(payload);
     }
+    if !args.yes {
+        let question = format!(
+            "Archive {} to {}? [y/N] ",
+            display_path(&case.folder),
+            display_path(&destination_folder)
+        );
+        match prompt::confirm(&question, true, PromptOptions::new()) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(CliError::runtime(
+                    "archive-cancelled",
+                    "archive cancelled",
+                    None,
+                ));
+            }
+            Err(PromptError::NonInteractive) => {
+                return Err(CliError::usage(
+                    "archive-confirmation-required",
+                    "archive requires --yes when stdin or stderr is not a TTY",
+                    Some(json!({
+                        "source": display_path(&case.folder),
+                        "destination": display_path(&destination_folder),
+                    })),
+                ));
+            }
+            Err(PromptError::Io(err)) => {
+                return Err(CliError::runtime(
+                    "archive-confirmation-failed",
+                    format!("failed to read archive confirmation: {err}"),
+                    None,
+                ));
+            }
+        }
+    }
 
     if let Some(parent) = destination_folder.parent() {
         fs::create_dir_all(parent).map_err(|err| {
@@ -2411,6 +2446,10 @@ struct ArchiveArgs {
     /// Optional archive reason.
     #[arg(long, default_value = "")]
     reason: String,
+
+    /// Archive without prompting.
+    #[arg(short = 'y', long = "yes")]
+    yes: bool,
 
     /// Report destination without moving the case folder.
     #[arg(long = "dry-run")]

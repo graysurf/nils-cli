@@ -85,6 +85,8 @@ _arguments "${_arguments_options[@]}" : \
 '--reason=[Optional archive reason]:REASON:_default' \
 '--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
+'-y[Archive without prompting]' \
+'--yes[Archive without prompting]' \
 '--dry-run[Report destination without moving the case folder]' \
 '-h[Print help]' \
 '--help[Print help]' \

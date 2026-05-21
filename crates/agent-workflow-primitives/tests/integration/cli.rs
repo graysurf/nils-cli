@@ -1544,6 +1544,38 @@ Promote after a durable fix and validation are linked.\n\n\
     }
 
     #[test]
+    fn archive_requires_yes_in_non_interactive_mode() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let entry = write_entry(
+            &inbox.join("fixture-gap"),
+            EntryOpts {
+                status: "promoted",
+                next_action: "None. Fixed and validated.",
+                ..EntryOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                entry.parent().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--date",
+                "2026-05-18",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 64, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        assert_eq!(payload["error"]["code"], "archive-confirmation-required");
+        assert!(entry.exists());
+    }
+
+    #[test]
     fn archive_moves_promoted_entry_with_evidence() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let inbox = inbox_root(tmp.path());
@@ -1576,6 +1608,7 @@ Promote after a durable fix and validation are linked.\n\n\
                 "2026-05-18",
                 "--reason",
                 "Fixed and compressed into docs.",
+                "--yes",
                 "--format",
                 "json",
             ],
@@ -1623,6 +1656,7 @@ Promote after a durable fix and validation are linked.\n\n\
                 "2026-05-18",
                 "--link",
                 "docs/accepted-risk.md",
+                "--yes",
                 "--format",
                 "json",
             ],
