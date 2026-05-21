@@ -11,7 +11,7 @@ provider credentials.
 | Field | Value |
 | ----- | ----- |
 | Package name | `nils-agent-workflow-primitives` |
-| Binary names | `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `review-specialists`, `skill-usage` |
+| Binary names | `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `review-specialists`, `skill-usage`, `test-first-evidence` |
 
 Each binary supports `--version` and `completion <bash|zsh>`.
 
@@ -28,6 +28,7 @@ Each binary supports `--version` and `completion <bash|zsh>`.
 | `review-evidence` | Record review findings and passing validation evidence. | `review-evidence.json` under `--out DIR` |
 | `review-specialists` | Validate, merge, render, bundle, and scope specialist review findings without running reviewers or mutating providers. | stdout by default; optional bundle files under `--out-dir DIR` |
 | `skill-usage` | Record skill invocation intent, linked records, validation, failures, outcome, and follow-up. | `skill-usage.record.json` under `--out DIR` |
+| `test-first-evidence` | Record before-fix failing evidence, explicit waivers, and final validation. | `test-first-evidence.json` under `--out DIR` |
 
 ## Common command shape
 
@@ -53,6 +54,7 @@ review-specialists validate --input findings.jsonl --format json
 review-specialists merge --input findings.jsonl --summary-out review.md
 model-cross-check init --out /tmp/cross-check --prompt "review patch" --primary-model gpt-5.4 --checker-model gpt-5.5
 skill-usage init --out /tmp/skill --skill tools/devex/review-evidence --intent "record review" --user-request-summary "review this PR"
+test-first-evidence init --out /tmp/test-first --classification behavior-change --production-path src/lib.rs
 ```
 
 ## `review-specialists` flow
@@ -109,6 +111,30 @@ skill-usage record-validation --out <dir> --command <command> \
 skill-usage record-outcome --out <dir> --status pass --summary <summary>
 skill-usage verify --out <dir> --format json
 skill-usage show --out <dir> --format json
+```
+
+## `test-first-evidence` flow
+
+`test-first-evidence` keeps the public binary contract that was previously
+implemented by a standalone package. It records one JSON file under the caller's
+artifact directory and preserves the schema versions
+`test-first-evidence.record.v1` and `cli.test-first-evidence.*.v1`.
+
+```bash
+test-first-evidence init \
+  --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --classification behavior-change \
+  --production-path src/lib.rs
+test-first-evidence record-failing \
+  --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --command "cargo test bug_repro" \
+  --exit-code 101 \
+  --summary "bug reproduced before fix"
+test-first-evidence record-final \
+  --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --command "cargo test bug_repro" \
+  --status pass
+test-first-evidence verify --out "$AGENT_HOME/out/projects/acme__app/test-first" --format json
 ```
 
 ## Output contract

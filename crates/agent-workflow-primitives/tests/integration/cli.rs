@@ -33,6 +33,7 @@ fn all_binaries_export_zsh_completion() {
         "review-evidence",
         "review-specialists",
         "skill-usage",
+        "test-first-evidence",
     ] {
         let output = run(bin, tmp.path(), &["completion", "zsh"]);
         assert_eq!(output.code, 0, "{bin} stderr={}", output.stderr_text());

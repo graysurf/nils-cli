@@ -1,5 +1,4 @@
 mod cli;
-mod completion;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -73,7 +72,9 @@ fn dispatch(cli: Cli) -> i32 {
         Command::RecordFinal(args) => run_record_final(args),
         Command::Verify(args) => run_verify(args),
         Command::Show(args) => run_show(args),
-        Command::Completion(args) => completion::run(args.shell),
+        Command::Completion(args) => {
+            crate::completion::run::<Cli>(args.shell, "test-first-evidence")
+        }
     }
 }
 

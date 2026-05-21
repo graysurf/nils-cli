@@ -1,4 +1,4 @@
-//! Per-binary exit-code matrix for the eight agent-workflow-primitives binaries.
+//! Per-binary exit-code matrix for the agent-workflow-primitives binaries.
 //!
 //! Sprint 3.1 of `cli-output-contract-unification`: each binary returns the
 //! BSD sysexits-aligned exit code from `nils_common::cli_contract::exit`.
@@ -21,6 +21,7 @@ const BINARIES: &[&str] = &[
     "review-evidence",
     "review-specialists",
     "skill-usage",
+    "test-first-evidence",
 ];
 
 #[test]

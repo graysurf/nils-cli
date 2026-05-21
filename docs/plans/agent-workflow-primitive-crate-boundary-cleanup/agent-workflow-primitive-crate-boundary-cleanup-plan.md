@@ -98,10 +98,8 @@ This plan is intentionally narrow. It does not move `web-evidence` or
   - crates/agent-workflow-primitives/Cargo.toml
   - crates/agent-workflow-primitives/src/bin/test-first-evidence.rs
   - crates/agent-workflow-primitives/src/test_first_evidence.rs
+  - crates/agent-workflow-primitives/src/test_first_evidence/cli.rs
   - crates/agent-workflow-primitives/src/lib.rs
-  - crates/test-first-evidence/src/cli.rs
-  - crates/test-first-evidence/src/lib.rs
-  - crates/test-first-evidence/src/main.rs
 - **Description**: Move the `test-first-evidence` implementation into
   `crates/agent-workflow-primitives`, add a `[[bin]]` target for
   `test-first-evidence`, and preserve the current command dispatch and library
@@ -128,10 +126,9 @@ This plan is intentionally narrow. It does not move `web-evidence` or
   - crates/agent-workflow-primitives/tests/integration/exit_codes.rs
   - crates/agent-workflow-primitives/tests/integration/help_snapshot.rs
   - crates/agent-workflow-primitives/tests/integration/test_first_evidence.rs
-  - crates/test-first-evidence/tests/integration.rs
-  - crates/test-first-evidence/tests/integration/cli.rs
-  - crates/test-first-evidence/tests/integration/exit_codes.rs
-  - crates/test-first-evidence/tests/integration/help_snapshot.rs
+  - crates/agent-workflow-primitives/tests/integration/test_first_evidence/cli.rs
+  - crates/agent-workflow-primitives/tests/integration/test_first_evidence/exit_codes.rs
+  - crates/agent-workflow-primitives/tests/integration/test_first_evidence/help_snapshot.rs
 - **Description**: Move the `test-first-evidence` integration coverage under
   `crates/agent-workflow-primitives` and extend the shared binary matrices so
   completion, help, and exit-code checks include `test-first-evidence`.
@@ -171,15 +168,11 @@ the public binary contract remains stable from the workspace.
 
 - **Location**:
   - Cargo.toml
+  - Cargo.lock
+  - THIRD_PARTY_LICENSES.md
+  - THIRD_PARTY_NOTICES.md
   - release/crates-io-publish-order.txt
-  - crates/test-first-evidence/Cargo.toml
-  - crates/test-first-evidence/src/cli.rs
-  - crates/test-first-evidence/src/lib.rs
-  - crates/test-first-evidence/src/main.rs
-  - crates/test-first-evidence/tests/integration.rs
-  - crates/test-first-evidence/tests/integration/cli.rs
-  - crates/test-first-evidence/tests/integration/exit_codes.rs
-  - crates/test-first-evidence/tests/integration/help_snapshot.rs
+  - crates/agent-workflow-primitives/Cargo.toml
 - **Description**: Remove `crates/test-first-evidence` from workspace members,
   delete the old package files, and remove `nils-test-first-evidence` from the
   crates.io publish order after its binary has moved.
@@ -203,8 +196,7 @@ the public binary contract remains stable from the workspace.
 - **Location**:
   - crates/agent-workflow-primitives/README.md
   - crates/agent-workflow-primitives/docs/README.md
-  - crates/test-first-evidence/README.md
-  - crates/test-first-evidence/docs/README.md
+  - README.md
   - docs/specs/completion-coverage-matrix-v1.md
   - completions/bash/test-first-evidence
   - completions/zsh/_test-first-evidence

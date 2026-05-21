@@ -8,3 +8,5 @@ mod exit_codes;
 mod help_snapshot;
 #[path = "integration/review_specialists.rs"]
 mod review_specialists;
+#[path = "integration/test_first_evidence.rs"]
+mod test_first_evidence;

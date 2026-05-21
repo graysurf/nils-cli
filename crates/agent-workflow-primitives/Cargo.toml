@@ -47,6 +47,10 @@ path = "src/bin/repo-retro.rs"
 name = "skill-usage"
 path = "src/bin/skill-usage.rs"
 
+[[bin]]
+name = "test-first-evidence"
+path = "src/bin/test-first-evidence.rs"
+
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }

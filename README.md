@@ -81,10 +81,9 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 - [crates/agent-scope-lock](crates/agent-scope-lock): Deterministic edit-scope lock CLI for agent workflows (`create`, `read`,
   `validate`, `clear`).
 - [crates/web-evidence](crates/web-evidence): Redacted static HTTP evidence capture for agent workflows (`capture`, `completion`).
-- [crates/test-first-evidence](crates/test-first-evidence): Deterministic failing-test/waiver/final-validation evidence records for
-  test-first workflow gates.
 - [crates/agent-workflow-primitives](crates/agent-workflow-primitives): Multi-binary local-first agent workflow primitives
-  (`browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage`).
+  (`browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`,
+  `skill-usage`, `test-first-evidence`).
 
 ### Planning, delivery, and provider lanes
 

@@ -2,7 +2,7 @@
 
 - Status: open, ready for implementation planning
 - Date: 2026-05-21
-- Source issue: https://github.com/sympoies/nils-cli/issues/425
+- Source issue: <https://github.com/sympoies/nils-cli/issues/425>
 
 ## Execution
 

@@ -2273,21 +2273,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nils-test-first-evidence"
-version = "0.15.0"
-dependencies = [
- "clap",
- "clap_complete",
- "nils-common",
- "nils-test-support",
- "pretty_assertions",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "nils-test-support"
 version = "0.15.0"
 dependencies = [

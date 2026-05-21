@@ -281,7 +281,7 @@ _test-first-evidence() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _test-first-evidence -o nosort -o bashdefault -o default test-first-evidence
+    complete -o nospace -F _test-first-evidence -o nosort -o bashdefault -o default test-first-evidence
 else
-    complete -F _test-first-evidence -o bashdefault -o default test-first-evidence
+    complete -o nospace -F _test-first-evidence -o bashdefault -o default test-first-evidence
 fi
