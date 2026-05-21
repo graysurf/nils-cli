@@ -1,10 +1,11 @@
-//! Read-only `agent-runtime doctor` probes. Plan 04 Sprint 3 Task 3.1.
+//! Read-only `agent-runtime doctor` probes. Plan 04 Sprint 3.
 //!
 //! This sprint covers filesystem posture only: link-map symlinks,
-//! managed-block marker pairing, and runtime-roots path readability.
-//! Version probes and upgrade suggestions land in later Sprint 3 tasks.
+//! managed-block marker pairing, runtime-roots path readability, and
+//! product version posture.
 
 pub mod probes;
+pub mod version;
 
 use crate::install::link_map::{LinkMap, LinkMapError};
 use crate::install::overlay::{self, LinkMapOverlay, OverlaySummary};
@@ -141,6 +142,7 @@ pub struct ResolvedRuntimeRoots {
 pub struct DoctorOutcome {
     pub product: String,
     pub findings: Vec<DoctorFinding>,
+    pub version_probes: Vec<version::VersionProbeFinding>,
     pub ok: usize,
     pub warn: usize,
     pub block: usize,
@@ -203,6 +205,13 @@ pub fn run(
     let mut report = probes::ProbeReport::default();
     report.extend(probes::runtime_roots(&resolved_roots));
     report.extend(probes::install_plan(product, &plan));
+    let version_probe = version::probe_product(product, product_root);
+    match version_probe.severity {
+        DoctorSeverity::Ok => report.ok += 1,
+        DoctorSeverity::Warn | DoctorSeverity::Block => {
+            report.findings.push(version_probe.to_doctor_finding());
+        }
+    }
 
     let warn = report
         .findings
@@ -218,6 +227,7 @@ pub fn run(
     Ok(DoctorOutcome {
         product: product.to_string(),
         findings: report.findings,
+        version_probes: vec![version_probe],
         ok: report.ok,
         warn,
         block,
