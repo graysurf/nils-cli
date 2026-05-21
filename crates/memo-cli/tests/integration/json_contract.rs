@@ -64,6 +64,7 @@ fn json_contract() {
     assert_eq!(list_json["data"]["pagination"]["limit"], 20);
     assert_eq!(list_json["data"]["pagination"]["offset"], 0);
     assert_eq!(list_json["data"]["pagination"]["returned"], 1);
+    assert_eq!(list_json["data"]["pagination"]["truncated"], false);
     let first_list_item = &list_json["data"]["items"][0];
     assert!(
         first_list_item.get("content_type").is_some(),
@@ -96,6 +97,7 @@ fn json_contract() {
     assert_eq!(search_json["data"]["meta"]["limit"], 5);
     assert_eq!(search_json["data"]["meta"]["state"], "all");
     assert_eq!(search_json["data"]["meta"]["match"], "fts");
+    assert_eq!(search_json["data"]["meta"]["truncated"], false);
     assert_eq!(
         search_json["data"]["meta"]["fields"],
         json!(["raw_text", "derived_text", "tags_text"])

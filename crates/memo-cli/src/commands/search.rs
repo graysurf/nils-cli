@@ -25,6 +25,7 @@ pub fn run(
     let rows = storage.with_connection(|conn| {
         search::search_items(conn, query, state, &search_fields, match_mode, limit)
     })?;
+    let truncated = limit > 0 && rows.len() == limit;
 
     if format.is_json() {
         let items = rows
@@ -51,12 +52,13 @@ pub fn run(
                     "state": query_state_label(state),
                     "fields": search_field_labels(&search_fields),
                     "match": search_match_mode_label(match_mode),
+                    "truncated": truncated,
                 },
             }),
         );
     }
 
-    text::print_search(&rows);
+    text::print_search(&rows, limit, truncated);
 
     Ok(())
 }

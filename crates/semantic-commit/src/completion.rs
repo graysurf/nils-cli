@@ -120,6 +120,12 @@ fn build_completion_command() -> Command {
                         .value_hint(ValueHint::DirPath),
                 )
                 .arg(
+                    Arg::new("max-header-width")
+                        .long("max-header-width")
+                        .help("Override commit header width")
+                        .value_name("N"),
+                )
+                .arg(
                     Arg::new("automation")
                         .long("automation")
                         .help("Disable interactive prompts and stdin input")

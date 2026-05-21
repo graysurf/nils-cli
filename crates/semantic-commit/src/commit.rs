@@ -44,6 +44,7 @@ struct CommitOptions {
     dry_run: bool,
     auto_fix: bool,
     repo: Option<PathBuf>,
+    max_header_width: usize,
 }
 
 impl Default for CommitOptions {
@@ -60,6 +61,7 @@ impl Default for CommitOptions {
             dry_run: false,
             auto_fix: false,
             repo: None,
+            max_header_width: DEFAULT_MAX_HEADER_WIDTH,
         }
     }
 }
@@ -109,7 +111,8 @@ pub fn run(args: &[String]) -> i32 {
         return EXIT_ERROR;
     }
 
-    if let Err(code) = validate_commit_message(tmpfile.path()) {
+    if let Err(code) = validate_commit_message_with_width(tmpfile.path(), options.max_header_width)
+    {
         return code;
     }
 
@@ -138,8 +141,7 @@ pub fn run(args: &[String]) -> i32 {
         return 0;
     }
 
-    let show_progress = !options.no_progress && std::io::stderr().is_terminal();
-    let progress = if show_progress {
+    let progress = if !options.no_progress {
         Some(Progress::spinner(
             ProgressOptions::default()
                 .with_prefix("semantic-commit ")
@@ -178,6 +180,7 @@ pub fn run(args: &[String]) -> i32 {
 
 fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
     let mut options = CommitOptions::default();
+    let mut max_header_width_from_flag = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -283,6 +286,19 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
                 options.repo = Some(PathBuf::from(value));
                 i += 2;
             }
+            "--max-header-width" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("error: --max-header-width requires a value");
+                        print_usage_stderr();
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.max_header_width = parse_header_width_flag(value)?;
+                max_header_width_from_flag = true;
+                i += 2;
+            }
             other => {
                 eprintln!("error: unknown argument: {other}");
                 print_usage_stderr();
@@ -296,7 +312,42 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
         return Err(EXIT_ERROR);
     }
 
+    if !max_header_width_from_flag {
+        options.max_header_width = env_header_width()?;
+    }
+
     Ok(options)
+}
+
+fn env_header_width() -> Result<usize, i32> {
+    match std::env::var("SEMANTIC_COMMIT_HEADER_WIDTH") {
+        Ok(value) => parse_header_width_env(&value),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX_HEADER_WIDTH),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("error: SEMANTIC_COMMIT_HEADER_WIDTH must be valid UTF-8");
+            Err(EXIT_ERROR)
+        }
+    }
+}
+
+fn parse_header_width_flag(value: &str) -> Result<usize, i32> {
+    parse_positive_width(value, "--max-header-width")
+}
+
+fn parse_header_width_env(value: &str) -> Result<usize, i32> {
+    parse_positive_width(value, "SEMANTIC_COMMIT_HEADER_WIDTH")
+}
+
+fn parse_positive_width(value: &str, label: &str) -> Result<usize, i32> {
+    let Ok(parsed) = value.parse::<usize>() else {
+        eprintln!("error: {label} must be a positive integer");
+        return Err(EXIT_ERROR);
+    };
+    if parsed == 0 {
+        eprintln!("error: {label} must be a positive integer");
+        return Err(EXIT_ERROR);
+    }
+    Ok(parsed)
 }
 
 fn read_message_contents(options: &CommitOptions) -> Result<String, i32> {
@@ -454,7 +505,12 @@ fn write_message_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_commit_message(path: &Path) -> Result<(), i32> {
+    validate_commit_message_with_width(path, DEFAULT_MAX_HEADER_WIDTH)
+}
+
+fn validate_commit_message_with_width(path: &Path, max_header_width: usize) -> Result<(), i32> {
     let file = File::open(path).map_err(|_| {
         eprintln!("error: commit message validation failed");
         EXIT_VALIDATION_FAILED
@@ -479,8 +535,10 @@ fn validate_commit_message(path: &Path) -> Result<(), i32> {
     if header.is_empty() {
         return fail_validation("commit header is empty");
     }
-    if header.chars().count() > MAX_LINE_WIDTH {
-        return fail_validation("commit header exceeds 100 characters (max 100)");
+    if header.chars().count() > max_header_width {
+        return fail_validation(&format!(
+            "commit header exceeds {max_header_width} characters (max {max_header_width})"
+        ));
     }
     if !is_valid_header(header) {
         return fail_validation(
@@ -502,9 +560,9 @@ fn validate_commit_message(path: &Path) -> Result<(), i32> {
                     "commit body line {line_no} is empty; body lines must start with '- ' followed by uppercase letter (or '  ' to continue the previous bullet)"
                 ));
             }
-            if line.chars().count() > MAX_LINE_WIDTH {
+            if line.chars().count() > BODY_LINE_WIDTH {
                 return fail_validation(&format!(
-                    "commit body line {line_no} exceeds 100 characters (max 100)"
+                    "commit body line {line_no} exceeds {BODY_LINE_WIDTH} characters (max {BODY_LINE_WIDTH})"
                 ));
             }
 
@@ -574,7 +632,8 @@ fn is_valid_header(header: &str) -> bool {
     true
 }
 
-const MAX_LINE_WIDTH: usize = 100;
+const DEFAULT_MAX_HEADER_WIDTH: usize = 100;
+const BODY_LINE_WIDTH: usize = 100;
 
 fn normalize_message(input: &str) -> String {
     let lines: Vec<&str> = input.lines().collect();
@@ -596,7 +655,7 @@ fn normalize_message(input: &str) -> String {
         out.push(String::new());
         for line in body {
             let cased = capitalize_bullet_first_char(line);
-            for wrapped in wrap_body_line(&cased, MAX_LINE_WIDTH) {
+            for wrapped in wrap_body_line(&cased, BODY_LINE_WIDTH) {
                 out.push(wrapped);
             }
         }
@@ -750,6 +809,10 @@ fn print_usage(stderr: bool) {
     let _ = writeln!(
         out,
         "      --repo <path>            Run git commands against repo path"
+    );
+    let _ = writeln!(
+        out,
+        "      --max-header-width <N>   Override commit header width (default: {DEFAULT_MAX_HEADER_WIDTH}; env: SEMANTIC_COMMIT_HEADER_WIDTH)"
     );
     let _ = writeln!(
         out,

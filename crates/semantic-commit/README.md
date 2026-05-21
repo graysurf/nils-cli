@@ -61,6 +61,8 @@ Flags:
 - `--summary <git-scope|git-show|none>` (default: `git-scope` with fallback to `git-show`)
 - `--no-summary` — equivalent to `--summary none`
 - `--repo <path>` — run git commands against the repository path
+- `--max-header-width <N>` — override the commit header width (default: `100`). When the flag is
+  absent, `SEMANTIC_COMMIT_HEADER_WIDTH` may set the default; the flag wins when both are present.
 - `--automation` (alias: `--non-interactive`) — disallow stdin message fallback
 - `--validate-only` — validate the commit message format and exit without committing
 - `--dry-run` — run validation and staged-change checks, then skip `git commit`
@@ -83,7 +85,8 @@ semantic-commit completion <bash|zsh>
 
 ## Commit Message Validation
 
-- Header must be non-empty, `<= 100` characters, and use a lowercase type.
+- Header must be non-empty, no longer than the active header width, and use a lowercase type. The
+  default active header width is `100`.
 - Header format: `type(scope): subject` or `type: subject`.
 - If a body exists, line 2 must be blank and each body line must start with `-` + space, followed by an
   uppercase letter and be `<= 100` characters. A bullet may wrap onto a following line by prefixing that

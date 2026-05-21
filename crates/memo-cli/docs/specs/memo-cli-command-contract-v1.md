@@ -210,6 +210,8 @@ Behavior:
 Text output (`stdout`):
 
 - table/list with id, timestamp, state, short preview.
+- when the returned row count reaches `--limit`, a footer names the active
+  limit and suggests `--limit` / `--offset` for follow-up paging.
 
 JSON output:
 
@@ -217,6 +219,8 @@ JSON output:
   fields when available:
   - `content_type`
   - `validation_status`
+- `pagination.truncated` is `true` when the returned row count reaches
+  `--limit`.
 
 ### `search`
 
@@ -242,6 +246,8 @@ Behavior:
 Text output (`stdout`):
 
 - ranked matches with score, id, timestamp, and preview.
+- when the returned match count reaches `--limit`, a footer names the active
+  limit and suggests increasing `--limit`.
 
 JSON output:
 
@@ -251,6 +257,8 @@ JSON output:
   - `validation_status`
 - JSON `meta` includes `fields[]` reflecting the effective field scope.
 - JSON `meta` includes `match` reflecting the effective match mode.
+- JSON `meta.truncated` is `true` when the returned match count reaches
+  `--limit`.
 
 ### `report`
 

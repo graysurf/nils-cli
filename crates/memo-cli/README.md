@@ -51,7 +51,8 @@ Commands:
 - `fetch` and `apply` are machine-facing commands and support both `--json` and `--format json`.
 - `list`, `search`, and `report` also support JSON mode for automation and dashboards.
 - `list`/`search`/`fetch` may include additive metadata fields:
-  `content_type`, `validation_status`.
+  `content_type`, `validation_status`; `list` and `search` also expose
+  `truncated` pagination metadata.
 - `report` may include additive metadata aggregates:
   `top_content_types`, `validation_status_totals`.
 - In JSON mode, parse `stdout` only. `stderr` is diagnostic-only and not part of the data contract.

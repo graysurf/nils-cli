@@ -38,7 +38,7 @@ pub fn print_delete(
     );
 }
 
-pub fn print_list(rows: &[ListItem]) {
+pub fn print_list(rows: &[ListItem], limit: usize, offset: usize, truncated: bool) {
     if rows.is_empty() {
         println!("(no items)");
         return;
@@ -60,9 +60,17 @@ pub fn print_list(rows: &[ListItem]) {
             row.text_preview
         );
     }
+
+    if truncated {
+        println!(
+            "(showing {} items with --limit {limit}; use --limit <N> to show more or --offset {} for the next page)",
+            rows.len(),
+            offset.saturating_add(limit),
+        );
+    }
 }
 
-pub fn print_search(rows: &[SearchItem]) {
+pub fn print_search(rows: &[SearchItem], limit: usize, truncated: bool) {
     if rows.is_empty() {
         println!("(no matches)");
         return;
@@ -82,6 +90,13 @@ pub fn print_search(rows: &[SearchItem]) {
             row.created_at,
             row.score,
             row.preview
+        );
+    }
+
+    if truncated {
+        println!(
+            "(showing {} matches with --limit {limit}; use --limit <N> to show more)",
+            rows.len(),
         );
     }
 }
@@ -271,11 +286,11 @@ mod tests {
         print_add(1, "2026-02-12T10:00:00Z");
         print_update(1, "2026-02-12T10:30:00Z", 2, 1);
         print_delete(1, "2026-02-12T10:40:00Z", 2, 1);
-        print_list(&[]);
-        print_list(&sample_list_rows());
+        print_list(&[], 20, 0, false);
+        print_list(&sample_list_rows(), 20, 0, false);
 
-        print_search(&[]);
-        print_search(&sample_search_rows());
+        print_search(&[], 20, false);
+        print_search(&sample_search_rows(), 20, false);
 
         print_report(&sample_report());
         print_report(&ReportSummary {
