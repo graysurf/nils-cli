@@ -5,6 +5,8 @@
 
 #[path = "integration/audit_drift_classes.rs"]
 mod audit_drift_classes;
+#[path = "integration/audit_drift_unsafe_score.rs"]
+mod audit_drift_unsafe_score;
 #[path = "integration/cli.rs"]
 mod cli;
 #[path = "integration/determinism_gate.rs"]
