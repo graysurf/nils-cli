@@ -22,6 +22,22 @@ use std::sync::Arc;
 use tera::Tera;
 
 pub const SKILL_TEMPLATE_FILE: &str = "SKILL.md.tera";
+const TERA_EXT: &str = "tera";
+
+/// One file under a skill source directory. The path is relative to the
+/// skill source root (e.g. `SKILL.md.tera`, `bin/topic_radar.py`); the
+/// caller joins it against the canonical source dir before opening.
+#[derive(Debug)]
+struct SourceFile {
+    rel: PathBuf,
+    abs: PathBuf,
+    /// Unix permission bits (mode & 0o777), used to preserve the
+    /// executable bit on shell scripts when copying. Absent under
+    /// `#[cfg(not(unix))]` builds; the hash and copy paths fall back
+    /// to a constant on those platforms.
+    #[cfg(unix)]
+    mode: u32,
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RenderReport {
@@ -84,31 +100,79 @@ pub(crate) fn write_product_to(
             report.skipped.push(skill.id.clone());
             continue;
         };
-        let template_path = sandboxed_join(root.path(), &skill.source)?.join(SKILL_TEMPLATE_FILE);
-        // Defeat symlink escape: a hostile `core/skills/<x>/SKILL.md.tera`
-        // could be a symlink pointing outside the source root (e.g. to
-        // `/etc/passwd`). `fs::read_to_string` follows symlinks, so we
-        // resolve the real path first and verify it stays beneath the
-        // canonical source root before opening it.
-        let template_path = canonicalize_under(&canonical_source_root, &template_path)?;
-        let template_body = fs::read_to_string(&template_path).with_context(|| {
+        // `render_to` is the output path RELATIVE to `<source-root>/build/<product>/`,
+        // including the filename for the rendered SKILL.md (e.g.
+        // `plugins/reporting/skills/daily-brief/SKILL.md`). Manifests that include
+        // a leading `build/<product>/` segment produce doubled output paths
+        // (`build/<product>/build/<product>/...`) because the binary already
+        // prepends `build/<product>/`. Reject that shape with a helpful error
+        // so the source manifest can be fixed once, not silently broken.
+        validate_render_to(&skill.id, product, &render.render_to)?;
+
+        let source_dir = sandboxed_join(root.path(), &skill.source)?;
+        let canonical_source_dir = canonicalize_under(&canonical_source_root, &source_dir)?;
+        let source_files = walk_skill_source(&canonical_source_dir, &canonical_source_root)
+            .with_context(|| {
+                format!(
+                    "walk source for skill {} at {}",
+                    skill.id,
+                    canonical_source_dir.display()
+                )
+            })?;
+        let template_file = source_files
+            .iter()
+            .find(|f| f.rel == Path::new(SKILL_TEMPLATE_FILE))
+            .ok_or_else(|| {
+                anyhow!(
+                    "skill {} source {} is missing required {SKILL_TEMPLATE_FILE}",
+                    skill.id,
+                    skill.source
+                )
+            })?;
+        let template_body = fs::read_to_string(&template_file.abs).with_context(|| {
             format!(
                 "read template {} for skill {}",
-                template_path.display(),
+                template_file.abs.display(),
                 skill.id
             )
         })?;
+
+        // Pre-compute the set of paths this skill will write (relative
+        // to `build/<product>/`). Used for the cache entry and for
+        // surgical removal of stale prior outputs that two-skills-share-
+        // a-dir layouts make impossible to handle with `remove_dir_all`.
+        let render_to_rel = PathBuf::from(&render.render_to);
+        let output_dir_rel = render_to_rel.parent().ok_or_else(|| {
+            anyhow!(
+                "render_to {:?} for skill {} has no parent dir",
+                render.render_to,
+                skill.id,
+            )
+        })?;
+        let mut planned_outputs: Vec<String> = Vec::with_capacity(source_files.len());
+        for file in &source_files {
+            let rel = if file.rel == Path::new(SKILL_TEMPLATE_FILE) {
+                render_to_rel.clone()
+            } else {
+                output_dir_rel.join(strip_tera_suffix(&file.rel))
+            };
+            planned_outputs.push(rel.to_string_lossy().into_owned());
+        }
+        planned_outputs.sort();
+        planned_outputs.dedup();
 
         let input_hash = input_hash(
             product,
             skill,
             &render.render_to,
-            &template_body,
+            &source_files,
+            &canonical_source_dir,
             &manifest_bytes,
-        );
+        )
+        .with_context(|| format!("hash source tree for skill {}", skill.id))?;
         let entry = CacheEntry {
             hash: input_hash.clone(),
-            output: render.render_to.clone(),
+            outputs: planned_outputs.clone(),
         };
         let output_path = sandboxed_join(&output_root, &render.render_to)?;
         let cache_hit = prior_cache
@@ -120,20 +184,112 @@ pub(crate) fn write_product_to(
         if cache_hit {
             report.cached.push(skill.id.clone());
         } else {
-            let rendered =
-                render_template(root.path(), &manifests, product, skill, &template_body)?;
+            // Cache miss: remove files this skill wrote on the prior
+            // run that are NOT in `planned_outputs` (renamed or deleted
+            // siblings). Crucially, we only touch paths recorded in
+            // *this* skill's prior cache entry — files owned by sibling
+            // skills that happen to share a parent dir (e.g.
+            // `sample.determinism` writes `skills/sample/SKILL.md` and
+            // `sample.codex-only` writes `skills/sample/CODEX_ONLY.md`)
+            // are never disturbed.
+            if let Some(prior) = prior_cache.skills.get(&skill.id) {
+                let planned: std::collections::BTreeSet<&String> = planned_outputs.iter().collect();
+                for stale in &prior.outputs {
+                    if planned.contains(stale) {
+                        continue;
+                    }
+                    let stale_path = sandboxed_join(&output_root, stale)?;
+                    if !stale_path.exists() {
+                        continue;
+                    }
+                    // Symlink-escape guard: a hostile cache entry could
+                    // record a path that — combined with a symlink
+                    // pre-staged at that location — points outside the
+                    // build root. Canonicalize and re-verify before any
+                    // unlink.
+                    let canonical_stale = stale_path.canonicalize().with_context(|| {
+                        format!("canonicalize stale output {}", stale_path.display())
+                    })?;
+                    if !canonical_stale.starts_with(&canonical_output_root) {
+                        return Err(anyhow!(
+                            "stale rendered output {} resolves outside the build root \
+                             ({} not under {}) — refusing to remove",
+                            stale_path.display(),
+                            canonical_stale.display(),
+                            canonical_output_root.display(),
+                        ));
+                    }
+                    fs::remove_file(&canonical_stale).with_context(|| {
+                        format!("remove stale rendered file {}", canonical_stale.display())
+                    })?;
+                }
+            }
+
+            // Render the SKILL template and write it at `render_to`.
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("create_dir_all {}", parent.display()))?;
             }
+            let rendered =
+                render_template(root.path(), &manifests, product, skill, &template_body)?;
             // Same symlink-escape guard for writes: canonicalize the
             // parent (which we just ensured exists) and verify it stays
             // beneath `<source-root>/build/<product>/`. A hostile
             // `render_to` of `../../etc/passwd` is already rejected by
             // sandboxed_join; this also catches `dir-that-is-a-symlink/foo`.
-            let output_path = guard_write_under(&canonical_output_root, &output_path)?;
-            fs::write(&output_path, rendered.as_bytes())
-                .with_context(|| format!("write {}", output_path.display()))?;
+            let output_path_guarded = guard_write_under(&canonical_output_root, &output_path)?;
+            fs::write(&output_path_guarded, rendered.as_bytes())
+                .with_context(|| format!("write {}", output_path_guarded.display()))?;
+
+            // Walk every other source file. Sibling .tera files are
+            // rendered through the same helper context (the suffix is
+            // stripped from the destination filename); non-.tera files
+            // are byte-copied verbatim with the original mode preserved
+            // so executables stay executable on disk.
+            for file in &source_files {
+                if file.rel == Path::new(SKILL_TEMPLATE_FILE) {
+                    continue;
+                }
+                let dest_rel = strip_tera_suffix(&file.rel);
+                let dest = sandboxed_join(
+                    &output_root,
+                    &output_dir_rel.join(&dest_rel).to_string_lossy(),
+                )?;
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("create_dir_all {}", parent.display()))?;
+                }
+                let dest = guard_write_under(&canonical_output_root, &dest)?;
+                if file.rel.extension().and_then(|e| e.to_str()) == Some(TERA_EXT) {
+                    let body = fs::read_to_string(&file.abs).with_context(|| {
+                        format!(
+                            "read sibling tera template {} for skill {}",
+                            file.abs.display(),
+                            skill.id
+                        )
+                    })?;
+                    let rendered = render_template(root.path(), &manifests, product, skill, &body)?;
+                    fs::write(&dest, rendered.as_bytes())
+                        .with_context(|| format!("write {}", dest.display()))?;
+                } else {
+                    // `fs::copy` follows symlinks at the source. If the
+                    // source is itself a hostile symlink that points
+                    // outside the source root, we've already rejected
+                    // it during the `walk_skill_source` canonicalize-
+                    // under check, so this is safe.
+                    fs::copy(&file.abs, &dest).with_context(|| {
+                        format!("copy {} -> {}", file.abs.display(), dest.display())
+                    })?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let perms = fs::Permissions::from_mode(file.mode);
+                        fs::set_permissions(&dest, perms).with_context(|| {
+                            format!("set mode {:#o} on {}", file.mode, dest.display())
+                        })?;
+                    }
+                }
+            }
             report.rendered.push(skill.id.clone());
         }
         next_cache.skills.insert(skill.id.clone(), entry);
@@ -143,6 +299,38 @@ pub(crate) fn write_product_to(
         .save(&cache_path)
         .with_context(|| format!("write {}", cache_path.display()))?;
     Ok(report)
+}
+
+/// Reject `render_to` values that start with `build/<product>/` (or the
+/// generic `build/` prefix). The output root is already
+/// `<source-root>/build/<product>/`; a `render_to` like
+/// `build/codex/plugins/...` doubles the prefix to
+/// `build/codex/build/codex/plugins/...`. The render cache happily records
+/// the (undoubled) intended path but the on-disk file lives at the doubled
+/// path, which produces audit-drift confusion and silently broken installs.
+///
+/// The canonical form is the path **relative to** `build/<product>/`,
+/// **including** the rendered filename. Per the source-doc canonical
+/// example for the reporting POC:
+///
+/// ```yaml
+/// products:
+///   codex:
+///     render_to: plugins/reporting/skills/daily-brief/SKILL.md
+///   claude:
+///     render_to: plugins/reporting/skills/daily-brief/SKILL.md
+/// ```
+fn validate_render_to(skill_id: &str, product: &str, render_to: &str) -> Result<()> {
+    let leading = render_to.split('/').next().unwrap_or(render_to);
+    if leading == "build" {
+        return Err(anyhow!(
+            "render_to {render_to:?} for skill {skill_id} (product {product}) starts with \
+             `build/`; the binary already prepends `build/{product}/` to the value, so this \
+             shape would double the prefix. Use a path relative to `build/{product}/` \
+             (including the rendered filename), e.g. `plugins/<plugin>/skills/<skill>/SKILL.md`.",
+        ));
+    }
+    Ok(())
 }
 
 fn require_known_product(manifests: &ManifestSet, product: &str) -> Result<()> {
@@ -204,19 +392,52 @@ fn input_hash(
     product: &str,
     skill: &Skill,
     render_to: &str,
-    template_body: &str,
+    source_files: &[SourceFile],
+    canonical_source_dir: &Path,
     manifests: &ManifestBytes,
-) -> String {
+) -> Result<String> {
+    // Hash version bumped to v2 when multi-file render landed; cache
+    // entries from v0.13 are auto-invalidated because the version tag
+    // changes the digest of an otherwise-identical input set.
     let mut hasher = Sha256::new();
-    hasher.update(b"agent-runtime-cli render v1\0");
+    hasher.update(b"agent-runtime-cli render v2\0");
     hasher.update(product.as_bytes());
     hasher.update(b"\0");
     hasher.update(skill.id.as_bytes());
     hasher.update(b"\0");
     hasher.update(render_to.as_bytes());
     hasher.update(b"\0");
-    hasher.update(template_body.as_bytes());
-    hasher.update(b"\0");
+    // Hash every file under the skill source dir. The walk returns the
+    // entries sorted by relative path so the digest is reproducible
+    // across processes and filesystems with non-deterministic readdir
+    // ordering.
+    for file in source_files {
+        let rel = file.rel.to_string_lossy();
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        // Include the mode so a chmod-only change still invalidates the
+        // cache. On non-unix platforms the field is absent; fold a
+        // constant in so the hash space stays identical across builds
+        // of the same platform.
+        #[cfg(unix)]
+        {
+            hasher.update(file.mode.to_le_bytes());
+        }
+        #[cfg(not(unix))]
+        {
+            hasher.update([0u8; 4]);
+        }
+        hasher.update(b"\0");
+        let bytes = fs::read(&file.abs).with_context(|| {
+            format!(
+                "hash-read {} (skill source dir {})",
+                file.abs.display(),
+                canonical_source_dir.display()
+            )
+        })?;
+        hasher.update(&bytes);
+        hasher.update(b"\0");
+    }
     // Whole-file manifest bytes — keeps the hash sensitive to any change
     // in a file the helpers might consume, at the cost of a coarse cache
     // invalidation when an unrelated manifest line shifts.
@@ -236,7 +457,82 @@ fn input_hash(
         use std::fmt::Write;
         let _ = write!(&mut out, "{byte:02x}");
     }
-    out
+    Ok(out)
+}
+
+/// Walk a skill source directory recursively and return every file with
+/// its path relative to the skill root. Directories are descended in
+/// sorted order so the resulting entry list (and the hash derived from
+/// it) is deterministic across filesystems with arbitrary readdir order.
+///
+/// Symlinks are followed via the same `canonicalize_under` guard used
+/// for the SKILL template read: a hostile sibling symlink that points
+/// outside the canonical source root is rejected before any I/O.
+fn walk_skill_source(skill_dir: &Path, canonical_source_root: &Path) -> Result<Vec<SourceFile>> {
+    let mut out = Vec::new();
+    walk_dir(skill_dir, skill_dir, canonical_source_root, &mut out)?;
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(out)
+}
+
+fn walk_dir(
+    skill_root: &Path,
+    dir: &Path,
+    canonical_source_root: &Path,
+    out: &mut Vec<SourceFile>,
+) -> Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
+    let mut paths: Vec<PathBuf> = entries
+        .map(|e| e.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("read_dir entries under {}", dir.display()))?;
+    paths.sort();
+    for path in paths {
+        // Each entry — file or directory — gets the canonical-under
+        // guard so a hostile symlink under, say, `bin/` can't escape
+        // the source root.
+        let canonical = canonicalize_under(canonical_source_root, &path)?;
+        let meta = fs::metadata(&canonical)
+            .with_context(|| format!("metadata {}", canonical.display()))?;
+        if meta.is_dir() {
+            walk_dir(skill_root, &canonical, canonical_source_root, out)?;
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let rel = canonical.strip_prefix(skill_root).map_err(|err| {
+            anyhow!(
+                "source file {} is not under skill root {}: {err}",
+                canonical.display(),
+                skill_root.display(),
+            )
+        })?;
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o777
+        };
+        let source = SourceFile {
+            rel: rel.to_path_buf(),
+            abs: canonical.clone(),
+            #[cfg(unix)]
+            mode,
+        };
+        out.push(source);
+    }
+    Ok(())
+}
+
+/// Strip a trailing `.tera` extension from `rel` so a sibling like
+/// `prompts/intro.md.tera` lands as `prompts/intro.md` in the rendered
+/// tree. Files without a `.tera` extension pass through unchanged.
+fn strip_tera_suffix(rel: &Path) -> PathBuf {
+    if rel.extension().and_then(|e| e.to_str()) == Some(TERA_EXT) {
+        rel.with_extension("")
+    } else {
+        rel.to_path_buf()
+    }
 }
 
 /// Resolve a candidate read path and assert the canonical result is
@@ -704,6 +1000,320 @@ skills:
             msg.contains("outside the build root") || msg.contains("symlink"),
             "{msg}",
         );
+    }
+
+    #[test]
+    fn render_rejects_render_to_with_build_prefix() {
+        // A `render_to` value that starts with `build/<product>/` would
+        // double the prefix because the binary already prepends
+        // `build/<product>/` to the output root. The validator should
+        // reject this shape with a clear pointer at the canonical form.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("manifests/skills.yaml"),
+            r#"
+schema_version: 1
+skills:
+  - id: market.favorites
+    domain: market
+    source: core/skills/market/favorites
+    products:
+      codex:
+        name: /market-favorites
+        render_to: build/codex/plugins/market/skills/favorites/SKILL.md
+    required_clis: {}
+"#,
+        );
+        write(
+            &root.join("manifests/plugins.yaml"),
+            "schema_version: 1\nplugins: []\n",
+        );
+        write(
+            &root.join("manifests/product-capabilities.yaml"),
+            PRODUCT_CAPS,
+        );
+        write(&root.join("manifests/runtime-roots.yaml"), RUNTIME_ROOTS);
+        write(&root.join("manifests/cli-tools.yaml"), CLI_TOOLS);
+        write(
+            &root.join("core/skills/market/favorites/SKILL.md.tera"),
+            "# market\n",
+        );
+        let source_root = SourceRoot::from_arg_or_cwd(Some(root)).unwrap();
+        let set = load_set(&source_root);
+        let err = write_product(&source_root, set, "codex").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("starts with `build/`"), "{msg}");
+        assert!(msg.contains("market.favorites"), "{msg}");
+        assert!(
+            msg.contains("plugins/<plugin>/skills/<skill>/SKILL.md"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn write_product_copies_sibling_files_with_executable_bit() {
+        // A skill that ships `bin/`, `scripts/`, `references/` siblings
+        // (the topic-radar shape) should land all of them under the
+        // rendered output directory, with shell scripts keeping their
+        // executable bit. Without this, the rendered SKILL points at a
+        // script path that doesn't exist in the build tree.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("manifests/skills.yaml"),
+            r#"
+schema_version: 1
+skills:
+  - id: tools.topic-radar
+    domain: tools
+    source: core/skills/tools/topic-radar
+    products:
+      codex:
+        name: topic-radar
+        render_to: plugins/tools/skills/topic-radar/SKILL.md
+    required_clis: {}
+"#,
+        );
+        write(
+            &root.join("manifests/plugins.yaml"),
+            "schema_version: 1\nplugins: []\n",
+        );
+        write(
+            &root.join("manifests/product-capabilities.yaml"),
+            PRODUCT_CAPS,
+        );
+        write(&root.join("manifests/runtime-roots.yaml"), RUNTIME_ROOTS);
+        write(&root.join("manifests/cli-tools.yaml"), CLI_TOOLS);
+
+        let skill_src = root.join("core/skills/tools/topic-radar");
+        write(&skill_src.join("SKILL.md.tera"), "# topic-radar\n");
+        write(&skill_src.join("bin/topic_radar.py"), "print('hello')\n");
+        write(
+            &skill_src.join("scripts/topic-radar.sh"),
+            "#!/bin/sh\necho hi\n",
+        );
+        write(
+            &skill_src.join("references/source-strategy.md"),
+            "# strategy\n",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                skill_src.join("scripts/topic-radar.sh"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let source_root = SourceRoot::from_arg_or_cwd(Some(root)).unwrap();
+        let set = load_set(&source_root);
+        let report = write_product(&source_root, set, "codex").unwrap();
+        assert_eq!(report.rendered, vec!["tools.topic-radar".to_string()]);
+
+        let out_dir = report.output_root.join("plugins/tools/skills/topic-radar");
+        assert!(
+            out_dir.join("SKILL.md").exists(),
+            "rendered SKILL.md missing"
+        );
+        assert!(
+            out_dir.join("bin/topic_radar.py").exists(),
+            "bin/topic_radar.py not copied"
+        );
+        assert_eq!(
+            fs::read_to_string(out_dir.join("bin/topic_radar.py")).unwrap(),
+            "print('hello')\n",
+        );
+        assert_eq!(
+            fs::read_to_string(out_dir.join("scripts/topic-radar.sh")).unwrap(),
+            "#!/bin/sh\necho hi\n",
+        );
+        assert_eq!(
+            fs::read_to_string(out_dir.join("references/source-strategy.md")).unwrap(),
+            "# strategy\n",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let copied_mode = fs::metadata(out_dir.join("scripts/topic-radar.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                copied_mode, 0o755,
+                "executable bit not preserved on rendered shell script",
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_tera_file_is_rendered_through_helpers_and_drops_suffix() {
+        // A `.tera` sibling (e.g. `prompts/intro.md.tera`) should be
+        // rendered through the same helper context as the SKILL body
+        // and land in the output as `prompts/intro.md` (no `.tera`
+        // suffix) so downstream tooling consumes a plain file.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("manifests/skills.yaml"),
+            r#"
+schema_version: 1
+skills:
+  - id: market.favorites
+    domain: market
+    source: core/skills/market/favorites
+    products:
+      codex:
+        name: favorites
+        render_to: skills/market/favorites/SKILL.md
+    required_clis:
+      agent-out: ">=0.5.0"
+"#,
+        );
+        write(
+            &root.join("manifests/plugins.yaml"),
+            "schema_version: 1\nplugins: []\n",
+        );
+        write(
+            &root.join("manifests/product-capabilities.yaml"),
+            PRODUCT_CAPS,
+        );
+        write(&root.join("manifests/runtime-roots.yaml"), RUNTIME_ROOTS);
+        write(&root.join("manifests/cli-tools.yaml"), CLI_TOOLS);
+
+        let skill_src = root.join("core/skills/market/favorites");
+        write(&skill_src.join("SKILL.md.tera"), "# favorites\n");
+        write(
+            &skill_src.join("prompts/intro.md.tera"),
+            r#"intro for {{ skill_ref(id="market.favorites") }}"#,
+        );
+
+        let source_root = SourceRoot::from_arg_or_cwd(Some(root)).unwrap();
+        let set = load_set(&source_root);
+        write_product(&source_root, set, "codex").unwrap();
+
+        let out = root.join("build/codex/skills/market/favorites/prompts/intro.md");
+        assert!(
+            out.exists(),
+            "rendered sibling tera should land without .tera suffix"
+        );
+        let body = fs::read_to_string(&out).unwrap();
+        assert_eq!(body, "intro for favorites");
+    }
+
+    #[test]
+    fn stale_sibling_files_are_removed_on_re_render() {
+        // If a sibling file is removed from source between two renders,
+        // the prior rendered copy must not survive in the output. The
+        // cache-miss path clears the output dir, so deleting a source
+        // file is enough to make it disappear from `build/`.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("manifests/skills.yaml"),
+            r#"
+schema_version: 1
+skills:
+  - id: tools.foo
+    domain: tools
+    source: core/skills/tools/foo
+    products:
+      codex:
+        name: foo
+        render_to: plugins/tools/skills/foo/SKILL.md
+    required_clis: {}
+"#,
+        );
+        write(
+            &root.join("manifests/plugins.yaml"),
+            "schema_version: 1\nplugins: []\n",
+        );
+        write(
+            &root.join("manifests/product-capabilities.yaml"),
+            PRODUCT_CAPS,
+        );
+        write(&root.join("manifests/runtime-roots.yaml"), RUNTIME_ROOTS);
+        write(&root.join("manifests/cli-tools.yaml"), CLI_TOOLS);
+
+        let skill_src = root.join("core/skills/tools/foo");
+        write(&skill_src.join("SKILL.md.tera"), "# foo\n");
+        write(&skill_src.join("old-helper.sh"), "echo old\n");
+
+        let source_root = SourceRoot::from_arg_or_cwd(Some(root)).unwrap();
+        let set = load_set(&source_root);
+        write_product(&source_root, set.clone(), "codex").unwrap();
+        let out_dir = root.join("build/codex/plugins/tools/skills/foo");
+        assert!(out_dir.join("old-helper.sh").exists());
+
+        // Delete the sibling from source; re-load + re-render.
+        fs::remove_file(skill_src.join("old-helper.sh")).unwrap();
+        let set = load_set(&source_root);
+        write_product(&source_root, set, "codex").unwrap();
+        assert!(
+            !out_dir.join("old-helper.sh").exists(),
+            "stale rendered sibling must be cleaned on re-render",
+        );
+        assert!(
+            out_dir.join("SKILL.md").exists(),
+            "SKILL.md should still render after sibling removal",
+        );
+    }
+
+    #[test]
+    fn sibling_byte_change_invalidates_cache() {
+        // A pure sibling-file edit (no SKILL.md.tera change) must still
+        // invalidate the cache so the rendered output picks up the new
+        // bytes — otherwise users editing a helper script see stale
+        // output on the next render.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("manifests/skills.yaml"),
+            r#"
+schema_version: 1
+skills:
+  - id: tools.foo
+    domain: tools
+    source: core/skills/tools/foo
+    products:
+      codex:
+        name: foo
+        render_to: plugins/tools/skills/foo/SKILL.md
+    required_clis: {}
+"#,
+        );
+        write(
+            &root.join("manifests/plugins.yaml"),
+            "schema_version: 1\nplugins: []\n",
+        );
+        write(
+            &root.join("manifests/product-capabilities.yaml"),
+            PRODUCT_CAPS,
+        );
+        write(&root.join("manifests/runtime-roots.yaml"), RUNTIME_ROOTS);
+        write(&root.join("manifests/cli-tools.yaml"), CLI_TOOLS);
+
+        let skill_src = root.join("core/skills/tools/foo");
+        write(&skill_src.join("SKILL.md.tera"), "# foo\n");
+        write(&skill_src.join("helper.sh"), "echo v1\n");
+
+        let source_root = SourceRoot::from_arg_or_cwd(Some(root)).unwrap();
+        let set = load_set(&source_root);
+        write_product(&source_root, set, "codex").unwrap();
+
+        write(&skill_src.join("helper.sh"), "echo v2\n");
+        let set = load_set(&source_root);
+        let second = write_product(&source_root, set, "codex").unwrap();
+        assert_eq!(
+            second.rendered,
+            vec!["tools.foo".to_string()],
+            "sibling byte change should trigger a re-render (cache miss)",
+        );
+        let body = fs::read_to_string(root.join("build/codex/plugins/tools/skills/foo/helper.sh"))
+            .unwrap();
+        assert_eq!(body, "echo v2\n");
     }
 
     #[test]

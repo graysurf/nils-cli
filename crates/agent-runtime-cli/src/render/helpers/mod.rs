@@ -96,12 +96,12 @@ mod test_support {
         let products = SkillProducts {
             codex: Some(ProductRender {
                 name: Some("/codex-name".to_string()),
-                render_to: "build/codex/skills/sample/SKILL.md".to_string(),
+                render_to: "skills/sample/SKILL.md".to_string(),
                 path_override: None,
             }),
             claude: Some(ProductRender {
                 name: Some("market:favorites".to_string()),
-                render_to: "build/claude/plugins/market/skills/favorites/SKILL.md".to_string(),
+                render_to: "plugins/market/skills/favorites/SKILL.md".to_string(),
                 path_override: None,
             }),
         };
