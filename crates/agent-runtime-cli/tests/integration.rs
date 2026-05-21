@@ -9,6 +9,8 @@ mod audit_drift_classes;
 mod cli;
 #[path = "integration/determinism_gate.rs"]
 mod determinism_gate;
+#[path = "integration/managed_block.rs"]
+mod managed_block;
 #[path = "integration/render.rs"]
 mod render;
 #[path = "integration/render_determinism.rs"]
