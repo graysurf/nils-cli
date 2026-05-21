@@ -1,4 +1,4 @@
-use crate::doctor::{self, DoctorFinding, DoctorOptions, DoctorSeverity};
+use crate::doctor::{self, DoctorFinding, DoctorOptions, DoctorSeverity, upgrade};
 use crate::render::manifest::SourceRoot;
 use clap::Args;
 use std::path::PathBuf;
@@ -28,6 +28,15 @@ pub struct DoctorArgs {
     /// `<source-root>/.private/link-map.overrides.yaml` is ignored.
     #[arg(long, conflicts_with = "no_overlay")]
     pub overlay_path: Option<PathBuf>,
+    /// Active cli-tools profile to check.
+    #[arg(long, default_value = "recommended")]
+    pub profile: String,
+    /// Print copy-pasteable Homebrew upgrade commands for non-ok probes.
+    #[arg(long, default_value_t = false)]
+    pub suggest_upgrade: bool,
+    /// Inspect a consuming repo's `.agents/scripts/` project-local overlays.
+    #[arg(long)]
+    pub check_project: Option<PathBuf>,
 }
 
 pub fn run(args: DoctorArgs) -> anyhow::Result<u8> {
@@ -52,6 +61,8 @@ pub fn run(args: DoctorArgs) -> anyhow::Result<u8> {
     let options = DoctorOptions {
         overlay_enabled: !args.no_overlay,
         overlay_path: args.overlay_path.clone(),
+        cli_tools_profile: args.profile.clone(),
+        check_project: args.check_project.clone(),
     };
     let outcome = doctor::run(
         &args.product,
@@ -90,8 +101,44 @@ pub fn run(args: DoctorArgs) -> anyhow::Result<u8> {
             probe.command,
         );
     }
+    for probe in &outcome.coverage_probes {
+        let parsed = probe.parsed_version.as_deref().unwrap_or("unknown");
+        let required = probe.required_version.as_deref().unwrap_or("n/a");
+        eprintln!(
+            "  {} {} status={} name={} command=`{}` required={} parsed={}",
+            match probe.severity {
+                DoctorSeverity::Ok => "ok",
+                DoctorSeverity::Warn => "warn",
+                DoctorSeverity::Block => "block",
+            },
+            probe.kind.check(),
+            probe.status.as_str(),
+            probe.name,
+            probe.command,
+            required,
+            parsed,
+        );
+    }
+    for probe in &outcome.project_probes {
+        eprintln!(
+            "  {} project-overlay status={} script={} path={}",
+            match probe.severity {
+                DoctorSeverity::Ok => "ok",
+                DoctorSeverity::Warn => "warn",
+                DoctorSeverity::Block => "block",
+            },
+            probe.status.as_str(),
+            probe.script,
+            probe.path.display(),
+        );
+    }
     for finding in &outcome.findings {
         print_finding(finding);
+    }
+    if args.suggest_upgrade {
+        for suggestion in upgrade::suggestions(&outcome) {
+            println!("{}", suggestion.command);
+        }
     }
 
     Ok(outcome.exit_code())

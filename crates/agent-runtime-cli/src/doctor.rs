@@ -4,7 +4,10 @@
 //! managed-block marker pairing, runtime-roots path readability, and
 //! product version posture.
 
+pub mod coverage;
 pub mod probes;
+pub mod project;
+pub mod upgrade;
 pub mod version;
 
 use crate::install::link_map::{LinkMap, LinkMapError};
@@ -19,6 +22,8 @@ use thiserror::Error;
 pub struct DoctorOptions {
     pub overlay_enabled: bool,
     pub overlay_path: Option<PathBuf>,
+    pub cli_tools_profile: String,
+    pub check_project: Option<PathBuf>,
 }
 
 impl Default for DoctorOptions {
@@ -26,6 +31,8 @@ impl Default for DoctorOptions {
         Self {
             overlay_enabled: true,
             overlay_path: None,
+            cli_tools_profile: "recommended".to_string(),
+            check_project: None,
         }
     }
 }
@@ -38,6 +45,8 @@ pub enum DoctorError {
     LinkMap(#[from] LinkMapError),
     #[error("plan: {0}")]
     Plan(#[from] PlanError),
+    #[error("coverage: {0}")]
+    Coverage(#[from] coverage::CoverageError),
     #[error("unknown product `{product}`; expected `codex` or `claude`")]
     UnknownProduct { product: String },
 }
@@ -143,6 +152,8 @@ pub struct DoctorOutcome {
     pub product: String,
     pub findings: Vec<DoctorFinding>,
     pub version_probes: Vec<version::VersionProbeFinding>,
+    pub coverage_probes: Vec<coverage::CoverageFinding>,
+    pub project_probes: Vec<project::ProjectOverlayFinding>,
     pub ok: usize,
     pub warn: usize,
     pub block: usize,
@@ -212,6 +223,28 @@ pub fn run(
             report.findings.push(version_probe.to_doctor_finding());
         }
     }
+    let coverage_probes = coverage::probe(source_root, &options.cli_tools_profile)?;
+    for probe in &coverage_probes {
+        match probe.severity {
+            DoctorSeverity::Ok => report.ok += 1,
+            DoctorSeverity::Warn | DoctorSeverity::Block => {
+                report.findings.push(probe.to_doctor_finding(product));
+            }
+        }
+    }
+    let project_probes = options
+        .check_project
+        .as_deref()
+        .map(project::probe_project)
+        .unwrap_or_default();
+    for probe in &project_probes {
+        match probe.severity {
+            DoctorSeverity::Ok => report.ok += 1,
+            DoctorSeverity::Warn | DoctorSeverity::Block => {
+                report.findings.push(probe.to_doctor_finding(product));
+            }
+        }
+    }
 
     let warn = report
         .findings
@@ -228,6 +261,8 @@ pub fn run(
         product: product.to_string(),
         findings: report.findings,
         version_probes: vec![version_probe],
+        coverage_probes,
+        project_probes,
         ok: report.ok,
         warn,
         block,

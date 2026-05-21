@@ -91,14 +91,14 @@ impl VersionProbeFinding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Version {
+pub(crate) struct Version {
     major: u64,
     minor: u64,
     patch: u64,
 }
 
 impl Version {
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         let bytes = raw.as_bytes();
         for i in 0..bytes.len() {
             if !(bytes[i].is_ascii_digit()
@@ -239,7 +239,7 @@ fn finding(
     }
 }
 
-fn run_probe_command(command: &str) -> String {
+pub(crate) fn run_probe_command(command: &str) -> String {
     run_probe_command_with_timeout(command, PROBE_TIMEOUT_POLLS, PROBE_TIMEOUT_SLEEP)
 }
 
