@@ -11,7 +11,7 @@ provider credentials.
 | Field | Value |
 | ----- | ----- |
 | Package name | `nils-agent-workflow-primitives` |
-| Binary names | `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage` |
+| Binary names | `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `review-specialists`, `skill-usage` |
 
 Each binary supports `--version` and `completion <bash|zsh>`.
 
@@ -26,6 +26,7 @@ Each binary supports `--version` and `completion <bash|zsh>`.
 | `model-cross-check` | Record primary/checker model observations without owning provider calls. | `model-cross-check.json` under `--out DIR` |
 | `repo-retro` | Generate deterministic repo-local implementation retrospectives from local Git, HEURISTIC_SYSTEM records, and explicit JSONL inputs. | stdout by default; optional Markdown/raw JSON/index under `--history-dir DIR --write` |
 | `review-evidence` | Record review findings and passing validation evidence. | `review-evidence.json` under `--out DIR` |
+| `review-specialists` | Validate, merge, render, bundle, and scope specialist review findings without running reviewers or mutating providers. | stdout by default; optional bundle files under `--out-dir DIR` |
 | `skill-usage` | Record skill invocation intent, linked records, validation, failures, outcome, and follow-up. | `skill-usage.record.json` under `--out DIR` |
 
 ## Common command shape
@@ -48,8 +49,29 @@ repo-retro report --repo . --mode maintainer --format markdown
 canary-check run --out /tmp/canary --name smoke --command "cargo test smoke"
 browser-session init --out /tmp/browser --target http://localhost:3000 --goal "verify checkout flow"
 review-evidence init --out /tmp/review --subject "PR #123"
+review-specialists validate --input findings.jsonl --format json
+review-specialists merge --input findings.jsonl --summary-out review.md
 model-cross-check init --out /tmp/cross-check --prompt "review patch" --primary-model gpt-5.4 --checker-model gpt-5.5
 skill-usage init --out /tmp/skill --skill tools/devex/review-evidence --intent "record review" --user-request-summary "review this PR"
+```
+
+## `review-specialists` flow
+
+`review-specialists` owns the deterministic helper work behind specialist
+review workflows. It accepts reviewer-authored JSONL findings, validates the
+schema, normalizes severity and confidence, deduplicates by stable fingerprint,
+renders local Markdown/JSON profiles, writes small artifact bundles, and
+classifies Git diffs for specialist routing. It does not run LLM prompts, spawn
+subagents, post comments, open issues, merge PRs, or close issues.
+
+```bash
+review-specialists scope --base main --format json
+review-specialists validate --input findings.jsonl --format json
+review-specialists merge --input findings.jsonl --summary-out review.md
+review-specialists render --profile issue-body --input findings.merged.json \
+  --repo sympoies/nils-cli --ref HEAD --out issue.md
+review-specialists bundle --input findings.jsonl --out-dir target/review-specialists/bundle \
+  --profile issue-body
 ```
 
 ## `heuristic-inbox verify` redaction guardrail
@@ -127,3 +149,4 @@ records or printing JSON/text output. They do not read linked artifact contents.
 - [Completion coverage matrix](../../docs/specs/completion-coverage-matrix-v1.md)
 - [CLI service JSON contract guideline](../../docs/specs/cli-service-json-contract-guideline-v1.md)
 - [New CLI crate development standard](../../docs/runbooks/new-cli-crate-development-standard.md)
+- [Review specialists primitive runbook](../../docs/runbooks/review-specialists-primitive.md)

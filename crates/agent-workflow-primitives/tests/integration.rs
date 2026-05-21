@@ -6,3 +6,5 @@ mod cli;
 mod exit_codes;
 #[path = "integration/help_snapshot.rs"]
 mod help_snapshot;
+#[path = "integration/review_specialists.rs"]
+mod review_specialists;

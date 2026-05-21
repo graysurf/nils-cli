@@ -31,6 +31,7 @@ fn all_binaries_export_zsh_completion() {
         "model-cross-check",
         "repo-retro",
         "review-evidence",
+        "review-specialists",
         "skill-usage",
     ] {
         let output = run(bin, tmp.path(), &["completion", "zsh"]);

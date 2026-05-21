@@ -10,6 +10,7 @@ fn help_snapshot_all_workflow_primitive_binaries() {
         ("model-cross-check", "none"),
         ("repo-retro", "HOME"),
         ("review-evidence", "none"),
+        ("review-specialists", "none"),
         ("skill-usage", "none"),
     ] {
         assert_help_contains(HelpCase::root(

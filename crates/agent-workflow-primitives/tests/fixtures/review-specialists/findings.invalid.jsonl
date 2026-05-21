@@ -1,0 +1,2 @@
+{"severity":"urgent","confidence":1.2,"path":"src/api/users.rs","summary":"Bad row lacks required fields."}
+not-json
