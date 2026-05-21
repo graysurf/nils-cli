@@ -22,6 +22,7 @@ use std::process::ExitCode;
 
 pub mod audit_drift;
 pub mod commands;
+pub mod managed_block;
 pub mod render;
 
 #[derive(Parser)]
