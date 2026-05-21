@@ -27,6 +27,10 @@ pub enum PlanError {
     NonRelativeDestination { id: String, path: PathBuf },
     #[error("source for entry `{id}` is not relative: {path}")]
     NonRelativeSource { id: String, path: PathBuf },
+    #[error("destination for entry `{id}` contains a `..` traversal: {path}")]
+    DestinationTraversal { id: String, path: PathBuf },
+    #[error("source for entry `{id}` contains a `..` traversal: {path}")]
+    SourceTraversal { id: String, path: PathBuf },
 }
 
 /// Single executable step the apply executor will run.
@@ -87,6 +91,12 @@ impl InstallPlan {
                     path: dest_rel.to_path_buf(),
                 });
             }
+            if has_parent_dir_component(dest_rel) {
+                return Err(PlanError::DestinationTraversal {
+                    id: entry.id.clone(),
+                    path: dest_rel.to_path_buf(),
+                });
+            }
             match entry.kind {
                 EntryKind::SymlinkedFile => {
                     expand_symlinked_file(entry, source_root, home, &mut actions)?;
@@ -129,13 +139,29 @@ fn require_relative_source(entry: &LinkEntry) -> Result<&str, PlanError> {
         .source
         .as_deref()
         .expect("validate() guarantees source for non-managed-block kinds");
-    if Path::new(s).is_absolute() {
+    let p = Path::new(s);
+    if p.is_absolute() {
         return Err(PlanError::NonRelativeSource {
             id: entry.id.clone(),
             path: PathBuf::from(s),
         });
     }
+    if has_parent_dir_component(p) {
+        return Err(PlanError::SourceTraversal {
+            id: entry.id.clone(),
+            path: PathBuf::from(s),
+        });
+    }
     Ok(s)
+}
+
+/// Return `true` if any component of `p` is `..`. We reject paths with
+/// parent-directory traversal because `PathBuf::join` does not normalize
+/// — `home.join("../etc/passwd")` would write under the user's
+/// filesystem above the sandbox home at apply time.
+fn has_parent_dir_component(p: &Path) -> bool {
+    use std::path::Component;
+    p.components().any(|c| matches!(c, Component::ParentDir))
 }
 
 fn expand_single_symlink(
@@ -240,5 +266,107 @@ fn is_regular_non_symlink(p: &Path) -> bool {
     match std::fs::symlink_metadata(p) {
         Ok(meta) => meta.file_type().is_file() && !meta.file_type().is_symlink(),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::install::link_map::{EntryKind, LinkEntry, LinkMap};
+
+    fn one_entry_map(entry: LinkEntry) -> LinkMap {
+        LinkMap {
+            schema_version: 1,
+            entries: vec![entry],
+        }
+    }
+
+    fn symlinked_file(id: &str, source: &str, destination: &str) -> LinkEntry {
+        LinkEntry {
+            id: id.to_string(),
+            kind: EntryKind::SymlinkedFile,
+            source: Some(source.to_string()),
+            destination: destination.to_string(),
+            recursive: false,
+            surface: None,
+            comment_style: None,
+            body_template: None,
+        }
+    }
+
+    #[test]
+    fn build_rejects_absolute_destination() {
+        let lm = one_entry_map(symlinked_file("x", "build/a", "/etc/passwd"));
+        let err = InstallPlan::build(
+            "claude",
+            Path::new("/tmp/src"),
+            Path::new("/tmp/home"),
+            Path::new("/tmp/state"),
+            &lm,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlanError::NonRelativeDestination { .. }));
+    }
+
+    #[test]
+    fn build_rejects_traversal_in_destination() {
+        let lm = one_entry_map(symlinked_file("x", "build/a", "../escape"));
+        let err = InstallPlan::build(
+            "claude",
+            Path::new("/tmp/src"),
+            Path::new("/tmp/home"),
+            Path::new("/tmp/state"),
+            &lm,
+        )
+        .unwrap_err();
+        match err {
+            PlanError::DestinationTraversal { id, .. } => assert_eq!(id, "x"),
+            other => panic!("expected DestinationTraversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_traversal_in_source() {
+        let lm = one_entry_map(symlinked_file("x", "../../etc/passwd", "plugins/x"));
+        let err = InstallPlan::build(
+            "claude",
+            Path::new("/tmp/src"),
+            Path::new("/tmp/home"),
+            Path::new("/tmp/state"),
+            &lm,
+        )
+        .unwrap_err();
+        match err {
+            PlanError::SourceTraversal { id, .. } => assert_eq!(id, "x"),
+            other => panic!("expected SourceTraversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_absolute_source() {
+        let lm = one_entry_map(symlinked_file("x", "/etc/passwd", "plugins/x"));
+        let err = InstallPlan::build(
+            "claude",
+            Path::new("/tmp/src"),
+            Path::new("/tmp/home"),
+            Path::new("/tmp/state"),
+            &lm,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlanError::NonRelativeSource { .. }));
+    }
+
+    #[test]
+    fn build_rejects_traversal_via_inner_component() {
+        let lm = one_entry_map(symlinked_file("x", "build/a", "plugins/../../escape"));
+        let err = InstallPlan::build(
+            "claude",
+            Path::new("/tmp/src"),
+            Path::new("/tmp/home"),
+            Path::new("/tmp/state"),
+            &lm,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlanError::DestinationTraversal { .. }));
     }
 }

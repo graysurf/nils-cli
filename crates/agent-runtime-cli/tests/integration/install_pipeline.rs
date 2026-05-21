@@ -277,6 +277,67 @@ fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
+fn managed_block_entry_writes_block_and_is_idempotent_on_second_apply() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("src");
+    fs::create_dir_all(root.join("targets").join("codex")).unwrap();
+    let link_map = "\
+schema_version: 1
+entries:
+  - id: codex.config
+    kind: managed-block
+    destination: config.toml
+    surface: install
+    comment_style: hash
+    body_template: |-
+      tag = \"agent-runtime\"
+      live_home = \"/tmp/sandbox\"
+";
+    fs::write(
+        root.join("targets").join("codex").join("link-map.yaml"),
+        link_map,
+    )
+    .unwrap();
+    let source_root = fs::canonicalize(&root).unwrap();
+
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+
+    let (_, changes_first) = install::run(
+        "codex",
+        &source_root,
+        &home,
+        &state_home,
+        Mode::Apply,
+        fixed_time(),
+    )
+    .unwrap();
+    assert_eq!(changes_first.len(), 1);
+    assert!(matches!(
+        changes_first[0],
+        AppliedChange::ManagedBlockApplied { .. }
+    ));
+
+    let config_after_first = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(config_after_first.contains("# >>> agent-runtime-kit:install >>>"));
+    assert!(config_after_first.contains("tag = \"agent-runtime\""));
+    assert!(config_after_first.contains("# <<< agent-runtime-kit:install <<<"));
+
+    let (_, changes_second) = install::run(
+        "codex",
+        &source_root,
+        &home,
+        &state_home,
+        Mode::Apply,
+        fixed_time(),
+    )
+    .unwrap();
+    assert!(matches!(changes_second[0], AppliedChange::NoOp { .. }));
+    let config_after_second = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert_eq!(config_after_first, config_after_second);
+}
+
+#[test]
 fn missing_link_map_returns_typed_error() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
