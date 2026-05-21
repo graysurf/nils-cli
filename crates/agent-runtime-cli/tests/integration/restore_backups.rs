@@ -18,10 +18,20 @@ use agent_runtime_cli::install::{self, InstallOptions, Mode as InstallMode};
 use agent_runtime_cli::restore_backups::{
     self, BackupRunSelector, Mode as RestoreMode, RestoreError, RestoreOptions, RestoredChange,
 };
+use nils_test_support::bin;
+use nils_test_support::cmd::{self, CmdOutput};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
+
+fn agent_runtime_bin() -> PathBuf {
+    bin::resolve("agent-runtime")
+}
+
+fn run_cli(args: &[&str]) -> CmdOutput {
+    cmd::run(&agent_runtime_bin(), args, &[], None)
+}
 
 fn ts(secs: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -133,6 +143,166 @@ fn run_install_tagged(
         &options,
     )
     .unwrap();
+}
+
+#[test]
+fn restore_backups_cli_missing_from_lists_available_runs() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_source_root(tmp.path(), "claude");
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+
+    seed_pre_install_manifest(&home, "ORIG-MANIFEST");
+    run_install(&source_root, &home, &state_home, ts(1_700_000_000));
+
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let home_arg = home.to_string_lossy().into_owned();
+    let state_arg = state_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "restore-backups",
+        "--source-root",
+        &source_arg,
+        "--product",
+        "claude",
+        "--live-home",
+        &home_arg,
+        "--state-home",
+        &state_arg,
+        "--dry-run",
+    ]);
+
+    assert_ne!(output.code, 0, "missing --from should fail");
+    let stderr = output.stderr_text();
+    assert!(
+        stderr.contains("available --from values"),
+        "stderr should list usable backup selectors: {stderr}"
+    );
+    assert!(
+        stderr.contains("1700000000"),
+        "stderr should include the exact backup timestamp: {stderr}"
+    );
+    assert!(
+        stderr.contains("latest (resolves to 1700000000)"),
+        "stderr should include the latest selector resolution: {stderr}"
+    );
+    assert!(
+        stderr.contains("--from is required"),
+        "stderr should explain the missing flag: {stderr}"
+    );
+}
+
+#[test]
+fn restore_backups_cli_dry_run_reports_restore_plan_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_source_root(tmp.path(), "claude");
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+
+    let manifest_dest = seed_pre_install_manifest(&home, "ORIG-MANIFEST");
+    run_install(&source_root, &home, &state_home, ts(1_700_000_000));
+    let target_before = fs::read_link(&manifest_dest).unwrap();
+    let backup_file =
+        state_home.join("backups/claude/1700000000/reporting.plugin-manifest/plugin.json");
+    assert!(backup_file.exists());
+
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let home_arg = home.to_string_lossy().into_owned();
+    let state_arg = state_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "restore-backups",
+        "--source-root",
+        &source_arg,
+        "--product",
+        "claude",
+        "--live-home",
+        &home_arg,
+        "--state-home",
+        &state_arg,
+        "--from",
+        "latest",
+        "--dry-run",
+    ]);
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        output.stdout_text(),
+        "",
+        "restore-backups status must stay on stderr"
+    );
+    let stderr = output.stderr_text();
+    assert!(
+        stderr.contains("product=claude mode=dry-run"),
+        "stderr should summarize the dry-run plan: {stderr}"
+    );
+    assert!(
+        stderr.contains("from=") && stderr.contains("actions=") && stderr.contains("restored="),
+        "stderr should include source run, action count, and restore count: {stderr}"
+    );
+    assert!(
+        stderr.contains("+ restore") && stderr.contains("reporting.plugin-manifest"),
+        "stderr should name the planned restore action: {stderr}"
+    );
+
+    assert_eq!(fs::read_link(&manifest_dest).unwrap(), target_before);
+    assert!(backup_file.exists(), "dry-run must not consume backups");
+}
+
+#[test]
+fn restore_backups_cli_foreign_symlink_reports_skip_without_destroying_it() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_source_root(tmp.path(), "claude");
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+
+    let manifest_dest = seed_pre_install_manifest(&home, "ORIG-MANIFEST");
+    run_install(&source_root, &home, &state_home, ts(1_700_000_000));
+
+    let operator_file = tmp.path().join("operator/custom.json");
+    fs::create_dir_all(operator_file.parent().unwrap()).unwrap();
+    fs::write(&operator_file, "OPERATOR-RETARGETED").unwrap();
+    fs::remove_file(&manifest_dest).unwrap();
+    std::os::unix::fs::symlink(&operator_file, &manifest_dest).unwrap();
+
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let home_arg = home.to_string_lossy().into_owned();
+    let state_arg = state_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "restore-backups",
+        "--source-root",
+        &source_arg,
+        "--product",
+        "claude",
+        "--live-home",
+        &home_arg,
+        "--state-home",
+        &state_arg,
+        "--from",
+        "latest",
+        "--apply",
+    ]);
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let stderr = output.stderr_text();
+    assert!(
+        stderr.contains("? skip") && stderr.contains("foreign target"),
+        "foreign symlink should be reported as a skipped change: {stderr}"
+    );
+    assert!(
+        stderr.contains(&manifest_dest.display().to_string()),
+        "stderr should name the skipped destination: {stderr}"
+    );
+    assert!(
+        stderr.contains(&operator_file.display().to_string()),
+        "stderr should name the operator-owned target: {stderr}"
+    );
+
+    assert_eq!(fs::read_link(&manifest_dest).unwrap(), operator_file);
+    let backup_file =
+        state_home.join("backups/claude/1700000000/reporting.plugin-manifest/plugin.json");
+    assert!(
+        backup_file.exists(),
+        "backup must survive a foreign-target skip"
+    );
 }
 
 #[test]
