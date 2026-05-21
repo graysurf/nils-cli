@@ -8,6 +8,10 @@ fn copy_staged_help() -> &'static str {
     "Usage: git-cli utils copy-staged [-p|--stdout|--both]\n  -p, --stdout, --print   Print staged diff to stdout (no status message)\n  --both                  Print to stdout and copy to clipboard\n"
 }
 
+fn zip_help() -> &'static str {
+    "Usage: git-cli utils zip\nCreate backup-<short-sha>.zip from HEAD in the current directory.\n"
+}
+
 fn trim_trailing_newlines(input: &str) -> &str {
     input.trim_end_matches(['\n', '\r'])
 }
@@ -59,6 +63,26 @@ fn utils_zip_creates_backup_zip() {
 
     let zip_path = dir.path().join(format!("backup-{short}.zip"));
     assert!(zip_path.exists(), "expected zip archive to exist");
+}
+
+#[test]
+fn utils_zip_help_does_not_create_backup_zip() {
+    let harness = GitCliHarness::new();
+    let dir = init_repo();
+
+    let output = harness.run(dir.path(), &["utils", "zip", "--help"]);
+
+    assert_eq!(output.code, 0);
+    assert_eq!(output.stderr_text(), "");
+    assert_eq!(output.stdout_text(), zip_help());
+
+    let entries: Vec<_> = fs::read_dir(dir.path())
+        .expect("read repo")
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("backup-") && name.ends_with(".zip"))
+        .collect();
+    assert!(entries.is_empty(), "unexpected backup files: {entries:?}");
 }
 
 #[test]

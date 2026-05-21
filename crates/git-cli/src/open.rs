@@ -182,6 +182,11 @@ fn open_commit(args: &[String]) -> i32 {
 }
 
 fn open_compare(args: &[String]) -> i32 {
+    if args.first().is_some_and(|arg| is_help_token(arg)) {
+        print_usage();
+        return 0;
+    }
+
     if args.len() > 2 {
         eprintln!("❌ git-cli open compare takes at most two refs");
         print_usage();
@@ -494,6 +499,11 @@ fn open_commits(args: &[String]) -> i32 {
 }
 
 fn open_file(args: &[String]) -> i32 {
+    if args.first().is_some_and(|arg| is_help_token(arg)) {
+        print_usage();
+        return 0;
+    }
+
     if args.is_empty() || args.len() > 2 {
         eprintln!("❌ Usage: git-cli open file <path> [ref]");
         return 2;
@@ -515,6 +525,11 @@ fn open_file(args: &[String]) -> i32 {
 }
 
 fn open_blame(args: &[String]) -> i32 {
+    if args.first().is_some_and(|arg| is_help_token(arg)) {
+        print_usage();
+        return 0;
+    }
+
     if args.is_empty() || args.len() > 2 {
         eprintln!("❌ Usage: git-cli open blame <path> [ref]");
         return 2;

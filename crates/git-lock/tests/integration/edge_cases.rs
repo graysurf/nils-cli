@@ -91,6 +91,7 @@ fn unlock_missing_label() {
     assert!(stdout.contains(&format!(
         "No git-lock named 'missing' found for {repo_name}"
     )));
+    assert!(stdout.contains("run `git-lock list`"));
     assert!(!output.status.success());
 }
 
