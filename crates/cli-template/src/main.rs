@@ -66,7 +66,10 @@ fn init_tracing(level: &str) {
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    fmt().with_env_filter(filter).init();
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 fn detect_format_from_argv() -> OutputFormat {

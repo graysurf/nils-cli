@@ -12,6 +12,7 @@ Runs the required pre-delivery checks from DEVELOPMENT.md:
   - bash scripts/ci/markdownlint-audit.sh --strict
   - bash scripts/ci/plan-bundle-validate.sh --strict
   - bash scripts/ci/cli-output-contract-lint.sh --strict
+  - bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
   - bash scripts/ci/test-stale-audit.sh --strict
   - bash scripts/ci/third-party-artifacts-audit.sh --strict
   - bash scripts/ci/completion-asset-audit.sh --strict
@@ -125,6 +126,7 @@ if [[ "$docs_only" -eq 1 ]]; then
   exit 0
 fi
 
+run bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
 run bash scripts/ci/test-stale-audit.sh --strict
 run bash scripts/ci/third-party-artifacts-audit.sh --strict
 run bash scripts/ci/completion-asset-audit.sh --strict

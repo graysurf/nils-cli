@@ -16,10 +16,21 @@ use agent_runtime_cli::install::{self, InstallOptions, Mode as InstallMode};
 use agent_runtime_cli::uninstall::{
     self, Mode as UninstallMode, UninstallOptions, UninstalledChange,
 };
+use nils_test_support::bin;
+use nils_test_support::cmd::{self, CmdOutput};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
+
+fn agent_runtime_bin() -> PathBuf {
+    bin::resolve("agent-runtime")
+}
+
+fn run_cli(args: &[&str]) -> CmdOutput {
+    let bin = agent_runtime_bin();
+    cmd::run(&bin, args, &[], None)
+}
 
 fn fixed_time() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
@@ -459,6 +470,65 @@ fn foreign_symlink_at_install_dest_is_skipped() {
 }
 
 #[test]
+fn foreign_symlink_recovery_is_reported_by_cli() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_source_root(tmp.path(), "claude");
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+
+    run_install(&source_root, &home, &state_home);
+
+    let foreign = tmp.path().join("operator-managed-file.json");
+    fs::write(&foreign, b"{}").unwrap();
+    let manifest_dest = home.join("plugins/reporting/.claude-plugin/plugin.json");
+    fs::remove_file(&manifest_dest).unwrap();
+    std::os::unix::fs::symlink(&foreign, &manifest_dest).unwrap();
+
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let home_arg = home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "uninstall",
+        "--source-root",
+        &source_arg,
+        "--product",
+        "claude",
+        "--live-home",
+        &home_arg,
+        "--apply",
+    ]);
+    assert_eq!(
+        output.code,
+        0,
+        "uninstall CLI should recover from a foreign symlink; stderr={}",
+        output.stderr_text()
+    );
+    let stderr = output.stderr_text();
+    assert!(
+        stderr.contains("? skip"),
+        "foreign symlink should be reported as a skipped change: {stderr}"
+    );
+    assert!(
+        stderr.contains(&manifest_dest.display().to_string()),
+        "stderr should name the skipped destination: {stderr}"
+    );
+    assert!(
+        stderr.contains(&foreign.display().to_string()),
+        "stderr should name the actual foreign target: {stderr}"
+    );
+    assert!(
+        stderr.contains("expected:"),
+        "stderr should introduce the expected source recovery hint: {stderr}"
+    );
+    assert!(
+        fs::symlink_metadata(&manifest_dest)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "operator's foreign symlink was removed by CLI uninstall"
+    );
+}
+
+#[test]
 fn missing_link_map_returns_typed_error() {
     let tmp = TempDir::new().unwrap();
     let source_root = tmp.path().join("src");
@@ -474,4 +544,36 @@ fn missing_link_map_returns_typed_error() {
     .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("link-map"), "expected link-map error: {msg}");
+}
+
+#[test]
+fn missing_link_map_error_is_reported_by_cli() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = tmp.path().join("src");
+    fs::create_dir_all(&source_root).unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let home_arg = home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "uninstall",
+        "--source-root",
+        &source_arg,
+        "--product",
+        "claude",
+        "--live-home",
+        &home_arg,
+        "--apply",
+    ]);
+    assert_ne!(output.code, 0, "missing link-map should fail");
+    let stderr = output.stderr_text();
+    assert!(
+        stderr.contains("link-map"),
+        "stderr should map the missing link-map error: {stderr}"
+    );
+    assert!(
+        stderr.contains("targets/claude/link-map.yaml") || stderr.contains("No such file"),
+        "stderr should include enough path or OS detail to recover: {stderr}"
+    );
 }

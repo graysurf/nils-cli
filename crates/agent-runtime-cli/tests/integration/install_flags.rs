@@ -26,6 +26,14 @@ fn run_cli(args: &[&str]) -> CmdOutput {
     cmd::run(&bin, args, &[], None)
 }
 
+fn assert_dir_empty_or_absent(path: &Path, label: &str) {
+    if !path.exists() {
+        return;
+    }
+    let entries: Vec<_> = fs::read_dir(path).unwrap().collect();
+    assert!(entries.is_empty(), "{label} was mutated: {entries:?}");
+}
+
 fn fixed_time() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
@@ -494,6 +502,16 @@ entries:
         stderr.contains("dropped=1"),
         "stderr should name the drop count: {stderr}"
     );
+    assert!(
+        stderr.contains("actions=1"),
+        "stderr should report the post-overlay effective plan action count: {stderr}"
+    );
+    assert!(
+        stderr.contains("changes=1"),
+        "dry-run should report the post-overlay planned change count: {stderr}"
+    );
+    assert_dir_empty_or_absent(&live_home, "dry-run live home");
+    assert_dir_empty_or_absent(&state_home, "dry-run state home");
 }
 
 #[test]
