@@ -19,6 +19,18 @@
 //!   `force = true`; this keeps the first install opt-in explicit.
 //! - Unbalanced markers (one half present, the other missing) refuse with
 //!   a typed error naming the surface.
+//! - The `body` passed to `write` must not itself contain a line that
+//!   matches our open or close marker — that would write a file that
+//!   refuses to round-trip. The helper validates and refuses.
+//!
+//! Caller contract:
+//!
+//! - `surface` is a trusted identifier. The helper accepts ASCII
+//!   alphanumeric / `-` / `_` only and `debug_assert!`s the shape; release
+//!   builds trust the caller. Embedding newlines or marker tokens in the
+//!   surface name will produce well-formed but surprising markers.
+//! - Inputs are assumed to use LF (`\n`) line endings. CRLF files are out
+//!   of scope for Plan 04 and may silently no-op on `read`.
 //!
 //! Source: `agent-runtime-kit/docs/plans/04-installer-doctor-and-bootstrap/
 //! 04-installer-doctor-and-bootstrap-plan.md` Sprint 1 Task 1.1.
@@ -64,6 +76,17 @@ pub enum ManagedBlockError {
     /// More than one complete block for the same surface in one file.
     #[error("managed block for surface `{surface}` appears multiple times in one file")]
     Duplicate { surface: String },
+    /// The provided body contains a line that matches our own open or
+    /// close marker — writing it would corrupt the file so the next read
+    /// or write fails with `Unbalanced` or `Duplicate`. Refused at the
+    /// write boundary so the file on disk stays intact.
+    #[error(
+        "managed block body for surface `{surface}` contains its own marker line ({which}); refused"
+    )]
+    BodyContainsMarker {
+        surface: String,
+        which: &'static str,
+    },
 }
 
 /// Owns the marker syntax for one (surface, comment-style) pair.
@@ -75,10 +98,12 @@ pub struct ManagedBlock {
 
 impl ManagedBlock {
     pub fn new(surface: impl Into<String>, style: CommentStyle) -> Self {
-        Self {
-            surface: surface.into(),
-            style,
-        }
+        let surface = surface.into();
+        debug_assert!(
+            is_trusted_surface(&surface),
+            "surface name `{surface}` must be ASCII alphanumeric / `-` / `_` and non-empty",
+        );
+        Self { surface, style }
     }
 
     pub fn surface(&self) -> &str {
@@ -120,6 +145,20 @@ impl ManagedBlock {
     /// when `force` is true.
     pub fn write(&self, text: &str, body: &str, force: bool) -> Result<String, ManagedBlockError> {
         let body = canonicalize_body(body);
+        let open = self.open_marker();
+        let close = self.close_marker();
+        if !line_anchored_matches(&body, &open).is_empty() {
+            return Err(ManagedBlockError::BodyContainsMarker {
+                surface: self.surface.clone(),
+                which: "open",
+            });
+        }
+        if !line_anchored_matches(&body, &close).is_empty() {
+            return Err(ManagedBlockError::BodyContainsMarker {
+                surface: self.surface.clone(),
+                which: "close",
+            });
+        }
         match self.locate(text)? {
             None => {
                 if !force {
@@ -127,20 +166,9 @@ impl ManagedBlock {
                         surface: self.surface.clone(),
                     });
                 }
-                Ok(append_block(
-                    text,
-                    &self.open_marker(),
-                    &self.close_marker(),
-                    &body,
-                ))
+                Ok(append_block(text, &open, &close, &body))
             }
-            Some(span) => Ok(replace_block(
-                text,
-                &span,
-                &self.open_marker(),
-                &self.close_marker(),
-                &body,
-            )),
+            Some(span) => Ok(replace_block(text, &span, &open, &close, &body)),
         }
     }
 
@@ -250,6 +278,12 @@ fn line_anchored_matches(text: &str, needle: &str) -> Vec<usize> {
 fn canonicalize_body(body: &str) -> String {
     let trimmed = body.trim_end_matches('\n');
     trimmed.to_string()
+}
+
+fn is_trusted_surface(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn append_block(text: &str, open: &str, close: &str, body: &str) -> String {
@@ -440,6 +474,58 @@ mod tests {
         let b = json_block();
         let text = "{\n  \"note\": \"// >>> agent-runtime-kit:install >>> inline string\"\n}\n";
         assert_eq!(b.read(text).unwrap(), None);
+    }
+
+    #[test]
+    fn write_rejects_body_that_contains_open_marker_line_on_append() {
+        let b = toml_block();
+        let evil = "# >>> agent-runtime-kit:install >>>";
+        let err = b.write("[plain]\n", evil, true).unwrap_err();
+        match err {
+            ManagedBlockError::BodyContainsMarker { surface, which } => {
+                assert_eq!(surface, "install");
+                assert_eq!(which, "open");
+            }
+            other => panic!("expected BodyContainsMarker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_rejects_body_that_contains_close_marker_line_on_replace() {
+        let b = toml_block();
+        let base = "alpha\n# >>> agent-runtime-kit:install >>>\nold\n# <<< agent-runtime-kit:install <<<\nbeta\n";
+        let evil = "innocent = 1\n# <<< agent-runtime-kit:install <<<\nmore = 2";
+        let err = b.write(base, evil, false).unwrap_err();
+        match err {
+            ManagedBlockError::BodyContainsMarker { surface, which } => {
+                assert_eq!(surface, "install");
+                assert_eq!(which, "close");
+            }
+            other => panic!("expected BodyContainsMarker, got {other:?}"),
+        }
+        // File on disk is untouched after a refused write.
+        // (The caller controls disk; this assertion just confirms the
+        // helper returns without producing a corrupted string.)
+    }
+
+    #[test]
+    fn write_accepts_body_containing_marker_substring_off_column_zero() {
+        // Same fingerprint, but not at the start of a line — must pass.
+        let b = toml_block();
+        let body = "    # >>> agent-runtime-kit:install >>> nested";
+        let out = b.write("[plain]\n", body, true).unwrap();
+        assert_eq!(b.read(&out).unwrap().as_deref(), Some(body));
+    }
+
+    #[test]
+    fn is_trusted_surface_accepts_canonical_identifiers() {
+        assert!(is_trusted_surface("install"));
+        assert!(is_trusted_surface("link-map"));
+        assert!(is_trusted_surface("agent_runtime_v2"));
+        assert!(!is_trusted_surface(""));
+        assert!(!is_trusted_surface("install\nmore"));
+        assert!(!is_trusted_surface("install >>>"));
+        assert!(!is_trusted_surface("install:tag"));
     }
 
     #[test]

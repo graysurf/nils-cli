@@ -102,6 +102,29 @@ fn remove_strips_block_and_leaves_outside_bytes_intact() {
 }
 
 #[test]
+fn write_refuses_when_body_contains_close_marker_line() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.toml");
+    let initial = "alpha\n# >>> agent-runtime-kit:install >>>\nold = 1\n# <<< agent-runtime-kit:install <<<\nbeta\n";
+    fs::write(&path, initial).unwrap();
+
+    let block = ManagedBlock::new("install", CommentStyle::Hash);
+    let before = fs::read_to_string(&path).unwrap();
+    let body = "tag = 1\n# <<< agent-runtime-kit:install <<<\nmore = 2";
+    let err = block.write(&before, body, true).unwrap_err();
+    match err {
+        ManagedBlockError::BodyContainsMarker { surface, which } => {
+            assert_eq!(surface, "install");
+            assert_eq!(which, "close");
+        }
+        other => panic!("expected BodyContainsMarker, got {other:?}"),
+    }
+
+    // File on disk must be byte-for-byte unchanged after the refusal.
+    assert_eq!(fs::read_to_string(&path).unwrap(), initial);
+}
+
+#[test]
 fn unbalanced_markers_refuse_and_do_not_mutate_file() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.toml");
