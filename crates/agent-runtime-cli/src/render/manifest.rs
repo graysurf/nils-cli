@@ -25,7 +25,7 @@ pub enum ManifestError {
     Parse {
         file: PathBuf,
         #[source]
-        source: serde_yml::Error,
+        source: serde_yaml_ng::Error,
     },
     #[error("io error reading {file}: {source}")]
     Io {
@@ -124,7 +124,7 @@ where
         file: file.to_path_buf(),
         source,
     })?;
-    let parsed: T = serde_yml::from_str(&raw).map_err(|source| ManifestError::Parse {
+    let parsed: T = serde_yaml_ng::from_str(&raw).map_err(|source| ManifestError::Parse {
         file: file.to_path_buf(),
         source,
     })?;
@@ -355,7 +355,7 @@ pub struct RuntimeRootsManifest {
     pub schema_version: u32,
     pub products: RuntimeRootsProducts,
     #[serde(default)]
-    pub host_profiles: IndexMap<String, IndexMap<String, serde_yml::Value>>,
+    pub host_profiles: IndexMap<String, IndexMap<String, serde_yaml_ng::Value>>,
 }
 
 impl WithSchemaVersion for RuntimeRootsManifest {
@@ -635,7 +635,7 @@ skills:
     required_clis:
       agent-runtime: ">=0.13.0"
 "#;
-        let parsed: SkillsManifest = serde_yml::from_str(yaml).unwrap();
+        let parsed: SkillsManifest = serde_yaml_ng::from_str(yaml).unwrap();
         let skill = parsed.skills.first().unwrap();
         assert_eq!(skill.state_out_mode, StateOutMode::Runtime);
         assert!(!skill.divergent);
@@ -652,7 +652,7 @@ plugins:
     product_manifests: {}
     install_policy: opt-in
 "#;
-        let parsed: PluginsManifest = serde_yml::from_str(yaml).unwrap();
+        let parsed: PluginsManifest = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(
             parsed.plugins.first().unwrap().install_policy,
             InstallPolicy::OptIn,
@@ -688,7 +688,7 @@ skills:
     required_clis:
       agent-runtime: ">=0.13.0"
 "#;
-        let err = serde_yml::from_str::<SkillsManifest>(yaml).unwrap_err();
+        let err = serde_yaml_ng::from_str::<SkillsManifest>(yaml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("code"), "{msg}");
     }
@@ -707,7 +707,7 @@ skills:
     required_clis:
       agent-runtime: ">=0.13.0"
 "#;
-        let err = serde_yml::from_str::<SkillsManifest>(yaml).unwrap_err();
+        let err = serde_yaml_ng::from_str::<SkillsManifest>(yaml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("products"), "{msg}");
     }
@@ -723,7 +723,7 @@ plugins:
     product_manifests:
       cluade: "targets/claude/.claude-plugin/plugin.json"
 "#;
-        let err = serde_yml::from_str::<PluginsManifest>(yaml).unwrap_err();
+        let err = serde_yaml_ng::from_str::<PluginsManifest>(yaml).unwrap_err();
         assert!(format!("{err}").contains("cluade"));
     }
 }

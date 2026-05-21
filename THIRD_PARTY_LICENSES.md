@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `d8530c845b68f74d56d8aa1a048af5c022ca416f917506f2dfe491718e4150a8`
+- Cargo.lock SHA256: `fcda8ef2b5cd0ce9de0926874ed0532571d2e15f1be4e46002a36cd83b32acd5`
 - Third-party crates (`source != null`): 465
 - Workspace crates (`source == null`, excluded below): 32
 
@@ -17,8 +17,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 
 | License Expression | Crate Count |
 | --- | ---: |
-| MIT OR Apache-2.0 | 224 |
-| MIT | 86 |
+| MIT OR Apache-2.0 | 223 |
+| MIT | 87 |
 | Apache-2.0 OR MIT | 36 |
 | Zlib OR Apache-2.0 OR MIT | 19 |
 | Unicode-3.0 | 18 |
@@ -227,7 +227,6 @@ This file documents third-party Rust crate licenses used by this workspace.
 | libm | 0.2.16 | MIT | crates.io |
 | libredox | 0.1.16 | MIT | crates.io |
 | libsqlite3-sys | 0.37.0 | MIT | crates.io |
-| libyml | 0.0.5 | MIT | crates.io |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | litemap | 0.8.2 | Unicode-3.0 | crates.io |
 | log | 0.4.29 | MIT OR Apache-2.0 | crates.io |
@@ -353,7 +352,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | serde_repr | 0.1.20 | MIT OR Apache-2.0 | crates.io |
 | serde_spanned | 1.1.1 | MIT OR Apache-2.0 | crates.io |
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 | crates.io |
-| serde_yml | 0.0.12 | MIT OR Apache-2.0 | crates.io |
+| serde_yaml_ng | 0.10.0 | MIT | crates.io |
 | sha1 | 0.10.6 | MIT OR Apache-2.0 | crates.io |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 | crates.io |
 | sha2 | 0.11.0 | MIT OR Apache-2.0 | crates.io |
@@ -428,6 +427,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | unicode-width | 0.2.2 | MIT OR Apache-2.0 | crates.io |
 | unicode-xid | 0.2.6 | MIT OR Apache-2.0 | crates.io |
 | unit-prefix | 0.5.2 | MIT | crates.io |
+| unsafe-libyaml | 0.2.11 | MIT | crates.io |
 | untrusted | 0.9.0 | ISC | crates.io |
 | url | 2.5.8 | MIT OR Apache-2.0 | crates.io |
 | urlencoding | 2.1.3 | MIT | crates.io |
