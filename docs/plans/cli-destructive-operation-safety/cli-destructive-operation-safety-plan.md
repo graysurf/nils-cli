@@ -11,8 +11,7 @@ appears, not before.
 
 ## Read First
 
-- Primary source:
-  docs/plans/cli-destructive-operation-safety/cli-destructive-operation-safety-review-source.md
+- Primary source: docs/plans/cli-destructive-operation-safety/cli-destructive-operation-safety-review-source.md
 - Source type: review-to-improvement-doc
 - Open questions carried into execution:
   - For `memo-cli delete`: redefine `--hard` as a real mode (soft vs. hard) or remove? Default: redefine.

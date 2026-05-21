@@ -10,8 +10,7 @@
 - Next task: Task 1.1
 - Last updated: 2026-05-19
 - Branch/commit: not started
-- Source document:
-  docs/plans/cli-ux-progress-and-defaults/cli-ux-progress-and-defaults-plan.md
+- Source document: docs/plans/cli-ux-progress-and-defaults/cli-ux-progress-and-defaults-plan.md
 - Direct source-doc execution waiver: not applicable
 
 ## Task Ledger
