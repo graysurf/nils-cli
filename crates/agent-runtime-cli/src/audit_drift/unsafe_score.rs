@@ -40,7 +40,7 @@ pub fn check(root: &SourceRoot, report: &mut DriftReport) -> Result<()> {
         let build_dir = root.path().join("build").join(product);
         scan_tree(root, &build_dir, Some((*product).to_string()), report)?;
     }
-    for sub in ["core", "targets", "manifests"] {
+    for sub in ["core", "targets", "manifests", "tests/drift"] {
         let dir = root.path().join(sub);
         scan_tree(root, &dir, None, report)?;
     }

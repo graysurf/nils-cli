@@ -3,6 +3,8 @@
 // links one integration test binary instead of many. This keeps the
 // dev-loop link phase O(crates) instead of O(test-files).
 
+#[path = "integration/audit_drift_allowlist.rs"]
+mod audit_drift_allowlist;
 #[path = "integration/audit_drift_classes.rs"]
 mod audit_drift_classes;
 #[path = "integration/audit_drift_unsafe_score.rs"]
