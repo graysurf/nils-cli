@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 pub mod agent_home_leak;
 pub mod allowlist;
+pub mod classes;
 pub mod docs_home;
 pub mod rendered_target;
 pub mod source_manifest;
@@ -34,6 +35,8 @@ pub enum Severity {
     /// Drift that is only visible in verbose output and never affects
     /// the exit code.
     Suppressed,
+    /// Drift that should be reported but never affects the exit code.
+    Info,
     /// Drift that the reporting POC will surface but not block on.
     Warn,
     /// Drift that breaks an explicit Resolved Decision contract.
@@ -44,6 +47,7 @@ impl Severity {
     pub fn exit_code(self) -> u8 {
         match self {
             Severity::Suppressed => 0,
+            Severity::Info => 0,
             Severity::Warn => 1,
             Severity::Block => 2,
         }
@@ -52,6 +56,7 @@ impl Severity {
     pub fn label(self) -> &'static str {
         match self {
             Severity::Suppressed => "suppressed",
+            Severity::Info => "info",
             Severity::Warn => "warn",
             Severity::Block => "block",
         }
@@ -124,7 +129,9 @@ pub fn run(root: &SourceRoot) -> Result<DriftReport> {
         rendered_target::check(root, manifests.as_deref(), product, &mut report)?;
         agent_home_leak::check_product_build(root, product, &mut report)?;
         docs_home::check(root, product, &mut report)?;
+        classes::extra::check(root, manifests.as_deref(), product, &mut report)?;
     }
+    classes::intentional::check(root, manifests.as_deref(), &mut report)?;
     agent_home_leak::check_source_tree(root, &mut report)?;
     unsafe_score::check(root, &mut report)?;
     allowlist.apply(&mut report);
@@ -190,9 +197,11 @@ mod tests {
     #[test]
     fn severity_exit_codes_match_documented_policy() {
         assert_eq!(Severity::Suppressed.exit_code(), 0);
+        assert_eq!(Severity::Info.exit_code(), 0);
         assert_eq!(Severity::Warn.exit_code(), 1);
         assert_eq!(Severity::Block.exit_code(), 2);
         assert_eq!(Severity::Suppressed.label(), "suppressed");
+        assert_eq!(Severity::Info.label(), "info");
         assert_eq!(Severity::Warn.label(), "warn");
         assert_eq!(Severity::Block.label(), "block");
     }

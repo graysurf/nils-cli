@@ -154,6 +154,7 @@ fn demote(severity: Severity) -> Severity {
     match severity {
         Severity::Block => Severity::Warn,
         Severity::Warn => Severity::Suppressed,
+        Severity::Info => Severity::Info,
         Severity::Suppressed => Severity::Suppressed,
     }
 }
