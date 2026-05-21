@@ -22,6 +22,7 @@ use std::process::ExitCode;
 
 pub mod audit_drift;
 pub mod commands;
+pub mod gc_backups;
 pub mod install;
 pub mod managed_block;
 pub mod purge_state;
@@ -53,7 +54,7 @@ pub enum Command {
     /// Detect source-vs-rendered, rendered-vs-live, and unsafe drift.
     AuditDrift(commands::audit_drift::AuditDriftArgs),
     /// Prune old backups under `<state_home>/backups/`.
-    GcBackups,
+    GcBackups(commands::gc_backups::GcBackupsArgs),
     /// Restore a runtime home from a recorded backup snapshot.
     RestoreBackups(commands::restore_backups::RestoreBackupsArgs),
     /// Purge runtime-managed state (use with caution).
@@ -68,7 +69,7 @@ impl Command {
             Command::Uninstall(_) => "uninstall",
             Command::Doctor => "doctor",
             Command::AuditDrift(_) => "audit-drift",
-            Command::GcBackups => "gc-backups",
+            Command::GcBackups(_) => "gc-backups",
             Command::RestoreBackups(_) => "restore-backups",
             Command::PurgeState(_) => "purge-state",
         }
@@ -118,6 +119,13 @@ pub fn run() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(err) => {
                 eprintln!("agent-runtime purge-state: {err:#}");
+                ExitCode::from(2)
+            }
+        },
+        Command::GcBackups(args) => match commands::gc_backups::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime gc-backups: {err:#}");
                 ExitCode::from(2)
             }
         },
