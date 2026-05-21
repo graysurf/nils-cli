@@ -1,5 +1,7 @@
 # Plan: Code Review Specialist Primitives
 
+<!-- markdownlint-disable MD013 -->
+
 ## Overview
 
 Add a deterministic `review-specialists` CLI to
