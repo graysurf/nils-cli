@@ -1,0 +1,216 @@
+//! Integration coverage for Plan 04 Sprint 3 Task 3.1 doctor probes.
+
+use agent_runtime_cli::doctor::{self, DoctorOptions, DoctorSeverity};
+use agent_runtime_cli::install::{self, InstallOptions, Mode};
+use agent_runtime_cli::managed_block::{CommentStyle, ManagedBlock};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+use tempfile::TempDir;
+
+fn fixed_time() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
+fn build_source_root(tmp: &Path, product: &str, home: &Path, state_home: &Path) -> PathBuf {
+    let root = tmp.join("src");
+    fs::create_dir_all(root.join("manifests")).unwrap();
+
+    let skill = root
+        .join("build")
+        .join(product)
+        .join("plugins")
+        .join("reporting")
+        .join("skills")
+        .join("daily-brief")
+        .join("SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(&skill, "# daily-brief\n").unwrap();
+
+    let target_dir = root.join("targets").join(product);
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(
+        target_dir.join("link-map.yaml"),
+        format!(
+            "\
+schema_version: 1
+entries:
+  - id: reporting.daily-brief
+    kind: symlinked-file
+    source: build/{product}/plugins/reporting/skills/daily-brief/SKILL.md
+    destination: plugins/reporting/skills/daily-brief/SKILL.md
+  - id: {product}.hooks
+    kind: managed-block
+    destination: settings.json
+    surface: hooks
+    comment_style: double-slash
+    body_template: '\"hooks\": []'
+",
+        ),
+    )
+    .unwrap();
+
+    let runtime_roots = format!(
+        "\
+schema_version: 1
+products:
+  codex:
+    live_home: \"{home}\"
+    docs_home: \"{home}\"
+    state_home: \"{state_home}\"
+    plugin_root: \"{home}/plugins\"
+    hook_config_strategy: managed-block
+    min_version: \"0.0.0\"
+    recommended_version: \"0.0.0\"
+    min_version_effective_from: \"2099-01-01\"
+    version_probe: \"codex --version\"
+  claude:
+    live_home: \"{home}\"
+    docs_home: \"{home}\"
+    state_home: \"{state_home}\"
+    hook_config_strategy: settings-json
+    min_version: \"0.0.0\"
+    recommended_version: \"0.0.0\"
+    min_version_effective_from: \"2099-01-01\"
+    version_probe: \"claude --version\"
+",
+        home = home.display(),
+        state_home = state_home.display(),
+    );
+    fs::write(
+        root.join("manifests").join("runtime-roots.yaml"),
+        runtime_roots,
+    )
+    .unwrap();
+
+    fs::canonicalize(&root).unwrap()
+}
+
+fn install_clean(product: &str, source_root: &Path, home: &Path, state_home: &Path) {
+    install::run(
+        product,
+        source_root,
+        home,
+        state_home,
+        Mode::Apply,
+        fixed_time(),
+        &InstallOptions::default(),
+    )
+    .unwrap();
+}
+
+fn run_doctor(
+    product: &str,
+    source_root: &Path,
+    home: &Path,
+    state_home: &Path,
+) -> doctor::DoctorOutcome {
+    doctor::run(
+        product,
+        source_root,
+        Some(home),
+        Some(state_home),
+        &DoctorOptions::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn clean_install_produces_zero_findings_and_exit_zero() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state_home).unwrap();
+    let source_root = build_source_root(tmp.path(), "claude", &home, &state_home);
+
+    install_clean("claude", &source_root, &home, &state_home);
+
+    let outcome = run_doctor("claude", &source_root, &home, &state_home);
+    assert_eq!(outcome.exit_code(), 0);
+    assert_eq!(outcome.findings, Vec::new());
+    assert!(outcome.ok > 0, "doctor should count successful probes");
+}
+
+#[test]
+fn broken_tracked_symlink_blocks_and_exits_two() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state_home).unwrap();
+    let source_root = build_source_root(tmp.path(), "claude", &home, &state_home);
+
+    install_clean("claude", &source_root, &home, &state_home);
+    fs::remove_file(
+        home.join("plugins")
+            .join("reporting")
+            .join("skills")
+            .join("daily-brief")
+            .join("SKILL.md"),
+    )
+    .unwrap();
+
+    let outcome = run_doctor("claude", &source_root, &home, &state_home);
+    assert_eq!(outcome.exit_code(), 2);
+    assert!(
+        outcome.findings.iter().any(|finding| {
+            finding.severity == DoctorSeverity::Block
+                && finding.check == "link-map.symlink"
+                && finding.entry_id.as_deref() == Some("reporting.daily-brief")
+        }),
+        "expected broken symlink block finding: {:#?}",
+        outcome.findings
+    );
+}
+
+#[test]
+fn unbalanced_managed_block_marker_blocks_and_exits_two() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state_home).unwrap();
+    let source_root = build_source_root(tmp.path(), "claude", &home, &state_home);
+
+    install_clean("claude", &source_root, &home, &state_home);
+    let config = home.join("settings.json");
+    let block = ManagedBlock::new("hooks", CommentStyle::DoubleSlash);
+    let edited = fs::read_to_string(&config)
+        .unwrap()
+        .replace(&(block.close_marker() + "\n"), "");
+    fs::write(&config, edited).unwrap();
+
+    let outcome = run_doctor("claude", &source_root, &home, &state_home);
+    assert_eq!(outcome.exit_code(), 2);
+    assert!(
+        outcome.findings.iter().any(|finding| {
+            finding.severity == DoctorSeverity::Block
+                && finding.check == "managed-block"
+                && finding.message.contains("unbalanced")
+        }),
+        "expected unbalanced managed-block finding: {:#?}",
+        outcome.findings
+    );
+}
+
+#[test]
+fn missing_state_home_warns_and_exits_one() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    let source_root = build_source_root(tmp.path(), "claude", &home, &state_home);
+
+    install_clean("claude", &source_root, &home, &state_home);
+
+    let outcome = run_doctor("claude", &source_root, &home, &state_home);
+    assert_eq!(outcome.exit_code(), 1);
+    assert!(
+        outcome.findings.iter().any(|finding| {
+            finding.severity == DoctorSeverity::Warn && finding.check == "runtime-root.state_home"
+        }),
+        "expected missing state_home warning: {:#?}",
+        outcome.findings
+    );
+}
