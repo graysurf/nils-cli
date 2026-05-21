@@ -16,6 +16,8 @@ completion, release, and new-crate rules in the root `docs/` tree.
   HEURISTIC_SYSTEM records, and explicit JSONL inputs.
 - `skill-usage`: skill invocation, linked evidence, validation, outcome, and
   failure handling records.
+- `test-first-evidence`: failing-test, waiver, and final-validation evidence
+  records.
 
 ## `repo-retro` examples
 

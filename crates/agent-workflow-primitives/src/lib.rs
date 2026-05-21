@@ -7,6 +7,7 @@ pub mod repo_retro;
 pub mod review_evidence;
 pub mod review_specialists;
 pub mod skill_usage;
+pub mod test_first_evidence;
 
 mod common;
 mod completion;
