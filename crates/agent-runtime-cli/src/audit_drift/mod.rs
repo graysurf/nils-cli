@@ -12,15 +12,15 @@
 //! - `2` — any `block`-tier finding (`$AGENT_HOME` leak, docs-home
 //!   per product).
 //!
-//! Plan 04 will expand the matrix (unsafe scoring, `extra`,
-//! `intentional-difference`, root-map). This module intentionally
-//! stops at the four classes Phase 2 needs.
+//! Plan 04 expands the matrix with unsafe scoring, unsafe allowlist
+//! demotion, `extra`, `intentional-difference`, and root-map checks.
 
 use crate::render::manifest::SourceRoot;
 use anyhow::Result;
 use std::path::PathBuf;
 
 pub mod agent_home_leak;
+pub mod allowlist;
 pub mod docs_home;
 pub mod rendered_target;
 pub mod source_manifest;
@@ -116,6 +116,7 @@ impl DriftReport {
 /// `$AGENT_HOME` substring) records it in the report and continues.
 pub fn run(root: &SourceRoot) -> Result<DriftReport> {
     let mut report = DriftReport::default();
+    let allowlist = allowlist::load(root)?;
 
     let manifests = source_manifest::check(root, &mut report)?;
 
@@ -126,6 +127,7 @@ pub fn run(root: &SourceRoot) -> Result<DriftReport> {
     }
     agent_home_leak::check_source_tree(root, &mut report)?;
     unsafe_score::check(root, &mut report)?;
+    allowlist.apply(&mut report);
 
     report.sort();
     Ok(report)
