@@ -19,6 +19,7 @@ const BINARIES: &[&str] = &[
     "model-cross-check",
     "repo-retro",
     "review-evidence",
+    "review-specialists",
     "skill-usage",
 ];
 

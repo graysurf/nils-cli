@@ -1,0 +1,160 @@
+#compdef review-specialists
+
+autoload -U is-at-least
+
+_review-specialists() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_review-specialists_commands" \
+"*::: :->review-specialists" \
+&& ret=0
+    case $state in
+    (review-specialists)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:review-specialists-command-$line[1]:"
+        case $line[1] in
+            (validate)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'*--input=[Specialist finding JSONL input file]:FILE:_files' \
+'--repo=[Repository root for optional path or line validation]:DIR:_files -/' \
+'--validate-paths[Check that finding paths exist under --repo]' \
+'--validate-lines[Check that finding lines are within file bounds under --repo]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(merge)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'*--input=[Specialist finding JSONL input file]:FILE:_files' \
+'--display-threshold=[Minimum confidence for displayed findings]:DISPLAY_THRESHOLD:_default' \
+'--summary-out=[Optional Markdown report path to write]:FILE:_files' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(render)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--profile=[Render profile]:PROFILE:(terminal report issue-body pr-comment evidence)' \
+'--input=[Merged findings JSON from \`review-specialists merge --format json\`]:FILE:_files' \
+'--out=[Output path. If omitted, text profiles print the rendered body]:FILE:_files' \
+'--repo=[Repository slug for GitHub source links, e.g. owner/repo]:REPO:_default' \
+'--ref=[Ref for source links]:GIT_REF:_default' \
+'--link-base=[Custom link base. Defaults to https\://github.com/<repo>/blob when --repo is provided]:LINK_BASE:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(bundle)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'*--input=[Specialist finding JSONL input file]:FILE:_files' \
+'--out-dir=[Bundle output directory]:DIR:_files -/' \
+'--display-threshold=[Minimum confidence for displayed findings]:DISPLAY_THRESHOLD:_default' \
+'--profile=[Optional additional render profile to write]:PROFILE:(terminal report issue-body pr-comment evidence)' \
+'--repo=[Repository slug for GitHub source links, e.g. owner/repo]:REPO:_default' \
+'--ref=[Ref for source links]:GIT_REF:_default' \
+'--link-base=[Custom link base. Defaults to https\://github.com/<repo>/blob when --repo is provided]:LINK_BASE:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(scope)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--repo=[Git worktree to inspect]:DIR:_files -/' \
+'--base=[Base ref for git diff]:BASE:_default' \
+'--testing[Force testing specialist]' \
+'--security[Force security specialist]' \
+'--performance[Force performance specialist]' \
+'--data-migration[Force data-migration specialist]' \
+'--api-contract[Force api-contract specialist]' \
+'--maintainability[Force maintainability specialist]' \
+'--red-team[Force red-team specialist]' \
+'--all-specialists[Force all initial specialists]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_review-specialists_commands] )) ||
+_review-specialists_commands() {
+    local commands; commands=(
+'validate:Validate and normalize specialist finding JSONL' \
+'merge:Merge normalized specialist findings by stable fingerprint' \
+'render:Render merged findings for terminal, reports, provider bodies, or evidence' \
+'bundle:Write a stable specialist review artifact bundle' \
+'scope:Classify a Git diff for specialist review routing' \
+'completion:Print shell completion script' \
+    )
+    _describe -t commands 'review-specialists commands' commands "$@"
+}
+(( $+functions[_review-specialists__subcmd__bundle_commands] )) ||
+_review-specialists__subcmd__bundle_commands() {
+    local commands; commands=()
+    _describe -t commands 'review-specialists bundle commands' commands "$@"
+}
+(( $+functions[_review-specialists__subcmd__completion_commands] )) ||
+_review-specialists__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'review-specialists completion commands' commands "$@"
+}
+(( $+functions[_review-specialists__subcmd__merge_commands] )) ||
+_review-specialists__subcmd__merge_commands() {
+    local commands; commands=()
+    _describe -t commands 'review-specialists merge commands' commands "$@"
+}
+(( $+functions[_review-specialists__subcmd__render_commands] )) ||
+_review-specialists__subcmd__render_commands() {
+    local commands; commands=()
+    _describe -t commands 'review-specialists render commands' commands "$@"
+}
+(( $+functions[_review-specialists__subcmd__scope_commands] )) ||
+_review-specialists__subcmd__scope_commands() {
+    local commands; commands=()
+    _describe -t commands 'review-specialists scope commands' commands "$@"
+}
+(( $+functions[_review-specialists__subcmd__validate_commands] )) ||
+_review-specialists__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'review-specialists validate commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_review-specialists" ]; then
+    _review-specialists "$@"
+else
+    compdef _review-specialists review-specialists
+fi

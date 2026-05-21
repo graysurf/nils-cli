@@ -8,6 +8,8 @@ completion, release, and new-crate rules in the root `docs/` tree.
 - `docs-impact`: Git change classification for docs impact review.
 - `canary-check`: redacted local canary command records.
 - `review-evidence`: review finding and validation evidence records.
+- `review-specialists`: deterministic specialist finding validation, merge,
+  render, bundle, and Git diff scope classification.
 - `browser-session`: browser-session goal, step, and artifact records.
 - `model-cross-check`: cross-model observation records without provider calls.
 - `repo-retro`: repo-local implementation retrospectives from local Git,
@@ -30,7 +32,7 @@ repo-retro report --repo . --from 2026-05-11 --to 2026-05-17 \
 
 ## Runbooks
 
-- None yet. Add documents under `docs/runbooks/` and register them here.
+- Workspace runbook: `docs/runbooks/review-specialists-primitive.md`.
 
 ## Reports
 

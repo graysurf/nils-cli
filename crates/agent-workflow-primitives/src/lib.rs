@@ -5,6 +5,7 @@ pub mod heuristic_inbox;
 pub mod model_cross_check;
 pub mod repo_retro;
 pub mod review_evidence;
+pub mod review_specialists;
 pub mod skill_usage;
 
 mod common;

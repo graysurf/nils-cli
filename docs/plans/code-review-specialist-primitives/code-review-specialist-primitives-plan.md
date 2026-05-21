@@ -67,8 +67,14 @@ rendering or bundle output depends on it.
 
 - Commands:
   - `cargo run -p nils-agent-workflow-primitives --bin review-specialists -- --help`
-  - `cargo run -p nils-agent-workflow-primitives --bin review-specialists -- validate --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.valid.jsonl --format json`
   - `cargo test -p nils-agent-workflow-primitives review_specialists_validate`
+
+```bash
+cargo run -p nils-agent-workflow-primitives --bin review-specialists -- validate \
+  --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.valid.jsonl \
+  --format json
+```
+
 - Verify: valid JSONL normalizes to canonical severity/confidence fields, and
   malformed rows fail with line-numbered data errors.
 
@@ -148,7 +154,12 @@ rendering or bundle output depends on it.
     path validation.
 - **Validation**:
   - `cargo test -p nils-agent-workflow-primitives review_specialists_validate`
-  - `cargo run -p nils-agent-workflow-primitives --bin review-specialists -- validate --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.valid.jsonl --format json`
+
+```bash
+cargo run -p nils-agent-workflow-primitives --bin review-specialists -- validate \
+  --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.valid.jsonl \
+  --format json
+```
 
 ## Sprint 2: Merge, fingerprints, and bundles
 
@@ -158,9 +169,18 @@ that can be reused by skills, issue bodies, and retained evidence.
 **Demo/Validation**:
 
 - Commands:
-  - `cargo run -p nils-agent-workflow-primitives --bin review-specialists -- merge --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.duplicates.jsonl --summary-out target/review-specialists/review.md --format json`
-  - `cargo run -p nils-agent-workflow-primitives --bin review-specialists -- bundle --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.valid.jsonl --out-dir target/review-specialists/bundle`
   - `cargo test -p nils-agent-workflow-primitives review_specialists_merge`
+
+```bash
+cargo run -p nils-agent-workflow-primitives --bin review-specialists -- merge \
+  --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.duplicates.jsonl \
+  --summary-out target/review-specialists/review.md \
+  --format json
+cargo run -p nils-agent-workflow-primitives --bin review-specialists -- bundle \
+  --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.valid.jsonl \
+  --out-dir target/review-specialists/bundle
+```
+
 - Verify: duplicate findings collapse deterministically, low-confidence findings
   move to an appendix, and bundle file names are stable.
 
@@ -210,7 +230,12 @@ that can be reused by skills, issue bodies, and retained evidence.
   - Text output is concise enough to paste into a chat response.
 - **Validation**:
   - `cargo test -p nils-agent-workflow-primitives review_specialists_merge`
-  - `cargo run -p nils-agent-workflow-primitives --bin review-specialists -- merge --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.duplicates.jsonl --summary-out target/review-specialists/review.md`
+
+```bash
+cargo run -p nils-agent-workflow-primitives --bin review-specialists -- merge \
+  --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.duplicates.jsonl \
+  --summary-out target/review-specialists/review.md
+```
 
 ### Task 2.3: Implement `bundle`
 
@@ -233,7 +258,12 @@ that can be reused by skills, issue bodies, and retained evidence.
   - Invalid findings fail without creating a partial bundle.
 - **Validation**:
   - `cargo test -p nils-agent-workflow-primitives review_specialists_bundle`
-  - `cargo run -p nils-agent-workflow-primitives --bin review-specialists -- bundle --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.valid.jsonl --out-dir target/review-specialists/bundle`
+
+```bash
+cargo run -p nils-agent-workflow-primitives --bin review-specialists -- bundle \
+  --input crates/agent-workflow-primitives/tests/fixtures/review-specialists/findings.valid.jsonl \
+  --out-dir target/review-specialists/bundle
+```
 
 ## Sprint 3: Render profiles and link formatting
 
@@ -244,9 +274,20 @@ mutation.
 **Demo/Validation**:
 
 - Commands:
-  - `cargo run -p nils-agent-workflow-primitives --bin review-specialists -- render --profile terminal --input target/review-specialists/bundle/findings.merged.json`
-  - `cargo run -p nils-agent-workflow-primitives --bin review-specialists -- render --profile issue-body --input target/review-specialists/bundle/findings.merged.json --repo sympoies/nils-cli --ref HEAD --out target/review-specialists/issue.md`
   - `cargo test -p nils-agent-workflow-primitives review_specialists_render`
+
+```bash
+cargo run -p nils-agent-workflow-primitives --bin review-specialists -- render \
+  --profile terminal \
+  --input target/review-specialists/bundle/findings.merged.json
+cargo run -p nils-agent-workflow-primitives --bin review-specialists -- render \
+  --profile issue-body \
+  --input target/review-specialists/bundle/findings.merged.json \
+  --repo sympoies/nils-cli \
+  --ref HEAD \
+  --out target/review-specialists/issue.md
+```
+
 - Verify: each profile clearly states that review output is not a merge or
   close decision.
 

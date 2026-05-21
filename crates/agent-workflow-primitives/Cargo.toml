@@ -36,6 +36,10 @@ name = "review-evidence"
 path = "src/bin/review-evidence.rs"
 
 [[bin]]
+name = "review-specialists"
+path = "src/bin/review-specialists.rs"
+
+[[bin]]
 name = "repo-retro"
 path = "src/bin/repo-retro.rs"
 
