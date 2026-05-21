@@ -25,6 +25,7 @@ pub mod commands;
 pub mod install;
 pub mod managed_block;
 pub mod render;
+pub mod uninstall;
 
 #[derive(Parser)]
 #[command(
@@ -44,7 +45,7 @@ pub enum Command {
     /// Activate rendered output against a product's runtime home.
     Install(commands::install::InstallArgs),
     /// Remove installed renderer output from a product's runtime home.
-    Uninstall,
+    Uninstall(commands::uninstall::UninstallArgs),
     /// Diagnose host setup, runtime roots, and required CLI floors.
     Doctor,
     /// Detect source-vs-rendered, rendered-vs-live, and unsafe drift.
@@ -62,7 +63,7 @@ impl Command {
         match self {
             Command::Render(_) => "render",
             Command::Install(_) => "install",
-            Command::Uninstall => "uninstall",
+            Command::Uninstall(_) => "uninstall",
             Command::Doctor => "doctor",
             Command::AuditDrift(_) => "audit-drift",
             Command::GcBackups => "gc-backups",
@@ -94,6 +95,13 @@ pub fn run() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(err) => {
                 eprintln!("agent-runtime install: {err:#}");
+                ExitCode::from(2)
+            }
+        },
+        Command::Uninstall(args) => match commands::uninstall::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime uninstall: {err:#}");
                 ExitCode::from(2)
             }
         },
