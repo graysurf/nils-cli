@@ -13,7 +13,12 @@ use std::fs;
 use std::path::Path;
 
 pub const CACHE_FILE: &str = ".render-cache.json";
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 alongside the multi-file render landing (v0.14): cache
+/// entries now record every file the skill wrote (`outputs: Vec<String>`)
+/// so the renderer can surgically remove sibling files that disappear
+/// from source on a subsequent run. Caches written by older binaries
+/// silently load as empty and force a full re-render.
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RenderCache {
@@ -57,7 +62,14 @@ impl RenderCache {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
     pub hash: String,
-    pub output: String,
+    /// Every file path (relative to `build/<product>/`) that this skill
+    /// wrote during the recorded render. Sorted lexicographically for
+    /// byte-stable serialization; the SKILL leaf appears in the list
+    /// alongside every sibling (`bin/...`, `scripts/...`,
+    /// `references/...`). The renderer uses this set to remove stale
+    /// files on cache miss without disturbing files owned by sibling
+    /// skills that share the same `dirname(render_to)`.
+    pub outputs: Vec<String>,
 }
 
 #[cfg(test)]
@@ -74,7 +86,7 @@ mod tests {
             "market.favorites".to_string(),
             CacheEntry {
                 hash: "sha256:deadbeef".to_string(),
-                output: "skills/sample/SKILL.md".to_string(),
+                outputs: vec!["skills/sample/SKILL.md".to_string()],
             },
         );
         cache.save(&path).unwrap();
@@ -109,7 +121,7 @@ mod tests {
         let path = tmp.path().join(".render-cache.json");
         fs::write(
             &path,
-            r#"{"schema_version": 99, "skills": {"old.skill": {"hash": "sha256:0", "output": "x"}}}"#,
+            r#"{"schema_version": 99, "skills": {"old.skill": {"hash": "sha256:0", "outputs": ["x"]}}}"#,
         )
         .unwrap();
         let loaded = RenderCache::load_or_empty(&path);
@@ -126,14 +138,14 @@ mod tests {
             "zeta.last".to_string(),
             CacheEntry {
                 hash: "sha256:1".to_string(),
-                output: "z".to_string(),
+                outputs: vec!["z".to_string()],
             },
         );
         cache.skills.insert(
             "alpha.first".to_string(),
             CacheEntry {
                 hash: "sha256:2".to_string(),
-                output: "a".to_string(),
+                outputs: vec!["a".to_string()],
             },
         );
         cache.save(&path).unwrap();
