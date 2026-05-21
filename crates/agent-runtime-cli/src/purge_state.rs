@@ -118,7 +118,7 @@ pub fn run(
         Confirm::Prompt { reader, writer } => {
             write!(
                 writer,
-                "agent-runtime purge-state: about to clear scope={} under {} — proceed? [y/N] ",
+                "agent-runtime purge-state: about to clear scope={} under {} — type `y` or `yes` to confirm (anything else cancels): ",
                 scope.as_str(),
                 state_home.display(),
             )

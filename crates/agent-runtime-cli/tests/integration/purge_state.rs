@@ -92,6 +92,12 @@ fn scope_out_yes_removes_only_out_subtree_and_emits_audit_line() {
         stderr.contains("--yes") && stderr.contains("scope=out"),
         "audit line missing or malformed: {stderr}"
     );
+    // Audit must go to stderr only — regression-pin for stdout/stderr discipline.
+    assert!(
+        !out.stdout_text().contains("--yes"),
+        "audit line must not leak to stdout: {}",
+        out.stdout_text()
+    );
 
     // out/ exists and is empty.
     assert!(state_path.join("out").is_dir());
