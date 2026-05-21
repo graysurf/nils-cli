@@ -25,9 +25,9 @@ pub mod plan;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-pub use executor::{AppliedChange, ApplyError, Mode};
+pub use executor::{AppliedChange, ApplyError, Mode, is_trusted_tag};
 pub use link_map::{LinkMap, LinkMapError};
-pub use overlay::{LinkMapOverlay, OVERLAY_REL_PATH};
+pub use overlay::{LinkMapOverlay, OVERLAY_REL_PATH, OverlaySummary};
 pub use plan::{InstallPlan, PlanError};
 
 /// Top-level error returned by [`run`]. Each variant wraps the typed
@@ -78,6 +78,20 @@ impl Default for InstallOptions {
     }
 }
 
+/// Full outcome of an `install::run` cycle. The CLI consumes the
+/// `overlay` field to print a one-line operator-visible notice when an
+/// overlay was merged (architecture-doc requirement: dry-run must expose
+/// the post-merge effective config).
+#[derive(Debug)]
+pub struct InstallOutcome {
+    pub plan: InstallPlan,
+    pub changes: Vec<AppliedChange>,
+    /// `None` when overlay merge was disabled or the overlay file was
+    /// absent; `Some(summary)` when an overlay was consumed (even if it
+    /// changed zero entries — the operator still wants to know it ran).
+    pub overlay: Option<OverlaySummary>,
+}
+
 /// Execute one install cycle. Builds the plan from the link-map at
 /// `<source_root>/targets/<product>/link-map.yaml`, then either prints
 /// it ([`Mode::DryRun`]) or applies it ([`Mode::Apply`]). `home` and
@@ -91,18 +105,24 @@ pub fn run(
     mode: Mode,
     now: SystemTime,
     options: &InstallOptions,
-) -> Result<(InstallPlan, Vec<AppliedChange>), InstallError> {
+) -> Result<InstallOutcome, InstallError> {
     let mut link_map = LinkMap::load(source_root, product)?;
+    let mut overlay_summary: Option<OverlaySummary> = None;
     if options.overlay_enabled {
         let overlay_opt = match options.overlay_path.as_deref() {
             Some(path) => LinkMapOverlay::load_from(path)?,
             None => LinkMapOverlay::load_optional(source_root)?,
         };
         if let Some(overlay) = overlay_opt {
-            overlay::apply(&mut link_map, &overlay)?;
+            let summary = overlay::apply(&mut link_map, &overlay)?;
+            overlay_summary = Some(summary);
         }
     }
     let plan = InstallPlan::build(product, source_root, home, state_home, &link_map)?;
     let changes = executor::run(&plan, mode, now, options.tag.as_deref())?;
-    Ok((plan, changes))
+    Ok(InstallOutcome {
+        plan,
+        changes,
+        overlay: overlay_summary,
+    })
 }

@@ -168,7 +168,7 @@ fn tag_writes_marker_into_backup_run_root_when_backup_happens() {
         tag: Some("pre-bump".to_string()),
         ..InstallOptions::default()
     };
-    let (_, _) = install::run(
+    let __outcome = install::run(
         "claude",
         &source_root,
         &home,
@@ -293,7 +293,7 @@ entries:
     let home = tmp.path().join("home");
     let state_home = tmp.path().join("state");
 
-    let (plan, _) = install::run(
+    let __outcome = install::run(
         "claude",
         &source_root,
         &home,
@@ -303,6 +303,7 @@ entries:
         &InstallOptions::default(),
     )
     .unwrap();
+    let plan = __outcome.plan;
 
     // Only the plugin-manifest entry survives — skills-tree was dropped.
     assert_eq!(
@@ -332,7 +333,7 @@ entries:
     let home = tmp.path().join("home");
     let state_home = tmp.path().join("state");
 
-    let (plan, _) = install::run(
+    let __outcome = install::run(
         "claude",
         &source_root,
         &home,
@@ -342,6 +343,7 @@ entries:
         &InstallOptions::default(),
     )
     .unwrap();
+    let plan = __outcome.plan;
 
     let dests: Vec<String> = plan
         .actions
@@ -381,7 +383,7 @@ entries:
         overlay_enabled: false,
         ..InstallOptions::default()
     };
-    let (plan, _) = install::run(
+    let __outcome = install::run(
         "claude",
         &source_root,
         &home,
@@ -391,6 +393,7 @@ entries:
         &options,
     )
     .unwrap();
+    let plan = __outcome.plan;
 
     // skills-tree drop is ignored → both initial entries flow through, so
     // the plan has >1 actions (manifest + every file under skills-tree).
@@ -426,7 +429,7 @@ entries:
         overlay_path: Some(custom.clone()),
         ..InstallOptions::default()
     };
-    let (plan, _) = install::run(
+    let __outcome = install::run(
         "claude",
         &source_root,
         &home,
@@ -436,11 +439,94 @@ entries:
         &options,
     )
     .unwrap();
+    let plan = __outcome.plan;
     assert_eq!(
         plan.actions.len(),
         1,
         "custom overlay path should have dropped skills-tree: {:?}",
         plan.actions
+    );
+}
+
+#[test]
+fn overlay_consumption_is_announced_on_stderr() {
+    // Architecture-doc requirement: `agent-runtime install --dry-run` must
+    // expose the post-overlay-merge effective config to reviewers. Pin the
+    // one-line summary naming dropped/replaced/added counts whenever an
+    // overlay is consumed.
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_source_root(tmp.path(), "claude");
+    write_overlay(
+        &source_root,
+        "\
+schema_version: 1
+entries:
+  - id: reporting.skills-tree
+    enabled: false
+",
+    );
+    let live_home = tmp.path().join("sandbox");
+    let state_home = tmp.path().join("state");
+    fs::create_dir_all(&live_home).unwrap();
+
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let live_arg = live_home.to_string_lossy().into_owned();
+    let state_arg = state_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "install",
+        "--source-root",
+        &source_arg,
+        "--product",
+        "claude",
+        "--live-home",
+        &live_arg,
+        "--state-home",
+        &state_arg,
+        "--dry-run",
+    ]);
+    assert_eq!(output.code, 0, "install dry-run should exit 0");
+    let stderr = output.stderr_text();
+    assert!(
+        stderr.contains("overlay merged"),
+        "stderr should announce overlay consumption: {stderr}"
+    );
+    assert!(
+        stderr.contains("dropped=1"),
+        "stderr should name the drop count: {stderr}"
+    );
+}
+
+#[test]
+fn overlay_stays_silent_when_no_overlay_file_present() {
+    // Mirror of the above — when no overlay is loaded, the CLI must NOT
+    // print the overlay-merged line; otherwise the operator cannot tell
+    // at a glance whether an overlay was in play.
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_source_root(tmp.path(), "claude");
+    let live_home = tmp.path().join("sandbox");
+    let state_home = tmp.path().join("state");
+    fs::create_dir_all(&live_home).unwrap();
+
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let live_arg = live_home.to_string_lossy().into_owned();
+    let state_arg = state_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "install",
+        "--source-root",
+        &source_arg,
+        "--product",
+        "claude",
+        "--live-home",
+        &live_arg,
+        "--state-home",
+        &state_arg,
+        "--dry-run",
+    ]);
+    assert_eq!(output.code, 0);
+    let stderr = output.stderr_text();
+    assert!(
+        !stderr.contains("overlay merged"),
+        "stderr must NOT announce overlay merge when no overlay file is present: {stderr}"
     );
 }
 

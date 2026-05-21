@@ -35,6 +35,22 @@ pub enum ApplyError {
         #[source]
         source: crate::managed_block::ManagedBlockError,
     },
+    #[error(
+        "tag `{value}` is not a trusted tag name (allowed: ASCII alphanumeric / `-` / `_`, non-empty)"
+    )]
+    InvalidTag { value: String },
+}
+
+/// Tag-name trust contract: non-empty ASCII alphanumeric / `-` / `_`.
+/// Mirrors `crate::managed_block::is_trusted_surface` because both produce
+/// filesystem-visible names from user-controlled identifiers. Validated at
+/// the executor entry as defense in depth — the CLI also rejects bad tags,
+/// but library callers using `InstallOptions { tag, .. }` directly hit the
+/// same gate.
+pub fn is_trusted_tag(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Single applied change. The dry-run printer also emits a list of these
@@ -87,6 +103,13 @@ pub fn run(
     now: SystemTime,
     tag: Option<&str>,
 ) -> Result<Vec<AppliedChange>, ApplyError> {
+    if let Some(name) = tag
+        && !is_trusted_tag(name)
+    {
+        return Err(ApplyError::InvalidTag {
+            value: name.to_string(),
+        });
+    }
     let backup_root = backup_root_for(plan, now);
     let mut changes = Vec::with_capacity(plan.actions.len());
     for action in &plan.actions {
@@ -384,4 +407,55 @@ fn handle_managed_block(
         entry_id: entry_id.to_string(),
         config_file: config_file.to_path_buf(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::install::plan::InstallPlan;
+    use tempfile::TempDir;
+
+    #[test]
+    fn trusted_tag_accepts_alnum_dash_underscore() {
+        assert!(is_trusted_tag("pre-bump"));
+        assert!(is_trusted_tag("rc_1"));
+        assert!(is_trusted_tag("0-2-0"));
+        assert!(is_trusted_tag("A1B2C3"));
+    }
+
+    #[test]
+    fn trusted_tag_rejects_empty_or_unsafe() {
+        assert!(!is_trusted_tag(""));
+        assert!(!is_trusted_tag("../escape"));
+        assert!(!is_trusted_tag("with space"));
+        assert!(!is_trusted_tag("dot.in.name"));
+        assert!(!is_trusted_tag("slash/in/name"));
+        assert!(!is_trusted_tag("null\0byte"));
+    }
+
+    #[test]
+    fn run_rejects_untrusted_tag_before_walking_actions() {
+        // Pins the defense-in-depth gate so a library caller that bypasses
+        // the CLI cannot compose `InstallOptions { tag: "../escape", .. }`
+        // that sneaks past the friendly anyhow message in commands::install.
+        let tmp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            product: "claude".to_string(),
+            source_root: tmp.path().to_path_buf(),
+            home: tmp.path().join("home"),
+            state_home: tmp.path().join("state"),
+            actions: Vec::new(),
+        };
+        let err = run(
+            &plan,
+            Mode::Apply,
+            SystemTime::UNIX_EPOCH,
+            Some("../escape"),
+        )
+        .unwrap_err();
+        match err {
+            ApplyError::InvalidTag { value } => assert_eq!(value, "../escape"),
+            other => panic!("expected InvalidTag, got {other:?}"),
+        }
+    }
 }

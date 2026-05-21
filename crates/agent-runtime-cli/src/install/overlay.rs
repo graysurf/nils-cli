@@ -108,16 +108,38 @@ impl LinkMapOverlay {
     }
 }
 
+/// Per-run accounting of the overlay merge. The install pipeline echoes
+/// this in dry-run / apply output so reviewers see at a glance that an
+/// overlay is in play (the architecture doc requires dry-run to expose
+/// the post-merge effective config).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverlaySummary {
+    pub dropped: usize,
+    pub replaced: usize,
+    pub added: usize,
+}
+
+impl OverlaySummary {
+    pub fn total(&self) -> usize {
+        self.dropped + self.replaced + self.added
+    }
+}
+
 /// Apply `overlay` to `base` per the per-entry-replace rule. Drops, replaces,
 /// and additions all happen in-place against `base.entries` so the caller's
 /// downstream plan builder consumes the merged result without knowing the
 /// overlay existed.
-pub fn apply(base: &mut LinkMap, overlay: &LinkMapOverlay) -> Result<(), LinkMapError> {
+pub fn apply(base: &mut LinkMap, overlay: &LinkMapOverlay) -> Result<OverlaySummary, LinkMapError> {
+    let mut summary = OverlaySummary::default();
     for ov in &overlay.entries {
         if !ov.enabled {
             // Drop matching tracked entry. Silently no-op when missing: the
             // overlay author may have already removed the entry upstream.
+            let before = base.entries.len();
             base.entries.retain(|e| e.id != ov.id);
+            if base.entries.len() < before {
+                summary.dropped += 1;
+            }
             continue;
         }
         let merged = build_full_entry(ov)?;
@@ -129,11 +151,17 @@ pub fn apply(base: &mut LinkMap, overlay: &LinkMapOverlay) -> Result<(), LinkMap
                 reason,
             })?;
         match base.entries.iter().position(|e| e.id == ov.id) {
-            Some(idx) => base.entries[idx] = merged,
-            None => base.entries.push(merged),
+            Some(idx) => {
+                base.entries[idx] = merged;
+                summary.replaced += 1;
+            }
+            None => {
+                base.entries.push(merged);
+                summary.added += 1;
+            }
         }
     }
-    Ok(())
+    Ok(summary)
 }
 
 fn build_full_entry(ov: &OverlayEntry) -> Result<LinkEntry, LinkMapError> {
@@ -284,9 +312,44 @@ entries:
                 body_template: None,
             }],
         };
-        apply(&mut base, &overlay).unwrap();
+        let summary = apply(&mut base, &overlay).unwrap();
         assert_eq!(base.entries.len(), 1);
         assert_eq!(base.entries[0].id, "keep");
+        assert_eq!(
+            summary,
+            OverlaySummary {
+                dropped: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn apply_summary_counts_disabled_misses_as_zero_drop() {
+        // Disabled overlay for an id that does not exist in `base` is a
+        // no-op rather than an error (overlay author may have already
+        // removed it upstream). Make sure the summary reflects that — we
+        // should not lie about "1 drop" if nothing was dropped.
+        let mut base = LinkMap {
+            schema_version: 1,
+            entries: vec![tracked_entry("alpha")],
+        };
+        let overlay = LinkMapOverlay {
+            schema_version: 1,
+            entries: vec![OverlayEntry {
+                id: "does-not-exist".to_string(),
+                enabled: false,
+                kind: None,
+                source: None,
+                destination: None,
+                recursive: false,
+                surface: None,
+                comment_style: None,
+                body_template: None,
+            }],
+        };
+        let summary = apply(&mut base, &overlay).unwrap();
+        assert_eq!(summary, OverlaySummary::default());
     }
 
     #[test]

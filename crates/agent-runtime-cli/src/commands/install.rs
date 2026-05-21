@@ -4,15 +4,6 @@ use clap::Args;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-/// Tag-name policy. Mirrors the `managed_block::is_trusted_surface` contract
-/// so backup-dir tags share the same ASCII-safe alphabet as managed-block
-/// surfaces. Plan 04 Sprint 1 Task 1.3.
-fn is_trusted_tag(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 #[derive(Args, Debug)]
 pub struct InstallArgs {
     /// Source root containing `manifests/`, `core/`, `targets/`, `build/`.
@@ -69,8 +60,10 @@ pub fn run(args: InstallArgs) -> anyhow::Result<u8> {
         );
     }
     if let Some(tag) = args.tag.as_deref()
-        && !is_trusted_tag(tag)
+        && !install::is_trusted_tag(tag)
     {
+        // The executor re-validates as defense in depth; the CLI catches
+        // the same shape early so the error message can name the flag.
         anyhow::bail!(
             "agent-runtime install: --tag `{tag}` is not a trusted tag name (allowed: ASCII alphanumeric / `-` / `_`)"
         );
@@ -94,7 +87,7 @@ pub fn run(args: InstallArgs) -> anyhow::Result<u8> {
         overlay_path: args.overlay_path.clone(),
     };
 
-    let (plan, changes) = install::run(
+    let outcome = install::run(
         &args.product,
         root.path(),
         &args.live_home,
@@ -104,22 +97,33 @@ pub fn run(args: InstallArgs) -> anyhow::Result<u8> {
         &options,
     )?;
 
+    if let Some(s) = outcome.overlay.as_ref() {
+        // Operator-visible notice that the overlay was consumed; matches
+        // the architecture-doc requirement that dry-run print the
+        // post-merge effective state, not just the inputs.
+        eprintln!(
+            "agent-runtime install: overlay merged (dropped={} replaced={} added={})",
+            s.dropped, s.replaced, s.added,
+        );
+    }
+
     eprintln!(
         "agent-runtime install: product={} mode={} actions={} changes={}",
-        plan.product,
+        outcome.plan.product,
         if matches!(mode, Mode::Apply) {
             "apply"
         } else {
             "dry-run"
         },
-        plan.actions.len(),
-        changes
+        outcome.plan.actions.len(),
+        outcome
+            .changes
             .iter()
             .filter(|c| !matches!(c, AppliedChange::NoOp { .. }))
             .count(),
     );
 
-    for change in &changes {
+    for change in &outcome.changes {
         print_change(change);
     }
 
@@ -171,26 +175,5 @@ fn print_change(c: &AppliedChange) {
         AppliedChange::NoOp { entry_id, dest } => {
             eprintln!("  = no-op {} ({})", dest.display(), entry_id)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_trusted_tag;
-
-    #[test]
-    fn trusted_tag_accepts_alnum_dash_underscore() {
-        assert!(is_trusted_tag("pre-bump"));
-        assert!(is_trusted_tag("rc_1"));
-        assert!(is_trusted_tag("0.2.0".replace('.', "-").as_str()));
-    }
-
-    #[test]
-    fn trusted_tag_rejects_empty_or_unsafe() {
-        assert!(!is_trusted_tag(""));
-        assert!(!is_trusted_tag("../escape"));
-        assert!(!is_trusted_tag("with space"));
-        assert!(!is_trusted_tag("dot.in.name"));
-        assert!(!is_trusted_tag("slash/in/name"));
     }
 }
