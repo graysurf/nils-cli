@@ -56,9 +56,76 @@ fn unlock_cancel() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(&format!("🔐 Found [{repo_name}:wip]")));
-    assert!(stdout.contains("Hard reset to [wip]?"));
+    assert!(stdout.contains("Hard reset to [wip]"));
     assert!(stdout.contains("🚫 Aborted"));
     assert!(!output.status.success());
+}
+
+#[test]
+fn unlock_dry_run_prints_summary_and_keeps_head() {
+    let repo = init_repo();
+    let cache = cache_dir();
+    let env = [("ZSH_CACHE_DIR", cache.path().to_str().unwrap())];
+
+    let base_hash = common::git(repo.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    commit_file(repo.path(), "change.txt", "second", "second");
+    let second_hash = common::git(repo.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    run_git_lock(
+        repo.path(),
+        &["lock", "base", "note", &base_hash],
+        &env,
+        None,
+    );
+
+    let output = run_git_lock_output(repo.path(), &["unlock", "--dry-run", "base"], &env, None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Dry run"));
+    assert!(stdout.contains("Changed files: 1"));
+    assert!(stdout.contains("change.txt"));
+
+    let head_after = common::git(repo.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    assert_eq!(head_after, second_hash);
+}
+
+#[test]
+fn unlock_verbose_prints_full_diff_before_prompt() {
+    let repo = init_repo();
+    let cache = cache_dir();
+    let env = [("ZSH_CACHE_DIR", cache.path().to_str().unwrap())];
+
+    let base_hash = common::git(repo.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    commit_file(repo.path(), "change.txt", "second", "second");
+
+    run_git_lock(
+        repo.path(),
+        &["lock", "base", "note", &base_hash],
+        &env,
+        None,
+    );
+
+    let output = run_git_lock_output(
+        repo.path(),
+        &["unlock", "--verbose", "base"],
+        &env,
+        Some("n\n"),
+    );
+    assert!(!output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Full diff"));
+    assert!(stdout.contains("diff --git"));
+    assert!(stdout.contains("Hard reset to [base]"));
 }
 
 #[test]

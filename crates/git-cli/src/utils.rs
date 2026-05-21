@@ -14,7 +14,21 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     }
 }
 
-fn zip(_args: &[String]) -> i32 {
+fn zip(args: &[String]) -> i32 {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
+    {
+        print_zip_help();
+        return 0;
+    }
+
+    if let Some(arg) = args.first() {
+        eprintln!("❗ Unknown argument: {arg}");
+        eprintln!("Usage: git-cli utils zip");
+        return 1;
+    }
+
     let short = match git_stdout_trimmed(&["rev-parse", "--short", "HEAD"]) {
         Ok(value) => value,
         Err(code) => return code,
@@ -30,6 +44,11 @@ fn zip(_args: &[String]) -> i32 {
         emit_output(&output);
         exit_code(&output)
     }
+}
+
+fn print_zip_help() {
+    println!("Usage: git-cli utils zip");
+    println!("Create backup-<short-sha>.zip from HEAD in the current directory.");
 }
 
 fn copy_staged(args: &[String]) -> i32 {

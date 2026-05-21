@@ -6,6 +6,7 @@ mod completion;
 mod copy;
 mod delete;
 mod diff;
+mod errors;
 mod fs;
 mod git;
 mod list;
@@ -139,7 +140,7 @@ fn run() -> i32 {
     match result {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("{err:#}");
+            eprintln!("{}", errors::format_error(&err));
             exit::RUNTIME
         }
     }

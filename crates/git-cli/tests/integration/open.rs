@@ -93,6 +93,40 @@ fn open_file_encodes_path_spaces() {
 }
 
 #[test]
+fn open_leaf_help_does_not_launch_browser() {
+    let harness = GitCliHarness::new();
+    let dir = init_repo();
+    git(
+        dir.path(),
+        &["remote", "add", "origin", "git@github.com:acme/repo.git"],
+    );
+
+    for args in [
+        &["open", "compare", "--help"][..],
+        &["open", "file", "--help"][..],
+        &["open", "blame", "--help"][..],
+    ] {
+        let output = run_with_open_script(
+            &harness,
+            dir.path(),
+            args,
+            r#"#!/bin/bash
+echo "open should not be called" >&2
+exit 99
+"#,
+        );
+
+        assert_eq!(output.code, 0, "args: {args:?}");
+        assert_eq!(output.stderr_text(), "", "args: {args:?}");
+        assert!(
+            output.stdout_text().contains("Usage:\n  git-cli open"),
+            "args: {args:?}, stdout: {}",
+            output.stdout_text()
+        );
+    }
+}
+
+#[test]
 fn open_actions_rejects_non_github_provider() {
     let harness = GitCliHarness::new();
     let dir = init_repo();
