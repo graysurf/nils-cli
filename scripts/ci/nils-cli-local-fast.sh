@@ -86,7 +86,6 @@ require_cmd() {
 }
 
 require_cmd git
-require_cmd cargo
 require_cmd python3
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
@@ -139,6 +138,7 @@ collect_changed_files >"$changed_file_list"
 python3 - "$repo_root" "$changed_file_list" >"$plan_file" <<'PY'
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -149,6 +149,37 @@ changed = [
     for line in changed_path.read_text(encoding="utf-8").splitlines()
     if line.strip()
 ]
+
+def emit(key, value):
+    print(f"{key}\t{value}")
+
+
+def is_doc_path(path):
+    return (
+        path.endswith(".md")
+        or path.startswith("docs/")
+        or "/docs/" in path
+        or path in {"README", "LICENSE", "NOTICE"}
+    )
+
+
+if not changed:
+    emit("mode", "none")
+    emit("docs_checks", "0")
+    emit("changed_count", "0")
+    sys.exit(0)
+
+if all(is_doc_path(path) for path in changed):
+    emit("mode", "docs-only")
+    emit("docs_checks", "1")
+    emit("changed_count", str(len(changed)))
+    for path in changed:
+        emit("changed", path)
+    sys.exit(0)
+
+if shutil.which("cargo") is None:
+    print("error: cargo is required for non-document local-fast planning", file=sys.stderr)
+    sys.exit(2)
 
 metadata_raw = subprocess.check_output(
     ["cargo", "metadata", "--no-deps", "--format-version", "1"],
@@ -165,19 +196,6 @@ for package in metadata["packages"]:
 crate_roots.sort(key=lambda item: len(item[0]), reverse=True)
 
 shared_packages = {"nils-common", "nils-term", "nils-test-support"}
-
-
-def emit(key, value):
-    print(f"{key}\t{value}")
-
-
-def is_doc_path(path):
-    return (
-        path.endswith(".md")
-        or path.startswith("docs/")
-        or "/docs/" in path
-        or path in {"README", "LICENSE", "NOTICE"}
-    )
 
 
 def package_for_path(path):

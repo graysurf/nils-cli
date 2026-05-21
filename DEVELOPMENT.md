@@ -38,6 +38,7 @@ Docs-only checks require:
 Local fast changed-scope checks also require:
 
 - `python3`
+- `cargo` for non-document changes
 
 Full required checks also require:
 

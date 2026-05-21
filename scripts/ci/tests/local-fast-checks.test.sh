@@ -62,6 +62,31 @@ assert_docs_only_uses_docs_mode() {
   echo "ok"
 }
 
+assert_docs_only_plan_does_not_require_cargo() {
+  echo "== docs-only plan does not require cargo =="
+  local tmp_bin
+  tmp_bin="$(mktemp -d)"
+  for cmd in bash git python3 sed sort mktemp rm; do
+    ln -s "$(command -v "$cmd")" "$tmp_bin/$cmd"
+  done
+
+  local output status
+  set +e
+  output="$(PATH="$tmp_bin" bash "$script" --plan-only --changed-file docs/runbooks/example.md 2>&1)"
+  status=$?
+  set -e
+  rm -rf "$tmp_bin"
+  if [[ "$status" -ne 0 ]]; then
+    echo "FAIL: $FUNCNAME"
+    echo "$output"
+    exit 1
+  fi
+
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=docs-only"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_CHECKS=1"
+  echo "ok"
+}
+
 assert_workspace_manifest_escalates_to_workspace() {
   echo "== workspace manifest escalates to workspace =="
   local output
@@ -95,6 +120,7 @@ assert_shell_script_is_reported() {
 assert_package_crate_uses_package_mode
 assert_shared_crate_escalates_to_workspace
 assert_docs_only_uses_docs_mode
+assert_docs_only_plan_does_not_require_cargo
 assert_workspace_manifest_escalates_to_workspace
 assert_docs_plus_package_runs_both
 assert_shell_script_is_reported
