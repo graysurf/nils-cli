@@ -94,6 +94,16 @@ products:
         runtime_roots,
     )
     .unwrap();
+    fs::write(
+        root.join("manifests").join("skills.yaml"),
+        "schema_version: 1\nskills: []\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("manifests").join("cli-tools.yaml"),
+        "schema_version: 1\nprofiles:\n  core: []\n  recommended: []\n  full: []\nformulas: {}\n",
+    )
+    .unwrap();
 
     fs::canonicalize(&root).unwrap()
 }
