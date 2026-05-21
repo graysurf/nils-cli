@@ -51,10 +51,18 @@ pub enum UninstalledChange {
     },
     /// `dest` is a symlink, but it points somewhere other than the
     /// install source we recorded. The executor refuses to remove it.
+    ///
+    /// `expected_source` carries the install source path the executor was
+    /// comparing against. The CLI prints both `actual_target` (what the
+    /// symlink currently resolves to) and `expected_source` (what it
+    /// would have been if uninstall could remove it) so an operator who
+    /// rebased their kit checkout can tell whether to re-point
+    /// `--source-root` or rm the orphaned symlinks by hand.
     SymlinkSkippedForeign {
         entry_id: String,
         dest: PathBuf,
         actual_target: PathBuf,
+        expected_source: PathBuf,
     },
     /// `dest` is a regular file (not a symlink). Uninstall does not own
     /// destruction of regular files — that responsibility lives in
@@ -120,6 +128,7 @@ fn handle_remove_symlink(
                 entry_id: entry_id.to_string(),
                 dest: dest.to_path_buf(),
                 actual_target: actual,
+                expected_source: expected_source.to_path_buf(),
             });
         }
         if matches!(mode, Mode::Apply) {
@@ -140,11 +149,14 @@ fn handle_remove_symlink(
         });
     }
     // Directory or other type at `dest`. Treat as "foreign" with an
-    // empty target so the caller surfaces a clear skipped notice.
+    // empty target so the caller surfaces a clear skipped notice. We
+    // still record `expected_source` so the operator-recovery message
+    // names the install source even on this edge.
     Ok(UninstalledChange::SymlinkSkippedForeign {
         entry_id: entry_id.to_string(),
         dest: dest.to_path_buf(),
         actual_target: PathBuf::new(),
+        expected_source: expected_source.to_path_buf(),
     })
 }
 
@@ -271,8 +283,16 @@ mod tests {
         });
         let changes = run(&plan, Mode::Apply).unwrap();
         match &changes[0] {
-            UninstalledChange::SymlinkSkippedForeign { actual_target, .. } => {
+            UninstalledChange::SymlinkSkippedForeign {
+                actual_target,
+                expected_source,
+                ..
+            } => {
                 assert_eq!(actual_target, &foreign_target);
+                // F-1 operator-recovery context: the executor must surface
+                // the install source it was comparing against so the CLI
+                // printer can name both paths.
+                assert_eq!(expected_source, &real_source);
             }
             other => panic!("expected SymlinkSkippedForeign, got {other:?}"),
         }

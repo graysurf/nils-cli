@@ -106,10 +106,12 @@ fn print_change(c: &UninstalledChange) {
             entry_id,
             dest,
             actual_target,
+            expected_source,
         } => eprintln!(
-            "  ? skip {} (foreign target: {}; {})",
+            "  ? skip {} (foreign target: {}; expected: {}; {})",
             dest.display(),
             actual_target.display(),
+            expected_source.display(),
             entry_id
         ),
         UninstalledChange::SymlinkSkippedRegularFile { entry_id, dest } => {

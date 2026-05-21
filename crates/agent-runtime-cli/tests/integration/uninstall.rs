@@ -406,15 +406,47 @@ fn foreign_symlink_at_install_dest_is_skipped() {
     .unwrap();
 
     // The foreign symlink should be reported as skipped, not removed.
-    let foreign_skips = outcome
+    let foreign_skips: Vec<&UninstalledChange> = outcome
         .changes
         .iter()
         .filter(|c| matches!(c, UninstalledChange::SymlinkSkippedForeign { .. }))
-        .count();
+        .collect();
     assert!(
-        foreign_skips >= 1,
+        !foreign_skips.is_empty(),
         "expected at least one SymlinkSkippedForeign, got: {:#?}",
         outcome.changes
+    );
+    // F-1 operator-recovery context: the skip change must carry both the
+    // actual_target (where the foreign symlink currently points) and the
+    // expected_source (the install source the executor was comparing
+    // against). The CLI printer surfaces both so an operator who rebased
+    // their kit checkout can decide which side to repoint.
+    let mut saw_recovery_evidence = false;
+    for c in &foreign_skips {
+        if let UninstalledChange::SymlinkSkippedForeign {
+            actual_target,
+            expected_source,
+            ..
+        } = c
+        {
+            assert_eq!(
+                actual_target, &foreign,
+                "actual_target should be the operator's foreign file"
+            );
+            assert!(
+                !expected_source.as_os_str().is_empty(),
+                "expected_source must not be empty on SymlinkSkippedForeign: {c:?}"
+            );
+            assert_ne!(
+                actual_target, expected_source,
+                "actual_target and expected_source must differ on a foreign skip"
+            );
+            saw_recovery_evidence = true;
+        }
+    }
+    assert!(
+        saw_recovery_evidence,
+        "no SymlinkSkippedForeign carried recovery evidence"
     );
     // And the foreign symlink survives.
     assert!(
