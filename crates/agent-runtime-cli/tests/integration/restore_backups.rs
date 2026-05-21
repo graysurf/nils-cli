@@ -545,3 +545,67 @@ fn restore_emits_skipped_ambiguous_for_recursive_basename_collision() {
         assert_eq!(candidates.len(), 2, "expected 2 candidates: {candidates:?}");
     }
 }
+
+#[test]
+fn foreign_symlink_at_install_dest_is_skipped_not_overwritten() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_source_root(tmp.path(), "claude");
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+
+    let manifest_dest = seed_pre_install_manifest(&home, "ORIG-MANIFEST");
+    run_install(&source_root, &home, &state_home, ts(1_700_000_000));
+
+    // Operator retargets the install-placed symlink to their own file —
+    // a foreign target restore-backups must refuse to destroy.
+    let operator_file = tmp.path().join("operator/custom.json");
+    fs::create_dir_all(operator_file.parent().unwrap()).unwrap();
+    fs::write(&operator_file, "OPERATOR-RETARGETED").unwrap();
+    fs::remove_file(&manifest_dest).unwrap();
+    std::os::unix::fs::symlink(&operator_file, &manifest_dest).unwrap();
+
+    let outcome = restore_backups::run(
+        "claude",
+        &source_root,
+        &home,
+        &state_home,
+        RestoreMode::Apply,
+        &RestoreOptions::default(),
+    )
+    .unwrap();
+
+    let foreign: Vec<_> = outcome
+        .changes
+        .iter()
+        .filter(|c| matches!(c, RestoredChange::SkippedSymlinkForeign { .. }))
+        .collect();
+    assert_eq!(
+        foreign.len(),
+        1,
+        "expected one foreign-symlink skip: {:#?}",
+        outcome.changes,
+    );
+    if let RestoredChange::SkippedSymlinkForeign {
+        actual_target,
+        expected_install_source,
+        ..
+    } = foreign[0]
+    {
+        assert_eq!(actual_target, &operator_file);
+        // expected_install_source resolves to <source_root>/targets/claude/plugins/reporting/.claude-plugin/plugin.json
+        let expected =
+            source_root.join("targets/claude/plugins/reporting/.claude-plugin/plugin.json");
+        assert_eq!(expected_install_source, &expected);
+    }
+
+    // Operator's retargeted symlink survived (still points at custom file).
+    assert_eq!(fs::read_link(&manifest_dest).unwrap(), operator_file);
+    // Backup file still present so the operator can recover later once
+    // they decide what to do with the retargeting.
+    let backup_file =
+        state_home.join("backups/claude/1700000000/reporting.plugin-manifest/plugin.json");
+    assert!(
+        backup_file.exists(),
+        "backup must survive a foreign-target skip"
+    );
+}

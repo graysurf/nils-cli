@@ -216,5 +216,18 @@ fn print_change(c: &RestoredChange) {
                 eprintln!("      candidate: {}", cand.display());
             }
         }
+        RestoredChange::SkippedSymlinkForeign {
+            entry_id,
+            dest,
+            actual_target,
+            expected_install_source,
+            from_backup: _,
+        } => eprintln!(
+            "  ? skip {} (foreign target: {}; expected: {}; {})",
+            dest.display(),
+            actual_target.display(),
+            expected_install_source.display(),
+            entry_id
+        ),
     }
 }

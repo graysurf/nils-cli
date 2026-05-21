@@ -81,6 +81,20 @@ pub enum RestoredChange {
         from_backup: PathBuf,
         candidates: Vec<PathBuf>,
     },
+    /// `dest` is a symlink, but it points somewhere other than the
+    /// install source the regenerated plan recorded. Restore refuses to
+    /// destroy operator-retargeted symlinks — same contract `uninstall`
+    /// enforces. The CLI prints both `actual_target` and
+    /// `expected_install_source` so an operator who reshaped their kit
+    /// checkout can decide whether to re-point `--source-root` or
+    /// manually unwind the symlink.
+    SkippedSymlinkForeign {
+        entry_id: String,
+        dest: PathBuf,
+        actual_target: PathBuf,
+        expected_install_source: PathBuf,
+        from_backup: PathBuf,
+    },
 }
 
 /// Walk `plan.actions`. In `Mode::DryRun` the filesystem is untouched;
@@ -95,7 +109,8 @@ pub fn run(plan: &RestorePlan, mode: Mode) -> Result<Vec<RestoredChange>, ApplyE
                 entry_id,
                 source_backup,
                 dest,
-            } => handle_restore(mode, entry_id, source_backup, dest)?,
+                expected_install_source,
+            } => handle_restore(mode, entry_id, source_backup, dest, expected_install_source)?,
             RestoreAction::SkippedNoMatch {
                 entry_id,
                 source_backup,
@@ -123,28 +138,44 @@ fn handle_restore(
     entry_id: &str,
     backup: &Path,
     dest: &Path,
+    expected_install_source: &Path,
 ) -> Result<RestoredChange, ApplyError> {
     let meta = fs::symlink_metadata(dest);
     match meta {
-        Ok(m) if m.file_type().is_symlink() => match mode {
-            Mode::DryRun => Ok(RestoredChange::FileRestored {
-                entry_id: entry_id.to_string(),
-                dest: dest.to_path_buf(),
-                from_backup: backup.to_path_buf(),
-            }),
-            Mode::Apply => {
-                fs::remove_file(dest).map_err(|source| ApplyError::Io {
-                    path: dest.to_path_buf(),
-                    source,
-                })?;
-                move_backup_to_dest(backup, dest)?;
-                Ok(RestoredChange::FileRestored {
+        Ok(m) if m.file_type().is_symlink() => {
+            let actual = fs::read_link(dest).map_err(|source| ApplyError::Io {
+                path: dest.to_path_buf(),
+                source,
+            })?;
+            if actual != expected_install_source {
+                return Ok(RestoredChange::SkippedSymlinkForeign {
+                    entry_id: entry_id.to_string(),
+                    dest: dest.to_path_buf(),
+                    actual_target: actual,
+                    expected_install_source: expected_install_source.to_path_buf(),
+                    from_backup: backup.to_path_buf(),
+                });
+            }
+            match mode {
+                Mode::DryRun => Ok(RestoredChange::FileRestored {
                     entry_id: entry_id.to_string(),
                     dest: dest.to_path_buf(),
                     from_backup: backup.to_path_buf(),
-                })
+                }),
+                Mode::Apply => {
+                    fs::remove_file(dest).map_err(|source| ApplyError::Io {
+                        path: dest.to_path_buf(),
+                        source,
+                    })?;
+                    move_backup_to_dest(backup, dest)?;
+                    Ok(RestoredChange::FileRestored {
+                        entry_id: entry_id.to_string(),
+                        dest: dest.to_path_buf(),
+                        from_backup: backup.to_path_buf(),
+                    })
+                }
             }
-        },
+        }
         Ok(m) if m.file_type().is_file() => Ok(RestoredChange::SkippedDestRegularFile {
             entry_id: entry_id.to_string(),
             dest: dest.to_path_buf(),
@@ -262,6 +293,7 @@ mod tests {
                 entry_id: "claude.config".to_string(),
                 source_backup: backup.clone(),
                 dest: dest.clone(),
+                expected_install_source: install_source.clone(),
             }],
         };
         let changes = run(&plan, Mode::Apply).unwrap();
@@ -293,6 +325,7 @@ mod tests {
                 entry_id: "claude.config".to_string(),
                 source_backup: backup.clone(),
                 dest: dest.clone(),
+                expected_install_source: PathBuf::from("/unused-in-this-unit-test"),
             }],
         };
         let changes = run(&plan, Mode::DryRun).unwrap();
@@ -321,6 +354,7 @@ mod tests {
                 entry_id: "claude.config".to_string(),
                 source_backup: backup.clone(),
                 dest: dest.clone(),
+                expected_install_source: PathBuf::from("/unused-in-this-unit-test"),
             }],
         };
         let changes = run(&plan, Mode::Apply).unwrap();
@@ -344,6 +378,7 @@ mod tests {
                 entry_id: "claude.config".to_string(),
                 source_backup: backup.clone(),
                 dest: dest.clone(),
+                expected_install_source: PathBuf::from("/unused-in-this-unit-test"),
             }],
         };
         let changes = run(&plan, Mode::Apply).unwrap();
@@ -353,6 +388,57 @@ mod tests {
         ));
         assert!(backup.exists());
         assert!(dest.is_dir());
+    }
+
+    #[test]
+    fn foreign_symlink_target_is_skipped_with_actual_and_expected_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let backup = tmp.path().join("backup/entry/settings.json");
+        write_file(&backup, "original-content");
+        let expected_source = tmp.path().join("source/settings.json");
+        write_file(&expected_source, "rendered-content");
+        let operator_target = tmp.path().join("operator/custom.json");
+        write_file(&operator_target, "operator-content");
+        let dest = tmp.path().join("home/settings.json");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        // Symlink at dest points somewhere the operator manually retargeted to,
+        // not the install source recorded in the plan.
+        std::os::unix::fs::symlink(&operator_target, &dest).unwrap();
+
+        let plan = RestorePlan {
+            product: "claude".to_string(),
+            home: tmp.path().join("home"),
+            backup_run: tmp.path().join("backup"),
+            actions: vec![RestoreAction::RestoreFile {
+                entry_id: "claude.config".to_string(),
+                source_backup: backup.clone(),
+                dest: dest.clone(),
+                expected_install_source: expected_source.clone(),
+            }],
+        };
+        let changes = run(&plan, Mode::Apply).unwrap();
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            RestoredChange::SkippedSymlinkForeign {
+                actual_target,
+                expected_install_source,
+                ..
+            } => {
+                assert_eq!(actual_target, &operator_target);
+                assert_eq!(expected_install_source, &expected_source);
+            }
+            other => panic!("expected SkippedSymlinkForeign, got {other:?}"),
+        }
+        // Operator content + backup file both survive.
+        assert_eq!(
+            fs::read_link(&dest).unwrap(),
+            operator_target,
+            "executor must not retarget operator symlink"
+        );
+        assert!(
+            backup.exists(),
+            "executor must not consume backup when skipping foreign"
+        );
     }
 
     #[test]

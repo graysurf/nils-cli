@@ -37,10 +37,17 @@ impl std::str::FromStr for BackupRunSelector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreAction {
     /// Move `source_backup` back to `dest`. Both paths are absolute.
+    ///
+    /// `expected_install_source` is the absolute path the post-install
+    /// symlink at `dest` should be pointing at — recorded from the
+    /// regenerated `InstallPlan` so the executor can refuse to clobber
+    /// a symlink an operator has manually retargeted away from the
+    /// install layout (the same protection `uninstall` enforces).
     RestoreFile {
         entry_id: String,
         source_backup: PathBuf,
         dest: PathBuf,
+        expected_install_source: PathBuf,
     },
     /// The backup file matched no `PlanAction::Symlink` in the
     /// regenerated install plan — usually because the link-map entry was
@@ -170,24 +177,32 @@ fn walk_backup_dir(
             Some(n) => n.to_os_string(),
             None => continue,
         };
-        let candidates: Vec<PathBuf> = install_plan
+        let candidates: Vec<(PathBuf, PathBuf)> = install_plan
             .actions
             .iter()
             .filter_map(|a| match a {
                 PlanAction::Symlink {
-                    entry_id: id, dest, ..
+                    entry_id: id,
+                    source,
+                    dest,
+                    ..
                 } if id == entry_id && dest.file_name() == Some(file_name.as_ref()) => {
-                    Some(dest.clone())
+                    Some((dest.clone(), source.clone()))
                 }
                 _ => None,
             })
             .collect();
         match candidates.len() {
-            1 => out.push(RestoreAction::RestoreFile {
-                entry_id: entry_id.to_string(),
-                source_backup: backup_file,
-                dest: candidates.into_iter().next().expect("len==1"),
-            }),
+            1 => {
+                let (dest, expected_install_source) =
+                    candidates.into_iter().next().expect("len==1");
+                out.push(RestoreAction::RestoreFile {
+                    entry_id: entry_id.to_string(),
+                    source_backup: backup_file,
+                    dest,
+                    expected_install_source,
+                });
+            }
             0 => out.push(RestoreAction::SkippedNoMatch {
                 entry_id: entry_id.to_string(),
                 source_backup: backup_file,
@@ -195,7 +210,7 @@ fn walk_backup_dir(
             _ => out.push(RestoreAction::SkippedAmbiguous {
                 entry_id: entry_id.to_string(),
                 source_backup: backup_file,
-                candidates,
+                candidates: candidates.into_iter().map(|(d, _)| d).collect(),
             }),
         }
     }
