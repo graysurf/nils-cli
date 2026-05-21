@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  shared-helper-adoption-audit.sh [--format tsv] [--out <manifest.tsv>] [--root <repo>]
+  shared-helper-adoption-audit.sh [--format tsv] [--out <manifest.tsv>] [--root <repo>] [--check-seeds]
 
 Scans for known maintainability candidates where code/tests duplicate primitives that should use
 `nils-common` or `nils-test-support`, then writes an issue-centric manifest.
@@ -16,6 +16,7 @@ Options:
   --format <tsv>   Output format (currently only `tsv` is supported)
   --out <file>     Write manifest TSV to file (also writes summary.md in the same directory)
   --root <dir>     Repo root (defaults to current git worktree root)
+  --check-seeds    Fail if any seeded candidate path is missing
   -h, --help       Show this help
 USAGE
 }
@@ -23,6 +24,7 @@ USAGE
 format="tsv"
 out_file=""
 repo_root=""
+check_seeds=0
 
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
@@ -37,6 +39,10 @@ while [[ $# -gt 0 ]]; do
     --root)
       repo_root="${2:-}"
       shift 2
+      ;;
+    --check-seeds)
+      check_seeds=1
+      shift
       ;;
     -h|--help)
       usage
@@ -185,14 +191,14 @@ seed_manifest() {
     'resolve_secret_dir_from_env|CODEX_SECRET_DIR' \
     "Duplicated env-only secret-dir resolver; parity-sensitive behavior."
 
-  add_row "crates/codex-cli/src/fs.rs" \
+  add_row "crates/codex-cli/tests/integration/fs.rs" \
     "runtime.fs_primitives" "nils-common::fs (extended)" "candidate" "Task 3.2" "high" \
-    'fn write_atomic|fn write_timestamp|fn sha256_file' \
-    "Codex-specific fs primitives overlap gemini and should be shared."
-  add_row "crates/gemini-cli/src/fs.rs" \
+    'sha256_file|write_atomic|write_timestamp|nils_common::fs' \
+    "Codex fs coverage records the shared primitive migration boundary."
+  add_row "crates/gemini-cli/tests/integration/fs.rs" \
     "runtime.fs_primitives" "nils-common::fs (extended)" "candidate" "Task 3.2" "high" \
-    'pub fn write_atomic|pub fn write_timestamp|pub fn sha256_file' \
-    "Gemini fs primitives overlap codex and should be shared."
+    'sha256_file|write_atomic|write_timestamp|nils_common::fs' \
+    "Gemini fs coverage records the shared primitive migration boundary."
   add_row "crates/gemini-cli/src/auth/mod.rs" \
     "runtime.auth_fs_primitives" "nils-common::fs/json helpers (via adapter)" "candidate" "Task 3.3" "high" \
     'pub\(crate\) fn (write_atomic|write_timestamp|strip_newlines|normalize_iso)' \
@@ -211,97 +217,108 @@ seed_manifest() {
     'fn env_lock|struct EnvGuard' \
     "Source tests define custom env guard pattern."
 
-  add_row "crates/gemini-cli/tests/paths.rs" \
+  add_row "crates/gemini-cli/tests/integration/paths.rs" \
     "integration-test.env_guard" "nils-test-support::EnvGuard/GlobalStateLock" "candidate" "Task 5.1" "medium" \
     'struct EnvVarGuard|fn env_lock|unsafe \{ std::env::(set_var|remove_var)' \
     "Integration tests define custom env guards and raw unsafe env mutation."
-  add_row "crates/gemini-cli/tests/prompts.rs" \
+  add_row "crates/gemini-cli/tests/integration/prompts.rs" \
     "integration-test.env_guard+fs" "nils-test-support::EnvGuard/GlobalStateLock + fs" "candidate" "Task 5.1" "medium" \
     'struct EnvVarGuard|fn env_lock|set_mode\(|unsafe \{ std::env::(set_var|remove_var)' \
     "Integration tests define custom env guards and manual chmod helper."
-  add_row "crates/gemini-cli/tests/agent_prompt.rs" \
+  add_row "crates/gemini-cli/tests/integration/agent_prompt.rs" \
     "integration-test.tempdir+fs" "nils-test-support::StubBinDir/fs + tempfile::TempDir" "candidate" "Task 5.1" "medium" \
     'fn temp_dir|fn write_executable\(' \
     "Custom tempdir and executable writer overlap shared helpers."
-  add_row "crates/gemini-cli/tests/auth_refresh.rs" \
+  add_row "crates/gemini-cli/tests/integration/auth_refresh.rs" \
     "integration-test.path_prepend+fs" "nils-test-support::CmdOptions::with_path_prepend + fs" "candidate" "Task 5.1" "medium" \
     'fn write_curl_stub|fn path_with_stub|set_mode\(|std::env::var\("PATH"\)' \
     "Manual stub writer and PATH prepend helper."
 
-  add_row "crates/codex-cli/tests/agent_commit.rs" \
+  add_row "crates/codex-cli/tests/integration/agent_commit.rs" \
     "integration-test.git_setup" "nils-test-support::git + fs" "candidate" "Task 5.2" "medium" \
     'Command::new\("git"\)|fn init_repo' \
     "Manual repo init/config/git calls in fallback commit tests."
-  add_row "crates/gemini-cli/tests/agent_commit_fallback.rs" \
+  add_row "crates/gemini-cli/tests/integration/agent_commit_fallback.rs" \
     "integration-test.git_setup" "nils-test-support::git + fs" "candidate" "Task 5.2" "medium" \
     'Command::new\("git"\)|fn init_repo|fn git_stdout' \
     "Manual repo init/config/git calls in fallback commit tests."
 
-  add_row "crates/agent-docs/tests/env_paths.rs" \
+  add_row "crates/agent-docs/tests/integration/env_paths.rs" \
     "integration-test.git_setup+fs" "nils-test-support::git/fs" "candidate" "Task 5.3" "medium" \
     'Command::new\("git"\)' \
     "Repeated git repo/worktree setup sequences and local fixture writers."
 
-  add_row "crates/git-scope/tests/help_outside_repo.rs" \
+  add_row "crates/git-scope/tests/integration/help_outside_repo.rs" \
     "integration-test.bin_resolve" "nils-test-support::bin + cmd" "candidate" "Task 5.4" "low" \
     'CARGO_BIN_EXE_|fn git_scope_bin' \
     "Manual binary resolution duplicates nils-test-support::bin::resolve."
-  add_row "crates/git-scope/tests/edge_cases.rs" \
+  add_row "crates/git-scope/tests/integration/edge_cases.rs" \
     "integration-test.allow_fail_runner" "nils-test-support::cmd" "candidate" "Task 5.4" "low" \
     'run_git_scope_allow_fail|std::process::Command::new\(common::git_scope_bin\(\)\)' \
     "Ad-hoc allow-fail command runner duplicates shared cmd helper behavior."
-  add_row "crates/git-scope/tests/common.rs" \
+  add_row "crates/git-scope/tests/integration/common.rs" \
     "integration-test.harness_consolidation" "nils-test-support::cmd/bin (thin wrappers only)" "candidate" "Task 5.4" "low" \
     'run_git_scope_output|run_resolved' \
     "Harness should remain thin and own shared wrappers for allow-fail path."
 
-  add_row "crates/api-grpc/tests/integration.rs" \
+  add_row "crates/api-grpc/tests/integration/integration.rs" \
     "integration-test.stub_executable" "nils-test-support::fs::write_executable" "candidate" "Task 5.5" "low" \
     'fn write_executable_script|set_mode\(0o755\)|set_permissions\(path, perms\)' \
     "Manual script chmod helper overlaps nils-test-support::fs."
-  add_row "crates/api-test/tests/grpc_integration.rs" \
+  add_row "crates/api-test/tests/integration/grpc_integration.rs" \
     "integration-test.stub_executable" "nils-test-support::fs::write_executable" "candidate" "Task 5.5" "low" \
     'set_mode\(0o755\)|set_permissions\(&mock, perms\)' \
     "Manual grpc mock chmod helper overlaps nils-test-support::fs."
-  add_row "crates/api-testing-core/tests/suite_runner_grpc_matrix.rs" \
+  add_row "crates/api-testing-core/tests/integration/suite_runner_grpc_matrix.rs" \
     "integration-test.stub_executable+env_guard" "nils-test-support::fs + EnvGuard/GlobalStateLock" "candidate" "Task 5.5" "medium" \
     'unsafe \{ std::env::(set_var|remove_var)|set_mode\(0o755\)' \
     "Manual chmod and raw env mutation in test."
 
-  add_row "crates/screen-record/tests/linux_request_permission.rs" \
+  add_row "crates/screen-record/tests/integration/linux_request_permission.rs" \
     "integration-test.stub_executable" "nils-test-support::fs::write_executable" "candidate" "Task 5.6" "low" \
     'ffmpeg_stub_dir|set_mode\(0o755\)|set_permissions\(&ffmpeg_path, perms\)' \
     "Manual ffmpeg stub writer duplicates executable helper."
 
-  add_row "crates/codex-cli/tests/agent_templates.rs" \
+  add_row "crates/codex-cli/tests/integration/agent_templates.rs" \
     "integration-test.path_prepend" "nils-test-support::CmdOptions::with_path_prepend" "candidate" "Task 5.7" "low" \
     'std::env::var\("PATH"\)|combined_path = format!' \
     "Manual PATH prepend string composition."
-  add_row "crates/codex-cli/tests/auth_json_contract.rs" \
+  add_row "crates/codex-cli/tests/integration/auth_json_contract.rs" \
     "integration-test.path_prepend" "nils-test-support::CmdOptions::with_path_prepend" "candidate" "Task 5.7" "low" \
     'current_path = std::env::var\("PATH"\)|path = format!\("\{\}:\{current_path\}"' \
     "Manual PATH prepend string composition."
-  add_row "crates/gemini-cli/tests/agent_templates.rs" \
+  add_row "crates/gemini-cli/tests/integration/agent_templates.rs" \
     "integration-test.path_prepend" "nils-test-support::CmdOptions::with_path_prepend" "candidate" "Task 5.7" "low" \
     'std::env::var\("PATH"\)|combined_path = format!' \
     "Manual PATH prepend string composition."
 
-  add_row "crates/fzf-cli/tests/open_and_file.rs" \
+  add_row "crates/fzf-cli/tests/integration/open_and_file.rs" \
     "integration-test.path_prepend" "nils-test-support::CmdOptions::with_path_prepend (via harness)" "candidate" "Task 5.7" "low" \
     'fn path_with_stub|std::env::var\("PATH"\)' \
     "Repeated PATH prepend helper."
-  add_row "crates/fzf-cli/tests/git_commands.rs" \
+  add_row "crates/fzf-cli/tests/integration/git_commands.rs" \
     "integration-test.path_prepend" "nils-test-support::CmdOptions::with_path_prepend (via harness)" "candidate" "Task 5.7" "low" \
     'fn path_with_stub|std::env::var\("PATH"\)' \
     "Repeated PATH prepend helper."
-  add_row "crates/fzf-cli/tests/git_commit.rs" \
+  add_row "crates/fzf-cli/tests/integration/git_commit.rs" \
     "integration-test.path_prepend" "nils-test-support::CmdOptions::with_path_prepend (via harness)" "candidate" "Task 5.7" "low" \
     'fn path_with_stub|std::env::var\("PATH"\)' \
     "Repeated PATH prepend helper."
-  add_row "crates/fzf-cli/tests/common.rs" \
+  add_row "crates/fzf-cli/tests/integration/common.rs" \
     "integration-test.harness_consolidation" "nils-test-support::cmd (thin wrappers only)" "candidate" "Task 5.7" "low" \
     'run_fzf_cli|StubBinDir|CmdOptions' \
     "Central harness file likely owns path-prepend helper after sweep."
+}
+
+check_seed_paths() {
+  local missing
+  missing="$(awk -F '\t' 'NR>1 && $9=="missing-file" {print $1}' "$tmp_rows")"
+  if [[ -n "$missing" ]]; then
+    echo "FAIL: shared-helper adoption audit has missing seeded paths:" >&2
+    echo "$missing" >&2
+    return 1
+  fi
+  echo "PASS: shared-helper adoption audit seed paths exist" >&2
 }
 
 render_summary_markdown() {
@@ -360,6 +377,10 @@ write_manifest() {
 }
 
 seed_manifest
+
+if [[ "$check_seeds" -eq 1 ]]; then
+  check_seed_paths
+fi
 
 if [[ -n "$out_file" ]]; then
   mkdir -p "$(dirname "$out_file")"

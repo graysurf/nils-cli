@@ -6,7 +6,7 @@
 
 - Date: 2026-05-21
 - Status: ready for implementation planning
-- Source issue: https://github.com/sympoies/nils-cli/issues/421
+- Source issue: <https://github.com/sympoies/nils-cli/issues/421>
 - Retention intent: plan-source artifact; eligible for cleanup after execution
   if the tracking issue keeps the durable closeout record.
 

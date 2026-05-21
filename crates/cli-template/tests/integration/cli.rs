@@ -21,6 +21,13 @@ fn run_without_rust_log(args: &[&str]) -> CmdOutput {
 fn cli_template_runs_without_subcommand() {
     let output = run(&[]);
     assert_eq!(output.code, 0);
+    let stdout = output.stdout_text();
+    assert_eq!(stdout, "", "no-subcommand path should not print stdout");
+    let stderr = output.stderr_text();
+    assert!(
+        stderr.contains("no subcommand selected"),
+        "stderr should log the no-subcommand default path: {stderr}"
+    );
 }
 
 #[test]
