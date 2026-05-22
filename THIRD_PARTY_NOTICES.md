@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `b0f6e2229196d984aec081c8130f34713ccd3be87ecd242dbef74396cf301e89`
+- Cargo.lock SHA256: `5be8ae295650e694b98f5649df1b753209e742cc98268f45e58b692eba29000d`
 - Third-party crates (`source != null`): 465
 
 ## Notice Extraction Policy
@@ -301,7 +301,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
   - `COPYING`
 
-### bumpalo 3.20.2
+### bumpalo 3.20.3
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -1473,7 +1473,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### js-sys 0.3.98
+### js-sys 0.3.99
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -3400,7 +3400,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### wasm-bindgen 0.2.121
+### wasm-bindgen 0.2.122
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -3409,7 +3409,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### wasm-bindgen-futures 0.4.71
+### wasm-bindgen-futures 0.4.72
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -3418,7 +3418,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### wasm-bindgen-macro 0.2.121
+### wasm-bindgen-macro 0.2.122
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -3427,7 +3427,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### wasm-bindgen-macro-support 0.2.121
+### wasm-bindgen-macro-support 0.2.122
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -3436,7 +3436,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### wasm-bindgen-shared 0.2.121
+### wasm-bindgen-shared 0.2.122
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -3466,7 +3466,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### web-sys 0.3.98
+### web-sys 0.3.99
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`

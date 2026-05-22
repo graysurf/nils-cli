@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-runtime-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -341,9 +341,9 @@ dependencies = [
 
 [[package]]
 name = "bumpalo"
-version = "3.20.2"
+version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
+checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bytemuck"
@@ -1636,9 +1636,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.98"
+version = "0.3.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67df7112613f8bfd9150013a0314e196f4800d3201ae742489d999db2f979f08"
+checksum = "142bc4740e452c1e57ade0cbc129f139c9093e354346f0872ef985f4f5cf5f11"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-docs"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-out"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "chrono",
  "clap",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-scope-lock"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1854,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-workflow-primitives"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-gql"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-grpc"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-rest"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-test"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1935,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-testing-core"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-websocket"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1975,7 +1975,7 @@ dependencies = [
 
 [[package]]
 name = "nils-cli-template"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "nils-codex-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "nils-common"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "base64",
  "clap",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "nils-forge-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "nils-fzf-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "nils-gemini-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-lock"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-scope"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-summary"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2132,7 +2132,7 @@ dependencies = [
 
 [[package]]
 name = "nils-image-processing"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2156,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "nils-macos-agent"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "nils-memo-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "nils-plan-issue-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "nils-plan-tooling"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2223,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "nils-screen-record"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "block2",
  "chrono",
@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "nils-semantic-commit"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "nils-term"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "indicatif",
  "pretty_assertions",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "nils-test-support"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -2284,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "nils-web-evidence"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -4318,9 +4318,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.121"
+version = "0.2.122"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49ace1d07c165b0864824eee619580c4689389afa9dc9ed3a4c75040d82e6790"
+checksum = "3ed04576f974d2b2fba0f38c51dbc5518011e38c36bf1143164be765528fd409"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -4331,9 +4331,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.71"
+version = "0.4.72"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96492d0d3ffba25305a7dc88720d250b1401d7edca02cc3bcd50633b424673b8"
+checksum = "9473dbd2991ae90b6291c3c32c30c6187ac49aa32f9905d1cce280ec1e110b0f"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -4341,9 +4341,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.121"
+version = "0.2.122"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e68e6f4afd367a562002c05637acb8578ff2dea1943df76afb9e83d177c8578"
+checksum = "916151b09da36bd82f6615cbf3a419e2f0ba23a03c6160e8e92eb6bd4aa1dec6"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -4351,9 +4351,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.121"
+version = "0.2.122"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d95a9ec35c64b2a7cb35d3fead40c4238d0940c86d107136999567a4703259f2"
+checksum = "299047362ccbfce148b67ab7e73349f77748e00c8296f9542adfad2ad82c5c5e"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -4364,9 +4364,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.121"
+version = "0.2.122"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4e0100b01e9f0d03189a92b96772a1fb998639d981193d7dbab487302513441"
+checksum = "9a929b2c61f11ba3e9bc35b50c1f25cb38e0e892c0c231ae2b8cf78d5dad4437"
 dependencies = [
  "unicode-ident",
 ]
@@ -4407,9 +4407,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.98"
+version = "0.3.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b572dff8bcf38bad0fa19729c89bb5748b2b9b1d8be70cf90df697e3a8f32aa"
+checksum = "6d621441cfc37b84979402712047321980c178f299193a3589d05b99e8763436"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

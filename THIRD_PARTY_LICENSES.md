@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `b0f6e2229196d984aec081c8130f34713ccd3be87ecd242dbef74396cf301e89`
+- Cargo.lock SHA256: `5be8ae295650e694b98f5649df1b753209e742cc98268f45e58b692eba29000d`
 - Third-party crates (`source != null`): 465
 - Workspace crates (`source == null`, excluded below): 31
 
@@ -84,7 +84,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | block2 | 0.6.2 | MIT | crates.io |
 | blocking | 1.6.2 | Apache-2.0 OR MIT | crates.io |
 | bstr | 1.12.1 | MIT OR Apache-2.0 | crates.io |
-| bumpalo | 3.20.2 | MIT OR Apache-2.0 | crates.io |
+| bumpalo | 3.20.3 | MIT OR Apache-2.0 | crates.io |
 | bytemuck | 1.25.0 | Zlib OR Apache-2.0 OR MIT | crates.io |
 | byteorder-lite | 0.1.0 | Unlicense OR MIT | crates.io |
 | bytes | 1.11.1 | MIT | crates.io |
@@ -219,7 +219,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | jni-sys | 0.4.1 | MIT OR Apache-2.0 | crates.io |
 | jni-sys-macros | 0.4.1 | MIT OR Apache-2.0 | crates.io |
 | jobserver | 0.1.34 | MIT OR Apache-2.0 | crates.io |
-| js-sys | 0.3.98 | MIT OR Apache-2.0 | crates.io |
+| js-sys | 0.3.99 | MIT OR Apache-2.0 | crates.io |
 | kurbo | 0.13.1 | Apache-2.0 OR MIT | crates.io |
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 | crates.io |
 | leb128fmt | 0.1.0 | MIT OR Apache-2.0 | crates.io |
@@ -443,15 +443,15 @@ This file documents third-party Rust crate licenses used by this workspace.
 | wasi | 0.11.1+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | wasip2 | 1.0.3+wasi-0.2.9 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | wasip3 | 0.4.0+wasi-0.3.0-rc-2026-01-06 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
-| wasm-bindgen | 0.2.121 | MIT OR Apache-2.0 | crates.io |
-| wasm-bindgen-futures | 0.4.71 | MIT OR Apache-2.0 | crates.io |
-| wasm-bindgen-macro | 0.2.121 | MIT OR Apache-2.0 | crates.io |
-| wasm-bindgen-macro-support | 0.2.121 | MIT OR Apache-2.0 | crates.io |
-| wasm-bindgen-shared | 0.2.121 | MIT OR Apache-2.0 | crates.io |
+| wasm-bindgen | 0.2.122 | MIT OR Apache-2.0 | crates.io |
+| wasm-bindgen-futures | 0.4.72 | MIT OR Apache-2.0 | crates.io |
+| wasm-bindgen-macro | 0.2.122 | MIT OR Apache-2.0 | crates.io |
+| wasm-bindgen-macro-support | 0.2.122 | MIT OR Apache-2.0 | crates.io |
+| wasm-bindgen-shared | 0.2.122 | MIT OR Apache-2.0 | crates.io |
 | wasm-encoder | 0.244.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | wasm-metadata | 0.244.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | wasmparser | 0.244.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
-| web-sys | 0.3.98 | MIT OR Apache-2.0 | crates.io |
+| web-sys | 0.3.99 | MIT OR Apache-2.0 | crates.io |
 | web-time | 1.1.0 | MIT OR Apache-2.0 | crates.io |
 | webpki-root-certs | 1.0.7 | CDLA-Permissive-2.0 | crates.io |
 | webpki-roots | 0.26.11 | CDLA-Permissive-2.0 | crates.io |
