@@ -8,14 +8,14 @@
 - Execution window: whole issue
 - Current task: PR delivery for Tasks 1.1 through 3.2
 - Next task: Task 4.1 release `nils-cli` `0.17.0` after PR merge
-- Last updated: 2026-05-22 19:17 Asia/Taipei
-- Branch/commit/PR: `feat/issue-439-gh-checks-compat`; PR not opened yet
+- Last updated: 2026-05-22 19:29 Asia/Taipei
+- Branch/commit/PR: `feat/issue-439-gh-checks-compat`; PR
+  [#440](https://github.com/sympoies/nils-cli/pull/440)
 - Source document:
   docs/plans/forge-cli-gh-292-checks/forge-cli-gh-292-checks-plan.md
 - Direct source-doc execution waiver: not applicable
 
-<details>
-<summary>Full task ledger</summary>
+## Task Ledger
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
@@ -28,8 +28,6 @@
 | Task 3.2 | done | Run full local gate | `bash scripts/ci/nils-cli-checks-entrypoint.sh` pass | Includes nextest 3484/3484 and workspace doc tests. |
 | Task 4.1 | pending | Cut nils-cli 0.17.0 | Planned: standard release workflow; `forge-cli --version`; `gh release view v0.17.0 --repo sympoies/nils-cli` | Release only after merged fix and green gates. |
 | Task 4.2 | pending | Record downstream handoff | Planned: comment on `graysurf/agent-runtime-kit` issue #26 | Downstream owns skill floor/backlog update after release evidence exists. |
-
-</details>
 
 ## Validation
 
@@ -57,6 +55,8 @@
   spec after docs edits; fixed with `rumdl fmt`.
 - `fix-now`: plan-bundle gate required the new execution state to include
   `Source document`; fixed in this ledger.
+- `fix-now`: remote CI found MD033 inline HTML in this execution-state ledger;
+  replaced the collapsible ledger with pure Markdown.
 
 ## Blockers
 
@@ -85,3 +85,12 @@
 - Fixed two small local gate issues: markdown table alignment and missing
   execution-state `Source document`.
 - Next: commit, open PR, run mandatory specialist review and remote checks.
+
+### 2026-05-22 19:29 Asia/Taipei
+
+- Opened draft PR
+  [#440](https://github.com/sympoies/nils-cli/pull/440)
+  for Tasks 1.1 through 3.2.
+- Remote CI exposed strict markdown lint failure on this execution-state file
+  (`MD033` for `<details>/<summary>`); fixed by converting the ledger to plain
+  Markdown.
