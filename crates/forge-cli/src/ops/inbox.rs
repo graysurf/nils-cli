@@ -338,14 +338,18 @@ impl QueryConfig {
     }
 
     /// Whether at least one selected GitLab query family needs the user
-    /// identity (review filters by `reviewer_username`, authored filters by
-    /// `author_id`). Identity lookup is skipped when no remaining query needs
-    /// it, including when item-type filtering has pruned away the dependent
-    /// families.
+    /// identity. Review filters by `reviewer_username`, so it needs identity
+    /// only when PR-class results are allowed (review queries are MR-only).
+    /// Authored filters by `author_id` and exists for both MR and issue, so it
+    /// needs identity whenever it is selected (`--item-type` always allows at
+    /// least one of `pr` / `issue`).
+    ///
+    /// Invariant locked by `gitlab_identity_predicate_matches_query_plan`:
+    /// this predicate must equal `gitlab_queries(_, None, self)` losing at
+    /// least one query family relative to `gitlab_queries(_, Some(_), self)`.
     fn gitlab_identity_needed(&self) -> bool {
         let review_needs = self.wants(InboxKindFlag::Review) && self.allows_pr();
-        let authored_needs =
-            self.wants(InboxKindFlag::Authored) && (self.allows_pr() || self.allows_issue());
+        let authored_needs = self.wants(InboxKindFlag::Authored);
         review_needs || authored_needs
     }
 }
@@ -910,20 +914,26 @@ fn parse_gitlab_items(
 }
 
 fn classify_gitlab_todo(raw: &serde_json::Value) -> TodoTarget {
+    // `target_type` is the authoritative field on the GitLab todos API; trust
+    // it whenever present.
     if let Some(t) = optional_str(raw, "target_type") {
         match t.as_str() {
             "MergeRequest" => return TodoTarget::MergeRequest,
             "Issue" => return TodoTarget::Issue,
-            _ => {}
+            _ => return TodoTarget::Unknown,
         }
     }
+    // Fallback for payloads without `target_type` (older stubs / unusual
+    // responses): only accept canonical GitLab path segments (`/-/issues/`,
+    // `/-/merge_requests/`) so loose substrings on foreign hosts cannot
+    // misclassify.
     let url = optional_str(raw, "target_url")
         .or_else(|| raw.get("target").and_then(|t| optional_str(t, "web_url")));
     if let Some(url) = url {
-        if url.contains("/merge_requests/") {
+        if url.contains("/-/merge_requests/") {
             return TodoTarget::MergeRequest;
         }
-        if url.contains("/-/issues/") || url.contains("/issues/") {
+        if url.contains("/-/issues/") {
             return TodoTarget::Issue;
         }
     }
@@ -1535,6 +1545,207 @@ mod tests {
             collection.warnings[0].starts_with("provider_failed: gitlab"),
             "warning order must follow target order: {:?}",
             collection.warnings
+        );
+    }
+
+    /// Invariant: `gitlab_identity_needed` must agree with the actual query
+    /// plan. Whenever the predicate returns `true`, `gitlab_queries(_, None,
+    /// config)` must drop at least one query that `gitlab_queries(_,
+    /// Some(_), config)` would have produced. Whenever it returns `false`,
+    /// both plans must be identical.
+    #[test]
+    fn gitlab_identity_predicate_matches_query_plan() {
+        let host = "gitlab.example.com";
+        let id = GitlabIdentity {
+            id: "1".into(),
+            username: "u".into(),
+        };
+        let kinds = [
+            InboxKindFlag::Review,
+            InboxKindFlag::Assigned,
+            InboxKindFlag::Todo,
+            InboxKindFlag::Authored,
+            InboxKindFlag::Involved,
+        ];
+        let item_types = [
+            InboxItemTypeFlag::All,
+            InboxItemTypeFlag::Pr,
+            InboxItemTypeFlag::Issue,
+        ];
+        // Cover every non-empty subset of kinds crossed with every item type.
+        for mask in 1u32..(1 << kinds.len()) {
+            let selected: Vec<InboxKindFlag> = kinds
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, k)| *k)
+                .collect();
+            for item_type in item_types {
+                let config = QueryConfig::new(selected.clone(), item_type, 30);
+                let without = gitlab_queries(host, None, &config).len();
+                let with = gitlab_queries(host, Some(&id), &config).len();
+                if config.gitlab_identity_needed() {
+                    assert!(
+                        with > without,
+                        "predicate=true but plans match: kinds={:?} item_type={:?}",
+                        selected,
+                        item_type
+                    );
+                } else {
+                    assert_eq!(
+                        with, without,
+                        "predicate=false but plans differ: kinds={:?} item_type={:?}",
+                        selected, item_type
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classify_gitlab_todo_rejects_foreign_host_paths() {
+        // No target_type, URL is a foreign host that happens to contain
+        // `/issues/` as a substring — must classify as Unknown so PR/issue-only
+        // filters do not surface it.
+        let raw = serde_json::json!({
+            "target_url": "https://customer.example.com/team/issues/42",
+            "target": {
+                "iid": 42,
+                "web_url": "https://customer.example.com/team/issues/42",
+            },
+        });
+        assert_eq!(classify_gitlab_todo(&raw), TodoTarget::Unknown);
+    }
+
+    #[test]
+    fn classify_gitlab_todo_accepts_canonical_gitlab_paths() {
+        let issue = serde_json::json!({
+            "target": {"web_url": "https://gitlab.example.com/team/api/-/issues/32"},
+        });
+        assert_eq!(classify_gitlab_todo(&issue), TodoTarget::Issue);
+        let mr = serde_json::json!({
+            "target_url": "https://gitlab.example.com/team/api/-/merge_requests/77",
+        });
+        assert_eq!(classify_gitlab_todo(&mr), TodoTarget::MergeRequest);
+    }
+
+    #[test]
+    fn classify_gitlab_todo_unknown_target_type_returns_unknown() {
+        // Explicit unfamiliar `target_type` (e.g. `DesignManagement::Design`)
+        // must short-circuit to Unknown without falling back to URL guessing.
+        let raw = serde_json::json!({
+            "target_type": "DesignManagement::Design",
+            "target_url": "https://gitlab.example.com/team/api/-/issues/9",
+        });
+        assert_eq!(classify_gitlab_todo(&raw), TodoTarget::Unknown);
+    }
+
+    #[test]
+    fn inbox_empty_query_plan_returns_success_without_identity_call() {
+        // `--kind review --item-type issue`: review is MR-only (dropped under
+        // item-type=issue), so GitLab ends up with zero query families and
+        // identity lookup is skipped. The provider must still return ok.
+        struct AssertNoIdentityRunner;
+        impl BackendRunner for AssertNoIdentityRunner {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                let argv = call.plan_argv().join(" ");
+                assert!(
+                    !argv.contains("api user --hostname"),
+                    "identity lookup must not be issued: {argv}"
+                );
+                Ok(BackendSuccess {
+                    stdout: "[]".into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let target = ProviderTarget {
+            provider: Provider::GitLab,
+            host: "gitlab.example.com".into(),
+        };
+        let config = QueryConfig::new(vec![InboxKindFlag::Review], InboxItemTypeFlag::Issue, 30);
+        let result =
+            execute_gitlab(&AssertNoIdentityRunner, &target, &config).expect("execute_gitlab");
+        assert!(result.items.is_empty());
+        assert!(!result.limited);
+    }
+
+    #[test]
+    fn inbox_partial_within_provider_failure_rolls_provider_up_as_failed() {
+        // One GitHub query family succeeds; another fails. The provider as a
+        // whole must surface a backend_error and the failing-provider warning
+        // must follow target order.
+        struct OneQueryFailsRunner;
+        impl BackendRunner for OneQueryFailsRunner {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                let argv = call.plan_argv().join(" ");
+                if argv.contains("--review-requested") {
+                    Err(ForgeError::backend_error(
+                        schema_err(),
+                        "boom",
+                        Some("stderr".into()),
+                    ))
+                } else {
+                    Ok(BackendSuccess {
+                        stdout: "[]".into(),
+                        stderr: String::new(),
+                    })
+                }
+            }
+        }
+        let targets = vec![ProviderTarget {
+            provider: Provider::GitHub,
+            host: "github.com".into(),
+        }];
+        let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
+        let err = collect_inbox(&OneQueryFailsRunner, &targets, &config)
+            .expect_err("must fail when only provider failed");
+        assert_eq!(err.kind(), "backend_error");
+    }
+
+    /// Within a single provider, plan-order error determinism: even if a
+    /// later-planned query fails fast and an earlier-planned query fails
+    /// slowly, the surfaced error must be the earlier-planned one.
+    #[test]
+    fn inbox_within_provider_error_follows_plan_order_not_completion_order() {
+        struct PlanOrderRunner;
+        impl BackendRunner for PlanOrderRunner {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                let argv = call.plan_argv().join(" ");
+                // Plan order for default GitHub: review-requested, assigned-prs,
+                // assigned-issues, authored-prs, authored-issues.
+                // Make the EARLIER one fail slow, the LATER one fail fast.
+                if argv.contains("--review-requested") {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    Err(ForgeError::backend_error(
+                        schema_err(),
+                        "slow-early-error",
+                        Some(String::new()),
+                    ))
+                } else if argv.contains("--author") && argv.contains("issues") {
+                    Err(ForgeError::backend_error(
+                        schema_err(),
+                        "fast-late-error",
+                        Some(String::new()),
+                    ))
+                } else {
+                    Ok(BackendSuccess {
+                        stdout: "[]".into(),
+                        stderr: String::new(),
+                    })
+                }
+            }
+        }
+        let target = ProviderTarget {
+            provider: Provider::GitHub,
+            host: "github.com".into(),
+        };
+        let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
+        let err = execute_github(&PlanOrderRunner, &target, &config)
+            .expect_err("must propagate first plan-order error");
+        assert!(
+            err.to_string().contains("slow-early-error"),
+            "expected earlier-planned (slow) error to win, got: {err}"
         );
     }
 }
