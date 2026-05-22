@@ -8,10 +8,14 @@ Usage:
 
 Options:
   --version X.Y.Z         Required. Accepts vX.Y.Z and normalizes to X.Y.Z.
-  --skip-checks           Skip full lint/tests; refresh Cargo.lock then run locked cargo check.
-  --ci-gate-main          Require CI gate on main; fail if gate conditions are not met.
+  --full-checks           Run the full local audit stack (nils-cli-verify-required-checks.sh)
+                          before commit; opt-in (slow). Default skips local audit and trusts CI.
+  --skip-checks           Deprecated alias of the new default (locked cargo check only).
+  --ci-gate-main          Require CI gate on main (pre-bump check): fail if the prior
+                          origin/main commit's ci.yml run is not green.
   --skip-readme           Do not update README release tag examples.
   --skip-push             Do not push commit or tag to origin (also disables tap stage).
+  --skip-ci-wait          Do not wait for ci.yml on the bump commit before the tap stage.
   --allow-dirty           Allow dirty release-managed files only.
   --force-tag             Delete existing local/remote tag before re-tagging.
   --tap-dir <path>        Path to homebrew-tap work tree (overrides env + convention).
@@ -27,8 +31,13 @@ Options:
   -h, --help              Show help.
 
 Default behavior:
-  Without --skip-checks/--ci-gate-main, the script first tries CI gate on main.
-  If CI gate is unavailable, it falls back to full release checks.
+  Local checks are minimal: refresh Cargo.lock, regenerate third-party artifacts,
+  then run `cargo check --workspace --locked`. The full audit stack (clippy, nextest,
+  zsh completion, docs/audit scripts) runs on CI for every push — the bump commit
+  itself triggers ci.yml, and the tap stage waits for that run to be green before
+  bumping the homebrew formula. Use --full-checks to run the full audit locally
+  (slow); use --skip-ci-wait to fire-and-forget without gating on the bump commit's
+  ci.yml run.
 
   After tagging the nils-cli release, the tap stage is run automatically when:
     - --skip-push is NOT set, AND
@@ -675,10 +684,12 @@ upgrade_local_brew_install() {
 # === Argument parsing ========================================================
 
 version=""
-skip_checks=0
+full_checks=0
+skip_checks=0  # backward-compat alias of new default; tracked for usage notes only
 ci_gate_main=0
 skip_readme=0
 skip_push=0
+skip_ci_wait=0
 allow_dirty=0
 force_tag=0
 tap_dir_arg=""
@@ -699,6 +710,10 @@ while [[ $# -gt 0 ]]; do
       version="${2:-}"
       shift 2
       ;;
+    --full-checks)
+      full_checks=1
+      shift
+      ;;
     --skip-checks)
       skip_checks=1
       shift
@@ -713,6 +728,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-push)
       skip_push=1
+      shift
+      ;;
+    --skip-ci-wait)
+      skip_ci_wait=1
       shift
       ;;
     --allow-dirty)
@@ -854,23 +873,16 @@ else
   assert_allow_dirty_only_release_managed
 fi
 
-if [[ "$skip_checks" -eq 0 ]]; then
-  if [[ "$ci_gate_main" -eq 1 ]]; then
-    if check_ci_gate_main; then
-      note "main CI is green: ${ci_gate_main_url}"
-      skip_checks=1
-    else
-      die "--ci-gate-main requirement failed: ${ci_gate_main_error}"
-    fi
+if [[ "$ci_gate_main" -eq 1 ]]; then
+  if check_ci_gate_main; then
+    note "main CI is green: ${ci_gate_main_url}"
   else
-    if check_ci_gate_main; then
-      note "main CI is green: ${ci_gate_main_url}"
-      note "using CI gate result; skipping full release checks"
-      skip_checks=1
-    else
-      note "CI gate unavailable (${ci_gate_main_error}); running full release checks"
-    fi
+    die "--ci-gate-main requirement failed: ${ci_gate_main_error}"
   fi
+fi
+
+if [[ "$skip_checks" -eq 1 && "$full_checks" -eq 0 ]]; then
+  note "--skip-checks is a deprecated alias of the new default (locked cargo check only); ignoring"
 fi
 
 python3 - "$version" <<'PY'
@@ -1020,21 +1032,21 @@ PY
 fi
 
 checks_script="$repo_root/.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh"
-if [[ "$skip_checks" -eq 0 ]]; then
-  refresh_lockfile
-  # Keep third-party artifacts aligned before strict audits (which include drift checks).
-  refresh_third_party_artifacts_if_present
+refresh_lockfile
+# Keep third-party artifacts aligned with the new lockfile; CI re-audits drift on the bump commit.
+refresh_third_party_artifacts_if_present
 
+if [[ "$full_checks" -eq 1 ]]; then
   if [[ ! -f "$checks_script" ]]; then
     die "missing checks script: $checks_script"
   fi
   checks_runner="${NILS_CLI_TEST_RUNNER:-nextest}"
   if [[ -z "${NILS_CLI_TEST_RUNNER:-}" ]]; then
-    note "NILS_CLI_TEST_RUNNER not set; defaulting to nextest for release checks"
+    note "NILS_CLI_TEST_RUNNER not set; defaulting to nextest for --full-checks"
   fi
   NILS_CLI_TEST_RUNNER="$checks_runner" "$checks_script"
 else
-  refresh_lockfile_and_verify_locked
+  verify_workspace_locked
 fi
 
 # Re-run artifact generation after checks in case lockfile changed during the check flow.
@@ -1095,6 +1107,20 @@ if [[ "$skip_push" -eq 0 ]]; then
 fi
 
 note "release tag ${tag} created"
+
+# === Wait for ci.yml on the bump commit (default safety gate) ===============
+
+if [[ "$skip_push" -eq 0 && "$skip_ci_wait" -eq 0 ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    warn "gh not on PATH; skipping ci.yml wait on bump commit"
+  elif [[ -z "$source_repo_slug" || "$source_repo_slug" == *"/"*"/"* ]]; then
+    warn "could not determine source repo slug; skipping ci.yml wait"
+  else
+    bump_sha="$(git rev-parse --verify HEAD)"
+    note "waiting for ${source_repo_slug} ci.yml on bump commit ${bump_sha}"
+    wait_for_release_run "$source_repo_slug" "ci.yml" "$bump_sha" "${NILS_CLI_CI_WAIT_SECONDS:-1800}"
+  fi
+fi
 
 # === Tap stage (auto-skipped when --skip-push or unable to resolve tap) =====
 

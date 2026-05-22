@@ -29,14 +29,22 @@ Inputs:
 - Required:
   - `--version X.Y.Z` (accepts `vX.Y.Z` and normalizes to `X.Y.Z`)
 - Optional (existing nils-cli stage):
-  - `--skip-checks` (skip full lint/tests; refreshes `Cargo.lock` then runs `cargo check --workspace --locked`)
-  - `--ci-gate-main` (strict mode: require CI gate on `main`; fail when gate conditions are not met)
+  - `--full-checks` (opt-in: run the full local audit stack via `nils-cli-verify-required-checks.sh`
+    before commit; slow — only needed for paranoid releases such as toolchain or major dep bumps)
+  - `--skip-checks` (deprecated alias of the new default; tolerated for backward-compat callers
+    and emits an info note)
+  - `--ci-gate-main` (pre-bump strict gate: require the prior `origin/main` commit's `ci.yml` to be
+    green; fail when gate conditions are not met)
   - `--skip-readme` (do not update README release tag example)
-  - `--skip-push` (do not push commit or tag to `origin`; **also disables the tap stage**)
+  - `--skip-push` (do not push commit or tag to `origin`; **also disables the tap stage and the
+    bump-commit ci.yml wait**)
+  - `--skip-ci-wait` (do not wait for `ci.yml` on the bump commit before the tap stage; fire-and-forget)
   - `--allow-dirty` (allow dirty release-managed files only: Cargo manifests, `Cargo.lock`,
     root `README.md`, and tracked third-party artifacts; fail on other dirty paths)
   - `--force-tag` (delete existing local/remote tag before re-tagging)
-  - `NILS_CLI_TEST_RUNNER=cargo|nextest` (environment variable; default is `nextest` in this release script)
+  - `NILS_CLI_TEST_RUNNER=cargo|nextest` (environment variable; default is `nextest` in this release script;
+    only consulted when `--full-checks` is active)
+  - `NILS_CLI_CI_WAIT_SECONDS` (env var; max seconds to wait for the bump commit's `ci.yml`, default 1800)
 - Optional (tap stage):
   - `--tap-dir <path>` (overrides env + convention resolution)
   - `--skip-tap` (skip the tap stage entirely)
@@ -51,11 +59,19 @@ Inputs:
   - `NILS_CLI_RELEASE_WAIT_SECONDS` (env var; max seconds to wait for source `release.yml`, default 1200)
   - `NILS_CLI_TAP_WAIT_SECONDS` (env var; max seconds to wait for tap `release.yml`, default 1200)
 
-Default check selection (no `--skip-checks` and no `--ci-gate-main`):
+Default check selection (no `--full-checks` and no `--ci-gate-main`):
 
-- First try CI gate conditions (`main`, `HEAD == origin/main`, green `ci.yml` run).
-- If CI gate passes, refresh `Cargo.lock` and run `cargo check --workspace --locked`.
-- If CI gate does not pass, run full release checks via `nils-cli-verify-required-checks.sh`.
+- Refresh `Cargo.lock` via `cargo generate-lockfile`.
+- Regenerate tracked third-party artifacts so they match the new lockfile (CI's drift audit will
+  reject mismatches on the bump commit).
+- Run `cargo check --workspace --locked` to catch lockfile/compile breaks locally.
+- No `ci.yml` query before bump — the safety net is the post-push `ci.yml` wait on the bump commit
+  itself (see Workflow below).
+
+Use `--full-checks` to additionally run the full audit stack locally
+(`nils-cli-verify-required-checks.sh`: clippy, nextest, zsh completion, all CI audit scripts).
+Use `--ci-gate-main` to additionally require that the prior `origin/main` commit's `ci.yml` was
+green before tagging.
 
 Default tap stage activation:
 
@@ -72,13 +88,13 @@ Outputs (nils-cli stage):
 - Pins workspace crate-to-crate `path` dependencies to the target version (and adds `version = "X.Y.Z"` when missing).
 - If manifests are already at target version, treats version bump as idempotent and continues.
 - Updates README release tag examples (unless `--skip-readme`).
-- Selects check mode in this order: strict CI gate (`--ci-gate-main`) or auto CI gate attempt, then full checks fallback.
-- Refreshes `Cargo.lock` via `cargo generate-lockfile` and then validates via `cargo check --workspace --locked` (CI-gated/skip-check path), or uses the full checks script.
+- Refreshes `Cargo.lock` via `cargo generate-lockfile` and validates via `cargo check --workspace --locked`. With `--full-checks`, additionally runs the full audit stack via `nils-cli-verify-required-checks.sh`.
 - Automatically disables an incompatible `RUSTC_WRAPPER` (for example a broken `sccache` wrapper) before running release cargo commands.
-- Regenerates tracked third-party artifacts (`THIRD_PARTY_LICENSES.md`, `THIRD_PARTY_NOTICES.md`) before strict full-check audits and again before commit.
-- Runs full release checks through `nils-cli-verify-required-checks.sh` with `NILS_CLI_TEST_RUNNER=nextest` by default (unless overridden).
+- Regenerates tracked third-party artifacts (`THIRD_PARTY_LICENSES.md`, `THIRD_PARTY_NOTICES.md`) so the bump commit matches CI's drift audit, then refreshes them again before commit.
+- Runs `nils-cli-verify-required-checks.sh` with `NILS_CLI_TEST_RUNNER=nextest` by default (only under `--full-checks`).
 - Creates a semantic commit for the version bump.
 - Creates an annotated tag `vX.Y.Z` and (unless `--skip-push`) pushes commit + tag to `origin`.
+- Unless `--skip-ci-wait`, waits for the source repo's `ci.yml` run on the bump commit to complete `success` before the tap stage (default 1800s; configurable via `NILS_CLI_CI_WAIT_SECONDS`). This is the primary safety gate that replaces the old local audit fallback.
 - GitHub Release artifacts are built by `.github/workflows/release.yml` and include all workspace `bin` targets (auto-discovered via `scripts/workspace-bins.sh`).
 
 Outputs (tap stage):
@@ -108,9 +124,10 @@ Failure modes:
   `--allow-dirty`.
 - Tag already exists without `--force-tag`.
 - Required commands missing (`git`, `python3`, `cargo`, `semantic-commit`, `git-scope`).
-- `cargo-nextest` missing while default check path (`nextest`) is active.
+- `cargo-nextest` missing while `--full-checks` is active with the default `nextest` runner.
 - Strict `--ci-gate-main` requested but CI gate conditions are not met (`main`, `HEAD == origin/main`, green CI run, `gh` available).
-- Release checks or `cargo check` fail.
+- `--full-checks` audit stack or `cargo check` fail.
+- Bump-commit `ci.yml` wait fails (non-success conclusion or exceeds `NILS_CLI_CI_WAIT_SECONDS`); use `--skip-ci-wait` only if you accept tap formula bump without that verification.
 - Commit or tag creation fails.
 - Tap stage failures (only when the tap stage runs):
   - `--tap-dir` or `NILS_CLI_HOMEBREW_TAP_DIR` set but does not resolve to a git work tree.
@@ -134,13 +151,13 @@ Failure modes:
 - Probe `RUSTC_WRAPPER` and disable it when it is incompatible with the active `rustc`.
 - `--from-tap` shortcut: skip nils-cli bump+tag and jump to the tap stage.
 - nils-cli stage:
+  - Optional pre-bump strict gate: `--ci-gate-main` requires the prior `origin/main` commit's `ci.yml` to be green (otherwise dies).
   - Bump workspace + crate versions and update README.
-  - Run checks with CI-gate-first logic:
-    - `--skip-checks`: refresh `Cargo.lock`; run `cargo check --workspace --locked`.
-    - `--ci-gate-main`: require CI gate; then refresh `Cargo.lock`; run `cargo check --workspace --locked`.
-    - default: try CI gate first; if unavailable, refresh `Cargo.lock`, regenerate third-party artifacts, then run full checks (`nils-cli-verify-required-checks.sh`).
+  - Refresh `Cargo.lock`, regenerate tracked third-party artifacts, then run `cargo check --workspace --locked`.
+  - With `--full-checks`, additionally run the full local audit stack via `nils-cli-verify-required-checks.sh`.
   - Regenerate tracked third-party artifacts again before commit to keep release/CI artifacts in sync.
-  - Commit with `semantic-commit`, tag `vX.Y.Z`, and push to trigger the source `release.yml`.
+  - Commit with `semantic-commit`, tag `vX.Y.Z`, and push to trigger the source `release.yml` and `ci.yml`.
+  - Unless `--skip-ci-wait`, wait for `ci.yml` on the bump commit to reach `completed success` before entering the tap stage; this is the canonical safety gate (use `NILS_CLI_CI_WAIT_SECONDS` to tune the timeout).
 - Tap stage (auto-skipped on `--skip-push` / `--skip-tap` / unresolved tap dir):
   - Verify tap is on clean `main`; fetch `--no-tags` and fast-forward.
   - Wait for source `release.yml` on `vX.Y.Z` to reach `completed success`.

@@ -309,7 +309,7 @@ test_full_checks_refresh_lockfile_and_disable_bad_wrapper() {
     PATH="${bin_dir}:$PATH" \
       MOCK_LOG="$log_file" \
       RUSTC_WRAPPER="bad-wrapper" \
-      "$entrypoint" --version v0.6.5 --skip-push
+      "$entrypoint" --version v0.6.5 --full-checks --skip-push
   ) >"${tmp}/stdout.log" 2>"${stderr_file}"
 
   local order_file="${tmp}/order.log"
@@ -322,6 +322,68 @@ test_full_checks_refresh_lockfile_and_disable_bad_wrapper() {
 
   git -C "$repo" rev-parse -q --verify "refs/tags/v0.6.5" >/dev/null \
     || fail "expected tag v0.6.5 to exist"
+}
+
+test_default_path_skips_full_audit_and_runs_locked_check() {
+  local tmp repo bin_dir log_file stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  bin_dir="${tmp}/bin"
+  log_file="${tmp}/mock.log"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_cargo "$bin_dir"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_LOG="$log_file" \
+      "$entrypoint" --version v0.6.5 --skip-push
+  ) >"${tmp}/stdout.log" 2>"${stderr_file}"
+
+  assert_contains "$log_file" 'cargo:generate-lockfile'
+  assert_contains "$log_file" 'cargo:check --workspace --locked'
+  # Full audit stack must NOT run in the new default path.
+  if rg -q 'checks:start' "$log_file"; then
+    fail "default path unexpectedly ran the full audit stack"
+  fi
+
+  git -C "$repo" rev-parse -q --verify "refs/tags/v0.6.5" >/dev/null \
+    || fail "expected tag v0.6.5 to exist"
+}
+
+test_skip_checks_is_deprecated_alias_of_default() {
+  local tmp repo bin_dir log_file stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  bin_dir="${tmp}/bin"
+  log_file="${tmp}/mock.log"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_cargo "$bin_dir"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_LOG="$log_file" \
+      "$entrypoint" --version v0.6.5 --skip-checks --skip-push
+  ) >"${tmp}/stdout.log" 2>"${stderr_file}"
+
+  assert_contains "$stderr_file" '--skip-checks is a deprecated alias'
+  assert_contains "$log_file" 'cargo:check --workspace --locked'
+  if rg -q 'checks:start' "$log_file"; then
+    fail "--skip-checks unexpectedly ran the full audit stack"
+  fi
 }
 
 test_readme_already_at_target_is_not_warned() {
@@ -680,6 +742,8 @@ if [[ ! -f "$entrypoint" ]]; then
 fi
 
 test_full_checks_refresh_lockfile_and_disable_bad_wrapper
+test_default_path_skips_full_audit_and_runs_locked_check
+test_skip_checks_is_deprecated_alias_of_default
 test_readme_already_at_target_is_not_warned
 test_allow_dirty_rejects_non_release_managed_paths
 test_skip_push_skips_tap_stage_with_note
