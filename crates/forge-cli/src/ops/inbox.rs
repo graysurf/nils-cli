@@ -773,10 +773,10 @@ fn parse_gitlab_todo(
             .or_else(|| optional_str(raw, "updated_at"))
             .or_else(|| optional_str(raw, "created_at"))
             .unwrap_or_default(),
-        author: raw
+        author: target_obj
             .get("author")
             .and_then(gitlab_author_from_value)
-            .or_else(|| target_obj.get("author").and_then(gitlab_author_from_value)),
+            .or_else(|| raw.get("author").and_then(gitlab_author_from_value)),
         source: query.source,
     })
 }

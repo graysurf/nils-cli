@@ -96,7 +96,7 @@ EOF
     ;;
   *"todos"*"state=pending"*)
     cat <<'EOF'
-[{"id":55,"body":"todo body","created_at":"2026-05-22T06:00:00Z","target_url":"https://gitlab.example.com/team/api/-/issues/32","target":{"iid":32,"title":"Todo issue","web_url":"https://gitlab.example.com/team/api/-/issues/32","updated_at":"2026-05-22T06:30:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"},"author":{"username":"frank"}}]
+[{"id":55,"body":"todo body","created_at":"2026-05-22T06:00:00Z","target_url":"https://gitlab.example.com/team/api/-/issues/32","target":{"iid":32,"title":"Todo issue","web_url":"https://gitlab.example.com/team/api/-/issues/32","updated_at":"2026-05-22T06:30:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"},"author":{"username":"notifier"}}]
 EOF
     ;;
   *)
@@ -165,6 +165,12 @@ fn inbox_gitlab_passes_hostname_and_normalizes_api_rows() {
     assert_eq!(env["data"]["items"][0]["kind"], "review");
     assert_eq!(env["data"]["items"][0]["repo"], "team/api");
     assert_eq!(env["data"]["items"][0]["source"], "gitlab_merge_requests");
+    let items = env["data"]["items"].as_array().expect("items");
+    let todo = items
+        .iter()
+        .find(|item| item["title"] == "Todo issue")
+        .expect("todo item");
+    assert_eq!(todo["author"], "frank");
 }
 
 #[test]
