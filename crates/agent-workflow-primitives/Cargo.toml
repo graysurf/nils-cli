@@ -1,6 +1,6 @@
 [package]
 name = "nils-agent-workflow-primitives"
-version = "0.17.1"
+version = "0.17.2"
 edition.workspace = true
 license.workspace = true
 
@@ -54,15 +54,15 @@ path = "src/bin/test-first-evidence.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-agent-out = { version = "0.17.1", path = "../agent-out" }
-nils-common = { version = "0.17.1", path = "../nils-common", package = "nils-common" }
-nils-term = { version = "0.17.1", path = "../nils-term", package = "nils-term" }
+nils-agent-out = { version = "0.17.2", path = "../agent-out" }
+nils-common = { version = "0.17.2", path = "../nils-common", package = "nils-common" }
+nils-term = { version = "0.17.2", path = "../nils-term", package = "nils-term" }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 
 [dev-dependencies]
-nils-test-support = { version = "0.17.1", path = "../nils-test-support" }
+nils-test-support = { version = "0.17.2", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
