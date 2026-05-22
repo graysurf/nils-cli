@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `56b2d283fba24d94b41c14aa450c7e5ce9ec774a10b26f89f5c680aec6e294aa`
+- Cargo.lock SHA256: `1d5a5785c658243cda2542b84837af6d77d59e2ab1962c1cc676ccd780a11188`
 - Third-party crates (`source != null`): 465
 - Workspace crates (`source == null`, excluded below): 31
 
@@ -74,7 +74,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | async-task | 4.7.1 | Apache-2.0 OR MIT | crates.io |
 | async-trait | 0.1.89 | MIT OR Apache-2.0 | crates.io |
 | atomic-waker | 1.1.2 | Apache-2.0 OR MIT | crates.io |
-| autocfg | 1.5.0 | Apache-2.0 OR MIT | crates.io |
+| autocfg | 1.5.1 | Apache-2.0 OR MIT | crates.io |
 | aws-lc-rs | 1.17.0 | ISC AND (Apache-2.0 OR ISC) | crates.io |
 | aws-lc-sys | 0.41.0 | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | crates.io |
 | base64 | 0.22.1 | MIT OR Apache-2.0 | crates.io |
@@ -348,7 +348,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | serde | 1.0.228 | MIT OR Apache-2.0 | crates.io |
 | serde_core | 1.0.228 | MIT OR Apache-2.0 | crates.io |
 | serde_derive | 1.0.228 | MIT OR Apache-2.0 | crates.io |
-| serde_json | 1.0.149 | MIT OR Apache-2.0 | crates.io |
+| serde_json | 1.0.150 | MIT OR Apache-2.0 | crates.io |
 | serde_repr | 0.1.20 | MIT OR Apache-2.0 | crates.io |
 | serde_spanned | 1.1.1 | MIT OR Apache-2.0 | crates.io |
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 | crates.io |
