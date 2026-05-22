@@ -196,6 +196,53 @@ esac
 }
 
 #[test]
+fn pr_checks_nonzero_pending_stdout_is_still_parsed() {
+    let stub = StubEnv::new().gh_stub(&format!(
+        r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr checks")
+    case " $* " in
+      *" --required "*)
+        echo "no required checks reported on the 'feat/example' branch" >&2
+        exit 1
+        ;;
+      *)
+        cat <<'EOF'
+{all_json}
+EOF
+        exit 8
+        ;;
+    esac
+    ;;
+  *)
+    echo "stub: unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+        all_json = FIXTURE_ALL_PENDING,
+    ));
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "1",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["required_count"], 0);
+    assert_eq!(env["data"]["success_count"], 0);
+    assert_eq!(env["data"]["checks"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn pr_checks_dry_run_renders_plan_with_json_fields() {
     // Dry-run does not invoke the backend; the stub should never fire.
     let stub = StubEnv::new().gh_stub("#!/bin/sh\necho 'should not run' >&2\nexit 77\n");

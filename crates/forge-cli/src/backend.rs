@@ -100,9 +100,30 @@ pub struct BackendSuccess {
     pub stderr: String,
 }
 
+/// Raw subprocess outcome. Some backend commands, notably `gh pr checks`,
+/// can return useful machine-readable stdout while exiting non-zero for
+/// pending or missing checks. Callers that understand those command-specific
+/// statuses can opt into this shape.
+#[derive(Debug, Clone)]
+pub struct BackendOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub status_success: bool,
+    pub exit_code: i32,
+}
+
 /// Runner abstraction allowing tests to inject fixtures.
 pub trait BackendRunner {
     fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError>;
+
+    fn run_raw(&self, call: &BackendCall) -> Result<BackendOutput, ForgeError> {
+        self.run(call).map(|output| BackendOutput {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            status_success: true,
+            exit_code: 0,
+        })
+    }
 }
 
 /// Production runner that actually spawns the backend.
@@ -111,6 +132,26 @@ pub struct ProcessRunner;
 
 impl BackendRunner for ProcessRunner {
     fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+        let output = self.run_raw(call)?;
+        if output.status_success {
+            return Ok(BackendSuccess {
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+        let exe = call.program.executable();
+        Err(ForgeError::backend_error(
+            schema(),
+            format!(
+                "{exe} exited with status {exit_code}",
+                exe = exe.to_string_lossy(),
+                exit_code = output.exit_code
+            ),
+            Some(output.stderr),
+        ))
+    }
+
+    fn run_raw(&self, call: &BackendCall) -> Result<BackendOutput, ForgeError> {
         let exe = call.program.executable();
         let mut cmd = Command::new(&exe);
         for arg in &call.argv {
@@ -143,18 +184,19 @@ impl BackendRunner for ProcessRunner {
         let stderr_full = String::from_utf8_lossy(&output.stderr).into_owned();
         let stderr = redact_and_tail(&stderr_full);
 
-        if output.status.success() {
-            return Ok(BackendSuccess { stdout, stderr });
-        }
+        let exit_code = output.status.code().unwrap_or(-1);
+        let status_success = output.status.success();
 
         // Distinguish "binary launched but auth failed" from a generic backend
         // error. Both `gh` and `glab` print recognisable cues on auth failure.
         let lower = stderr.to_ascii_lowercase();
-        if lower.contains("authentication required")
-            || lower.contains("not authenticated")
-            || lower.contains("could not prompt")
-            || lower.contains("auth login")
-            || lower.contains("token") && (lower.contains("invalid") || lower.contains("expired"))
+        if !status_success
+            && (lower.contains("authentication required")
+                || lower.contains("not authenticated")
+                || lower.contains("could not prompt")
+                || lower.contains("auth login")
+                || lower.contains("token")
+                    && (lower.contains("invalid") || lower.contains("expired")))
         {
             return Err(ForgeError::backend_unauthenticated(
                 schema(),
@@ -163,15 +205,12 @@ impl BackendRunner for ProcessRunner {
             ));
         }
 
-        let exit_code = output.status.code().unwrap_or(-1);
-        Err(ForgeError::backend_error(
-            schema(),
-            format!(
-                "{exe} exited with status {exit_code}",
-                exe = exe.to_string_lossy()
-            ),
-            Some(stderr),
-        ))
+        Ok(BackendOutput {
+            stdout,
+            stderr,
+            status_success,
+            exit_code,
+        })
     }
 }
 

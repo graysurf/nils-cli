@@ -191,10 +191,10 @@ fn snapshot_github<R: BackendRunner>(
     args: &PrChecksArgs,
 ) -> Result<PrChecksPayload, ForgeError> {
     let call = build_github_call(&args.id);
-    let output = runner.run(&call)?;
+    let output = run_github_checks_call(runner, &call)?;
     if args.required_only {
         let required_call = build_github_required_call(&args.id);
-        let required_output = run_required_github_call(runner, &required_call)?;
+        let required_output = run_github_checks_call(runner, &required_call)?;
         return parse_github_snapshot_with_required_output(ctx, &output, &required_output);
     }
     parse_github_snapshot(ctx, &output, false)
@@ -242,36 +242,40 @@ pub fn build_dry_run_call(ctx: &ProviderContext, args: &PrChecksArgs) -> Backend
     }
 }
 
-fn run_required_github_call<R: BackendRunner>(
+fn run_github_checks_call<R: BackendRunner>(
     runner: &R,
     call: &BackendCall,
 ) -> Result<BackendSuccess, ForgeError> {
-    match runner.run(call) {
-        Ok(output) => Ok(output),
-        Err(ForgeError::BackendError {
-            schema_version: _,
-            message,
-            detail,
-        }) if is_no_required_checks(detail.as_deref()) => Ok(BackendSuccess {
-            stdout: "[]".into(),
-            stderr: format!(
-                "{}{}",
-                message,
-                detail
-                    .as_deref()
-                    .map(|d| format!("\n{d}"))
-                    .unwrap_or_default()
-            ),
-        }),
-        Err(err) => Err(err),
+    let output = runner.run_raw(call)?;
+    if output.status_success || !output.stdout.trim().is_empty() {
+        return Ok(BackendSuccess {
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
     }
+    if is_no_checks_reported(Some(output.stderr.as_str())) {
+        return Ok(BackendSuccess {
+            stdout: "[]".into(),
+            stderr: output.stderr,
+        });
+    }
+    let exe = call.program.executable();
+    Err(ForgeError::backend_error(
+        schema_err(),
+        format!(
+            "{exe} exited with status {exit_code}",
+            exe = exe.to_string_lossy(),
+            exit_code = output.exit_code
+        ),
+        Some(output.stderr),
+    ))
 }
 
-fn is_no_required_checks(detail: Option<&str>) -> bool {
+fn is_no_checks_reported(detail: Option<&str>) -> bool {
     detail
         .map(|d| {
-            d.to_ascii_lowercase()
-                .contains("no required checks reported")
+            let lower = d.to_ascii_lowercase();
+            lower.contains("no required checks reported") || lower.contains("no checks reported")
         })
         .unwrap_or(false)
 }
