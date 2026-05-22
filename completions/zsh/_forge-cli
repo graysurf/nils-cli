@@ -482,7 +482,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
         case $line[1] in
             (status)
 _arguments "${_arguments_options[@]}" : \
-'--gitlab-host=[GitLab host for inbox API calls]:HOST:_default' \
+'--gitlab-host=[GitLab host for inbox API calls. Defaults from FORGE_CLI_INBOX_GITLAB_HOST, GitLab remote inference, then gitlab.com]:HOST:_default' \
 '*--kind=[Restrict inbox reasons/kinds. Repeatable. Defaults to review, assigned, todo, and authored; \`involved\` is opt-in because it can be broad on GitHub]:KINDS:(review assigned todo authored involved)' \
 '--limit=[Per-provider, per-query-family bounded result limit (default\: 30)]:LIMIT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
@@ -497,7 +497,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (list)
 _arguments "${_arguments_options[@]}" : \
-'--gitlab-host=[GitLab host for inbox API calls]:HOST:_default' \
+'--gitlab-host=[GitLab host for inbox API calls. Defaults from FORGE_CLI_INBOX_GITLAB_HOST, GitLab remote inference, then gitlab.com]:HOST:_default' \
 '*--kind=[Restrict inbox reasons/kinds. Repeatable. Defaults to review, assigned, todo, and authored; \`involved\` is opt-in because it can be broad on GitHub]:KINDS:(review assigned todo authored involved)' \
 '--limit=[Per-provider, per-query-family bounded result limit (default\: 30)]:LIMIT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
@@ -512,7 +512,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (next)
 _arguments "${_arguments_options[@]}" : \
-'--gitlab-host=[GitLab host for inbox API calls]:HOST:_default' \
+'--gitlab-host=[GitLab host for inbox API calls. Defaults from FORGE_CLI_INBOX_GITLAB_HOST, GitLab remote inference, then gitlab.com]:HOST:_default' \
 '*--kind=[Restrict inbox reasons/kinds. Repeatable. Defaults to review, assigned, todo, and authored; \`involved\` is opt-in]:KINDS:(review assigned todo authored involved)' \
 '--limit=[Number of ranked items to return (default\: 5). Provider queries remain bounded at at least 30 candidates so ranking has enough input]:LIMIT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
