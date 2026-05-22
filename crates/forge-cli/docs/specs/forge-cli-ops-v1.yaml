@@ -391,6 +391,76 @@ operations:
         scopes: list<string>
     notes: "Backend output is text, parsed into the structured envelope."
 
+  - id: inbox.list
+    schema_version: cli.forge-cli.inbox.list.v1
+    summary: List normalized personal inbox items across selected providers.
+    inputs:
+      - { name: --gitlab-host, type: string, default: gitlab.com, scope: inbox-only }
+      - { name: --kind,        type: list<enum<review|assigned|todo|authored|involved>>, default: [review, assigned, todo, authored] }
+      - { name: --limit,       type: integer, default: 30, semantics: "per provider and per query family" }
+    validations: []
+    backends:
+      github:
+        program: gh
+        argv:
+          - [search, prs, "--review-requested", "@me", --state, open, --sort, updated, --order, desc, --limit, "{limit}", --json, "number,url,title,updatedAt,author,repository"]
+          - [search, prs, "--assignee", "@me", --state, open, --sort, updated, --order, desc, --limit, "{limit}", --json, "number,url,title,updatedAt,author,repository"]
+          - [search, issues, "--assignee", "@me", --state, open, --sort, updated, --order, desc, --limit, "{limit}", --json, "number,url,title,updatedAt,author,repository"]
+          - [search, prs, "--author", "@me", --state, open, --sort, updated, --order, desc, --limit, "{limit}", --json, "number,url,title,updatedAt,author,repository"]
+          - [search, issues, "--author", "@me", --state, open, --sort, updated, --order, desc, --limit, "{limit}", --json, "number,url,title,updatedAt,author,repository"]
+      gitlab:
+        program: glab
+        argv:
+          - [api, user, --hostname, "{gitlab_host}"]
+          - [api, --hostname, "{gitlab_host}", "merge_requests?scope=assigned_to_me&state=opened&order_by=updated_at&sort=desc&per_page={limit}"]
+          - [api, --hostname, "{gitlab_host}", "merge_requests?reviewer_username={username}&state=opened&order_by=updated_at&sort=desc&per_page={limit}"]
+          - [api, --hostname, "{gitlab_host}", "merge_requests?author_id={user_id}&state=opened&order_by=updated_at&sort=desc&per_page={limit}"]
+          - [api, --hostname, "{gitlab_host}", "issues?scope=assigned_to_me&state=opened&order_by=updated_at&sort=desc&per_page={limit}"]
+          - [api, --hostname, "{gitlab_host}", "issues?author_id={user_id}&state=opened&order_by=updated_at&sort=desc&per_page={limit}"]
+          - [api, --hostname, "{gitlab_host}", "todos?state=pending&order_by=updated_at&sort=desc&per_page={limit}"]
+    output:
+      data:
+        providers: "list of { provider, host, ok, item_count, limited, error? }"
+        limit: integer
+        items: "list of normalized inbox items"
+    notes: "Partial provider success exits 0 with provider errors in data.providers[] and string warnings[]; all selected providers failing exits non-zero."
+
+  - id: inbox.status
+    schema_version: cli.forge-cli.inbox.status.v1
+    summary: Summarize bounded inbox counts by provider, host, kind, and reason.
+    inputs:
+      - { name: --gitlab-host, type: string, default: gitlab.com, scope: inbox-only }
+      - { name: --kind,        type: list<enum<review|assigned|todo|authored|involved>>, default: [review, assigned, todo, authored] }
+      - { name: --limit,       type: integer, default: 30, semantics: "per provider and per query family" }
+    validations: []
+    backends:
+      github: { derives_from: inbox.list }
+      gitlab: { derives_from: inbox.list }
+    output:
+      data:
+        providers: "list of provider status rows"
+        limit: integer
+        item_count: integer
+        counts: "list of { provider, host, kind, reason, count, limited }"
+
+  - id: inbox.next
+    schema_version: cli.forge-cli.inbox.next.v1
+    summary: Return ranked next-action candidates from the normalized inbox.
+    inputs:
+      - { name: --gitlab-host, type: string, default: gitlab.com, scope: inbox-only }
+      - { name: --kind,        type: list<enum<review|assigned|todo|authored|involved>>, default: [review, assigned, todo, authored] }
+      - { name: --limit,       type: integer, default: 5, semantics: "returned ranked item count" }
+    validations: []
+    backends:
+      github: { derives_from: inbox.list, query_limit_floor: 30 }
+      gitlab: { derives_from: inbox.list, query_limit_floor: 30 }
+    output:
+      data:
+        providers: "list of provider status rows"
+        limit: integer
+        query_limit: integer
+        items: "ranked normalized inbox items"
+
 # ---------------------------------------------------------------------------
 # Macro operations.
 # ---------------------------------------------------------------------------

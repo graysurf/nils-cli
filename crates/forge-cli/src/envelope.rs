@@ -61,6 +61,39 @@ where
     }
 }
 
+/// Emit a success envelope with non-fatal warning strings attached.
+pub fn emit_success_with_warnings<T, F>(
+    schema_version: impl Into<String>,
+    data: T,
+    warnings: Vec<String>,
+    format: OutputFormat,
+    render_text: F,
+) -> i32
+where
+    T: Serialize,
+    F: FnOnce(&T),
+{
+    let envelope = Envelope::success(schema_version, data).with_warnings(warnings);
+    match format {
+        OutputFormat::Json => match serde_json::to_string(&envelope) {
+            Ok(serialized) => {
+                println!("{serialized}");
+                exit::SUCCESS
+            }
+            Err(_) => exit::SOFTWARE,
+        },
+        OutputFormat::Text => {
+            if let Some(payload) = envelope.data.as_ref() {
+                render_text(payload);
+            }
+            for warning in envelope.warnings {
+                eprintln!("warning: {warning}");
+            }
+            exit::SUCCESS
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

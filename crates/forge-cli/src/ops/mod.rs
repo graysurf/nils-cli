@@ -3,6 +3,7 @@
 //! returns `Result<i32, ForgeError>`.
 
 pub mod auth_status;
+pub mod inbox;
 pub mod issue_close;
 pub mod issue_comment;
 pub mod issue_create;

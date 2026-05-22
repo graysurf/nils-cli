@@ -107,6 +107,8 @@ pub enum Command {
     Pr(PrArgs),
     /// Issue lifecycle.
     Issue(IssueArgs),
+    /// Personal cross-repo work inbox.
+    Inbox(InboxArgs),
     /// Repository helpers.
     Repo(RepoArgs),
     /// Backend authentication helpers.
@@ -125,6 +127,12 @@ pub struct PrArgs {
 pub struct IssueArgs {
     #[command(subcommand)]
     pub command: Option<IssueCommand>,
+}
+
+#[derive(Args, Debug)]
+pub struct InboxArgs {
+    #[command(subcommand)]
+    pub command: Option<InboxCommand>,
 }
 
 #[derive(Args, Debug)]
@@ -178,6 +186,29 @@ pub enum PrStateFilter {
     Closed,
     Merged,
     All,
+}
+
+/// Inbox item-kind / reason filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum InboxKindFlag {
+    Review,
+    Assigned,
+    Todo,
+    Authored,
+    Involved,
+}
+
+impl InboxKindFlag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InboxKindFlag::Review => "review",
+            InboxKindFlag::Assigned => "assigned",
+            InboxKindFlag::Todo => "todo",
+            InboxKindFlag::Authored => "authored",
+            InboxKindFlag::Involved => "involved",
+        }
+    }
 }
 
 impl PrStateFilter {
@@ -496,6 +527,57 @@ pub enum IssueCommand {
     },
 }
 
+/// `inbox` subtree.
+#[derive(Subcommand, Debug)]
+pub enum InboxCommand {
+    /// Summarize bounded personal work counts.
+    Status(InboxQueryArgs),
+    /// List normalized inbox items.
+    List(InboxQueryArgs),
+    /// Return ranked next-action candidates.
+    Next(InboxNextArgs),
+}
+
+/// Shared inbox query arguments for list/status.
+#[derive(Args, Debug, Clone)]
+pub struct InboxQueryArgs {
+    /// GitLab host for inbox API calls.
+    #[arg(
+        long = "gitlab-host",
+        value_name = "HOST",
+        default_value = "gitlab.com"
+    )]
+    pub gitlab_host: String,
+    /// Restrict inbox reasons/kinds. Repeatable. Defaults to review,
+    /// assigned, todo, and authored; `involved` is opt-in because it can be
+    /// broad on GitHub.
+    #[arg(long = "kind", value_enum)]
+    pub kinds: Vec<InboxKindFlag>,
+    /// Per-provider, per-query-family bounded result limit (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub limit: u32,
+}
+
+/// `inbox next` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct InboxNextArgs {
+    /// GitLab host for inbox API calls.
+    #[arg(
+        long = "gitlab-host",
+        value_name = "HOST",
+        default_value = "gitlab.com"
+    )]
+    pub gitlab_host: String,
+    /// Restrict inbox reasons/kinds. Repeatable. Defaults to review,
+    /// assigned, todo, and authored; `involved` is opt-in.
+    #[arg(long = "kind", value_enum)]
+    pub kinds: Vec<InboxKindFlag>,
+    /// Number of ranked items to return (default: 5). Provider queries remain
+    /// bounded at at least 30 candidates so ranking has enough input.
+    #[arg(long, default_value_t = 5)]
+    pub limit: u32,
+}
+
 /// `issue create` arguments.
 #[derive(Args, Debug, Clone)]
 pub struct IssueCreateArgs {
@@ -651,12 +733,16 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Issue(IssueArgs {
             command: Some(IssueCommand::Reopen { id }),
         })) => ops::issue_reopen::run(&global, id, format),
+        Some(Command::Inbox(InboxArgs {
+            command: Some(command),
+        })) => ops::inbox::run(&global, command, format),
         Some(Command::Completion(CompletionArgs { shell })) => emit_completion(shell),
         None
         | Some(Command::Auth(AuthArgs { command: None }))
         | Some(Command::Repo(RepoArgs { command: None }))
         | Some(Command::Pr(PrArgs { command: None }))
-        | Some(Command::Issue(IssueArgs { command: None })) => {
+        | Some(Command::Issue(IssueArgs { command: None }))
+        | Some(Command::Inbox(InboxArgs { command: None })) => {
             // No subcommand: print help and exit USAGE so callers don't
             // mistake the no-op for success.
             let _ = <Cli as clap::CommandFactory>::command().print_help();
@@ -932,6 +1018,50 @@ mod tests {
             let result = parse(&argv);
             assert!(result.is_ok(), "issue {sub} should parse, got {result:?}");
         }
+    }
+
+    #[test]
+    fn lists_every_inbox_v1_subcommand() {
+        for sub in ["status", "list", "next"] {
+            let result = parse(&["inbox", sub]);
+            assert!(result.is_ok(), "inbox {sub} should parse, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn inbox_cli_parses_gitlab_host_kind_and_limit() {
+        let cli = parse(&[
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--kind",
+            "review",
+            "--kind",
+            "assigned",
+            "--limit",
+            "7",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Inbox(InboxArgs {
+                command: Some(InboxCommand::List(args)),
+            })) => {
+                assert_eq!(args.gitlab_host, "gitlab.example.com");
+                assert_eq!(
+                    args.kinds,
+                    vec![InboxKindFlag::Review, InboxKindFlag::Assigned]
+                );
+                assert_eq!(args.limit, 7);
+            }
+            other => panic!("expected inbox list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gitlab_host_is_not_global() {
+        let result = parse(&["--gitlab-host", "gitlab.example.com", "repo", "view"]);
+        assert!(result.is_err(), "--gitlab-host must stay inbox-local");
     }
 
     #[test]

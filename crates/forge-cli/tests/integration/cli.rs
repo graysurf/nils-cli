@@ -10,7 +10,7 @@ fn help_lists_every_top_level_subcommand() {
     let stub = StubEnv::new();
     let out = run_forge_cli(&stub, &["--help"]);
     assert_eq!(out.code, 0, "stderr={}", out.stderr);
-    for sub in ["pr", "issue", "repo", "auth", "completion"] {
+    for sub in ["pr", "issue", "inbox", "repo", "auth", "completion"] {
         assert!(
             out.stdout.contains(sub),
             "--help missing {sub}: stdout={}",
@@ -21,6 +21,20 @@ fn help_lists_every_top_level_subcommand() {
         !out.stdout.contains("--json"),
         "must not surface --json flag"
     );
+}
+
+#[test]
+fn inbox_cli_help_lists_every_v1_subcommand() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(&stub, &["inbox", "--help"]);
+    assert_eq!(out.code, 0);
+    for sub in ["status", "list", "next"] {
+        assert!(
+            out.stdout.contains(sub),
+            "inbox --help missing {sub}: stdout={}",
+            out.stdout
+        );
+    }
 }
 
 #[test]
