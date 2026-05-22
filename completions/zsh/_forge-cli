@@ -484,6 +484,9 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--gitlab-host=[GitLab host for inbox API calls. Defaults from FORGE_CLI_INBOX_GITLAB_HOST, GitLab remote inference, then gitlab.com]:HOST:_default' \
 '*--kind=[Restrict inbox reasons/kinds. Repeatable. Defaults to review, assigned, todo, and authored; \`involved\` is opt-in because it can be broad on GitHub]:KINDS:(review assigned todo authored involved)' \
+'--item-type=[Restrict inbox by item type (PR/MR vs issue). \`--kind\` filters reasons (review/assigned/todo/authored/involved); \`--item-type\` filters result classes so PR-only and issue-only modes skip irrelevant provider queries. Defaults to all]:ITEM_TYPE:((all\:"Include PRs/MRs, issues, and classifiable todos (default)"
+pr\:"Include only pull requests / merge requests (and todos that target them)"
+issue\:"Include only issues (and todos that target them)"))' \
 '--limit=[Per-provider, per-query-family bounded result limit (default\: 30)]:LIMIT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -499,6 +502,9 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--gitlab-host=[GitLab host for inbox API calls. Defaults from FORGE_CLI_INBOX_GITLAB_HOST, GitLab remote inference, then gitlab.com]:HOST:_default' \
 '*--kind=[Restrict inbox reasons/kinds. Repeatable. Defaults to review, assigned, todo, and authored; \`involved\` is opt-in because it can be broad on GitHub]:KINDS:(review assigned todo authored involved)' \
+'--item-type=[Restrict inbox by item type (PR/MR vs issue). \`--kind\` filters reasons (review/assigned/todo/authored/involved); \`--item-type\` filters result classes so PR-only and issue-only modes skip irrelevant provider queries. Defaults to all]:ITEM_TYPE:((all\:"Include PRs/MRs, issues, and classifiable todos (default)"
+pr\:"Include only pull requests / merge requests (and todos that target them)"
+issue\:"Include only issues (and todos that target them)"))' \
 '--limit=[Per-provider, per-query-family bounded result limit (default\: 30)]:LIMIT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -514,6 +520,9 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--gitlab-host=[GitLab host for inbox API calls. Defaults from FORGE_CLI_INBOX_GITLAB_HOST, GitLab remote inference, then gitlab.com]:HOST:_default' \
 '*--kind=[Restrict inbox reasons/kinds. Repeatable. Defaults to review, assigned, todo, and authored; \`involved\` is opt-in]:KINDS:(review assigned todo authored involved)' \
+'--item-type=[Restrict inbox by item type (PR/MR vs issue). See \`inbox list --help\` for the distinction from \`--kind\`. Defaults to all]:ITEM_TYPE:((all\:"Include PRs/MRs, issues, and classifiable todos (default)"
+pr\:"Include only pull requests / merge requests (and todos that target them)"
+issue\:"Include only issues (and todos that target them)"))' \
 '--limit=[Number of ranked items to return (default\: 5). Provider queries remain bounded at at least 30 candidates so ranking has enough input]:LIMIT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \

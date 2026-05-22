@@ -183,8 +183,15 @@ Inbox-local flags:
   (default `30`).
 - `forge-cli inbox next --limit <n>` bounds the returned ranked candidates
   (default `5`); provider reads still use at least `30` candidates.
-- `--kind review|assigned|todo|authored|involved` is repeatable. `involved` is
-  opt-in because it can be broad on GitHub.
+- `--kind review|assigned|todo|authored|involved` is repeatable and selects
+  inbox *reasons* (why an item appears). `involved` is opt-in because it can
+  be broad on GitHub.
+- `--item-type all|pr|issue` selects *result classes* (pull/merge requests vs
+  issues) and is distinct from `--kind`. Default is `all`. PR-only mode skips
+  GitHub issue searches and GitLab issue API calls; issue-only mode skips PR
+  searches (GitHub review-requested is dropped). GitLab `todos` are kept when
+  their `target_type` (or target URL) matches the selected item type;
+  unclassifiable todos appear only in `all` mode.
 - `--gitlab-host <host>` is scoped to inbox commands only and is passed to
   every GitLab `glab api` invocation as `--hostname <host>`.
 - When `--gitlab-host` is omitted, GitLab host resolution uses
@@ -387,7 +394,15 @@ providers:
   successful inbox.
 - GitLab rows come from host-aware `glab api --hostname <host>` calls. The user
   id and username are discovered with `glab api user --hostname <host>` for the
-  current invocation and are not persisted.
+  current invocation and are not persisted. The identity lookup is skipped when
+  no remaining query family needs it (for example `--kind assigned --kind
+  todo`, or `--item-type issue` paired with reasons that drop the
+  identity-dependent families).
+- Selected provider adapters and independent query families within a provider
+  run concurrently. The output contract — provider order, deduplicated items,
+  warnings, and partial/all-failure exit behavior — is deterministic and
+  independent of thread completion order. Live wall-clock latency depends on
+  `gh`/`glab` and remote API responsiveness and is not asserted in CI.
 
 ## CLI output contract conformance
 
