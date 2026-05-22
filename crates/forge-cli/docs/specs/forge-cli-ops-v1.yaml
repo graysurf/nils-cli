@@ -259,7 +259,8 @@ operations:
       - { name: --required-only, type: bool,             default: true }
     validations: []
     backends:
-      github: { program: gh,   argv: [pr, checks, "{id}", --json, "name,state,conclusion,bucket,workflow,link,startedAt,completedAt,description,isRequired"] }
+      github: { program: gh,   argv: [pr, checks, "{id}", --json, "name,state,bucket,workflow,link,startedAt,completedAt,description"] }
+      github_required: { program: gh, argv: [pr, checks, "{id}", --required, --json, "name,state,bucket,workflow,link,startedAt,completedAt,description"] }
       gitlab: { program: glab, argv: [ci, status,  "-b", "{branch}"] }   # text fallback parsed
     output:
       data:

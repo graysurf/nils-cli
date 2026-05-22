@@ -27,7 +27,7 @@ use crate::config::ForgeConfig;
 use crate::error::ForgeError;
 use crate::ops::pr_create::{self, Environment};
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
-use crate::ops::{auth_status, pr_merge, pr_ready, pr_wait_checks, repo_view};
+use crate::ops::{auth_status, pr_checks, pr_merge, pr_ready, pr_wait_checks, repo_view};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::git_status_porcelain;
 
@@ -439,14 +439,7 @@ fn pr_create_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String
 fn pr_wait_checks_dry_plan(ctx: &ProviderContext) -> Vec<String> {
     let prog = BackendProgram::for_provider(ctx.provider).default_executable();
     match ctx.provider {
-        Provider::GitHub => vec![
-            prog.into(),
-            "pr".into(),
-            "checks".into(),
-            "<pr-number>".into(),
-            "--json".into(),
-            "name,state,conclusion,bucket,workflow,link,startedAt,completedAt,description,isRequired".into(),
-        ],
+        Provider::GitHub => pr_checks::build_github_required_call("<pr-number>").plan_argv(),
         Provider::GitLab => vec![
             prog.into(),
             "ci".into(),

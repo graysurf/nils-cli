@@ -22,3 +22,11 @@ cargo run -p nils-forge-cli -- pr deliver --kind feature --dry-run --format json
 
 `forge-cli` does NOT introduce a `--json` boolean flag. Use
 `--format text|json` exclusively.
+
+## GitHub checks compatibility
+
+Starting with `nils-cli` `0.17.0`, GitHub `pr checks` calls request only the
+`gh 2.92.0` supported JSON fields. Required-check gates use an explicit
+`gh pr checks --required` snapshot instead of the removed `isRequired` JSON
+field, so `pr checks`, `pr wait-checks`, `pr merge`, and `pr deliver` share the
+same compatibility path.

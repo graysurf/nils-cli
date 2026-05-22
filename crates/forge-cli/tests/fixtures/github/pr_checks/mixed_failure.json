@@ -2,37 +2,31 @@
   {
     "name": "build",
     "state": "COMPLETED",
-    "conclusion": "success",
     "bucket": "pass",
     "workflow": "CI",
     "link": "https://github.com/sympoies/nils-cli/actions/runs/2001",
     "startedAt": "2026-05-19T10:00:00Z",
     "completedAt": "2026-05-19T10:05:00Z",
-    "description": "",
-    "isRequired": true
+    "description": ""
   },
   {
     "name": "test",
     "state": "COMPLETED",
-    "conclusion": "failure",
     "bucket": "fail",
     "workflow": "CI",
     "link": "https://github.com/sympoies/nils-cli/actions/runs/2002",
     "startedAt": "2026-05-19T10:00:00Z",
     "completedAt": "2026-05-19T10:07:30Z",
-    "description": "cargo test failed",
-    "isRequired": true
+    "description": "cargo test failed"
   },
   {
     "name": "optional-flaky",
     "state": "IN_PROGRESS",
-    "conclusion": "",
     "bucket": "pending",
     "workflow": "Nightly",
     "link": "https://github.com/sympoies/nils-cli/actions/runs/2003",
     "startedAt": "2026-05-19T10:00:00Z",
     "completedAt": "",
-    "description": "",
-    "isRequired": false
+    "description": ""
   }
 ]

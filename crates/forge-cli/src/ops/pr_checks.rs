@@ -1,8 +1,9 @@
 //! `pr checks` atom — one-shot snapshot of PR/MR check state.
 //!
 //! Spec / ops: `cli.forge-cli.pr.checks.v1`. GitHub uses
-//! `gh pr checks <id> --json name,state,conclusion,bucket,workflow,link,
-//! startedAt,completedAt,description,isRequired`. GitLab is delegated to
+//! `gh pr checks <id> --json name,state,bucket,workflow,link,startedAt,
+//! completedAt,description` plus a separate `--required` call for required-only
+//! gating. GitLab is delegated to
 //! [`crate::ops::pr_checks_gitlab`] which parses `glab ci status` text after
 //! probing `glab --version`.
 //!
@@ -10,6 +11,7 @@
 //! for the gating decision but still reports them under `data.checks`. The
 //! aggregate `data.state` derives from the gating subset.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
@@ -27,8 +29,8 @@ use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 pub const SCHEMA: &str = "pr.checks";
 pub const SCHEMA_VERSION: u32 = 1;
 
-const GH_JSON_FIELDS: &str =
-    "name,state,conclusion,bucket,workflow,link,startedAt,completedAt,description,isRequired";
+pub const GH_JSON_FIELDS: &str =
+    "name,state,bucket,workflow,link,startedAt,completedAt,description";
 
 /// Canonical normalized check state. Spec enum:
 /// `success | failure | pending | cancelled | neutral | skipped | timed_out`.
@@ -190,7 +192,12 @@ fn snapshot_github<R: BackendRunner>(
 ) -> Result<PrChecksPayload, ForgeError> {
     let call = build_github_call(&args.id);
     let output = runner.run(&call)?;
-    parse_github_snapshot(ctx, &output, args.required_only)
+    if args.required_only {
+        let required_call = build_github_required_call(&args.id);
+        let required_output = run_required_github_call(runner, &required_call)?;
+        return parse_github_snapshot_with_required_output(ctx, &output, &required_output);
+    }
+    parse_github_snapshot(ctx, &output, false)
 }
 
 /// Build the `gh pr checks <id> --json …` call. Public so the dry-run helper
@@ -208,13 +215,65 @@ pub fn build_github_call(id: &str) -> BackendCall {
     )
 }
 
+/// Build the `gh pr checks <id> --required --json …` call used for GitHub
+/// required-check gating because `gh 2.92.0` no longer exposes `isRequired`
+/// through the JSON field set.
+pub fn build_github_required_call(id: &str) -> BackendCall {
+    BackendCall::new(
+        BackendProgram::Gh,
+        [
+            OsString::from("pr"),
+            OsString::from("checks"),
+            OsString::from(id),
+            OsString::from("--required"),
+            OsString::from("--json"),
+            OsString::from(GH_JSON_FIELDS),
+        ],
+    )
+}
+
 /// Build the dry-run preview call for the current provider — public so
 /// downstream atoms (e.g. `pr wait-checks` dry-run) can reuse it.
 pub fn build_dry_run_call(ctx: &ProviderContext, args: &PrChecksArgs) -> BackendCall {
     match ctx.provider {
+        Provider::GitHub if args.required_only => build_github_required_call(&args.id),
         Provider::GitHub => build_github_call(&args.id),
         Provider::GitLab => pr_checks_gitlab::build_status_call(&args.id),
     }
+}
+
+fn run_required_github_call<R: BackendRunner>(
+    runner: &R,
+    call: &BackendCall,
+) -> Result<BackendSuccess, ForgeError> {
+    match runner.run(call) {
+        Ok(output) => Ok(output),
+        Err(ForgeError::BackendError {
+            schema_version: _,
+            message,
+            detail,
+        }) if is_no_required_checks(detail.as_deref()) => Ok(BackendSuccess {
+            stdout: "[]".into(),
+            stderr: format!(
+                "{}{}",
+                message,
+                detail
+                    .as_deref()
+                    .map(|d| format!("\n{d}"))
+                    .unwrap_or_default()
+            ),
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+fn is_no_required_checks(detail: Option<&str>) -> bool {
+    detail
+        .map(|d| {
+            d.to_ascii_lowercase()
+                .contains("no required checks reported")
+        })
+        .unwrap_or(false)
 }
 
 fn parse_github_snapshot(
@@ -222,11 +281,50 @@ fn parse_github_snapshot(
     output: &BackendSuccess,
     required_only: bool,
 ) -> Result<PrChecksPayload, ForgeError> {
+    let checks = parse_github_checks(output, None, false)?;
+    Ok(aggregate(ctx, checks, required_only, None))
+}
+
+fn parse_github_snapshot_with_required_output(
+    ctx: &ProviderContext,
+    all_output: &BackendSuccess,
+    required_output: &BackendSuccess,
+) -> Result<PrChecksPayload, ForgeError> {
+    let required_entries = parse_github_checks(required_output, None, true)?;
+    let required_names = required_entries
+        .iter()
+        .map(|c| c.name.clone())
+        .collect::<HashSet<_>>();
+    let mut checks = parse_github_checks(all_output, Some(&required_names), false)?;
+
+    if checks.is_empty() {
+        checks = required_entries;
+    } else if !required_names.is_empty() {
+        let present_required = checks
+            .iter()
+            .filter(|c| c.required)
+            .map(|c| c.name.clone())
+            .collect::<HashSet<_>>();
+        for required in required_entries {
+            if !present_required.contains(required.name.as_str()) {
+                checks.push(required);
+            }
+        }
+    }
+
+    Ok(aggregate(ctx, checks, true, None))
+}
+
+fn parse_github_checks(
+    output: &BackendSuccess,
+    required_names: Option<&HashSet<String>>,
+    force_required: bool,
+) -> Result<Vec<CheckItem>, ForgeError> {
     let trimmed = output.stdout.trim();
     // Empty stdout: GitHub historically prints nothing when there are no
     // checks; tolerate the empty case as "no checks".
     if trimmed.is_empty() {
-        return Ok(empty_payload(ctx));
+        return Ok(Vec::new());
     }
     let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
         ForgeError::software(
@@ -244,12 +342,16 @@ fn parse_github_snapshot(
     })?;
     let mut checks = Vec::with_capacity(arr.len());
     for entry in arr {
-        checks.push(parse_github_entry(entry)?);
+        checks.push(parse_github_entry(entry, required_names, force_required)?);
     }
-    Ok(aggregate(ctx, checks, required_only, None))
+    Ok(checks)
 }
 
-fn parse_github_entry(value: &serde_json::Value) -> Result<CheckItem, ForgeError> {
+fn parse_github_entry(
+    value: &serde_json::Value,
+    required_names: Option<&HashSet<String>>,
+    force_required: bool,
+) -> Result<CheckItem, ForgeError> {
     let name = value
         .get("name")
         .and_then(|v| v.as_str())
@@ -264,7 +366,11 @@ fn parse_github_entry(value: &serde_json::Value) -> Result<CheckItem, ForgeError
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let state = normalize_github_state(bucket.as_deref(), conclusion.as_deref());
+    let raw_state = value
+        .get("state")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let state = normalize_github_state(bucket.as_deref(), conclusion.as_deref(), raw_state);
     let url = value
         .get("link")
         .and_then(|v| v.as_str())
@@ -275,10 +381,16 @@ fn parse_github_entry(value: &serde_json::Value) -> Result<CheckItem, ForgeError
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let required = value
-        .get("isRequired")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let required = if force_required {
+        true
+    } else if let Some(names) = required_names {
+        names.contains(&name)
+    } else {
+        value
+            .get("isRequired")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
     let started_at = value
         .get("startedAt")
         .and_then(|v| v.as_str())
@@ -301,11 +413,17 @@ fn parse_github_entry(value: &serde_json::Value) -> Result<CheckItem, ForgeError
     })
 }
 
-/// Normalize a GitHub `(bucket, conclusion)` pair to a canonical [`CheckState`].
-/// Conclusion takes precedence when populated; otherwise the bucket drives it.
-pub fn normalize_github_state(bucket: Option<&str>, conclusion: Option<&str>) -> CheckState {
+/// Normalize a GitHub `(bucket, conclusion, state)` triple to a canonical
+/// [`CheckState`]. `conclusion` is accepted for compatibility with older
+/// fixture/output shapes, but the `gh 2.92.0` request path relies on `bucket`
+/// and `state`.
+pub fn normalize_github_state(
+    bucket: Option<&str>,
+    conclusion: Option<&str>,
+    raw_state: Option<&str>,
+) -> CheckState {
     if let Some(c) = conclusion {
-        match c {
+        match c.to_ascii_lowercase().as_str() {
             "success" => return CheckState::Success,
             "failure" | "action_required" | "stale" | "startup_failure" => {
                 return CheckState::Failure;
@@ -317,13 +435,27 @@ pub fn normalize_github_state(bucket: Option<&str>, conclusion: Option<&str>) ->
             _ => {}
         }
     }
-    match bucket {
+    let bucket = bucket.map(str::to_ascii_lowercase);
+    match bucket.as_deref() {
         Some("pass") => CheckState::Success,
         Some("fail") => CheckState::Failure,
         Some("pending") => CheckState::Pending,
         Some("skipping") => CheckState::Skipped,
         Some("cancel") => CheckState::Cancelled,
-        _ => CheckState::Pending,
+        _ => match raw_state.map(str::to_ascii_lowercase).as_deref() {
+            Some("success" | "pass" | "completed") => CheckState::Success,
+            Some(
+                "failure" | "failed" | "error" | "action_required" | "stale" | "startup_failure",
+            ) => CheckState::Failure,
+            Some("pending" | "queued" | "in_progress" | "waiting" | "requested" | "expected") => {
+                CheckState::Pending
+            }
+            Some("cancelled" | "canceled") => CheckState::Cancelled,
+            Some("skipped" | "skipping") => CheckState::Skipped,
+            Some("neutral") => CheckState::Neutral,
+            Some("timed_out" | "timeout") => CheckState::TimedOut,
+            _ => CheckState::Pending,
+        },
     }
 }
 
@@ -410,19 +542,6 @@ pub fn aggregate(
         pending,
         checks,
         duration_ms,
-    }
-}
-
-fn empty_payload(ctx: &ProviderContext) -> PrChecksPayload {
-    PrChecksPayload {
-        provider: ctx.provider.as_str(),
-        state: CheckState::Success.as_str(),
-        required_count: 0,
-        success_count: 0,
-        failed: Vec::new(),
-        pending: Vec::new(),
-        checks: Vec::new(),
-        duration_ms: None,
     }
 }
 
@@ -532,23 +651,23 @@ mod tests {
     #[test]
     fn normalize_prefers_conclusion_over_bucket() {
         assert_eq!(
-            normalize_github_state(Some("pass"), Some("success")),
+            normalize_github_state(Some("pass"), Some("success"), None),
             CheckState::Success
         );
         assert_eq!(
-            normalize_github_state(Some("fail"), Some("timed_out")),
+            normalize_github_state(Some("fail"), Some("timed_out"), None),
             CheckState::TimedOut
         );
         assert_eq!(
-            normalize_github_state(Some("pass"), Some("neutral")),
+            normalize_github_state(Some("pass"), Some("neutral"), None),
             CheckState::Neutral
         );
         assert_eq!(
-            normalize_github_state(Some("pass"), Some("skipped")),
+            normalize_github_state(Some("pass"), Some("skipped"), None),
             CheckState::Skipped
         );
         assert_eq!(
-            normalize_github_state(Some("fail"), Some("action_required")),
+            normalize_github_state(Some("fail"), Some("action_required"), None),
             CheckState::Failure
         );
     }
@@ -556,14 +675,37 @@ mod tests {
     #[test]
     fn normalize_falls_back_to_bucket_when_no_conclusion() {
         assert_eq!(
-            normalize_github_state(Some("pending"), None),
+            normalize_github_state(Some("pending"), None, None),
             CheckState::Pending
         );
         assert_eq!(
-            normalize_github_state(Some("cancel"), None),
+            normalize_github_state(Some("cancel"), None, None),
             CheckState::Cancelled
         );
-        assert_eq!(normalize_github_state(None, None), CheckState::Pending);
+        assert_eq!(
+            normalize_github_state(None, None, None),
+            CheckState::Pending
+        );
+    }
+
+    #[test]
+    fn normalize_falls_back_to_state_when_bucket_is_unknown() {
+        assert_eq!(
+            normalize_github_state(None, None, Some("SUCCESS")),
+            CheckState::Success
+        );
+        assert_eq!(
+            normalize_github_state(None, None, Some("FAILURE")),
+            CheckState::Failure
+        );
+        assert_eq!(
+            normalize_github_state(None, None, Some("IN_PROGRESS")),
+            CheckState::Pending
+        );
+        assert_eq!(
+            normalize_github_state(None, None, Some("CANCELLED")),
+            CheckState::Cancelled
+        );
     }
 
     #[test]
@@ -691,9 +833,20 @@ mod tests {
             ["pr".to_string(), "checks".to_string(), "42".to_string()]
         );
         let json_idx = plan.iter().position(|s| s == "--json").expect("--json arg");
-        assert!(plan[json_idx + 1].contains("isRequired"));
         assert!(plan[json_idx + 1].contains("bucket"));
-        assert!(plan[json_idx + 1].contains("conclusion"));
+        assert!(!plan[json_idx + 1].contains("isRequired"));
+        assert!(!plan[json_idx + 1].contains("conclusion"));
+    }
+
+    #[test]
+    fn build_github_required_call_uses_required_flag_and_supported_json_fields() {
+        let call = build_github_required_call("42");
+        let plan = call.plan_argv();
+        assert!(plan.iter().any(|s| s == "--required"), "{plan:?}");
+        let json_idx = plan.iter().position(|s| s == "--json").expect("--json arg");
+        assert_eq!(plan[json_idx + 1], GH_JSON_FIELDS);
+        assert!(!plan[json_idx + 1].contains("isRequired"));
+        assert!(!plan[json_idx + 1].contains("conclusion"));
     }
 
     #[test]
@@ -730,14 +883,14 @@ mod tests {
     #[test]
     fn parse_github_snapshot_full_success_fixture() {
         let stdout = r#"[
-            {"name":"build","bucket":"pass","conclusion":"success","state":"COMPLETED","link":"https://ci/1","workflow":"CI","isRequired":true,"startedAt":"2026-05-19T10:00:00Z","completedAt":"2026-05-19T10:05:00Z","description":""},
-            {"name":"lint","bucket":"pass","conclusion":"success","state":"COMPLETED","link":"https://ci/2","workflow":"CI","isRequired":true,"startedAt":"2026-05-19T10:00:00Z","completedAt":"2026-05-19T10:02:00Z","description":""}
+            {"name":"build","bucket":"pass","state":"COMPLETED","link":"https://ci/1","workflow":"CI","startedAt":"2026-05-19T10:00:00Z","completedAt":"2026-05-19T10:05:00Z","description":""},
+            {"name":"lint","bucket":"pass","state":"COMPLETED","link":"https://ci/2","workflow":"CI","startedAt":"2026-05-19T10:00:00Z","completedAt":"2026-05-19T10:02:00Z","description":""}
         ]"#;
         let out = BackendSuccess {
             stdout: stdout.into(),
             stderr: String::new(),
         };
-        let p = parse_github_snapshot(&ctx(Provider::GitHub), &out, true).unwrap();
+        let p = parse_github_snapshot(&ctx(Provider::GitHub), &out, false).unwrap();
         assert_eq!(p.state, "success");
         assert_eq!(p.required_count, 2);
         assert_eq!(p.success_count, 2);
@@ -747,17 +900,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_github_snapshot_mixed_failure_fixture() {
-        let stdout = r#"[
-            {"name":"build","bucket":"pass","conclusion":"success","link":"https://ci/1","isRequired":true},
-            {"name":"test","bucket":"fail","conclusion":"failure","link":"https://ci/2","isRequired":true},
-            {"name":"flaky","bucket":"pending","conclusion":"","link":"https://ci/3","isRequired":false}
+    fn parse_github_snapshot_with_required_output_marks_only_required_names() {
+        let all_stdout = r#"[
+            {"name":"build","bucket":"pass","state":"COMPLETED","link":"https://ci/1"},
+            {"name":"test","bucket":"fail","state":"COMPLETED","link":"https://ci/2"},
+            {"name":"flaky","bucket":"pending","state":"IN_PROGRESS","link":"https://ci/3"}
         ]"#;
-        let out = BackendSuccess {
-            stdout: stdout.into(),
+        let required_stdout = r#"[
+            {"name":"build","bucket":"pass","state":"COMPLETED","link":"https://ci/1"},
+            {"name":"test","bucket":"fail","state":"COMPLETED","link":"https://ci/2"}
+        ]"#;
+        let all = BackendSuccess {
+            stdout: all_stdout.into(),
             stderr: String::new(),
         };
-        let p = parse_github_snapshot(&ctx(Provider::GitHub), &out, true).unwrap();
+        let required = BackendSuccess {
+            stdout: required_stdout.into(),
+            stderr: String::new(),
+        };
+        let p = parse_github_snapshot_with_required_output(&ctx(Provider::GitHub), &all, &required)
+            .unwrap();
         assert_eq!(p.state, "failure");
         assert_eq!(p.required_count, 2);
         assert_eq!(p.failed.len(), 1);

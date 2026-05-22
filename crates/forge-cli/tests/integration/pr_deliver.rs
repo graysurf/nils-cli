@@ -53,6 +53,31 @@ fn pr_deliver_dry_run_lists_all_six_steps_in_order() {
     );
     assert_eq!(env["data"]["no_merge"], false);
     assert_eq!(env["data"]["kind"], "feature");
+    let wait_plan = env["data"]["plan_steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["step"] == "wait_checks")
+        .expect("wait_checks step present")["plan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+    assert!(wait_plan.iter().any(|s| s == "--required"), "{wait_plan:?}");
+    let json_idx = wait_plan
+        .iter()
+        .position(|s| s == "--json")
+        .expect("--json present");
+    assert!(wait_plan[json_idx + 1].contains("bucket"), "{wait_plan:?}");
+    assert!(
+        !wait_plan[json_idx + 1].contains("conclusion"),
+        "{wait_plan:?}"
+    );
+    assert!(
+        !wait_plan[json_idx + 1].contains("isRequired"),
+        "{wait_plan:?}"
+    );
 }
 
 #[test]
