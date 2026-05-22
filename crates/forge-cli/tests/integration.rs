@@ -8,6 +8,7 @@ mod integration {
     mod exit_codes;
     mod exit_codes_full;
     mod fixture_lint;
+    mod inbox;
     mod issue_atoms;
     mod parity;
     mod pr_checks_github;

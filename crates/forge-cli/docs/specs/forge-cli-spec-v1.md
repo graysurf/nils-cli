@@ -44,6 +44,8 @@ Non-goals (v1):
 
 In scope (v1):
 
+- Personal work discovery: `inbox list`, `inbox status`, and
+  `inbox next` across GitHub and GitLab.
 - PR/MR lifecycle: `create`, `view`, `list`, `edit`, `comment`,
   `ready`, `merge`, `close`.
 - PR/MR checks: `pr checks` (one-shot snapshot) and `pr wait-checks`
@@ -55,11 +57,11 @@ In scope (v1):
   atoms above into the agent-kit standard "open draft → wait CI →
   ready → merge → cleanup" flow.
 
-Out of scope (v1): release management, labels, raw REST passthrough,
-issue macros, repo creation, branch protection management, code review
-state mutation beyond `pr ready`. Each of these would either widen the
-parity gap (GitLab has no equivalent today) or remove the "lock down
-behaviour" value (REST passthrough = same as `gh api` + rename).
+Out of scope (v1): inbox mutations, release management, labels, raw REST
+passthrough, issue macros, repo creation, branch protection management, code
+review state mutation beyond `pr ready`. Each of these would either widen the
+parity gap (GitLab has no equivalent today) or remove the "lock down behaviour"
+value (REST passthrough = same as `gh api` + rename).
 
 ## Provider parity model
 
@@ -110,6 +112,9 @@ Parity matrix (v1):
 | `issue reopen <id>`   | `gh issue reopen <id>`                                          | `glab issue reopen <id>`                             | exact                                |
 | `auth status`         | `gh auth status`                                                | `glab auth status`                                   | exact (text → typed)                 |
 | `repo view`           | `gh repo view --json …`                                         | `glab repo view -F json`                             | exact                                |
+| `inbox list`          | `gh search prs/issues --json …`                                 | `glab api --hostname <host> …`                       | normalized aggregation               |
+| `inbox status`        | same provider reads as `inbox list`                             | same provider reads as `inbox list`                  | bounded counts                       |
+| `inbox next`          | same provider reads as `inbox list`                             | same provider reads as `inbox list`                  | ranked bounded subset                |
 | `pr deliver`          | macro: `pr create` → `pr wait-checks` → `pr ready` → `pr merge` | same composition with gitlab atoms                   | exact (same macro logic on both)     |
 
 "emulated" means the backend's native command differs in shape, but
@@ -147,6 +152,10 @@ forge-cli
 │   ├── comment
 │   ├── close
 │   └── reopen
+├── inbox
+│   ├── status
+│   ├── list
+│   └── next
 ├── repo
 │   └── view
 ├── auth
@@ -167,6 +176,20 @@ Global flags (every subcommand):
 
 `forge-cli` itself does not expose `--token`, `--host`, or any auth
 override. Those belong to `gh`/`glab` and are configured there.
+
+Inbox-local flags:
+
+- `forge-cli inbox list|status --limit <n>` bounds each provider query family
+  (default `30`).
+- `forge-cli inbox next --limit <n>` bounds the returned ranked candidates
+  (default `5`); provider reads still use at least `30` candidates.
+- `--kind review|assigned|todo|authored|involved` is repeatable. `involved` is
+  opt-in because it can be broad on GitHub.
+- `--gitlab-host <host>` is scoped to inbox commands only and is passed to
+  every GitLab `glab api` invocation as `--hostname <host>`.
+- With no `--provider`, inbox queries both default providers. `--provider
+  github|gitlab` narrows the inbox just as it narrows lifecycle commands, but
+  inbox does not reuse the single-provider remote resolver internally.
 
 ## Atomic op surface
 
@@ -334,6 +357,34 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `checks_failed`            | 8 (`RUNTIME 1`)   |
 | `merge_method_unsupported` | 9                 |
 | `keep_branch_conflict`     | 10                |
+
+## Inbox output contract
+
+`inbox` is read-only and aggregates personal work discovery across selected
+providers:
+
+- `inbox list` emits `cli.forge-cli.inbox.list.v1` with
+  `data.providers[]`, `data.limit`, and normalized `data.items[]`.
+- `inbox status` emits `cli.forge-cli.inbox.status.v1` with bounded count rows
+  grouped by provider, host, kind, and reason. Counts are bounded by the
+  effective query limit, not guaranteed global totals.
+- `inbox next` emits `cli.forge-cli.inbox.next.v1` with ranked candidates;
+  review-requested work ranks ahead of assigned, todo, authored, and broad
+  involved work.
+- Every item includes `provider`, `host`, `kind`, `reasons`, `repo`, `number`,
+  `title`, `url`, `updated_at`, `author`, and `source`.
+- `reasons` is a deterministic de-duplicated array. Allowed v1 values are
+  `review`, `assigned`, `todo`, `authored`, and `involved`.
+- Partial provider success exits `SUCCESS 0`: successful provider items remain
+  in `data.items[]`, failed providers are represented in `data.providers[].
+  error`, and top-level `warnings[]` carries string warnings under the shared
+  workspace envelope contract.
+- If every selected provider fails, `inbox` exits non-zero through the normal
+  `ForgeError` / `cli_contract` failure envelope instead of returning an empty
+  successful inbox.
+- GitLab rows come from host-aware `glab api --hostname <host>` calls. The user
+  id and username are discovered with `glab api user --hostname <host>` for the
+  current invocation and are not persisted.
 
 ## CLI output contract conformance
 
