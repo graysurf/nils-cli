@@ -4,9 +4,13 @@
 
 `plan-issue-cli` provides the Rust command contract for plan/issue delivery orchestration. It is the typed replacement lane for
 `plan-issue-delivery-loop.sh` behavior and is built around deterministic task-spec generation, issue-body rendering, and gate-enforced
-sprint transitions. `Task Decomposition` is the runtime-truth execution table; sprint task-spec/prompt artifacts are derived from those
-issue rows. `plan-tooling split-prs` provides grouping primitives only in the current model; `plan-issue-cli` materializes runtime
-`Owner/Branch/Worktree/Notes` metadata from plan content plus grouping results.
+sprint transitions. `Task Decomposition` is the runtime-truth execution table for the existing plan/sprint command family; sprint
+task-spec/prompt artifacts are derived from those issue rows. `plan-tooling split-prs` provides grouping primitives only in the current
+model; `plan-issue-cli` materializes runtime `Owner/Branch/Worktree/Notes` metadata from plan content plus grouping results.
+
+For issue-backed tracking and dispatch workflows whose provider issue body is a mutable dashboard, use `plan-issue record ...`. The record
+surface renders dashboards and append-only comments, audits lifecycle markers, evaluates closeout readiness, and builds dispatch ledgers
+without mutating provider issues.
 
 The crate ships two binaries with the same command surface:
 
@@ -42,6 +46,14 @@ Shell wrapper scripts are deprecated for this crate path. Use `plan-issue` / `pl
 ### Shell completion
 
 - `completion <bash|zsh>`: export completion script for each binary.
+
+### Issue-backed records
+
+- `record render-dashboard`: render the mutable dashboard body shared by tracking and dispatch profiles.
+- `record render-comment`: render source, plan, state, session, validation, review, or closeout comments with compat or shared markers.
+- `record audit`: inspect issue body Markdown plus provider comments JSON for recognized lifecycle markers.
+- `record closeout-gate`: evaluate closeout readiness from audit evidence.
+- `record build-dispatch-ledger`: render a dispatch ledger from plan metadata and split grouping rules.
 
 ## Global flags
 
@@ -109,6 +121,15 @@ plan-issue-local build-plan-task-spec \
   --plan docs/plans/example-plan.md \
   --strategy auto \
   --default-pr-grouping group
+
+# 6) Render a tracking dashboard without provider mutation
+plan-issue-local record render-dashboard \
+  --profile tracking \
+  --status in-progress \
+  --source-url "$SOURCE_COMMENT_URL" \
+  --plan-url "$PLAN_COMMENT_URL" \
+  --state-url "$STATE_COMMENT_URL" \
+  --out /tmp/tracking-dashboard.md
 ```
 
 ## Exit codes
@@ -144,6 +165,7 @@ for the upstream contract.
 ## Specifications
 
 - [CLI contract v2](docs/specs/plan-issue-cli-contract-v2.md)
+- [Issue-backed plan record contract v1](docs/specs/issue-backed-plan-record-contract-v1.md)
 - [State machine and gate invariants v1](docs/specs/plan-issue-state-machine-v1.md)
 - [Gate matrix v1](docs/specs/plan-issue-gate-matrix-v1.md)
 

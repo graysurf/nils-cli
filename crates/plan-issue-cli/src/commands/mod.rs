@@ -1,6 +1,7 @@
 pub mod build;
 pub mod completion;
 pub mod plan;
+pub mod record;
 pub mod sprint;
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -15,6 +16,7 @@ use self::plan::{
     CleanupWorktreesArgs, ClosePlanArgs, LinkPrArgs, ReadyPlanArgs, ResolveApprovalArgs,
     StartPlanArgs, StatusPlanArgs,
 };
+use self::record::RecordArgs;
 use self::sprint::{AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -178,6 +180,9 @@ pub enum Command {
     /// comment on a PR, suitable for `accept-sprint --approved-comment-url`.
     ResolveApproval(ResolveApprovalArgs),
 
+    /// Render and audit issue-backed plan record dashboards and comments.
+    Record(RecordArgs),
+
     /// Export shell completion script.
     Completion(CompletionArgs),
 }
@@ -198,6 +203,7 @@ impl Command {
             Self::AcceptSprint(_) => "accept-sprint",
             Self::MultiSprintGuide(_) => "multi-sprint-guide",
             Self::ResolveApproval(_) => "resolve-approval",
+            Self::Record(args) => args.command_id(),
             Self::Completion(_) => "completion",
         }
     }
@@ -218,6 +224,7 @@ impl Command {
             // (Task 1.3); dispatch records gain `worktree_abs_path`
             // (Task 1.4).
             Self::StartSprint(_) => "v2",
+            Self::Record(_) => "v1",
             _ => "v1",
         };
         format!(
@@ -241,6 +248,7 @@ impl Command {
             Self::AcceptSprint(args) => serde_json::to_value(args),
             Self::MultiSprintGuide(args) => serde_json::to_value(args),
             Self::ResolveApproval(args) => serde_json::to_value(args),
+            Self::Record(args) => serde_json::to_value(args),
             Self::Completion(args) => serde_json::to_value(args),
         };
 
@@ -263,11 +271,24 @@ impl Command {
             Self::ClosePlan(args) => validate_close_plan_args(args, dry_run),
             Self::LinkPr(args) => validate_link_pr_args(args),
             Self::MultiSprintGuide(args) => validate_multi_sprint_guide_args(args),
+            Self::Record(_) => Ok(()),
             Self::Completion(_)
             | Self::StatusPlan(_)
             | Self::ReadyPlan(_)
             | Self::ResolveApproval(_)
             | Self::CleanupWorktrees(_) => Ok(()),
+        }
+    }
+}
+
+impl RecordArgs {
+    pub fn command_id(&self) -> &'static str {
+        match &self.command {
+            record::RecordCommand::RenderDashboard(_) => "record.render-dashboard",
+            record::RecordCommand::RenderComment(_) => "record.render-comment",
+            record::RecordCommand::Audit(_) => "record.audit",
+            record::RecordCommand::CloseoutGate(_) => "record.closeout-gate",
+            record::RecordCommand::BuildDispatchLedger(_) => "record.build-dispatch-ledger",
         }
     }
 }

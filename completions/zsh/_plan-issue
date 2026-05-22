@@ -17,12 +17,13 @@ _plan-issue() {
     _arguments "${_arguments_options[@]}" : \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
 '--version[Print version]' \
 ":: :_plan-issue_commands" \
@@ -48,10 +49,11 @@ _arguments "${_arguments_options[@]}" : \
 '*--pr-group=[Explicit task->group mapping (\`<task>=<group>\`). Repeatable]:task=group:_default' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -69,10 +71,11 @@ _arguments "${_arguments_options[@]}" : \
 '*--pr-group=[Explicit task->group mapping (\`<task>=<group>\`). Repeatable]:task=group:_default' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -93,10 +96,11 @@ _arguments "${_arguments_options[@]}" : \
 '*--label=[Labels to add at issue creation time]:name:_default' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -107,12 +111,13 @@ _arguments "${_arguments_options[@]}" : \
 '--body-file=[Offline issue body path]:path:_files' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '(--no-comment)--comment[Emit comment output]' \
 '(--comment)--no-comment[Disable comment output]' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -128,10 +133,11 @@ _arguments "${_arguments_options[@]}" : \
 '--status=[Row status to apply after linking PR (default\: \`in-progress\`)]:STATUS:(planned in-progress blocked)' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -146,13 +152,14 @@ _arguments "${_arguments_options[@]}" : \
 '*--remove-label=[Labels to remove when \`--label-update\` is set]:name:_default' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--label-update[Apply label updates in live mode]' \
 '(--no-comment)--comment[Emit comment output]' \
 '(--comment)--no-comment[Disable comment output]' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -167,11 +174,12 @@ _arguments "${_arguments_options[@]}" : \
 '(--comment)--comment-file=[Path to close comment markdown/text]:path:_files' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--allow-not-done[Allow closing when some tasks are not done]' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -181,10 +189,11 @@ _arguments "${_arguments_options[@]}" : \
 '--issue=[Plan issue number (live \`plan-issue\` only)]:number:_default' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -205,12 +214,13 @@ _arguments "${_arguments_options[@]}" : \
 '*--pr-group=[Explicit task->group mapping (\`<task>=<group>\`). Repeatable]:task=group:_default' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '(--no-comment)--comment[Emit comment output]' \
 '(--comment)--no-comment[Disable comment output]' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -232,12 +242,13 @@ _arguments "${_arguments_options[@]}" : \
 '(--summary)--summary-file=[Path to markdown/text review summary]:path:_files' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '(--no-comment)--comment[Emit comment output]' \
 '(--comment)--no-comment[Disable comment output]' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -260,12 +271,13 @@ _arguments "${_arguments_options[@]}" : \
 '(--summary)--summary-file=[Path to markdown/text review summary]:path:_files' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '(--no-comment)--comment[Emit comment output]' \
 '(--comment)--no-comment[Disable comment output]' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -277,22 +289,179 @@ _arguments "${_arguments_options[@]}" : \
 '--to-sprint=[Last sprint to include]:number:_default' \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
+;;
+(resolve-approval)
+_arguments "${_arguments_options[@]}" : \
+'--pr=[PR number (live \`plan-issue\` path only)]:number:_default' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(record)
+_arguments "${_arguments_options[@]}" : \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_plan-issue__subcmd__record_commands" \
+"*::: :->record" \
+&& ret=0
+
+    case $state in
+    (record)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:plan-issue-record-command-$line[1]:"
+        case $line[1] in
+            (render-dashboard)
+_arguments "${_arguments_options[@]}" : \
+'--profile=[Lifecycle profile for the issue record]:PROFILE:(tracking dispatch)' \
+'--status=[Current lifecycle status shown in the dashboard]:text:_default' \
+'--target-scope=[Target scope shown in the dashboard]:text:_default' \
+'--current=[Current task, lane, or closeout phase]:text:_default' \
+'--next-action=[Next action shown in the dashboard]:text:_default' \
+'--validation=[Latest validation summary or URL]:text:_default' \
+'*--linked-pr=[Linked PR reference. Repeatable]:ref:_default' \
+'*--blocker=[Current blocker. Repeatable]:text:_default' \
+'--approval=[Review or close approval state]:text:_default' \
+'--source-url=[Source snapshot URL]:url:_default' \
+'--plan-url=[Plan snapshot URL]:url:_default' \
+'--state-url=[Latest execution state URL]:url:_default' \
+'--session-url=[Latest execution session URL]:url:_default' \
+'--validation-url=[Latest validation evidence URL]:url:_default' \
+'--review-url=[Latest review evidence URL]:url:_default' \
+'--closeout-url=[Closeout comment URL]:url:_default' \
+'--title=[Original plan title]:text:_default' \
+'--issue-url=[Provider issue URL]:url:_default' \
+'--out=[Write rendered Markdown to this path]:path:_files' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(render-comment)
+_arguments "${_arguments_options[@]}" : \
+'--profile=[Lifecycle profile for the comment marker and visible metadata]:PROFILE:(tracking dispatch)' \
+'--marker-family=[Marker family to emit]:MARKER_FAMILY:((shared\:"Emit the shared issue-backed-plan marker family"
+compat\:"Emit compatibility markers used by the existing tracking lifecycle"))' \
+'--kind=[Lifecycle comment kind]:KIND:(source plan state session validation review closeout)' \
+'--path=[Source file path represented by this comment]:path:_files' \
+'--commit=[Commit hash for snapshot comments]:sha:_default' \
+'--content-file=[Markdown content to embed in the comment]:path:_files' \
+'--title=[Override the visible heading]:text:_default' \
+'--details-summary=[Override the collapsed details summary for source/plan snapshots]:text:_default' \
+'--out=[Write rendered Markdown to this path]:path:_files' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(audit)
+_arguments "${_arguments_options[@]}" : \
+'--body-file=[Provider issue body Markdown]:path:_files' \
+'--comments-json=[JSON containing either \`comments\` from \`gh issue view --json comments\` or a raw array of comment objects]:path:_files' \
+'--profile=[Expected profile. When omitted, all recognized markers are reported]:PROFILE:(tracking dispatch)' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(closeout-gate)
+_arguments "${_arguments_options[@]}" : \
+'--body-file=[Provider issue body Markdown]:path:_files' \
+'--comments-json=[JSON containing either \`comments\` from \`gh issue view --json comments\` or a raw array of comment objects]:path:_files' \
+'--profile=[Expected profile]:PROFILE:(tracking dispatch)' \
+'--approval=[Explicit approval comment URL or approval evidence text]:text:_default' \
+'*--linked-pr=[Linked PR reference. Repeatable; checked for presence in the body or comments, not for provider merge state]:ref:_default' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--require-complete[Require an execution state whose visible status is complete]' \
+'--require-session[Require a session comment]' \
+'--require-validation[Require validation evidence]' \
+'--require-review[Require review evidence]' \
+'--require-closeout[Require a closeout comment]' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(build-dispatch-ledger)
+_arguments "${_arguments_options[@]}" : \
+'--plan=[Plan markdown path]:path:_files' \
+'--owner-prefix=[Task owner prefix]:text:_default' \
+'--branch-prefix=[Branch prefix]:text:_default' \
+'--worktree-prefix=[Worktree prefix]:text:_default' \
+'--strategy=[Split strategy for group assignment]:strategy:(deterministic auto)' \
+'--pr-grouping=[PR grouping mode (deterministic only)]:mode:(per-sprint group)' \
+'--default-pr-grouping=[Auto fallback when sprint metadata omits grouping intent]:mode:(per-sprint group)' \
+'*--pr-group=[Explicit task->group mapping (\`<task>=<group>\`). Repeatable]:task=group:_default' \
+'--out=[Write rendered Markdown to this path]:path:_files' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 ;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
 '--dry-run[Print write actions without mutating GitHub state]' \
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
-'--json[Output machine-readable JSON (alias for --format json)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '-h[Print help]' \
 '--help[Print help]' \
 ':shell -- Shell to generate completion script for:(bash zsh)' \
@@ -318,72 +487,115 @@ _plan-issue_commands() {
 'ready-sprint:Post sprint-ready comment for main-agent review before merge' \
 'accept-sprint:Enforce merged-PR gate, sync sprint status=done, then post accepted comment' \
 'multi-sprint-guide:Print the full repeated command flow for a plan (1 plan = 1 issue)' \
+'resolve-approval:Resolve the URL of the most recent \`Decision\: merge\` review-evidence comment on a PR, suitable for \`accept-sprint --approved-comment-url\`' \
+'record:Render and audit issue-backed plan record dashboards and comments' \
 'completion:Export shell completion script' \
     )
     _describe -t commands 'plan-issue commands' commands "$@"
 }
-(( $+functions[_plan-issue__accept-sprint_commands] )) ||
-_plan-issue__accept-sprint_commands() {
+(( $+functions[_plan-issue__subcmd__accept-sprint_commands] )) ||
+_plan-issue__subcmd__accept-sprint_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue accept-sprint commands' commands "$@"
 }
-(( $+functions[_plan-issue__build-plan-task-spec_commands] )) ||
-_plan-issue__build-plan-task-spec_commands() {
+(( $+functions[_plan-issue__subcmd__build-plan-task-spec_commands] )) ||
+_plan-issue__subcmd__build-plan-task-spec_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue build-plan-task-spec commands' commands "$@"
 }
-(( $+functions[_plan-issue__build-task-spec_commands] )) ||
-_plan-issue__build-task-spec_commands() {
+(( $+functions[_plan-issue__subcmd__build-task-spec_commands] )) ||
+_plan-issue__subcmd__build-task-spec_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue build-task-spec commands' commands "$@"
 }
-(( $+functions[_plan-issue__cleanup-worktrees_commands] )) ||
-_plan-issue__cleanup-worktrees_commands() {
+(( $+functions[_plan-issue__subcmd__cleanup-worktrees_commands] )) ||
+_plan-issue__subcmd__cleanup-worktrees_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue cleanup-worktrees commands' commands "$@"
 }
-(( $+functions[_plan-issue__close-plan_commands] )) ||
-_plan-issue__close-plan_commands() {
+(( $+functions[_plan-issue__subcmd__close-plan_commands] )) ||
+_plan-issue__subcmd__close-plan_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue close-plan commands' commands "$@"
 }
-(( $+functions[_plan-issue__completion_commands] )) ||
-_plan-issue__completion_commands() {
+(( $+functions[_plan-issue__subcmd__completion_commands] )) ||
+_plan-issue__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue completion commands' commands "$@"
 }
-(( $+functions[_plan-issue__link-pr_commands] )) ||
-_plan-issue__link-pr_commands() {
+(( $+functions[_plan-issue__subcmd__link-pr_commands] )) ||
+_plan-issue__subcmd__link-pr_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue link-pr commands' commands "$@"
 }
-(( $+functions[_plan-issue__multi-sprint-guide_commands] )) ||
-_plan-issue__multi-sprint-guide_commands() {
+(( $+functions[_plan-issue__subcmd__multi-sprint-guide_commands] )) ||
+_plan-issue__subcmd__multi-sprint-guide_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue multi-sprint-guide commands' commands "$@"
 }
-(( $+functions[_plan-issue__ready-plan_commands] )) ||
-_plan-issue__ready-plan_commands() {
+(( $+functions[_plan-issue__subcmd__ready-plan_commands] )) ||
+_plan-issue__subcmd__ready-plan_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue ready-plan commands' commands "$@"
 }
-(( $+functions[_plan-issue__ready-sprint_commands] )) ||
-_plan-issue__ready-sprint_commands() {
+(( $+functions[_plan-issue__subcmd__ready-sprint_commands] )) ||
+_plan-issue__subcmd__ready-sprint_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue ready-sprint commands' commands "$@"
 }
-(( $+functions[_plan-issue__start-plan_commands] )) ||
-_plan-issue__start-plan_commands() {
+(( $+functions[_plan-issue__subcmd__record_commands] )) ||
+_plan-issue__subcmd__record_commands() {
+    local commands; commands=(
+'render-dashboard:Render a mutable issue dashboard for an issue-backed plan record' \
+'render-comment:Render one append-only lifecycle comment' \
+'audit:Audit issue body and comments for lifecycle markers' \
+'closeout-gate:Evaluate closeout readiness from lifecycle audit evidence' \
+'build-dispatch-ledger:Build a dispatch ledger from plan metadata and split grouping rules' \
+    )
+    _describe -t commands 'plan-issue record commands' commands "$@"
+}
+(( $+functions[_plan-issue__subcmd__record__subcmd__audit_commands] )) ||
+_plan-issue__subcmd__record__subcmd__audit_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue record audit commands' commands "$@"
+}
+(( $+functions[_plan-issue__subcmd__record__subcmd__build-dispatch-ledger_commands] )) ||
+_plan-issue__subcmd__record__subcmd__build-dispatch-ledger_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue record build-dispatch-ledger commands' commands "$@"
+}
+(( $+functions[_plan-issue__subcmd__record__subcmd__closeout-gate_commands] )) ||
+_plan-issue__subcmd__record__subcmd__closeout-gate_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue record closeout-gate commands' commands "$@"
+}
+(( $+functions[_plan-issue__subcmd__record__subcmd__render-comment_commands] )) ||
+_plan-issue__subcmd__record__subcmd__render-comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue record render-comment commands' commands "$@"
+}
+(( $+functions[_plan-issue__subcmd__record__subcmd__render-dashboard_commands] )) ||
+_plan-issue__subcmd__record__subcmd__render-dashboard_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue record render-dashboard commands' commands "$@"
+}
+(( $+functions[_plan-issue__subcmd__resolve-approval_commands] )) ||
+_plan-issue__subcmd__resolve-approval_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue resolve-approval commands' commands "$@"
+}
+(( $+functions[_plan-issue__subcmd__start-plan_commands] )) ||
+_plan-issue__subcmd__start-plan_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue start-plan commands' commands "$@"
 }
-(( $+functions[_plan-issue__start-sprint_commands] )) ||
-_plan-issue__start-sprint_commands() {
+(( $+functions[_plan-issue__subcmd__start-sprint_commands] )) ||
+_plan-issue__subcmd__start-sprint_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue start-sprint commands' commands "$@"
 }
-(( $+functions[_plan-issue__status-plan_commands] )) ||
-_plan-issue__status-plan_commands() {
+(( $+functions[_plan-issue__subcmd__status-plan_commands] )) ||
+_plan-issue__subcmd__status-plan_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue status-plan commands' commands "$@"
 }

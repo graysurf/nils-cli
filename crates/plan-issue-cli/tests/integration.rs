@@ -15,6 +15,8 @@ mod exit_codes;
 mod grouping_default;
 #[path = "integration/help_snapshot.rs"]
 mod help_snapshot;
+#[path = "integration/lifecycle_record.rs"]
+mod lifecycle_record;
 #[path = "integration/link_pr_flow.rs"]
 mod link_pr_flow;
 #[path = "integration/live_issue_ops.rs"]

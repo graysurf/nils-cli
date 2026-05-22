@@ -5,6 +5,7 @@ pub mod dispatch_record;
 mod execute;
 mod github;
 mod issue_body;
+pub mod lifecycle_record;
 pub mod output;
 mod render;
 pub mod runtime_layout;
