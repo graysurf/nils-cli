@@ -1,6 +1,6 @@
 [package]
 name = "nils-common"
-version = "0.17.3"
+version = "0.17.4"
 edition.workspace = true
 license.workspace = true
 description = "Library crate for nils-common in the nils-cli workspace."
@@ -14,6 +14,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "0.17.3", path = "../nils-test-support" }
+nils-test-support = { version = "0.17.4", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
