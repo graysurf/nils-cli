@@ -165,6 +165,65 @@ fn issue_backed_lifecycle_closeout_gate_reports_ready_when_required_markers_pass
 }
 
 #[test]
+fn issue_backed_lifecycle_closeout_gate_filters_linked_prs_by_profile() {
+    let tmp = TempDir::new().expect("tmp");
+    let body = tmp.path().join("body.md");
+    let comments = tmp.path().join("comments.json");
+    fs::write(
+        &body,
+        "## Final Dashboard\n\n## Durable Record\n\n## Closeout Checks\n",
+    )
+    .expect("write body");
+    fs::write(
+        &comments,
+        r##"[
+  {"url":"https://github.com/owner/repo/issues/1#issuecomment-source","body":"<!-- issue-backed-plan:snapshot:v1 kind=source profile=dispatch -->\n\n## Source Snapshot\n"},
+  {"url":"https://github.com/owner/repo/issues/1#issuecomment-plan","body":"<!-- issue-backed-plan:snapshot:v1 kind=plan profile=dispatch -->\n\n## Plan Snapshot\n"},
+  {"url":"https://github.com/owner/repo/issues/1#issuecomment-state","body":"<!-- issue-backed-plan:state:v1 profile=dispatch -->\n\n## Execution State\n\n- Status: complete\n"},
+  {"url":"https://github.com/owner/repo/issues/1#issuecomment-session","body":"<!-- issue-backed-plan:session:v1 profile=dispatch -->\n\n## Execution Session\n"},
+  {"url":"https://github.com/owner/repo/issues/1#issuecomment-validation","body":"<!-- issue-backed-plan:validation:v1 profile=dispatch -->\n\n## Validation Evidence\n"},
+  {"url":"https://github.com/owner/repo/issues/1#issuecomment-review","body":"<!-- issue-backed-plan:review:v1 profile=dispatch -->\n\n## Review Evidence\n"},
+  {"url":"https://github.com/owner/repo/issues/1#issuecomment-tracking","body":"<!-- execute-from-tracking-issue:session:v1 -->\n\n## Execution Session\n\n- PR: #999\n"}
+]"##,
+    )
+    .expect("write comments");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "closeout-gate",
+        "--profile",
+        "dispatch",
+        "--require-complete",
+        "--require-session",
+        "--require-validation",
+        "--require-review",
+        "--approval",
+        "explicit dispatch approval",
+        "--linked-pr",
+        "#999",
+        "--body-file",
+        body.to_str().expect("body path"),
+        "--comments-json",
+        comments.to_str().expect("comments path"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let payload = json_stdout(&out);
+    let result = &payload["payload"]["result"];
+    assert_eq!(result["ready"], false);
+    assert!(
+        result["checks_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("| linked PRs | fail | linked PRs not found in lifecycle evidence: #999 |"),
+        "{}",
+        result["checks_markdown"]
+    );
+}
+
+#[test]
 fn issue_backed_lifecycle_build_dispatch_ledger_uses_plan_tooling_without_task_decomposition() {
     let tmp = TempDir::new().expect("tmp");
     let rendered = tmp.path().join("dispatch-ledger.md");

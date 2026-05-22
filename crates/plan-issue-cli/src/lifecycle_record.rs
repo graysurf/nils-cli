@@ -272,14 +272,14 @@ pub fn audit_record(
         let Some(body) = comment.body.as_deref() else {
             continue;
         };
-        evidence_text.push_str(body);
-        evidence_text.push('\n');
         let Some(mut hit) = marker_hit(body) else {
             continue;
         };
         if profile_filter.is_some_and(|profile| hit.profile != profile.as_str()) {
             continue;
         }
+        evidence_text.push_str(body);
+        evidence_text.push('\n');
         hit.url = comment.url.or(comment.html_url);
         hit.created_at = comment.created_at;
         hit.status = extract_status(body);
