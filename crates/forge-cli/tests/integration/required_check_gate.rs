@@ -53,9 +53,9 @@ fn run_globals() -> GlobalFlags {
     }
 }
 
-const SUCCESS_JSON: &str = r#"[{"name":"build","bucket":"pass","conclusion":"success","isRequired":true,"link":"https://ci/1"},{"name":"test","bucket":"pass","conclusion":"success","isRequired":true,"link":"https://ci/2"}]"#;
-const PENDING_JSON: &str = r#"[{"name":"build","bucket":"pass","conclusion":"success","isRequired":true,"link":"https://ci/1"},{"name":"test","bucket":"pending","conclusion":"","isRequired":true,"link":"https://ci/2"}]"#;
-const FAILURE_JSON: &str = r#"[{"name":"build","bucket":"pass","conclusion":"success","isRequired":true,"link":"https://ci/1"},{"name":"test","bucket":"fail","conclusion":"failure","isRequired":true,"link":"https://ci/2"}]"#;
+const SUCCESS_JSON: &str = r#"[{"name":"build","bucket":"pass","state":"COMPLETED","link":"https://ci/1"},{"name":"test","bucket":"pass","state":"COMPLETED","link":"https://ci/2"}]"#;
+const PENDING_JSON: &str = r#"[{"name":"build","bucket":"pass","state":"COMPLETED","link":"https://ci/1"},{"name":"test","bucket":"pending","state":"IN_PROGRESS","link":"https://ci/2"}]"#;
+const FAILURE_JSON: &str = r#"[{"name":"build","bucket":"pass","state":"COMPLETED","link":"https://ci/1"},{"name":"test","bucket":"fail","state":"COMPLETED","link":"https://ci/2"}]"#;
 
 #[test]
 fn all_required_green_returns_payload_with_runtime_runner() {
@@ -137,7 +137,7 @@ fn helper_refetches_every_call_no_caching_across_atoms() {
     fs::write(&counter, "0").unwrap();
     let stub_dir = tmp.path().to_string_lossy().to_string();
     let body = format!(
-        "#!/bin/sh\nset -e\ncase \"$1 $2\" in\n  \"pr checks\")\n    n=$(cat \"{stub_dir}/counter\")\n    echo $((n + 1)) > \"{stub_dir}/counter\"\n    cat <<'EOF'\n{SUCCESS_JSON}\nEOF\n    ;;\n  *)\n    echo \"stub: unexpected gh args: $*\" >&2; exit 99;;\nesac\n"
+        "#!/bin/sh\nset -e\ncase \"$1 $2\" in\n  \"pr checks\")\n    case \" $* \" in\n      *\" --required \"*) ;;\n      *)\n        n=$(cat \"{stub_dir}/counter\")\n        echo $((n + 1)) > \"{stub_dir}/counter\"\n        ;;\n    esac\n    cat <<'EOF'\n{SUCCESS_JSON}\nEOF\n    ;;\n  *)\n    echo \"stub: unexpected gh args: $*\" >&2; exit 99;;\nesac\n"
     );
     write_stub(&tmp, &body);
     let _guard = lock_env();

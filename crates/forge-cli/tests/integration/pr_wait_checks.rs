@@ -34,13 +34,23 @@ case "$1 $2" in
   "pr checks")
     counter="{dir}/counter"
     idx=$(cat "$counter")
+    case " $* " in
+      *" --required "*)
+        idx=$((idx - 1))
+        if [ "$idx" -lt 0 ]; then
+            idx=0
+        fi
+        ;;
+      *)
+        next=$((idx + 1))
+        echo "$next" > "$counter"
+        ;;
+    esac
     if [ "$idx" -ge "{max_idx}" ]; then
         eff="{max_idx}"
     else
         eff="$idx"
     fi
-    next=$((idx + 1))
-    echo "$next" > "$counter"
     cat "{dir}/snap-$eff.json"
     ;;
   *)
@@ -53,9 +63,12 @@ esac
     stub.write_stub("gh", &body);
 }
 
-const PENDING_SNAP: &str = r#"[{"name":"build","bucket":"pending","conclusion":"","isRequired":true,"link":"https://ci/1"}]"#;
-const SUCCESS_SNAP: &str = r#"[{"name":"build","bucket":"pass","conclusion":"success","isRequired":true,"link":"https://ci/1"}]"#;
-const FAILURE_SNAP: &str = r#"[{"name":"build","bucket":"fail","conclusion":"failure","isRequired":true,"link":"https://ci/1"}]"#;
+const PENDING_SNAP: &str =
+    r#"[{"name":"build","bucket":"pending","state":"IN_PROGRESS","link":"https://ci/1"}]"#;
+const SUCCESS_SNAP: &str =
+    r#"[{"name":"build","bucket":"pass","state":"COMPLETED","link":"https://ci/1"}]"#;
+const FAILURE_SNAP: &str =
+    r#"[{"name":"build","bucket":"fail","state":"COMPLETED","link":"https://ci/1"}]"#;
 
 #[test]
 fn pr_wait_checks_succeeds_when_terminal_on_third_poll() {

@@ -12,19 +12,30 @@ use super::support::{StubEnv, parse_envelope, run_forge_cli};
 
 const FIXTURE_ALL_SUCCESS: &str = include_str!("../fixtures/github/pr_checks/all_success.json");
 const FIXTURE_MIXED_FAILURE: &str = include_str!("../fixtures/github/pr_checks/mixed_failure.json");
+const FIXTURE_MIXED_FAILURE_REQUIRED: &str =
+    include_str!("../fixtures/github/pr_checks/mixed_failure_required.json");
 const FIXTURE_ALL_PENDING: &str = include_str!("../fixtures/github/pr_checks/all_pending.json");
 const FIXTURE_CANCELLED: &str = include_str!("../fixtures/github/pr_checks/cancelled.json");
 const FIXTURE_EMPTY: &str = include_str!("../fixtures/github/pr_checks/empty.json");
 
-fn gh_dispatch_stub(checks_json: &str) -> String {
+fn gh_dispatch_stub(all_checks_json: &str, required_checks_json: &str) -> String {
     format!(
         r#"#!/bin/sh
 set -e
 case "$1 $2" in
   "pr checks")
-    cat <<'EOF'
-{json}
+    case " $* " in
+      *" --required "*)
+        cat <<'EOF'
+{required_json}
 EOF
+        ;;
+      *)
+        cat <<'EOF'
+{all_json}
+EOF
+        ;;
+    esac
     ;;
   *)
     echo "stub: unexpected gh args: $*" >&2
@@ -32,12 +43,17 @@ EOF
     ;;
 esac
 "#,
-        json = checks_json,
+        all_json = all_checks_json,
+        required_json = required_checks_json,
     )
 }
 
-fn run_checks(checks_json: &str, extra_args: &[&str]) -> (i32, serde_json::Value) {
-    let stub = StubEnv::new().gh_stub(&gh_dispatch_stub(checks_json));
+fn run_checks(
+    all_checks_json: &str,
+    required_checks_json: &str,
+    extra_args: &[&str],
+) -> (i32, serde_json::Value) {
+    let stub = StubEnv::new().gh_stub(&gh_dispatch_stub(all_checks_json, required_checks_json));
     let mut argv = vec![
         "--provider",
         "github",
@@ -56,7 +72,7 @@ fn run_checks(checks_json: &str, extra_args: &[&str]) -> (i32, serde_json::Value
 
 #[test]
 fn pr_checks_all_success_emits_success_state() {
-    let (_, env) = run_checks(FIXTURE_ALL_SUCCESS, &[]);
+    let (_, env) = run_checks(FIXTURE_ALL_SUCCESS, FIXTURE_ALL_SUCCESS, &[]);
     assert_eq!(env["schema_version"], "cli.forge-cli.pr.checks.v1");
     assert_eq!(env["ok"], true);
     assert_eq!(env["data"]["provider"], "github");
@@ -70,14 +86,14 @@ fn pr_checks_all_success_emits_success_state() {
 
 #[test]
 fn pr_checks_mixed_failure_marks_required_failed() {
-    let (_, env) = run_checks(FIXTURE_MIXED_FAILURE, &[]);
+    let (_, env) = run_checks(FIXTURE_MIXED_FAILURE, FIXTURE_MIXED_FAILURE_REQUIRED, &[]);
     assert_eq!(env["data"]["state"], "failure");
     assert_eq!(env["data"]["required_count"], 2);
     assert_eq!(env["data"]["success_count"], 1);
     let failed = env["data"]["failed"].as_array().expect("failed array");
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0]["name"], "test");
-    assert_eq!(failed[0]["conclusion"], "failure");
+    assert!(failed[0]["conclusion"].is_null());
     // Non-required pending check stays in data.checks but not in gating.
     let checks = env["data"]["checks"].as_array().expect("checks array");
     assert_eq!(checks.len(), 3);
@@ -86,7 +102,11 @@ fn pr_checks_mixed_failure_marks_required_failed() {
 
 #[test]
 fn pr_checks_mixed_failure_required_only_false_includes_optional_in_gating() {
-    let (_, env) = run_checks(FIXTURE_MIXED_FAILURE, &["--required-only", "false"]);
+    let (_, env) = run_checks(
+        FIXTURE_MIXED_FAILURE,
+        FIXTURE_MIXED_FAILURE_REQUIRED,
+        &["--required-only", "false"],
+    );
     // Required-only=false: the optional pending check is now part of the
     // gating set, so required_count grows to 3 and pending becomes part of
     // the aggregate.
@@ -100,7 +120,7 @@ fn pr_checks_mixed_failure_required_only_false_includes_optional_in_gating() {
 
 #[test]
 fn pr_checks_all_pending_reports_pending_state() {
-    let (_, env) = run_checks(FIXTURE_ALL_PENDING, &[]);
+    let (_, env) = run_checks(FIXTURE_ALL_PENDING, FIXTURE_ALL_PENDING, &[]);
     assert_eq!(env["data"]["state"], "pending");
     assert_eq!(env["data"]["required_count"], 2);
     assert_eq!(env["data"]["success_count"], 0);
@@ -110,22 +130,69 @@ fn pr_checks_all_pending_reports_pending_state() {
 
 #[test]
 fn pr_checks_cancelled_marks_failure_lane() {
-    let (_, env) = run_checks(FIXTURE_CANCELLED, &[]);
+    let (_, env) = run_checks(FIXTURE_CANCELLED, FIXTURE_CANCELLED, &[]);
     // Cancelled is a failure-class terminal state.
     assert_eq!(env["data"]["state"], "cancelled");
     let failed = env["data"]["failed"].as_array().expect("failed");
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0]["name"], "test");
-    assert_eq!(failed[0]["conclusion"], "cancelled");
+    assert!(failed[0]["conclusion"].is_null());
 }
 
 #[test]
 fn pr_checks_empty_array_is_success_zero_count() {
-    let (_, env) = run_checks(FIXTURE_EMPTY, &[]);
+    let (_, env) = run_checks(FIXTURE_EMPTY, FIXTURE_EMPTY, &[]);
     assert_eq!(env["data"]["state"], "success");
     assert_eq!(env["data"]["required_count"], 0);
     assert_eq!(env["data"]["success_count"], 0);
     assert!(env["data"]["checks"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn pr_checks_no_required_checks_backend_message_is_success_zero_required() {
+    let stub = StubEnv::new().gh_stub(&format!(
+        r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr checks")
+    case " $* " in
+      *" --required "*)
+        echo "no required checks reported on the 'feat/example' branch" >&2
+        exit 1
+        ;;
+      *)
+        cat <<'EOF'
+{all_json}
+EOF
+        ;;
+    esac
+    ;;
+  *)
+    echo "stub: unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+        all_json = FIXTURE_ALL_SUCCESS,
+    ));
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "1",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["state"], "success");
+    assert_eq!(env["data"]["required_count"], 0);
+    assert_eq!(env["data"]["success_count"], 0);
+    assert_eq!(env["data"]["checks"].as_array().unwrap().len(), 3);
 }
 
 #[test]
@@ -156,9 +223,12 @@ fn pr_checks_dry_run_renders_plan_with_json_fields() {
         .collect();
     assert!(plan.contains(&"checks".to_string()), "{plan:?}");
     assert!(plan.contains(&"42".to_string()), "{plan:?}");
+    assert!(plan.contains(&"--required".to_string()), "{plan:?}");
     let json_idx = plan
         .iter()
         .position(|s| s == "--json")
         .expect("--json present");
-    assert!(plan[json_idx + 1].contains("isRequired"), "{plan:?}");
+    assert!(plan[json_idx + 1].contains("bucket"), "{plan:?}");
+    assert!(!plan[json_idx + 1].contains("isRequired"), "{plan:?}");
+    assert!(!plan[json_idx + 1].contains("conclusion"), "{plan:?}");
 }

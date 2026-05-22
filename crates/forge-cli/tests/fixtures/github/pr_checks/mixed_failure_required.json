@@ -4,7 +4,7 @@
     "state": "COMPLETED",
     "bucket": "pass",
     "workflow": "CI",
-    "link": "https://github.com/sympoies/nils-cli/actions/runs/4001",
+    "link": "https://github.com/sympoies/nils-cli/actions/runs/2001",
     "startedAt": "2026-05-19T10:00:00Z",
     "completedAt": "2026-05-19T10:05:00Z",
     "description": ""
@@ -12,11 +12,11 @@
   {
     "name": "test",
     "state": "COMPLETED",
-    "bucket": "cancel",
+    "bucket": "fail",
     "workflow": "CI",
-    "link": "https://github.com/sympoies/nils-cli/actions/runs/4002",
+    "link": "https://github.com/sympoies/nils-cli/actions/runs/2002",
     "startedAt": "2026-05-19T10:00:00Z",
-    "completedAt": "2026-05-19T10:03:00Z",
-    "description": "cancelled by user"
+    "completedAt": "2026-05-19T10:07:30Z",
+    "description": "cargo test failed"
   }
 ]

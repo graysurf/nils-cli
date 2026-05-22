@@ -100,8 +100,8 @@ Parity matrix (v1):
 | `pr ready <id>`       | `gh pr ready <id>`                                              | `glab mr update <id> --ready`                        | exact                                |
 | `pr merge <id>`       | `gh pr merge <id> --squash --delete-branch`                     | `glab mr merge <id> --squash --remove-source-branch` | exact (method honoured per repo cfg) |
 | `pr close <id>`       | `gh pr close <id>`                                              | `glab mr close <id>`                                 | exact                                |
-| `pr checks <id>`      | `gh pr checks <id> --json …`                                    | `glab ci status -b <branch>` parsed                  | emulated on GitLab                   |
-| `pr wait-checks <id>` | poll `gh pr checks` + `gh run view`                             | poll `glab ci status` / pipeline view                | emulated; same envelope              |
+| `pr checks <id>`      | `gh pr checks <id> --json …` plus `--required` for gating       | `glab ci status -b <branch>` parsed                  | emulated on GitLab                   |
+| `pr wait-checks <id>` | poll `gh pr checks` / `gh pr checks --required`                 | poll `glab ci status` / pipeline view                | emulated; same envelope              |
 | `issue create`        | `gh issue create …`                                             | `glab issue create …`                                | exact                                |
 | `issue view <id>`     | `gh issue view <id> --json …`                                   | `glab issue view <id> -F json`                       | exact                                |
 | `issue edit <id>`     | `gh issue edit <id> …`                                          | `glab issue update <id> …`                           | exact                                |
@@ -200,7 +200,11 @@ backend mapping, validation rules, and output schema versions.
 - Behaviour: polls the backend until every required check is in a
   terminal state (`success`, `failure`, `cancelled`, `skipped`,
   `neutral`). `--required-only=true` ignores non-required checks for
-  the gating decision but still reports them in `data.checks`.
+  the gating decision but still reports them in `data.checks`. On
+  GitHub, required-check classification comes from an explicit
+  `gh pr checks --required` call; the JSON field set is
+  `name,state,bucket,workflow,link,startedAt,completedAt,description`
+  so the backend stays compatible with `gh 2.92.0`.
 - Terminal states map to envelope `ok`:
   - all required `success` → `ok = true`.
   - any required `failure`/`cancelled`/`timed_out` → `ok = false`,

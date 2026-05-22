@@ -2,25 +2,21 @@
   {
     "name": "build",
     "state": "IN_PROGRESS",
-    "conclusion": "",
     "bucket": "pending",
     "workflow": "CI",
     "link": "https://github.com/sympoies/nils-cli/actions/runs/3001",
     "startedAt": "2026-05-19T10:00:00Z",
     "completedAt": "",
-    "description": "",
-    "isRequired": true
+    "description": ""
   },
   {
     "name": "test",
     "state": "QUEUED",
-    "conclusion": "",
     "bucket": "pending",
     "workflow": "CI",
     "link": "https://github.com/sympoies/nils-cli/actions/runs/3002",
     "startedAt": "",
     "completedAt": "",
-    "description": "",
-    "isRequired": true
+    "description": ""
   }
 ]
