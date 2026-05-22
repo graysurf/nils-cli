@@ -28,6 +28,7 @@ fn cli_help_lists_full_surface_for_live_and_local_bins() {
         "multi-sprint-guide",
         // Task 1.5
         "resolve-approval",
+        "record",
         "-V, --version",
         "USAGE PATHS",
         "plan-issue-local",

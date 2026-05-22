@@ -14,6 +14,10 @@ use crate::commands::plan::{
     CleanupWorktreesArgs, ClosePlanArgs, LinkPrArgs, LinkPrStatus, ReadyPlanArgs,
     ResolveApprovalArgs, StartPlanArgs, StatusPlanArgs,
 };
+use crate::commands::record::{
+    BuildDispatchLedgerArgs, RecordArgs, RecordAuditArgs, RecordCloseoutGateArgs, RecordCommand,
+    RenderCommentArgs, RenderDashboardArgs,
+};
 use crate::commands::sprint::{
     AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs,
 };
@@ -21,6 +25,9 @@ use crate::commands::{Command as CliCommand, SplitStrategy, SummaryArgs};
 use crate::dispatch_record::{self, DispatchRecord};
 use crate::github::{GhCliAdapter, GitHubAdapter};
 use crate::issue_body::{self, TaskRow};
+use crate::lifecycle_record::{
+    self, CloseoutGateInput, CommentInput, DashboardInput, render_closeout_checks,
+};
 use crate::render::{self, SprintCommentInput, SprintCommentMode};
 use crate::runtime_layout::{self, IssueRoot, SprintRoot};
 use crate::task_spec::{self, TaskSpecBuildOptions, TaskSpecRow, TaskSpecScope};
@@ -63,11 +70,152 @@ pub fn execute(binary: BinaryFlavor, cli: &Cli) -> Result<Value, CommandError> {
         CliCommand::ResolveApproval(args) => {
             run_resolve_approval_json(binary, cli.force, cli.repo.as_deref(), args)
         }
+        CliCommand::Record(args) => run_record(args),
         CliCommand::Completion(_) => Err(CommandError::usage(
             "completion-direct-output-only",
             "completion output is emitted directly; run `<binary> completion <bash|zsh>`",
         )),
     }
+}
+
+fn run_record(args: &RecordArgs) -> Result<Value, CommandError> {
+    match &args.command {
+        RecordCommand::RenderDashboard(args) => run_record_render_dashboard(args),
+        RecordCommand::RenderComment(args) => run_record_render_comment(args),
+        RecordCommand::Audit(args) => run_record_audit(args),
+        RecordCommand::CloseoutGate(args) => run_record_closeout_gate(args),
+        RecordCommand::BuildDispatchLedger(args) => run_record_build_dispatch_ledger(args),
+    }
+}
+
+fn run_record_render_dashboard(args: &RenderDashboardArgs) -> Result<Value, CommandError> {
+    let markdown = lifecycle_record::render_dashboard(DashboardInput {
+        profile: args.profile,
+        status: args.status.clone(),
+        target_scope: args.target_scope.clone(),
+        current: args.current.clone(),
+        next_action: args.next_action.clone(),
+        validation: args.validation.clone(),
+        linked_prs: args.linked_pr.clone(),
+        blockers: args.blocker.clone(),
+        approval: args.approval.clone(),
+        source_url: args.source_url.clone(),
+        plan_url: args.plan_url.clone(),
+        state_url: args.state_url.clone(),
+        session_url: args.session_url.clone(),
+        validation_url: args.validation_url.clone(),
+        review_url: args.review_url.clone(),
+        closeout_url: args.closeout_url.clone(),
+        title: args.title.clone(),
+        issue_url: args.issue_url.clone(),
+    });
+    let out_path = write_optional_record_output(args.out.as_ref(), &markdown)?;
+
+    Ok(json!({
+        "profile": args.profile.as_str(),
+        "operation": "render-dashboard",
+        "out_path": out_path,
+        "markdown": markdown,
+    }))
+}
+
+fn run_record_render_comment(args: &RenderCommentArgs) -> Result<Value, CommandError> {
+    let content = match &args.content_file {
+        Some(path) => Some(read_text_file(path, "comment-content-read-failed")?),
+        None => None,
+    };
+    let markdown = lifecycle_record::render_comment(CommentInput {
+        profile: args.profile,
+        marker_family: args.marker_family,
+        kind: args.kind,
+        path: args.path.as_ref().map(|path| path_text(path)),
+        commit: args.commit.clone(),
+        content,
+        title: args.title.clone(),
+        details_summary: args.details_summary.clone(),
+    })
+    .map_err(|err| CommandError::runtime("record-comment-render-failed", err))?;
+    let out_path = write_optional_record_output(args.out.as_ref(), &markdown)?;
+
+    Ok(json!({
+        "profile": args.profile.as_str(),
+        "marker_family": args.marker_family.as_str(),
+        "kind": args.kind.as_str(),
+        "operation": "render-comment",
+        "out_path": out_path,
+        "markdown": markdown,
+    }))
+}
+
+fn run_record_audit(args: &RecordAuditArgs) -> Result<Value, CommandError> {
+    let body = match &args.body_file {
+        Some(path) => Some(read_text_file(path, "record-body-read-failed")?),
+        None => None,
+    };
+    let comments_json = read_text_file(&args.comments_json, "record-comments-read-failed")?;
+    let audit = lifecycle_record::audit_record(body.as_deref(), &comments_json, args.profile)
+        .map_err(|err| CommandError::runtime("record-audit-failed", err))?;
+
+    Ok(json!({
+        "operation": "audit",
+        "audit": audit,
+    }))
+}
+
+fn run_record_closeout_gate(args: &RecordCloseoutGateArgs) -> Result<Value, CommandError> {
+    let body = match &args.body_file {
+        Some(path) => Some(read_text_file(path, "record-body-read-failed")?),
+        None => None,
+    };
+    let comments_json = read_text_file(&args.comments_json, "record-comments-read-failed")?;
+    let audit = lifecycle_record::audit_record(body.as_deref(), &comments_json, Some(args.profile))
+        .map_err(|err| CommandError::runtime("record-audit-failed", err))?;
+    let gate = lifecycle_record::evaluate_closeout_gate(
+        &audit,
+        CloseoutGateInput {
+            profile: args.profile,
+            require_complete: args.require_complete,
+            require_session: args.require_session,
+            require_validation: args.require_validation,
+            require_review: args.require_review,
+            require_closeout: args.require_closeout,
+            approval: args.approval.clone(),
+            linked_prs: args.linked_pr.clone(),
+        },
+    );
+    let checks_markdown = render_closeout_checks(&gate.checks);
+
+    Ok(json!({
+        "operation": "closeout-gate",
+        "profile": args.profile.as_str(),
+        "ready": gate.ready,
+        "checks": gate.checks,
+        "checks_markdown": checks_markdown,
+    }))
+}
+
+fn run_record_build_dispatch_ledger(args: &BuildDispatchLedgerArgs) -> Result<Value, CommandError> {
+    let options = to_build_options(
+        args.prefixes.owner_prefix.clone(),
+        args.prefixes.branch_prefix.clone(),
+        args.prefixes.worktree_prefix.clone(),
+        args.grouping.pr_grouping,
+        args.grouping.default_pr_grouping,
+        args.grouping.strategy,
+        args.grouping.pr_group.clone(),
+    );
+    let build = task_spec::build_task_spec(&args.plan, TaskSpecScope::Plan, &options)
+        .map_err(|err| CommandError::runtime("dispatch-ledger-generation-failed", err))?;
+    let markdown = render_dispatch_ledger(&build.rows);
+    let out_path = write_optional_record_output(args.out.as_ref(), &markdown)?;
+
+    Ok(json!({
+        "operation": "build-dispatch-ledger",
+        "plan_title": build.plan_title,
+        "record_count": build.rows.len(),
+        "out_path": out_path,
+        "markdown": markdown,
+    }))
 }
 
 fn run_build_task_spec(args: &BuildTaskSpecArgs) -> Result<Value, CommandError> {
@@ -1962,6 +2110,66 @@ fn load_summary(summary: &SummaryArgs) -> Result<Option<String>, CommandError> {
         return Ok(Some(text));
     }
     Ok(None)
+}
+
+fn read_text_file(path: &Path, code: &'static str) -> Result<String, CommandError> {
+    fs::read_to_string(path).map_err(|err| {
+        CommandError::runtime(code, format!("failed to read {}: {err}", path.display()))
+    })
+}
+
+fn write_optional_record_output(
+    path: Option<&PathBuf>,
+    markdown: &str,
+) -> Result<Option<String>, CommandError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    render::write_rendered(path, markdown)
+        .map_err(|err| CommandError::runtime("record-output-write-failed", err))?;
+    Ok(Some(path_text(path)))
+}
+
+fn render_dispatch_ledger(rows: &[TaskSpecRow]) -> String {
+    let mut out = vec![
+        "## Dispatch Ledger".to_string(),
+        String::new(),
+        "| Task | Summary | Sprint | Owner/Subagent | Branch | Worktree | Execution Mode | PR Group | PR | Status | Validation | Review | Notes |".to_string(),
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            .to_string(),
+    ];
+    for row in rows {
+        let execution_mode = dispatch_execution_mode(row);
+        out.push(format!(
+            "| {} | {} | S{} | {} | {} | {} | {} | {} | TBD | planned | pending | pending | {} |",
+            record_table_cell(&row.task_id),
+            record_table_cell(&row.summary),
+            row.sprint,
+            record_table_cell(&row.owner),
+            record_table_cell(&row.branch),
+            record_table_cell(&row.worktree),
+            record_table_cell(&execution_mode),
+            record_table_cell(&row.pr_group),
+            record_table_cell(&row.notes),
+        ));
+    }
+    let mut rendered = out.join("\n");
+    rendered.push('\n');
+    rendered
+}
+
+fn dispatch_execution_mode(row: &TaskSpecRow) -> String {
+    match row.grouping {
+        crate::commands::PrGrouping::PerSprint => "per-sprint".to_string(),
+        crate::commands::PrGrouping::Group if row.pr_group.trim().is_empty() => {
+            "pr-isolated".to_string()
+        }
+        crate::commands::PrGrouping::Group => "pr-shared".to_string(),
+    }
+}
+
+fn record_table_cell(value: &str) -> String {
+    common_markdown::canonicalize_table_cell(value)
 }
 
 fn load_close_comment(
