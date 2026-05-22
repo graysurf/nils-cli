@@ -24,6 +24,7 @@ const NEXT_SCHEMA: &str = "inbox.next";
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_QUERY_LIMIT: u32 = 30;
 const GH_JSON_FIELDS: &str = "number,url,title,updatedAt,author,repository";
+const ENV_INBOX_GITLAB_HOST: &str = "FORGE_CLI_INBOX_GITLAB_HOST";
 
 #[derive(Debug, Clone)]
 struct ProviderTarget {
@@ -180,7 +181,7 @@ fn run_list<R: BackendRunner>(
     args: InboxQueryArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let targets = resolve_targets(global, &args.gitlab_host);
+    let targets = resolve_targets(global, args.gitlab_host.as_deref());
     let config = QueryConfig::new(args.kinds, args.limit.max(1));
     if global.dry_run {
         return Ok(emit_dry_run(
@@ -214,7 +215,7 @@ fn run_status<R: BackendRunner>(
     args: InboxQueryArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let targets = resolve_targets(global, &args.gitlab_host);
+    let targets = resolve_targets(global, args.gitlab_host.as_deref());
     let config = QueryConfig::new(args.kinds, args.limit.max(1));
     if global.dry_run {
         return Ok(emit_dry_run(
@@ -250,7 +251,7 @@ fn run_next<R: BackendRunner>(
     args: InboxNextArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let targets = resolve_targets(global, &args.gitlab_host);
+    let targets = resolve_targets(global, args.gitlab_host.as_deref());
     let result_limit = args.limit.max(1);
     let query_limit = result_limit.max(DEFAULT_QUERY_LIMIT);
     let config = QueryConfig::new(args.kinds, query_limit);
@@ -307,7 +308,7 @@ impl QueryConfig {
     }
 }
 
-fn resolve_targets(global: &GlobalFlags, gitlab_host: &str) -> Vec<ProviderTarget> {
+fn resolve_targets(global: &GlobalFlags, gitlab_host: Option<&str>) -> Vec<ProviderTarget> {
     match global.provider {
         Some(crate::cli::ProviderFlag::Github) => vec![ProviderTarget {
             provider: Provider::GitHub,
@@ -334,12 +335,23 @@ fn github_host(global: &GlobalFlags) -> String {
     host_from_remote(global, Provider::GitHub).unwrap_or_else(|| "github.com".to_string())
 }
 
-fn gitlab_host_for(global: &GlobalFlags, explicit: &str) -> String {
-    let trimmed = explicit.trim();
-    if !trimmed.is_empty() && trimmed != "gitlab.com" {
+fn gitlab_host_for(global: &GlobalFlags, explicit: Option<&str>) -> String {
+    if let Some(trimmed) = explicit.map(str::trim)
+        && !trimmed.is_empty()
+    {
         return trimmed.to_string();
     }
+    if let Some(host) = env_gitlab_host() {
+        return host;
+    }
     host_from_remote(global, Provider::GitLab).unwrap_or_else(|| "gitlab.com".to_string())
+}
+
+fn env_gitlab_host() -> Option<String> {
+    std::env::var(ENV_INBOX_GITLAB_HOST)
+        .ok()
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
 }
 
 fn host_from_remote(global: &GlobalFlags, provider: Provider) -> Option<String> {
@@ -1128,7 +1140,7 @@ mod tests {
             repo: None,
             dry_run: false,
         };
-        let targets = resolve_targets(&global, "gitlab.example.com");
+        let targets = resolve_targets(&global, Some("gitlab.example.com"));
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].provider, Provider::GitHub);
         assert_eq!(targets[1].provider, Provider::GitLab);

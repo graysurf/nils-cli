@@ -541,13 +541,10 @@ pub enum InboxCommand {
 /// Shared inbox query arguments for list/status.
 #[derive(Args, Debug, Clone)]
 pub struct InboxQueryArgs {
-    /// GitLab host for inbox API calls.
-    #[arg(
-        long = "gitlab-host",
-        value_name = "HOST",
-        default_value = "gitlab.com"
-    )]
-    pub gitlab_host: String,
+    /// GitLab host for inbox API calls. Defaults from FORGE_CLI_INBOX_GITLAB_HOST,
+    /// GitLab remote inference, then gitlab.com.
+    #[arg(long = "gitlab-host", value_name = "HOST")]
+    pub gitlab_host: Option<String>,
     /// Restrict inbox reasons/kinds. Repeatable. Defaults to review,
     /// assigned, todo, and authored; `involved` is opt-in because it can be
     /// broad on GitHub.
@@ -561,13 +558,10 @@ pub struct InboxQueryArgs {
 /// `inbox next` arguments.
 #[derive(Args, Debug, Clone)]
 pub struct InboxNextArgs {
-    /// GitLab host for inbox API calls.
-    #[arg(
-        long = "gitlab-host",
-        value_name = "HOST",
-        default_value = "gitlab.com"
-    )]
-    pub gitlab_host: String,
+    /// GitLab host for inbox API calls. Defaults from FORGE_CLI_INBOX_GITLAB_HOST,
+    /// GitLab remote inference, then gitlab.com.
+    #[arg(long = "gitlab-host", value_name = "HOST")]
+    pub gitlab_host: Option<String>,
     /// Restrict inbox reasons/kinds. Repeatable. Defaults to review,
     /// assigned, todo, and authored; `involved` is opt-in.
     #[arg(long = "kind", value_enum)]
@@ -1047,7 +1041,7 @@ mod tests {
             Some(Command::Inbox(InboxArgs {
                 command: Some(InboxCommand::List(args)),
             })) => {
-                assert_eq!(args.gitlab_host, "gitlab.example.com");
+                assert_eq!(args.gitlab_host.as_deref(), Some("gitlab.example.com"));
                 assert_eq!(
                     args.kinds,
                     vec![InboxKindFlag::Review, InboxKindFlag::Assigned]

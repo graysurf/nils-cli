@@ -187,6 +187,9 @@ Inbox-local flags:
   opt-in because it can be broad on GitHub.
 - `--gitlab-host <host>` is scoped to inbox commands only and is passed to
   every GitLab `glab api` invocation as `--hostname <host>`.
+- When `--gitlab-host` is omitted, GitLab host resolution uses
+  `FORGE_CLI_INBOX_GITLAB_HOST`, then GitLab remote inference, then
+  `gitlab.com`.
 - With no `--provider`, inbox queries both default providers. `--provider
   github|gitlab` narrows the inbox just as it narrows lifecycle commands, but
   inbox does not reuse the single-provider remote resolver internally.

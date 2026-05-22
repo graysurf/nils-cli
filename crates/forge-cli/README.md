@@ -38,7 +38,8 @@ forge-cli inbox next --limit 5 --format json
 
 With no `--provider`, inbox queries GitHub and GitLab and keeps successful
 provider results when another provider fails. GitLab inbox calls always pass
-`--hostname <host>` to `glab api`; use `--gitlab-host` for self-managed hosts.
+`--hostname <host>` to `glab api`; set `FORGE_CLI_INBOX_GITLAB_HOST` for a
+default self-managed host, or use `--gitlab-host` for a per-command override.
 `status` reports bounded counts, and `next` returns a ranked bounded subset
 without mutating PRs, issues, merge requests, or todos.
 

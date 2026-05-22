@@ -60,7 +60,7 @@ exit 7
 const GLAB_INBOX_STUB: &str = r#"#!/bin/sh
 set -e
 case "$*" in
-  *"--hostname gitlab.example.com"*) ;;
+  *"--hostname gitlab.example.com"*|*"--hostname gitlab.env.example"*) ;;
   *)
     echo "missing hostname: $*" >&2
     exit 98
@@ -68,7 +68,7 @@ case "$*" in
 esac
 
 case "$*" in
-  "api user --hostname gitlab.example.com")
+  "api user --hostname gitlab.example.com"|"api user --hostname gitlab.env.example")
     cat <<'EOF'
 {"id":1435,"username":"terrylin"}
 EOF
@@ -142,7 +142,9 @@ fn inbox_github_dedupes_reasons_and_normalizes_items() {
 
 #[test]
 fn inbox_gitlab_passes_hostname_and_normalizes_api_rows() {
-    let stub = StubEnv::new().glab_stub(GLAB_INBOX_STUB);
+    let stub = StubEnv::new()
+        .env("FORGE_CLI_INBOX_GITLAB_HOST", "gitlab.env.example")
+        .glab_stub(GLAB_INBOX_STUB);
     let out = run_forge_cli(
         &stub,
         &[
@@ -171,6 +173,29 @@ fn inbox_gitlab_passes_hostname_and_normalizes_api_rows() {
         .find(|item| item["title"] == "Todo issue")
         .expect("todo item");
     assert_eq!(todo["author"], "frank");
+}
+
+#[test]
+fn inbox_gitlab_host_can_default_from_env() {
+    let stub = StubEnv::new()
+        .env("FORGE_CLI_INBOX_GITLAB_HOST", "gitlab.env.example")
+        .glab_stub(GLAB_INBOX_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--limit",
+            "7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["providers"][0]["host"], "gitlab.env.example");
 }
 
 #[test]
