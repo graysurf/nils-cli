@@ -43,6 +43,52 @@ default self-managed host, or use `--gitlab-host` for a per-command override.
 `status` reports bounded counts, and `next` returns a ranked bounded subset
 without mutating PRs, issues, merge requests, or todos.
 
+### Reason filter (`--kind`) vs item-type filter (`--item-type`)
+
+`--kind` selects inbox *reasons* — why an item should appear (`review`,
+`assigned`, `todo`, `authored`, `involved`). `--item-type` selects *result
+classes* — pull/merge requests, issues, or all items. They are independent:
+
+```sh
+# default: all reasons, all item types
+forge-cli inbox list --format json
+
+# pull/merge requests only (skips GitHub issue searches and GitLab issue API calls)
+forge-cli inbox list --item-type pr --format json
+
+# issues only (skips PR searches; GitHub review-requested is dropped)
+forge-cli inbox list --item-type issue --format json
+
+# review-requested PRs only
+forge-cli inbox list --kind review --item-type pr --format json
+```
+
+`--item-type` defaults to `all`. Dry-run output reflects the pruned query plan:
+
+```sh
+forge-cli --dry-run --format json inbox list --item-type pr
+```
+
+GitLab `todos` are classified by `target_type` (or the target URL); todos whose
+target cannot be classified appear only in `--item-type all` mode.
+
+### Latency notes
+
+Provider adapters and independent query families run concurrently, so
+default-mode latency is bounded by the slowest single backend call rather than
+their sum. Identity lookup is only issued when a remaining GitLab query needs
+it. Manual smoke timings (provider/network dependent, not a CI assertion):
+
+```sh
+time forge-cli --provider github --format json inbox list --limit 30
+time forge-cli --provider github --format json inbox list --limit 30 --item-type pr
+time forge-cli --provider gitlab --gitlab-host gitlab.example.com --format json inbox list --limit 30
+time forge-cli --format json inbox list --gitlab-host gitlab.example.com --limit 30
+```
+
+Wall-clock latency depends on `gh`/`glab` and remote API responsiveness; treat
+these timings as delivery evidence, not deterministic budgets.
+
 ## GitHub checks compatibility
 
 Starting with `nils-cli` `0.17.0`, GitHub `pr checks` calls request only the

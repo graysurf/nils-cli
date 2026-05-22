@@ -211,6 +211,31 @@ impl InboxKindFlag {
     }
 }
 
+/// Inbox item-type filter. Distinct from `--kind` (reason): item-type selects
+/// PR/MR-only or issue-only result classes so the CLI can skip irrelevant
+/// provider query families before any subprocess runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum InboxItemTypeFlag {
+    /// Include PRs/MRs, issues, and classifiable todos (default).
+    #[default]
+    All,
+    /// Include only pull requests / merge requests (and todos that target them).
+    Pr,
+    /// Include only issues (and todos that target them).
+    Issue,
+}
+
+impl InboxItemTypeFlag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InboxItemTypeFlag::All => "all",
+            InboxItemTypeFlag::Pr => "pr",
+            InboxItemTypeFlag::Issue => "issue",
+        }
+    }
+}
+
 impl PrStateFilter {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -550,6 +575,12 @@ pub struct InboxQueryArgs {
     /// broad on GitHub.
     #[arg(long = "kind", value_enum)]
     pub kinds: Vec<InboxKindFlag>,
+    /// Restrict inbox by item type (PR/MR vs issue). `--kind` filters reasons
+    /// (review/assigned/todo/authored/involved); `--item-type` filters result
+    /// classes so PR-only and issue-only modes skip irrelevant provider
+    /// queries. Defaults to all.
+    #[arg(long = "item-type", value_enum, default_value_t = InboxItemTypeFlag::All)]
+    pub item_type: InboxItemTypeFlag,
     /// Per-provider, per-query-family bounded result limit (default: 30).
     #[arg(long, default_value_t = 30)]
     pub limit: u32,
@@ -566,6 +597,10 @@ pub struct InboxNextArgs {
     /// assigned, todo, and authored; `involved` is opt-in.
     #[arg(long = "kind", value_enum)]
     pub kinds: Vec<InboxKindFlag>,
+    /// Restrict inbox by item type (PR/MR vs issue). See `inbox list --help`
+    /// for the distinction from `--kind`. Defaults to all.
+    #[arg(long = "item-type", value_enum, default_value_t = InboxItemTypeFlag::All)]
+    pub item_type: InboxItemTypeFlag,
     /// Number of ranked items to return (default: 5). Provider queries remain
     /// bounded at at least 30 candidates so ranking has enough input.
     #[arg(long, default_value_t = 5)]
@@ -1047,9 +1082,35 @@ mod tests {
                     vec![InboxKindFlag::Review, InboxKindFlag::Assigned]
                 );
                 assert_eq!(args.limit, 7);
+                assert_eq!(args.item_type, InboxItemTypeFlag::All);
             }
             other => panic!("expected inbox list, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inbox_cli_parses_item_type_for_list_status_next() {
+        for sub in ["list", "status", "next"] {
+            let cli = parse(&["inbox", sub, "--item-type", "pr"]).expect("parse pr item-type");
+            match cli.command {
+                Some(Command::Inbox(InboxArgs {
+                    command: Some(InboxCommand::List(args)),
+                })) => assert_eq!(args.item_type, InboxItemTypeFlag::Pr),
+                Some(Command::Inbox(InboxArgs {
+                    command: Some(InboxCommand::Status(args)),
+                })) => assert_eq!(args.item_type, InboxItemTypeFlag::Pr),
+                Some(Command::Inbox(InboxArgs {
+                    command: Some(InboxCommand::Next(args)),
+                })) => assert_eq!(args.item_type, InboxItemTypeFlag::Pr),
+                other => panic!("expected inbox {sub}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn inbox_cli_rejects_unknown_item_type() {
+        let result = parse(&["inbox", "list", "--item-type", "bogus"]);
+        assert!(result.is_err(), "--item-type bogus must fail clap parsing");
     }
 
     #[test]

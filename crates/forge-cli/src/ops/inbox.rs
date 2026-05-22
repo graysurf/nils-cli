@@ -13,7 +13,10 @@ use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, ProcessRunner};
-use crate::cli::{BINARY, GlobalFlags, InboxCommand, InboxKindFlag, InboxNextArgs, InboxQueryArgs};
+use crate::cli::{
+    BINARY, GlobalFlags, InboxCommand, InboxItemTypeFlag, InboxKindFlag, InboxNextArgs,
+    InboxQueryArgs,
+};
 use crate::envelope::emit_success_with_warnings;
 use crate::error::ForgeError;
 use crate::provider::{Provider, classify_host, git_remote_url, parse_host};
@@ -35,7 +38,19 @@ struct ProviderTarget {
 #[derive(Debug, Clone)]
 struct QueryConfig {
     reasons: Vec<InboxKindFlag>,
+    item_type: InboxItemTypeFlag,
     query_limit: u32,
+}
+
+/// Classification of a GitLab `todo` target. `Unknown` covers payloads where
+/// neither `target_type` nor the URL gives a confident PR/Issue answer; those
+/// rows are included only in all-items mode so PR-only and issue-only callers
+/// never see noise from unclassifiable todos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TodoTarget {
+    MergeRequest,
+    Issue,
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -162,7 +177,7 @@ pub fn run(
     run_with(&runner, global, command, format)
 }
 
-pub fn run_with<R: BackendRunner>(
+pub fn run_with<R: BackendRunner + Sync>(
     runner: &R,
     global: &GlobalFlags,
     command: InboxCommand,
@@ -175,14 +190,14 @@ pub fn run_with<R: BackendRunner>(
     }
 }
 
-fn run_list<R: BackendRunner>(
+fn run_list<R: BackendRunner + Sync>(
     runner: &R,
     global: &GlobalFlags,
     args: InboxQueryArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
     let targets = resolve_targets(global, args.gitlab_host.as_deref());
-    let config = QueryConfig::new(args.kinds, args.limit.max(1));
+    let config = QueryConfig::new(args.kinds, args.item_type, args.limit.max(1));
     if global.dry_run {
         return Ok(emit_dry_run(
             schema_version_for(BINARY, LIST_SCHEMA, SCHEMA_VERSION),
@@ -209,14 +224,14 @@ fn run_list<R: BackendRunner>(
     ))
 }
 
-fn run_status<R: BackendRunner>(
+fn run_status<R: BackendRunner + Sync>(
     runner: &R,
     global: &GlobalFlags,
     args: InboxQueryArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
     let targets = resolve_targets(global, args.gitlab_host.as_deref());
-    let config = QueryConfig::new(args.kinds, args.limit.max(1));
+    let config = QueryConfig::new(args.kinds, args.item_type, args.limit.max(1));
     if global.dry_run {
         return Ok(emit_dry_run(
             schema_version_for(BINARY, STATUS_SCHEMA, SCHEMA_VERSION),
@@ -245,7 +260,7 @@ fn run_status<R: BackendRunner>(
     ))
 }
 
-fn run_next<R: BackendRunner>(
+fn run_next<R: BackendRunner + Sync>(
     runner: &R,
     global: &GlobalFlags,
     args: InboxNextArgs,
@@ -254,7 +269,7 @@ fn run_next<R: BackendRunner>(
     let targets = resolve_targets(global, args.gitlab_host.as_deref());
     let result_limit = args.limit.max(1);
     let query_limit = result_limit.max(DEFAULT_QUERY_LIMIT);
-    let config = QueryConfig::new(args.kinds, query_limit);
+    let config = QueryConfig::new(args.kinds, args.item_type, query_limit);
     if global.dry_run {
         return Ok(emit_dry_run(
             schema_version_for(BINARY, NEXT_SCHEMA, SCHEMA_VERSION),
@@ -284,7 +299,7 @@ fn run_next<R: BackendRunner>(
 }
 
 impl QueryConfig {
-    fn new(kinds: Vec<InboxKindFlag>, query_limit: u32) -> Self {
+    fn new(kinds: Vec<InboxKindFlag>, item_type: InboxItemTypeFlag, query_limit: u32) -> Self {
         let mut reasons = if kinds.is_empty() {
             vec![
                 InboxKindFlag::Review,
@@ -299,12 +314,39 @@ impl QueryConfig {
         reasons.dedup();
         Self {
             reasons,
+            item_type,
             query_limit,
         }
     }
 
     fn wants(&self, reason: InboxKindFlag) -> bool {
         self.reasons.contains(&reason)
+    }
+
+    fn allows_pr(&self) -> bool {
+        matches!(
+            self.item_type,
+            InboxItemTypeFlag::All | InboxItemTypeFlag::Pr
+        )
+    }
+
+    fn allows_issue(&self) -> bool {
+        matches!(
+            self.item_type,
+            InboxItemTypeFlag::All | InboxItemTypeFlag::Issue
+        )
+    }
+
+    /// Whether at least one selected GitLab query family needs the user
+    /// identity (review filters by `reviewer_username`, authored filters by
+    /// `author_id`). Identity lookup is skipped when no remaining query needs
+    /// it, including when item-type filtering has pruned away the dependent
+    /// families.
+    fn gitlab_identity_needed(&self) -> bool {
+        let review_needs = self.wants(InboxKindFlag::Review) && self.allows_pr();
+        let authored_needs =
+            self.wants(InboxKindFlag::Authored) && (self.allows_pr() || self.allows_issue());
+        review_needs || authored_needs
     }
 }
 
@@ -364,19 +406,97 @@ fn host_from_remote(global: &GlobalFlags, provider: Provider) -> Option<String> 
     }
 }
 
-fn collect_inbox<R: BackendRunner>(
+/// Pre-execution snapshot of a provider's query plan. Built from
+/// `(target, config)` only — no backend calls are issued at build time.
+/// Dry-run and live execution paths share this builder so the planned argv
+/// can never drift from what live execution would actually run.
+#[derive(Debug, Clone)]
+struct ProviderPlan {
+    target: ProviderTarget,
+    config: QueryConfig,
+}
+
+impl ProviderPlan {
+    fn build(target: &ProviderTarget, config: &QueryConfig) -> Self {
+        Self {
+            target: target.clone(),
+            config: config.clone(),
+        }
+    }
+
+    /// Render the argv list a dry-run would emit. GitLab queries that depend
+    /// on identity are rendered with placeholder `<user_id>` / `<username>`
+    /// values so callers can still inspect what the live path would call.
+    fn dry_run_argv(&self) -> Vec<Vec<String>> {
+        match self.target.provider {
+            Provider::GitHub => github_queries(&self.config)
+                .into_iter()
+                .map(|q| q.call.plan_argv())
+                .collect(),
+            Provider::GitLab => {
+                let mut out = Vec::new();
+                let needs_identity = self.config.gitlab_identity_needed();
+                if needs_identity {
+                    out.push(gitlab_identity_call(&self.target.host).plan_argv());
+                }
+                let placeholder = GitlabIdentity {
+                    id: "<user_id>".to_string(),
+                    username: "<username>".to_string(),
+                };
+                let identity = needs_identity.then_some(&placeholder);
+                for q in gitlab_queries(&self.target.host, identity, &self.config) {
+                    out.push(q.call.plan_argv());
+                }
+                out
+            }
+        }
+    }
+
+    fn execute<R: BackendRunner + Sync>(&self, runner: &R) -> Result<ProviderSuccess, ForgeError> {
+        match self.target.provider {
+            Provider::GitHub => execute_github(runner, &self.target, &self.config),
+            Provider::GitLab => execute_gitlab(runner, &self.target, &self.config),
+        }
+    }
+}
+
+fn collect_inbox<R: BackendRunner + Sync>(
     runner: &R,
     targets: &[ProviderTarget],
     config: &QueryConfig,
 ) -> Result<InboxCollection, ForgeError> {
-    let mut providers = Vec::new();
+    let plans: Vec<ProviderPlan> = targets
+        .iter()
+        .map(|t| ProviderPlan::build(t, config))
+        .collect();
+
+    // Run providers concurrently. Each provider does its own identity lookup
+    // (if needed) and query-family fan-out internally. Mixed-provider mode
+    // does not block GitHub work on the GitLab identity lookup.
+    let mut slots: Vec<Option<Result<ProviderSuccess, ForgeError>>> =
+        (0..plans.len()).map(|_| None).collect();
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(plans.len());
+        for (i, plan) in plans.iter().enumerate() {
+            handles.push(s.spawn(move || (i, plan.execute(runner))));
+        }
+        for h in handles {
+            let (i, res) = h.join().expect("inbox provider task panicked");
+            slots[i] = Some(res);
+        }
+    });
+
+    // Aggregate strictly in target order so providers, warnings, and items
+    // are deterministic regardless of completion order.
+    let mut providers = Vec::with_capacity(targets.len());
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let mut failures = Vec::new();
     let mut successes = 0usize;
 
-    for target in targets {
-        match query_provider(runner, target, config) {
+    for (i, target) in targets.iter().enumerate() {
+        let result = slots[i].take().expect("provider slot filled");
+        match result {
             Ok(success) => {
                 successes += 1;
                 let item_count = success.items.len();
@@ -445,65 +565,97 @@ fn collect_inbox<R: BackendRunner>(
     })
 }
 
-fn query_provider<R: BackendRunner>(
-    runner: &R,
-    target: &ProviderTarget,
-    config: &QueryConfig,
-) -> Result<ProviderSuccess, ForgeError> {
-    match target.provider {
-        Provider::GitHub => query_github(runner, target, config),
-        Provider::GitLab => query_gitlab(runner, target, config),
-    }
-}
-
-fn query_github<R: BackendRunner>(
+fn execute_github<R: BackendRunner + Sync>(
     runner: &R,
     target: &ProviderTarget,
     config: &QueryConfig,
 ) -> Result<ProviderSuccess, ForgeError> {
     let queries = github_queries(config);
-    let mut items = Vec::new();
-    let mut limited = false;
-    for query in queries {
-        let output = runner.run(&query.call)?;
-        let parsed = parse_github_items(target, &query, &output)?;
-        if parsed.len() as u32 >= config.query_limit {
-            limited = true;
-        }
-        items.extend(parsed);
-    }
-    Ok(ProviderSuccess {
-        items: dedupe_items(items),
-        limited,
-    })
+    let per_query = run_queries_in_parallel(runner, &queries, |query, output| {
+        parse_github_items(target, query, output)
+    })?;
+    Ok(aggregate_query_results(per_query, config.query_limit))
 }
 
-fn query_gitlab<R: BackendRunner>(
+fn execute_gitlab<R: BackendRunner + Sync>(
     runner: &R,
     target: &ProviderTarget,
     config: &QueryConfig,
 ) -> Result<ProviderSuccess, ForgeError> {
-    let identity = parse_gitlab_identity(&runner.run(&gitlab_identity_call(&target.host))?)?;
-    let queries = gitlab_queries(&target.host, &identity, config);
+    let identity = if config.gitlab_identity_needed() {
+        Some(parse_gitlab_identity(
+            &runner.run(&gitlab_identity_call(&target.host))?,
+        )?)
+    } else {
+        None
+    };
+    let queries = gitlab_queries(&target.host, identity.as_ref(), config);
+    let item_type = config.item_type;
+    let per_query = run_queries_in_parallel(runner, &queries, |query, output| {
+        parse_gitlab_items(target, query, output, item_type)
+    })?;
+    Ok(aggregate_query_results(per_query, config.query_limit))
+}
+
+/// Run a slice of independent provider query families concurrently and
+/// return their parsed item lists in plan order. The first plan-order error
+/// wins so failure reporting stays deterministic across thread completion
+/// orders.
+fn run_queries_in_parallel<R, F>(
+    runner: &R,
+    queries: &[ProviderQuery],
+    parse: F,
+) -> Result<Vec<Vec<InboxItem>>, ForgeError>
+where
+    R: BackendRunner + Sync,
+    F: Fn(&ProviderQuery, &BackendSuccess) -> Result<Vec<InboxItem>, ForgeError> + Sync,
+{
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut slots: Vec<Option<Result<Vec<InboxItem>, ForgeError>>> =
+        (0..queries.len()).map(|_| None).collect();
+    let parse_ref = &parse;
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(queries.len());
+        for (i, query) in queries.iter().enumerate() {
+            handles.push(s.spawn(move || {
+                let result = runner
+                    .run(&query.call)
+                    .and_then(|output| parse_ref(query, &output));
+                (i, result)
+            }));
+        }
+        for h in handles {
+            let (i, res) = h.join().expect("inbox query task panicked");
+            slots[i] = Some(res);
+        }
+    });
+    let mut out = Vec::with_capacity(slots.len());
+    for slot in slots {
+        out.push(slot.expect("query slot filled")?);
+    }
+    Ok(out)
+}
+
+fn aggregate_query_results(per_query: Vec<Vec<InboxItem>>, query_limit: u32) -> ProviderSuccess {
     let mut items = Vec::new();
     let mut limited = false;
-    for query in queries {
-        let output = runner.run(&query.call)?;
-        let parsed = parse_gitlab_items(target, &query, &output)?;
-        if parsed.len() as u32 >= config.query_limit {
+    for q in per_query {
+        if q.len() as u32 >= query_limit {
             limited = true;
         }
-        items.extend(parsed);
+        items.extend(q);
     }
-    Ok(ProviderSuccess {
+    ProviderSuccess {
         items: dedupe_items(items),
         limited,
-    })
+    }
 }
 
 fn github_queries(config: &QueryConfig) -> Vec<ProviderQuery> {
     let mut queries = Vec::new();
-    if config.wants(InboxKindFlag::Review) {
+    if config.wants(InboxKindFlag::Review) && config.allows_pr() {
         queries.push(ProviderQuery {
             reason: InboxKindFlag::Review,
             source: "github_search_prs",
@@ -511,40 +663,52 @@ fn github_queries(config: &QueryConfig) -> Vec<ProviderQuery> {
         });
     }
     if config.wants(InboxKindFlag::Assigned) {
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Assigned,
-            source: "github_search_prs",
-            call: github_search_call("prs", "--assignee", config.query_limit),
-        });
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Assigned,
-            source: "github_search_issues",
-            call: github_search_call("issues", "--assignee", config.query_limit),
-        });
+        if config.allows_pr() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Assigned,
+                source: "github_search_prs",
+                call: github_search_call("prs", "--assignee", config.query_limit),
+            });
+        }
+        if config.allows_issue() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Assigned,
+                source: "github_search_issues",
+                call: github_search_call("issues", "--assignee", config.query_limit),
+            });
+        }
     }
     if config.wants(InboxKindFlag::Authored) {
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Authored,
-            source: "github_search_prs",
-            call: github_search_call("prs", "--author", config.query_limit),
-        });
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Authored,
-            source: "github_search_issues",
-            call: github_search_call("issues", "--author", config.query_limit),
-        });
+        if config.allows_pr() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Authored,
+                source: "github_search_prs",
+                call: github_search_call("prs", "--author", config.query_limit),
+            });
+        }
+        if config.allows_issue() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Authored,
+                source: "github_search_issues",
+                call: github_search_call("issues", "--author", config.query_limit),
+            });
+        }
     }
     if config.wants(InboxKindFlag::Involved) {
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Involved,
-            source: "github_search_prs",
-            call: github_search_call("prs", "--involves", config.query_limit),
-        });
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Involved,
-            source: "github_search_issues",
-            call: github_search_call("issues", "--involves", config.query_limit),
-        });
+        if config.allows_pr() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Involved,
+                source: "github_search_prs",
+                call: github_search_call("prs", "--involves", config.query_limit),
+            });
+        }
+        if config.allows_issue() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Involved,
+                source: "github_search_issues",
+                call: github_search_call("issues", "--involves", config.query_limit),
+            });
+        }
     }
     queries
 }
@@ -585,35 +749,42 @@ fn gitlab_identity_call(host: &str) -> BackendCall {
 
 fn gitlab_queries(
     host: &str,
-    identity: &GitlabIdentity,
+    identity: Option<&GitlabIdentity>,
     config: &QueryConfig,
 ) -> Vec<ProviderQuery> {
     let mut queries = Vec::new();
     if config.wants(InboxKindFlag::Assigned) {
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Assigned,
-            source: "gitlab_merge_requests",
-            call: gitlab_api_call(
-                host,
-                format!(
-                    "merge_requests?scope=assigned_to_me&state=opened&order_by=updated_at&sort=desc&per_page={}",
-                    config.query_limit
+        if config.allows_pr() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Assigned,
+                source: "gitlab_merge_requests",
+                call: gitlab_api_call(
+                    host,
+                    format!(
+                        "merge_requests?scope=assigned_to_me&state=opened&order_by=updated_at&sort=desc&per_page={}",
+                        config.query_limit
+                    ),
                 ),
-            ),
-        });
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Assigned,
-            source: "gitlab_issues",
-            call: gitlab_api_call(
-                host,
-                format!(
-                    "issues?scope=assigned_to_me&state=opened&order_by=updated_at&sort=desc&per_page={}",
-                    config.query_limit
+            });
+        }
+        if config.allows_issue() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Assigned,
+                source: "gitlab_issues",
+                call: gitlab_api_call(
+                    host,
+                    format!(
+                        "issues?scope=assigned_to_me&state=opened&order_by=updated_at&sort=desc&per_page={}",
+                        config.query_limit
+                    ),
                 ),
-            ),
-        });
+            });
+        }
     }
-    if config.wants(InboxKindFlag::Review) {
+    if config.wants(InboxKindFlag::Review)
+        && config.allows_pr()
+        && let Some(identity) = identity
+    {
         queries.push(ProviderQuery {
             reason: InboxKindFlag::Review,
             source: "gitlab_merge_requests",
@@ -626,29 +797,35 @@ fn gitlab_queries(
             ),
         });
     }
-    if config.wants(InboxKindFlag::Authored) {
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Authored,
-            source: "gitlab_merge_requests",
-            call: gitlab_api_call(
-                host,
-                format!(
-                    "merge_requests?author_id={}&state=opened&order_by=updated_at&sort=desc&per_page={}",
-                    identity.id, config.query_limit
+    if config.wants(InboxKindFlag::Authored)
+        && let Some(identity) = identity
+    {
+        if config.allows_pr() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Authored,
+                source: "gitlab_merge_requests",
+                call: gitlab_api_call(
+                    host,
+                    format!(
+                        "merge_requests?author_id={}&state=opened&order_by=updated_at&sort=desc&per_page={}",
+                        identity.id, config.query_limit
+                    ),
                 ),
-            ),
-        });
-        queries.push(ProviderQuery {
-            reason: InboxKindFlag::Authored,
-            source: "gitlab_issues",
-            call: gitlab_api_call(
-                host,
-                format!(
-                    "issues?author_id={}&state=opened&order_by=updated_at&sort=desc&per_page={}",
-                    identity.id, config.query_limit
+            });
+        }
+        if config.allows_issue() {
+            queries.push(ProviderQuery {
+                reason: InboxKindFlag::Authored,
+                source: "gitlab_issues",
+                call: gitlab_api_call(
+                    host,
+                    format!(
+                        "issues?author_id={}&state=opened&order_by=updated_at&sort=desc&per_page={}",
+                        identity.id, config.query_limit
+                    ),
                 ),
-            ),
-        });
+            });
+        }
     }
     if config.wants(InboxKindFlag::Todo) {
         queries.push(ProviderQuery {
@@ -711,18 +888,55 @@ fn parse_gitlab_items(
     target: &ProviderTarget,
     query: &ProviderQuery,
     output: &BackendSuccess,
+    item_type: InboxItemTypeFlag,
 ) -> Result<Vec<InboxItem>, ForgeError> {
     let values = parse_array(output, "GitLab inbox JSON is invalid")?;
-    values
-        .iter()
-        .map(|raw| {
-            if query.source == "gitlab_todos" {
-                parse_gitlab_todo(target, query, raw)
-            } else {
-                parse_gitlab_work_item(target, query, raw)
+    if query.source == "gitlab_todos" {
+        let mut out = Vec::with_capacity(values.len());
+        for raw in &values {
+            let target_kind = classify_gitlab_todo(raw);
+            if !todo_target_matches(target_kind, item_type) {
+                continue;
             }
-        })
-        .collect()
+            out.push(parse_gitlab_todo(target, query, raw)?);
+        }
+        Ok(out)
+    } else {
+        values
+            .iter()
+            .map(|raw| parse_gitlab_work_item(target, query, raw))
+            .collect()
+    }
+}
+
+fn classify_gitlab_todo(raw: &serde_json::Value) -> TodoTarget {
+    if let Some(t) = optional_str(raw, "target_type") {
+        match t.as_str() {
+            "MergeRequest" => return TodoTarget::MergeRequest,
+            "Issue" => return TodoTarget::Issue,
+            _ => {}
+        }
+    }
+    let url = optional_str(raw, "target_url")
+        .or_else(|| raw.get("target").and_then(|t| optional_str(t, "web_url")));
+    if let Some(url) = url {
+        if url.contains("/merge_requests/") {
+            return TodoTarget::MergeRequest;
+        }
+        if url.contains("/-/issues/") || url.contains("/issues/") {
+            return TodoTarget::Issue;
+        }
+    }
+    TodoTarget::Unknown
+}
+
+fn todo_target_matches(target: TodoTarget, item_type: InboxItemTypeFlag) -> bool {
+    matches!(
+        (item_type, target),
+        (InboxItemTypeFlag::All, _)
+            | (InboxItemTypeFlag::Pr, TodoTarget::MergeRequest)
+            | (InboxItemTypeFlag::Issue, TodoTarget::Issue)
+    )
 }
 
 fn parse_gitlab_work_item(
@@ -1060,25 +1274,7 @@ fn emit_dry_run(
 }
 
 fn dry_run_plans(target: &ProviderTarget, config: &QueryConfig) -> Vec<Vec<String>> {
-    match target.provider {
-        Provider::GitHub => github_queries(config)
-            .into_iter()
-            .map(|query| query.call.plan_argv())
-            .collect(),
-        Provider::GitLab => {
-            let identity = GitlabIdentity {
-                id: "<user_id>".to_string(),
-                username: "<username>".to_string(),
-            };
-            let mut plans = vec![gitlab_identity_call(&target.host).plan_argv()];
-            plans.extend(
-                gitlab_queries(&target.host, &identity, config)
-                    .into_iter()
-                    .map(|query| query.call.plan_argv()),
-            );
-            plans
-        }
-    }
+    ProviderPlan::build(target, config).dry_run_argv()
 }
 
 fn render_list_text(payload: &InboxListPayload) {
@@ -1174,5 +1370,171 @@ mod tests {
         assert_eq!(items[0].reasons, vec!["review", "assigned"]);
         assert_eq!(items[0].source, "github_review_search");
         assert_eq!(items[0].updated_at, "2026-05-22T00:00:00Z");
+    }
+
+    /// Fake runner that records concurrent-call peak via atomic counters.
+    /// Each call sleeps briefly so genuinely-serial callers can be detected
+    /// (max_inflight stays at 1) and parallel callers can be confirmed
+    /// (max_inflight reaches the parallelism width). Returns `[]` for every
+    /// call so downstream parse paths succeed.
+    struct ConcurrencyProbeRunner {
+        inflight: std::sync::atomic::AtomicUsize,
+        max_inflight: std::sync::atomic::AtomicUsize,
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConcurrencyProbeRunner {
+        fn new() -> Self {
+            Self {
+                inflight: std::sync::atomic::AtomicUsize::new(0),
+                max_inflight: std::sync::atomic::AtomicUsize::new(0),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BackendRunner for ConcurrencyProbeRunner {
+        fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+            use std::sync::atomic::Ordering;
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut prev = self.max_inflight.load(Ordering::SeqCst);
+            while now > prev
+                && let Err(found) = self.max_inflight.compare_exchange(
+                    prev,
+                    now,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+            {
+                prev = found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            // GitLab identity lookup must look like a user object; everything
+            // else returns an empty array so parse paths succeed.
+            let body = if call.argv.first().map(|s| s.to_string_lossy().into_owned())
+                == Some("api".into())
+                && call.argv.get(1).map(|s| s.to_string_lossy().into_owned()) == Some("user".into())
+            {
+                "{\"id\":42,\"username\":\"probe\"}".to_string()
+            } else {
+                "[]".to_string()
+            };
+            Ok(BackendSuccess {
+                stdout: body,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn inbox_parallel_query_families_observe_concurrent_inflight() {
+        // GitHub default mode has 5 independent search families; expect at
+        // least 2 to be inflight simultaneously when the parallel path is
+        // wired correctly. (Serial execution would peak at 1.)
+        let runner = ConcurrencyProbeRunner::new();
+        let target = ProviderTarget {
+            provider: Provider::GitHub,
+            host: "github.com".into(),
+        };
+        let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
+        let result = execute_github(&runner, &target, &config).expect("execute_github");
+        assert!(result.items.is_empty(), "stub returns empty payloads");
+
+        let calls = runner.call_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            calls >= 5,
+            "expected at least 5 search families, observed {calls}"
+        );
+        let peak = runner
+            .max_inflight
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "expected concurrent inflight queries (>=2), observed peak {peak}"
+        );
+    }
+
+    #[test]
+    fn inbox_parallel_providers_observe_concurrent_inflight() {
+        let runner = ConcurrencyProbeRunner::new();
+        let targets = vec![
+            ProviderTarget {
+                provider: Provider::GitHub,
+                host: "github.com".into(),
+            },
+            ProviderTarget {
+                provider: Provider::GitLab,
+                host: "gitlab.example.com".into(),
+            },
+        ];
+        let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
+        let collection = collect_inbox(&runner, &targets, &config).expect("collect_inbox");
+        assert_eq!(collection.providers.len(), 2);
+        assert_eq!(collection.providers[0].provider, "github");
+        assert_eq!(collection.providers[1].provider, "gitlab");
+
+        let peak = runner
+            .max_inflight
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "expected concurrent inflight across providers (>=2), observed {peak}"
+        );
+    }
+
+    #[test]
+    fn inbox_parallel_provider_failure_keeps_deterministic_order() {
+        // First provider succeeds (returns empty), second fails. Even with
+        // parallel execution, target order — and warning order — must stay
+        // stable.
+        struct FailingSecondProvider {
+            calls: std::sync::Mutex<Vec<String>>,
+        }
+        impl BackendRunner for FailingSecondProvider {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                let argv = call.plan_argv().join(" ");
+                self.calls.lock().unwrap().push(argv.clone());
+                if argv.contains("glab") {
+                    Err(ForgeError::backend_error(
+                        schema_err(),
+                        "boom",
+                        Some("stderr".into()),
+                    ))
+                } else {
+                    Ok(BackendSuccess {
+                        stdout: "[]".into(),
+                        stderr: String::new(),
+                    })
+                }
+            }
+        }
+        let runner = FailingSecondProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let targets = vec![
+            ProviderTarget {
+                provider: Provider::GitHub,
+                host: "github.com".into(),
+            },
+            ProviderTarget {
+                provider: Provider::GitLab,
+                host: "gitlab.example.com".into(),
+            },
+        ];
+        let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
+        let collection = collect_inbox(&runner, &targets, &config).expect("collect_inbox");
+        assert_eq!(collection.providers.len(), 2);
+        assert_eq!(collection.providers[0].provider, "github");
+        assert!(collection.providers[0].ok);
+        assert_eq!(collection.providers[1].provider, "gitlab");
+        assert!(!collection.providers[1].ok);
+        assert_eq!(collection.warnings.len(), 1);
+        assert!(
+            collection.warnings[0].starts_with("provider_failed: gitlab"),
+            "warning order must follow target order: {:?}",
+            collection.warnings
+        );
     }
 }

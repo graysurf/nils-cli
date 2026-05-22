@@ -292,3 +292,451 @@ fn inbox_next_returns_ranked_review_items_first() {
     assert!(items.len() <= 5);
     assert_eq!(items[0]["kind"], "review");
 }
+
+/// Plans from `data.providers[0].plans` rendered as joined argv strings so
+/// tests can match on individual search families without hand-walking JSON
+/// arrays.
+fn dry_run_plan_joins(env: &serde_json::Value, provider_index: usize) -> Vec<String> {
+    env["data"]["providers"][provider_index]["plans"]
+        .as_array()
+        .expect("plans array")
+        .iter()
+        .map(|plan| {
+            plan.as_array()
+                .expect("plan argv array")
+                .iter()
+                .map(|s| s.as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+#[test]
+fn inbox_item_type_github_default_plans_pr_and_issue_families() {
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "--dry-run",
+            "inbox",
+            "list",
+            "--limit",
+            "30",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let plans = dry_run_plan_joins(&env, 0);
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("search prs --review-requested"))
+    );
+    assert!(plans.iter().any(|p| p.contains("search prs --assignee")));
+    assert!(plans.iter().any(|p| p.contains("search issues --assignee")));
+    assert!(plans.iter().any(|p| p.contains("search prs --author")));
+    assert!(plans.iter().any(|p| p.contains("search issues --author")));
+}
+
+#[test]
+fn inbox_item_type_github_pr_only_skips_issue_searches() {
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "--dry-run",
+            "inbox",
+            "list",
+            "--item-type",
+            "pr",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let plans = dry_run_plan_joins(&env, 0);
+    assert!(plans.iter().all(|p| !p.contains("search issues")));
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("search prs --review-requested"))
+    );
+    assert!(plans.iter().any(|p| p.contains("search prs --assignee")));
+    assert!(plans.iter().any(|p| p.contains("search prs --author")));
+}
+
+#[test]
+fn inbox_item_type_github_issue_only_skips_pr_searches() {
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "--dry-run",
+            "inbox",
+            "list",
+            "--item-type",
+            "issue",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let plans = dry_run_plan_joins(&env, 0);
+    // Review-requested is PR-only; issue-only must drop it.
+    assert!(plans.iter().all(|p| !p.contains("search prs")));
+    assert!(plans.iter().any(|p| p.contains("search issues --assignee")));
+    assert!(plans.iter().any(|p| p.contains("search issues --author")));
+}
+
+#[test]
+fn inbox_item_type_gitlab_default_plans_identity_and_default_families() {
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "--dry-run",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let plans = dry_run_plan_joins(&env, 0);
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("api user --hostname gitlab.example.com"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("merge_requests?scope=assigned_to_me"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("issues?scope=assigned_to_me"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("merge_requests?reviewer_username=<username>"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("merge_requests?author_id=<user_id>"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("issues?author_id=<user_id>"))
+    );
+    assert!(plans.iter().any(|p| p.contains("todos?state=pending")));
+}
+
+#[test]
+fn inbox_item_type_gitlab_pr_only_skips_issue_calls() {
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "--dry-run",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--item-type",
+            "pr",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let plans = dry_run_plan_joins(&env, 0);
+    // PR-only: identity still needed (review + authored MR), no issue queries,
+    // todos still scheduled because target classification happens post-fetch.
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("api user --hostname gitlab.example.com"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("merge_requests?scope=assigned_to_me"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("merge_requests?reviewer_username=<username>"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("merge_requests?author_id=<user_id>"))
+    );
+    assert!(plans.iter().any(|p| p.contains("todos?state=pending")));
+    assert!(
+        plans.iter().all(|p| !p.contains("/issues?")),
+        "PR-only must skip issue API calls: {plans:?}"
+    );
+}
+
+#[test]
+fn inbox_item_type_gitlab_issue_only_skips_mr_calls() {
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "--dry-run",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--item-type",
+            "issue",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let plans = dry_run_plan_joins(&env, 0);
+    // Issue-only: review (MR-only) is dropped. Identity still needed for
+    // authored issues. No MR queries.
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("api user --hostname gitlab.example.com"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("issues?scope=assigned_to_me"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("issues?author_id=<user_id>"))
+    );
+    assert!(plans.iter().any(|p| p.contains("todos?state=pending")));
+    assert!(
+        plans.iter().all(|p| !p.contains("merge_requests")),
+        "issue-only must skip MR API calls: {plans:?}"
+    );
+}
+
+#[test]
+fn inbox_item_type_gitlab_skips_identity_when_no_query_needs_it() {
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "--dry-run",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--kind",
+            "assigned",
+            "--kind",
+            "todo",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let plans = dry_run_plan_joins(&env, 0);
+    assert!(
+        plans.iter().all(|p| !p.contains("api user --hostname")),
+        "assigned+todo must skip identity lookup: {plans:?}"
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("merge_requests?scope=assigned_to_me"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("issues?scope=assigned_to_me"))
+    );
+    assert!(plans.iter().any(|p| p.contains("todos?state=pending")));
+}
+
+/// GitLab todo stub returning two todos: one targets an issue, the other
+/// targets a merge request. The item-type filter should keep only the
+/// matching target type post-fetch.
+const GLAB_TODOS_MIXED_STUB: &str = r#"#!/bin/sh
+set -e
+case "$*" in
+  *"api user --hostname"*)
+    cat <<'EOF'
+{"id":1435,"username":"terrylin"}
+EOF
+    ;;
+  *"todos"*"state=pending"*)
+    cat <<'EOF'
+[{"id":55,"target_type":"Issue","target_url":"https://gitlab.example.com/team/api/-/issues/32","target":{"iid":32,"title":"Todo issue","web_url":"https://gitlab.example.com/team/api/-/issues/32","updated_at":"2026-05-22T06:30:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"}},
+ {"id":56,"target_type":"MergeRequest","target_url":"https://gitlab.example.com/team/api/-/merge_requests/77","target":{"iid":77,"title":"Todo MR","web_url":"https://gitlab.example.com/team/api/-/merge_requests/77","updated_at":"2026-05-22T06:45:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"}}]
+EOF
+    ;;
+  *)
+    echo '[]'
+    ;;
+esac
+"#;
+
+#[test]
+fn inbox_item_type_gitlab_todo_pr_only_keeps_mr_targets() {
+    let stub = StubEnv::new().glab_stub(GLAB_TODOS_MIXED_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--kind",
+            "todo",
+            "--item-type",
+            "pr",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let items = env["data"]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "expected only MR-target todo: {items:?}");
+    assert_eq!(items[0]["title"], "Todo MR");
+}
+
+#[test]
+fn inbox_item_type_gitlab_todo_issue_only_keeps_issue_targets() {
+    let stub = StubEnv::new().glab_stub(GLAB_TODOS_MIXED_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--kind",
+            "todo",
+            "--item-type",
+            "issue",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let items = env["data"]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "expected only issue-target todo: {items:?}");
+    assert_eq!(items[0]["title"], "Todo issue");
+}
+
+#[test]
+fn inbox_item_type_gitlab_todo_all_keeps_unclassified_targets() {
+    // Stub returns a todo with neither target_type nor a classifiable URL.
+    let stub = StubEnv::new().glab_stub(
+        r#"#!/bin/sh
+set -e
+case "$*" in
+  *"todos"*"state=pending"*)
+    cat <<'EOF'
+[{"id":99,"target_url":"https://gitlab.example.com/team/snippets/-/snippets/5","target":{"iid":5,"title":"Mystery todo","web_url":"https://gitlab.example.com/team/snippets/-/snippets/5","updated_at":"2026-05-22T07:00:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/snippets"}}]
+EOF
+    ;;
+  *)
+    echo '[]'
+    ;;
+esac
+"#,
+    );
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--kind",
+            "todo",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let items = env["data"]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["title"], "Mystery todo");
+
+    // PR-only drops it.
+    let stub = StubEnv::new().glab_stub(
+        r#"#!/bin/sh
+set -e
+case "$*" in
+  *"todos"*"state=pending"*)
+    cat <<'EOF'
+[{"id":99,"target_url":"https://gitlab.example.com/team/snippets/-/snippets/5","target":{"iid":5,"title":"Mystery todo","web_url":"https://gitlab.example.com/team/snippets/-/snippets/5","updated_at":"2026-05-22T07:00:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/snippets"}}]
+EOF
+    ;;
+  *)
+    echo '[]'
+    ;;
+esac
+"#,
+    );
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--kind",
+            "todo",
+            "--item-type",
+            "pr",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let items = env["data"]["items"].as_array().expect("items");
+    assert!(
+        items.is_empty(),
+        "unclassifiable todo must be filtered in PR-only mode"
+    );
+}

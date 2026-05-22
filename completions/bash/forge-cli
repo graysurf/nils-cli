@@ -975,7 +975,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox__list)
-            opts="-h --gitlab-host --kind --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --gitlab-host --kind --item-type --limit --format --remote --provider --repo --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -987,6 +987,10 @@ _forge-cli() {
                     ;;
                 --kind)
                     COMPREPLY=($(compgen -W "review assigned todo authored involved" -- "${cur}"))
+                    return 0
+                    ;;
+                --item-type)
+                    COMPREPLY=($(compgen -W "all pr issue" -- "${cur}"))
                     return 0
                     ;;
                 --limit)
@@ -1017,7 +1021,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox__next)
-            opts="-h --gitlab-host --kind --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --gitlab-host --kind --item-type --limit --format --remote --provider --repo --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1029,6 +1033,10 @@ _forge-cli() {
                     ;;
                 --kind)
                     COMPREPLY=($(compgen -W "review assigned todo authored involved" -- "${cur}"))
+                    return 0
+                    ;;
+                --item-type)
+                    COMPREPLY=($(compgen -W "all pr issue" -- "${cur}"))
                     return 0
                     ;;
                 --limit)
@@ -1059,7 +1067,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox__status)
-            opts="-h --gitlab-host --kind --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --gitlab-host --kind --item-type --limit --format --remote --provider --repo --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1071,6 +1079,10 @@ _forge-cli() {
                     ;;
                 --kind)
                     COMPREPLY=($(compgen -W "review assigned todo authored involved" -- "${cur}"))
+                    return 0
+                    ;;
+                --item-type)
+                    COMPREPLY=($(compgen -W "all pr issue" -- "${cur}"))
                     return 0
                     ;;
                 --limit)
