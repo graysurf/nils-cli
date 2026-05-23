@@ -735,3 +735,430 @@ fn finalize_markdown(lines: Vec<String>) -> String {
     }
     rendered
 }
+
+// -----------------------------------------------------------------------------
+// Structured lifecycle payload (issue-backed plan record contract v2)
+//
+// Each lifecycle comment carries one fenced JSON block whose info-string is the
+// literal token PAYLOAD_FENCE_INFO. Audit, dashboard repair, and closeout gate
+// evaluation consume the structured payload exclusively. Visible Markdown
+// around the fence is human commentary only.
+// -----------------------------------------------------------------------------
+
+/// On-wire schema identity for v2 lifecycle payloads.
+pub const PAYLOAD_SCHEMA_V2: &str = "plan-issue-record.payload.v2";
+
+/// Fenced-code-block info-string used to mark a lifecycle payload fence.
+pub const PAYLOAD_FENCE_INFO: &str = "plan-issue-record-payload";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PayloadRole {
+    Source,
+    Plan,
+    State,
+    Session,
+    Validation,
+    Review,
+    Closeout,
+}
+
+impl PayloadRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Plan => "plan",
+            Self::State => "state",
+            Self::Session => "session",
+            Self::Validation => "validation",
+            Self::Review => "review",
+            Self::Closeout => "closeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PayloadProfile {
+    Tracking,
+    Dispatch,
+}
+
+impl PayloadProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tracking => "tracking",
+            Self::Dispatch => "dispatch",
+        }
+    }
+}
+
+/// Envelope for every lifecycle comment payload.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct RecordPayload {
+    pub schema: String,
+    pub role: PayloadRole,
+    pub profile: PayloadProfile,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub data: Value,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct SnapshotData {
+    pub path: String,
+    pub commit: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateStatus {
+    InProgress,
+    Complete,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskRowStatus {
+    Pending,
+    InProgress,
+    Done,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct TaskRowPayload {
+    pub id: String,
+    pub status: TaskRowStatus,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrLifecycleStatus {
+    Open,
+    Merged,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct PrRefPayload {
+    #[serde(rename = "ref")]
+    pub pr_ref: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    pub status: PrLifecycleStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct StateData {
+    pub status: Option<StateStatus>,
+    #[serde(default)]
+    pub target_scope: Option<String>,
+    #[serde(default)]
+    pub current: Option<String>,
+    #[serde(default)]
+    pub next_action: Option<String>,
+    #[serde(default)]
+    pub tasks: Vec<TaskRowPayload>,
+    #[serde(default)]
+    pub prs: Vec<PrRefPayload>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub links: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct SessionData {
+    pub summary: String,
+    #[serde(default)]
+    pub highlights: Vec<String>,
+    #[serde(default)]
+    pub links: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValidationOverall {
+    Pass,
+    Fail,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValidationCommandStatus {
+    Pass,
+    Fail,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ValidationCommand {
+    pub command: String,
+    pub status: ValidationCommandStatus,
+    #[serde(default)]
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ValidationWaiver {
+    pub command: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ValidationData {
+    pub overall: ValidationOverall,
+    #[serde(default)]
+    pub commands: Vec<ValidationCommand>,
+    #[serde(default)]
+    pub waivers: Vec<ValidationWaiver>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewDecision {
+    Approve,
+    RequestChanges,
+    CommentsOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FindingSeverity {
+    Blocker,
+    Major,
+    Minor,
+    Nit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FindingDisposition {
+    Fixed,
+    Residual,
+    FollowUp,
+    Deferred,
+    NoAction,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ReviewFinding {
+    pub id: String,
+    pub severity: FindingSeverity,
+    pub disposition: FindingDisposition,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ReviewData {
+    pub decision: ReviewDecision,
+    #[serde(default)]
+    pub lenses: Vec<String>,
+    #[serde(default)]
+    pub findings: Vec<ReviewFinding>,
+    #[serde(default)]
+    pub outcome_comment_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ApprovalEvidence {
+    #[serde(default)]
+    pub comment_url: Option<String>,
+    #[serde(default)]
+    pub approver: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckStatus {
+    Pass,
+    Fail,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct LinkedPrEvidence {
+    #[serde(rename = "ref")]
+    pub pr_ref: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub merge_sha: Option<String>,
+    pub checks: CheckStatus,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct CloseoutData {
+    pub final_status: String,
+    pub approval: ApprovalEvidence,
+    #[serde(default)]
+    pub linked_prs: Vec<LinkedPrEvidence>,
+    #[serde(default)]
+    pub final_validation_url: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadErrorKind {
+    NoFence,
+    MultipleFences,
+    SchemaMismatch,
+    InvalidJson,
+}
+
+#[derive(Debug, Clone)]
+pub struct PayloadError {
+    pub kind: PayloadErrorKind,
+    pub message: String,
+}
+
+impl PayloadError {
+    fn new(kind: PayloadErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for PayloadError {}
+
+/// Extract the structured lifecycle payload fenced inside `comment_body`.
+///
+/// - Returns `Ok(payload)` on a single well-formed `plan-issue-record-payload`
+///   fence whose envelope `schema` matches [`PAYLOAD_SCHEMA_V2`].
+/// - Returns `Err(NoFence)` when the comment does not contain the fence.
+/// - Returns `Err(MultipleFences)` when multiple payload fences are present;
+///   each comment carries at most one payload.
+/// - Returns `Err(SchemaMismatch)` when the fence parses but its `schema`
+///   does not match the v2 wire identity.
+/// - Returns `Err(InvalidJson)` when the fence body is not valid JSON or
+///   does not deserialize into the envelope.
+pub fn extract_payload(comment_body: &str) -> Result<RecordPayload, PayloadError> {
+    let fences = collect_payload_fences(comment_body);
+    if fences.is_empty() {
+        return Err(PayloadError::new(
+            PayloadErrorKind::NoFence,
+            "no plan-issue-record-payload fence in comment body",
+        ));
+    }
+    if fences.len() > 1 {
+        return Err(PayloadError::new(
+            PayloadErrorKind::MultipleFences,
+            "multiple plan-issue-record-payload fences in comment body",
+        ));
+    }
+
+    let raw = &fences[0];
+    let payload: RecordPayload = serde_json::from_str(raw)
+        .map_err(|err| PayloadError::new(PayloadErrorKind::InvalidJson, err.to_string()))?;
+    if payload.schema != PAYLOAD_SCHEMA_V2 {
+        return Err(PayloadError::new(
+            PayloadErrorKind::SchemaMismatch,
+            format!(
+                "expected schema `{PAYLOAD_SCHEMA_V2}`, got `{}`",
+                payload.schema
+            ),
+        ));
+    }
+    Ok(payload)
+}
+
+fn collect_payload_fences(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if let Some(buf) = current.as_mut() {
+            if trimmed.starts_with("```") {
+                let mut block = String::new();
+                for chunk in buf.iter() {
+                    if !block.is_empty() {
+                        block.push('\n');
+                    }
+                    block.push_str(chunk);
+                }
+                out.push(block);
+                current = None;
+            } else {
+                buf.push(line.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("```")
+            && rest.trim() == PAYLOAD_FENCE_INFO
+        {
+            current = Some(Vec::new());
+        }
+    }
+    out
+}
+
+impl RecordPayload {
+    pub fn parse_state(&self) -> Result<StateData, PayloadError> {
+        self.decode_data(PayloadRole::State)
+    }
+
+    pub fn parse_session(&self) -> Result<SessionData, PayloadError> {
+        self.decode_data(PayloadRole::Session)
+    }
+
+    pub fn parse_validation(&self) -> Result<ValidationData, PayloadError> {
+        self.decode_data(PayloadRole::Validation)
+    }
+
+    pub fn parse_review(&self) -> Result<ReviewData, PayloadError> {
+        self.decode_data(PayloadRole::Review)
+    }
+
+    pub fn parse_closeout(&self) -> Result<CloseoutData, PayloadError> {
+        self.decode_data(PayloadRole::Closeout)
+    }
+
+    pub fn parse_snapshot(&self) -> Result<SnapshotData, PayloadError> {
+        if !matches!(self.role, PayloadRole::Source | PayloadRole::Plan) {
+            return Err(PayloadError::new(
+                PayloadErrorKind::SchemaMismatch,
+                format!(
+                    "expected source or plan payload, got `{}`",
+                    self.role.as_str()
+                ),
+            ));
+        }
+        serde_json::from_value::<SnapshotData>(self.data.clone())
+            .map_err(|err| PayloadError::new(PayloadErrorKind::InvalidJson, err.to_string()))
+    }
+
+    fn decode_data<T: serde::de::DeserializeOwned>(
+        &self,
+        expected: PayloadRole,
+    ) -> Result<T, PayloadError> {
+        if self.role != expected {
+            return Err(PayloadError::new(
+                PayloadErrorKind::SchemaMismatch,
+                format!(
+                    "expected role `{}`, got `{}`",
+                    expected.as_str(),
+                    self.role.as_str()
+                ),
+            ));
+        }
+        serde_json::from_value::<T>(self.data.clone())
+            .map_err(|err| PayloadError::new(PayloadErrorKind::InvalidJson, err.to_string()))
+    }
+}

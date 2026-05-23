@@ -15,8 +15,9 @@ use crate::commands::plan::{
     ResolveApprovalArgs, StartPlanArgs, StatusPlanArgs,
 };
 use crate::commands::record::{
-    BuildDispatchLedgerArgs, RecordArgs, RecordAuditArgs, RecordCloseoutGateArgs, RecordCommand,
-    RenderCommentArgs, RenderDashboardArgs,
+    BuildDispatchLedgerArgs, RecordArgs, RecordAuditArgs, RecordCloseArgs, RecordCloseoutGateArgs,
+    RecordCommand, RecordOpenArgs, RecordPostArgs, RecordRepairDashboardArgs, RenderCommentArgs,
+    RenderDashboardArgs,
 };
 use crate::commands::sprint::{
     AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs,
@@ -80,12 +81,52 @@ pub fn execute(binary: BinaryFlavor, cli: &Cli) -> Result<Value, CommandError> {
 
 fn run_record(args: &RecordArgs) -> Result<Value, CommandError> {
     match &args.command {
+        RecordCommand::Open(args) => run_record_open(args),
+        RecordCommand::Post(args) => run_record_post(args),
+        RecordCommand::RepairDashboard(args) => run_record_repair_dashboard(args),
+        RecordCommand::Close(args) => run_record_close(args),
         RecordCommand::RenderDashboard(args) => run_record_render_dashboard(args),
         RecordCommand::RenderComment(args) => run_record_render_comment(args),
         RecordCommand::Audit(args) => run_record_audit(args),
         RecordCommand::CloseoutGate(args) => run_record_closeout_gate(args),
         RecordCommand::BuildDispatchLedger(args) => run_record_build_dispatch_ledger(args),
     }
+}
+
+fn run_record_open(_args: &RecordOpenArgs) -> Result<Value, CommandError> {
+    Err(CommandError::usage(
+        "record-open-not-yet-implemented",
+        "`plan-issue record open` lifecycle wiring lands in plan-issue-lifecycle-v3 Sprint 3; \
+         the v2 spec contract is defined and the CLI surface is scaffolded so consumers can \
+         test against it",
+    ))
+}
+
+fn run_record_post(_args: &RecordPostArgs) -> Result<Value, CommandError> {
+    Err(CommandError::usage(
+        "record-post-not-yet-implemented",
+        "`plan-issue record post` lifecycle wiring lands in plan-issue-lifecycle-v3 Sprint 3; \
+         the v2 spec contract is defined and the CLI surface is scaffolded so consumers can \
+         test against it",
+    ))
+}
+
+fn run_record_repair_dashboard(_args: &RecordRepairDashboardArgs) -> Result<Value, CommandError> {
+    Err(CommandError::usage(
+        "record-repair-dashboard-not-yet-implemented",
+        "`plan-issue record repair-dashboard` lifecycle wiring lands in \
+         plan-issue-lifecycle-v3 Sprint 3; the v2 spec contract is defined and the CLI \
+         surface is scaffolded so consumers can test against it",
+    ))
+}
+
+fn run_record_close(_args: &RecordCloseArgs) -> Result<Value, CommandError> {
+    Err(CommandError::usage(
+        "record-close-not-yet-implemented",
+        "`plan-issue record close` lifecycle wiring lands in plan-issue-lifecycle-v3 Sprint 3; \
+         the v2 spec contract is defined and the CLI surface is scaffolded so consumers can \
+         test against it",
+    ))
 }
 
 fn run_record_render_dashboard(args: &RenderDashboardArgs) -> Result<Value, CommandError> {

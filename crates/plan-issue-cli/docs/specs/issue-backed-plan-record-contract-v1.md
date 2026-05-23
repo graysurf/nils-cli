@@ -1,4 +1,13 @@
-# Issue-Backed Plan Record Contract v1
+# Issue-Backed Plan Record Contract v1 (Retired)
+
+> **Status:** Retired. This contract is superseded by
+> [issue-backed plan record contract v2](issue-backed-plan-record-contract-v2.md).
+> The v2 contract removes the dual marker families, the
+> caller-assembled closeout pipeline, and the local-only command boundary
+> in favor of one canonical marker family and provider-backed live
+> commands. Consumer skills must migrate to v2 in a coordinated
+> agent-runtime-kit release after the `plan-issue` v3 binary ships. This
+> document is kept only for migration reference.
 
 ## Scope
 
