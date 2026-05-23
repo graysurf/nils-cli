@@ -1,6 +1,6 @@
 [package]
 name = "nils-plan-issue-cli"
-version = "0.17.4"
+version = "0.17.5"
 edition.workspace = true
 license.workspace = true
 default-run = "plan-issue"
@@ -25,10 +25,10 @@ clap = { workspace = true }
 clap_complete = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-nils-common = { version = "0.17.4", path = "../nils-common", package = "nils-common" }
-plan-tooling = { version = "0.17.4", path = "../plan-tooling", package = "nils-plan-tooling" }
+nils-common = { version = "0.17.5", path = "../nils-common", package = "nils-common" }
+plan-tooling = { version = "0.17.5", path = "../plan-tooling", package = "nils-plan-tooling" }
 
 [dev-dependencies]
-nils-test-support = { version = "0.17.4", path = "../nils-test-support" }
+nils-test-support = { version = "0.17.5", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
