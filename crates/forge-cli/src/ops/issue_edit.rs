@@ -50,7 +50,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
     if let Some(ref t) = args.title {
         title_length(t)?;
     }
@@ -140,6 +145,7 @@ fn build_edit_call(ctx: &ProviderContext, args: &IssueEditArgs, body: Option<&st
         argv.push(OsString::from(flag));
         argv.push(OsString::from(assignee));
     }
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -195,6 +201,7 @@ mod tests {
             provider: p,
             host: "x".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

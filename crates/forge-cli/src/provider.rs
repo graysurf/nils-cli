@@ -6,6 +6,7 @@
 //! / `glab auth status` host match. Unknown host produces `USAGE 64` with
 //! `error.kind = "provider_unsupported"`.
 
+use std::ffi::OsString;
 use std::process::Command;
 
 use serde::Serialize;
@@ -45,6 +46,23 @@ pub struct ProviderContext {
     pub provider: Provider,
     pub host: String,
     pub source: DetectionSource,
+    /// Repo slug from `--repo owner/name`; ops push `--repo <slug>` into the
+    /// backend argv when set so dry-run plans and live calls hit the same repo.
+    pub repo: Option<String>,
+}
+
+impl ProviderContext {
+    /// Push `--repo <owner/name>` into `argv` when the caller passed
+    /// `--repo`. Both `gh` and `glab` accept the long form across all
+    /// non-`repo view` subcommands, so this helper centralizes the wiring.
+    /// `repo view` does not use this — it pushes the slug as a positional
+    /// argument instead.
+    pub fn push_repo_override(&self, argv: &mut Vec<OsString>) {
+        if let Some(slug) = self.repo.as_deref() {
+            argv.push(OsString::from("--repo"));
+            argv.push(OsString::from(slug));
+        }
+    }
 }
 
 /// Where the provider decision came from. Useful for diagnostics and tests.
@@ -65,13 +83,17 @@ pub enum DetectionSource {
 pub fn detect(
     hint: ProviderHint,
     remote: &str,
+    repo_override: Option<&str>,
     remote_url_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<ProviderContext, ForgeError> {
+    let repo = repo_override.map(str::to_string);
+
     if let ProviderHint::Forced(provider) = hint {
         return Ok(ProviderContext {
             provider,
             host: default_host_for(provider).to_string(),
             source: DetectionSource::Flag,
+            repo,
         });
     }
 
@@ -84,6 +106,7 @@ pub fn detect(
                 provider,
                 host,
                 source: DetectionSource::Remote,
+                repo,
             });
         }
         return Err(ForgeError::provider_unsupported(
@@ -251,8 +274,13 @@ mod tests {
             counter.set(counter.get() + 1);
             None
         };
-        let ctx = detect(ProviderHint::Forced(Provider::GitHub), "origin", lookup)
-            .expect("forced provider");
+        let ctx = detect(
+            ProviderHint::Forced(Provider::GitHub),
+            "origin",
+            None,
+            lookup,
+        )
+        .expect("forced provider");
         assert_eq!(ctx.provider, Provider::GitHub);
         assert_eq!(ctx.source, DetectionSource::Flag);
         assert_eq!(counter.get(), 0, "remote lookup must not run when forced");
@@ -260,7 +288,7 @@ mod tests {
 
     #[test]
     fn detect_from_remote_url() {
-        let ctx = detect(ProviderHint::Auto, "origin", |_| {
+        let ctx = detect(ProviderHint::Auto, "origin", None, |_| {
             Some("git@gitlab.com:owner/repo.git".to_string())
         })
         .expect("auto from remote");
@@ -271,7 +299,7 @@ mod tests {
 
     #[test]
     fn detect_unknown_host_errors() {
-        let err = detect(ProviderHint::Auto, "origin", |_| {
+        let err = detect(ProviderHint::Auto, "origin", None, |_| {
             Some("https://bitbucket.org/owner/repo.git".to_string())
         })
         .expect_err("unknown host");
@@ -280,7 +308,7 @@ mod tests {
 
     #[test]
     fn detect_no_remote_errors() {
-        let err = detect(ProviderHint::Auto, "origin", |_| None).expect_err("no remote");
+        let err = detect(ProviderHint::Auto, "origin", None, |_| None).expect_err("no remote");
         assert_eq!(err.kind(), "provider_unsupported");
     }
 }

@@ -44,7 +44,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = crate::provider::detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = crate::provider::detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
 
     if global.dry_run {
         let call = build_call(&ctx);
@@ -73,7 +78,12 @@ pub fn compute<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     global: &GlobalFlags,
     remote_url_lookup: F,
 ) -> Result<AuthStatusPayload, ForgeError> {
-    let ctx = crate::provider::detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = crate::provider::detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
     compute_with_ctx(runner, &ctx)
 }
 
@@ -208,6 +218,7 @@ mod tests {
             provider: Provider::GitHub,
             host: "github.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 
@@ -216,6 +227,7 @@ mod tests {
             provider: Provider::GitLab,
             host: "gitlab.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

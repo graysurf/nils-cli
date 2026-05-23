@@ -63,7 +63,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
     let call = build_list_call(&ctx, &args);
 
     if global.dry_run {
@@ -135,6 +140,7 @@ fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
             argv.push(OsString::from("json"));
         }
     }
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -327,6 +333,7 @@ mod tests {
             provider: p,
             host: "example.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

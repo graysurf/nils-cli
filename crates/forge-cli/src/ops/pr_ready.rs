@@ -53,7 +53,12 @@ where
     F: Fn(&str) -> Option<String>,
     G: FnOnce(&std::path::Path) -> Result<String, ForgeError>,
 {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
     worktree_clean(workdir, git_status)?;
 
     let call = build_ready_call(&ctx, args.id);
@@ -105,7 +110,7 @@ fn run_backend_and_fetch<R: BackendRunner>(
 
 fn build_ready_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => vec![
             OsString::from("pr"),
             OsString::from("ready"),
@@ -118,12 +123,13 @@ fn build_ready_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from("--ready"),
         ],
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
 fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => vec![
             OsString::from("pr"),
             OsString::from("view"),
@@ -141,6 +147,7 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from("json"),
         ],
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -164,6 +171,7 @@ mod tests {
             provider: p,
             host: "x".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

@@ -99,7 +99,12 @@ pub fn run_with<R: BackendRunner, C: Clock>(
     format: OutputFormat,
     workdir: &Path,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, git_remote_url)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        git_remote_url,
+    )?;
 
     if global.dry_run {
         return Ok(emit_dry_run(&ctx, &args, format));
@@ -136,7 +141,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
     });
 
     // 2. repo.view
-    let repo_payload = match repo_view::compute(runner, ctx, global.repo.as_deref()) {
+    let repo_payload = match repo_view::compute(runner, ctx) {
         Ok(p) => p,
         Err(err) => {
             return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
@@ -439,7 +444,7 @@ fn pr_create_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String
 fn pr_wait_checks_dry_plan(ctx: &ProviderContext) -> Vec<String> {
     let prog = BackendProgram::for_provider(ctx.provider).default_executable();
     match ctx.provider {
-        Provider::GitHub => pr_checks::build_github_required_call("<pr-number>").plan_argv(),
+        Provider::GitHub => pr_checks::build_github_required_call(ctx, "<pr-number>").plan_argv(),
         Provider::GitLab => vec![
             prog.into(),
             "ci".into(),
@@ -602,6 +607,7 @@ mod tests {
             provider: Provider::GitHub,
             host: "github.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

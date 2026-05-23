@@ -148,7 +148,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
     let payload = snapshot(runner, global, &ctx, args)?;
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
@@ -190,10 +195,10 @@ fn snapshot_github<R: BackendRunner>(
     ctx: &ProviderContext,
     args: &PrChecksArgs,
 ) -> Result<PrChecksPayload, ForgeError> {
-    let call = build_github_call(&args.id);
+    let call = build_github_call(ctx, &args.id);
     let output = run_github_checks_call(runner, &call)?;
     if args.required_only {
-        let required_call = build_github_required_call(&args.id);
+        let required_call = build_github_required_call(ctx, &args.id);
         let required_output = run_github_checks_call(runner, &required_call)?;
         return parse_github_snapshot_with_required_output(ctx, &output, &required_output);
     }
@@ -202,43 +207,41 @@ fn snapshot_github<R: BackendRunner>(
 
 /// Build the `gh pr checks <id> --json …` call. Public so the dry-run helper
 /// can render the plan.
-pub fn build_github_call(id: &str) -> BackendCall {
-    BackendCall::new(
-        BackendProgram::Gh,
-        [
-            OsString::from("pr"),
-            OsString::from("checks"),
-            OsString::from(id),
-            OsString::from("--json"),
-            OsString::from(GH_JSON_FIELDS),
-        ],
-    )
+pub fn build_github_call(ctx: &ProviderContext, id: &str) -> BackendCall {
+    let mut argv: Vec<OsString> = vec![
+        OsString::from("pr"),
+        OsString::from("checks"),
+        OsString::from(id),
+        OsString::from("--json"),
+        OsString::from(GH_JSON_FIELDS),
+    ];
+    ctx.push_repo_override(&mut argv);
+    BackendCall::new(BackendProgram::Gh, argv)
 }
 
 /// Build the `gh pr checks <id> --required --json …` call used for GitHub
 /// required-check gating because `gh 2.92.0` no longer exposes `isRequired`
 /// through the JSON field set.
-pub fn build_github_required_call(id: &str) -> BackendCall {
-    BackendCall::new(
-        BackendProgram::Gh,
-        [
-            OsString::from("pr"),
-            OsString::from("checks"),
-            OsString::from(id),
-            OsString::from("--required"),
-            OsString::from("--json"),
-            OsString::from(GH_JSON_FIELDS),
-        ],
-    )
+pub fn build_github_required_call(ctx: &ProviderContext, id: &str) -> BackendCall {
+    let mut argv: Vec<OsString> = vec![
+        OsString::from("pr"),
+        OsString::from("checks"),
+        OsString::from(id),
+        OsString::from("--required"),
+        OsString::from("--json"),
+        OsString::from(GH_JSON_FIELDS),
+    ];
+    ctx.push_repo_override(&mut argv);
+    BackendCall::new(BackendProgram::Gh, argv)
 }
 
 /// Build the dry-run preview call for the current provider — public so
 /// downstream atoms (e.g. `pr wait-checks` dry-run) can reuse it.
 pub fn build_dry_run_call(ctx: &ProviderContext, args: &PrChecksArgs) -> BackendCall {
     match ctx.provider {
-        Provider::GitHub if args.required_only => build_github_required_call(&args.id),
-        Provider::GitHub => build_github_call(&args.id),
-        Provider::GitLab => pr_checks_gitlab::build_status_call(&args.id),
+        Provider::GitHub if args.required_only => build_github_required_call(ctx, &args.id),
+        Provider::GitHub => build_github_call(ctx, &args.id),
+        Provider::GitLab => pr_checks_gitlab::build_status_call(ctx, &args.id),
     }
 }
 
@@ -623,6 +626,7 @@ mod tests {
             provider: p,
             host: "example.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 
@@ -830,7 +834,7 @@ mod tests {
 
     #[test]
     fn build_github_call_carries_id_and_json_fields() {
-        let call = build_github_call("42");
+        let call = build_github_call(&ctx(Provider::GitHub), "42");
         let plan = call.plan_argv();
         assert_eq!(
             plan[1..4],
@@ -844,7 +848,7 @@ mod tests {
 
     #[test]
     fn build_github_required_call_uses_required_flag_and_supported_json_fields() {
-        let call = build_github_required_call("42");
+        let call = build_github_required_call(&ctx(Provider::GitHub), "42");
         let plan = call.plan_argv();
         assert!(plan.iter().any(|s| s == "--required"), "{plan:?}");
         let json_idx = plan.iter().position(|s| s == "--json").expect("--json arg");

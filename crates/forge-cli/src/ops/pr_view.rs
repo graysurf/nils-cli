@@ -56,7 +56,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
 
     // GitLab cannot resolve a branch name in a single view call; fan out to
     // `mr list --source-branch <branch>` first.
@@ -90,7 +95,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
 fn build_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => vec![
             OsString::from("pr"),
             OsString::from("view"),
@@ -106,6 +111,7 @@ fn build_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
             OsString::from("json"),
         ],
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -117,7 +123,7 @@ fn resolve_branch_id<R: BackendRunner>(
     match ctx.provider {
         Provider::GitHub => Ok(branch.to_string()),
         Provider::GitLab => {
-            let argv: Vec<OsString> = vec![
+            let mut argv: Vec<OsString> = vec![
                 OsString::from("mr"),
                 OsString::from("list"),
                 OsString::from("--source-branch"),
@@ -125,6 +131,7 @@ fn resolve_branch_id<R: BackendRunner>(
                 OsString::from("-F"),
                 OsString::from("json"),
             ];
+            ctx.push_repo_override(&mut argv);
             let call = BackendCall::new(BackendProgram::Glab, argv);
             let output = runner.run(&call)?;
             extract_first_iid(&output.stdout).ok_or_else(|| {
@@ -309,6 +316,7 @@ mod tests {
             provider,
             host: "example.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

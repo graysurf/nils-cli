@@ -768,6 +768,7 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
                 let ctx = match crate::provider::detect(
                     global.provider_hint(),
                     &global.remote,
+                    global.repo.as_deref(),
                     crate::provider::git_remote_url,
                 ) {
                     Ok(ctx) => ctx,

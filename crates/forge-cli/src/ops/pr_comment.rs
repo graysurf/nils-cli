@@ -46,7 +46,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
     let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
     if body.trim().is_empty() {
         return Err(ForgeError::validation(
@@ -89,7 +94,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
 fn build_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => vec![
             OsString::from("pr"),
             OsString::from("comment"),
@@ -105,12 +110,13 @@ fn build_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall
             OsString::from(body),
         ],
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
 fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => vec![
             OsString::from("pr"),
             OsString::from("view"),
@@ -128,6 +134,7 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from("json"),
         ],
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -182,6 +189,7 @@ mod tests {
             provider: p,
             host: "x".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

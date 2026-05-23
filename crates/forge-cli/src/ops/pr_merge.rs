@@ -78,7 +78,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     workdir: &std::path::Path,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
 
     // Load .forge-cli.toml so the method default + delete_branch default flow
     // from the per-repo config when no explicit flag is set.
@@ -121,7 +126,12 @@ pub fn compute<R: BackendRunner>(
     args: &PrMergeArgs,
     workdir: &std::path::Path,
 ) -> Result<PrMergePayload, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, git_remote_url)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        git_remote_url,
+    )?;
     let cfg = ForgeConfig::load_from(workdir, find_git_toplevel(workdir).as_deref());
     let method = cfg.resolve_merge_method(args.method.map(|m| m.into_method()));
     let cfg_delete = cfg.resolve_delete_branch(None);
@@ -202,7 +212,7 @@ pub fn build_merge_call(
 ) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let id_str = id.to_string();
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => {
             let mut v = vec![
                 OsString::from("pr"),
@@ -235,6 +245,7 @@ pub fn build_merge_call(
             v
         }
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -259,7 +270,7 @@ fn fetch_pr_view<R: BackendRunner>(
 fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let id_str = id.to_string();
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => vec![
             OsString::from("pr"),
             OsString::from("view"),
@@ -277,6 +288,7 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from("json"),
         ],
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -332,7 +344,7 @@ fn fetch_merge_sha<R: BackendRunner>(
 fn merge_sha_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let id_str = id.to_string();
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => vec![
             OsString::from("pr"),
             OsString::from("view"),
@@ -348,6 +360,7 @@ fn merge_sha_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from("json"),
         ],
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -472,6 +485,7 @@ mod tests {
             provider,
             host: "github.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 
