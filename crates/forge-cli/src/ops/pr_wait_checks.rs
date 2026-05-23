@@ -63,7 +63,12 @@ pub fn run_with<R: BackendRunner, C: Clock, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
     let snapshot_args = PrChecksArgs {
         id: args.id.clone(),
         required_only: args.required_only,
@@ -295,6 +300,7 @@ mod tests {
             provider: p,
             host: "example.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

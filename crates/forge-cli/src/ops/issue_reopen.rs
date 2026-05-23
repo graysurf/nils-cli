@@ -38,7 +38,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
     let call = build_reopen_call(&ctx, id);
 
     if global.dry_run {
@@ -69,13 +74,14 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
 fn build_reopen_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub | Provider::GitLab => vec![
             OsString::from("issue"),
             OsString::from("reopen"),
             OsString::from(id.to_string()),
         ],
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -100,6 +106,7 @@ mod tests {
             provider: p,
             host: "x".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

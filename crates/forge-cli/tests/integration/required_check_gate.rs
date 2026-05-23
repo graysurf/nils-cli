@@ -40,6 +40,7 @@ fn github_ctx() -> ProviderContext {
         provider: Provider::GitHub,
         host: "github.com".into(),
         source: DetectionSource::Flag,
+        repo: None,
     }
 }
 

@@ -142,9 +142,12 @@ pub fn run_with<R: BackendRunner>(
     format: OutputFormat,
     env: &Environment<'_>,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, |r| {
-        (env.remote_url)(r)
-    })?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        |r| (env.remote_url)(r),
+    )?;
 
     // 1. Resolve head + base.
     let head = match args.head.clone() {
@@ -213,9 +216,12 @@ pub fn compute<R: BackendRunner>(
     args: &PrCreateArgs,
     env: &Environment<'_>,
 ) -> Result<PrCreatePayload, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, |r| {
-        (env.remote_url)(r)
-    })?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        |r| (env.remote_url)(r),
+    )?;
     let head = match args.head.clone() {
         Some(h) => h,
         None => (env.current_branch)()?,
@@ -391,12 +397,13 @@ fn build_create_call(
             }
         }
     }
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
 fn build_view_call(ctx: &ProviderContext, number: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
-    let argv: Vec<OsString> = match ctx.provider {
+    let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => vec![
             OsString::from("pr"),
             OsString::from("view"),
@@ -412,6 +419,7 @@ fn build_view_call(ctx: &ProviderContext, number: u64) -> BackendCall {
             OsString::from("json"),
         ],
     };
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -566,6 +574,7 @@ mod tests {
             provider: Provider::GitHub,
             host: "github.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 
@@ -574,6 +583,7 @@ mod tests {
             provider: Provider::GitLab,
             host: "gitlab.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 

@@ -49,10 +49,15 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = crate::provider::detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = crate::provider::detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
 
     if global.dry_run {
-        let call = build_call(&ctx, global.repo.as_deref());
+        let call = build_call(&ctx);
         let payload = DryRunPayload::new(ctx.provider, &call);
         return Ok(emit_success(
             schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
@@ -62,7 +67,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
-    let payload = compute(runner, &ctx, global.repo.as_deref())?;
+    let payload = compute(runner, &ctx)?;
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
         payload,
@@ -73,25 +78,25 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
 /// Macro-facing entry point: compute the payload without emitting. Used by
 /// `pr deliver` to capture the repo view step's typed output for the
-/// composite envelope.
+/// composite envelope. Repo override comes from `ctx.repo` (set by the
+/// global `--repo owner/name` flag in [`crate::provider::detect`]).
 pub fn compute<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
-    repo_override: Option<&str>,
 ) -> Result<RepoViewPayload, ForgeError> {
-    let call = build_call(ctx, repo_override);
+    let call = build_call(ctx);
     let output = runner.run(&call)?;
     parse_backend_output(ctx, &output)
 }
 
-fn build_call(ctx: &ProviderContext, repo_override: Option<&str>) -> BackendCall {
+fn build_call(ctx: &ProviderContext) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = Vec::new();
     match ctx.provider {
         Provider::GitHub => {
             argv.push(OsString::from("repo"));
             argv.push(OsString::from("view"));
-            if let Some(slug) = repo_override {
+            if let Some(slug) = ctx.repo.as_deref() {
                 argv.push(OsString::from(slug));
             }
             argv.push(OsString::from("--json"));
@@ -100,7 +105,7 @@ fn build_call(ctx: &ProviderContext, repo_override: Option<&str>) -> BackendCall
         Provider::GitLab => {
             argv.push(OsString::from("repo"));
             argv.push(OsString::from("view"));
-            if let Some(slug) = repo_override {
+            if let Some(slug) = ctx.repo.as_deref() {
                 argv.push(OsString::from(slug));
             }
             argv.push(OsString::from("-F"));
@@ -112,8 +117,9 @@ fn build_call(ctx: &ProviderContext, repo_override: Option<&str>) -> BackendCall
 
 /// Re-export of the internal builder so `pr create` (and later atoms) can
 /// resolve the repo's default branch without duplicating the argv shape.
+/// Repo override (when set) flows through `ctx.repo`.
 pub fn build_call_for_default_branch(ctx: &ProviderContext) -> BackendCall {
-    build_call(ctx, None)
+    build_call(ctx)
 }
 
 /// Parse the backend stdout into the normalized payload.
@@ -283,6 +289,7 @@ mod tests {
             provider: Provider::GitHub,
             host: "github.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 
@@ -291,6 +298,7 @@ mod tests {
             provider: Provider::GitLab,
             host: "gitlab.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 
@@ -387,7 +395,7 @@ mod tests {
 
     #[test]
     fn build_call_github_argv() {
-        let call = build_call(&github_ctx(), None);
+        let call = build_call(&github_ctx());
         let argv = call.plan_argv();
         assert_eq!(argv[1..3], vec!["repo".to_string(), "view".to_string()]);
         assert!(argv.contains(&"--json".to_string()));
@@ -395,9 +403,18 @@ mod tests {
 
     #[test]
     fn build_call_gitlab_argv() {
-        let call = build_call(&gitlab_ctx(), None);
+        let call = build_call(&gitlab_ctx());
         let argv = call.plan_argv();
         assert_eq!(argv[1..3], vec!["repo".to_string(), "view".to_string()]);
         assert!(argv.contains(&"-F".to_string()));
+    }
+
+    #[test]
+    fn build_call_github_includes_repo_slug_when_ctx_has_repo() {
+        let mut ctx = github_ctx();
+        ctx.repo = Some("owner/name".into());
+        let argv = build_call(&ctx).plan_argv();
+        let pos = argv.iter().position(|s| s == "view").expect("view present");
+        assert_eq!(argv[pos + 1], "owner/name");
     }
 }

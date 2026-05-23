@@ -55,7 +55,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(global.provider_hint(), &global.remote, remote_url_lookup)?;
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
     title_length(&args.title)?;
     let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
     let body_tempfile = write_body_tempfile(&body)?;
@@ -150,6 +155,7 @@ fn build_create_call(
             }
         }
     }
+    ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
 }
 
@@ -270,6 +276,7 @@ mod tests {
             provider: p,
             host: "x".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 
@@ -295,6 +302,28 @@ mod tests {
         assert_eq!(label_count, 2);
         let asg_count = plan.iter().filter(|s| s.as_str() == "--assignee").count();
         assert_eq!(asg_count, 1);
+    }
+
+    #[test]
+    fn build_create_call_propagates_repo_override_to_argv() {
+        let mut ctx_gh = ctx(Provider::GitHub);
+        ctx_gh.repo = Some("owner/name".into());
+        let path = PathBuf::from("/tmp/body.md");
+        let plan_gh = build_create_call(&ctx_gh, "t", "b", &path, &[], &[]).plan_argv();
+        let gh_pos = plan_gh
+            .iter()
+            .position(|s| s == "--repo")
+            .expect("gh issue create dry-run plan must include --repo override");
+        assert_eq!(plan_gh[gh_pos + 1], "owner/name");
+
+        let mut ctx_glab = ctx(Provider::GitLab);
+        ctx_glab.repo = Some("owner/name".into());
+        let plan_glab = build_create_call(&ctx_glab, "t", "b", &path, &[], &[]).plan_argv();
+        let glab_pos = plan_glab
+            .iter()
+            .position(|s| s == "--repo")
+            .expect("glab issue create dry-run plan must include --repo override");
+        assert_eq!(plan_glab[glab_pos + 1], "owner/name");
     }
 
     #[test]

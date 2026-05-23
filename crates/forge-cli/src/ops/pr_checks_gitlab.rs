@@ -21,16 +21,15 @@ use crate::provider::ProviderContext;
 /// Build the `glab ci status -b <branch>` call. The id parameter is the
 /// branch name to query (the resolver upstream of this function converts a
 /// numeric MR id to its source branch).
-pub fn build_status_call(branch: &str) -> BackendCall {
-    BackendCall::new(
-        BackendProgram::Glab,
-        [
-            OsString::from("ci"),
-            OsString::from("status"),
-            OsString::from("-b"),
-            OsString::from(branch),
-        ],
-    )
+pub fn build_status_call(ctx: &ProviderContext, branch: &str) -> BackendCall {
+    let mut argv: Vec<OsString> = vec![
+        OsString::from("ci"),
+        OsString::from("status"),
+        OsString::from("-b"),
+        OsString::from(branch),
+    ];
+    ctx.push_repo_override(&mut argv);
+    BackendCall::new(BackendProgram::Glab, argv)
 }
 
 /// Build the `glab --version` probe call.
@@ -47,8 +46,8 @@ pub fn snapshot<R: BackendRunner>(
     args: &crate::cli::PrChecksArgs,
 ) -> Result<PrChecksPayload, ForgeError> {
     probe_version(runner)?;
-    let branch = resolve_branch(runner, &args.id)?;
-    let call = build_status_call(&branch);
+    let branch = resolve_branch(runner, ctx, &args.id)?;
+    let call = build_status_call(ctx, &branch);
     let output = runner.run(&call)?;
     parse_status_text(ctx, &output, args.required_only)
 }
@@ -80,20 +79,23 @@ pub fn probe_version<R: BackendRunner>(runner: &R) -> Result<(u32, u32, u32), Fo
 
 /// Resolve a PR id to a source branch. Numeric ids hit `glab mr view <id>`;
 /// branch-shaped ids pass through.
-fn resolve_branch<R: BackendRunner>(runner: &R, id: &str) -> Result<String, ForgeError> {
+fn resolve_branch<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    id: &str,
+) -> Result<String, ForgeError> {
     if !id.chars().all(|c| c.is_ascii_digit()) {
         return Ok(id.to_string());
     }
-    let call = BackendCall::new(
-        BackendProgram::Glab,
-        [
-            OsString::from("mr"),
-            OsString::from("view"),
-            OsString::from(id),
-            OsString::from("-F"),
-            OsString::from("json"),
-        ],
-    );
+    let mut argv: Vec<OsString> = vec![
+        OsString::from("mr"),
+        OsString::from("view"),
+        OsString::from(id),
+        OsString::from("-F"),
+        OsString::from("json"),
+    ];
+    ctx.push_repo_override(&mut argv);
+    let call = BackendCall::new(BackendProgram::Glab, argv);
     let out = runner.run(&call)?;
     let value: serde_json::Value = serde_json::from_str(out.stdout.trim()).map_err(|e| {
         ForgeError::software(
@@ -277,12 +279,13 @@ mod tests {
             provider: Provider::GitLab,
             host: "gitlab.com".into(),
             source: DetectionSource::Flag,
+            repo: None,
         }
     }
 
     #[test]
     fn build_status_call_uses_branch_flag() {
-        let call = build_status_call("feat/sample");
+        let call = build_status_call(&ctx(), "feat/sample");
         let plan = call.plan_argv();
         assert_eq!(
             plan[1..],
@@ -293,6 +296,18 @@ mod tests {
                 "feat/sample".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn build_status_call_includes_repo_override_when_set() {
+        let mut ctx = ctx();
+        ctx.repo = Some("owner/name".into());
+        let plan = build_status_call(&ctx, "feat/sample").plan_argv();
+        let pos = plan
+            .iter()
+            .position(|s| s == "--repo")
+            .expect("--repo present");
+        assert_eq!(plan[pos + 1], "owner/name");
     }
 
     #[test]
