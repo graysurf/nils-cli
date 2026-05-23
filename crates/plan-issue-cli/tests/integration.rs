@@ -21,6 +21,8 @@ mod lifecycle_record;
 mod link_pr_flow;
 #[path = "integration/live_issue_ops.rs"]
 mod live_issue_ops;
+#[path = "integration/live_record_ops.rs"]
+mod live_record_ops;
 #[path = "integration/live_start_sprint_runtime_truth.rs"]
 mod live_start_sprint_runtime_truth;
 #[path = "integration/output_contract.rs"]

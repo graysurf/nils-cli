@@ -1396,3 +1396,803 @@ impl RecordPayload {
             .map_err(|err| PayloadError::new(PayloadErrorKind::InvalidJson, err.to_string()))
     }
 }
+
+// -----------------------------------------------------------------------------
+// v2 provider-backed renderers (Sprint 3)
+//
+// `render_record_snapshot_comment` and `render_record_post_comment` produce the
+// canonical Markdown body for `record open` and `record post`: every comment
+// carries the v2 marker on its first line plus a single
+// `plan-issue-record-payload` JSON fence as the structured source of truth.
+// -----------------------------------------------------------------------------
+
+fn payload_role_for_kind(kind: LifecycleCommentKind) -> PayloadRole {
+    match kind {
+        LifecycleCommentKind::Source => PayloadRole::Source,
+        LifecycleCommentKind::Plan => PayloadRole::Plan,
+        LifecycleCommentKind::State => PayloadRole::State,
+        LifecycleCommentKind::Session => PayloadRole::Session,
+        LifecycleCommentKind::Validation => PayloadRole::Validation,
+        LifecycleCommentKind::Review => PayloadRole::Review,
+        LifecycleCommentKind::Closeout => PayloadRole::Closeout,
+    }
+}
+
+fn render_payload_fence(envelope: &RecordPayload) -> Result<String, String> {
+    serde_json::to_string_pretty(envelope).map_err(|err| err.to_string())
+}
+
+/// Render the canonical v2 source/plan snapshot comment used by
+/// `record open`. The body carries the v2 marker, visible details, and a
+/// `plan-issue-record-payload` JSON fence carrying [`SnapshotData`].
+pub fn render_record_snapshot_comment(
+    profile: RecordProfile,
+    kind: LifecycleCommentKind,
+    snapshot: &SnapshotData,
+    content: &str,
+    updated_at: Option<&str>,
+) -> Result<String, String> {
+    if !matches!(
+        kind,
+        LifecycleCommentKind::Source | LifecycleCommentKind::Plan
+    ) {
+        return Err(format!(
+            "render_record_snapshot_comment: expected source or plan kind, got `{}`",
+            kind.as_str()
+        ));
+    }
+
+    let envelope = RecordPayload {
+        schema: PAYLOAD_SCHEMA_V2.to_string(),
+        role: payload_role_for_kind(kind),
+        profile: PayloadProfile::from(profile),
+        updated_at: updated_at.map(str::to_string),
+        data: serde_json::to_value(snapshot).map_err(|err| err.to_string())?,
+    };
+    let envelope_json = render_payload_fence(&envelope)?;
+
+    let marker = marker_for(profile, kind);
+    let heading = default_heading(profile, kind);
+    let details_summary = default_details_summary(kind);
+
+    let mut out = Vec::new();
+    out.push(marker);
+    out.push(String::new());
+    out.push(format!("## {heading}"));
+    out.push(String::new());
+    out.push(format!("- Profile: {}", profile.as_str()));
+    if !snapshot.path.trim().is_empty() {
+        out.push(format!("- Path: `{}`", snapshot.path.trim()));
+    }
+    if !snapshot.commit.trim().is_empty() {
+        out.push(format!("- Commit: `{}`", snapshot.commit.trim()));
+    }
+    if let Some(summary) = snapshot
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        out.push(format!("- Summary: {summary}"));
+    }
+    out.push("- Snapshot mode: local committed Markdown".to_string());
+    out.push(String::new());
+    out.push("<details>".to_string());
+    out.push(format!("<summary>{details_summary}</summary>"));
+    out.push(String::new());
+    out.push(content.to_string());
+    out.push(String::new());
+    out.push("</details>".to_string());
+    out.push(String::new());
+    out.push(format!("```{PAYLOAD_FENCE_INFO}"));
+    out.push(envelope_json);
+    out.push("```".to_string());
+    Ok(finalize_markdown(out))
+}
+
+/// Render the canonical v2 lifecycle comment used by `record post` for
+/// state, session, validation, review, and closeout kinds. Source/plan
+/// kinds are rejected because `record open` owns them.
+pub fn render_record_post_comment(
+    profile: RecordProfile,
+    kind: LifecycleCommentKind,
+    payload_data: Value,
+    summary: Option<&str>,
+    updated_at: Option<&str>,
+) -> Result<String, String> {
+    if matches!(
+        kind,
+        LifecycleCommentKind::Source | LifecycleCommentKind::Plan
+    ) {
+        return Err(format!(
+            "render_record_post_comment: source/plan kinds are owned by `record open`, got `{}`",
+            kind.as_str()
+        ));
+    }
+
+    let envelope = RecordPayload {
+        schema: PAYLOAD_SCHEMA_V2.to_string(),
+        role: payload_role_for_kind(kind),
+        profile: PayloadProfile::from(profile),
+        updated_at: updated_at.map(str::to_string),
+        data: payload_data,
+    };
+    let envelope_json = render_payload_fence(&envelope)?;
+
+    let marker = marker_for(profile, kind);
+    let heading = default_heading(profile, kind);
+
+    let mut out = Vec::new();
+    out.push(marker);
+    out.push(String::new());
+    out.push(format!("## {heading}"));
+    out.push(String::new());
+    out.push(format!("- Profile: {}", profile.as_str()));
+    if let Some(text) = summary.map(str::trim).filter(|value| !value.is_empty()) {
+        out.push(String::new());
+        out.push(text.to_string());
+    }
+    out.push(String::new());
+    out.push(format!("```{PAYLOAD_FENCE_INFO}"));
+    out.push(envelope_json);
+    out.push("```".to_string());
+    Ok(finalize_markdown(out))
+}
+
+// -----------------------------------------------------------------------------
+// Strict closeout gate (Sprint 3)
+//
+// Sprint 3 introduces `evaluate_strict_closeout_gate` for `record close`. It
+// supersedes the v1 `evaluate_closeout_gate` which is retained for the legacy
+// `record closeout-gate` subcommand until Sprint 4 retires that surface.
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StrictCloseoutGateResult {
+    pub ready: bool,
+    pub checks: Vec<CloseoutCheck>,
+    /// Stable machine-readable codes for blocked items, one per failure.
+    pub blocked_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StrictCloseoutGateInput<'a> {
+    pub profile: RecordProfile,
+    pub approval: Option<&'a str>,
+    /// Provider-verified linked PR evidence. Each entry must carry a
+    /// `merge_sha`; missing merge_sha is treated as `linked-pr-not-merged`.
+    pub linked_prs: &'a [LinkedPrEvidence],
+    /// Current issue body. When paired with `expected_dashboard`, the gate
+    /// fails with `dashboard-out-of-date` if the recomputed dashboard does
+    /// not appear in the body.
+    pub current_body: Option<&'a str>,
+    pub expected_dashboard: Option<&'a str>,
+}
+
+pub fn evaluate_strict_closeout_gate(
+    audit: &RecordAudit,
+    input: StrictCloseoutGateInput<'_>,
+) -> StrictCloseoutGateResult {
+    let mut checks = Vec::new();
+    let mut blocked_codes: Vec<String> = Vec::new();
+
+    let push_pass = |checks: &mut Vec<CloseoutCheck>, check: &str, detail: String| {
+        checks.push(CloseoutCheck {
+            check: check.to_string(),
+            status: "pass".to_string(),
+            detail,
+        });
+    };
+    let push_fail = |checks: &mut Vec<CloseoutCheck>,
+                     blocked: &mut Vec<String>,
+                     check: &str,
+                     detail: String,
+                     code: &str| {
+        checks.push(CloseoutCheck {
+            check: check.to_string(),
+            status: "fail".to_string(),
+            detail,
+        });
+        blocked.push(code.to_string());
+    };
+
+    for (role, label, code) in [
+        ("source", "source snapshot", "source-missing"),
+        ("plan", "plan snapshot", "plan-missing"),
+    ] {
+        if audit.evidence.contains_key(role) {
+            push_pass(&mut checks, label, "present".to_string());
+        } else {
+            push_fail(
+                &mut checks,
+                &mut blocked_codes,
+                label,
+                "missing".to_string(),
+                code,
+            );
+        }
+    }
+
+    match audit.evidence.get("state") {
+        Some(hit) => {
+            let status = hit.status.as_deref();
+            let parsed = hit
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.parse_state().ok());
+            match status {
+                Some(value) if value.eq_ignore_ascii_case("complete") => {
+                    let tasks_incomplete = parsed
+                        .as_ref()
+                        .map(|data| {
+                            data.tasks.iter().any(|task| {
+                                !matches!(
+                                    task.status,
+                                    TaskRowStatus::Done | TaskRowStatus::Deferred
+                                )
+                            })
+                        })
+                        .unwrap_or(false);
+                    if tasks_incomplete {
+                        push_fail(
+                            &mut checks,
+                            &mut blocked_codes,
+                            "execution state",
+                            "complete but tasks are not all done/deferred".to_string(),
+                            "state-tasks-incomplete",
+                        );
+                    } else {
+                        push_pass(&mut checks, "execution state", "complete".to_string());
+                    }
+                }
+                Some(value) => push_fail(
+                    &mut checks,
+                    &mut blocked_codes,
+                    "execution state",
+                    format!("latest state status is `{value}`"),
+                    "state-not-complete",
+                ),
+                None => push_fail(
+                    &mut checks,
+                    &mut blocked_codes,
+                    "execution state",
+                    "missing payload status".to_string(),
+                    "state-not-complete",
+                ),
+            }
+        }
+        None => push_fail(
+            &mut checks,
+            &mut blocked_codes,
+            "execution state",
+            "missing".to_string(),
+            "state-missing",
+        ),
+    }
+
+    match audit.evidence.get("validation") {
+        Some(hit) => match hit.status.as_deref() {
+            Some("pass") => push_pass(&mut checks, "validation", "pass".to_string()),
+            Some(value) => push_fail(
+                &mut checks,
+                &mut blocked_codes,
+                "validation",
+                format!("latest validation overall = `{value}`"),
+                "validation-failed",
+            ),
+            None => push_fail(
+                &mut checks,
+                &mut blocked_codes,
+                "validation",
+                "missing payload status".to_string(),
+                "validation-failed",
+            ),
+        },
+        None => push_fail(
+            &mut checks,
+            &mut blocked_codes,
+            "validation",
+            "missing".to_string(),
+            "validation-missing",
+        ),
+    }
+
+    match audit.evidence.get("review") {
+        Some(hit) => {
+            let parsed = hit.payload.as_ref().map(|payload| payload.parse_review());
+            match parsed {
+                Some(Ok(data)) => match data.decision {
+                    ReviewDecision::RequestChanges => push_fail(
+                        &mut checks,
+                        &mut blocked_codes,
+                        "review",
+                        "decision = request-changes".to_string(),
+                        "review-rejected",
+                    ),
+                    decision => {
+                        let unresolved = data.findings.iter().any(|finding| {
+                            matches!(finding.disposition, FindingDisposition::Residual)
+                                && matches!(
+                                    finding.severity,
+                                    FindingSeverity::Blocker | FindingSeverity::Major
+                                )
+                        });
+                        if unresolved {
+                            push_fail(
+                                &mut checks,
+                                &mut blocked_codes,
+                                "review",
+                                "unresolved blocker/major findings".to_string(),
+                                "review-unresolved-findings",
+                            );
+                        } else {
+                            let label = match decision {
+                                ReviewDecision::Approve => "approve",
+                                ReviewDecision::CommentsOnly => "comments-only",
+                                ReviewDecision::RequestChanges => unreachable!(),
+                            };
+                            push_pass(&mut checks, "review", format!("decision = {label}"));
+                        }
+                    }
+                },
+                Some(Err(err)) => push_fail(
+                    &mut checks,
+                    &mut blocked_codes,
+                    "review",
+                    format!("malformed review payload: {}", err.message),
+                    "review-rejected",
+                ),
+                None => push_fail(
+                    &mut checks,
+                    &mut blocked_codes,
+                    "review",
+                    "missing payload".to_string(),
+                    "review-missing",
+                ),
+            }
+        }
+        None => push_fail(
+            &mut checks,
+            &mut blocked_codes,
+            "review",
+            "missing".to_string(),
+            "review-missing",
+        ),
+    }
+
+    let approval_text = input.approval.unwrap_or("").trim();
+    if approval_text.is_empty() {
+        push_fail(
+            &mut checks,
+            &mut blocked_codes,
+            "close approval",
+            "missing explicit approval".to_string(),
+            "approval-missing",
+        );
+    } else {
+        push_pass(&mut checks, "close approval", approval_text.to_string());
+    }
+
+    if input.linked_prs.is_empty() {
+        push_pass(&mut checks, "linked PRs", "none provided".to_string());
+    } else {
+        let mut failing = Vec::new();
+        for pr in input.linked_prs {
+            let sha = pr.merge_sha.as_deref().map(str::trim).unwrap_or("");
+            if sha.is_empty() {
+                failing.push(format!("{} (no merge_sha)", pr.pr_ref));
+            } else if !matches!(pr.checks, CheckStatus::Pass | CheckStatus::None) {
+                failing.push(format!("{} (checks={:?})", pr.pr_ref, pr.checks));
+            }
+        }
+        if failing.is_empty() {
+            push_pass(
+                &mut checks,
+                "linked PRs",
+                format!("{} merged", input.linked_prs.len()),
+            );
+        } else {
+            push_fail(
+                &mut checks,
+                &mut blocked_codes,
+                "linked PRs",
+                failing.join(", "),
+                "linked-pr-not-merged",
+            );
+        }
+    }
+
+    if let (Some(current), Some(expected)) = (input.current_body, input.expected_dashboard) {
+        let current_norm = normalize_for_dashboard_compare(current);
+        let expected_norm = normalize_for_dashboard_compare(expected);
+        if current_norm.contains(&expected_norm) {
+            push_pass(&mut checks, "dashboard", "matches canonical".to_string());
+        } else {
+            push_fail(
+                &mut checks,
+                &mut blocked_codes,
+                "dashboard",
+                "dashboard differs from recomputed canonical".to_string(),
+                "dashboard-out-of-date",
+            );
+        }
+    }
+
+    let ready = checks.iter().all(|check| check.status == "pass");
+    StrictCloseoutGateResult {
+        ready,
+        checks,
+        blocked_codes,
+    }
+}
+
+fn normalize_for_dashboard_compare(text: &str) -> String {
+    text.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod sprint3_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn build_audit_with_evidence(comments: Vec<(serde_json::Value, &str)>) -> RecordAudit {
+        let payload = json!({
+            "comments": comments
+                .into_iter()
+                .map(|(body, url)| json!({"body": body, "url": url, "created_at": "2026-05-23T08:00:00Z"}))
+                .collect::<Vec<_>>()
+        });
+        audit_record(None, &payload.to_string(), None).expect("audit ok")
+    }
+
+    fn v2_body(role: &str, data: Value) -> Value {
+        let envelope = json!({
+            "schema": PAYLOAD_SCHEMA_V2,
+            "role": role,
+            "profile": "tracking",
+            "data": data,
+        });
+        let payload_json = serde_json::to_string(&envelope).expect("serialize");
+        json!(format!(
+            "<!-- plan-issue-record:v2 role={role} profile=tracking -->\n\n```{PAYLOAD_FENCE_INFO}\n{payload_json}\n```\n",
+        ))
+    }
+
+    #[test]
+    fn audit_treats_v2_marker_without_payload_fence_as_payload_none() {
+        // Reproduces [F11] deferred follow-up: v2 marker with no payload
+        // fence should leave evidence.payload = None instead of erroring.
+        let body_only_marker = json!(
+            "<!-- plan-issue-record:v2 role=session profile=tracking -->\n\n## Execution Session\n\nfreeform notes, no payload\n"
+        );
+        let audit = build_audit_with_evidence(vec![(
+            body_only_marker,
+            "https://github.com/owner/repo/issues/1#issuecomment-session",
+        )]);
+        let session = audit
+            .evidence
+            .get("session")
+            .expect("session evidence registered");
+        assert!(session.payload.is_none(), "payload should be None");
+        assert_eq!(audit.recognized_count, 1);
+    }
+
+    #[test]
+    fn audit_strict_fails_on_malformed_payload() {
+        // [F11] deferred: malformed payload fence must error rather than
+        // silently degrade to payload=None.
+        let body = json!(
+            "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n```plan-issue-record-payload\n{not valid json\n```\n"
+        );
+        let payload = json!({
+            "comments": [{
+                "body": body,
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-bad",
+                "created_at": "2026-05-23T08:00:00Z",
+            }]
+        });
+        let err = audit_record(None, &payload.to_string(), None)
+            .expect_err("malformed payload should fail audit");
+        assert!(
+            err.contains("malformed payload"),
+            "error should mention malformed payload: {err}"
+        );
+    }
+
+    #[test]
+    fn strict_gate_passes_when_all_v2_evidence_complete_and_merged() {
+        let state = v2_body(
+            "state",
+            json!({
+                "status": "complete",
+                "target_scope": "scope",
+                "tasks": [
+                    {"id": "1.1", "status": "done", "title": "x"},
+                    {"id": "1.2", "status": "deferred", "title": "y"},
+                ],
+                "prs": [{"ref": "owner/repo#1", "url": "u", "status": "merged"}],
+                "blockers": [],
+                "links": {},
+            }),
+        );
+        let validation = v2_body(
+            "validation",
+            json!({"overall": "pass", "commands": [], "waivers": []}),
+        );
+        let review = v2_body(
+            "review",
+            json!({
+                "decision": "approve",
+                "lenses": ["testing"],
+                "findings": [],
+            }),
+        );
+        let source = v2_body("source", json!({"path": "p", "commit": "c"}));
+        let plan = v2_body("plan", json!({"path": "p", "commit": "c"}));
+        let audit = build_audit_with_evidence(vec![
+            (source, "u-src"),
+            (plan, "u-plan"),
+            (state, "u-state"),
+            (validation, "u-val"),
+            (review, "u-rev"),
+        ]);
+
+        let linked_prs = vec![LinkedPrEvidence {
+            pr_ref: "owner/repo#1".to_string(),
+            url: Some("https://github.com/owner/repo/pull/1".to_string()),
+            merge_sha: Some("abcdef1234567890".to_string()),
+            checks: CheckStatus::Pass,
+        }];
+        let result = evaluate_strict_closeout_gate(
+            &audit,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("https://github.com/owner/repo/issues/1#issuecomment-9"),
+                linked_prs: &linked_prs,
+                current_body: None,
+                expected_dashboard: None,
+            },
+        );
+        assert!(result.ready, "gate should pass: {:?}", result.checks);
+        assert!(result.blocked_codes.is_empty());
+    }
+
+    #[test]
+    fn strict_gate_blocks_when_state_not_complete() {
+        let state = v2_body(
+            "state",
+            json!({"status": "in-progress", "target_scope": "s", "tasks": [], "prs": [], "blockers": [], "links": {}}),
+        );
+        let source = v2_body("source", json!({"path": "p", "commit": "c"}));
+        let plan = v2_body("plan", json!({"path": "p", "commit": "c"}));
+        let validation = v2_body("validation", json!({"overall": "pass"}));
+        let review = v2_body("review", json!({"decision": "approve"}));
+        let audit = build_audit_with_evidence(vec![
+            (source, "a"),
+            (plan, "b"),
+            (state, "c"),
+            (validation, "d"),
+            (review, "e"),
+        ]);
+        let result = evaluate_strict_closeout_gate(
+            &audit,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("ok"),
+                linked_prs: &[],
+                current_body: None,
+                expected_dashboard: None,
+            },
+        );
+        assert!(!result.ready);
+        assert!(
+            result
+                .blocked_codes
+                .iter()
+                .any(|c| c == "state-not-complete"),
+            "{:?}",
+            result.blocked_codes
+        );
+    }
+
+    #[test]
+    fn strict_gate_blocks_when_review_rejected_or_unresolved() {
+        let source = v2_body("source", json!({"path": "p", "commit": "c"}));
+        let plan = v2_body("plan", json!({"path": "p", "commit": "c"}));
+        let state = v2_body(
+            "state",
+            json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
+        );
+        let validation = v2_body("validation", json!({"overall": "pass"}));
+        let review_rejected = v2_body("review", json!({"decision": "request-changes"}));
+        let audit_rej = build_audit_with_evidence(vec![
+            (source.clone(), "a"),
+            (plan.clone(), "b"),
+            (state.clone(), "c"),
+            (validation.clone(), "d"),
+            (review_rejected, "e"),
+        ]);
+        let res_rej = evaluate_strict_closeout_gate(
+            &audit_rej,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("ok"),
+                linked_prs: &[],
+                current_body: None,
+                expected_dashboard: None,
+            },
+        );
+        assert!(res_rej.blocked_codes.iter().any(|c| c == "review-rejected"));
+
+        let review_unresolved = v2_body(
+            "review",
+            json!({
+                "decision": "approve",
+                "findings": [
+                    {"id": "F1", "severity": "blocker", "disposition": "residual", "summary": "x"}
+                ]
+            }),
+        );
+        let audit_un = build_audit_with_evidence(vec![
+            (source, "a"),
+            (plan, "b"),
+            (state, "c"),
+            (validation, "d"),
+            (review_unresolved, "e"),
+        ]);
+        let res_un = evaluate_strict_closeout_gate(
+            &audit_un,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("ok"),
+                linked_prs: &[],
+                current_body: None,
+                expected_dashboard: None,
+            },
+        );
+        assert!(
+            res_un
+                .blocked_codes
+                .iter()
+                .any(|c| c == "review-unresolved-findings")
+        );
+    }
+
+    #[test]
+    fn strict_gate_blocks_when_linked_pr_missing_merge_sha() {
+        let source = v2_body("source", json!({"path": "p", "commit": "c"}));
+        let plan = v2_body("plan", json!({"path": "p", "commit": "c"}));
+        let state = v2_body(
+            "state",
+            json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
+        );
+        let validation = v2_body("validation", json!({"overall": "pass"}));
+        let review = v2_body("review", json!({"decision": "approve"}));
+        let audit = build_audit_with_evidence(vec![
+            (source, "a"),
+            (plan, "b"),
+            (state, "c"),
+            (validation, "d"),
+            (review, "e"),
+        ]);
+        let linked = vec![LinkedPrEvidence {
+            pr_ref: "owner/repo#1".to_string(),
+            url: None,
+            merge_sha: None,
+            checks: CheckStatus::Pass,
+        }];
+        let res = evaluate_strict_closeout_gate(
+            &audit,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("ok"),
+                linked_prs: &linked,
+                current_body: None,
+                expected_dashboard: None,
+            },
+        );
+        assert!(
+            res.blocked_codes
+                .iter()
+                .any(|c| c == "linked-pr-not-merged")
+        );
+    }
+
+    #[test]
+    fn strict_gate_blocks_when_approval_empty() {
+        let source = v2_body("source", json!({"path": "p", "commit": "c"}));
+        let plan = v2_body("plan", json!({"path": "p", "commit": "c"}));
+        let state = v2_body(
+            "state",
+            json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
+        );
+        let validation = v2_body("validation", json!({"overall": "pass"}));
+        let review = v2_body("review", json!({"decision": "approve"}));
+        let audit = build_audit_with_evidence(vec![
+            (source, "a"),
+            (plan, "b"),
+            (state, "c"),
+            (validation, "d"),
+            (review, "e"),
+        ]);
+        let res = evaluate_strict_closeout_gate(
+            &audit,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("   "),
+                linked_prs: &[],
+                current_body: None,
+                expected_dashboard: None,
+            },
+        );
+        assert!(res.blocked_codes.iter().any(|c| c == "approval-missing"));
+    }
+
+    #[test]
+    fn render_record_post_comment_emits_marker_and_payload_fence() {
+        let body = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::State,
+            json!({"status": "complete", "tasks": [], "prs": []}),
+            Some("session summary"),
+            Some("2026-05-23T08:42:11Z"),
+        )
+        .expect("render");
+        assert!(
+            body.starts_with("<!-- plan-issue-record:v2 role=state profile=tracking -->"),
+            "{body}"
+        );
+        assert!(body.contains(&format!("```{PAYLOAD_FENCE_INFO}")), "{body}");
+        assert!(
+            body.contains("\"schema\": \"plan-issue-record.payload.v2\""),
+            "{body}"
+        );
+        assert!(body.contains("session summary"), "{body}");
+    }
+
+    #[test]
+    fn render_record_post_comment_rejects_source_or_plan() {
+        let err = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Source,
+            json!({}),
+            None,
+            None,
+        )
+        .expect_err("must reject source");
+        assert!(err.contains("source"), "{err}");
+    }
+
+    #[test]
+    fn render_record_snapshot_comment_includes_details_and_payload() {
+        let snapshot = SnapshotData {
+            path: "docs/plans/sample/sample-plan.md".to_string(),
+            commit: "abc1234".to_string(),
+            title: Some("Sample Plan".to_string()),
+            summary: Some("One-liner".to_string()),
+        };
+        let body = render_record_snapshot_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Plan,
+            &snapshot,
+            "# Sample Plan\n\nbody...\n",
+            Some("2026-05-23T08:42:11Z"),
+        )
+        .expect("render");
+        assert!(
+            body.contains("- Path: `docs/plans/sample/sample-plan.md`"),
+            "{body}"
+        );
+        assert!(body.contains("- Commit: `abc1234`"), "{body}");
+        assert!(body.contains("- Summary: One-liner"), "{body}");
+        assert!(body.contains("<details>"), "{body}");
+        assert!(body.contains(&format!("```{PAYLOAD_FENCE_INFO}")), "{body}");
+        assert!(
+            body.contains("\"schema\": \"plan-issue-record.payload.v2\""),
+            "{body}"
+        );
+    }
+}

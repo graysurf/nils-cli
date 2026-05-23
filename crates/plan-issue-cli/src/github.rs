@@ -11,6 +11,12 @@ use crate::commands::plan::CloseReason;
 pub trait GitHubAdapter {
     fn issue_body(&self, repo: &str, issue: u64) -> Result<String, String>;
 
+    /// Fetch the issue body plus comments JSON, suitable for `audit_record`
+    /// fixture parsing. Returns `(body, comments_json)` where
+    /// `comments_json` is the raw JSON string from
+    /// `gh issue view --json comments`.
+    fn issue_evidence(&self, repo: &str, issue: u64) -> Result<(String, String), String>;
+
     fn create_issue(
         &self,
         repo: &str,
@@ -21,7 +27,9 @@ pub trait GitHubAdapter {
 
     fn edit_issue_body(&self, repo: &str, issue: u64, body_file: &Path) -> Result<(), String>;
 
-    fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<(), String>;
+    /// Post an issue comment. Returns the URL of the created comment as
+    /// printed by `gh issue comment` on stdout.
+    fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<String, String>;
 
     fn edit_issue_labels(
         &self,
@@ -41,10 +49,26 @@ pub trait GitHubAdapter {
 
     fn pr_is_merged(&self, repo: &str, pr: u64) -> Result<bool, String>;
 
+    /// Provider-verified PR summary used by `record close` strict gating.
+    /// Returns merge state, optional merge commit SHA, and rolled-up check
+    /// status when available.
+    fn pr_merge_summary(&self, repo: &str, pr: u64) -> Result<PrMergeSummary, String>;
+
     /// List the PR's issue-style comments via `gh api`. Returns an array of
     /// objects with at least `body` and `html_url` keys (passed through
     /// from the GitHub REST response). Used by `resolve-approval`.
     fn pr_comments(&self, repo: &str, pr: u64) -> Result<Vec<Value>, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrMergeSummary {
+    /// Raw `state` field from the GitHub PR view (`MERGED`, `OPEN`, `CLOSED`).
+    pub state: String,
+    pub merged: bool,
+    pub merge_sha: Option<String>,
+    /// Rolled-up status check state when known
+    /// (`success`, `failure`, `pending`, `error`, ...).
+    pub checks: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -124,6 +148,33 @@ impl GitHubAdapter for GhCliAdapter {
         Ok(body.to_string())
     }
 
+    fn issue_evidence(&self, repo: &str, issue: u64) -> Result<(String, String), String> {
+        let args = vec![
+            "issue".to_string(),
+            "view".to_string(),
+            issue.to_string(),
+            "--repo".to_string(),
+            repo.to_string(),
+            "--json".to_string(),
+            "body,comments".to_string(),
+        ];
+        let stdout = Self::run(&args)?;
+        let json = Self::parse_json(&stdout, "issue view (body+comments)")?;
+        let body = json
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let comments = json
+            .get("comments")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new()));
+        let envelope = serde_json::json!({ "comments": comments });
+        let comments_json = serde_json::to_string(&envelope)
+            .map_err(|err| format!("failed to serialize issue evidence comments: {err}"))?;
+        Ok((body, comments_json))
+    }
+
     fn create_issue(
         &self,
         repo: &str,
@@ -174,7 +225,7 @@ impl GitHubAdapter for GhCliAdapter {
         Self::run(&args).map(|_| ())
     }
 
-    fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<(), String> {
+    fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<String, String> {
         self.guard_markdown_file(body_file, "github issue comment write rejected")?;
 
         let args = vec![
@@ -186,7 +237,9 @@ impl GitHubAdapter for GhCliAdapter {
             "--body-file".to_string(),
             body_file.to_string_lossy().to_string(),
         ];
-        Self::run(&args).map(|_| ())
+        let stdout = Self::run(&args)?;
+        let url = stdout.lines().last().unwrap_or("").trim().to_string();
+        Ok(url)
     }
 
     fn edit_issue_labels(
@@ -288,6 +341,43 @@ impl GitHubAdapter for GhCliAdapter {
         Ok(merged_at_present || merged_state)
     }
 
+    fn pr_merge_summary(&self, repo: &str, pr: u64) -> Result<PrMergeSummary, String> {
+        let args = vec![
+            "pr".to_string(),
+            "view".to_string(),
+            pr.to_string(),
+            "--repo".to_string(),
+            repo.to_string(),
+            "--json".to_string(),
+            "state,mergeCommit,statusCheckRollup".to_string(),
+        ];
+        let stdout = Self::run(&args)?;
+        let json = Self::parse_json(&stdout, "pr view (merge summary)")?;
+
+        let state = json
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let merged = state.eq_ignore_ascii_case("merged");
+        let merge_sha = json
+            .get("mergeCommit")
+            .and_then(|value| value.get("oid"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|sha| !sha.is_empty());
+        let checks = json
+            .get("statusCheckRollup")
+            .and_then(rollup_status)
+            .filter(|status| !status.is_empty());
+        Ok(PrMergeSummary {
+            state,
+            merged,
+            merge_sha,
+            checks,
+        })
+    }
+
     fn pr_comments(&self, repo: &str, pr: u64) -> Result<Vec<Value>, String> {
         // Use `--paginate` so PRs with > 100 comments still return the full
         // list. Endpoint mirrors REST `/repos/{owner}/{repo}/issues/{n}/comments`
@@ -337,6 +427,49 @@ impl GitHubAdapter for GhCliAdapter {
             }
         }
         Ok(combined)
+    }
+}
+
+fn rollup_status(rollup: &Value) -> Option<String> {
+    let extract_state = |item: &Value| -> Option<String> {
+        item.get("state")
+            .and_then(Value::as_str)
+            .map(|status| status.to_ascii_lowercase())
+            .or_else(|| {
+                item.get("conclusion")
+                    .and_then(Value::as_str)
+                    .map(|status| status.to_ascii_lowercase())
+            })
+    };
+
+    match rollup {
+        Value::Array(items) if items.is_empty() => Some("none".to_string()),
+        Value::Array(items) => {
+            let mut has_failure = false;
+            let mut has_pending = false;
+            let mut has_success = false;
+            for item in items {
+                match extract_state(item).as_deref() {
+                    Some("success" | "neutral" | "skipped") => has_success = true,
+                    Some("failure" | "cancelled" | "timed_out" | "action_required" | "error") => {
+                        has_failure = true
+                    }
+                    Some("pending" | "in_progress" | "queued" | "expected") => has_pending = true,
+                    _ => {}
+                }
+            }
+            if has_failure {
+                Some("failure".to_string())
+            } else if has_pending {
+                Some("pending".to_string())
+            } else if has_success {
+                Some("success".to_string())
+            } else {
+                Some("unknown".to_string())
+            }
+        }
+        Value::Object(_) => extract_state(rollup),
+        _ => None,
     }
 }
 

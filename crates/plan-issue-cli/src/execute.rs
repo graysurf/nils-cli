@@ -71,7 +71,9 @@ pub fn execute(binary: BinaryFlavor, cli: &Cli) -> Result<Value, CommandError> {
         CliCommand::ResolveApproval(args) => {
             run_resolve_approval_json(binary, cli.force, cli.repo.as_deref(), args)
         }
-        CliCommand::Record(args) => run_record(args),
+        CliCommand::Record(args) => {
+            run_record(binary, cli.dry_run, cli.force, cli.repo.as_deref(), args)
+        }
         CliCommand::Completion(_) => Err(CommandError::usage(
             "completion-direct-output-only",
             "completion output is emitted directly; run `<binary> completion <bash|zsh>`",
@@ -79,12 +81,20 @@ pub fn execute(binary: BinaryFlavor, cli: &Cli) -> Result<Value, CommandError> {
     }
 }
 
-fn run_record(args: &RecordArgs) -> Result<Value, CommandError> {
+fn run_record(
+    binary: BinaryFlavor,
+    dry_run: bool,
+    force: bool,
+    repo_override: Option<&str>,
+    args: &RecordArgs,
+) -> Result<Value, CommandError> {
     match &args.command {
-        RecordCommand::Open(args) => run_record_open(args),
-        RecordCommand::Post(args) => run_record_post(args),
-        RecordCommand::RepairDashboard(args) => run_record_repair_dashboard(args),
-        RecordCommand::Close(args) => run_record_close(args),
+        RecordCommand::Open(args) => run_record_open(binary, dry_run, force, repo_override, args),
+        RecordCommand::Post(args) => run_record_post(binary, dry_run, force, repo_override, args),
+        RecordCommand::RepairDashboard(args) => {
+            run_record_repair_dashboard(binary, dry_run, force, repo_override, args)
+        }
+        RecordCommand::Close(args) => run_record_close(binary, dry_run, force, repo_override, args),
         RecordCommand::RenderDashboard(args) => run_record_render_dashboard(args),
         RecordCommand::RenderComment(args) => run_record_render_comment(args),
         RecordCommand::Audit(args) => run_record_audit(args),
@@ -93,40 +103,1008 @@ fn run_record(args: &RecordArgs) -> Result<Value, CommandError> {
     }
 }
 
-fn run_record_open(_args: &RecordOpenArgs) -> Result<Value, CommandError> {
+#[derive(Debug, Clone)]
+struct RecordBundle {
+    source_file: PathBuf,
+    plan_file: PathBuf,
+    /// Resolved when present; `None` only when the caller explicitly opted out.
+    #[allow(dead_code)]
+    execution_state_file: Option<PathBuf>,
+}
+
+fn resolve_record_bundle(
+    bundle: Option<&Path>,
+    explicit_source: Option<&Path>,
+    explicit_plan: Option<&Path>,
+    explicit_execution_state: Option<&Path>,
+) -> Result<RecordBundle, CommandError> {
+    if let (Some(source), Some(plan)) = (explicit_source, explicit_plan) {
+        return Ok(RecordBundle {
+            source_file: source.to_path_buf(),
+            plan_file: plan.to_path_buf(),
+            execution_state_file: explicit_execution_state.map(Path::to_path_buf),
+        });
+    }
+
+    let bundle_dir = bundle.ok_or_else(|| {
+        CommandError::usage(
+            "record-open-missing-bundle",
+            "either --bundle <dir> or both --source-file and --plan-file are required",
+        )
+    })?;
+    if !bundle_dir.is_dir() {
+        return Err(CommandError::usage(
+            "record-open-bundle-not-dir",
+            format!("--bundle path is not a directory: {}", bundle_dir.display()),
+        ));
+    }
+
+    let mut plan_file: Option<PathBuf> = None;
+    let mut source_file: Option<PathBuf> = None;
+    let mut execution_state_file: Option<PathBuf> = None;
+    let entries = fs::read_dir(bundle_dir).map_err(|err| {
+        CommandError::runtime(
+            "record-open-bundle-read-failed",
+            format!("failed to read bundle dir {}: {err}", bundle_dir.display()),
+        )
+    })?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with("-plan.md") {
+            plan_file = Some(path.clone());
+        } else if name.ends_with("-discussion-source.md") || name.ends_with("-review-source.md") {
+            source_file = Some(path.clone());
+        } else if name.ends_with("-execution-state.md") {
+            execution_state_file = Some(path.clone());
+        }
+    }
+
+    let plan_file = explicit_plan
+        .map(Path::to_path_buf)
+        .or(plan_file)
+        .ok_or_else(|| {
+            CommandError::usage(
+                "record-open-missing-plan",
+                format!(
+                    "no <slug>-plan.md found in bundle {} and no --plan-file provided",
+                    bundle_dir.display()
+                ),
+            )
+        })?;
+    let source_file = explicit_source
+        .map(Path::to_path_buf)
+        .or(source_file)
+        .ok_or_else(|| {
+            CommandError::usage(
+                "record-open-missing-source",
+                format!(
+                    "no <slug>-discussion-source.md or <slug>-review-source.md found in bundle {} and no --source-file provided",
+                    bundle_dir.display()
+                ),
+            )
+        })?;
+    let execution_state_file = explicit_execution_state
+        .map(Path::to_path_buf)
+        .or(execution_state_file);
+
+    Ok(RecordBundle {
+        source_file,
+        plan_file,
+        execution_state_file,
+    })
+}
+
+fn last_commit_for_path(path: &Path) -> Result<String, CommandError> {
+    let arg_path = path.to_string_lossy().to_string();
+    let output =
+        common_git::run_output(&["log", "-n", "1", "--format=%H", "--", arg_path.as_str()])
+            .map_err(|err| {
+                CommandError::runtime(
+                    "record-open-git-log-failed",
+                    format!("git log {arg_path} failed: {err}"),
+                )
+            })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(CommandError::runtime(
+            "record-open-git-log-failed",
+            format!("git log {arg_path}: {stderr}"),
+        ));
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err(CommandError::runtime(
+            "record-open-uncommitted",
+            format!(
+                "path {} has no commit in git history; commit it first or pass --allow-dirty",
+                path.display()
+            ),
+        ));
+    }
+    Ok(sha)
+}
+
+fn path_is_dirty(path: &Path) -> Result<bool, CommandError> {
+    let arg_path = path.to_string_lossy().to_string();
+    let output = common_git::run_output(&["status", "--porcelain", "--", arg_path.as_str()])
+        .map_err(|err| {
+            CommandError::runtime(
+                "record-open-git-status-failed",
+                format!("git status {arg_path} failed: {err}"),
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(CommandError::runtime(
+            "record-open-git-status-failed",
+            format!("git status {arg_path}: {stderr}"),
+        ));
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn resolve_bundle_snapshots(
+    bundle: &RecordBundle,
+    allow_dirty: bool,
+) -> Result<
+    (
+        lifecycle_record::SnapshotData,
+        lifecycle_record::SnapshotData,
+    ),
+    CommandError,
+> {
+    for (label, path) in [("source", &bundle.source_file), ("plan", &bundle.plan_file)] {
+        if !path.exists() {
+            return Err(CommandError::usage(
+                "record-open-bundle-file-missing",
+                format!("{label} file not found: {}", path.display()),
+            ));
+        }
+        if !allow_dirty && path_is_dirty(path)? {
+            return Err(CommandError::usage(
+                "record-open-bundle-dirty",
+                format!(
+                    "{label} file {} has uncommitted changes; commit them or pass --allow-dirty",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    let source_commit = last_commit_for_path(&bundle.source_file)?;
+    let plan_commit = last_commit_for_path(&bundle.plan_file)?;
+
+    let source_snapshot = lifecycle_record::SnapshotData {
+        path: relative_repo_path(&bundle.source_file),
+        commit: source_commit,
+        title: None,
+        summary: None,
+    };
+    let plan_snapshot = lifecycle_record::SnapshotData {
+        path: relative_repo_path(&bundle.plan_file),
+        commit: plan_commit,
+        title: None,
+        summary: None,
+    };
+    Ok((source_snapshot, plan_snapshot))
+}
+
+fn relative_repo_path(path: &Path) -> String {
+    // Try to express the path relative to the repo root for stable
+    // payload identity; otherwise fall back to the display path.
+    let cwd = std::env::current_dir().ok();
+    if let Some(cwd) = cwd
+        && let Ok(stripped) = path.strip_prefix(&cwd)
+    {
+        return stripped.to_string_lossy().to_string();
+    }
+    path.to_string_lossy().to_string()
+}
+
+fn build_initial_state_payload(plan: &plan_tooling::parse::Plan) -> Value {
+    let tasks = plan
+        .sprints
+        .iter()
+        .flat_map(|sprint| {
+            sprint.tasks.iter().map(|task| {
+                json!({
+                    "id": task.id,
+                    "status": "pending",
+                    "title": task.name,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "status": "in-progress",
+        "target_scope": plan.title,
+        "current": "Sprint 1 ready",
+        "next_action": "execute Sprint 1 tasks",
+        "tasks": tasks,
+        "prs": [],
+        "blockers": [],
+        "links": {},
+    })
+}
+
+fn parse_plan_for_record(plan_file: &Path) -> Result<plan_tooling::parse::Plan, CommandError> {
+    let resolved = task_spec::resolve_plan_file(plan_file);
+    let display = plan_file.to_string_lossy().to_string();
+    let (plan, errors) = parse_plan_with_display(&resolved, &display).map_err(|err| {
+        CommandError::runtime(
+            "record-open-plan-parse-failed",
+            format!("failed to read {}: {err}", plan_file.display()),
+        )
+    })?;
+    if !errors.is_empty() {
+        return Err(CommandError::runtime(
+            "record-open-plan-invalid",
+            errors.join(" | "),
+        ));
+    }
+    Ok(plan)
+}
+
+fn record_initial_dashboard(
+    profile: crate::commands::record::RecordProfile,
+    plan_title: &str,
+    issue_url: Option<&str>,
+) -> String {
+    lifecycle_record::render_dashboard(DashboardInput {
+        profile,
+        status: "in-progress".to_string(),
+        target_scope: plan_title.to_string(),
+        current: "Sprint 1 ready".to_string(),
+        next_action: "execute Sprint 1 tasks".to_string(),
+        validation: "pending".to_string(),
+        linked_prs: Vec::new(),
+        blockers: Vec::new(),
+        approval: "pending".to_string(),
+        source_url: None,
+        plan_url: None,
+        state_url: None,
+        session_url: None,
+        validation_url: None,
+        review_url: None,
+        closeout_url: None,
+        title: Some(plan_title.to_string()),
+        issue_url: issue_url.map(str::to_string),
+    })
+}
+
+fn read_fixture_evidence(fixture_dir: &Path) -> Result<(String, String), CommandError> {
+    let body_path = fixture_dir.join("issue-body.md");
+    let comments_path = fixture_dir.join("comments.json");
+    let body = fs::read_to_string(&body_path).map_err(|err| {
+        CommandError::runtime(
+            "record-fixture-body-read-failed",
+            format!("failed to read fixture body {}: {err}", body_path.display()),
+        )
+    })?;
+    let comments = fs::read_to_string(&comments_path).map_err(|err| {
+        CommandError::runtime(
+            "record-fixture-comments-read-failed",
+            format!(
+                "failed to read fixture comments {}: {err}",
+                comments_path.display()
+            ),
+        )
+    })?;
+    Ok((body, comments))
+}
+
+fn read_fixture_pr_snapshot(
+    fixture_dir: &Path,
+    repo: &str,
+    pr: u64,
+) -> Result<lifecycle_record::LinkedPrEvidence, CommandError> {
+    let slug = repo.replace('/', "__");
+    let file = fixture_dir.join("prs").join(format!("{slug}__{pr}.json"));
+    let raw = fs::read_to_string(&file).map_err(|err| {
+        CommandError::runtime(
+            "record-fixture-pr-missing",
+            format!("failed to read PR fixture {}: {err}", file.display()),
+        )
+    })?;
+    let value: Value = serde_json::from_str(&raw).map_err(|err| {
+        CommandError::runtime(
+            "record-fixture-pr-invalid",
+            format!("failed to parse PR fixture {}: {err}", file.display()),
+        )
+    })?;
+    let state = value
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let merged = state.eq_ignore_ascii_case("merged");
+    let merge_sha = value
+        .get("mergeCommit")
+        .and_then(|v| v.get("oid"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let checks_str = value
+        .get("statusCheckRollup")
+        .and_then(|rollup| rollup.get("state"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_ascii_lowercase());
+    let checks = match checks_str.as_deref() {
+        Some("success") => lifecycle_record::CheckStatus::Pass,
+        Some("failure" | "error") => lifecycle_record::CheckStatus::Fail,
+        _ => lifecycle_record::CheckStatus::None,
+    };
+    Ok(lifecycle_record::LinkedPrEvidence {
+        pr_ref: format!("{repo}#{pr}"),
+        url: value.get("url").and_then(Value::as_str).map(str::to_string),
+        merge_sha: if merged { merge_sha } else { None },
+        checks,
+    })
+}
+
+fn parse_issue_reference(value: &str) -> Result<u64, CommandError> {
+    let trimmed = value.trim();
+    if let Ok(num) = trimmed.parse::<u64>() {
+        return Ok(num);
+    }
+    if let Some(tail) = trimmed.rsplit('/').next()
+        && let Ok(num) = tail.parse::<u64>()
+    {
+        return Ok(num);
+    }
     Err(CommandError::usage(
-        "record-open-not-yet-implemented",
-        "`plan-issue record open` lifecycle wiring lands in plan-issue-lifecycle-v3 Sprint 3; \
-         the v2 spec contract is defined and the CLI surface is scaffolded so consumers can \
-         test against it",
+        "record-invalid-issue",
+        format!("--issue must be a number or full URL, got `{value}`"),
     ))
 }
 
-fn run_record_post(_args: &RecordPostArgs) -> Result<Value, CommandError> {
+fn parse_linked_pr_reference(value: &str) -> Result<(String, u64), CommandError> {
+    let trimmed = value.trim();
+    if let Some((repo, number_raw)) = trimmed.rsplit_once('#') {
+        if !repo.contains('/') {
+            return Err(CommandError::usage(
+                "record-invalid-linked-pr",
+                format!("--linked-pr must be `owner/repo#NN` or a PR URL, got `{value}`"),
+            ));
+        }
+        let number = number_raw.parse::<u64>().map_err(|err| {
+            CommandError::usage(
+                "record-invalid-linked-pr",
+                format!("--linked-pr number is not numeric in `{value}`: {err}"),
+            )
+        })?;
+        return Ok((repo.to_string(), number));
+    }
+    if trimmed.starts_with("https://github.com/") {
+        let tail = trimmed.trim_end_matches('/');
+        if let Some(rest) = tail.strip_prefix("https://github.com/") {
+            let mut parts = rest.splitn(4, '/');
+            let owner = parts.next().unwrap_or("");
+            let repo = parts.next().unwrap_or("");
+            let kind = parts.next().unwrap_or("");
+            let number = parts.next().unwrap_or("");
+            if !owner.is_empty()
+                && !repo.is_empty()
+                && (kind == "pull" || kind == "issues")
+                && let Ok(num) = number.parse::<u64>()
+            {
+                return Ok((format!("{owner}/{repo}"), num));
+            }
+        }
+    }
     Err(CommandError::usage(
-        "record-post-not-yet-implemented",
-        "`plan-issue record post` lifecycle wiring lands in plan-issue-lifecycle-v3 Sprint 3; \
-         the v2 spec contract is defined and the CLI surface is scaffolded so consumers can \
-         test against it",
+        "record-invalid-linked-pr",
+        format!("--linked-pr must be `owner/repo#NN` or a PR URL, got `{value}`"),
     ))
 }
 
-fn run_record_repair_dashboard(_args: &RecordRepairDashboardArgs) -> Result<Value, CommandError> {
-    Err(CommandError::usage(
-        "record-repair-dashboard-not-yet-implemented",
-        "`plan-issue record repair-dashboard` lifecycle wiring lands in \
-         plan-issue-lifecycle-v3 Sprint 3; the v2 spec contract is defined and the CLI \
-         surface is scaffolded so consumers can test against it",
-    ))
+fn read_payload_data(path: &Path) -> Result<Value, CommandError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        CommandError::runtime(
+            "record-post-payload-read-failed",
+            format!("failed to read --payload-file {}: {err}", path.display()),
+        )
+    })?;
+    serde_json::from_str(&raw).map_err(|err| {
+        CommandError::runtime(
+            "record-post-payload-invalid",
+            format!("invalid JSON in --payload-file {}: {err}", path.display()),
+        )
+    })
 }
 
-fn run_record_close(_args: &RecordCloseArgs) -> Result<Value, CommandError> {
-    Err(CommandError::usage(
-        "record-close-not-yet-implemented",
-        "`plan-issue record close` lifecycle wiring lands in plan-issue-lifecycle-v3 Sprint 3; \
-         the v2 spec contract is defined and the CLI surface is scaffolded so consumers can \
-         test against it",
-    ))
+fn run_record_open(
+    binary: BinaryFlavor,
+    dry_run: bool,
+    force: bool,
+    repo_override: Option<&str>,
+    args: &RecordOpenArgs,
+) -> Result<Value, CommandError> {
+    // Fixture mode is deterministic and never reaches the network.
+    if let Some(fixture_dir) = &args.fixture {
+        let (body, comments_json) = read_fixture_evidence(fixture_dir)?;
+        let audit = lifecycle_record::audit_record(Some(&body), &comments_json, Some(args.profile))
+            .map_err(|err| CommandError::runtime("record-open-fixture-audit-failed", err))?;
+        let source_url = audit
+            .evidence
+            .get("source")
+            .and_then(|hit| hit.url.clone())
+            .unwrap_or_default();
+        let plan_url = audit
+            .evidence
+            .get("plan")
+            .and_then(|hit| hit.url.clone())
+            .unwrap_or_default();
+        let state_url = audit
+            .evidence
+            .get("state")
+            .and_then(|hit| hit.url.clone())
+            .unwrap_or_default();
+        let plan_title = args
+            .title
+            .clone()
+            .unwrap_or_else(|| "fixture-plan".to_string());
+        let dashboard = lifecycle_record::render_dashboard_from_audit(
+            &audit,
+            Some(&plan_title),
+            audit
+                .evidence
+                .values()
+                .next()
+                .and_then(|hit| hit.url.as_deref().and_then(|url| url.split('#').next())),
+        );
+        return Ok(json!({
+            "operation": "record.open",
+            "execution_mode": binary.execution_mode(),
+            "dry_run": true,
+            "mode": "fixture",
+            "issue": {"number": null, "url": null},
+            "comments": {"source": source_url, "plan": plan_url, "state": state_url},
+            "dashboard_markdown": dashboard,
+        }));
+    }
+
+    let bundle = resolve_record_bundle(
+        args.bundle.as_deref(),
+        args.source_file.as_deref(),
+        args.plan_file.as_deref(),
+        args.execution_state_file.as_deref(),
+    )?;
+    let plan = parse_plan_for_record(&bundle.plan_file)?;
+    let plan_title = args.title.clone().unwrap_or_else(|| plan.title.clone());
+
+    let (source_snapshot, plan_snapshot) = resolve_bundle_snapshots(&bundle, args.allow_dirty)?;
+    let source_content = fs::read_to_string(&bundle.source_file).map_err(|err| {
+        CommandError::runtime(
+            "record-open-source-read-failed",
+            format!("failed to read {}: {err}", bundle.source_file.display()),
+        )
+    })?;
+    let plan_content = fs::read_to_string(&bundle.plan_file).map_err(|err| {
+        CommandError::runtime(
+            "record-open-plan-read-failed",
+            format!("failed to read {}: {err}", bundle.plan_file.display()),
+        )
+    })?;
+
+    let source_body = lifecycle_record::render_record_snapshot_comment(
+        args.profile,
+        crate::commands::record::LifecycleCommentKind::Source,
+        &source_snapshot,
+        &source_content,
+        None,
+    )
+    .map_err(|err| CommandError::runtime("record-open-source-render-failed", err))?;
+    let plan_body = lifecycle_record::render_record_snapshot_comment(
+        args.profile,
+        crate::commands::record::LifecycleCommentKind::Plan,
+        &plan_snapshot,
+        &plan_content,
+        None,
+    )
+    .map_err(|err| CommandError::runtime("record-open-plan-render-failed", err))?;
+
+    let initial_state = build_initial_state_payload(&plan);
+    let state_body = lifecycle_record::render_record_post_comment(
+        args.profile,
+        crate::commands::record::LifecycleCommentKind::State,
+        initial_state.clone(),
+        Some("Initial execution state seeded by `plan-issue record open`."),
+        None,
+    )
+    .map_err(|err| CommandError::runtime("record-open-state-render-failed", err))?;
+
+    let initial_dashboard = record_initial_dashboard(args.profile, &plan_title, None);
+
+    let preview = json!({
+        "issue_body_markdown": initial_dashboard,
+        "comments": {
+            "source": source_body,
+            "plan": plan_body,
+            "state": state_body,
+        },
+        "plan_title": plan_title,
+        "source_path": path_text(&bundle.source_file),
+        "plan_path": path_text(&bundle.plan_file),
+        "source_commit": source_snapshot.commit,
+        "plan_commit": plan_snapshot.commit,
+    });
+
+    if binary != BinaryFlavor::PlanIssue || dry_run {
+        return Ok(json!({
+            "operation": "record.open",
+            "execution_mode": binary.execution_mode(),
+            "dry_run": true,
+            "mode": "dry-run",
+            "preview": preview,
+        }));
+    }
+
+    // Live mode.
+    let repo = resolve_repo_for_live(binary, repo_override)?;
+    let adapter = GhCliAdapter::new(force);
+
+    let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
+        .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
+    let (issue_number, issue_url) = adapter
+        .create_issue(&repo, &plan_title, &body_path, &[])
+        .map_err(|err| CommandError::runtime("record-open-issue-create-failed", err))?;
+
+    let source_path = write_temp_markdown("record-open-source-comment", &source_body)
+        .map_err(|err| CommandError::runtime("record-open-source-write-failed", err))?;
+    let source_url = adapter
+        .comment_issue(&repo, issue_number, &source_path)
+        .map_err(|err| CommandError::runtime("record-open-source-post-failed", err))?;
+    let plan_path = write_temp_markdown("record-open-plan-comment", &plan_body)
+        .map_err(|err| CommandError::runtime("record-open-plan-write-failed", err))?;
+    let plan_url = adapter
+        .comment_issue(&repo, issue_number, &plan_path)
+        .map_err(|err| CommandError::runtime("record-open-plan-post-failed", err))?;
+    let state_path = write_temp_markdown("record-open-state-comment", &state_body)
+        .map_err(|err| CommandError::runtime("record-open-state-write-failed", err))?;
+    let state_url = adapter
+        .comment_issue(&repo, issue_number, &state_path)
+        .map_err(|err| CommandError::runtime("record-open-state-post-failed", err))?;
+
+    // Repair dashboard with freshly-created comment URLs through audit.
+    let (body_after, comments_json) = adapter
+        .issue_evidence(&repo, issue_number)
+        .map_err(|err| CommandError::runtime("record-open-evidence-read-failed", err))?;
+    let audit =
+        lifecycle_record::audit_record(Some(&body_after), &comments_json, Some(args.profile))
+            .map_err(|err| CommandError::runtime("record-open-audit-failed", err))?;
+    let repaired =
+        lifecycle_record::render_dashboard_from_audit(&audit, Some(&plan_title), Some(&issue_url));
+    let repaired_path = write_temp_markdown("record-open-dashboard", &repaired)
+        .map_err(|err| CommandError::runtime("record-open-dashboard-write-failed", err))?;
+    adapter
+        .edit_issue_body(&repo, issue_number, &repaired_path)
+        .map_err(|err| CommandError::runtime("record-open-dashboard-edit-failed", err))?;
+
+    Ok(json!({
+        "operation": "record.open",
+        "execution_mode": binary.execution_mode(),
+        "dry_run": false,
+        "mode": "live",
+        "issue": {"number": issue_number, "url": issue_url},
+        "comments": {"source": source_url, "plan": plan_url, "state": state_url},
+        "dashboard_markdown": repaired,
+    }))
+}
+
+fn run_record_post(
+    binary: BinaryFlavor,
+    dry_run: bool,
+    force: bool,
+    repo_override: Option<&str>,
+    args: &RecordPostArgs,
+) -> Result<Value, CommandError> {
+    match args.kind {
+        crate::commands::record::LifecycleCommentKind::Source
+        | crate::commands::record::LifecycleCommentKind::Plan => {
+            return Err(CommandError::usage(
+                "record-post-kind-not-allowed",
+                format!(
+                    "`record post --kind {}` is rejected; source/plan are owned by `record open`",
+                    args.kind.as_str()
+                ),
+            ));
+        }
+        crate::commands::record::LifecycleCommentKind::Closeout => {
+            return Err(CommandError::usage(
+                "record-post-closeout-not-allowed",
+                "`record post --kind closeout` is rejected; use `plan-issue record close` which posts the closeout comment after the strict gate passes",
+            ));
+        }
+        _ => {}
+    }
+
+    let payload_data = match &args.payload_file {
+        Some(path) => read_payload_data(path)?,
+        None => Value::Null,
+    };
+    let summary = match &args.summary_file {
+        Some(path) => Some(read_text_file(path, "record-post-summary-read-failed")?),
+        None => None,
+    };
+    let body = lifecycle_record::render_record_post_comment(
+        args.profile,
+        args.kind,
+        payload_data,
+        summary.as_deref(),
+        None,
+    )
+    .map_err(|err| CommandError::runtime("record-post-render-failed", err))?;
+
+    // Fixture mode: just return the rendered body + simulated URL.
+    if let Some(fixture_dir) = &args.fixture {
+        let _ = fixture_dir;
+        return Ok(json!({
+            "operation": "record.post",
+            "execution_mode": binary.execution_mode(),
+            "dry_run": true,
+            "mode": "fixture",
+            "issue": args.issue,
+            "kind": args.kind.as_str(),
+            "comment_body": body,
+            "comment_url": null,
+        }));
+    }
+
+    if binary != BinaryFlavor::PlanIssue || dry_run {
+        return Ok(json!({
+            "operation": "record.post",
+            "execution_mode": binary.execution_mode(),
+            "dry_run": true,
+            "mode": "dry-run",
+            "issue": args.issue,
+            "kind": args.kind.as_str(),
+            "comment_body": body,
+        }));
+    }
+
+    let repo = resolve_repo_for_live(binary, repo_override)?;
+    let issue_number = parse_issue_reference(&args.issue)?;
+    let adapter = GhCliAdapter::new(force);
+    let comment_path = write_temp_markdown("record-post-comment", &body)
+        .map_err(|err| CommandError::runtime("record-post-comment-write-failed", err))?;
+    let url = adapter
+        .comment_issue(&repo, issue_number, &comment_path)
+        .map_err(|err| CommandError::runtime("record-post-comment-post-failed", err))?;
+
+    Ok(json!({
+        "operation": "record.post",
+        "execution_mode": binary.execution_mode(),
+        "dry_run": false,
+        "mode": "live",
+        "issue": args.issue,
+        "kind": args.kind.as_str(),
+        "comment_url": url,
+    }))
+}
+
+fn run_record_repair_dashboard(
+    binary: BinaryFlavor,
+    dry_run: bool,
+    force: bool,
+    repo_override: Option<&str>,
+    args: &RecordRepairDashboardArgs,
+) -> Result<Value, CommandError> {
+    let (body, comments_json, issue_number, repo, issue_url) = if let Some(fixture_dir) =
+        &args.fixture
+    {
+        let (body, comments) = read_fixture_evidence(fixture_dir)?;
+        (body, comments, None, None, None)
+    } else if let (Some(body_file), Some(comments_path)) = (&args.body_file, &args.comments_json) {
+        let body = read_text_file(body_file, "record-repair-body-read-failed")?;
+        let comments = read_text_file(comments_path, "record-repair-comments-read-failed")?;
+        (body, comments, None, None, None)
+    } else {
+        let issue_value = args.issue.as_deref().ok_or_else(|| {
+                CommandError::usage(
+                    "record-repair-missing-issue",
+                    "--issue is required for live record repair-dashboard (or pass --body-file + --comments-json / --fixture)",
+                )
+            })?;
+        ensure_live_binary_for_command(
+            binary,
+            "record repair-dashboard --issue <number>",
+            Some(
+                "plan-issue-local record repair-dashboard --body-file <path> --comments-json <path>",
+            ),
+        )?;
+        let issue_number = parse_issue_reference(issue_value)?;
+        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let adapter = GhCliAdapter::new(force);
+        let (body, comments) = adapter
+            .issue_evidence(&repo, issue_number)
+            .map_err(|err| CommandError::runtime("record-repair-evidence-read-failed", err))?;
+        let issue_url = format!("https://github.com/{repo}/issues/{issue_number}");
+        (
+            body,
+            comments,
+            Some(issue_number),
+            Some(repo),
+            Some(issue_url),
+        )
+    };
+
+    let audit = lifecycle_record::audit_record(Some(&body), &comments_json, None)
+        .map_err(|err| CommandError::runtime("record-repair-audit-failed", err))?;
+    let dashboard =
+        lifecycle_record::render_dashboard_from_audit(&audit, None, issue_url.as_deref());
+
+    if let Some(out) = &args.out {
+        render::write_rendered(out, &dashboard)
+            .map_err(|err| CommandError::runtime("record-repair-out-write-failed", err))?;
+        return Ok(json!({
+            "operation": "record.repair-dashboard",
+            "execution_mode": binary.execution_mode(),
+            "dry_run": true,
+            "mode": "local",
+            "out_path": path_text(out),
+            "dashboard_markdown": dashboard,
+        }));
+    }
+
+    if dry_run || issue_number.is_none() {
+        return Ok(json!({
+            "operation": "record.repair-dashboard",
+            "execution_mode": binary.execution_mode(),
+            "dry_run": true,
+            "mode": "dry-run",
+            "dashboard_markdown": dashboard,
+        }));
+    }
+
+    let issue_number = issue_number.expect("live mode has issue number");
+    let repo = repo.expect("live mode has repo");
+    let adapter = GhCliAdapter::new(force);
+    let dashboard_path = write_temp_markdown("record-repair-dashboard", &dashboard)
+        .map_err(|err| CommandError::runtime("record-repair-dashboard-write-failed", err))?;
+    adapter
+        .edit_issue_body(&repo, issue_number, &dashboard_path)
+        .map_err(|err| CommandError::runtime("record-repair-edit-failed", err))?;
+
+    Ok(json!({
+        "operation": "record.repair-dashboard",
+        "execution_mode": binary.execution_mode(),
+        "dry_run": false,
+        "mode": "live",
+        "issue": {"number": issue_number, "url": issue_url},
+        "dashboard_markdown": dashboard,
+    }))
+}
+
+fn run_record_close(
+    binary: BinaryFlavor,
+    dry_run: bool,
+    force: bool,
+    repo_override: Option<&str>,
+    args: &RecordCloseArgs,
+) -> Result<Value, CommandError> {
+    let approval_text = args
+        .approval
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CommandError::usage(
+                "record-close-missing-approval",
+                "--approval is required and must be a non-empty URL or text",
+            )
+        })?;
+
+    // Resolve evidence source.
+    let (body, comments_json, repo_for_provider, issue_number) = if let Some(fixture_dir) =
+        &args.fixture
+    {
+        let (body, comments) = read_fixture_evidence(fixture_dir)?;
+        let issue_number = parse_issue_reference(&args.issue)?;
+        (body, comments, None, issue_number)
+    } else if let (Some(body_file), Some(comments_path)) = (&args.body_file, &args.comments_json) {
+        let body = read_text_file(body_file, "record-close-body-read-failed")?;
+        let comments = read_text_file(comments_path, "record-close-comments-read-failed")?;
+        let issue_number = parse_issue_reference(&args.issue)?;
+        (body, comments, None, issue_number)
+    } else {
+        ensure_live_binary_for_command(
+            binary,
+            "record close --issue <number> --linked-pr <ref> --approval <evidence>",
+            Some(
+                "plan-issue-local record close --issue <n> --body-file <path> --comments-json <path> --approval <evidence>",
+            ),
+        )?;
+        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let issue_number = parse_issue_reference(&args.issue)?;
+        let adapter = GhCliAdapter::new(force);
+        let (body, comments) = adapter
+            .issue_evidence(&repo, issue_number)
+            .map_err(|err| CommandError::runtime("record-close-evidence-read-failed", err))?;
+        (body, comments, Some(repo), issue_number)
+    };
+
+    // Resolve linked PRs through provider/fixture for merge_sha + checks.
+    let mut linked_evidence: Vec<lifecycle_record::LinkedPrEvidence> = Vec::new();
+    for raw in &args.linked_pr {
+        let (pr_repo, pr_number) = parse_linked_pr_reference(raw)?;
+        if let Some(fixture_dir) = &args.fixture {
+            let pr_ev = read_fixture_pr_snapshot(fixture_dir, &pr_repo, pr_number)?;
+            linked_evidence.push(pr_ev);
+        } else if let Some(provider_repo) = &repo_for_provider {
+            let adapter = GhCliAdapter::new(force);
+            let summary = adapter
+                .pr_merge_summary(&pr_repo, pr_number)
+                .map_err(|err| CommandError::runtime("record-close-pr-summary-failed", err))?;
+            let checks = match summary.checks.as_deref() {
+                Some("success") => lifecycle_record::CheckStatus::Pass,
+                Some("failure" | "error") => lifecycle_record::CheckStatus::Fail,
+                _ => lifecycle_record::CheckStatus::None,
+            };
+            linked_evidence.push(lifecycle_record::LinkedPrEvidence {
+                pr_ref: format!("{pr_repo}#{pr_number}"),
+                url: Some(format!("https://github.com/{pr_repo}/pull/{pr_number}")),
+                merge_sha: if summary.merged {
+                    summary.merge_sha
+                } else {
+                    None
+                },
+                checks,
+            });
+            let _ = provider_repo;
+        } else {
+            // body-file/comments-json mode without fixture: cannot resolve PR
+            // state without the provider. Treat as missing merge_sha.
+            linked_evidence.push(lifecycle_record::LinkedPrEvidence {
+                pr_ref: format!("{pr_repo}#{pr_number}"),
+                url: None,
+                merge_sha: None,
+                checks: lifecycle_record::CheckStatus::None,
+            });
+        }
+    }
+
+    let audit = lifecycle_record::audit_record(Some(&body), &comments_json, Some(args.profile))
+        .map_err(|err| CommandError::runtime("record-close-audit-failed", err))?;
+
+    // Compute canonical final dashboard from audit.
+    let issue_url_hint = repo_for_provider
+        .as_ref()
+        .map(|repo| format!("https://github.com/{repo}/issues/{issue_number}"));
+    let canonical_dashboard =
+        lifecycle_record::render_dashboard_from_audit(&audit, None, issue_url_hint.as_deref());
+
+    let gate = lifecycle_record::evaluate_strict_closeout_gate(
+        &audit,
+        lifecycle_record::StrictCloseoutGateInput {
+            profile: args.profile,
+            approval: Some(approval_text),
+            linked_prs: &linked_evidence,
+            // record close repairs the dashboard as part of its own flow
+            // (after posting the closeout comment), so the body-vs-canonical
+            // diff is not a useful pre-flight signal here. The dashboard
+            // failure mode remains available to other callers (e.g. a future
+            // `record audit --strict` surface).
+            current_body: None,
+            expected_dashboard: None,
+        },
+    );
+
+    if !gate.ready {
+        return Err(CommandError::runtime(
+            "record-close-gate-failed",
+            format!(
+                "strict closeout gate blocked: {} ({})",
+                gate.blocked_codes.join(", "),
+                gate.checks
+                    .iter()
+                    .filter(|check| check.status == "fail")
+                    .map(|check| format!("{}: {}", check.check, check.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ));
+    }
+
+    // Render closeout comment using the same renderer as record post.
+    let closeout_payload = json!({
+        "final_status": "complete",
+        "approval": {"comment_url": approval_text},
+        "linked_prs": linked_evidence
+            .iter()
+            .map(|pr| {
+                json!({
+                    "ref": pr.pr_ref,
+                    "url": pr.url,
+                    "merge_sha": pr.merge_sha,
+                    "checks": match pr.checks {
+                        lifecycle_record::CheckStatus::Pass => "pass",
+                        lifecycle_record::CheckStatus::Fail => "fail",
+                        lifecycle_record::CheckStatus::None => "none",
+                    },
+                })
+            })
+            .collect::<Vec<_>>(),
+        "notes": null,
+    });
+    let closeout_body = lifecycle_record::render_record_post_comment(
+        args.profile,
+        crate::commands::record::LifecycleCommentKind::Closeout,
+        closeout_payload.clone(),
+        Some("Strict closeout gate passed; record closed by `plan-issue record close`."),
+        None,
+    )
+    .map_err(|err| CommandError::runtime("record-close-render-failed", err))?;
+
+    // Bundle preview for dry-run and fixture modes.
+    let preview = json!({
+        "closeout_comment_body": closeout_body,
+        "final_dashboard": canonical_dashboard,
+        "blocked_codes": gate.blocked_codes,
+        "checks": gate.checks,
+    });
+
+    if args.fixture.is_some() || dry_run || binary != BinaryFlavor::PlanIssue {
+        return Ok(json!({
+            "operation": "record.close",
+            "execution_mode": binary.execution_mode(),
+            "dry_run": true,
+            "mode": if args.fixture.is_some() { "fixture" } else { "dry-run" },
+            "issue": {"number": issue_number, "url": issue_url_hint},
+            "linked_prs": linked_evidence,
+            "preview": preview,
+        }));
+    }
+
+    let repo = repo_for_provider.expect("live mode has repo");
+    let adapter = GhCliAdapter::new(force);
+    let closeout_path = write_temp_markdown("record-close-comment", &closeout_body)
+        .map_err(|err| CommandError::runtime("record-close-comment-write-failed", err))?;
+    let closeout_url = adapter
+        .comment_issue(&repo, issue_number, &closeout_path)
+        .map_err(|err| CommandError::runtime("record-close-comment-post-failed", err))?;
+
+    // Re-audit so the final dashboard includes the closeout URL.
+    let (body_after, comments_after) = adapter
+        .issue_evidence(&repo, issue_number)
+        .map_err(|err| CommandError::runtime("record-close-evidence-reread-failed", err))?;
+    let audit_after =
+        lifecycle_record::audit_record(Some(&body_after), &comments_after, Some(args.profile))
+            .map_err(|err| CommandError::runtime("record-close-audit-reread-failed", err))?;
+    let final_dashboard = lifecycle_record::render_dashboard_from_audit(
+        &audit_after,
+        None,
+        Some(&format!("https://github.com/{repo}/issues/{issue_number}")),
+    );
+    let dashboard_path = write_temp_markdown("record-close-dashboard", &final_dashboard)
+        .map_err(|err| CommandError::runtime("record-close-dashboard-write-failed", err))?;
+    adapter
+        .edit_issue_body(&repo, issue_number, &dashboard_path)
+        .map_err(|err| CommandError::runtime("record-close-dashboard-edit-failed", err))?;
+    adapter
+        .close_issue(
+            &repo,
+            issue_number,
+            crate::commands::plan::CloseReason::Completed,
+            None,
+        )
+        .map_err(|err| CommandError::runtime("record-close-issue-close-failed", err))?;
+
+    Ok(json!({
+        "operation": "record.close",
+        "execution_mode": binary.execution_mode(),
+        "dry_run": false,
+        "mode": "live",
+        "issue": {
+            "number": issue_number,
+            "url": format!("https://github.com/{repo}/issues/{issue_number}"),
+        },
+        "closeout_url": closeout_url,
+        "linked_prs": linked_evidence,
+        "final_dashboard": final_dashboard,
+    }))
 }
 
 fn run_record_render_dashboard(args: &RenderDashboardArgs) -> Result<Value, CommandError> {
@@ -3090,8 +4068,25 @@ mod tests {
             unreachable!("edit_issue_body is not needed in this test")
         }
 
-        fn comment_issue(&self, _repo: &str, _issue: u64, _body_file: &Path) -> Result<(), String> {
+        fn comment_issue(
+            &self,
+            _repo: &str,
+            _issue: u64,
+            _body_file: &Path,
+        ) -> Result<String, String> {
             unreachable!("comment_issue is not needed in this test")
+        }
+
+        fn issue_evidence(&self, _repo: &str, _issue: u64) -> Result<(String, String), String> {
+            unreachable!("issue_evidence is not needed in this test")
+        }
+
+        fn pr_merge_summary(
+            &self,
+            _repo: &str,
+            _pr: u64,
+        ) -> Result<crate::github::PrMergeSummary, String> {
+            unreachable!("pr_merge_summary is not needed in this test")
         }
 
         fn edit_issue_labels(

@@ -1,0 +1,685 @@
+use std::fs;
+use std::path::Path;
+
+use pretty_assertions::assert_eq;
+use serde_json::{Value, json};
+use tempfile::TempDir;
+
+use nils_test_support::StubBinDir;
+use nils_test_support::cmd::CmdOptions;
+
+use crate::common;
+
+const PAYLOAD_SCHEMA_V2: &str = "plan-issue-record.payload.v2";
+const PAYLOAD_FENCE_INFO: &str = "plan-issue-record-payload";
+
+/// Build a `plan-issue-record:v2` comment body with the payload fence
+/// carrying `data` for the given role/profile.
+fn v2_comment_body(role: &str, profile: &str, data: Value) -> String {
+    let envelope = json!({
+        "schema": PAYLOAD_SCHEMA_V2,
+        "role": role,
+        "profile": profile,
+        "data": data,
+    });
+    let payload = serde_json::to_string(&envelope).expect("payload json");
+    format!(
+        "<!-- plan-issue-record:v2 role={role} profile={profile} -->\n\n```{PAYLOAD_FENCE_INFO}\n{payload}\n```\n",
+    )
+}
+
+fn parse_json(stdout: &str) -> Value {
+    serde_json::from_str(stdout).expect("stdout is valid JSON")
+}
+
+fn write_fixture_files(dir: &Path, body: &str, comments: &Value) {
+    fs::write(dir.join("issue-body.md"), body).expect("write fixture body");
+    fs::write(
+        dir.join("comments.json"),
+        serde_json::to_string(comments).expect("comments json"),
+    )
+    .expect("write fixture comments");
+}
+
+fn write_pr_fixture(dir: &Path, repo: &str, pr: u64, value: Value) {
+    let prs = dir.join("prs");
+    fs::create_dir_all(&prs).expect("create prs dir");
+    let slug = repo.replace('/', "__");
+    fs::write(
+        prs.join(format!("{slug}__{pr}.json")),
+        serde_json::to_string(&value).expect("pr json"),
+    )
+    .expect("write pr fixture");
+}
+
+#[test]
+fn record_post_state_with_payload_file_renders_v2_marker_in_dry_run() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "scope",
+            "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["operation"], "record.post");
+    assert_eq!(result["kind"], "state");
+    let body = result["comment_body"]
+        .as_str()
+        .expect("comment_body in dry-run");
+    assert!(
+        body.starts_with("<!-- plan-issue-record:v2 role=state profile=tracking -->"),
+        "{body}"
+    );
+    assert!(body.contains(&format!("```{PAYLOAD_FENCE_INFO}")), "{body}");
+    assert!(body.contains("\"target_scope\": \"scope\""), "{body}");
+}
+
+#[test]
+fn record_post_rejects_source_plan_and_closeout_kinds() {
+    for kind in ["source", "plan", "closeout"] {
+        let out = common::run_plan_issue_local(&[
+            "--format", "json", "record", "post", "--issue", "1", "--kind", kind,
+        ]);
+        assert_ne!(out.code, 0, "kind {kind} should be rejected");
+        assert!(
+            out.stderr.contains("record-post-") || out.stdout.contains("record-post-"),
+            "expected record-post error for kind {kind}: stdout={} stderr={}",
+            out.stdout,
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn record_repair_dashboard_renders_canonical_dashboard_from_body_and_comments() {
+    let tmp = TempDir::new().expect("tempdir");
+    let body_path = tmp.path().join("body.md");
+    let comments_path = tmp.path().join("comments.json");
+    fs::write(
+        &body_path,
+        "## Current Dashboard\n\n- Status: in-progress\n",
+    )
+    .expect("write body");
+
+    let comments = json!({
+        "comments": [
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-state-1",
+                "body": v2_comment_body(
+                    "state",
+                    "tracking",
+                    json!({
+                        "status": "in-progress",
+                        "target_scope": "sample plan",
+                        "current": "Sprint 2 in progress",
+                        "next_action": "land Sprint 2",
+                        "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+                        "prs": [{"ref": "owner/repo#1", "url": "https://github.com/owner/repo/pull/1", "status": "merged"}],
+                        "blockers": [],
+                        "links": {}
+                    }),
+                ),
+                "created_at": "2026-05-23T10:00:00Z"
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-source",
+                "body": v2_comment_body(
+                    "source",
+                    "tracking",
+                    json!({"path": "docs/plans/sample/sample-discussion-source.md", "commit": "abc"}),
+                ),
+                "created_at": "2026-05-23T09:00:00Z"
+            }
+        ]
+    });
+    fs::write(
+        &comments_path,
+        serde_json::to_string(&comments).expect("json"),
+    )
+    .expect("write comments");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "repair-dashboard",
+        "--body-file",
+        body_path.to_str().expect("body path"),
+        "--comments-json",
+        comments_path.to_str().expect("comments path"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let dashboard = parsed["payload"]["result"]["dashboard_markdown"]
+        .as_str()
+        .expect("dashboard markdown");
+    assert!(dashboard.starts_with("## Current Dashboard"), "{dashboard}");
+    assert!(dashboard.contains("- Status: in-progress"), "{dashboard}");
+    // Source URL from latest audit evidence should appear in Durable Record.
+    assert!(
+        dashboard.contains("https://github.com/owner/repo/issues/9#issuecomment-source"),
+        "{dashboard}"
+    );
+}
+
+#[test]
+fn record_close_requires_non_empty_approval() {
+    let out =
+        common::run_plan_issue_local(&["--format", "json", "record", "close", "--issue", "9"]);
+    assert_ne!(out.code, 0, "missing --approval should fail");
+    assert!(
+        out.stderr.contains("record-close-missing-approval")
+            || out.stdout.contains("record-close-missing-approval"),
+        "stderr: {} stdout: {}",
+        out.stderr,
+        out.stdout
+    );
+}
+
+fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
+    json!({
+        "comments": [
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-source",
+                "body": v2_comment_body(
+                    "source",
+                    "tracking",
+                    json!({"path": "docs/plans/sample/sample-discussion-source.md", "commit": "src1234"}),
+                ),
+                "created_at": "2026-05-23T09:00:00Z"
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-plan",
+                "body": v2_comment_body(
+                    "plan",
+                    "tracking",
+                    json!({"path": "docs/plans/sample/sample-plan.md", "commit": "pln1234"}),
+                ),
+                "created_at": "2026-05-23T09:01:00Z"
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-state",
+                "body": v2_comment_body(
+                    "state",
+                    "tracking",
+                    json!({
+                        "status": "complete",
+                        "target_scope": "sample plan",
+                        "current": "complete",
+                        "next_action": "closeout",
+                        "tasks": [
+                            {"id": "1.1", "status": "done", "title": "x"},
+                            {"id": "1.2", "status": "deferred", "title": "y"},
+                        ],
+                        "prs": [{"ref": linked_pr_ref, "url": "https://github.com/owner/repo/pull/1", "status": "merged"}],
+                        "blockers": [],
+                        "links": {}
+                    }),
+                ),
+                "created_at": "2026-05-23T10:00:00Z"
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-validation",
+                "body": v2_comment_body(
+                    "validation",
+                    "tracking",
+                    json!({
+                        "overall": "pass",
+                        "commands": [{"command": "cargo test", "status": "pass"}],
+                        "waivers": []
+                    }),
+                ),
+                "created_at": "2026-05-23T11:00:00Z"
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-review",
+                "body": v2_comment_body(
+                    "review",
+                    "tracking",
+                    json!({
+                        "decision": "approve",
+                        "lenses": ["testing", "maintainability"],
+                        "findings": [],
+                    }),
+                ),
+                "created_at": "2026-05-23T12:00:00Z"
+            }
+        ]
+    })
+}
+
+#[test]
+fn record_close_fixture_passes_strict_gate_with_complete_v2_evidence() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    let body = "## Current Dashboard\n\n- Status: in-progress\n";
+    write_fixture_files(&fixture, body, &build_closeout_evidence("owner/repo#1"));
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "deadbeefcafebabe"},
+            "statusCheckRollup": {"state": "success"},
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "https://github.com/owner/repo/issues/9#issuecomment-approval",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["operation"], "record.close");
+    assert_eq!(result["mode"], "fixture");
+    assert_eq!(result["dry_run"], true);
+    let preview = &result["preview"];
+    let body = preview["closeout_comment_body"]
+        .as_str()
+        .expect("closeout body");
+    assert!(
+        body.starts_with("<!-- plan-issue-record:v2 role=closeout profile=tracking -->"),
+        "{body}"
+    );
+    assert!(body.contains("\"final_status\": \"complete\""), "{body}");
+    assert!(
+        body.contains("\"merge_sha\": \"deadbeefcafebabe\""),
+        "{body}"
+    );
+    let final_dashboard = preview["final_dashboard"]
+        .as_str()
+        .expect("final dashboard");
+    assert!(
+        final_dashboard.starts_with("## Final Dashboard"),
+        "{final_dashboard}"
+    );
+}
+
+#[test]
+fn record_close_fixture_blocks_when_linked_pr_not_merged() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    let body = "## Current Dashboard\n";
+    write_fixture_files(&fixture, body, &build_closeout_evidence("owner/repo#1"));
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "OPEN",
+            "mergeCommit": null,
+            "statusCheckRollup": {"state": "pending"},
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "ok",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+
+    assert_ne!(out.code, 0, "unmerged PR should block strict gate");
+    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    assert!(
+        joined.contains("linked-pr-not-merged"),
+        "expected linked-pr-not-merged code, got: {joined}"
+    );
+}
+
+#[test]
+fn record_close_fixture_blocks_when_review_request_changes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    // Replace the review entry in the evidence stack with a
+    // request-changes decision.
+    let mut comments = build_closeout_evidence("owner/repo#1");
+    let comments_list = comments["comments"].as_array_mut().expect("comments array");
+    let last_index = comments_list.len() - 1;
+    comments_list[last_index] = json!({
+        "url": "https://github.com/owner/repo/issues/9#issuecomment-review-rej",
+        "body": v2_comment_body(
+            "review",
+            "tracking",
+            json!({"decision": "request-changes", "findings": []}),
+        ),
+        "created_at": "2026-05-23T12:00:00Z"
+    });
+    write_fixture_files(&fixture, "## Current Dashboard\n", &comments);
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "abc"},
+            "statusCheckRollup": {"state": "success"},
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "ok",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+    assert_ne!(out.code, 0);
+    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    assert!(
+        joined.contains("review-rejected"),
+        "expected review-rejected: {joined}"
+    );
+}
+
+#[test]
+fn record_close_fixture_blocks_when_state_not_complete() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    let mut comments = build_closeout_evidence("owner/repo#1");
+    let comments_list = comments["comments"].as_array_mut().expect("comments array");
+    // Replace the state entry (index 2) with status=in-progress.
+    comments_list[2] = json!({
+        "url": "https://github.com/owner/repo/issues/9#issuecomment-state",
+        "body": v2_comment_body(
+            "state",
+            "tracking",
+            json!({
+                "status": "in-progress",
+                "target_scope": "x",
+                "tasks": [],
+                "prs": [],
+                "blockers": [],
+                "links": {}
+            }),
+        ),
+        "created_at": "2026-05-23T10:00:00Z"
+    });
+    write_fixture_files(&fixture, "## Current Dashboard\n", &comments);
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "abc"},
+            "statusCheckRollup": {"state": "success"},
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "ok",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+    assert_ne!(out.code, 0);
+    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    assert!(
+        joined.contains("state-not-complete"),
+        "expected state-not-complete: {joined}"
+    );
+}
+
+#[test]
+fn record_open_fixture_mode_returns_v2_evidence_urls() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    let body = "## Current Dashboard\n";
+    let comments = json!({
+        "comments": [
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-source",
+                "body": v2_comment_body(
+                    "source",
+                    "tracking",
+                    json!({"path": "docs/plans/sample/sample-discussion-source.md", "commit": "src1"}),
+                ),
+                "created_at": "2026-05-23T09:00:00Z"
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-plan",
+                "body": v2_comment_body(
+                    "plan",
+                    "tracking",
+                    json!({"path": "docs/plans/sample/sample-plan.md", "commit": "pln1"}),
+                ),
+                "created_at": "2026-05-23T09:01:00Z"
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-state",
+                "body": v2_comment_body(
+                    "state",
+                    "tracking",
+                    json!({"status": "in-progress", "tasks": [], "prs": [], "blockers": [], "links": {}}),
+                ),
+                "created_at": "2026-05-23T09:02:00Z"
+            }
+        ]
+    });
+    write_fixture_files(&fixture, body, &comments);
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "open",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+        "--title",
+        "Sample Plan",
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["operation"], "record.open");
+    assert_eq!(result["mode"], "fixture");
+    let comments_result = &result["comments"];
+    assert_eq!(
+        comments_result["source"],
+        "https://github.com/owner/repo/issues/9#issuecomment-source"
+    );
+    assert_eq!(
+        comments_result["plan"],
+        "https://github.com/owner/repo/issues/9#issuecomment-plan"
+    );
+    assert_eq!(
+        comments_result["state"],
+        "https://github.com/owner/repo/issues/9#issuecomment-state"
+    );
+}
+
+#[test]
+fn record_post_state_fixture_returns_rendered_body_without_provider_call() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+    write_fixture_files(&fixture, "## Current Dashboard\n", &json!({"comments": []}));
+    let payload = tmp.path().join("payload.json");
+    fs::write(
+        &payload,
+        json!({"status": "in-progress", "tasks": [], "prs": [], "blockers": [], "links": {}})
+            .to_string(),
+    )
+    .expect("write payload");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "9",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["mode"], "fixture");
+    assert_eq!(result["kind"], "state");
+    let body = result["comment_body"]
+        .as_str()
+        .expect("comment body in fixture mode");
+    assert!(
+        body.contains("<!-- plan-issue-record:v2 role=state profile=tracking -->"),
+        "{body}"
+    );
+}
+
+fn record_open_dry_run_gh_stub() -> &'static str {
+    r#"#!/usr/bin/env bash
+echo "record_open_dry_run_gh_stub should not be called" >&2
+exit 1
+"#
+}
+
+fn dry_run_cmd_options(stub_dir: &Path) -> CmdOptions {
+    common::plan_issue_cmd_options()
+        .with_env_remove_prefix("PLAN_ISSUE_GH_")
+        .with_path_prepend(stub_dir)
+}
+
+#[test]
+fn record_open_dry_run_returns_preview_without_gh_calls() {
+    use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
+
+    let stub = StubBinDir::new();
+    stub.write_exe("gh", record_open_dry_run_gh_stub());
+
+    let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
+    let bundle = repo.path().join("docs/plans/sample");
+    fs::create_dir_all(&bundle).expect("create bundle dir");
+    let source = bundle.join("sample-discussion-source.md");
+    let plan = bundle.join("sample-plan.md");
+    fs::write(&source, "# Source\n\n- Decision: implement v2 lifecycle.\n").expect("write source");
+    fs::write(
+        &plan,
+        "# Plan: Sample Plan\n\n## Overview\n\n- Sample plan body.\n\n## Read First\n\n- Primary source: docs/plans/sample/sample-discussion-source.md\n- Source type: discussion-to-implementation-doc\n- Open questions carried into execution: none\n\n## Scope\n\n- In scope:\n  - Demo plan.\n- Out of scope:\n  - none.\n\n## Assumptions\n\n1. Demo only.\n\n## Sprint 1: Demo\n\n**Goal**: Demo the surface.\n\n**PR grouping intent**: group\n**Execution Profile**: serial\n\n### Task 1.1: Demo task\n\n- **Location**:\n  - `docs/plans/sample/sample-plan.md`\n- **Description**: Demo task description.\n- **Dependencies**:\n  - none\n- **Complexity**: 1\n- **Acceptance criteria**:\n  - The demo task is complete.\n- **Validation**:\n  - `true`\n",
+    )
+    .expect("write plan");
+    git(repo.path(), &["add", "."]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "seed bundle",
+            "--no-gpg-sign",
+        ],
+    );
+
+    let opts = dry_run_cmd_options(stub.path()).with_cwd(repo.path());
+    let bundle_arg = bundle.to_string_lossy().to_string();
+    let out = nils_test_support::cmd::run_resolved(
+        "plan-issue-local",
+        &[
+            "--format",
+            "json",
+            "record",
+            "open",
+            "--bundle",
+            &bundle_arg,
+        ],
+        &opts,
+    );
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed: Value = serde_json::from_str(&out.stdout_text()).expect("json");
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["operation"], "record.open");
+    assert_eq!(result["mode"], "dry-run");
+    assert_eq!(result["dry_run"], true);
+    let preview = &result["preview"];
+    assert_eq!(preview["plan_title"], "Plan: Sample Plan");
+    let source_comment = preview["comments"]["source"]
+        .as_str()
+        .expect("source comment");
+    assert!(
+        source_comment.starts_with("<!-- plan-issue-record:v2 role=source profile=tracking -->"),
+        "{source_comment}"
+    );
+}
