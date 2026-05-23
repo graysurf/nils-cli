@@ -11,6 +11,12 @@ use crate::commands::plan::CloseReason;
 pub trait GitHubAdapter {
     fn issue_body(&self, repo: &str, issue: u64) -> Result<String, String>;
 
+    /// Fetch the issue body plus comments JSON, suitable for `audit_record`
+    /// fixture parsing. Returns `(body, comments_json)` where
+    /// `comments_json` is the raw JSON string from
+    /// `gh issue view --json comments`.
+    fn issue_evidence(&self, repo: &str, issue: u64) -> Result<(String, String), String>;
+
     fn create_issue(
         &self,
         repo: &str,
@@ -21,7 +27,9 @@ pub trait GitHubAdapter {
 
     fn edit_issue_body(&self, repo: &str, issue: u64, body_file: &Path) -> Result<(), String>;
 
-    fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<(), String>;
+    /// Post an issue comment. Returns the URL of the created comment as
+    /// printed by `gh issue comment` on stdout.
+    fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<String, String>;
 
     fn edit_issue_labels(
         &self,
@@ -41,10 +49,26 @@ pub trait GitHubAdapter {
 
     fn pr_is_merged(&self, repo: &str, pr: u64) -> Result<bool, String>;
 
+    /// Provider-verified PR summary used by `record close` strict gating.
+    /// Returns merge state, optional merge commit SHA, and rolled-up check
+    /// status when available.
+    fn pr_merge_summary(&self, repo: &str, pr: u64) -> Result<PrMergeSummary, String>;
+
     /// List the PR's issue-style comments via `gh api`. Returns an array of
     /// objects with at least `body` and `html_url` keys (passed through
     /// from the GitHub REST response). Used by `resolve-approval`.
     fn pr_comments(&self, repo: &str, pr: u64) -> Result<Vec<Value>, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrMergeSummary {
+    /// Raw `state` field from the GitHub PR view (`MERGED`, `OPEN`, `CLOSED`).
+    pub state: String,
+    pub merged: bool,
+    pub merge_sha: Option<String>,
+    /// Rolled-up status check state when known
+    /// (`success`, `failure`, `pending`, `error`, ...).
+    pub checks: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -124,6 +148,33 @@ impl GitHubAdapter for GhCliAdapter {
         Ok(body.to_string())
     }
 
+    fn issue_evidence(&self, repo: &str, issue: u64) -> Result<(String, String), String> {
+        let args = vec![
+            "issue".to_string(),
+            "view".to_string(),
+            issue.to_string(),
+            "--repo".to_string(),
+            repo.to_string(),
+            "--json".to_string(),
+            "body,comments".to_string(),
+        ];
+        let stdout = Self::run(&args)?;
+        let json = Self::parse_json(&stdout, "issue view (body+comments)")?;
+        let body = json
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let comments = json
+            .get("comments")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new()));
+        let envelope = serde_json::json!({ "comments": comments });
+        let comments_json = serde_json::to_string(&envelope)
+            .map_err(|err| format!("failed to serialize issue evidence comments: {err}"))?;
+        Ok((body, comments_json))
+    }
+
     fn create_issue(
         &self,
         repo: &str,
@@ -174,7 +225,7 @@ impl GitHubAdapter for GhCliAdapter {
         Self::run(&args).map(|_| ())
     }
 
-    fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<(), String> {
+    fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<String, String> {
         self.guard_markdown_file(body_file, "github issue comment write rejected")?;
 
         let args = vec![
@@ -186,7 +237,13 @@ impl GitHubAdapter for GhCliAdapter {
             "--body-file".to_string(),
             body_file.to_string_lossy().to_string(),
         ];
-        Self::run(&args).map(|_| ())
+        let stdout = Self::run(&args)?;
+        extract_issue_comment_url(&stdout).ok_or_else(|| {
+            format!(
+                "gh issue comment did not print a recognisable comment URL; got: {:?}",
+                stdout.trim()
+            )
+        })
     }
 
     fn edit_issue_labels(
@@ -288,6 +345,43 @@ impl GitHubAdapter for GhCliAdapter {
         Ok(merged_at_present || merged_state)
     }
 
+    fn pr_merge_summary(&self, repo: &str, pr: u64) -> Result<PrMergeSummary, String> {
+        let args = vec![
+            "pr".to_string(),
+            "view".to_string(),
+            pr.to_string(),
+            "--repo".to_string(),
+            repo.to_string(),
+            "--json".to_string(),
+            "state,mergeCommit,statusCheckRollup".to_string(),
+        ];
+        let stdout = Self::run(&args)?;
+        let json = Self::parse_json(&stdout, "pr view (merge summary)")?;
+
+        let state = json
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let merged = state.eq_ignore_ascii_case("merged");
+        let merge_sha = json
+            .get("mergeCommit")
+            .and_then(|value| value.get("oid"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|sha| !sha.is_empty());
+        let checks = json
+            .get("statusCheckRollup")
+            .and_then(rollup_status)
+            .filter(|status| !status.is_empty());
+        Ok(PrMergeSummary {
+            state,
+            merged,
+            merge_sha,
+            checks,
+        })
+    }
+
     fn pr_comments(&self, repo: &str, pr: u64) -> Result<Vec<Value>, String> {
         // Use `--paginate` so PRs with > 100 comments still return the full
         // list. Endpoint mirrors REST `/repos/{owner}/{repo}/issues/{n}/comments`
@@ -337,6 +431,89 @@ impl GitHubAdapter for GhCliAdapter {
             }
         }
         Ok(combined)
+    }
+}
+
+/// Pick the first line in `stdout` that looks like a GitHub issue/PR
+/// comment URL (`https://github.com/<owner>/<repo>/(issues|pull)/<n>#issuecomment-<m>`).
+/// Returns the trimmed URL or `None` if no line matches.
+///
+/// Used by `GhCliAdapter::comment_issue` so banner / warning lines from `gh`
+/// do not corrupt the returned URL. Address PR-454 specialist review finding
+/// (security/0.80) — `stdout.lines().last()` returned an empty string when
+/// `gh` emitted a trailing newline.
+fn extract_issue_comment_url(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if is_issue_comment_url(trimmed) {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn is_issue_comment_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let Some((base, suffix)) = rest.split_once("#issuecomment-") else {
+        return false;
+    };
+    if !suffix.chars().all(|ch| ch.is_ascii_digit()) || suffix.is_empty() {
+        return false;
+    }
+    let mut parts = base.splitn(4, '/');
+    let owner = parts.next().unwrap_or("");
+    let repo = parts.next().unwrap_or("");
+    let kind = parts.next().unwrap_or("");
+    let number = parts.next().unwrap_or("");
+    !owner.is_empty()
+        && !repo.is_empty()
+        && (kind == "issues" || kind == "pull")
+        && number.chars().all(|ch| ch.is_ascii_digit())
+        && !number.is_empty()
+}
+
+fn rollup_status(rollup: &Value) -> Option<String> {
+    let extract_state = |item: &Value| -> Option<String> {
+        item.get("state")
+            .and_then(Value::as_str)
+            .map(|status| status.to_ascii_lowercase())
+            .or_else(|| {
+                item.get("conclusion")
+                    .and_then(Value::as_str)
+                    .map(|status| status.to_ascii_lowercase())
+            })
+    };
+
+    match rollup {
+        Value::Array(items) if items.is_empty() => Some("none".to_string()),
+        Value::Array(items) => {
+            let mut has_failure = false;
+            let mut has_pending = false;
+            let mut has_success = false;
+            for item in items {
+                match extract_state(item).as_deref() {
+                    Some("success" | "neutral" | "skipped") => has_success = true,
+                    Some("failure" | "cancelled" | "timed_out" | "action_required" | "error") => {
+                        has_failure = true
+                    }
+                    Some("pending" | "in_progress" | "queued" | "expected") => has_pending = true,
+                    _ => {}
+                }
+            }
+            if has_failure {
+                Some("failure".to_string())
+            } else if has_pending {
+                Some("pending".to_string())
+            } else if has_success {
+                Some("success".to_string())
+            } else {
+                Some("unknown".to_string())
+            }
+        }
+        Value::Object(_) => extract_state(rollup),
+        _ => None,
     }
 }
 
@@ -415,7 +592,10 @@ fn issue_number_from_url(url: &str) -> Option<u64> {
 mod tests {
     use std::fs;
 
-    use super::{issue_number_from_url, normalize_repo_slug};
+    use super::{
+        extract_issue_comment_url, is_issue_comment_url, issue_number_from_url,
+        normalize_repo_slug, rollup_status,
+    };
     use crate::commands::plan::CloseReason;
     use crate::github::{GhCliAdapter, GitHubAdapter, resolve_repo};
     use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
@@ -455,6 +635,11 @@ case "$cmd $sub" in
   "issue edit")
     ;;
   "issue comment")
+    if [[ -n "${GH_STUB_ISSUE_COMMENT_URL:-}" ]]; then
+      printf '%s\n' "$GH_STUB_ISSUE_COMMENT_URL"
+    else
+      printf '%s\n' 'https://github.com/sympoies/nils-cli/issues/217#issuecomment-1'
+    fi
     ;;
   "issue close")
     ;;
@@ -693,5 +878,124 @@ esac
             err_unparseable.contains("unable to derive owner/repo"),
             "{err_unparseable}"
         );
+    }
+
+    // Sprint 3 PR-454 specialist review follow-ups (testing + security).
+
+    #[test]
+    fn extract_issue_comment_url_picks_recognisable_line_and_rejects_noise() {
+        let url = "https://github.com/sympoies/nils-cli/issues/448#issuecomment-12345";
+        assert_eq!(extract_issue_comment_url(url).as_deref(), Some(url));
+        let with_banner = format!("warning: deprecated\n{url}\n");
+        assert_eq!(
+            extract_issue_comment_url(&with_banner).as_deref(),
+            Some(url)
+        );
+        let pr_url = "https://github.com/sympoies/nils-cli/pull/454#issuecomment-99";
+        assert_eq!(extract_issue_comment_url(pr_url).as_deref(), Some(pr_url));
+
+        assert_eq!(extract_issue_comment_url(""), None);
+        assert_eq!(extract_issue_comment_url("\n\n"), None);
+        assert_eq!(
+            extract_issue_comment_url("https://example.com/owner/repo/issues/1#issuecomment-1"),
+            None
+        );
+        assert_eq!(
+            extract_issue_comment_url("https://github.com/owner/repo/issues/1#comment-1"),
+            None
+        );
+        assert!(!is_issue_comment_url("not a url"));
+    }
+
+    #[test]
+    fn rollup_status_normalizes_array_and_object_shapes() {
+        use serde_json::json;
+        assert_eq!(rollup_status(&json!([])), Some("none".to_string()));
+        assert_eq!(
+            rollup_status(&json!([{"state": "SUCCESS"}, {"state": "success"}])),
+            Some("success".to_string())
+        );
+        assert_eq!(
+            rollup_status(&json!([{"state": "success"}, {"state": "failure"}])),
+            Some("failure".to_string())
+        );
+        assert_eq!(
+            rollup_status(&json!([{"state": "success"}, {"state": "pending"}])),
+            Some("pending".to_string())
+        );
+        assert_eq!(
+            rollup_status(&json!({"state": "success"})),
+            Some("success".to_string())
+        );
+        assert_eq!(
+            rollup_status(&json!({"conclusion": "failure"})),
+            Some("failure".to_string())
+        );
+        assert_eq!(rollup_status(&json!(null)), None);
+    }
+
+    fn gh_pr_merge_summary_stub_script() -> &'static str {
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+cmd="${1:-}"; sub="${2:-}"
+case "$cmd $sub" in
+  "pr view")
+    if [[ -n "${GH_STUB_PR_VIEW_FULL_JSON:-}" ]]; then
+      printf '%s\n' "$GH_STUB_PR_VIEW_FULL_JSON"
+    else
+      printf '%s\n' '{"state":"MERGED","mergeCommit":{"oid":"abcd"},"statusCheckRollup":{"state":"success"}}'
+    fi
+    ;;
+  *)
+    echo "unsupported gh call: $*" >&2
+    exit 1
+    ;;
+esac
+"#
+    }
+
+    #[test]
+    fn gh_adapter_pr_merge_summary_parses_state_merge_sha_and_checks() {
+        let lock = GlobalStateLock::new();
+        let stubs = StubBinDir::new();
+        stubs.write_exe("gh", gh_pr_merge_summary_stub_script());
+        let _path = prepend_path(&lock, stubs.path());
+
+        let adapter = GhCliAdapter::new(false);
+        let summary = adapter
+            .pr_merge_summary("sympoies/nils-cli", 454)
+            .expect("merge summary");
+        assert_eq!(summary.state, "MERGED");
+        assert!(summary.merged);
+        assert_eq!(summary.merge_sha.as_deref(), Some("abcd"));
+        assert_eq!(summary.checks.as_deref(), Some("success"));
+
+        let _open = EnvGuard::set(
+            &lock,
+            "GH_STUB_PR_VIEW_FULL_JSON",
+            r#"{"state":"OPEN","mergeCommit":null,"statusCheckRollup":{"state":"pending"}}"#,
+        );
+        let summary_open = adapter
+            .pr_merge_summary("sympoies/nils-cli", 454)
+            .expect("open pr summary");
+        assert!(!summary_open.merged);
+        assert!(summary_open.merge_sha.is_none());
+        assert_eq!(summary_open.checks.as_deref(), Some("pending"));
+        drop(_open);
+
+        let _empty = EnvGuard::set(
+            &lock,
+            "GH_STUB_PR_VIEW_FULL_JSON",
+            r#"{"state":"MERGED","mergeCommit":{"oid":""},"statusCheckRollup":[]}"#,
+        );
+        let summary_empty = adapter
+            .pr_merge_summary("sympoies/nils-cli", 454)
+            .expect("empty rollup summary");
+        assert!(summary_empty.merged);
+        assert!(
+            summary_empty.merge_sha.is_none(),
+            "empty oid should be filtered out"
+        );
+        assert_eq!(summary_empty.checks.as_deref(), Some("none"));
     }
 }

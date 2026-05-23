@@ -224,7 +224,12 @@ impl Command {
             // (Task 1.3); dispatch records gain `worktree_abs_path`
             // (Task 1.4).
             Self::StartSprint(_) => "v2",
-            Self::Record(_) => "v1",
+            // v2 lifecycle record subcommand surface (Sprint 3): live
+            // open/post/repair-dashboard/close, structured payloads, and
+            // strict closeout gate. The result envelope grew live operation
+            // fields (`issue.url`, `comments.*`, `closeout_url`,
+            // `final_dashboard`).
+            Self::Record(_) => "v2",
             _ => "v1",
         };
         format!(
