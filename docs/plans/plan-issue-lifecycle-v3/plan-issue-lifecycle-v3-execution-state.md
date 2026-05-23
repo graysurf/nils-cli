@@ -115,6 +115,6 @@ Tracked here so the next major-release cycle can act on them:
 - This plan intentionally does not preserve backwards compatibility.
 - This plan does not mutate agent-runtime-kit source files.
 - The agent-runtime-kit consumer migration is documented in
-  [`crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md`](../../crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md)
+  [`crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md`](../../../crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md)
   ("Consumer Migration" section). It happens after the next
   plan-issue-cli release cuts.
