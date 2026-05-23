@@ -62,6 +62,15 @@ For optional runtime tools used by individual CLIs, see `BINARY_DEPENDENCIES.md`
   - `cargo run -p nils-cli-template -- --help`
   - `cargo run -p nils-git-scope -- --help`
 
+### 2.1 Codex skill-surface shape checks
+
+`agent-runtime doctor --class skill-surface --product codex` validates
+install-map shape only. A passing shape check is not Codex Desktop acceptance;
+live acceptance still requires `codex debug prompt-input` in a fresh Codex
+Desktop session with `$HOME/.agents` absent and legacy skill environment
+variables unset. Rationale:
+`docs/plans/codex-skill-surface-primitives/codex-skill-surface-primitives-discussion-source.md`.
+
 ## 3. Canonical local test flows
 
 Primary local entrypoint for day-to-day implementation work:

@@ -131,13 +131,19 @@ pub fn run(args: InstallArgs) -> anyhow::Result<u8> {
 }
 
 fn print_change(c: &AppliedChange) {
+    eprintln!("{}", format_change(c));
+}
+
+fn format_change(c: &AppliedChange) -> String {
     match c {
         AppliedChange::SymlinkCreated {
             entry_id,
             dest,
             source,
-        } => eprintln!(
-            "  + symlink {} -> {} ({})",
+            link_mode,
+        } => format!(
+            "  + {} {} -> {} ({})",
+            link_mode.label(),
             dest.display(),
             source.display(),
             entry_id
@@ -146,8 +152,10 @@ fn print_change(c: &AppliedChange) {
             entry_id,
             dest,
             source,
-        } => eprintln!(
-            "  ~ symlink {} -> {} (replaced; {})",
+            link_mode,
+        } => format!(
+            "  ~ {} {} -> {} (replaced; {})",
+            link_mode.label(),
             dest.display(),
             source.display(),
             entry_id
@@ -156,24 +164,64 @@ fn print_change(c: &AppliedChange) {
             entry_id,
             dest,
             source,
+            link_mode,
             backup,
-        } => eprintln!(
-            "  ! backup {} -> {}, then symlink to {} ({})",
+        } => format!(
+            "  ! backup {} -> {}, then {} to {} ({})",
             dest.display(),
             backup.display(),
+            link_mode.label(),
             source.display(),
             entry_id
         ),
         AppliedChange::ManagedBlockApplied {
             entry_id,
             config_file,
-        } => eprintln!(
+        } => format!(
             "  ~ managed-block applied to {} ({})",
             config_file.display(),
             entry_id
         ),
         AppliedChange::NoOp { entry_id, dest } => {
-            eprintln!("  = no-op {} ({})", dest.display(), entry_id)
+            format!("  = no-op {} ({})", dest.display(), entry_id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::install::plan::SymlinkLinkMode;
+    use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
+
+    #[test]
+    fn format_change_names_directory_symlink_mode() {
+        let line = format_change(&AppliedChange::SymlinkCreated {
+            entry_id: "reporting.daily-brief".to_string(),
+            dest: PathBuf::from("/tmp/home/skills/reporting/daily-brief"),
+            source: PathBuf::from("/tmp/source/daily-brief"),
+            link_mode: SymlinkLinkMode::Directory,
+        });
+
+        assert_eq!(
+            line,
+            "  + directory symlink /tmp/home/skills/reporting/daily-brief -> /tmp/source/daily-brief (reporting.daily-brief)"
+        );
+    }
+
+    #[test]
+    fn format_change_names_recursive_file_symlink_mode() {
+        let line = format_change(&AppliedChange::SymlinkReplaced {
+            entry_id: "reporting.skills-tree".to_string(),
+            dest: PathBuf::from("/tmp/home/plugins/reporting/skills/foo/SKILL.md"),
+            source: PathBuf::from("/tmp/source/build/skills/foo/SKILL.md"),
+            link_mode: SymlinkLinkMode::RecursiveFile,
+        });
+
+        assert_eq!(
+            line,
+            "  ~ recursive file symlink /tmp/home/plugins/reporting/skills/foo/SKILL.md -> /tmp/source/build/skills/foo/SKILL.md (replaced; reporting.skills-tree)"
+        );
     }
 }

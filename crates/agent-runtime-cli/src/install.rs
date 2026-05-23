@@ -9,7 +9,9 @@
 //!   the per-entry-replace merge function. Applied before plan generation.
 //! - [`plan`] — builder that turns a (post-overlay-merge) `LinkMap` into a
 //!   flat ordered `InstallPlan`, expanding `recursive: true` directory
-//!   entries into one action per file.
+//!   entries into one action per file. Non-recursive `symlinked-file`
+//!   entries intentionally accept either file or directory sources and
+//!   become one symlink action at the declared destination.
 //! - [`executor`] — walks the plan and reconciles the runtime home to
 //!   the plan. Re-running on a clean install is a byte-identical no-op.
 //!

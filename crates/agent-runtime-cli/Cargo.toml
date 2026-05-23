@@ -29,3 +29,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 nils-test-support = { version = "0.17.4", path = "../nils-test-support" }
+pretty_assertions = { workspace = true }

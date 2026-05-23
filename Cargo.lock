@@ -16,6 +16,7 @@ dependencies = [
  "clap",
  "indexmap",
  "nils-test-support",
+ "pretty_assertions",
  "serde",
  "serde_json",
  "serde_yaml_ng",
