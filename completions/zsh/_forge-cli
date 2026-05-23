@@ -352,6 +352,23 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':id -- Numeric id:_default' \
 && ret=0
 ;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'--state=[Filter by state (default\: open)]:STATE:(open closed all)' \
+'*--label=[Filter by label. Repeatable. GitHub joins labels into a comma list (issue must have all labels); GitLab passes a repeated --label]:NAME:_default' \
+'--author=[Filter by author handle]:AUTHOR:_default' \
+'--assignee=[Filter by assignee handle]:ASSIGNEE:_default' \
+'--limit=[Cap the number of returned issues (default\: 30)]:LIMIT:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (edit)
 _arguments "${_arguments_options[@]}" : \
 '--title=[New title (re-validated against \`title_length\`)]:TITLE:_default' \
@@ -429,6 +446,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -795,6 +816,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (edit)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1013,6 +1038,7 @@ _forge-cli__subcmd__help__subcmd__issue_commands() {
     local commands; commands=(
 'create:Open a new issue' \
 'view:Fetch a single issue' \
+'list:List issues filtered by state / labels / author / assignee' \
 'edit:Mutate an issue' \
 'comment:Append a comment to an issue' \
 'close:Close an issue' \
@@ -1039,6 +1065,11 @@ _forge-cli__subcmd__help__subcmd__issue__subcmd__create_commands() {
 _forge-cli__subcmd__help__subcmd__issue__subcmd__edit_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli help issue edit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__issue__subcmd__list_commands] )) ||
+_forge-cli__subcmd__help__subcmd__issue__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help issue list commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__issue__subcmd__reopen_commands] )) ||
 _forge-cli__subcmd__help__subcmd__issue__subcmd__reopen_commands() {
@@ -1194,6 +1225,7 @@ _forge-cli__subcmd__issue_commands() {
     local commands; commands=(
 'create:Open a new issue' \
 'view:Fetch a single issue' \
+'list:List issues filtered by state / labels / author / assignee' \
 'edit:Mutate an issue' \
 'comment:Append a comment to an issue' \
 'close:Close an issue' \
@@ -1227,6 +1259,7 @@ _forge-cli__subcmd__issue__subcmd__help_commands() {
     local commands; commands=(
 'create:Open a new issue' \
 'view:Fetch a single issue' \
+'list:List issues filtered by state / labels / author / assignee' \
 'edit:Mutate an issue' \
 'comment:Append a comment to an issue' \
 'close:Close an issue' \
@@ -1260,6 +1293,11 @@ _forge-cli__subcmd__issue__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli issue help help commands' commands "$@"
 }
+(( $+functions[_forge-cli__subcmd__issue__subcmd__help__subcmd__list_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue help list commands' commands "$@"
+}
 (( $+functions[_forge-cli__subcmd__issue__subcmd__help__subcmd__reopen_commands] )) ||
 _forge-cli__subcmd__issue__subcmd__help__subcmd__reopen_commands() {
     local commands; commands=()
@@ -1269,6 +1307,11 @@ _forge-cli__subcmd__issue__subcmd__help__subcmd__reopen_commands() {
 _forge-cli__subcmd__issue__subcmd__help__subcmd__view_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli issue help view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__issue__subcmd__list_commands] )) ||
+_forge-cli__subcmd__issue__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli issue list commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__issue__subcmd__reopen_commands] )) ||
 _forge-cli__subcmd__issue__subcmd__reopen_commands() {

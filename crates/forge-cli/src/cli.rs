@@ -188,6 +188,26 @@ pub enum PrStateFilter {
     All,
 }
 
+/// `--state` filter for `issue list`. Issues have no `merged` state, so
+/// this enum is intentionally narrower than [`PrStateFilter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum IssueStateFilter {
+    Open,
+    Closed,
+    All,
+}
+
+impl IssueStateFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IssueStateFilter::Open => "open",
+            IssueStateFilter::Closed => "closed",
+            IssueStateFilter::All => "all",
+        }
+    }
+}
+
 /// Inbox item-kind / reason filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 #[clap(rename_all = "lower")]
@@ -536,6 +556,8 @@ pub enum IssueCommand {
         /// Numeric id.
         id: u64,
     },
+    /// List issues filtered by state / labels / author / assignee.
+    List(IssueListArgs),
     /// Mutate an issue.
     Edit(IssueEditArgs),
     /// Append a comment to an issue.
@@ -604,6 +626,28 @@ pub struct InboxNextArgs {
     /// Number of ranked items to return (default: 5). Provider queries remain
     /// bounded at at least 30 candidates so ranking has enough input.
     #[arg(long, default_value_t = 5)]
+    pub limit: u32,
+}
+
+/// `issue list` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.issue.list` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct IssueListArgs {
+    /// Filter by state (default: open).
+    #[arg(long, value_enum, default_value_t = IssueStateFilter::Open)]
+    pub state: IssueStateFilter,
+    /// Filter by label. Repeatable. GitHub joins labels into a comma list
+    /// (issue must have all labels); GitLab passes a repeated --label.
+    #[arg(long = "label", value_name = "NAME")]
+    pub labels: Vec<String>,
+    /// Filter by author handle.
+    #[arg(long)]
+    pub author: Option<String>,
+    /// Filter by assignee handle.
+    #[arg(long)]
+    pub assignee: Option<String>,
+    /// Cap the number of returned issues (default: 30).
+    #[arg(long, default_value_t = 30)]
     pub limit: u32,
 }
 
@@ -750,6 +794,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Issue(IssueArgs {
             command: Some(IssueCommand::View { id }),
         })) => ops::issue_view::run(&global, id, format),
+        Some(Command::Issue(IssueArgs {
+            command: Some(IssueCommand::List(args)),
+        })) => ops::issue_list::run(&global, args, format),
         Some(Command::Issue(IssueArgs {
             command: Some(IssueCommand::Edit(args)),
         })) => ops::issue_edit::run(&global, args, format),
