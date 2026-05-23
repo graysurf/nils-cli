@@ -75,6 +75,8 @@ case "$cmd $sub" in
     ;;
   "issue comment")
     capture_comment_file "$@"
+    issue_num="${3:-1}"
+    printf '%s\n' "${PLAN_ISSUE_GH_COMMENT_URL:-https://github.com/sympoies/nils-cli/issues/${issue_num}#issuecomment-1}"
     ;;
   "issue close")
     ;;
