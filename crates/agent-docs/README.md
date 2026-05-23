@@ -70,7 +70,7 @@ If neither is provided, the binary errors with
 | `startup`     | `home`    | Use `AGENTS.override.md` when present; else `AGENTS.md` | `true`   |
 | `startup`     | `project` | Use `AGENTS.override.md` when present; else `AGENTS.md` | `true`   |
 | `skill-dev`   | `home`    | `DEVELOPMENT.md`                                        | `true`   |
-| `task-tools`  | `home`    | `CLI_TOOLS.md`                                          | `true`   |
+| `task-tools`  | `home`    | `core/policies/cli-tools.md`                            | `true`   |
 | `project-dev` | `project` | `DEVELOPMENT.md`                                        | `true`   |
 
 `AGENTS.override.md` precedence is evaluated per scope independently.
@@ -392,14 +392,14 @@ $ echo $?
 ```text
 $ agent-docs baseline --check --target all
 BASELINE CHECK: all
-AGENT_DOCS_HOME: /Users/example/.agents
-PROJECT_PATH: /Users/example/work/nils-cli
+AGENT_DOCS_HOME: $HOME/.agents
+PROJECT_PATH: $HOME/work/nils-cli
 
-[home] startup policy /Users/example/.agents/AGENTS.md required present source=builtin-fallback why="startup home policy (AGENTS.override.md missing, fallback AGENTS.md)"
-[home] skill-dev /Users/example/.agents/DEVELOPMENT.md required missing source=builtin why="skill development guidance from AGENT_DOCS_HOME/DEVELOPMENT.md"
-[home] task-tools /Users/example/.agents/CLI_TOOLS.md required present source=builtin why="tool-selection guidance from AGENT_DOCS_HOME/CLI_TOOLS.md"
-[project] startup policy /Users/example/work/nils-cli/AGENTS.md required present source=builtin-fallback why="startup project policy (AGENTS.override.md missing, fallback AGENTS.md)"
-[project] project-dev /Users/example/work/nils-cli/DEVELOPMENT.md required present source=builtin why="project development guidance from PROJECT_PATH/DEVELOPMENT.md"
+[home] startup policy $HOME/.agents/AGENTS.md required present source=builtin-fallback why="startup home policy (AGENTS.override.md missing, fallback AGENTS.md)"
+[home] skill-dev $HOME/.agents/DEVELOPMENT.md required missing source=builtin why="skill development guidance from AGENT_DOCS_HOME/DEVELOPMENT.md"
+[home] task-tools $HOME/.agents/core/policies/cli-tools.md required present source=builtin why="tool-selection guidance from AGENT_DOCS_HOME/core/policies/cli-tools.md"
+[project] startup policy $HOME/work/nils-cli/AGENTS.md required present source=builtin-fallback why="startup project policy (AGENTS.override.md missing, fallback AGENTS.md)"
+[project] project-dev $HOME/work/nils-cli/DEVELOPMENT.md required present source=builtin why="project development guidance from PROJECT_PATH/DEVELOPMENT.md"
 
 missing_required: 1
 missing_optional: 0

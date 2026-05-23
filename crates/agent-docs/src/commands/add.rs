@@ -339,7 +339,7 @@ mod tests {
             target: Scope::Home,
             context: Context::TaskTools,
             scope: Scope::Home,
-            path: PathBuf::from("CLI_TOOLS.md"),
+            path: PathBuf::from("core/policies/cli-tools.md"),
             required: false,
             when: DocumentWhen::Always,
             notes: Some("initial".to_string()),
@@ -350,7 +350,7 @@ mod tests {
             target: Scope::Home,
             context: Context::TaskTools,
             scope: Scope::Home,
-            path: PathBuf::from("CLI_TOOLS.md"),
+            path: PathBuf::from("core/policies/cli-tools.md"),
             required: true,
             when: DocumentWhen::Always,
             notes: Some("updated".to_string()),
@@ -375,7 +375,7 @@ mod tests {
         let only = &loaded.documents[0];
         assert_eq!(only.context, Context::TaskTools);
         assert_eq!(only.scope, Scope::Home);
-        assert_eq!(only.path, Path::new("CLI_TOOLS.md"));
+        assert_eq!(only.path, Path::new("core/policies/cli-tools.md"));
         assert!(only.required);
         assert_eq!(only.when, DocumentWhen::Always);
         assert_eq!(only.notes.as_deref(), Some("updated"));
@@ -399,7 +399,7 @@ notes = "first"
 [[document]]
 context = "task-tools"
 scope = "home"
-path = "CLI_TOOLS.md"
+path = "core/policies/cli-tools.md"
 required = true
 when = "always"
 notes = "other"
@@ -482,7 +482,7 @@ notes = "second"
 [[document]]
 context = "task-tools"
 scope = "home"
-path = "CLI_TOOLS.md"
+path = "core/policies/cli-tools.md"
 required = false
 when = "always"
 notes = "before"
@@ -505,7 +505,7 @@ notes = "tail"
                 target: Scope::Home,
                 context: Context::TaskTools,
                 scope: Scope::Home,
-                path: PathBuf::from("CLI_TOOLS.md"),
+                path: PathBuf::from("core/policies/cli-tools.md"),
                 required: true,
                 when: DocumentWhen::Always,
                 notes: Some("after".to_string()),
@@ -536,7 +536,7 @@ notes = "tail"
 [[document]]
 context = "task-tools"
 scope = "home"
-path = "CLI_TOOLS.md"
+path = "core/policies/cli-tools.md"
 required = false
 when = "always"
 notes = "before"
@@ -551,7 +551,7 @@ notes = "before"
                 target: Scope::Home,
                 context: Context::TaskTools,
                 scope: Scope::Home,
-                path: PathBuf::from("CLI_TOOLS.md"),
+                path: PathBuf::from("core/policies/cli-tools.md"),
                 required: true,
                 when: DocumentWhen::Always,
                 notes: Some("after".to_string()),
@@ -575,7 +575,7 @@ notes = "before"
 [[document]]
 context = "task-tools" # keep context comment
 scope = "home" # keep scope comment
-path = "CLI_TOOLS.md" # keep path comment
+path = "core/policies/cli-tools.md" # keep path comment
 required = false # keep required comment
 when = "always" # keep when comment
 notes = "before" # keep notes comment
@@ -590,7 +590,7 @@ notes = "before" # keep notes comment
                 target: Scope::Home,
                 context: Context::TaskTools,
                 scope: Scope::Home,
-                path: PathBuf::from("CLI_TOOLS.md"),
+                path: PathBuf::from("core/policies/cli-tools.md"),
                 required: true,
                 when: DocumentWhen::Always,
                 notes: Some("after".to_string()),

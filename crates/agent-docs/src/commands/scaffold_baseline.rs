@@ -11,7 +11,7 @@ use crate::paths::normalize_path;
 
 const AGENTS_FILE_NAME: &str = "AGENTS.md";
 const DEVELOPMENT_FILE_NAME: &str = "DEVELOPMENT.md";
-const CLI_TOOLS_FILE_NAME: &str = "CLI_TOOLS.md";
+const CLI_TOOLS_FILE_NAME: &str = "core/policies/cli-tools.md";
 const DEVELOPMENT_TEMPLATE: &str = include_str!("../templates/development_default.md");
 const CLI_TOOLS_TEMPLATE: &str = include_str!("../templates/cli_tools_default.md");
 const SETUP_PLACEHOLDER: &str = "{{SETUP_COMMANDS}}";
@@ -652,7 +652,7 @@ mod tests {
             "# existing project dev\n"
         );
         assert!(!home.path().join("DEVELOPMENT.md").exists());
-        assert!(!home.path().join("CLI_TOOLS.md").exists());
+        assert!(!home.path().join("core/policies/cli-tools.md").exists());
         assert!(!project.path().join("AGENTS.md").exists());
     }
 

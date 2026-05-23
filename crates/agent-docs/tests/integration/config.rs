@@ -101,7 +101,7 @@ fn load_scope_config_rejects_unsupported_when_with_actionable_error() {
 [[document]]
 context = "task-tools"
 scope = "home"
-path = "CLI_TOOLS.md"
+path = "core/policies/cli-tools.md"
 required = true
 when = "if-env:CI"
 "#,

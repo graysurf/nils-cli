@@ -76,7 +76,7 @@ fn baseline_check_target_all_json_contains_required_fields_and_actions() {
     let project = TempDir::new().expect("failed to create project tempdir");
 
     write_markdown(&home.path().join("AGENTS.override.md"));
-    write_markdown(&home.path().join("CLI_TOOLS.md"));
+    write_markdown(&home.path().join("core/policies/cli-tools.md"));
     write_markdown(&project.path().join("AGENTS.md"));
 
     let report = check_builtin_baseline(BaselineTarget::All, &roots(&home, &project), false)

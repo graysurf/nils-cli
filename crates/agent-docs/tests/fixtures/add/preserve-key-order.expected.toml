@@ -1,7 +1,7 @@
 # key-order fixture
 
 [[document]]
-path = "CLI_TOOLS.md"
+path = "core/policies/cli-tools.md"
 # keep context block
 context = "task-tools"
 notes = "after"
