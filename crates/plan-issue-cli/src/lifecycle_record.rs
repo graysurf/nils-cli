@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::commands::record::{LifecycleCommentKind, MarkerFamily, RecordProfile};
+use crate::commands::record::{LifecycleCommentKind, RecordProfile};
 
 #[derive(Debug, Clone)]
 pub struct DashboardInput {
@@ -30,7 +30,6 @@ pub struct DashboardInput {
 #[derive(Debug, Clone)]
 pub struct CommentInput {
     pub profile: RecordProfile,
-    pub marker_family: MarkerFamily,
     pub kind: LifecycleCommentKind,
     pub path: Option<String>,
     pub commit: Option<String>,
@@ -40,21 +39,44 @@ pub struct CommentInput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct MarkerHit {
-    pub role: String,
-    pub profile: String,
-    pub family: String,
+pub struct LifecycleEvidence {
+    pub role: PayloadRole,
+    pub profile: PayloadProfile,
     pub url: Option<String>,
     pub created_at: Option<String>,
+    /// Stable status string derived from the structured payload (e.g.
+    /// state `status`, validation `overall`, review `decision`). `None`
+    /// when the role does not declare a status or the payload could not
+    /// be parsed.
     pub status: Option<String>,
+    /// Parsed structured payload. `None` when the comment lacks a
+    /// `plan-issue-record-payload` fence; audit still records the marker
+    /// for visibility but downstream gates treat missing payloads as
+    /// unparseable evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<RecordPayload>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnsupportedMarker {
+    pub marker_prefix: String,
+    pub url: Option<String>,
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordAudit {
     pub profile_filter: Option<String>,
     pub body_sections: BodySections,
-    pub markers: BTreeMap<String, MarkerHit>,
+    /// Latest v2 lifecycle evidence indexed by role name (`source`,
+    /// `plan`, `state`, `session`, `validation`, `review`, `closeout`).
+    pub evidence: BTreeMap<String, LifecycleEvidence>,
+    /// Stable machine-readable codes for missing required evidence
+    /// (e.g. `source-missing`, `plan-missing`, `state-missing`).
     pub missing_required: Vec<String>,
+    /// Pre-v2 markers seen during audit. Reported for visibility but not
+    /// counted as current lifecycle evidence.
+    pub unsupported_markers: Vec<UnsupportedMarker>,
     pub recognized_count: usize,
     #[serde(skip_serializing)]
     pub evidence_text: String,
@@ -194,7 +216,7 @@ pub fn render_dashboard(input: DashboardInput) -> String {
 }
 
 pub fn render_comment(input: CommentInput) -> Result<String, String> {
-    let marker = marker_for(input.marker_family, input.profile, input.kind)?;
+    let marker = marker_for(input.profile, input.kind);
     let heading = input
         .title
         .clone()
@@ -207,9 +229,7 @@ pub fn render_comment(input: CommentInput) -> Result<String, String> {
     out.push(format!("## {heading}"));
     out.push(String::new());
 
-    if input.marker_family == MarkerFamily::Shared || input.profile == RecordProfile::Dispatch {
-        out.push(format!("- Profile: {}", input.profile.as_str()));
-    }
+    out.push(format!("- Profile: {}", input.profile.as_str()));
     if let Some(path) = input
         .path
         .as_deref()
@@ -260,7 +280,8 @@ pub fn audit_record(
     profile_filter: Option<RecordProfile>,
 ) -> Result<RecordAudit, String> {
     let comments = parse_comments_json(comments_json)?;
-    let mut markers = BTreeMap::new();
+    let mut evidence: BTreeMap<String, LifecycleEvidence> = BTreeMap::new();
+    let mut unsupported_markers = Vec::new();
     let mut recognized_count = 0usize;
     let mut evidence_text = String::new();
     if let Some(body) = body {
@@ -269,51 +290,158 @@ pub fn audit_record(
     }
 
     for comment in comments {
-        let Some(body) = comment.body.as_deref() else {
+        let Some(comment_body) = comment.body.as_deref() else {
             continue;
         };
-        let Some(mut hit) = marker_hit(body) else {
+        let Some(first_marker) = first_comment_marker(comment_body) else {
             continue;
         };
-        if profile_filter.is_some_and(|profile| hit.profile != profile.as_str()) {
+        let Some(parsed) = parse_marker_line(first_marker) else {
             continue;
+        };
+        match parsed {
+            MarkerParse::V2 { role, profile } => {
+                if profile_filter.is_some_and(|expected| profile != PayloadProfile::from(expected))
+                {
+                    continue;
+                }
+                let url = comment.url.clone().or_else(|| comment.html_url.clone());
+                let created_at = comment.created_at.clone();
+                let payload = match extract_payload(comment_body) {
+                    Ok(payload) => Some(payload),
+                    Err(err) if err.kind == PayloadErrorKind::NoFence => None,
+                    Err(err) => {
+                        return Err(format!(
+                            "comment at {} has malformed payload: {}",
+                            url.as_deref().unwrap_or("(unknown url)"),
+                            err.message
+                        ));
+                    }
+                };
+                let status = payload.as_ref().and_then(derive_status_from_payload);
+                let candidate = LifecycleEvidence {
+                    role,
+                    profile,
+                    url,
+                    created_at: created_at.clone(),
+                    status,
+                    payload,
+                };
+                let key = role.as_str().to_string();
+                let supersedes = evidence
+                    .get(&key)
+                    .map(|existing| {
+                        compare_created_at(
+                            candidate.created_at.as_deref(),
+                            existing.created_at.as_deref(),
+                        ) != std::cmp::Ordering::Less
+                    })
+                    .unwrap_or(true);
+                if supersedes {
+                    evidence_text.push_str(comment_body);
+                    evidence_text.push('\n');
+                    recognized_count += 1;
+                    evidence.insert(key, candidate);
+                }
+            }
+            MarkerParse::Unsupported { prefix } => {
+                unsupported_markers.push(UnsupportedMarker {
+                    marker_prefix: prefix,
+                    url: comment.url.or(comment.html_url),
+                    created_at: comment.created_at,
+                });
+            }
         }
-        evidence_text.push_str(body);
-        evidence_text.push('\n');
-        hit.url = comment.url.or(comment.html_url);
-        hit.created_at = comment.created_at;
-        hit.status = extract_status(body);
-        recognized_count += 1;
-        markers.insert(hit.role.clone(), hit);
     }
 
     let mut missing_required = Vec::new();
-    for role in ["source_snapshot", "plan_snapshot", "state"] {
-        if !markers.contains_key(role) {
-            missing_required.push(role.to_string());
+    for code in ["source-missing", "plan-missing", "state-missing"] {
+        let role_key = code.trim_end_matches("-missing");
+        if !evidence.contains_key(role_key) {
+            missing_required.push(code.to_string());
         }
     }
 
     Ok(RecordAudit {
         profile_filter: profile_filter.map(|profile| profile.as_str().to_string()),
         body_sections: inspect_body_sections(body.unwrap_or_default()),
-        markers,
+        evidence,
         missing_required,
+        unsupported_markers,
         recognized_count,
         evidence_text,
     })
 }
 
+/// Compare two RFC3339 created-at strings. `None` is considered older than
+/// any `Some(_)`. This keeps latest-by-role selection deterministic even
+/// when GitHub returns comments out of order.
+fn compare_created_at(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(l), Some(r)) => l.cmp(r),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Derive a stable visible status string from a parsed payload, suitable
+/// for dashboard rendering and closeout gating. Returns `None` when the
+/// role does not declare a status or the payload's status field is
+/// unparseable.
+fn derive_status_from_payload(payload: &RecordPayload) -> Option<String> {
+    match payload.role {
+        PayloadRole::State => payload
+            .parse_state()
+            .ok()
+            .and_then(|data| data.status.map(|s| status_state_label(s).to_string())),
+        PayloadRole::Validation => payload
+            .parse_validation()
+            .ok()
+            .map(|data| validation_overall_label(data.overall).to_string()),
+        PayloadRole::Review => payload
+            .parse_review()
+            .ok()
+            .map(|data| review_decision_label(data.decision).to_string()),
+        PayloadRole::Closeout => payload.parse_closeout().ok().map(|data| data.final_status),
+        PayloadRole::Source | PayloadRole::Plan | PayloadRole::Session => None,
+    }
+}
+
+fn status_state_label(value: StateStatus) -> &'static str {
+    match value {
+        StateStatus::InProgress => "in-progress",
+        StateStatus::Complete => "complete",
+        StateStatus::Blocked => "blocked",
+    }
+}
+
+fn validation_overall_label(value: ValidationOverall) -> &'static str {
+    match value {
+        ValidationOverall::Pass => "pass",
+        ValidationOverall::Fail => "fail",
+        ValidationOverall::Partial => "partial",
+    }
+}
+
+fn review_decision_label(value: ReviewDecision) -> &'static str {
+    match value {
+        ReviewDecision::Approve => "approve",
+        ReviewDecision::RequestChanges => "request-changes",
+        ReviewDecision::CommentsOnly => "comments-only",
+    }
+}
+
 pub fn evaluate_closeout_gate(audit: &RecordAudit, input: CloseoutGateInput) -> CloseoutGateResult {
     let mut checks = Vec::new();
 
-    push_marker_check(&mut checks, audit, "source_snapshot", "source snapshot");
-    push_marker_check(&mut checks, audit, "plan_snapshot", "plan snapshot");
-    push_marker_check(&mut checks, audit, "state", "execution state");
+    push_evidence_check(&mut checks, audit, "source", "source snapshot");
+    push_evidence_check(&mut checks, audit, "plan", "plan snapshot");
+    push_evidence_check(&mut checks, audit, "state", "execution state");
 
     if input.require_complete {
         let (status, detail) = match audit
-            .markers
+            .evidence
             .get("state")
             .and_then(|hit| hit.status.as_deref())
         {
@@ -331,16 +459,16 @@ pub fn evaluate_closeout_gate(audit: &RecordAudit, input: CloseoutGateInput) -> 
     }
 
     if input.require_session {
-        push_marker_check(&mut checks, audit, "session", "completed session");
+        push_evidence_check(&mut checks, audit, "session", "completed session");
     }
     if input.require_validation {
-        push_marker_check(&mut checks, audit, "validation", "validation evidence");
+        push_evidence_check(&mut checks, audit, "validation", "validation evidence");
     }
     if input.require_review || input.profile == RecordProfile::Dispatch {
-        push_marker_check(&mut checks, audit, "review", "review evidence");
+        push_evidence_check(&mut checks, audit, "review", "review evidence");
     }
     if input.require_closeout {
-        push_marker_check(&mut checks, audit, "closeout", "closeout comment");
+        push_evidence_check(&mut checks, audit, "closeout", "closeout comment");
     }
 
     let approval = input.approval.as_deref().unwrap_or("").trim();
@@ -386,6 +514,177 @@ pub fn evaluate_closeout_gate(audit: &RecordAudit, input: CloseoutGateInput) -> 
 
     let ready = checks.iter().all(|check| check.status == "pass");
     CloseoutGateResult { ready, checks }
+}
+
+/// Render the canonical dashboard for an issue-backed plan record from
+/// audit evidence alone — callers no longer need to pass every per-role
+/// URL. Returns a `## Final Dashboard` when the latest state payload
+/// reports `status=complete`, otherwise `## Current Dashboard`. Pending
+/// roles render as `pending` so the dashboard remains idempotent across
+/// repeated calls with the same evidence.
+pub fn render_dashboard_from_audit(
+    audit: &RecordAudit,
+    title: Option<&str>,
+    issue_url: Option<&str>,
+) -> String {
+    let state_evidence = audit.evidence.get("state");
+    let state_data = state_evidence
+        .and_then(|hit| hit.payload.as_ref())
+        .and_then(|payload| payload.parse_state().ok());
+    let is_complete = state_evidence
+        .and_then(|hit| hit.status.as_deref())
+        .map(|status| status.eq_ignore_ascii_case("complete"))
+        .unwrap_or(false);
+
+    let dashboard_title = if is_complete {
+        "## Final Dashboard"
+    } else {
+        "## Current Dashboard"
+    };
+
+    let profile_str = state_evidence
+        .map(|hit| hit.profile.as_str().to_string())
+        .or_else(|| {
+            audit
+                .evidence
+                .values()
+                .next()
+                .map(|hit| hit.profile.as_str().to_string())
+        })
+        .unwrap_or_else(|| "tracking".to_string());
+
+    let status_value = state_evidence
+        .and_then(|hit| hit.status.clone())
+        .unwrap_or_else(|| "pending".to_string());
+
+    let target_scope = state_data
+        .as_ref()
+        .and_then(|data| data.target_scope.clone())
+        .unwrap_or_else(|| "pending".to_string());
+    let current = state_data
+        .as_ref()
+        .and_then(|data| data.current.clone())
+        .unwrap_or_else(|| "pending".to_string());
+    let next_action = state_data
+        .as_ref()
+        .and_then(|data| data.next_action.clone())
+        .unwrap_or_else(|| "pending".to_string());
+    let validation_status = audit
+        .evidence
+        .get("validation")
+        .and_then(|hit| hit.status.clone())
+        .unwrap_or_else(|| "pending".to_string());
+    let linked_prs = state_data
+        .as_ref()
+        .map(|data| {
+            data.prs
+                .iter()
+                .map(|pr| pr.url.clone().unwrap_or_else(|| pr.pr_ref.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let blockers = state_data
+        .as_ref()
+        .map(|data| data.blockers.clone())
+        .unwrap_or_default();
+    let approval = audit
+        .evidence
+        .get("closeout")
+        .and_then(|hit| hit.payload.as_ref())
+        .and_then(|payload| payload.parse_closeout().ok())
+        .and_then(|data| data.approval.comment_url)
+        .unwrap_or_else(|| "pending".to_string());
+
+    let mut out = Vec::new();
+    out.push(dashboard_title.to_string());
+    out.push(String::new());
+    out.push("This issue is the durable tracking surface for an issue-backed plan execution. The full source, plan, and execution logs remain in".to_string());
+    out.push("append-only issue comments.".to_string());
+    out.push(String::new());
+    out.push(format!("- Status: {status_value}"));
+    out.push(format!("- Profile: {profile_str}"));
+    out.push(format!("- Target scope: {target_scope}"));
+    out.push(format!("- Current task: {current}"));
+    out.push(format!("- Next action: {next_action}"));
+    out.push(format!("- Validation: {validation_status}"));
+    out.push(format!(
+        "- Linked PRs: {}",
+        non_empty_join(&linked_prs, "none yet")
+    ));
+    out.push(format!("- Blockers: {}", non_empty_join(&blockers, "none")));
+    out.push(format!("- Review approval: {approval}"));
+    out.push(String::new());
+    out.push("## Durable Record".to_string());
+    out.push(String::new());
+    out.push(format!(
+        "- Source snapshot: {}",
+        dashboard_link(evidence_url(audit, "source").as_deref(), "source snapshot")
+    ));
+    out.push(format!(
+        "- Plan snapshot: {}",
+        dashboard_link(evidence_url(audit, "plan").as_deref(), "plan snapshot")
+    ));
+    out.push(format!(
+        "- Execution state: {}",
+        dashboard_link(evidence_url(audit, "state").as_deref(), "execution state")
+    ));
+    out.push(format!(
+        "- Latest session: {}",
+        dashboard_link(
+            evidence_url(audit, "session").as_deref(),
+            "Execution Session"
+        )
+    ));
+    out.push(format!(
+        "- Latest validation: {}",
+        dashboard_link(
+            evidence_url(audit, "validation").as_deref(),
+            "Validation Evidence"
+        )
+    ));
+    let is_dispatch_profile = profile_str == "dispatch";
+    if is_dispatch_profile || audit.evidence.contains_key("review") {
+        out.push(format!(
+            "- Latest review: {}",
+            dashboard_link(evidence_url(audit, "review").as_deref(), "Review Evidence")
+        ));
+    }
+    out.push(format!(
+        "- Closeout comment: {}",
+        dashboard_link(evidence_url(audit, "closeout").as_deref(), "closeout")
+    ));
+    out.push(String::new());
+    out.push("## Guardrails".to_string());
+    out.push(String::new());
+    out.push("- The issue body is a mutable dashboard only.".to_string());
+    out.push("- Append-only issue comments are the durable source of truth.".to_string());
+    out.push(
+        "- `plan-tooling` owns plan parsing, validation, batching, and PR split modeling only."
+            .to_string(),
+    );
+    out.push("- Provider create, comment, edit, and close operations remain owned by `forge-cli` or provider atoms.".to_string());
+
+    if title.is_some() || issue_url.is_some() {
+        out.push(String::new());
+        out.push("## Original Tracker".to_string());
+        out.push(String::new());
+        if let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) {
+            out.push(format!("- Title: {title}"));
+        }
+        if let Some(url) = issue_url.map(str::trim).filter(|value| !value.is_empty()) {
+            out.push(format!("- Issue: {url}"));
+        }
+    }
+
+    finalize_markdown(out)
+}
+
+fn evidence_url(audit: &RecordAudit, role: &str) -> Option<String> {
+    audit
+        .evidence
+        .get(role)
+        .and_then(|hit| hit.url.clone())
+        .filter(|value| !value.trim().is_empty())
 }
 
 pub fn render_closeout_checks(checks: &[CloseoutCheck]) -> String {
@@ -450,73 +749,13 @@ fn default_details_summary(kind: LifecycleCommentKind) -> &'static str {
     }
 }
 
-fn marker_for(
-    family: MarkerFamily,
-    profile: RecordProfile,
-    kind: LifecycleCommentKind,
-) -> Result<String, String> {
-    let marker = match family {
-        MarkerFamily::Shared => match kind {
-            LifecycleCommentKind::Source | LifecycleCommentKind::Plan => format!(
-                "<!-- issue-backed-plan:snapshot:v1 kind={} profile={} -->",
-                kind.as_str(),
-                profile.as_str()
-            ),
-            _ => format!(
-                "<!-- issue-backed-plan:{}:v1 profile={} -->",
-                kind.as_str(),
-                profile.as_str()
-            ),
-        },
-        MarkerFamily::Compat => compat_marker(profile, kind)?,
-    };
-    Ok(marker)
-}
-
-fn compat_marker(profile: RecordProfile, kind: LifecycleCommentKind) -> Result<String, String> {
-    let marker = match (profile, kind) {
-        (RecordProfile::Tracking, LifecycleCommentKind::Source)
-        | (RecordProfile::Tracking, LifecycleCommentKind::Plan) => format!(
-            "<!-- plan-tracking-issue:snapshot:v1 kind={} -->",
-            kind.as_str()
-        ),
-        (RecordProfile::Tracking, LifecycleCommentKind::State) => {
-            "<!-- execute-from-tracking-issue:state:v1 -->".to_string()
-        }
-        (RecordProfile::Tracking, LifecycleCommentKind::Session) => {
-            "<!-- execute-from-tracking-issue:session:v1 -->".to_string()
-        }
-        (RecordProfile::Tracking, LifecycleCommentKind::Validation) => {
-            "<!-- execute-from-tracking-issue:validation:v1 -->".to_string()
-        }
-        (RecordProfile::Tracking, LifecycleCommentKind::Closeout) => {
-            "<!-- tracking-issue-closeout:v1 -->".to_string()
-        }
-        (RecordProfile::Tracking, LifecycleCommentKind::Review) => {
-            return Err("tracking profile does not emit compat review markers".to_string());
-        }
-        (RecordProfile::Dispatch, LifecycleCommentKind::Source)
-        | (RecordProfile::Dispatch, LifecycleCommentKind::Plan) => format!(
-            "<!-- deliver-dispatch-plan:snapshot:v1 kind={} -->",
-            kind.as_str()
-        ),
-        (RecordProfile::Dispatch, LifecycleCommentKind::State) => {
-            "<!-- deliver-dispatch-plan:state:v1 -->".to_string()
-        }
-        (RecordProfile::Dispatch, LifecycleCommentKind::Session) => {
-            "<!-- deliver-dispatch-plan:session:v1 -->".to_string()
-        }
-        (RecordProfile::Dispatch, LifecycleCommentKind::Validation) => {
-            "<!-- deliver-dispatch-plan:validation:v1 -->".to_string()
-        }
-        (RecordProfile::Dispatch, LifecycleCommentKind::Review) => {
-            "<!-- deliver-dispatch-plan:review:v1 -->".to_string()
-        }
-        (RecordProfile::Dispatch, LifecycleCommentKind::Closeout) => {
-            "<!-- deliver-dispatch-plan:closeout:v1 -->".to_string()
-        }
-    };
-    Ok(marker)
+/// Render the canonical v2 marker for a lifecycle comment kind.
+fn marker_for(profile: RecordProfile, kind: LifecycleCommentKind) -> String {
+    format!(
+        "<!-- plan-issue-record:v2 role={} profile={} -->",
+        kind.as_str(),
+        profile.as_str()
+    )
 }
 
 fn parse_comments_json(raw: &str) -> Result<Vec<CommentJson>, String> {
@@ -560,11 +799,6 @@ fn string_field(object: &mut serde_json::Map<String, Value>, key: &str) -> Optio
         .and_then(|value| value.as_str().map(ToString::to_string))
 }
 
-fn marker_hit(body: &str) -> Option<MarkerHit> {
-    let marker = first_comment_marker(body)?;
-    parse_marker_line(marker)
-}
-
 fn first_comment_marker(body: &str) -> Option<&str> {
     for line in body.lines() {
         let trimmed = line.trim();
@@ -579,70 +813,75 @@ fn first_comment_marker(body: &str) -> Option<&str> {
     None
 }
 
-fn parse_marker_line(marker: &str) -> Option<MarkerHit> {
+/// Outcome of marker parsing on a comment's first non-empty line.
+#[derive(Debug, Clone)]
+enum MarkerParse {
+    /// Canonical v2 marker.
+    V2 {
+        role: PayloadRole,
+        profile: PayloadProfile,
+    },
+    /// Pre-v2 marker family the v3 lifecycle no longer recognizes as
+    /// current lifecycle evidence (but tracks for reporting).
+    Unsupported { prefix: String },
+}
+
+fn parse_marker_line(marker: &str) -> Option<MarkerParse> {
     let inner = marker.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
     let attrs = parse_attrs(inner);
 
-    if inner.starts_with("issue-backed-plan:snapshot:v1") {
-        let kind = attrs.get("kind")?;
+    if let Some(rest) = inner.strip_prefix("plan-issue-record:v2") {
+        let _ = rest;
+        let role = attrs.get("role").and_then(|value| parse_role(value))?;
         let profile = attrs
             .get("profile")
-            .map(String::as_str)
-            .unwrap_or("tracking");
-        return Some(hit(format!("{kind}_snapshot"), profile, "shared"));
-    }
-    if let Some(rest) = inner.strip_prefix("issue-backed-plan:") {
-        let kind = rest.split(':').next()?;
-        let profile = attrs
-            .get("profile")
-            .map(String::as_str)
-            .unwrap_or("tracking");
-        return Some(hit(kind.to_string(), profile, "shared"));
+            .and_then(|value| parse_profile(value))
+            .unwrap_or(PayloadProfile::Tracking);
+        return Some(MarkerParse::V2 { role, profile });
     }
 
-    if inner.starts_with("plan-tracking-issue:snapshot:v") {
-        let kind = attrs.get("kind")?;
-        return Some(hit(format!("{kind}_snapshot"), "tracking", "compat"));
-    }
-    if let Some(rest) = inner.strip_prefix("execute-from-tracking-issue:") {
-        let kind = rest.split(':').next()?;
-        return Some(hit(kind.to_string(), "tracking", "compat"));
-    }
-    if let Some(rest) = inner.strip_prefix("execute-plan-tracking-issue:") {
-        let kind = rest.split(':').next()?;
-        return Some(hit(kind.to_string(), "tracking", "compat"));
-    }
-    if inner.starts_with("tracking-issue-closeout:v")
-        || inner.starts_with("plan-tracking-issue-closeout:v")
-    {
-        return Some(hit("closeout".to_string(), "tracking", "compat"));
-    }
-
-    if inner.starts_with("deliver-dispatch-plan:snapshot:v") {
-        let kind = attrs.get("kind")?;
-        return Some(hit(format!("{kind}_snapshot"), "dispatch", "compat"));
-    }
-    if let Some(rest) = inner.strip_prefix("deliver-dispatch-plan:") {
-        let kind = rest.split(':').next()?;
-        return Some(hit(kind.to_string(), "dispatch", "compat"));
-    }
-    if let Some(rest) = inner.strip_prefix("dispatch-plan:") {
-        let kind = rest.split(':').next()?;
-        return Some(hit(kind.to_string(), "dispatch", "compat"));
+    // Known pre-v2 marker families. They are no longer recognized as
+    // current lifecycle evidence but are reported by audit so callers
+    // can identify v1-marker comments that need migration to v2.
+    for prefix in [
+        "issue-backed-plan:",
+        "plan-tracking-issue:",
+        "execute-from-tracking-issue:",
+        "execute-plan-tracking-issue:",
+        "tracking-issue-closeout:",
+        "plan-tracking-issue-closeout:",
+        "deliver-dispatch-plan:",
+        "dispatch-plan:",
+    ] {
+        if inner.starts_with(prefix) {
+            return Some(MarkerParse::Unsupported {
+                prefix: prefix.trim_end_matches(':').to_string(),
+            });
+        }
     }
 
     None
 }
 
-fn hit(role: String, profile: &str, family: &str) -> MarkerHit {
-    MarkerHit {
-        role,
-        profile: profile.to_string(),
-        family: family.to_string(),
-        url: None,
-        created_at: None,
-        status: None,
-    }
+fn parse_role(value: &str) -> Option<PayloadRole> {
+    Some(match value {
+        "source" => PayloadRole::Source,
+        "plan" => PayloadRole::Plan,
+        "state" => PayloadRole::State,
+        "session" => PayloadRole::Session,
+        "validation" => PayloadRole::Validation,
+        "review" => PayloadRole::Review,
+        "closeout" => PayloadRole::Closeout,
+        _ => return None,
+    })
+}
+
+fn parse_profile(value: &str) -> Option<PayloadProfile> {
+    Some(match value {
+        "tracking" => PayloadProfile::Tracking,
+        "dispatch" => PayloadProfile::Dispatch,
+        _ => return None,
+    })
 }
 
 fn parse_attrs(marker: &str) -> BTreeMap<String, String> {
@@ -663,20 +902,6 @@ fn parse_attrs(marker: &str) -> BTreeMap<String, String> {
     attrs
 }
 
-fn extract_status(body: &str) -> Option<String> {
-    for line in body.lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix("- Status:") else {
-            continue;
-        };
-        let status = rest.trim();
-        if !status.is_empty() {
-            return Some(status.to_string());
-        }
-    }
-    None
-}
-
 fn inspect_body_sections(body: &str) -> BodySections {
     BodySections {
         current_dashboard: body.contains("## Current Dashboard"),
@@ -687,13 +912,13 @@ fn inspect_body_sections(body: &str) -> BodySections {
     }
 }
 
-fn push_marker_check(
+fn push_evidence_check(
     checks: &mut Vec<CloseoutCheck>,
     audit: &RecordAudit,
     role: &str,
     label: &str,
 ) {
-    let (status, detail) = match audit.markers.get(role) {
+    let (status, detail) = match audit.evidence.get(role) {
         Some(hit) => (
             "pass",
             hit.url
@@ -716,7 +941,7 @@ fn audit_text_for_pr_search(audit: &RecordAudit) -> String {
     if !audit.evidence_text.trim().is_empty() {
         values.insert(audit.evidence_text.clone());
     }
-    for hit in audit.markers.values() {
+    for hit in audit.evidence.values() {
         if let Some(url) = hit.url.as_deref() {
             values.insert(url.to_string());
         }
@@ -789,6 +1014,15 @@ impl PayloadProfile {
         match self {
             Self::Tracking => "tracking",
             Self::Dispatch => "dispatch",
+        }
+    }
+}
+
+impl From<RecordProfile> for PayloadProfile {
+    fn from(value: RecordProfile) -> Self {
+        match value {
+            RecordProfile::Tracking => PayloadProfile::Tracking,
+            RecordProfile::Dispatch => PayloadProfile::Dispatch,
         }
     }
 }

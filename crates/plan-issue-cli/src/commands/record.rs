@@ -59,23 +59,6 @@ impl RecordProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-pub enum MarkerFamily {
-    /// Emit the shared issue-backed-plan marker family.
-    Shared,
-    /// Emit compatibility markers used by the existing tracking lifecycle.
-    Compat,
-}
-
-impl MarkerFamily {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Shared => "shared",
-            Self::Compat => "compat",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 pub enum LifecycleCommentKind {
     #[value(name = "source", alias = "source-snapshot")]
     Source,
@@ -190,10 +173,6 @@ pub struct RenderCommentArgs {
     /// Lifecycle profile for the comment marker and visible metadata.
     #[arg(long, value_enum, default_value_t = RecordProfile::Tracking)]
     pub profile: RecordProfile,
-
-    /// Marker family to emit.
-    #[arg(long = "marker-family", value_enum, default_value_t = MarkerFamily::Compat)]
-    pub marker_family: MarkerFamily,
 
     /// Lifecycle comment kind.
     #[arg(long, value_enum)]

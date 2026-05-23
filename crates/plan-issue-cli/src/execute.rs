@@ -167,7 +167,6 @@ fn run_record_render_comment(args: &RenderCommentArgs) -> Result<Value, CommandE
     };
     let markdown = lifecycle_record::render_comment(CommentInput {
         profile: args.profile,
-        marker_family: args.marker_family,
         kind: args.kind,
         path: args.path.as_ref().map(|path| path_text(path)),
         commit: args.commit.clone(),
@@ -180,7 +179,6 @@ fn run_record_render_comment(args: &RenderCommentArgs) -> Result<Value, CommandE
 
     Ok(json!({
         "profile": args.profile.as_str(),
-        "marker_family": args.marker_family.as_str(),
         "kind": args.kind.as_str(),
         "operation": "render-comment",
         "out_path": out_path,
