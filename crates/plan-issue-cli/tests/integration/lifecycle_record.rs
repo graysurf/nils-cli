@@ -1,7 +1,7 @@
 use std::fs;
 
 use pretty_assertions::assert_eq;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use plan_issue_cli::lifecycle_record::{
@@ -12,18 +12,35 @@ use plan_issue_cli::lifecycle_record::{
 
 use crate::common;
 
+/// Build a `plan-issue-record:v2` lifecycle comment body whose payload
+/// fence carries the given `data` value. Used by audit + closeout-gate
+/// tests in this file to produce comment JSON without re-deriving the
+/// fenced payload by hand.
+fn v2_comment_body(role: &str, profile: &str, data: Value) -> String {
+    let envelope = json!({
+        "schema": PAYLOAD_SCHEMA_V2,
+        "role": role,
+        "profile": profile,
+        "data": data,
+    });
+    let payload = serde_json::to_string(&envelope).expect("serialize payload");
+    format!(
+        "<!-- plan-issue-record:v2 role={role} profile={profile} -->\n\n```plan-issue-record-payload\n{payload}\n```\n",
+    )
+}
+
 fn json_stdout(out: &common::CmdOut) -> Value {
     serde_json::from_str(&out.stdout).expect("json stdout")
 }
 
 #[test]
-fn issue_backed_lifecycle_render_comment_emits_compat_tracking_snapshot() {
+fn issue_backed_lifecycle_render_comment_emits_v2_canonical_marker() {
     let tmp = TempDir::new().expect("tmp");
     let content = tmp.path().join("source.md");
     let rendered = tmp.path().join("comment.md");
     fs::write(
         &content,
-        "# Source\n\n<!-- execute-from-tracking-issue:validation:v1 -->\n",
+        "# Source\n\nQuoted markers inside details are ignored by the v2 parser:\n<!-- plan-issue-record:v2 role=state profile=tracking -->\n",
     )
     .expect("write content");
 
@@ -47,12 +64,19 @@ fn issue_backed_lifecycle_render_comment_emits_compat_tracking_snapshot() {
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     let body = fs::read_to_string(&rendered).expect("read rendered");
     assert!(
-        body.starts_with("<!-- plan-tracking-issue:snapshot:v1 kind=source -->"),
+        body.starts_with("<!-- plan-issue-record:v2 role=source profile=tracking -->"),
         "{body}"
     );
     assert!(body.contains("## Source Snapshot"), "{body}");
     assert!(body.contains("<details>"), "{body}");
     assert!(!body.contains("## Task Decomposition"), "{body}");
+    // The v3 lifecycle no longer emits any pre-v2 marker family from
+    // `record render-comment`, even when the rendered content contains
+    // quoted v1 markers.
+    assert!(
+        !body.contains("plan-tracking-issue:snapshot:v1"),
+        "v2 render must not emit v1 outer marker: {body}"
+    );
 
     let payload = json_stdout(&out);
     assert_eq!(payload["command"], "record.render-comment");
@@ -60,7 +84,7 @@ fn issue_backed_lifecycle_render_comment_emits_compat_tracking_snapshot() {
 }
 
 #[test]
-fn issue_backed_lifecycle_audit_uses_only_top_level_comment_markers() {
+fn lifecycle_record_audit_returns_typed_v2_evidence_and_ignores_v1_markers() {
     let tmp = TempDir::new().expect("tmp");
     let body = tmp.path().join("body.md");
     let comments = tmp.path().join("comments.json");
@@ -69,26 +93,40 @@ fn issue_backed_lifecycle_audit_uses_only_top_level_comment_markers() {
         "## Current Dashboard\n\n## Durable Record\n\nNo task table here.\n",
     )
     .expect("write body");
-    fs::write(
-        &comments,
-        r##"{
-  "comments": [
-    {
-      "url": "https://github.com/owner/repo/issues/1#issuecomment-source",
-      "body": "<!-- plan-tracking-issue:snapshot:v1 kind=source -->\n\n## Source Snapshot\n\n<details>\n<summary>Source snapshot</summary>\n\n<!-- execute-from-tracking-issue:validation:v1 -->\n\n</details>\n"
-    },
-    {
-      "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
-      "body": "<!-- plan-tracking-issue:snapshot:v1 kind=plan -->\n\n## Plan Snapshot\n"
-    },
-    {
-      "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
-      "body": "<!-- execute-from-tracking-issue:state:v1 -->\n\n## Execution State\n\n- Status: complete\n"
-    }
-  ]
-}"##,
-    )
-    .expect("write comments");
+
+    let payload = json!({
+        "comments": [
+            {
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-source",
+                "body": v2_comment_body(
+                    "source",
+                    "tracking",
+                    json!({"path": "docs/plans/example/example-discussion-source.md", "commit": "abc1234"}),
+                ),
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
+                "body": v2_comment_body(
+                    "plan",
+                    "tracking",
+                    json!({"path": "docs/plans/example/example-plan.md", "commit": "abc1234"}),
+                ),
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+                "body": v2_comment_body(
+                    "state",
+                    "tracking",
+                    json!({"status": "complete", "target_scope": "v3", "tasks": [], "prs": []}),
+                ),
+            },
+            {
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-v1-marker",
+                "body": "<!-- execute-from-tracking-issue:state:v1 -->\n\n## Execution State\n\n- Status: complete\n",
+            }
+        ]
+    });
+    fs::write(&comments, payload.to_string()).expect("write comments");
 
     let out = common::run_plan_issue_local(&[
         "--format",
@@ -108,16 +146,29 @@ fn issue_backed_lifecycle_audit_uses_only_top_level_comment_markers() {
     let audit = &payload["payload"]["result"]["audit"];
     assert_eq!(audit["recognized_count"], 3);
     assert_eq!(
-        audit["markers"]["source_snapshot"]["url"],
+        audit["evidence"]["source"]["url"],
         "https://github.com/owner/repo/issues/1#issuecomment-source"
     );
-    assert!(audit["markers"]["validation"].is_null());
+    assert_eq!(
+        audit["evidence"]["plan"]["url"],
+        "https://github.com/owner/repo/issues/1#issuecomment-plan"
+    );
+    assert_eq!(audit["evidence"]["state"]["status"], "complete");
+    assert_eq!(
+        audit["evidence"]["state"]["payload"]["schema"],
+        PAYLOAD_SCHEMA_V2
+    );
+    assert!(audit["evidence"]["validation"].is_null());
     assert_eq!(audit["missing_required"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        audit["unsupported_markers"][0]["marker_prefix"],
+        "execute-from-tracking-issue"
+    );
     assert_eq!(audit["body_sections"]["task_decomposition"], false);
 }
 
 #[test]
-fn issue_backed_lifecycle_closeout_gate_reports_ready_when_required_markers_pass() {
+fn lifecycle_record_closeout_gate_passes_with_v2_payloads() {
     let tmp = TempDir::new().expect("tmp");
     let body = tmp.path().join("body.md");
     let comments = tmp.path().join("comments.json");
@@ -126,17 +177,42 @@ fn issue_backed_lifecycle_closeout_gate_reports_ready_when_required_markers_pass
         "## Final Dashboard\n\n## Durable Record\n\n## Closeout Checks\n",
     )
     .expect("write body");
-    fs::write(
-        &comments,
-        r##"[
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-source","body":"<!-- plan-tracking-issue:snapshot:v1 kind=source -->\n\n## Source Snapshot\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-plan","body":"<!-- plan-tracking-issue:snapshot:v1 kind=plan -->\n\n## Plan Snapshot\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-state","body":"<!-- execute-from-tracking-issue:state:v1 -->\n\n## Execution State\n\n- Status: complete\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-session","body":"<!-- execute-from-tracking-issue:session:v1 -->\n\n## Execution Session\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-validation","body":"<!-- execute-from-tracking-issue:validation:v1 -->\n\n## Validation Evidence\n"}
-]"##,
-    )
-    .expect("write comments");
+
+    let payload = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-source",
+            "body": v2_comment_body(
+                "source",
+                "tracking",
+                json!({"path": "docs/plans/example/example-discussion-source.md", "commit": "abc1234"}),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
+            "body": v2_comment_body(
+                "plan",
+                "tracking",
+                json!({"path": "docs/plans/example/example-plan.md", "commit": "abc1234"}),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({"status": "complete", "target_scope": "v3", "tasks": [], "prs": []}),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-session",
+            "body": v2_comment_body("session", "tracking", json!({"summary": "Final session"})),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-validation",
+            "body": v2_comment_body("validation", "tracking", json!({"overall": "pass", "commands": []})),
+        }
+    ]);
+    fs::write(&comments, payload.to_string()).expect("write comments");
 
     let out = common::run_plan_issue_local(&[
         "--format",
@@ -171,7 +247,7 @@ fn issue_backed_lifecycle_closeout_gate_reports_ready_when_required_markers_pass
 }
 
 #[test]
-fn issue_backed_lifecycle_closeout_gate_filters_linked_prs_by_profile() {
+fn lifecycle_record_closeout_gate_filters_linked_prs_by_profile_v2() {
     let tmp = TempDir::new().expect("tmp");
     let body = tmp.path().join("body.md");
     let comments = tmp.path().join("comments.json");
@@ -180,19 +256,50 @@ fn issue_backed_lifecycle_closeout_gate_filters_linked_prs_by_profile() {
         "## Final Dashboard\n\n## Durable Record\n\n## Closeout Checks\n",
     )
     .expect("write body");
-    fs::write(
-        &comments,
-        r##"[
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-source","body":"<!-- issue-backed-plan:snapshot:v1 kind=source profile=dispatch -->\n\n## Source Snapshot\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-plan","body":"<!-- issue-backed-plan:snapshot:v1 kind=plan profile=dispatch -->\n\n## Plan Snapshot\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-state","body":"<!-- issue-backed-plan:state:v1 profile=dispatch -->\n\n## Execution State\n\n- Status: complete\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-session","body":"<!-- issue-backed-plan:session:v1 profile=dispatch -->\n\n## Execution Session\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-validation","body":"<!-- issue-backed-plan:validation:v1 profile=dispatch -->\n\n## Validation Evidence\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-review","body":"<!-- issue-backed-plan:review:v1 profile=dispatch -->\n\n## Review Evidence\n"},
-  {"url":"https://github.com/owner/repo/issues/1#issuecomment-tracking","body":"<!-- execute-from-tracking-issue:session:v1 -->\n\n## Execution Session\n\n- PR: #999\n"}
-]"##,
-    )
-    .expect("write comments");
+
+    let payload = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-source",
+            "body": v2_comment_body(
+                "source",
+                "dispatch",
+                json!({"path": "docs/plans/example/example-discussion-source.md", "commit": "abc1234"}),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
+            "body": v2_comment_body(
+                "plan",
+                "dispatch",
+                json!({"path": "docs/plans/example/example-plan.md", "commit": "abc1234"}),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "body": v2_comment_body(
+                "state",
+                "dispatch",
+                json!({"status": "complete", "target_scope": "v3", "tasks": [], "prs": []}),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-session",
+            "body": v2_comment_body("session", "dispatch", json!({"summary": "Session"})),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-validation",
+            "body": v2_comment_body("validation", "dispatch", json!({"overall": "pass", "commands": []})),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-review",
+            "body": v2_comment_body("review", "dispatch", json!({"decision": "approve", "lenses": ["testing"], "findings": []})),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-tracking",
+            "body": v2_comment_body("session", "tracking", json!({"summary": "PR #999"})),
+        }
+    ]);
+    fs::write(&comments, payload.to_string()).expect("write comments");
 
     let out = common::run_plan_issue_local(&[
         "--format",
@@ -218,6 +325,9 @@ fn issue_backed_lifecycle_closeout_gate_filters_linked_prs_by_profile() {
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     let payload = json_stdout(&out);
     let result = &payload["payload"]["result"];
+    // The dispatch-profile filter rejects the tracking-profile session
+    // payload, so `#999` (which appears only in the tracking session
+    // payload) is not present in any dispatch-profile evidence text.
     assert_eq!(result["ready"], false);
     assert!(
         result["checks_markdown"]
@@ -395,6 +505,215 @@ fn lifecycle_record_structured_payloads_reject_invalid_json() {
     let comment = "```plan-issue-record-payload\n{ not json }\n```\n";
     let err = lifecycle_record::extract_payload(comment).expect_err("invalid json");
     assert_eq!(err.kind, PayloadErrorKind::InvalidJson);
+}
+
+// --- Sprint 2 Tasks 2.1-2.3 acceptance tests ---
+
+#[test]
+fn lifecycle_record_audit_latest_marker_per_role_wins_by_timestamp() {
+    let earlier = v2_comment_body(
+        "state",
+        "tracking",
+        json!({"status": "in-progress", "target_scope": "v3"}),
+    );
+    let later = v2_comment_body(
+        "state",
+        "tracking",
+        json!({"status": "complete", "target_scope": "v3"}),
+    );
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state-1",
+            "body": earlier,
+            "created_at": "2026-05-20T10:00:00Z",
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state-2",
+            "body": later,
+            "created_at": "2026-05-23T10:00:00Z",
+        }
+    ]);
+
+    let tmp = TempDir::new().expect("tmp");
+    let comments_path = tmp.path().join("comments.json");
+    fs::write(&comments_path, comments.to_string()).expect("write comments");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "audit",
+        "--comments-json",
+        comments_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let payload = json_stdout(&out);
+    let audit = &payload["payload"]["result"]["audit"];
+    assert_eq!(audit["evidence"]["state"]["status"], "complete");
+    assert_eq!(
+        audit["evidence"]["state"]["url"],
+        "https://github.com/owner/repo/issues/1#issuecomment-state-2"
+    );
+}
+
+#[test]
+fn lifecycle_record_audit_reports_stable_missing_required_codes() {
+    let tmp = TempDir::new().expect("tmp");
+    let comments_path = tmp.path().join("comments.json");
+    let comments = json!({
+        "comments": [
+            {
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-source",
+                "body": v2_comment_body(
+                    "source",
+                    "tracking",
+                    json!({"path": "docs/plans/example/example-discussion-source.md", "commit": "abc"}),
+                ),
+            }
+        ]
+    });
+    fs::write(&comments_path, comments.to_string()).expect("write comments");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "audit",
+        "--comments-json",
+        comments_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let payload = json_stdout(&out);
+    let audit = &payload["payload"]["result"]["audit"];
+    let missing = audit["missing_required"]
+        .as_array()
+        .expect("missing_required array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(missing, vec!["plan-missing", "state-missing"]);
+}
+
+#[test]
+fn lifecycle_record_dashboard_renders_from_audit_without_explicit_urls() {
+    use lifecycle_record::render_dashboard_from_audit;
+
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-source",
+            "body": v2_comment_body(
+                "source",
+                "tracking",
+                json!({"path": "docs/plans/example/example-discussion-source.md", "commit": "abc"}),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
+            "body": v2_comment_body(
+                "plan",
+                "tracking",
+                json!({"path": "docs/plans/example/example-plan.md", "commit": "abc"}),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({
+                    "status": "in-progress",
+                    "target_scope": "v3 lifecycle rewrite",
+                    "current": "Sprint 2 PR",
+                    "next_action": "Land marker collapse",
+                    "tasks": [],
+                    "prs": [{"ref": "owner/repo#500", "url": "https://example/pull/500", "status": "open"}]
+                }),
+            ),
+        }
+    ]);
+    let audit =
+        lifecycle_record::audit_record(None, &comments.to_string(), None).expect("audit ok");
+
+    let rendered = render_dashboard_from_audit(
+        &audit,
+        Some("Plan-Issue Lifecycle v3"),
+        Some("https://github.com/owner/repo/issues/1"),
+    );
+
+    assert!(rendered.contains("## Current Dashboard"), "{rendered}");
+    assert!(
+        rendered.contains("- Target scope: v3 lifecycle rewrite"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("- Linked PRs: https://example/pull/500"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "- Source snapshot: [source snapshot](https://github.com/owner/repo/issues/1#issuecomment-source)"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("- Closeout comment: pending"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn lifecycle_record_dashboard_renders_final_when_state_complete() {
+    use lifecycle_record::render_dashboard_from_audit;
+
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-source",
+            "body": v2_comment_body("source", "tracking", json!({"path": "x", "commit": "abc"})),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
+            "body": v2_comment_body("plan", "tracking", json!({"path": "y", "commit": "abc"})),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({"status": "complete", "target_scope": "v3", "tasks": [], "prs": []}),
+            ),
+        }
+    ]);
+    let audit =
+        lifecycle_record::audit_record(None, &comments.to_string(), None).expect("audit ok");
+
+    let rendered = render_dashboard_from_audit(&audit, None, None);
+    assert!(
+        rendered.contains("## Final Dashboard"),
+        "expected Final Dashboard heading: {rendered}"
+    );
+    assert!(!rendered.contains("## Current Dashboard"), "{rendered}");
+}
+
+#[test]
+fn lifecycle_record_dashboard_render_is_idempotent_for_same_audit() {
+    use lifecycle_record::render_dashboard_from_audit;
+
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({"status": "in-progress", "target_scope": "v3", "current": "step", "next_action": "do", "tasks": [], "prs": []}),
+            ),
+        }
+    ]);
+    let audit =
+        lifecycle_record::audit_record(None, &comments.to_string(), None).expect("audit ok");
+
+    let first = render_dashboard_from_audit(&audit, None, None);
+    let second = render_dashboard_from_audit(&audit, None, None);
+    assert_eq!(first, second);
 }
 
 #[test]
