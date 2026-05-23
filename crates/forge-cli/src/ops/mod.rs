@@ -8,6 +8,7 @@ pub mod issue_close;
 pub mod issue_comment;
 pub mod issue_create;
 pub mod issue_edit;
+pub mod issue_list;
 pub mod issue_reopen;
 pub mod issue_view;
 pub mod pr_checks;

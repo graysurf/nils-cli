@@ -315,6 +315,23 @@ operations:
       github: { program: gh,   argv: [issue, view, "{id}", --json, "number,url,state,title,labels,assignees,body"] }
       gitlab: { program: glab, argv: [issue, view, "{id}", -F, json] }
 
+  - id: issue.list
+    schema_version: cli.forge-cli.issue.list.v1
+    summary: List issues filtered by state / labels / author / assignee.
+    inputs:
+      - { name: --state,    type: enum<open|closed|all>, default: open }
+      - { name: --label,    type: list<string>,          default: [] }
+      - { name: --author,   type: string,                required: false }
+      - { name: --assignee, type: string,                required: false }
+      - { name: --limit,    type: integer,               default: 30 }
+    validations: []
+    backends:
+      github: { program: gh,   argv: [issue, list, --json, "number,url,state,title,labels,author,assignees"] }
+      gitlab: { program: glab, argv: [issue, list, -F, json] }
+    output:
+      data:
+        items: list<{ number, url, state, title, labels, author, assignees }>
+
   - id: issue.edit
     schema_version: cli.forge-cli.issue.edit.v1
     summary: Mutate issue title / body / labels / assignees.
