@@ -36,6 +36,22 @@ const FULL_PR_VIEW_JSON: &str = r#"{
   "labels": []
 }"#;
 
+/// Post-merge `pr view` payload — same as [`FULL_PR_VIEW_JSON`] except the
+/// state has flipped to `MERGED`. Used by stubs that need to surface a
+/// merged PR after the merge step ran (and possibly exited non-zero).
+const MERGED_PR_VIEW_JSON: &str = r#"{
+  "number": 123,
+  "url": "https://github.com/sympoies/nils-cli/pull/123",
+  "state": "MERGED",
+  "isDraft": false,
+  "title": "feat: sample feature",
+  "headRefName": "feat/sample",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergedAt": "2026-05-23T12:00:00Z",
+  "labels": []
+}"#;
+
 /// Build the canonical Sprint 2 git tempdir: clean worktree on `feat/sample`
 /// tracking `origin/feat/sample` at the same SHA, with the remote URL set to
 /// `https://<host>/<repo_slug>.git` so provider detection lands on GitHub.
@@ -91,6 +107,42 @@ fn make_git_repo() -> TempDir {
 }
 
 fn write_full_chain_stub(stub: &StubEnv) -> PathBuf {
+    write_chain_stub(stub, FULL_PR_VIEW_JSON, MERGED_PR_VIEW_JSON, false)
+}
+
+/// Chain stub with a controllable `pr merge` failure mode used by the
+/// idempotency-on-non-zero-exit regression test. When `merge_exits_one` is
+/// true, the merge subcommand touches a sentinel file in `stub.tempdir`
+/// and exits 1 with a non-fatal stderr message. Subsequent `pr view`
+/// calls observe the sentinel and switch to the post-merge JSON so the
+/// macro can verify the PR actually landed.
+fn write_chain_stub_with_merge_exit(
+    stub: &StubEnv,
+    pre_view: &str,
+    post_view: &str,
+    merge_exits_one: bool,
+) -> PathBuf {
+    write_chain_stub(stub, pre_view, post_view, merge_exits_one)
+}
+
+fn write_chain_stub(
+    stub: &StubEnv,
+    pre_view: &str,
+    post_view: &str,
+    merge_exits_one: bool,
+) -> PathBuf {
+    let sentinel = stub.tempdir.path().join("merge-called");
+    let merge_branch = if merge_exits_one {
+        format!(
+            "    touch {sentinel}\n    echo 'X stderr warning after merge' >&2\n    exit 1\n",
+            sentinel = sentinel.display(),
+        )
+    } else {
+        format!(
+            "    touch {sentinel}\n    :\n",
+            sentinel = sentinel.display(),
+        )
+    };
     let body = format!(
         r#"#!/bin/sh
 set -e
@@ -125,11 +177,16 @@ EOF
 {checks}
 EOF
     ;;
-  "pr ready"|"pr merge")
+  "pr ready")
     :
     ;;
+  "pr merge")
+{merge_branch}
+    ;;
   "pr view")
-    # Distinguish the post-merge view (--json mergeCommit) from regular view.
+    # Distinguish the post-merge merge_sha view (--json mergeCommit) from
+    # regular view; for the latter, switch to the merged-state JSON once
+    # the merge step has been observed via the sentinel file.
     case "$*" in
       *"--json mergeCommit"*)
         cat <<'EOF'
@@ -137,9 +194,15 @@ EOF
 EOF
         ;;
       *)
-        cat <<'EOF'
-{view}
+        if [ -e {sentinel} ]; then
+          cat <<'EOF'
+{post_view}
 EOF
+        else
+          cat <<'EOF'
+{pre_view}
+EOF
+        fi
         ;;
     esac
     ;;
@@ -150,8 +213,11 @@ EOF
 esac
 "#,
         create = FIXTURE_CREATE_STDOUT,
-        view = FULL_PR_VIEW_JSON,
+        pre_view = pre_view,
+        post_view = post_view,
         checks = FIXTURE_CHECKS_JSON,
+        merge_branch = merge_branch,
+        sentinel = sentinel.display(),
     );
     let path = stub.tempdir.path().join("gh");
     fs::write(&path, body).expect("write gh stub");
@@ -347,4 +413,78 @@ fn pr_deliver_short_circuits_when_pr_create_validation_fails_with_data_65() {
         .map(|s| s["step"].as_str().unwrap_or(""))
         .collect();
     assert_eq!(steps, vec!["auth_status", "repo_view"]);
+}
+
+#[test]
+fn pr_deliver_treats_gh_exit_1_after_successful_merge_as_success() {
+    // Regression: `gh pr merge` can return exit 1 even after the API merge
+    // call succeeds (typically a branch-cleanup race or post-merge stderr
+    // warning treated as failure). The pr.merge atom should re-check the
+    // PR state and treat the chain as successful when GitHub reports the
+    // PR as merged, so `forge-cli pr deliver` does not surface a phantom
+    // `backend_error: gh exited with status 1` after the PR is actually on
+    // main.
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let gh_path = write_chain_stub_with_merge_exit(
+        &stub,
+        FULL_PR_VIEW_JSON,
+        MERGED_PR_VIEW_JSON,
+        /*merge_exits_one=*/ true,
+    );
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(
+        out.code, 0,
+        "expected success when gh exits 1 but PR is merged; stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], true);
+    let steps: Vec<&str> = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .map(|s| s["step"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            "auth_status",
+            "repo_view",
+            "create",
+            "wait_checks",
+            "ready",
+            "merge",
+        ],
+        "merge step must still be recorded as ok=true after recovery"
+    );
+    assert_eq!(envelope["data"]["pr"]["merged"], true);
+    assert_eq!(envelope["data"]["pr"]["merge_sha"], "abc123def456");
 }

@@ -176,7 +176,7 @@ fn run_lockdown_chain<R: BackendRunner>(
 
     // All gates clear — invoke the backend.
     let merge_call = build_merge_call(ctx, args.id, method, delete_branch);
-    runner.run(&merge_call)?;
+    invoke_merge_with_idempotency_check(runner, ctx, args.id, &merge_call)?;
 
     // Post-merge re-fetch for merge_sha.
     let merge_sha = fetch_merge_sha(runner, ctx, args.id)?;
@@ -287,6 +287,36 @@ fn fetch_repo_view<R: BackendRunner>(
     let call = repo_view::build_call_for_default_branch(ctx);
     let output = runner.run(&call)?;
     repo_view::parse_backend_output(ctx, &output)
+}
+
+/// Run the backend merge call, then verify the PR state if the backend
+/// exits non-zero. `gh` sometimes returns exit 1 after the actual merge
+/// API call succeeds — typically when a post-merge branch cleanup races
+/// the repo's `delete_branch_on_merge` setting, or when `gh` treats a
+/// non-fatal stderr warning as a failure. Treat the call as success only
+/// when GitHub / GitLab actually reports the PR as merged; otherwise
+/// propagate the original [`ForgeError::BackendError`] so a real merge
+/// failure stays loud.
+fn invoke_merge_with_idempotency_check<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pr_id: u64,
+    merge_call: &BackendCall,
+) -> Result<(), ForgeError> {
+    match runner.run(merge_call) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if !matches!(err, ForgeError::BackendError { .. }) {
+                // Software / validation / unavailable errors short-circuit
+                // without consulting the live PR state.
+                return Err(err);
+            }
+            match fetch_pr_view(runner, ctx, pr_id) {
+                Ok(post) if post.state.eq_ignore_ascii_case("merged") => Ok(()),
+                _ => Err(err),
+            }
+        }
+    }
 }
 
 fn fetch_merge_sha<R: BackendRunner>(
