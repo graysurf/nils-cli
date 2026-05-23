@@ -95,9 +95,13 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 - [crates/plan-tooling](crates/plan-tooling): Plan Format v1 tooling CLI (`to-json`, `validate`, `batches`, `artifact-audit`,
   `split-prs`, `scaffold`, `completion`), with bundle validation, advisory durable-artifact classification, deterministic/auto grouping
   primitives, and strict lane-metadata validation gates.
-- [crates/plan-issue-cli](crates/plan-issue-cli): Plan issue orchestration binaries (`plan-issue`, `plan-issue-local`) where
-  `Task Decomposition` is runtime truth, planning artifacts are derived outputs, and runtime lane metadata is materialized from
-  plan content + split-prs grouping results.
+- [crates/plan-issue-cli](crates/plan-issue-cli): Plan issue orchestration binaries (`plan-issue`, `plan-issue-local`).
+  The v3 issue-backed lifecycle is owned by `record open`, `record post`,
+  `record repair-dashboard`, `record audit`, and `record close` (see
+  [`docs/specs/issue-backed-plan-record-contract-v2.md`](crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md)).
+  `Task Decomposition` orchestration remains available through `start-plan`,
+  `start-sprint`, etc., with runtime lane metadata materialized from plan
+  content + split-prs grouping results.
 
 ## Shared helper policy (`nils-common`)
 

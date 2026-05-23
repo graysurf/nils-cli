@@ -6,6 +6,88 @@ versioning.
 
 ## [Unreleased]
 
+### BREAKING (Plan-Issue Lifecycle v3)
+
+- The `plan-issue record` surface is rewritten around the v3 issue-backed
+  plan record contract (see
+  [`docs/specs/issue-backed-plan-record-contract-v2.md`](docs/specs/issue-backed-plan-record-contract-v2.md)
+  and [`docs/specs/plan-issue-state-machine-v2.md`](docs/specs/plan-issue-state-machine-v2.md)).
+  Consumers (notably `agent-runtime-kit`) must migrate after upgrading to
+  the next plan-issue-cli release. There is no compat shim.
+  - The `--marker-family compat|shared` argument is removed. There is now
+    one canonical marker family
+    `<!-- plan-issue-record:v2 role=<role> profile=<profile> -->`. Pre-v2
+    markers (`plan-tracking-issue:`, `execute-from-tracking-issue:`,
+    `tracking-issue-closeout:`, `deliver-dispatch-plan:`, ...) are
+    reported by audit as `unsupported_markers` and ignored as current
+    lifecycle evidence.
+  - Audit JSON renames `audit.markers` to `audit.evidence` and indexes by
+    role (`source`, `plan`, `state`, `session`, `validation`, `review`,
+    `closeout`). Each entry exposes the latest URL, created timestamp,
+    profile, role, status, and the parsed structured payload. Audit also
+    surfaces a stable `missing_required` array (`source-missing`,
+    `plan-missing`, `state-missing`).
+  - Every v2 lifecycle comment carries a fenced JSON block whose
+    info-string is the literal `plan-issue-record-payload`. The payload
+    is the structured source of truth for audit, dashboard repair, and
+    closeout gating. Prose-Markdown status parsing is no longer used.
+  - The `record closeout-gate` standalone command and its
+    `--require-complete`, `--require-session`, `--require-validation`,
+    `--require-review`, `--require-closeout` flags are retired.
+    Closeout-gate evaluation now runs inside `record close` and is
+    strict by default. Failure modes return stable codes
+    (`source-missing`, `plan-missing`, `state-missing`,
+    `state-not-complete`, `state-tasks-incomplete`, `validation-missing`,
+    `validation-failed`, `review-missing`, `review-rejected`,
+    `review-unresolved-findings`, `linked-pr-not-merged`,
+    `approval-missing`).
+  - `record render-comment`, `record render-dashboard`,
+    `record closeout-gate`, and `record build-dispatch-ledger` are
+    retired from the primary `record --help` surface via
+    `#[command(hide = true)]`. They remain callable as transitional
+    helpers until the next major release, but consumers should migrate
+    to `record open`, `record post`, `record repair-dashboard`, and
+    `record close` immediately.
+  - `record close` now requires a non-empty `--approval` URL or text. The
+    strict gate verifies linked PR evidence through provider state
+    (`gh pr view --json state,mergeCommit,statusCheckRollup`) and
+    records the resolved `merge_sha` + `checks` rollup back into the
+    closeout payload.
+  - The JSON envelope `schema_version` for every `record` subcommand
+    bumps to `plan-issue-cli.record.<sub>.v2`. v1 readers that only read
+    the older fields are still compatible because new fields are
+    additive at the result top level, but consumers should pin v2 before
+    reading new fields (`issue.url`, `comments.{source,plan,state}`,
+    `closeout_url`, `final_dashboard`).
+
+### Added (Plan-Issue Lifecycle v3)
+
+- `plan-issue record open --bundle <dir>` opens a provider issue from a
+  plan bundle, validates the plan via `plan-tooling`, verifies source +
+  plan files are committed (`--allow-dirty` opts out), posts canonical
+  v2 source / plan / initial-state comments with structured payloads,
+  and repairs the dashboard with the freshly-created comment URLs.
+  Supports `--dry-run` and `--fixture <dir>` deterministic modes.
+- `plan-issue record post --issue <n> --kind <state|session|validation|review> --payload-file <p>`
+  appends one canonical lifecycle comment with the v2 marker + payload
+  fence. `--kind source|plan` is rejected (owned by `record open`);
+  `--kind closeout` is rejected (owned by `record close`).
+- `plan-issue record repair-dashboard --issue <n>` (or `--body-file +
+  --comments-json` for local mode) recomputes the canonical dashboard
+  from audit evidence and edits the issue body without requiring
+  caller-supplied per-role URLs.
+- `plan-issue record close --issue <n> --linked-pr <ref>... --approval <url-or-text>`
+  performs strict closeout: audit → strict gate → closeout comment →
+  final dashboard → issue close, with provider-verified PR merge
+  evidence.
+- Adapter additions: `GitHubAdapter::issue_evidence`,
+  `GitHubAdapter::pr_merge_summary`, and `comment_issue` now returns the
+  posted comment URL.
+- Agent-runtime-kit consumer handoff: see
+  [`docs/specs/issue-backed-plan-record-contract-v2.md`](docs/specs/issue-backed-plan-record-contract-v2.md)
+  section "Consumer Migration" for example commands for replacing the
+  current `--marker-family compat` invocations.
+
 ### BREAKING
 
 - `start-plan` and `start-sprint` retire the previous flat artifact

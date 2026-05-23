@@ -349,6 +349,74 @@ There is none. Consumers must migrate from v1 markers and v1 command flags
 in a coordinated release of the consumer (agent-runtime-kit) after the
 `plan-issue` v3 release ships.
 
+## Consumer Migration
+
+The agent-runtime-kit dispatch skills are the primary downstream consumer
+of this contract. They currently call `plan-issue` 0.17.x with
+`--marker-family compat` and assemble closeout from `record render-comment`,
+`record render-dashboard`, and `record closeout-gate` by hand. The
+migration is a one-time replacement of those invocations with the new
+provider-backed surface.
+
+### Before (v1, retired)
+
+```bash
+# Open a tracking issue and seed snapshots manually.
+plan-issue record render-comment \
+  --marker-family compat --kind source --content-file source.md --commit "$SOURCE_SHA" \
+  --out source.md
+forge-cli --provider github issue create --repo "$REPO" --title "$TITLE" --body-file source.md
+
+# Post lifecycle comments manually.
+plan-issue record render-comment --marker-family compat --kind state \
+  --content-file state.md --out state.md
+forge-cli --provider github issue comment "$ISSUE" --repo "$REPO" --body-file state.md
+
+# Evaluate closeout gate explicitly.
+plan-issue record closeout-gate \
+  --body-file issue-body.md --comments-json comments.json \
+  --require-complete --require-validation --require-review --require-closeout \
+  --approval "$APPROVAL_URL"
+
+# Close issue manually.
+forge-cli --provider github issue close "$ISSUE" --repo "$REPO" --reason completed
+```
+
+### After (v2, current)
+
+```bash
+# Open the tracking issue from a plan bundle.
+plan-issue --repo "$REPO" record open --bundle docs/plans/<slug>
+
+# Post one lifecycle comment.
+plan-issue --repo "$REPO" record post \
+  --issue "$ISSUE" --kind state --payload-file state.json
+
+# Refresh the dashboard from audit (no caller-supplied URLs).
+plan-issue --repo "$REPO" record repair-dashboard --issue "$ISSUE"
+
+# Strict closeout: audit, gate, comment, repair, close in one call.
+plan-issue --repo "$REPO" record close \
+  --issue "$ISSUE" \
+  --linked-pr "$REPO#$PR_NUMBER" \
+  --approval "$APPROVAL_URL"
+```
+
+### Migration checklist
+
+- [ ] Replace any `--marker-family compat` callsites with v2 invocations.
+- [ ] Replace `record render-comment | render-dashboard | closeout-gate`
+      composition with `record open | post | repair-dashboard | close`.
+- [ ] Switch JSON consumers from `audit.markers` (v1) to `audit.evidence`
+      keyed by role (v2).
+- [ ] Re-pin the JSON envelope on `plan-issue-cli.record.<sub>.v2` before
+      reading the new top-level fields (`issue.url`, `comments.*`,
+      `closeout_url`, `final_dashboard`).
+- [ ] After upgrading, re-post v2-marker `source`, `plan`, and `state`
+      comments on any in-flight tracking issue so audit can find them
+      (Sprint 1 + 2 lifecycle comments on existing issues remain v1 and
+      audit treats them as `unsupported_markers`).
+
 ## Test Fixtures
 
 Live commands accept a `--fixture <dir>` argument. The directory contains:
