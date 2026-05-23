@@ -333,7 +333,86 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:plan-issue-local-record-command-$line[1]:"
         case $line[1] in
-            (render-dashboard)
+            (open)
+_arguments "${_arguments_options[@]}" : \
+'--profile=[Lifecycle profile for the record]:PROFILE:(tracking dispatch)' \
+'--bundle=[Plan bundle directory. The bundle directory contains the source, plan, and execution-state Markdown files using the \`<slug>-discussion-source.md\` / \`<slug>-review-source.md\`, \`<slug>-plan.md\`, and \`<slug>-execution-state.md\` naming convention validated by \`plan-tooling validate\`]:dir:_files' \
+'--source-file=[Explicit source document path. Overrides bundle derivation]:path:_files' \
+'--plan-file=[Explicit plan document path. Overrides bundle derivation]:path:_files' \
+'--execution-state-file=[Explicit execution-state document path. Overrides bundle derivation]:path:_files' \
+'--title=[Issue title. Defaults to the plan title]:text:_default' \
+'--fixture=[Deterministic fixture mode. The directory is consumed instead of live provider calls]:dir:_files' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--allow-dirty[Allow opening the record even when local plan files are dirty]' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(post)
+_arguments "${_arguments_options[@]}" : \
+'--issue=[Provider issue number or full URL]:issue:_default' \
+'--profile=[Lifecycle profile for the marker and payload]:PROFILE:(tracking dispatch)' \
+'--kind=[Lifecycle comment kind. \`source\` and \`plan\` kinds are owned by \`record open\` and rejected here]:KIND:(source plan state session validation review closeout)' \
+'--payload-file=[JSON file containing the structured payload \`data\` field]:path:_files' \
+'--summary-file=[Visible Markdown commentary appended after the structured payload]:path:_files' \
+'--fixture=[Deterministic fixture mode]:dir:_files' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(repair-dashboard)
+_arguments "${_arguments_options[@]}" : \
+'--issue=[Provider issue number or full URL]:issue:_default' \
+'--body-file=[Provider issue body Markdown (deterministic mode)]:path:_files' \
+'--comments-json=[JSON containing either \`comments\` from \`gh issue view --json comments\` or a raw array of comment objects (deterministic mode)]:path:_files' \
+'--fixture=[Deterministic fixture mode]:dir:_files' \
+'--out=[Write rendered Markdown to this path instead of editing the issue]:path:_files' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+'--issue=[Provider issue number or full URL]:issue:_default' \
+'--profile=[Lifecycle profile of the record being closed]:PROFILE:(tracking dispatch)' \
+'*--linked-pr=[Linked PR reference. Repeatable. Each ref is cross-checked against the latest state payload and verified through the provider for merge status]:ref:_default' \
+'--approval=[Approval evidence. May be a provider comment URL or non-empty approval text]:text:_default' \
+'--bundle=[Plan bundle directory. Used for local source/plan commit verification when provided]:dir:_files' \
+'--body-file=[Deterministic test mode\: issue body Markdown]:path:_files' \
+'--comments-json=[Deterministic test mode\: comments JSON]:path:_files' \
+'--fixture=[Deterministic fixture mode. Contains issue body, comments JSON, and PR snapshots used in place of provider lookups]:dir:_files' \
+'--repo=[Pass-through repository target for GitHub operations]:owner/repo:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--state-dir=[Runtime workspace root. Overrides \$PLAN_ISSUE_HOME and the \$XDG_STATE_HOME/plan-issue default. Artefacts land under \`<state-dir>/out/plan-issue-delivery/...\`]:PATH:_files' \
+'--dry-run[Print write actions without mutating GitHub state]' \
+'-f[Bypass markdown payload guard for GitHub body/comment writes]' \
+'--force[Bypass markdown payload guard for GitHub body/comment writes]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(render-dashboard)
 _arguments "${_arguments_options[@]}" : \
 '--profile=[Lifecycle profile for the issue record]:PROFILE:(tracking dispatch)' \
 '--status=[Current lifecycle status shown in the dashboard]:text:_default' \
@@ -368,8 +447,6 @@ _arguments "${_arguments_options[@]}" : \
 (render-comment)
 _arguments "${_arguments_options[@]}" : \
 '--profile=[Lifecycle profile for the comment marker and visible metadata]:PROFILE:(tracking dispatch)' \
-'--marker-family=[Marker family to emit]:MARKER_FAMILY:((shared\:"Emit the shared issue-backed-plan marker family"
-compat\:"Emit compatibility markers used by the existing tracking lifecycle"))' \
 '--kind=[Lifecycle comment kind]:KIND:(source plan state session validation review closeout)' \
 '--path=[Source file path represented by this comment]:path:_files' \
 '--commit=[Commit hash for snapshot comments]:sha:_default' \
@@ -384,8 +461,8 @@ compat\:"Emit compatibility markers used by the existing tracking lifecycle"))' 
 '-f[Bypass markdown payload guard for GitHub body/comment writes]' \
 '--force[Bypass markdown payload guard for GitHub body/comment writes]' \
 '(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
+'-h[Print help]' \
+'--help[Print help]' \
 && ret=0
 ;;
 (audit)
@@ -546,11 +623,15 @@ _plan-issue-local__subcmd__ready-sprint_commands() {
 (( $+functions[_plan-issue-local__subcmd__record_commands] )) ||
 _plan-issue-local__subcmd__record_commands() {
     local commands; commands=(
-'render-dashboard:Render a mutable issue dashboard for an issue-backed plan record' \
-'render-comment:Render one append-only lifecycle comment' \
+'open:Open a provider issue from a plan bundle and post initial lifecycle comments (v3 issue-backed plan record contract)' \
+'post:Append a canonical lifecycle comment (state, session, validation, review, or closeout) to an existing plan record issue' \
+'repair-dashboard:Recompute and edit the dashboard issue body from audit evidence' \
+'close:Close a plan record issue after the strict lifecycle gate passes' \
+'render-dashboard:Render a mutable issue dashboard for an issue-backed plan record. Retired in v2 — dashboard rendering moved under \`record repair-dashboard\`. Kept callable as a transitional helper' \
+'render-comment:Render one append-only lifecycle comment. Retired in v2 — comment rendering is an implementation detail of \`record open\` / \`record post\`. Kept callable as a transitional helper' \
 'audit:Audit issue body and comments for lifecycle markers' \
-'closeout-gate:Evaluate closeout readiness from lifecycle audit evidence' \
-'build-dispatch-ledger:Build a dispatch ledger from plan metadata and split grouping rules' \
+'closeout-gate:Evaluate closeout readiness from lifecycle audit evidence. Retired in v2 — closeout gate evaluation moved inside \`record close\` (strict by default). Kept callable as a transitional helper' \
+'build-dispatch-ledger:Build a dispatch ledger from plan metadata and split grouping rules. Retired in v2 — dispatch consumers move to \`record open\` + state payload. Kept callable as a transitional helper' \
     )
     _describe -t commands 'plan-issue-local record commands' commands "$@"
 }
@@ -564,10 +645,25 @@ _plan-issue-local__subcmd__record__subcmd__build-dispatch-ledger_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue-local record build-dispatch-ledger commands' commands "$@"
 }
+(( $+functions[_plan-issue-local__subcmd__record__subcmd__close_commands] )) ||
+_plan-issue-local__subcmd__record__subcmd__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue-local record close commands' commands "$@"
+}
 (( $+functions[_plan-issue-local__subcmd__record__subcmd__closeout-gate_commands] )) ||
 _plan-issue-local__subcmd__record__subcmd__closeout-gate_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue-local record closeout-gate commands' commands "$@"
+}
+(( $+functions[_plan-issue-local__subcmd__record__subcmd__open_commands] )) ||
+_plan-issue-local__subcmd__record__subcmd__open_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue-local record open commands' commands "$@"
+}
+(( $+functions[_plan-issue-local__subcmd__record__subcmd__post_commands] )) ||
+_plan-issue-local__subcmd__record__subcmd__post_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue-local record post commands' commands "$@"
 }
 (( $+functions[_plan-issue-local__subcmd__record__subcmd__render-comment_commands] )) ||
 _plan-issue-local__subcmd__record__subcmd__render-comment_commands() {
@@ -578,6 +674,11 @@ _plan-issue-local__subcmd__record__subcmd__render-comment_commands() {
 _plan-issue-local__subcmd__record__subcmd__render-dashboard_commands() {
     local commands; commands=()
     _describe -t commands 'plan-issue-local record render-dashboard commands' commands "$@"
+}
+(( $+functions[_plan-issue-local__subcmd__record__subcmd__repair-dashboard_commands] )) ||
+_plan-issue-local__subcmd__record__subcmd__repair-dashboard_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-issue-local record repair-dashboard commands' commands "$@"
 }
 (( $+functions[_plan-issue-local__subcmd__resolve-approval_commands] )) ||
 _plan-issue-local__subcmd__resolve-approval_commands() {

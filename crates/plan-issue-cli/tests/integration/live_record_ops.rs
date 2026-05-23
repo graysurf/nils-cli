@@ -683,3 +683,126 @@ fn record_open_dry_run_returns_preview_without_gh_calls() {
         "{source_comment}"
     );
 }
+
+/// Sprint 4 Task 4.3: exercise the v3 closeout end-to-end against a sanitized
+/// agent-runtime-kit fixture. Asserts that one `record close` invocation can
+/// audit the issue, verify provider PR merge evidence, render the closeout
+/// comment + final dashboard, and that no v1 markers leak into the result.
+#[test]
+fn agent_runtime_kit_lifecycle_fixture_passes_strict_v2_closeout_end_to_end() {
+    let fixture = Path::new("tests/fixtures/lifecycle/agent-runtime-kit-closeout").to_path_buf();
+    assert!(fixture.exists(), "fixture missing: {}", fixture.display());
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "42",
+        "--linked-pr",
+        "sympoies/agent-runtime-kit#1",
+        "--approval",
+        "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-approval",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["operation"], "record.close");
+    assert_eq!(result["mode"], "fixture");
+    assert_eq!(result["dry_run"], true);
+
+    let preview = &result["preview"];
+    let closeout_body = preview["closeout_comment_body"]
+        .as_str()
+        .expect("closeout body present");
+    // Closeout comment uses the v2 marker and carries provider-verified
+    // merge_sha from the fixture PR snapshot.
+    assert!(
+        closeout_body.starts_with("<!-- plan-issue-record:v2 role=closeout profile=tracking -->"),
+        "{closeout_body}"
+    );
+    assert!(
+        closeout_body.contains("\"merge_sha\": \"merge1111111111111111111111111111111111\""),
+        "merge_sha must come from PR fixture, not state payload: {closeout_body}"
+    );
+    assert!(
+        closeout_body.contains("\"final_status\": \"complete\""),
+        "{closeout_body}"
+    );
+    // Sanity: no v1 marker bleed-through.
+    assert!(
+        !closeout_body.contains("execute-from-tracking-issue:")
+            && !closeout_body.contains("plan-tracking-issue:"),
+        "v1 markers must not appear in v2 closeout body: {closeout_body}"
+    );
+
+    let final_dashboard = preview["final_dashboard"]
+        .as_str()
+        .expect("final dashboard present");
+    assert!(
+        final_dashboard.starts_with("## Final Dashboard"),
+        "complete state must render Final Dashboard: {final_dashboard}"
+    );
+    // Durable record links derive from audit, not caller-supplied URLs.
+    assert!(
+        final_dashboard.contains(
+            "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-source"
+        ),
+        "dashboard must include source URL from audit: {final_dashboard}"
+    );
+    assert!(
+        final_dashboard
+            .contains("https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-state"),
+        "dashboard must include state URL from audit: {final_dashboard}"
+    );
+}
+
+/// Sprint 4 Task 4.3: same fixture, but force the strict gate to fail by
+/// flipping the PR snapshot to unmerged. Verifies the gate code surfaces.
+#[test]
+fn agent_runtime_kit_lifecycle_fixture_blocks_when_pr_unmerged() {
+    let src = Path::new("tests/fixtures/lifecycle/agent-runtime-kit-closeout");
+    let tmp = TempDir::new().expect("tmp");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(fixture.join("prs")).expect("create fixture dirs");
+    fs::copy(src.join("issue-body.md"), fixture.join("issue-body.md")).expect("copy body");
+    fs::copy(src.join("comments.json"), fixture.join("comments.json")).expect("copy comments");
+    // Replace the PR snapshot with an open PR so the strict gate fails.
+    fs::write(
+        fixture.join("prs/sympoies__agent-runtime-kit__1.json"),
+        serde_json::to_string(&json!({
+            "state": "OPEN",
+            "mergeCommit": null,
+            "statusCheckRollup": {"state": "pending"},
+            "url": "https://github.com/sympoies/agent-runtime-kit/pull/1"
+        }))
+        .expect("pr json"),
+    )
+    .expect("write open pr fixture");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "42",
+        "--linked-pr",
+        "sympoies/agent-runtime-kit#1",
+        "--approval",
+        "ok",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+
+    assert_ne!(out.code, 0, "unmerged PR should block strict closeout");
+    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    assert!(
+        joined.contains("linked-pr-not-merged"),
+        "expected linked-pr-not-merged code, got: {joined}"
+    );
+}

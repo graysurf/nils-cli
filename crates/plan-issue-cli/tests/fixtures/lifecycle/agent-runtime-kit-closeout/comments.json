@@ -1,0 +1,34 @@
+{
+  "comments": [
+    {
+      "url": "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-source",
+      "created_at": "2026-05-20T08:00:00Z",
+      "body": "<!-- plan-issue-record:v2 role=source profile=tracking -->\n\n## Source Snapshot\n\n- Profile: tracking\n- Path: `docs/plans/agent-runtime-kit-closeout/agent-runtime-kit-closeout-discussion-source.md`\n- Commit: `src111111`\n\n```plan-issue-record-payload\n{\n  \"schema\": \"plan-issue-record.payload.v2\",\n  \"role\": \"source\",\n  \"profile\": \"tracking\",\n  \"data\": {\"path\": \"docs/plans/agent-runtime-kit-closeout/agent-runtime-kit-closeout-discussion-source.md\", \"commit\": \"src1111111111111111111111111111111111111\"}\n}\n```\n"
+    },
+    {
+      "url": "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-plan",
+      "created_at": "2026-05-20T08:01:00Z",
+      "body": "<!-- plan-issue-record:v2 role=plan profile=tracking -->\n\n## Plan Snapshot\n\n- Profile: tracking\n- Path: `docs/plans/agent-runtime-kit-closeout/agent-runtime-kit-closeout-plan.md`\n- Commit: `pln111111`\n\n```plan-issue-record-payload\n{\n  \"schema\": \"plan-issue-record.payload.v2\",\n  \"role\": \"plan\",\n  \"profile\": \"tracking\",\n  \"data\": {\"path\": \"docs/plans/agent-runtime-kit-closeout/agent-runtime-kit-closeout-plan.md\", \"commit\": \"pln1111111111111111111111111111111111111\"}\n}\n```\n"
+    },
+    {
+      "url": "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-state",
+      "created_at": "2026-05-22T18:00:00Z",
+      "body": "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n## Execution State\n\n- Profile: tracking\n\n```plan-issue-record-payload\n{\n  \"schema\": \"plan-issue-record.payload.v2\",\n  \"role\": \"state\",\n  \"profile\": \"tracking\",\n  \"updated_at\": \"2026-05-22T18:00:00Z\",\n  \"data\": {\n    \"status\": \"complete\",\n    \"target_scope\": \"agent-runtime-kit closeout fixture\",\n    \"current\": \"complete\",\n    \"next_action\": \"closeout\",\n    \"tasks\": [\n      {\"id\": \"1.1\", \"status\": \"done\", \"title\": \"Implement skill consumers\"},\n      {\"id\": \"1.2\", \"status\": \"done\", \"title\": \"Wire dispatch lanes\"},\n      {\"id\": \"1.3\", \"status\": \"deferred\", \"title\": \"Tooling polish\"}\n    ],\n    \"prs\": [\n      {\"ref\": \"sympoies/agent-runtime-kit#1\", \"url\": \"https://github.com/sympoies/agent-runtime-kit/pull/1\", \"status\": \"merged\"}\n    ],\n    \"blockers\": [],\n    \"links\": {\n      \"source\": \"https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-source\",\n      \"plan\": \"https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-plan\"\n    }\n  }\n}\n```\n"
+    },
+    {
+      "url": "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-session",
+      "created_at": "2026-05-22T18:10:00Z",
+      "body": "<!-- plan-issue-record:v2 role=session profile=tracking -->\n\n## Execution Session\n\n- Profile: tracking\n\n```plan-issue-record-payload\n{\n  \"schema\": \"plan-issue-record.payload.v2\",\n  \"role\": \"session\",\n  \"profile\": \"tracking\",\n  \"data\": {\n    \"summary\": \"Implementation complete; ready for closeout.\",\n    \"highlights\": [\"All tasks done or explicitly deferred\", \"Provider-side PR merged\"],\n    \"links\": {\"state\": \"https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-state\"}\n  }\n}\n```\n"
+    },
+    {
+      "url": "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-validation",
+      "created_at": "2026-05-22T18:15:00Z",
+      "body": "<!-- plan-issue-record:v2 role=validation profile=tracking -->\n\n## Validation Evidence\n\n- Profile: tracking\n\n```plan-issue-record-payload\n{\n  \"schema\": \"plan-issue-record.payload.v2\",\n  \"role\": \"validation\",\n  \"profile\": \"tracking\",\n  \"data\": {\n    \"overall\": \"pass\",\n    \"commands\": [\n      {\"command\": \"cargo test\", \"status\": \"pass\"},\n      {\"command\": \"npm test\", \"status\": \"pass\"}\n    ],\n    \"waivers\": []\n  }\n}\n```\n"
+    },
+    {
+      "url": "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-review",
+      "created_at": "2026-05-22T18:30:00Z",
+      "body": "<!-- plan-issue-record:v2 role=review profile=tracking -->\n\n## Review Evidence\n\n- Profile: tracking\n\n```plan-issue-record-payload\n{\n  \"schema\": \"plan-issue-record.payload.v2\",\n  \"role\": \"review\",\n  \"profile\": \"tracking\",\n  \"data\": {\n    \"decision\": \"approve\",\n    \"lenses\": [\"testing\", \"maintainability\", \"api-contract\"],\n    \"findings\": [\n      {\"id\": \"F1\", \"severity\": \"minor\", \"disposition\": \"fixed\", \"summary\": \"Edge case test added\"}\n    ],\n    \"outcome_comment_url\": \"https://github.com/sympoies/agent-runtime-kit/pull/1#issuecomment-outcome\"\n  }\n}\n```\n"
+    }
+  ]
+}
