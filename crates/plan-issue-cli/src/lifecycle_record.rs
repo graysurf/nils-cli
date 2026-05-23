@@ -1543,8 +1543,9 @@ pub fn render_record_post_comment(
 // Strict closeout gate (Sprint 3)
 //
 // Sprint 3 introduces `evaluate_strict_closeout_gate` for `record close`. It
-// supersedes the v1 `evaluate_closeout_gate` which is retained for the legacy
-// `record closeout-gate` subcommand until Sprint 4 retires that surface.
+// supersedes the v1 `evaluate_closeout_gate`, which is retained as a
+// transitional helper for the `record closeout-gate` subcommand until
+// Sprint 4 retires that surface.
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
