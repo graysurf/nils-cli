@@ -4,6 +4,12 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tempfile::TempDir;
 
+use plan_issue_cli::lifecycle_record::{
+    self, CheckStatus, FindingDisposition, FindingSeverity, PAYLOAD_SCHEMA_V2, PayloadErrorKind,
+    PayloadProfile, PayloadRole, PrLifecycleStatus, ReviewDecision, StateStatus, TaskRowStatus,
+    ValidationCommandStatus, ValidationOverall,
+};
+
 use crate::common;
 
 fn json_stdout(out: &common::CmdOut) -> Value {
@@ -257,4 +263,148 @@ fn issue_backed_lifecycle_build_dispatch_ledger_uses_plan_tooling_without_task_d
             .unwrap()
             > 0
     );
+}
+
+// --- Sprint 1 Task 1.3: lifecycle_record_structured_payloads ---
+
+fn payload_comment(body: &str) -> String {
+    format!(
+        "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n## State\n\n```plan-issue-record-payload\n{body}\n```\n",
+    )
+}
+
+#[test]
+fn lifecycle_record_structured_payloads_state_round_trip() {
+    let body = format!(
+        "{{\n  \"schema\": \"{PAYLOAD_SCHEMA_V2}\",\n  \"role\": \"state\",\n  \"profile\": \"tracking\",\n  \"updated_at\": \"2026-05-23T09:00:00Z\",\n  \"data\": {{\n    \"status\": \"in-progress\",\n    \"target_scope\": \"Plan-Issue v3 sprint 1\",\n    \"current\": \"Sprint 1 implementation\",\n    \"next_action\": \"Land spec PR\",\n    \"tasks\": [\n      {{\"id\": \"1.1\", \"status\": \"done\", \"title\": \"Spec\"}},\n      {{\"id\": \"1.2\", \"status\": \"in-progress\"}}\n    ],\n    \"prs\": [\n      {{\"ref\": \"sympoies/nils-cli#500\", \"url\": \"https://github.com/sympoies/nils-cli/pull/500\", \"status\": \"open\"}}\n    ],\n    \"blockers\": [],\n    \"links\": {{\"source\": \"https://github.com/sympoies/nils-cli/issues/448#issuecomment-100\"}}\n  }}\n}}"
+    );
+    let comment = payload_comment(&body);
+
+    let envelope = lifecycle_record::extract_payload(&comment).expect("extract state payload");
+    assert_eq!(envelope.role, PayloadRole::State);
+    assert_eq!(envelope.profile, PayloadProfile::Tracking);
+    assert_eq!(envelope.updated_at.as_deref(), Some("2026-05-23T09:00:00Z"));
+
+    let state = envelope.parse_state().expect("parse state data");
+    assert_eq!(state.status, Some(StateStatus::InProgress));
+    assert_eq!(
+        state.target_scope.as_deref(),
+        Some("Plan-Issue v3 sprint 1")
+    );
+    assert_eq!(state.tasks.len(), 2);
+    assert_eq!(state.tasks[0].id, "1.1");
+    assert_eq!(state.tasks[0].status, TaskRowStatus::Done);
+    assert_eq!(state.tasks[1].status, TaskRowStatus::InProgress);
+    assert_eq!(state.prs.len(), 1);
+    assert_eq!(state.prs[0].pr_ref, "sympoies/nils-cli#500");
+    assert_eq!(state.prs[0].status, PrLifecycleStatus::Open);
+    assert_eq!(
+        state.links.get("source").map(String::as_str),
+        Some("https://github.com/sympoies/nils-cli/issues/448#issuecomment-100"),
+    );
+}
+
+#[test]
+fn lifecycle_record_structured_payloads_validation_command_rows() {
+    let body = format!(
+        "{{\n  \"schema\": \"{PAYLOAD_SCHEMA_V2}\",\n  \"role\": \"validation\",\n  \"profile\": \"tracking\",\n  \"data\": {{\n    \"overall\": \"pass\",\n    \"commands\": [\n      {{\"command\": \"cargo test -p nils-plan-issue-cli\", \"status\": \"pass\"}},\n      {{\"command\": \"bash scripts/ci/nils-cli-checks-entrypoint.sh\", \"status\": \"pass\", \"evidence\": \"out/log.txt\"}}\n    ],\n    \"waivers\": []\n  }}\n}}"
+    );
+    let comment = payload_comment(&body);
+
+    let envelope = lifecycle_record::extract_payload(&comment).expect("extract validation payload");
+    let validation = envelope.parse_validation().expect("parse validation data");
+    assert_eq!(validation.overall, ValidationOverall::Pass);
+    assert_eq!(validation.commands.len(), 2);
+    for cmd in &validation.commands {
+        assert_eq!(cmd.status, ValidationCommandStatus::Pass);
+    }
+    assert_eq!(
+        validation.commands[1].evidence.as_deref(),
+        Some("out/log.txt")
+    );
+    assert!(validation.waivers.is_empty());
+}
+
+#[test]
+fn lifecycle_record_structured_payloads_review_findings_and_decision() {
+    let body = format!(
+        "{{\n  \"schema\": \"{PAYLOAD_SCHEMA_V2}\",\n  \"role\": \"review\",\n  \"profile\": \"tracking\",\n  \"data\": {{\n    \"decision\": \"approve\",\n    \"lenses\": [\"testing\", \"maintainability\"],\n    \"findings\": [\n      {{\"id\": \"F1\", \"severity\": \"minor\", \"disposition\": \"fixed\", \"summary\": \"Fence parser handles whitespace\"}},\n      {{\"id\": \"F2\", \"severity\": \"nit\", \"disposition\": \"no-action\", \"summary\": \"Comment wording\"}}\n    ],\n    \"outcome_comment_url\": \"https://github.com/sympoies/nils-cli/pull/500#issuecomment-200\"\n  }}\n}}"
+    );
+    let comment = payload_comment(&body);
+
+    let envelope = lifecycle_record::extract_payload(&comment).expect("extract review payload");
+    let review = envelope.parse_review().expect("parse review data");
+    assert_eq!(review.decision, ReviewDecision::Approve);
+    assert_eq!(review.lenses, vec!["testing", "maintainability"]);
+    assert_eq!(review.findings.len(), 2);
+    assert_eq!(review.findings[0].severity, FindingSeverity::Minor);
+    assert_eq!(review.findings[0].disposition, FindingDisposition::Fixed);
+    assert_eq!(review.findings[1].severity, FindingSeverity::Nit);
+    assert_eq!(review.findings[1].disposition, FindingDisposition::NoAction);
+    assert_eq!(
+        review.outcome_comment_url.as_deref(),
+        Some("https://github.com/sympoies/nils-cli/pull/500#issuecomment-200"),
+    );
+}
+
+#[test]
+fn lifecycle_record_structured_payloads_closeout_final_checks_and_merge_evidence() {
+    let body = format!(
+        "{{\n  \"schema\": \"{PAYLOAD_SCHEMA_V2}\",\n  \"role\": \"closeout\",\n  \"profile\": \"tracking\",\n  \"data\": {{\n    \"final_status\": \"complete\",\n    \"approval\": {{\"comment_url\": \"https://example/approve\", \"approver\": \"graysurf\"}},\n    \"linked_prs\": [\n      {{\"ref\": \"sympoies/nils-cli#500\", \"url\": \"https://github.com/sympoies/nils-cli/pull/500\", \"merge_sha\": \"abcd1234\", \"checks\": \"pass\"}},\n      {{\"ref\": \"sympoies/nils-cli#501\", \"merge_sha\": \"5678ef\", \"checks\": \"pass\"}}\n    ],\n    \"final_validation_url\": \"https://example/validation\"\n  }}\n}}"
+    );
+    let comment = payload_comment(&body);
+
+    let envelope = lifecycle_record::extract_payload(&comment).expect("extract closeout payload");
+    let closeout = envelope.parse_closeout().expect("parse closeout data");
+    assert_eq!(closeout.final_status, "complete");
+    assert_eq!(closeout.approval.approver.as_deref(), Some("graysurf"));
+    assert_eq!(closeout.linked_prs.len(), 2);
+    for pr in &closeout.linked_prs {
+        assert!(pr.merge_sha.is_some(), "merge_sha required: {pr:?}");
+        assert_eq!(pr.checks, CheckStatus::Pass);
+    }
+    assert_eq!(
+        closeout.final_validation_url.as_deref(),
+        Some("https://example/validation"),
+    );
+}
+
+#[test]
+fn lifecycle_record_structured_payloads_reject_schema_mismatch() {
+    let body = "{\n  \"schema\": \"plan-issue-record.payload.v1\",\n  \"role\": \"state\",\n  \"profile\": \"tracking\",\n  \"data\": {}\n}";
+    let comment = payload_comment(body);
+
+    let err = lifecycle_record::extract_payload(&comment).expect_err("schema mismatch");
+    assert_eq!(err.kind, PayloadErrorKind::SchemaMismatch);
+    assert!(
+        err.message.contains("plan-issue-record.payload.v2"),
+        "{}",
+        err.message,
+    );
+}
+
+#[test]
+fn lifecycle_record_structured_payloads_reject_missing_fence() {
+    let comment = "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\nNo payload here.\n";
+    let err = lifecycle_record::extract_payload(comment).expect_err("no fence");
+    assert_eq!(err.kind, PayloadErrorKind::NoFence);
+}
+
+#[test]
+fn lifecycle_record_structured_payloads_reject_invalid_json() {
+    let comment = "```plan-issue-record-payload\n{ not json }\n```\n";
+    let err = lifecycle_record::extract_payload(comment).expect_err("invalid json");
+    assert_eq!(err.kind, PayloadErrorKind::InvalidJson);
+}
+
+#[test]
+fn lifecycle_record_structured_payloads_reject_role_decode_mismatch() {
+    let body = format!(
+        "{{\n  \"schema\": \"{PAYLOAD_SCHEMA_V2}\",\n  \"role\": \"session\",\n  \"profile\": \"tracking\",\n  \"data\": {{\"summary\": \"x\"}}\n}}"
+    );
+    let comment = payload_comment(&body);
+    let envelope = lifecycle_record::extract_payload(&comment).expect("extract session payload");
+    let err = envelope.parse_state().expect_err("state decode mismatch");
+    assert_eq!(err.kind, PayloadErrorKind::SchemaMismatch);
+    assert!(err.message.contains("state"), "{}", err.message);
 }

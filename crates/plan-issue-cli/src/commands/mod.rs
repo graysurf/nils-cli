@@ -284,6 +284,10 @@ impl Command {
 impl RecordArgs {
     pub fn command_id(&self) -> &'static str {
         match &self.command {
+            record::RecordCommand::Open(_) => "record.open",
+            record::RecordCommand::Post(_) => "record.post",
+            record::RecordCommand::RepairDashboard(_) => "record.repair-dashboard",
+            record::RecordCommand::Close(_) => "record.close",
             record::RecordCommand::RenderDashboard(_) => "record.render-dashboard",
             record::RecordCommand::RenderComment(_) => "record.render-comment",
             record::RecordCommand::Audit(_) => "record.audit",

@@ -1,4 +1,14 @@
-# plan-issue State Machine and Gate Invariants v1
+# plan-issue State Machine and Gate Invariants v1 (Task Decomposition Runtime)
+
+> **Status:** Prior surface. v1 describes the `start-plan` /
+> `start-sprint` Task Decomposition runtime. The default lifecycle for new
+> agent-runtime-kit issue-backed records is described in
+> [plan-issue state machine v2](plan-issue-state-machine-v2.md), which
+> pairs with [issue-backed plan record contract v2](issue-backed-plan-record-contract-v2.md).
+> v1 remains normative only for the Task Decomposition commands while
+> they continue to ship. `## Task Decomposition` is no longer the default
+> runtime-truth surface for agent-runtime-kit consumers; new lifecycles
+> live in append-only canonical marker comments.
 
 ## Purpose
 
