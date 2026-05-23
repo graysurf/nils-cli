@@ -14,7 +14,7 @@ fixture_dir="$repo_root/crates/agent-docs/tests/fixtures/add"
 manifest_path="$repo_root/crates/agent-docs/Cargo.toml"
 
 run_snapshot_tests() {
-  cargo test --manifest-path "$manifest_path" --test add --test baseline
+  cargo test --manifest-path "$manifest_path" --test integration -- add:: baseline::
 }
 
 bless_add_snapshots() {
@@ -46,7 +46,7 @@ bless_add_snapshots() {
       --target home \
       --context task-tools \
       --scope home \
-      --path CLI_TOOLS.md \
+      --path core/policies/cli-tools.md \
       --required \
       --notes after >/dev/null
 

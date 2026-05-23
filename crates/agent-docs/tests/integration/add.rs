@@ -145,8 +145,9 @@ fn add_full_flow_for_home_and_project_scopes() {
     assert!(
         task_tools_required
             .iter()
-            .any(|line| line.contains("CLI_TOOLS.md") && line.contains("source=builtin")),
-        "task-tools output should include builtin CLI_TOOLS.md:\n{}",
+            .any(|line| line.contains("core/policies/cli-tools.md")
+                && line.contains("source=builtin")),
+        "task-tools output should include builtin core/policies/cli-tools.md:\n{}",
         task_tools_resolve.stdout
     );
     assert!(
@@ -206,7 +207,7 @@ fn run_home_task_tools_add_update(workspace: &common::FixtureWorkspace) -> commo
             "--scope",
             "home",
             "--path",
-            "CLI_TOOLS.md",
+            "core/policies/cli-tools.md",
             "--required",
             "--notes",
             "after",

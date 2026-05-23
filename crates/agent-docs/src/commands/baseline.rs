@@ -82,8 +82,8 @@ fn home_items(roots: &ResolvedRoots) -> Vec<BaselineCheckItem> {
             Context::TaskTools,
             "task-tools",
             &roots.docs_home,
-            "CLI_TOOLS.md",
-            "tool-selection guidance from AGENT_DOCS_HOME/CLI_TOOLS.md",
+            "core/policies/cli-tools.md",
+            "tool-selection guidance from AGENT_DOCS_HOME/core/policies/cli-tools.md",
             DocumentSource::Builtin,
         ),
     ]

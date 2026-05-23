@@ -322,7 +322,7 @@ notes = "home-extra"
 [[document]]
 context = "task-tools"
 scope = "home"
-path = "CLI_TOOLS.md"
+path = "core/policies/cli-tools.md"
 required = true
 notes = "other-context-ignored"
 "#,
@@ -342,7 +342,7 @@ notes = "project-extra-overrides-home"
 [[document]]
 context = "project-dev"
 scope = "home"
-path = "CLI_TOOLS.md"
+path = "core/policies/cli-tools.md"
 required = false
 notes = "project-home-scope-entry"
 "#,
@@ -397,7 +397,7 @@ notes = "project-home-scope-entry"
     );
 
     let home_scoped = &documents[3];
-    assert!(home_scoped.path.ends_with("CLI_TOOLS.md"));
+    assert!(home_scoped.path.ends_with("core/policies/cli-tools.md"));
     assert_eq!(home_scoped.source, DocumentSource::ExtensionProject);
     assert!(!home_scoped.required);
     assert_eq!(home_scoped.status, DocumentStatus::Present);
@@ -440,7 +440,7 @@ fn expected_documents(context: Context) -> &'static [ExpectedDocument] {
         }],
         Context::TaskTools => &[ExpectedDocument {
             scope: "home",
-            file_name: "CLI_TOOLS.md",
+            file_name: "cli-tools.md",
             source: "builtin",
             status: "present",
         }],

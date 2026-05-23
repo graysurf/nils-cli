@@ -31,7 +31,7 @@ notes = "required must be boolean"
 [[document]]
 context = "task-tools"
 scope = "home"
-path = "CLI_TOOLS.md"
+path = "core/policies/cli-tools.md"
 required = true
 when = "if-env:CI"
 notes = "unsupported when condition"

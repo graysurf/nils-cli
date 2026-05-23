@@ -10,7 +10,7 @@ context = "task-tools" # keep context inline
 scope = "home" # keep scope inline
 
 # section path
-path = "CLI_TOOLS.md" # keep path inline
+path = "core/policies/cli-tools.md" # keep path inline
 required = false # keep required inline
 
 # section when

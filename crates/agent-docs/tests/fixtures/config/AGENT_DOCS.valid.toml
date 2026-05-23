@@ -40,7 +40,7 @@ notes = "skill-dev home baseline"
 [[document]]
 context = "task-tools"
 scope = "home"
-path = "CLI_TOOLS.md"
+path = "core/policies/cli-tools.md"
 required = true
 when = "always"
 notes = "task-tools home baseline"

@@ -23,7 +23,7 @@ fn scaffold_baseline_missing_only_creates_only_missing_files() {
 
     let home_agents = workspace.docs_home.join("AGENTS.md");
     let home_development = workspace.docs_home.join("DEVELOPMENT.md");
-    let home_cli_tools = workspace.docs_home.join("CLI_TOOLS.md");
+    let home_cli_tools = workspace.docs_home.join("core/policies/cli-tools.md");
     let project_agents = workspace.project_path.join("AGENTS.md");
     let project_development = workspace.project_path.join("DEVELOPMENT.md");
 
@@ -35,7 +35,7 @@ fn scaffold_baseline_missing_only_creates_only_missing_files() {
     common::remove_file_if_exists(&project_development);
     assert!(
         !home_cli_tools.exists(),
-        "precondition: home CLI_TOOLS.md missing"
+        "precondition: home core/policies/cli-tools.md missing"
     );
     assert!(
         !project_development.exists(),
@@ -64,7 +64,7 @@ fn scaffold_baseline_missing_only_creates_only_missing_files() {
     assert_eq!(read_file(&home_development), home_development_before);
     assert_eq!(read_file(&project_agents), project_agents_before);
 
-    let expected_home_cli_tools = read_fixture("home/CLI_TOOLS.template.expected.md");
+    let expected_home_cli_tools = read_fixture("home/cli-tools.template.expected.md");
     let expected_project_development = read_fixture("project/DEVELOPMENT.template.expected.md");
     assert_eq!(read_file(&home_cli_tools), expected_home_cli_tools);
     assert_eq!(
@@ -79,7 +79,7 @@ fn scaffold_baseline_force_overwrite_updates_existing_baseline_files() {
     seed_cargo_workspace(&workspace.docs_home);
     seed_cargo_workspace(&workspace.project_path);
 
-    let home_cli_tools = workspace.docs_home.join("CLI_TOOLS.md");
+    let home_cli_tools = workspace.docs_home.join("core/policies/cli-tools.md");
     let project_development = workspace.project_path.join("DEVELOPMENT.md");
     common::write_text(&home_cli_tools, "# stale home cli tools\n");
     common::write_text(&project_development, "# stale project development\n");
@@ -102,7 +102,7 @@ fn scaffold_baseline_force_overwrite_updates_existing_baseline_files() {
         output.stdout
     );
 
-    let expected_home_cli_tools = read_fixture("home/CLI_TOOLS.template.expected.md");
+    let expected_home_cli_tools = read_fixture("home/cli-tools.template.expected.md");
     let expected_project_development = read_fixture("project/DEVELOPMENT.template.expected.md");
     let actual_home_cli_tools = read_file(&home_cli_tools);
     let actual_project_development = read_file(&project_development);
@@ -110,7 +110,7 @@ fn scaffold_baseline_force_overwrite_updates_existing_baseline_files() {
     assert_eq!(actual_project_development, expected_project_development);
     assert!(
         !actual_home_cli_tools.contains("stale"),
-        "force mode should overwrite stale CLI_TOOLS.md"
+        "force mode should overwrite stale core/policies/cli-tools.md"
     );
     assert!(
         !actual_project_development.contains("stale"),
@@ -161,9 +161,9 @@ fn scaffold_baseline_generated_templates_include_required_sections_and_actionabl
         development
     );
 
-    let cli_tools = read_file(&workspace.docs_home.join("CLI_TOOLS.md"));
+    let cli_tools = read_file(&workspace.docs_home.join("core/policies/cli-tools.md"));
     for required in [
-        "# CLI_TOOLS.md",
+        "# CLI Tools",
         "## Tool Selection",
         "## Setup Command",
         "## Build Command",
@@ -177,14 +177,14 @@ fn scaffold_baseline_generated_templates_include_required_sections_and_actionabl
     ] {
         assert!(
             cli_tools.contains(required),
-            "generated CLI_TOOLS.md missing `{required}`:\n{cli_tools}"
+            "generated core/policies/cli-tools.md missing `{required}`:\n{cli_tools}"
         );
     }
     assert!(
         !cli_tools.contains("{{SETUP_COMMANDS}}")
             && !cli_tools.contains("{{BUILD_COMMANDS}}")
             && !cli_tools.contains("{{TEST_COMMANDS}}"),
-        "generated CLI_TOOLS.md should resolve template placeholders:\n{}",
+        "generated core/policies/cli-tools.md should resolve template placeholders:\n{}",
         cli_tools
     );
 }

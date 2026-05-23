@@ -83,8 +83,8 @@ pub fn resolve_builtin_only_with_mode(
             Context::TaskTools,
             Scope::Home,
             &roots.docs_home,
-            "CLI_TOOLS.md",
-            "tool-selection guidance from AGENT_DOCS_HOME/CLI_TOOLS.md",
+            "core/policies/cli-tools.md",
+            "tool-selection guidance from AGENT_DOCS_HOME/core/policies/cli-tools.md",
             DocumentSource::Builtin,
         )],
         Context::ProjectDev => vec![resolve_required_doc_with_project_fallback(
