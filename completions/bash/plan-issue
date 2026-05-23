@@ -67,14 +67,26 @@ _plan-issue() {
             plan__issue__record,build-dispatch-ledger)
                 cmd="plan__issue__record__build__dispatch__ledger"
                 ;;
+            plan__issue__record,close)
+                cmd="plan__issue__record__close"
+                ;;
             plan__issue__record,closeout-gate)
                 cmd="plan__issue__record__closeout__gate"
+                ;;
+            plan__issue__record,open)
+                cmd="plan__issue__record__open"
+                ;;
+            plan__issue__record,post)
+                cmd="plan__issue__record__post"
                 ;;
             plan__issue__record,render-comment)
                 cmd="plan__issue__record__render__comment"
                 ;;
             plan__issue__record,render-dashboard)
                 cmd="plan__issue__record__render__dashboard"
+                ;;
+            plan__issue__record,repair-dashboard)
+                cmd="plan__issue__record__repair__dashboard"
                 ;;
             *)
                 ;;
@@ -645,7 +657,7 @@ _plan-issue() {
             return 0
             ;;
         plan__issue__record)
-            opts="-f -h --repo --dry-run --force --json --format --state-dir --help render-dashboard render-comment audit closeout-gate build-dispatch-ledger"
+            opts="-f -h --repo --dry-run --force --json --format --state-dir --help open post repair-dashboard close render-dashboard render-comment audit closeout-gate build-dispatch-ledger"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -770,6 +782,64 @@ _plan-issue() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        plan__issue__record__close)
+            opts="-f -h --issue --profile --linked-pr --approval --bundle --body-file --comments-json --fixture --repo --dry-run --force --json --format --state-dir --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --issue)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --profile)
+                    COMPREPLY=($(compgen -W "tracking dispatch" -- "${cur}"))
+                    return 0
+                    ;;
+                --linked-pr)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --approval)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --bundle)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --body-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --comments-json)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --fixture)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         plan__issue__record__closeout__gate)
             opts="-f -h --body-file --comments-json --profile --require-complete --require-session --require-validation --require-review --require-closeout --approval --linked-pr --repo --dry-run --force --json --format --state-dir --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -816,8 +886,8 @@ _plan-issue() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        plan__issue__record__render__comment)
-            opts="-f -h --profile --marker-family --kind --path --commit --content-file --title --details-summary --out --repo --dry-run --force --json --format --state-dir --help"
+        plan__issue__record__open)
+            opts="-f -h --profile --bundle --source-file --plan-file --execution-state-file --title --allow-dirty --fixture --repo --dry-run --force --json --format --state-dir --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -827,8 +897,108 @@ _plan-issue() {
                     COMPREPLY=($(compgen -W "tracking dispatch" -- "${cur}"))
                     return 0
                     ;;
-                --marker-family)
-                    COMPREPLY=($(compgen -W "shared compat" -- "${cur}"))
+                --bundle)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --source-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --plan-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --execution-state-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --title)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --fixture)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        plan__issue__record__post)
+            opts="-f -h --issue --profile --kind --payload-file --summary-file --fixture --repo --dry-run --force --json --format --state-dir --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --issue)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --profile)
+                    COMPREPLY=($(compgen -W "tracking dispatch" -- "${cur}"))
+                    return 0
+                    ;;
+                --kind)
+                    COMPREPLY=($(compgen -W "source plan state session validation review closeout" -- "${cur}"))
+                    return 0
+                    ;;
+                --payload-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --summary-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --fixture)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        plan__issue__record__render__comment)
+            opts="-f -h --profile --kind --path --commit --content-file --title --details-summary --out --repo --dry-run --force --json --format --state-dir --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --profile)
+                    COMPREPLY=($(compgen -W "tracking dispatch" -- "${cur}"))
                     return 0
                     ;;
                 --kind)
@@ -954,6 +1124,52 @@ _plan-issue() {
                     return 0
                     ;;
                 --issue-url)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --out)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        plan__issue__record__repair__dashboard)
+            opts="-f -h --issue --body-file --comments-json --fixture --out --repo --dry-run --force --json --format --state-dir --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --issue)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --body-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --comments-json)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --fixture)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

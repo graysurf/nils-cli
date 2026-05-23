@@ -28,18 +28,30 @@ pub enum RecordCommand {
     Close(Box<RecordCloseArgs>),
 
     /// Render a mutable issue dashboard for an issue-backed plan record.
+    /// Retired in v2 — dashboard rendering moved under `record repair-dashboard`.
+    /// Kept callable as a transitional helper.
+    #[command(hide = true)]
     RenderDashboard(Box<RenderDashboardArgs>),
 
     /// Render one append-only lifecycle comment.
+    /// Retired in v2 — comment rendering is an implementation detail of
+    /// `record open` / `record post`. Kept callable as a transitional helper.
+    #[command(hide = true)]
     RenderComment(Box<RenderCommentArgs>),
 
     /// Audit issue body and comments for lifecycle markers.
     Audit(Box<RecordAuditArgs>),
 
     /// Evaluate closeout readiness from lifecycle audit evidence.
+    /// Retired in v2 — closeout gate evaluation moved inside `record close`
+    /// (strict by default). Kept callable as a transitional helper.
+    #[command(hide = true)]
     CloseoutGate(Box<RecordCloseoutGateArgs>),
 
     /// Build a dispatch ledger from plan metadata and split grouping rules.
+    /// Retired in v2 — dispatch consumers move to `record open` + state
+    /// payload. Kept callable as a transitional helper.
+    #[command(hide = true)]
     BuildDispatchLedger(Box<BuildDispatchLedgerArgs>),
 }
 
