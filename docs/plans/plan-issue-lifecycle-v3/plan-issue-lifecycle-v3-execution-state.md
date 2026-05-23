@@ -3,16 +3,19 @@
 <!-- execute-from-tracking-issue:state:v1 -->
 ## Execution State
 
-- Status: planning complete; tracking issue creation pending
+- Status: tracking issue open; ready for Sprint 1 execution
 - Target scope: breaking `plan-issue` issue-backed lifecycle v3 rewrite
 - Execution window: next nils-cli implementation lane
-- Current task: create tracking issue from committed plan bundle
-- Next task: execute Sprint 1 after tracking issue is open
+- Current task: Sprint 1 ready
+- Next task: execute Task 1.1, Task 1.2, and Task 1.3
 - Last updated: 2026-05-23
-- Branch/commit/PR: plan/plan-issue-lifecycle-v3; PR pending
+- Branch/commit/PR: plan/plan-issue-lifecycle-v3; plan commit dc9aedc; PR pending
 - Source document: docs/plans/plan-issue-lifecycle-v3/plan-issue-lifecycle-v3-plan.md
 - Direct source-doc execution waiver: not applicable
-- Tracking issue: pending
+- Tracking issue: [#448](https://github.com/sympoies/nils-cli/issues/448)
+- Source snapshot: [source](https://github.com/sympoies/nils-cli/issues/448#issuecomment-4524856896)
+- Plan snapshot: [plan](https://github.com/sympoies/nils-cli/issues/448#issuecomment-4524856962)
+- Initial state snapshot: [state](https://github.com/sympoies/nils-cli/issues/448#issuecomment-4524857027)
 
 ## Validation Plan
 
@@ -48,6 +51,9 @@
   migration until the CLI is released.
 - 2026-05-23: Created the plan bundle for a breaking v3 rewrite of the
   issue-backed lifecycle surface.
+- 2026-05-23: Opened tracking issue #448 with source, plan, and initial state
+  snapshots. The plan branch was pushed to
+  `origin/plan/plan-issue-lifecycle-v3`.
 
 ## Notes
 
