@@ -17,6 +17,8 @@ mod cli;
 mod determinism_gate;
 #[path = "integration/doctor_filesystem.rs"]
 mod doctor_filesystem;
+#[path = "integration/doctor_skill_surface.rs"]
+mod doctor_skill_surface;
 #[path = "integration/doctor_upgrade.rs"]
 mod doctor_upgrade;
 #[path = "integration/doctor_version.rs"]

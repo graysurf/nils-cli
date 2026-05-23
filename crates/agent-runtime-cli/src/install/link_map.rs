@@ -7,6 +7,11 @@
 //! required/forbidden field enforcement happens in [`LinkEntry::validate`]
 //! after the YAML round-trip, because `serde` alone cannot express the
 //! `allOf if/then` shape that the JSON Schema uses.
+//! `kind=symlinked-file` is a compatibility name: with
+//! `recursive: false`, its `source` may be a file or a directory and the
+//! installer creates exactly one symlink at `destination`. With
+//! `recursive: true`, directory sources expand into one file symlink per
+//! source file.
 //!
 //! Source: agent-runtime-kit Plan 04 Sprint 1 Task 1.2.
 //!   `docs/plans/04-installer-doctor-and-bootstrap/...-plan.md`.
@@ -91,7 +96,9 @@ impl LinkEntry {
         match self.kind {
             EntryKind::SymlinkedFile => {
                 if self.source.is_none() {
-                    return Err("kind=symlinked-file requires `source`".to_string());
+                    return Err(
+                        "kind=symlinked-file requires `source` (file or directory)".to_string()
+                    );
                 }
                 self.forbid_managed_block_fields()?;
             }

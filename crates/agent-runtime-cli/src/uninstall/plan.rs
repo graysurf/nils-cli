@@ -55,6 +55,7 @@ impl UninstallPlan {
                     entry_id,
                     source,
                     dest,
+                    link_mode: _,
                     requires_backup: _,
                 } => {
                     actions.push(UninstallAction::RemoveSymlink {

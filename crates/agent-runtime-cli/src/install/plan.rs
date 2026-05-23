@@ -3,10 +3,14 @@
 //!
 //! The builder walks a [`LinkMap`] in declared order, expands
 //! `recursive: true` directory entries into one [`PlanAction`] per file,
-//! and produces a flat list. Order is preserved — the executor walks the
-//! list top to bottom. Re-running against an unchanged tree produces an
-//! empty change set (idempotence is enforced at apply time by checking
-//! the current state of each destination before mutating).
+//! leaves `recursive: false` entries as one symlink action, and produces
+//! a flat list. A non-recursive `kind=symlinked-file` entry may point at
+//! either a file or a directory; directory sources intentionally become
+//! directory symlinks at the entry's destination. Order is preserved —
+//! the executor walks the list top to bottom. Re-running against an
+//! unchanged tree produces an empty change set (idempotence is enforced
+//! at apply time by checking the current state of each destination before
+//! mutating).
 
 use super::link_map::{CommentStyle, EntryKind, LinkEntry, LinkMap};
 use std::path::{Path, PathBuf};
@@ -43,6 +47,7 @@ pub enum PlanAction {
         entry_id: String,
         source: PathBuf,
         dest: PathBuf,
+        link_mode: SymlinkLinkMode,
         /// True when `dest` would replace a regular file (not a symlink).
         /// Drives backup behaviour at apply time.
         requires_backup: bool,
@@ -55,6 +60,23 @@ pub enum PlanAction {
         comment_style: CommentStyle,
         body: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymlinkLinkMode {
+    File,
+    Directory,
+    RecursiveFile,
+}
+
+impl SymlinkLinkMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SymlinkLinkMode::File => "file symlink",
+            SymlinkLinkMode::Directory => "directory symlink",
+            SymlinkLinkMode::RecursiveFile => "recursive file symlink",
+        }
+    }
 }
 
 /// Resolved install plan. Each entry in `actions` is ready to run; the
@@ -180,10 +202,12 @@ fn expand_single_symlink(
     }
     let dest_abs = home.join(&entry.destination);
     let requires_backup = is_regular_non_symlink(&dest_abs);
+    let link_mode = link_mode_for_source(&source_abs);
     out.push(PlanAction::Symlink {
         entry_id: entry.id.clone(),
         source: source_abs,
         dest: dest_abs,
+        link_mode,
         requires_backup,
     });
     Ok(())
@@ -206,10 +230,12 @@ fn expand_symlinked_file(
     if !entry.recursive {
         let dest_abs = home.join(&entry.destination);
         let requires_backup = is_regular_non_symlink(&dest_abs);
+        let link_mode = link_mode_for_source(&source_abs);
         out.push(PlanAction::Symlink {
             entry_id: entry.id.clone(),
             source: source_abs,
             dest: dest_abs,
+            link_mode,
             requires_backup,
         });
         return Ok(());
@@ -231,10 +257,18 @@ fn expand_symlinked_file(
             entry_id: entry.id.clone(),
             source: abs_source,
             dest: abs_dest,
+            link_mode: SymlinkLinkMode::RecursiveFile,
             requires_backup,
         });
     }
     Ok(())
+}
+
+fn link_mode_for_source(source: &Path) -> SymlinkLinkMode {
+    match std::fs::symlink_metadata(source) {
+        Ok(meta) if meta.is_dir() => SymlinkLinkMode::Directory,
+        _ => SymlinkLinkMode::File,
+    }
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), std::io::Error> {
@@ -273,6 +307,9 @@ fn is_regular_non_symlink(p: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::install::link_map::{EntryKind, LinkEntry, LinkMap};
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn one_entry_map(entry: LinkEntry) -> LinkMap {
         LinkMap {
@@ -368,5 +405,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PlanError::DestinationTraversal { .. }));
+    }
+
+    #[test]
+    fn build_keeps_non_recursive_directory_source_as_one_symlink_action() {
+        let tmp = TempDir::new().unwrap();
+        let source_root = tmp.path().join("src");
+        let source_dir = source_root.join("build/codex/plugins/reporting/skills/daily-brief");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("SKILL.md"), "# daily brief\n").unwrap();
+
+        let home = tmp.path().join("home");
+        let state_home = tmp.path().join("state");
+        let lm = one_entry_map(symlinked_file(
+            "reporting.daily-brief",
+            "build/codex/plugins/reporting/skills/daily-brief",
+            "skills/reporting/daily-brief",
+        ));
+
+        let plan = InstallPlan::build("codex", &source_root, &home, &state_home, &lm).unwrap();
+
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            PlanAction::Symlink {
+                entry_id,
+                source,
+                dest,
+                link_mode,
+                requires_backup,
+            } => {
+                assert_eq!(entry_id, "reporting.daily-brief");
+                assert_eq!(source, &source_dir);
+                assert_eq!(dest, &home.join("skills/reporting/daily-brief"));
+                assert_eq!(*link_mode, SymlinkLinkMode::Directory);
+                assert!(!requires_backup);
+            }
+            other => panic!("expected symlink action, got {other:?}"),
+        }
     }
 }

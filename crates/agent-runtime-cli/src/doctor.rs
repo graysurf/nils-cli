@@ -7,6 +7,7 @@
 pub mod coverage;
 pub mod probes;
 pub mod project;
+pub mod skill_surface;
 pub mod upgrade;
 pub mod version;
 
@@ -14,6 +15,7 @@ use crate::install::link_map::{LinkMap, LinkMapError};
 use crate::install::overlay::{self, LinkMapOverlay, OverlaySummary};
 use crate::install::plan::{InstallPlan, PlanError};
 use crate::render::manifest::{ProductRoot, RuntimeRootsManifest, SCHEMA_VERSION};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -24,6 +26,7 @@ pub struct DoctorOptions {
     pub overlay_path: Option<PathBuf>,
     pub cli_tools_profile: String,
     pub check_project: Option<PathBuf>,
+    pub class_filter: Option<DoctorClass>,
 }
 
 impl Default for DoctorOptions {
@@ -33,8 +36,14 @@ impl Default for DoctorOptions {
             overlay_path: None,
             cli_tools_profile: "recommended".to_string(),
             check_project: None,
+            class_filter: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorClass {
+    SkillSurface,
 }
 
 #[derive(Debug, Error)]
@@ -75,7 +84,8 @@ pub enum RuntimeRootsError {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DoctorSeverity {
     Ok,
     Warn,
@@ -92,7 +102,7 @@ impl DoctorSeverity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorFinding {
     pub product: String,
     pub check: &'static str,
@@ -154,6 +164,8 @@ pub struct DoctorOutcome {
     pub version_probes: Vec<version::VersionProbeFinding>,
     pub coverage_probes: Vec<coverage::CoverageFinding>,
     pub project_probes: Vec<project::ProjectOverlayFinding>,
+    pub skill_surface: Option<skill_surface::SkillSurfaceReport>,
+    pub acceptance_boundary: Option<String>,
     pub ok: usize,
     pub warn: usize,
     pub block: usize,
@@ -183,6 +195,10 @@ pub fn run(
     state_home_override: Option<&Path>,
     options: &DoctorOptions,
 ) -> Result<DoctorOutcome, DoctorError> {
+    if matches!(options.class_filter, Some(DoctorClass::SkillSurface)) {
+        return run_skill_surface_only(product, source_root, options);
+    }
+
     let runtime_roots = load_runtime_roots(source_root)?;
     let product_root = product_root(&runtime_roots, product)?;
     let resolved_roots = resolve_runtime_roots(
@@ -263,11 +279,91 @@ pub fn run(
         version_probes: vec![version_probe],
         coverage_probes,
         project_probes,
+        skill_surface: None,
+        acceptance_boundary: None,
         ok: report.ok,
         warn,
         block,
         overlay: overlay_summary,
     })
+}
+
+fn run_skill_surface_only(
+    product: &str,
+    source_root: &Path,
+    options: &DoctorOptions,
+) -> Result<DoctorOutcome, DoctorError> {
+    let link_map = match load_effective_link_map(source_root, product, options)? {
+        Some(link_map) => link_map,
+        None => {
+            return Ok(DoctorOutcome {
+                product: product.to_string(),
+                findings: Vec::new(),
+                version_probes: Vec::new(),
+                coverage_probes: Vec::new(),
+                project_probes: Vec::new(),
+                skill_surface: Some(skill_surface::SkillSurfaceReport::empty(product)),
+                acceptance_boundary: skill_surface::acceptance_boundary(product)
+                    .map(str::to_string),
+                ok: 0,
+                warn: 0,
+                block: 0,
+                overlay: None,
+            });
+        }
+    };
+    let report = skill_surface::check(product, source_root, &link_map);
+    let warn = report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == DoctorSeverity::Warn)
+        .count();
+    let block = report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == DoctorSeverity::Block)
+        .count();
+    let ok = report
+        .items
+        .iter()
+        .filter(|item| item.warnings.is_empty())
+        .count();
+    let acceptance_boundary = report.acceptance_boundary.clone();
+    Ok(DoctorOutcome {
+        product: product.to_string(),
+        findings: report.findings.clone(),
+        version_probes: Vec::new(),
+        coverage_probes: Vec::new(),
+        project_probes: Vec::new(),
+        skill_surface: Some(report),
+        acceptance_boundary,
+        ok,
+        warn,
+        block,
+        overlay: None,
+    })
+}
+
+fn load_effective_link_map(
+    source_root: &Path,
+    product: &str,
+    options: &DoctorOptions,
+) -> Result<Option<LinkMap>, DoctorError> {
+    let mut link_map = match LinkMap::load(source_root, product) {
+        Ok(link_map) => link_map,
+        Err(LinkMapError::Missing { .. }) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if options.overlay_enabled {
+        let overlay_opt = match options.overlay_path.as_deref() {
+            Some(path) => LinkMapOverlay::load_from(path)?,
+            None => LinkMapOverlay::load_optional(source_root)?,
+        };
+        if let Some(overlay) = overlay_opt {
+            overlay::apply(&mut link_map, &overlay)?;
+        }
+    }
+    Ok(Some(link_map))
 }
 
 fn load_runtime_roots(source_root: &Path) -> Result<RuntimeRootsManifest, RuntimeRootsError> {

@@ -1,6 +1,7 @@
-use crate::doctor::{self, DoctorFinding, DoctorOptions, DoctorSeverity, upgrade};
+use crate::doctor::{self, DoctorClass, DoctorFinding, DoctorOptions, DoctorSeverity, upgrade};
 use crate::render::manifest::SourceRoot;
-use clap::Args;
+use clap::{Args, ValueEnum};
+use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(Args, Debug)]
@@ -37,6 +38,33 @@ pub struct DoctorArgs {
     /// Inspect a consuming repo's `.agents/scripts/` project-local overlays.
     #[arg(long)]
     pub check_project: Option<PathBuf>,
+    /// Run a single doctor class instead of the default host/runtime probes.
+    #[arg(long = "class", value_enum)]
+    pub class: Option<DoctorClassArg>,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum DoctorClassArg {
+    SkillSurface,
+}
+
+impl From<DoctorClassArg> for DoctorClass {
+    fn from(value: DoctorClassArg) -> Self {
+        match value {
+            DoctorClassArg::SkillSurface => DoctorClass::SkillSurface,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum OutputFormat {
+    Text,
+    Json,
 }
 
 pub fn run(args: DoctorArgs) -> anyhow::Result<u8> {
@@ -63,6 +91,7 @@ pub fn run(args: DoctorArgs) -> anyhow::Result<u8> {
         overlay_path: args.overlay_path.clone(),
         cli_tools_profile: args.profile.clone(),
         check_project: args.check_project.clone(),
+        class_filter: args.class.map(Into::into),
     };
     let outcome = doctor::run(
         &args.product,
@@ -72,6 +101,16 @@ pub fn run(args: DoctorArgs) -> anyhow::Result<u8> {
         &options,
     )?;
 
+    if args.format == OutputFormat::Json {
+        print_json(&outcome, args.suggest_upgrade)?;
+        return Ok(outcome.exit_code());
+    }
+
+    print_text(&outcome, args.suggest_upgrade);
+    Ok(outcome.exit_code())
+}
+
+fn print_text(outcome: &doctor::DoctorOutcome, suggest_upgrade: bool) {
     if let Some(summary) = outcome.overlay.as_ref() {
         eprintln!(
             "agent-runtime doctor: overlay merged (dropped={} replaced={} added={})",
@@ -135,13 +174,58 @@ pub fn run(args: DoctorArgs) -> anyhow::Result<u8> {
     for finding in &outcome.findings {
         print_finding(finding);
     }
-    if args.suggest_upgrade {
-        for suggestion in upgrade::suggestions(&outcome) {
+    if suggest_upgrade {
+        for suggestion in upgrade::suggestions(outcome) {
             println!("{}", suggestion.command);
         }
     }
+    if let Some(boundary) = outcome.acceptance_boundary.as_deref() {
+        eprintln!("agent-runtime doctor: acceptance-boundary: {boundary}");
+    }
+}
 
-    Ok(outcome.exit_code())
+#[derive(Serialize)]
+struct DoctorJson<'a> {
+    schema_version: &'static str,
+    product: &'a str,
+    checks: usize,
+    ok: usize,
+    warn: usize,
+    block: usize,
+    exit_code: u8,
+    findings: &'a [DoctorFinding],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill_surface: Option<&'a doctor::skill_surface::SkillSurfaceReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptance_boundary: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    upgrade_suggestions: Vec<String>,
+}
+
+fn print_json(outcome: &doctor::DoctorOutcome, suggest_upgrade: bool) -> anyhow::Result<()> {
+    let upgrade_suggestions = if suggest_upgrade {
+        upgrade::suggestions(outcome)
+            .into_iter()
+            .map(|suggestion| suggestion.command)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let envelope = DoctorJson {
+        schema_version: "agent-runtime-cli.doctor.v1",
+        product: &outcome.product,
+        checks: outcome.total_checks(),
+        ok: outcome.ok,
+        warn: outcome.warn,
+        block: outcome.block,
+        exit_code: outcome.exit_code(),
+        findings: &outcome.findings,
+        skill_surface: outcome.skill_surface.as_ref(),
+        acceptance_boundary: outcome.acceptance_boundary.as_deref(),
+        upgrade_suggestions,
+    };
+    println!("{}", serde_json::to_string_pretty(&envelope)?);
+    Ok(())
 }
 
 fn print_finding(finding: &DoctorFinding) {

@@ -71,6 +71,7 @@ pub fn install_plan(product: &str, plan: &InstallPlan) -> ProbeReport {
                 entry_id,
                 source,
                 dest,
+                link_mode: _,
                 requires_backup: _,
             } => check_symlink(&mut report, product, entry_id, source, dest),
             PlanAction::ManagedBlock {

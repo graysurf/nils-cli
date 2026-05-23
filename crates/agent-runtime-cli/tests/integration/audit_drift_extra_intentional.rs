@@ -127,6 +127,19 @@ entries:
     );
 }
 
+fn add_codex_directory_skill_link_map(root: &Path) {
+    write(
+        &root.join("targets/codex/link-map.yaml"),
+        r#"schema_version: 1
+entries:
+  - id: reporting.sample
+    kind: symlinked-file
+    source: core/skills/sample
+    destination: skills/reporting/sample
+"#,
+    );
+}
+
 #[test]
 fn documented_plugin_manifest_divergence_reports_intentional_difference_exit_zero() {
     let tmp = copy_fixture();
@@ -205,6 +218,33 @@ fn unrelated_live_home_sibling_outside_owned_link_map_roots_is_ignored() {
     assert!(
         !out.stderr_text().contains("[extra/warn"),
         "unexpected extra finding for unrelated sibling; stderr=\n{}",
+        out.stderr_text(),
+    );
+}
+
+#[test]
+fn codex_domain_nested_directory_skill_symlink_is_not_extra_surface() {
+    let tmp = copy_fixture();
+    add_codex_directory_skill_link_map(tmp.path());
+
+    let codex_home = tmp.path().join("home/.codex");
+    let source = tmp.path().join("core/skills/sample");
+    let destination = codex_home.join("skills/reporting/sample");
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&source, &destination).unwrap();
+
+    let codex_home_str = codex_home.to_str().unwrap();
+    let out = audit(tmp.path(), &[], &[("CODEX_HOME", codex_home_str)]);
+
+    assert_eq!(
+        out.code,
+        0,
+        "domain-nested directory skill symlink should not be reported as extra; stderr=\n{}",
+        out.stderr_text(),
+    );
+    assert!(
+        !out.stderr_text().contains("[extra/warn/codex]"),
+        "unexpected codex extra finding; stderr=\n{}",
         out.stderr_text(),
     );
 }

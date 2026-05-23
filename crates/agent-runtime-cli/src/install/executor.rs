@@ -4,7 +4,7 @@
 //! load-bearing invariant Plan 04 Sprint 1 Task 1.2 ships against — see
 //! the integration test in `tests/integration/install_pipeline.rs`.
 
-use super::plan::{InstallPlan, PlanAction};
+use super::plan::{InstallPlan, PlanAction, SymlinkLinkMode};
 use crate::managed_block::{CommentStyle as MbStyle, ManagedBlock};
 use std::fs;
 use std::io;
@@ -62,16 +62,19 @@ pub enum AppliedChange {
         entry_id: String,
         dest: PathBuf,
         source: PathBuf,
+        link_mode: SymlinkLinkMode,
     },
     SymlinkReplaced {
         entry_id: String,
         dest: PathBuf,
         source: PathBuf,
+        link_mode: SymlinkLinkMode,
     },
     FileBackedUpThenSymlinked {
         entry_id: String,
         dest: PathBuf,
         source: PathBuf,
+        link_mode: SymlinkLinkMode,
         backup: PathBuf,
     },
     ManagedBlockApplied {
@@ -118,8 +121,17 @@ pub fn run(
                 entry_id,
                 source,
                 dest,
+                link_mode,
                 requires_backup,
-            } => handle_symlink(mode, entry_id, source, dest, *requires_backup, &backup_root)?,
+            } => handle_symlink(
+                mode,
+                entry_id,
+                source,
+                dest,
+                *link_mode,
+                *requires_backup,
+                &backup_root,
+            )?,
             PlanAction::ManagedBlock {
                 entry_id,
                 config_file,
@@ -170,6 +182,7 @@ fn handle_symlink(
     entry_id: &str,
     source: &Path,
     dest: &Path,
+    link_mode: SymlinkLinkMode,
     requires_backup_flag: bool,
     backup_root: &Path,
 ) -> Result<AppliedChange, ApplyError> {
@@ -187,6 +200,7 @@ fn handle_symlink(
             entry_id,
             source,
             dest,
+            link_mode,
             requires_backup_flag,
             backup_root,
         ));
@@ -210,6 +224,7 @@ fn handle_symlink(
                 entry_id: entry_id.to_string(),
                 dest: dest.to_path_buf(),
                 source: source.to_path_buf(),
+                link_mode,
             })
         }
         Ok(m) if m.file_type().is_file() => {
@@ -223,6 +238,7 @@ fn handle_symlink(
                 entry_id: entry_id.to_string(),
                 dest: dest.to_path_buf(),
                 source: source.to_path_buf(),
+                link_mode,
                 backup,
             })
         }
@@ -249,6 +265,7 @@ fn handle_symlink(
                 entry_id: entry_id.to_string(),
                 dest: dest.to_path_buf(),
                 source: source.to_path_buf(),
+                link_mode,
             })
         }
         Err(e) => Err(ApplyError::Io {
@@ -262,6 +279,7 @@ fn classify_dry_run(
     entry_id: &str,
     source: &Path,
     dest: &Path,
+    link_mode: SymlinkLinkMode,
     requires_backup_flag: bool,
     backup_root: &Path,
 ) -> AppliedChange {
@@ -271,6 +289,7 @@ fn classify_dry_run(
             entry_id: entry_id.to_string(),
             dest: dest.to_path_buf(),
             source: source.to_path_buf(),
+            link_mode,
         },
         Ok(m) if m.file_type().is_file() => {
             let backup = backup_root
@@ -280,6 +299,7 @@ fn classify_dry_run(
                 entry_id: entry_id.to_string(),
                 dest: dest.to_path_buf(),
                 source: source.to_path_buf(),
+                link_mode,
                 backup,
             }
         }
@@ -287,6 +307,7 @@ fn classify_dry_run(
             entry_id: entry_id.to_string(),
             dest: dest.to_path_buf(),
             source: source.to_path_buf(),
+            link_mode,
         },
         Err(_) if requires_backup_flag => {
             // Plan said "requires backup" but the file vanished between
@@ -295,12 +316,14 @@ fn classify_dry_run(
                 entry_id: entry_id.to_string(),
                 dest: dest.to_path_buf(),
                 source: source.to_path_buf(),
+                link_mode,
             }
         }
         Err(_) => AppliedChange::SymlinkCreated {
             entry_id: entry_id.to_string(),
             dest: dest.to_path_buf(),
             source: source.to_path_buf(),
+            link_mode,
         },
     }
 }
@@ -412,7 +435,9 @@ fn handle_managed_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::install::plan::InstallPlan;
+    use crate::install::plan::{InstallPlan, SymlinkLinkMode};
+    use pretty_assertions::assert_eq;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]
@@ -456,6 +481,79 @@ mod tests {
         match err {
             ApplyError::InvalidTag { value } => assert_eq!(value, "../escape"),
             other => panic!("expected InvalidTag, got {other:?}"),
+        }
+    }
+
+    fn directory_symlink_plan(tmp: &TempDir) -> (InstallPlan, PathBuf, PathBuf) {
+        let source = tmp.path().join("source/skills/reporting/daily-brief");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "# daily brief\n").unwrap();
+        let dest = tmp.path().join("home/skills/reporting/daily-brief");
+        let plan = InstallPlan {
+            product: "codex".to_string(),
+            source_root: tmp.path().join("source"),
+            home: tmp.path().join("home"),
+            state_home: tmp.path().join("state"),
+            actions: vec![PlanAction::Symlink {
+                entry_id: "reporting.daily-brief".to_string(),
+                source: source.clone(),
+                dest: dest.clone(),
+                link_mode: SymlinkLinkMode::Directory,
+                requires_backup: false,
+            }],
+        };
+        (plan, source, dest)
+    }
+
+    #[test]
+    fn apply_creates_directory_symlink_and_second_apply_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let (plan, source, dest) = directory_symlink_plan(&tmp);
+
+        let first = run(&plan, Mode::Apply, SystemTime::UNIX_EPOCH, None).unwrap();
+
+        assert_eq!(
+            first,
+            vec![AppliedChange::SymlinkCreated {
+                entry_id: "reporting.daily-brief".to_string(),
+                dest: dest.clone(),
+                source: source.clone(),
+                link_mode: SymlinkLinkMode::Directory,
+            }]
+        );
+        assert!(
+            fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&dest).unwrap(), source);
+
+        let second = run(&plan, Mode::Apply, SystemTime::UNIX_EPOCH, None).unwrap();
+
+        assert_eq!(
+            second,
+            vec![AppliedChange::NoOp {
+                entry_id: "reporting.daily-brief".to_string(),
+                dest,
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_refuses_to_overwrite_existing_real_directory() {
+        let tmp = TempDir::new().unwrap();
+        let (plan, _source, dest) = directory_symlink_plan(&tmp);
+        fs::create_dir_all(&dest).unwrap();
+
+        let err = run(&plan, Mode::Apply, SystemTime::UNIX_EPOCH, None).unwrap_err();
+
+        match err {
+            ApplyError::Io { path, source } => {
+                assert_eq!(path, dest);
+                assert_eq!(source.kind(), io::ErrorKind::AlreadyExists);
+            }
+            other => panic!("expected AlreadyExists io error, got {other:?}"),
         }
     }
 }
