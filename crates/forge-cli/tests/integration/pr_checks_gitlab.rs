@@ -149,6 +149,47 @@ fn pr_checks_glab_numeric_id_resolves_through_mr_view() {
     assert_eq!(env["data"]["state"], "success");
 }
 
+fn glab_stub_no_pipeline(version: &str) -> String {
+    // Stub that mimics `glab ci status -b ...` when the repo has no pipeline
+    // at all: exits non-zero with the human-readable error on stderr (matches
+    // glab 1.99 behaviour).
+    format!(
+        r#"#!/bin/sh
+case "$1" in
+  "--version")
+    cat <<'EOF'
+{version}
+EOF
+    exit 0
+    ;;
+  "ci")
+    if [ "$2" = "status" ]; then
+      printf 'No pipeline found. It might not exist yet.\n' >&2
+      exit 1
+    fi
+    ;;
+esac
+echo "stub: unexpected glab args: $*" >&2
+exit 99
+"#,
+        version = version,
+    )
+}
+
+#[test]
+fn pr_checks_glab_no_pipeline_is_success_zero_count() {
+    let stub = StubEnv::new().glab_stub(&glab_stub_no_pipeline(VERSION_OK));
+    let argv = vec![
+        "--provider", "gitlab", "--format", "json", "pr", "checks", "feat/sample",
+    ];
+    let out = run_forge_cli(&stub, &argv);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(out.code, 0, "no-pipeline should be success, got {env:?}");
+    assert_eq!(env["data"]["state"], "success");
+    assert_eq!(env["data"]["required_count"], 0);
+    assert!(env["data"]["checks"].as_array().unwrap().is_empty());
+}
+
 #[test]
 fn pr_checks_glab_version_too_new_fails_unavailable() {
     let (code, env) = run_checks(VERSION_TOO_NEW, ALL_SUCCESS, "feat/sample", &[]);

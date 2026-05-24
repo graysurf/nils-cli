@@ -112,7 +112,9 @@ fn build_list_call(ctx: &ProviderContext, args: &PrListArgs) -> BackendCall {
         Provider::GitLab => {
             argv.push(OsString::from("mr"));
             argv.push(OsString::from("list"));
-            argv.push(OsString::from(gitlab_state_flag(args.state)));
+            if let Some(flag) = gitlab_state_flag(args.state) {
+                argv.push(OsString::from(flag));
+            }
             argv.push(OsString::from("--per-page"));
             argv.push(OsString::from(limit.to_string()));
             if let Some(a) = &args.author {
@@ -123,7 +125,7 @@ fn build_list_call(ctx: &ProviderContext, args: &PrListArgs) -> BackendCall {
                 argv.push(OsString::from("--source-branch"));
                 argv.push(OsString::from(h));
             }
-            argv.push(OsString::from("-F"));
+            argv.push(OsString::from("--output"));
             argv.push(OsString::from("json"));
         }
     }
@@ -131,14 +133,15 @@ fn build_list_call(ctx: &ProviderContext, args: &PrListArgs) -> BackendCall {
     BackendCall::new(program, argv)
 }
 
-fn gitlab_state_flag(state: PrStateFilter) -> &'static str {
-    // glab uses a positional-flag form for "all states"; the value is the
-    // same as the state literal.
+fn gitlab_state_flag(state: PrStateFilter) -> Option<&'static str> {
+    // glab deprecated `--opened` in favor of "default when --closed/--merged
+    // are not used" — and it prints the deprecation warning to stdout, which
+    // breaks JSON parsing. Pass no flag for open.
     match state {
-        PrStateFilter::Open => "--opened",
-        PrStateFilter::Closed => "--closed",
-        PrStateFilter::Merged => "--merged",
-        PrStateFilter::All => "--all",
+        PrStateFilter::Open => None,
+        PrStateFilter::Closed => Some("--closed"),
+        PrStateFilter::Merged => Some("--merged"),
+        PrStateFilter::All => Some("--all"),
     }
 }
 
@@ -292,6 +295,19 @@ mod tests {
     }
 
     #[test]
+    fn build_list_call_gitlab_omits_opened_flag_for_default_open_state() {
+        let call = build_list_call(&ctx(Provider::GitLab), &default_args());
+        let plan = call.plan_argv();
+        assert!(
+            !plan.contains(&"--opened".to_string()),
+            "glab deprecated --opened and prints a warning to stdout; pass no flag for open"
+        );
+        assert!(!plan.contains(&"--closed".to_string()));
+        assert!(!plan.contains(&"--merged".to_string()));
+        assert!(!plan.contains(&"--all".to_string()));
+    }
+
+    #[test]
     fn build_list_call_gitlab_maps_state_to_flag() {
         let mut args = default_args();
         args.state = PrStateFilter::Merged;
@@ -299,7 +315,8 @@ mod tests {
         let plan = call.plan_argv();
         assert!(plan.contains(&"--merged".to_string()));
         assert!(plan.contains(&"--per-page".to_string()));
-        assert!(plan.contains(&"-F".to_string()));
+        assert!(plan.contains(&"--output".to_string()));
+        assert!(!plan.contains(&"-F".to_string()));
     }
 
     #[test]

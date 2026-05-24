@@ -121,7 +121,9 @@ fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
         Provider::GitLab => {
             argv.push(OsString::from("issue"));
             argv.push(OsString::from("list"));
-            argv.push(OsString::from(gitlab_state_flag(args.state)));
+            if let Some(flag) = gitlab_state_flag(args.state) {
+                argv.push(OsString::from(flag));
+            }
             argv.push(OsString::from("--per-page"));
             argv.push(OsString::from(limit.to_string()));
             for label in &args.labels {
@@ -136,7 +138,7 @@ fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
                 argv.push(OsString::from("--assignee"));
                 argv.push(OsString::from(a));
             }
-            argv.push(OsString::from("-F"));
+            argv.push(OsString::from("--output"));
             argv.push(OsString::from("json"));
         }
     }
@@ -144,11 +146,14 @@ fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
     BackendCall::new(program, argv)
 }
 
-fn gitlab_state_flag(state: IssueStateFilter) -> &'static str {
+fn gitlab_state_flag(state: IssueStateFilter) -> Option<&'static str> {
     match state {
-        IssueStateFilter::Open => "--opened",
-        IssueStateFilter::Closed => "--closed",
-        IssueStateFilter::All => "--all",
+        // `glab issue list` deprecated `--opened` in favor of "default when
+        // `--closed` is not used" — and it prints the deprecation warning to
+        // stdout, which breaks JSON parsing. Pass no flag for open.
+        IssueStateFilter::Open => None,
+        IssueStateFilter::Closed => Some("--closed"),
+        IssueStateFilter::All => Some("--all"),
     }
 }
 
@@ -391,6 +396,18 @@ mod tests {
     }
 
     #[test]
+    fn build_list_call_gitlab_omits_opened_flag_for_default_open_state() {
+        let call = build_list_call(&ctx(Provider::GitLab), &default_args());
+        let plan = call.plan_argv();
+        assert!(
+            !plan.contains(&"--opened".to_string()),
+            "glab deprecated --opened and prints a warning to stdout; pass no flag for open"
+        );
+        assert!(!plan.contains(&"--closed".to_string()));
+        assert!(!plan.contains(&"--all".to_string()));
+    }
+
+    #[test]
     fn build_list_call_gitlab_maps_state_to_flag_and_repeats_labels() {
         let mut args = default_args();
         args.state = IssueStateFilter::Closed;
@@ -399,7 +416,8 @@ mod tests {
         let plan = call.plan_argv();
         assert!(plan.contains(&"--closed".to_string()));
         assert!(plan.contains(&"--per-page".to_string()));
-        assert!(plan.contains(&"-F".to_string()));
+        assert!(plan.contains(&"--output".to_string()));
+        assert!(!plan.contains(&"-F".to_string()));
         let label_count = plan.iter().filter(|s| *s == "--label").count();
         assert_eq!(
             label_count, 2,
@@ -468,6 +486,24 @@ mod tests {
             vec!["plan".to_string(), "support-matrix".to_string()]
         );
         assert_eq!(payload.items[0].author.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn parse_list_output_accepts_empty_array_for_both_providers() {
+        for provider in [Provider::GitHub, Provider::GitLab] {
+            let payload = parse_list_output(
+                &ctx(provider),
+                &BackendSuccess {
+                    stdout: "[]".into(),
+                    stderr: String::new(),
+                },
+            )
+            .unwrap();
+            assert!(
+                payload.items.is_empty(),
+                "{provider:?} should accept empty array without erroring"
+            );
+        }
     }
 
     #[test]

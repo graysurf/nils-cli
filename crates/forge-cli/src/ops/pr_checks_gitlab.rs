@@ -40,6 +40,12 @@ pub fn build_version_call() -> BackendCall {
 /// Snapshot path for `pr checks` against GitLab. Probes version first,
 /// then resolves `--head <branch>` from the id (numeric MRs are looked up via
 /// `mr view`), then parses `glab ci status` text.
+///
+/// `glab` exits non-zero when there is no pipeline at all (vs. an empty
+/// pipeline). We surface that case as an empty-success payload to match the
+/// "empty pipeline" semantic the rest of the gate already expects — a repo
+/// without `.gitlab-ci.yml` should not look like a backend failure to the
+/// merge gate.
 pub fn snapshot<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -48,7 +54,27 @@ pub fn snapshot<R: BackendRunner>(
     probe_version(runner)?;
     let branch = resolve_branch(runner, ctx, &args.id)?;
     let call = build_status_call(ctx, &branch);
-    let output = runner.run(&call)?;
+    let raw = runner.run_raw(&call)?;
+    if !raw.status_success {
+        let stderr_lower = raw.stderr.to_ascii_lowercase();
+        let stdout_lower = raw.stdout.to_ascii_lowercase();
+        if stderr_lower.contains("no pipeline") || stdout_lower.contains("no pipeline") {
+            return Ok(aggregate(ctx, Vec::new(), args.required_only, None));
+        }
+        return Err(ForgeError::backend_error(
+            schema_err(),
+            format!(
+                "{exe} exited with status {exit_code}",
+                exe = BackendProgram::Glab.executable().to_string_lossy(),
+                exit_code = raw.exit_code,
+            ),
+            Some(raw.stderr),
+        ));
+    }
+    let output = BackendSuccess {
+        stdout: raw.stdout,
+        stderr: raw.stderr,
+    };
     parse_status_text(ctx, &output, args.required_only)
 }
 
