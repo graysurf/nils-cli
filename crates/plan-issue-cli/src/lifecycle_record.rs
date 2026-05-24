@@ -1328,7 +1328,14 @@ pub fn extract_payload(comment_body: &str) -> Result<RecordPayload, PayloadError
 
 fn collect_payload_comment_carriers(body: &str) -> Result<Vec<String>, PayloadError> {
     let mut out = Vec::new();
+    let mut details_depth = 0usize;
     for line in body.lines() {
+        if update_details_depth(line, &mut details_depth) {
+            continue;
+        }
+        if details_depth > 0 {
+            continue;
+        }
         let trimmed = line.trim();
         let Some(inner) = trimmed
             .strip_prefix("<!--")
@@ -1360,6 +1367,7 @@ fn collect_payload_comment_carriers(body: &str) -> Result<Vec<String>, PayloadEr
 fn collect_payload_fences(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current: Option<Vec<String>> = None;
+    let mut details_depth = 0usize;
     for line in body.lines() {
         let trimmed = line.trim_start();
         if let Some(buf) = current.as_mut() {
@@ -1376,13 +1384,34 @@ fn collect_payload_fences(body: &str) -> Vec<String> {
             } else {
                 buf.push(line.to_string());
             }
-        } else if let Some(rest) = trimmed.strip_prefix("```")
-            && rest.trim() == PAYLOAD_FENCE_INFO
-        {
-            current = Some(Vec::new());
+        } else {
+            if update_details_depth(line, &mut details_depth) {
+                continue;
+            }
+            if details_depth > 0 {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("```")
+                && rest.trim() == PAYLOAD_FENCE_INFO
+            {
+                current = Some(Vec::new());
+            }
         }
     }
     out
+}
+
+fn update_details_depth(line: &str, depth: &mut usize) -> bool {
+    let trimmed = line.trim();
+    if trimmed.starts_with("<details") {
+        *depth += 1;
+        return true;
+    }
+    if trimmed.starts_with("</details>") {
+        *depth = depth.saturating_sub(1);
+        return true;
+    }
+    false
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -2279,5 +2308,36 @@ mod sprint3_tests {
         let payload = extract_payload(&body).expect("payload");
         assert_eq!(payload.schema, PAYLOAD_SCHEMA_V2);
         assert_eq!(payload.role, PayloadRole::Plan);
+    }
+
+    #[test]
+    fn extract_payload_ignores_payload_markers_inside_snapshot_details() {
+        let nested_payload = RecordPayload {
+            schema: PAYLOAD_SCHEMA_V2.to_string(),
+            role: PayloadRole::State,
+            profile: PayloadProfile::Tracking,
+            updated_at: None,
+            data: json!({"status": "complete"}),
+        };
+        let nested_carrier = render_payload_carrier(&nested_payload).expect("nested carrier");
+        let snapshot = SnapshotData {
+            path: "docs/plans/sample/sample-discussion-source.md".to_string(),
+            commit: "abc1234".to_string(),
+            title: None,
+            summary: None,
+        };
+        let body = render_record_snapshot_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Source,
+            &snapshot,
+            &format!(
+                "# Source\n\n{nested_carrier}\n\n```{PAYLOAD_FENCE_INFO}\n{{not valid json}}\n```\n"
+            ),
+            None,
+        )
+        .expect("render");
+
+        let payload = extract_payload(&body).expect("payload");
+        assert_eq!(payload.role, PayloadRole::Source);
     }
 }
