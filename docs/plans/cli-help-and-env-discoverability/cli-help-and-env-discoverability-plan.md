@@ -12,7 +12,7 @@ binary and resolves the `api-gql` implicit-default UX decision.
 
 - Primary source:
   docs/plans/cli-help-and-env-discoverability/cli-help-and-env-discoverability-review-source.md
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 - Open questions carried into execution:
   - Are `EXIT CODES` blocks mandatory on every binary? Default: yes, consistency outweighs the small extra cost.
   - For `api-gql`: document the implicit `call` default, or remove the fallback entirely? Default: document the default (no breaking change).

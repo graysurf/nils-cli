@@ -13,7 +13,7 @@ remaining binaries in three batches grouped by ownership.
 
 - Primary source:
   docs/plans/cli-output-contract-unification/cli-output-contract-unification-review-source.md
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 - Open questions carried into execution:
   - Whether `cli-template` migrates before or after `memo-cli` (default: `cli-template` first as a contract reference implementation).
   - Whether the parse-error envelope ships as a `nils-common` helper or a per-binary copy (default: shared helper to ensure shape parity).
@@ -387,7 +387,6 @@ binaries with shared crates can be reviewed together.
   - crates/agent-docs/src/
   - crates/agent-scope-lock/src/
   - crates/web-evidence/src/
-  - crates/test-first-evidence/src/
   - crates/image-processing/src/
   - crates/codex-cli/src/
   - crates/gemini-cli/src/

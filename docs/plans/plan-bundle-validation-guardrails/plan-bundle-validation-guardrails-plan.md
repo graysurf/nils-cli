@@ -13,7 +13,7 @@ rewrite same-line sprint metadata into the canonical two-line shape.
 
 - Primary source:
   docs/plans/plan-bundle-validation-guardrails/plan-bundle-validation-guardrails-review-source.md
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 - Open questions carried into execution:
   - Should the plan-bundle gate scan only changed files in CI, or all
     `docs/plans/**/*-plan.md` locally? Default to changed files in CI and all

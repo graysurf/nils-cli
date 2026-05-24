@@ -13,7 +13,7 @@ changes are allowed only when the new tests reveal a contract mismatch.
 ## Read First
 
 - Primary source: docs/plans/testing-audits-cli-contracts/testing-audits-cli-contracts-review-source.md
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 - Open questions carried into execution: none
 
 ## Scope
