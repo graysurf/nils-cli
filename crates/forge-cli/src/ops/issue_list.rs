@@ -121,7 +121,9 @@ fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
         Provider::GitLab => {
             argv.push(OsString::from("issue"));
             argv.push(OsString::from("list"));
-            argv.push(OsString::from(gitlab_state_flag(args.state)));
+            if let Some(flag) = gitlab_state_flag(args.state) {
+                argv.push(OsString::from(flag));
+            }
             argv.push(OsString::from("--per-page"));
             argv.push(OsString::from(limit.to_string()));
             for label in &args.labels {
@@ -144,11 +146,14 @@ fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
     BackendCall::new(program, argv)
 }
 
-fn gitlab_state_flag(state: IssueStateFilter) -> &'static str {
+fn gitlab_state_flag(state: IssueStateFilter) -> Option<&'static str> {
     match state {
-        IssueStateFilter::Open => "--opened",
-        IssueStateFilter::Closed => "--closed",
-        IssueStateFilter::All => "--all",
+        // `glab issue list` deprecated `--opened` in favor of "default when
+        // `--closed` is not used" — and it prints the deprecation warning to
+        // stdout, which breaks JSON parsing. Pass no flag for open.
+        IssueStateFilter::Open => None,
+        IssueStateFilter::Closed => Some("--closed"),
+        IssueStateFilter::All => Some("--all"),
     }
 }
 
@@ -388,6 +393,18 @@ mod tests {
         assert_eq!(plan[asn_idx + 1], "bob");
         let l_idx = plan.iter().position(|s| s == "--limit").unwrap();
         assert_eq!(plan[l_idx + 1], "5");
+    }
+
+    #[test]
+    fn build_list_call_gitlab_omits_opened_flag_for_default_open_state() {
+        let call = build_list_call(&ctx(Provider::GitLab), &default_args());
+        let plan = call.plan_argv();
+        assert!(
+            !plan.contains(&"--opened".to_string()),
+            "glab deprecated --opened and prints a warning to stdout; pass no flag for open"
+        );
+        assert!(!plan.contains(&"--closed".to_string()));
+        assert!(!plan.contains(&"--all".to_string()));
     }
 
     #[test]
