@@ -121,6 +121,11 @@ pub struct RecordOpenArgs {
     #[arg(long = "allow-dirty")]
     pub allow_dirty: bool,
 
+    /// Label to apply at issue creation. Repeatable. Empty values are
+    /// dropped. Names are passed through to `gh issue create --label`.
+    #[arg(long = "label", value_name = "NAME")]
+    pub labels: Vec<String>,
+
     /// Deterministic fixture mode. The directory is consumed instead of
     /// live provider calls.
     #[arg(long, value_name = "dir")]
@@ -149,6 +154,15 @@ pub struct RecordPostArgs {
     /// Visible Markdown commentary appended after the structured payload.
     #[arg(long = "summary-file", value_name = "path")]
     pub summary_file: Option<PathBuf>,
+
+    /// Add a label alongside the lifecycle comment in live mode. Repeatable.
+    #[arg(long = "add-label", value_name = "NAME")]
+    pub add_labels: Vec<String>,
+
+    /// Remove a label alongside the lifecycle comment in live mode.
+    /// Repeatable.
+    #[arg(long = "remove-label", value_name = "NAME")]
+    pub remove_labels: Vec<String>,
 
     /// Deterministic fixture mode.
     #[arg(long, value_name = "dir")]
@@ -212,6 +226,16 @@ pub struct RecordCloseArgs {
     /// Deterministic test mode: comments JSON.
     #[arg(long = "comments-json", value_name = "path")]
     pub comments_json: Option<PathBuf>,
+
+    /// Add a label as part of the closeout transition in live mode (e.g.
+    /// `state::closed`). Repeatable.
+    #[arg(long = "add-label", value_name = "NAME")]
+    pub add_labels: Vec<String>,
+
+    /// Remove a label as part of the closeout transition in live mode
+    /// (e.g. earlier `state::*` markers). Repeatable.
+    #[arg(long = "remove-label", value_name = "NAME")]
+    pub remove_labels: Vec<String>,
 
     /// Deterministic fixture mode. Contains issue body, comments JSON, and
     /// PR snapshots used in place of provider lookups.

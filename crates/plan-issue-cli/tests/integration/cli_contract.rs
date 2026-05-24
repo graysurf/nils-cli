@@ -691,3 +691,95 @@ fn cli_conflict_rules_reject_summary_and_summary_file_together() {
         "{rendered}"
     );
 }
+
+#[test]
+fn cli_parse_contract_record_open_accepts_repeatable_label() {
+    let cli = Cli::try_parse_from([
+        "plan-issue",
+        "record",
+        "open",
+        "--bundle",
+        "docs/plans/example",
+        "--label",
+        "workflow::plan",
+        "--label",
+        "state::needs-triage",
+    ])
+    .expect("parse record open with labels");
+
+    cli.validate().expect("validation");
+
+    match &cli.command {
+        Command::Record(args) => match &args.command {
+            RecordCommand::Open(open) => {
+                assert_eq!(open.labels, vec!["workflow::plan", "state::needs-triage"]);
+            }
+            other => panic!("unexpected record subcommand: {other:?}"),
+        },
+        other => panic!("unexpected command parsed: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_parse_contract_record_post_accepts_add_remove_label() {
+    let cli = Cli::try_parse_from([
+        "plan-issue",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--add-label",
+        "state::blocked",
+        "--remove-label",
+        "state::in-progress",
+    ])
+    .expect("parse record post with label mutations");
+
+    cli.validate().expect("validation");
+
+    match &cli.command {
+        Command::Record(args) => match &args.command {
+            RecordCommand::Post(post) => {
+                assert_eq!(post.add_labels, vec!["state::blocked"]);
+                assert_eq!(post.remove_labels, vec!["state::in-progress"]);
+            }
+            other => panic!("unexpected record subcommand: {other:?}"),
+        },
+        other => panic!("unexpected command parsed: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_parse_contract_record_close_accepts_add_remove_label() {
+    let cli = Cli::try_parse_from([
+        "plan-issue",
+        "record",
+        "close",
+        "--issue",
+        "448",
+        "--linked-pr",
+        "sympoies/nils-cli#500",
+        "--approval",
+        "https://github.com/sympoies/nils-cli/issues/448#issuecomment-1",
+        "--add-label",
+        "state::closed",
+        "--remove-label",
+        "state::in-progress",
+    ])
+    .expect("parse record close with label mutations");
+
+    cli.validate().expect("validation");
+
+    match &cli.command {
+        Command::Record(args) => match &args.command {
+            RecordCommand::Close(close) => {
+                assert_eq!(close.add_labels, vec!["state::closed"]);
+                assert_eq!(close.remove_labels, vec!["state::in-progress"]);
+            }
+            other => panic!("unexpected record subcommand: {other:?}"),
+        },
+        other => panic!("unexpected command parsed: {other:?}"),
+    }
+}
