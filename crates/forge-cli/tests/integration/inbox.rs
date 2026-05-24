@@ -362,6 +362,45 @@ exit 99
 }
 
 #[test]
+fn inbox_gitlab_vpn_required_tcp_probe_failure_skips_glab() {
+    let stub = StubEnv::new().glab_stub(
+        r#"#!/bin/sh
+echo "glab should not run" >&2
+exit 99
+"#,
+    );
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--gitlab-vpn",
+            "required",
+            "--gitlab-vpn-check",
+            "tcp:127.0.0.1:1",
+            "--gitlab-vpn-check-timeout",
+            "250ms",
+        ],
+    );
+    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(
+        env["error"]["details"]["providers"][0]["error"]["kind"],
+        "vpn_unavailable"
+    );
+    assert!(
+        !out.stderr.contains("glab should not run"),
+        "glab backend must be skipped when required TCP VPN probe fails"
+    );
+}
+
+#[test]
 fn inbox_dry_run_redacts_openvpn_profile_path() {
     let private_profile = "LOCAL_OPENVPN_PROFILE";
     let out = run_forge_cli(

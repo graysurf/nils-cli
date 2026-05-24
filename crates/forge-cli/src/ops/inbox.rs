@@ -14,6 +14,7 @@ use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -1180,27 +1181,87 @@ fn run_tcp_vpn_check(
     runtime: &InboxRuntimeConfig,
 ) -> Result<(), ForgeError> {
     let timeout = runtime.gitlab_vpn_check_timeout;
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(|err| {
-            vpn_unavailable(
-                format!("GitLab VPN TCP probe could not resolve host: {err}"),
-                None,
-            )
-        })?
-        .next()
-        .ok_or_else(|| vpn_unavailable("GitLab VPN TCP probe found no address", None))?;
-    TcpStream::connect_timeout(&addr, timeout)
-        .map(|_| ())
-        .map_err(|err| {
-            vpn_unavailable(
+    let host = host.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn({
+        let host = host.clone();
+        move || {
+            let _ = tx.send(resolve_and_connect_tcp_probe(&host, port, timeout));
+        }
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(TcpProbeError::Resolve(err))) => Err(vpn_unavailable(
+            format!("GitLab VPN TCP probe could not resolve host: {err}"),
+            None,
+        )),
+        Ok(Err(TcpProbeError::NoAddress)) => Err(vpn_unavailable(
+            "GitLab VPN TCP probe found no address",
+            None,
+        )),
+        Ok(Err(TcpProbeError::Connect(err))) => Err(vpn_unavailable(
+            format!(
+                "GitLab VPN TCP probe failed for {host}:{port} within {}: {err}",
+                format_duration(timeout)
+            ),
+            None,
+        )),
+        Ok(Err(TcpProbeError::Timeout)) | Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(vpn_unavailable(
                 format!(
-                    "GitLab VPN TCP probe failed for {host}:{port} within {}: {err}",
+                    "GitLab VPN TCP probe timed out for {host}:{port} after {}",
                     format_duration(timeout)
                 ),
                 None,
-            )
-        })
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(vpn_unavailable(
+            "GitLab VPN TCP probe worker ended without a result",
+            None,
+        )),
+    }
+}
+
+enum TcpProbeError {
+    Resolve(String),
+    NoAddress,
+    Connect(String),
+    Timeout,
+}
+
+fn resolve_and_connect_tcp_probe(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), TcpProbeError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| TcpProbeError::Resolve(err.to_string()))?;
+    let mut saw_addr = false;
+    let mut last_err = None;
+    for addr in addrs {
+        saw_addr = true;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(TcpProbeError::Timeout);
+        }
+        match TcpStream::connect_timeout(&addr, remaining) {
+            Ok(_) => return Ok(()),
+            Err(err) => last_err = Some(err.to_string()),
+        }
+    }
+    if saw_addr {
+        Err(TcpProbeError::Connect(
+            last_err.unwrap_or_else(|| "connection failed".to_string()),
+        ))
+    } else {
+        Err(TcpProbeError::NoAddress)
+    }
 }
 
 fn run_cmd_vpn_check(
