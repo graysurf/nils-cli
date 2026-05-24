@@ -27,10 +27,11 @@ versioning.
     profile, role, status, and the parsed structured payload. Audit also
     surfaces a stable `missing_required` array (`source-missing`,
     `plan-missing`, `state-missing`).
-  - Every v2 lifecycle comment carries a fenced JSON block whose
-    info-string is the literal `plan-issue-record-payload`. The payload
-    is the structured source of truth for audit, dashboard repair, and
-    closeout gating. Prose-Markdown status parsing is no longer used.
+  - Every v2 lifecycle comment carries a hidden structured payload. Audit,
+    dashboard repair, and closeout gating consume that payload as the source
+    of truth; older visible `plan-issue-record-payload` fences remain
+    accepted for existing records. Prose-Markdown status parsing is no longer
+    used.
   - The `record closeout-gate` standalone command and its
     `--require-complete`, `--require-session`, `--require-validation`,
     `--require-review`, `--require-closeout` flags are retired.
@@ -69,8 +70,8 @@ versioning.
   and repairs the dashboard with the freshly-created comment URLs.
   Supports `--dry-run` and `--fixture <dir>` deterministic modes.
 - `plan-issue record post --issue <n> --kind <state|session|validation|review> --payload-file <p>`
-  appends one canonical lifecycle comment with the v2 marker + payload
-  fence. `--kind source|plan` is rejected (owned by `record open`);
+  appends one canonical lifecycle comment with the v2 marker + hidden payload
+  carrier. `--kind source|plan` is rejected (owned by `record open`);
   `--kind closeout` is rejected (owned by `record close`).
 - `plan-issue record repair-dashboard --issue <n>` (or `--body-file +
   --comments-json` for local mode) recomputes the canonical dashboard

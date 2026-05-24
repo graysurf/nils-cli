@@ -588,6 +588,18 @@ fn run_record_open(
             format!("failed to read {}: {err}", bundle.plan_file.display()),
         )
     })?;
+    let execution_state_content = bundle
+        .execution_state_file
+        .as_deref()
+        .map(|path| {
+            fs::read_to_string(path).map_err(|err| {
+                CommandError::runtime(
+                    "record-open-execution-state-read-failed",
+                    format!("failed to read {}: {err}", path.display()),
+                )
+            })
+        })
+        .transpose()?;
 
     let source_body = lifecycle_record::render_record_snapshot_comment(
         args.profile,
@@ -607,11 +619,16 @@ fn run_record_open(
     .map_err(|err| CommandError::runtime("record-open-plan-render-failed", err))?;
 
     let initial_state = build_initial_state_payload(&plan);
+    let state_summary = execution_state_content
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Initial execution state seeded by `plan-issue record open`.");
     let state_body = lifecycle_record::render_record_post_comment(
         args.profile,
         crate::commands::record::LifecycleCommentKind::State,
         initial_state.clone(),
-        Some("Initial execution state seeded by `plan-issue record open`."),
+        Some(state_summary),
         None,
     )
     .map_err(|err| CommandError::runtime("record-open-state-render-failed", err))?;

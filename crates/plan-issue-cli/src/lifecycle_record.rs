@@ -49,10 +49,10 @@ pub struct LifecycleEvidence {
     /// when the role does not declare a status or the payload could not
     /// be parsed.
     pub status: Option<String>,
-    /// Parsed structured payload. `None` when the comment lacks a
-    /// `plan-issue-record-payload` fence; audit still records the marker
-    /// for visibility but downstream gates treat missing payloads as
-    /// unparseable evidence.
+    /// Parsed structured payload. `None` when the comment lacks a hidden
+    /// payload carrier or older `plan-issue-record-payload` fence; audit
+    /// still records the marker for visibility but downstream gates treat
+    /// missing payloads as unparseable evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<RecordPayload>,
 }
@@ -964,17 +964,19 @@ fn finalize_markdown(lines: Vec<String>) -> String {
 // -----------------------------------------------------------------------------
 // Structured lifecycle payload (issue-backed plan record contract v2)
 //
-// Each lifecycle comment carries one fenced JSON block whose info-string is the
-// literal token PAYLOAD_FENCE_INFO. Audit, dashboard repair, and closeout gate
-// evaluation consume the structured payload exclusively. Visible Markdown
-// around the fence is human commentary only.
+// Each lifecycle comment carries one hidden payload carrier. Audit, dashboard
+// repair, and closeout gate evaluation consume the structured payload
+// exclusively. Visible Markdown around the carrier is human commentary only.
+// The older PAYLOAD_FENCE_INFO fenced block remains accepted for existing
+// records created before the hidden carrier renderer.
 // -----------------------------------------------------------------------------
 
 /// On-wire schema identity for v2 lifecycle payloads.
 pub const PAYLOAD_SCHEMA_V2: &str = "plan-issue-record.payload.v2";
 
-/// Fenced-code-block info-string used to mark a lifecycle payload fence.
+/// Older fenced-code-block info-string used to mark a lifecycle payload.
 pub const PAYLOAD_FENCE_INFO: &str = "plan-issue-record-payload";
+const PAYLOAD_COMMENT_PREFIX: &str = "plan-issue-record-payload:hex:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1274,33 +1276,42 @@ impl std::fmt::Display for PayloadError {
 
 impl std::error::Error for PayloadError {}
 
-/// Extract the structured lifecycle payload fenced inside `comment_body`.
+/// Extract the structured lifecycle payload carried inside `comment_body`.
 ///
-/// - Returns `Ok(payload)` on a single well-formed `plan-issue-record-payload`
-///   fence whose envelope `schema` matches [`PAYLOAD_SCHEMA_V2`].
-/// - Returns `Err(NoFence)` when the comment does not contain the fence.
-/// - Returns `Err(MultipleFences)` when multiple payload fences are present;
+/// - Returns `Ok(payload)` on a single well-formed hidden carrier or older
+///   `plan-issue-record-payload` fence whose envelope `schema` matches
+///   [`PAYLOAD_SCHEMA_V2`].
+/// - Returns `Err(NoFence)` when the comment does not contain either payload
+///   carrier.
+/// - Returns `Err(MultipleFences)` when multiple payload carriers are present;
 ///   each comment carries at most one payload.
-/// - Returns `Err(SchemaMismatch)` when the fence parses but its `schema`
+/// - Returns `Err(SchemaMismatch)` when the payload parses but its `schema`
 ///   does not match the v2 wire identity.
-/// - Returns `Err(InvalidJson)` when the fence body is not valid JSON or
+/// - Returns `Err(InvalidJson)` when the payload body is not valid JSON or
 ///   does not deserialize into the envelope.
 pub fn extract_payload(comment_body: &str) -> Result<RecordPayload, PayloadError> {
+    let carriers = collect_payload_comment_carriers(comment_body)?;
     let fences = collect_payload_fences(comment_body);
-    if fences.is_empty() {
+    let payload_count = carriers.len() + fences.len();
+    if payload_count == 0 {
         return Err(PayloadError::new(
             PayloadErrorKind::NoFence,
-            "no plan-issue-record-payload fence in comment body",
+            "no plan-issue-record-payload carrier or fence in comment body",
         ));
     }
-    if fences.len() > 1 {
+    if payload_count > 1 {
         return Err(PayloadError::new(
             PayloadErrorKind::MultipleFences,
-            "multiple plan-issue-record-payload fences in comment body",
+            "multiple plan-issue-record-payload carriers or fences in comment body",
         ));
     }
 
-    let raw = &fences[0];
+    let raw = carriers.first().or_else(|| fences.first()).ok_or_else(|| {
+        PayloadError::new(
+            PayloadErrorKind::NoFence,
+            "no plan-issue-record-payload carrier or fence in comment body",
+        )
+    })?;
     let payload: RecordPayload = serde_json::from_str(raw)
         .map_err(|err| PayloadError::new(PayloadErrorKind::InvalidJson, err.to_string()))?;
     if payload.schema != PAYLOAD_SCHEMA_V2 {
@@ -1313,6 +1324,37 @@ pub fn extract_payload(comment_body: &str) -> Result<RecordPayload, PayloadError
         ));
     }
     Ok(payload)
+}
+
+fn collect_payload_comment_carriers(body: &str) -> Result<Vec<String>, PayloadError> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let Some(inner) = trimmed
+            .strip_prefix("<!--")
+            .and_then(|value| value.strip_suffix("-->"))
+        else {
+            continue;
+        };
+        let inner = inner.trim();
+        let Some(encoded) = inner.strip_prefix(PAYLOAD_COMMENT_PREFIX) else {
+            continue;
+        };
+        let payload = decode_hex(encoded.trim()).map_err(|err| {
+            PayloadError::new(
+                PayloadErrorKind::InvalidJson,
+                format!("invalid hidden payload carrier: {err}"),
+            )
+        })?;
+        let payload = String::from_utf8(payload).map_err(|err| {
+            PayloadError::new(
+                PayloadErrorKind::InvalidJson,
+                format!("hidden payload carrier is not UTF-8: {err}"),
+            )
+        })?;
+        out.push(payload);
+    }
+    Ok(out)
 }
 
 fn collect_payload_fences(body: &str) -> Vec<String> {
@@ -1341,6 +1383,41 @@ fn collect_payload_fences(body: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
+    if !input.len().is_multiple_of(2) {
+        return Err("hex payload has odd length".to_string());
+    }
+    let mut out = Vec::with_capacity(input.len() / 2);
+    let bytes = input.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = hex_value(pair[0])
+            .ok_or_else(|| format!("invalid hex digit `{}`", char::from(pair[0])))?;
+        let lo = hex_value(pair[1])
+            .ok_or_else(|| format!("invalid hex digit `{}`", char::from(pair[1])))?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl RecordPayload {
@@ -1402,8 +1479,9 @@ impl RecordPayload {
 //
 // `render_record_snapshot_comment` and `render_record_post_comment` produce the
 // canonical Markdown body for `record open` and `record post`: every comment
-// carries the v2 marker on its first line plus a single
-// `plan-issue-record-payload` JSON fence as the structured source of truth.
+// carries the v2 marker on its first line plus a hidden payload carrier as the
+// structured source of truth. Audit still accepts the older visible payload
+// fence for records created before this renderer was fixed.
 // -----------------------------------------------------------------------------
 
 fn payload_role_for_kind(kind: LifecycleCommentKind) -> PayloadRole {
@@ -1418,13 +1496,17 @@ fn payload_role_for_kind(kind: LifecycleCommentKind) -> PayloadRole {
     }
 }
 
-fn render_payload_fence(envelope: &RecordPayload) -> Result<String, String> {
-    serde_json::to_string_pretty(envelope).map_err(|err| err.to_string())
+fn render_payload_carrier(envelope: &RecordPayload) -> Result<String, String> {
+    let envelope_json = serde_json::to_string(envelope).map_err(|err| err.to_string())?;
+    Ok(format!(
+        "<!-- {PAYLOAD_COMMENT_PREFIX}{} -->",
+        encode_hex(envelope_json.as_bytes())
+    ))
 }
 
 /// Render the canonical v2 source/plan snapshot comment used by
 /// `record open`. The body carries the v2 marker, visible details, and a
-/// `plan-issue-record-payload` JSON fence carrying [`SnapshotData`].
+/// hidden structured payload carrying [`SnapshotData`].
 pub fn render_record_snapshot_comment(
     profile: RecordProfile,
     kind: LifecycleCommentKind,
@@ -1449,7 +1531,7 @@ pub fn render_record_snapshot_comment(
         updated_at: updated_at.map(str::to_string),
         data: serde_json::to_value(snapshot).map_err(|err| err.to_string())?,
     };
-    let envelope_json = render_payload_fence(&envelope)?;
+    let envelope_carrier = render_payload_carrier(&envelope)?;
 
     let marker = marker_for(profile, kind);
     let heading = default_heading(profile, kind);
@@ -1484,9 +1566,7 @@ pub fn render_record_snapshot_comment(
     out.push(String::new());
     out.push("</details>".to_string());
     out.push(String::new());
-    out.push(format!("```{PAYLOAD_FENCE_INFO}"));
-    out.push(envelope_json);
-    out.push("```".to_string());
+    out.push(envelope_carrier);
     Ok(finalize_markdown(out))
 }
 
@@ -1517,7 +1597,7 @@ pub fn render_record_post_comment(
         updated_at: updated_at.map(str::to_string),
         data: payload_data,
     };
-    let envelope_json = render_payload_fence(&envelope)?;
+    let envelope_carrier = render_payload_carrier(&envelope)?;
 
     let marker = marker_for(profile, kind);
     let heading = default_heading(profile, kind);
@@ -1533,9 +1613,7 @@ pub fn render_record_post_comment(
         out.push(text.to_string());
     }
     out.push(String::new());
-    out.push(format!("```{PAYLOAD_FENCE_INFO}"));
-    out.push(envelope_json);
-    out.push("```".to_string());
+    out.push(envelope_carrier);
     Ok(finalize_markdown(out))
 }
 
@@ -2133,7 +2211,7 @@ mod sprint3_tests {
     }
 
     #[test]
-    fn render_record_post_comment_emits_marker_and_payload_fence() {
+    fn render_record_post_comment_emits_marker_and_hidden_payload_carrier() {
         let body = render_record_post_comment(
             RecordProfile::Tracking,
             LifecycleCommentKind::State,
@@ -2146,11 +2224,14 @@ mod sprint3_tests {
             body.starts_with("<!-- plan-issue-record:v2 role=state profile=tracking -->"),
             "{body}"
         );
-        assert!(body.contains(&format!("```{PAYLOAD_FENCE_INFO}")), "{body}");
         assert!(
-            body.contains("\"schema\": \"plan-issue-record.payload.v2\""),
+            !body.contains(&format!("```{PAYLOAD_FENCE_INFO}")),
             "{body}"
         );
+        assert!(body.contains(PAYLOAD_COMMENT_PREFIX), "{body}");
+        let payload = extract_payload(&body).expect("payload");
+        assert_eq!(payload.schema, PAYLOAD_SCHEMA_V2);
+        assert_eq!(payload.role, PayloadRole::State);
         assert!(body.contains("session summary"), "{body}");
     }
 
@@ -2168,7 +2249,7 @@ mod sprint3_tests {
     }
 
     #[test]
-    fn render_record_snapshot_comment_includes_details_and_payload() {
+    fn render_record_snapshot_comment_includes_details_and_hidden_payload() {
         let snapshot = SnapshotData {
             path: "docs/plans/sample/sample-plan.md".to_string(),
             commit: "abc1234".to_string(),
@@ -2190,10 +2271,13 @@ mod sprint3_tests {
         assert!(body.contains("- Commit: `abc1234`"), "{body}");
         assert!(body.contains("- Summary: One-liner"), "{body}");
         assert!(body.contains("<details>"), "{body}");
-        assert!(body.contains(&format!("```{PAYLOAD_FENCE_INFO}")), "{body}");
         assert!(
-            body.contains("\"schema\": \"plan-issue-record.payload.v2\""),
+            !body.contains(&format!("```{PAYLOAD_FENCE_INFO}")),
             "{body}"
         );
+        assert!(body.contains(PAYLOAD_COMMENT_PREFIX), "{body}");
+        let payload = extract_payload(&body).expect("payload");
+        assert_eq!(payload.schema, PAYLOAD_SCHEMA_V2);
+        assert_eq!(payload.role, PayloadRole::Plan);
     }
 }
