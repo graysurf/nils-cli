@@ -115,6 +115,42 @@ fn assert_cross_process_byte_equal(product: &str) {
     );
 }
 
+fn assert_support_matrix_cross_process_byte_equal() {
+    let tmp = copy_fixture_to_tempdir();
+    let root_str = tmp.path().to_str().unwrap();
+
+    let first = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "support-matrix",
+    ]);
+    assert_eq!(first.code, 0, "first render exit: {}", first.stderr_text());
+    let build_dir = tmp.path().join("build/shared");
+    let snapshot_first = snapshot(&build_dir);
+
+    fs::remove_dir_all(&build_dir).unwrap();
+    let second = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "support-matrix",
+    ]);
+    assert_eq!(
+        second.code,
+        0,
+        "second render exit: {}",
+        second.stderr_text()
+    );
+    let snapshot_second = snapshot(&build_dir);
+    assert_eq!(
+        snapshot_second, snapshot_first,
+        "support-matrix render was not byte-identical",
+    );
+}
+
 #[test]
 fn cross_process_render_is_byte_identical_for_codex() {
     assert_cross_process_byte_equal("codex");
@@ -123,4 +159,9 @@ fn cross_process_render_is_byte_identical_for_codex() {
 #[test]
 fn cross_process_render_is_byte_identical_for_claude() {
     assert_cross_process_byte_equal("claude");
+}
+
+#[test]
+fn cross_process_support_matrix_render_is_byte_identical() {
+    assert_support_matrix_cross_process_byte_equal();
 }

@@ -440,6 +440,44 @@ fn cli_parse_contract_record_open_accepts_explicit_bundle_paths() {
 }
 
 #[test]
+fn cli_parse_contract_record_attach_accepts_existing_issue_bundle() {
+    let cli = Cli::try_parse_from([
+        "plan-issue",
+        "record",
+        "attach",
+        "--issue",
+        "69",
+        "--bundle",
+        "docs/plans/support-matrix-rendered",
+        "--profile",
+        "tracking",
+        "--title",
+        "Existing Issue",
+        "--allow-dirty",
+    ])
+    .expect("parse record attach");
+
+    cli.validate().expect("validation");
+
+    match &cli.command {
+        Command::Record(args) => match &args.command {
+            RecordCommand::Attach(attach) => {
+                assert_eq!(attach.issue, "69");
+                assert_eq!(attach.profile, RecordProfile::Tracking);
+                assert_eq!(
+                    attach.bundle.as_deref(),
+                    Some(PathBuf::from("docs/plans/support-matrix-rendered").as_path()),
+                );
+                assert_eq!(attach.title.as_deref(), Some("Existing Issue"));
+                assert!(attach.allow_dirty);
+            }
+            other => panic!("unexpected record subcommand: {other:?}"),
+        },
+        other => panic!("unexpected command parsed: {other:?}"),
+    }
+}
+
+#[test]
 fn cli_parse_contract_record_post_accepts_kind_and_payload_file() {
     let cli = Cli::try_parse_from([
         "plan-issue",

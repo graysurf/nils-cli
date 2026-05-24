@@ -3,18 +3,20 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: plan bundle ready; provider tracking issue pending
+- Status: local implementation complete; downstream agent-runtime-kit
+  verification complete
 - Target scope: nils-cli support for agent-runtime-kit support matrix
   rendering and existing issue lifecycle attach
 - Execution window: 2026-05-25
-- Current task: create tracking issue, then implement Sprint 1 and Sprint 2
-- Next task: run `plan-issue record open` for this bundle, then start
-  `agent-runtime render --target support-matrix`
+- Current task: prepare commit / PR handoff
+- Next task: deliver the nils-cli branch, then consume the released binary in
+  agent-runtime-kit when available
 - Last updated: 2026-05-25
-- Branch/commit/PR: feat/support-matrix-render-target
+- Branch/commit/PR: feat/support-matrix-render-target; tracking issue
+  <https://github.com/sympoies/nils-cli/issues/486>
 - Source document: docs/plans/support-matrix-render-target/support-matrix-render-target-plan.md
 - Direct source-doc execution waiver: not applicable
-- Downstream issue: https://github.com/graysurf/agent-runtime-kit/issues/69
+- Downstream issue: <https://github.com/graysurf/agent-runtime-kit/issues/69>
 
 ## Validation Plan
 
@@ -34,16 +36,23 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | pending | Add shared target CLI routing | pending | Preserve product render default. |
-| 1.2 | pending | Load `surfaces.yaml` | pending | Closed product keys and actionable validation errors. |
-| 1.3 | pending | Render deterministic Markdown | pending | Writes `build/shared/SUPPORT_MATRIX.md`. |
-| 1.4 | pending | Add shared golden and determinism coverage | pending | Shared target must not touch product golden trees. |
-| 2.1 | pending | Define `record attach` | pending | Existing issue source/plan/state attach. |
-| 2.2 | pending | Implement provider-backed attach | pending | Posts canonical lifecycle comments then repairs/audits. |
-| 2.3 | pending | Refresh generated CLI surfaces | pending | Help/output contracts/completions/docs. |
-| 3.1 | pending | Render support matrix in agent-runtime-kit | pending | Local binary downstream verification. |
-| 3.2 | pending | Attach v3 lifecycle comments to #69 | pending | Local binary downstream lifecycle repair. |
+| 1.1 | done | Add shared target CLI routing | `crates/agent-runtime-cli/src/commands/render.rs` | `--target support-matrix` preserves default product render behavior. |
+| 1.2 | done | Load `surfaces.yaml` | `crates/agent-runtime-cli/src/render/support_matrix.rs` | Closed product keys and actionable validation errors. |
+| 1.3 | done | Render deterministic Markdown | `build/shared/SUPPORT_MATRIX.md` downstream check | Writes shared generated support matrix. |
+| 1.4 | done | Add shared golden and determinism coverage | `cargo nextest run --profile ci -p agent-runtime-cli` | Shared target has integration and determinism coverage. |
+| 2.1 | done | Define `record attach` | `crates/plan-issue-cli/src/commands/record.rs` | Existing issue source/plan/state attach. |
+| 2.2 | done | Implement provider-backed attach | `crates/plan-issue-cli/src/execute.rs` | Posts canonical lifecycle comments then repairs/audits. |
+| 2.3 | done | Refresh generated CLI surfaces | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | Help/output contracts/completions/docs covered by local-fast. |
+| 3.1 | done | Render support matrix in agent-runtime-kit | local `target/debug/agent-runtime` | Local binary rendered 17 surfaces / 34 rows. |
+| 3.2 | done | Attach v3 lifecycle comments to #69 | <https://github.com/graysurf/agent-runtime-kit/issues/69#issuecomment-4529537599> | Read-back audit recognized source/plan/state with no missing required evidence. |
 
 ## Session Log
 
 - 2026-05-25: Created plan bundle from agent-runtime-kit #69 audit results.
+- 2026-05-25: Opened tracking issue #486 with v2 source, plan, and state
+  lifecycle comments.
+- 2026-05-25: Implemented `agent-runtime render --target support-matrix` and
+  `plan-issue record attach`.
+- 2026-05-25: Used local binaries to render agent-runtime-kit
+  `SUPPORT_MATRIX.md` and attach v2 lifecycle comments to
+  graysurf/agent-runtime-kit#69.

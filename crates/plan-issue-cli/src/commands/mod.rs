@@ -290,6 +290,7 @@ impl RecordArgs {
     pub fn command_id(&self) -> &'static str {
         match &self.command {
             record::RecordCommand::Open(_) => "record.open",
+            record::RecordCommand::Attach(_) => "record.attach",
             record::RecordCommand::Post(_) => "record.post",
             record::RecordCommand::RepairDashboard(_) => "record.repair-dashboard",
             record::RecordCommand::Close(_) => "record.close",

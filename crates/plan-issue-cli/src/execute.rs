@@ -15,8 +15,8 @@ use crate::commands::plan::{
     ResolveApprovalArgs, StartPlanArgs, StatusPlanArgs,
 };
 use crate::commands::record::{
-    RecordArgs, RecordAuditArgs, RecordCloseArgs, RecordCommand, RecordOpenArgs, RecordPostArgs,
-    RecordRepairDashboardArgs,
+    RecordArgs, RecordAttachArgs, RecordAuditArgs, RecordCloseArgs, RecordCommand, RecordOpenArgs,
+    RecordPostArgs, RecordRepairDashboardArgs,
 };
 use crate::commands::sprint::{
     AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs,
@@ -87,6 +87,9 @@ fn run_record(
 ) -> Result<Value, CommandError> {
     match &args.command {
         RecordCommand::Open(args) => run_record_open(binary, dry_run, force, repo_override, args),
+        RecordCommand::Attach(args) => {
+            run_record_attach(binary, dry_run, force, repo_override, args)
+        }
         RecordCommand::Post(args) => run_record_post(binary, dry_run, force, repo_override, args),
         RecordCommand::RepairDashboard(args) => {
             run_record_repair_dashboard(binary, dry_run, force, repo_override, args)
@@ -103,6 +106,17 @@ struct RecordBundle {
     /// Resolved when present; `None` only when the caller explicitly opted out.
     #[allow(dead_code)]
     execution_state_file: Option<PathBuf>,
+}
+
+struct RecordSeed {
+    plan_title: String,
+    source_path: String,
+    plan_path: String,
+    source_commit: String,
+    plan_commit: String,
+    source_body: String,
+    plan_body: String,
+    state_body: String,
 }
 
 fn resolve_record_bundle(
@@ -368,6 +382,88 @@ fn record_initial_dashboard(
     })
 }
 
+fn build_record_seed(
+    profile: crate::commands::record::RecordProfile,
+    title: Option<&str>,
+    bundle: &RecordBundle,
+    allow_dirty: bool,
+    state_fallback: &str,
+) -> Result<RecordSeed, CommandError> {
+    let plan = parse_plan_for_record(&bundle.plan_file)?;
+    let plan_title = title
+        .map(str::to_string)
+        .unwrap_or_else(|| plan.title.clone());
+
+    let (source_snapshot, plan_snapshot) = resolve_bundle_snapshots(bundle, allow_dirty)?;
+    let source_content = fs::read_to_string(&bundle.source_file).map_err(|err| {
+        CommandError::runtime(
+            "record-open-source-read-failed",
+            format!("failed to read {}: {err}", bundle.source_file.display()),
+        )
+    })?;
+    let plan_content = fs::read_to_string(&bundle.plan_file).map_err(|err| {
+        CommandError::runtime(
+            "record-open-plan-read-failed",
+            format!("failed to read {}: {err}", bundle.plan_file.display()),
+        )
+    })?;
+    let execution_state_content = bundle
+        .execution_state_file
+        .as_deref()
+        .map(|path| {
+            fs::read_to_string(path).map_err(|err| {
+                CommandError::runtime(
+                    "record-open-execution-state-read-failed",
+                    format!("failed to read {}: {err}", path.display()),
+                )
+            })
+        })
+        .transpose()?;
+
+    let source_body = lifecycle_record::render_record_snapshot_comment(
+        profile,
+        crate::commands::record::LifecycleCommentKind::Source,
+        &source_snapshot,
+        &source_content,
+        None,
+    )
+    .map_err(|err| CommandError::runtime("record-open-source-render-failed", err))?;
+    let plan_body = lifecycle_record::render_record_snapshot_comment(
+        profile,
+        crate::commands::record::LifecycleCommentKind::Plan,
+        &plan_snapshot,
+        &plan_content,
+        None,
+    )
+    .map_err(|err| CommandError::runtime("record-open-plan-render-failed", err))?;
+
+    let initial_state = build_initial_state_payload(&plan);
+    let state_summary = execution_state_content
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(state_fallback);
+    let state_body = lifecycle_record::render_record_post_comment(
+        profile,
+        crate::commands::record::LifecycleCommentKind::State,
+        initial_state,
+        Some(state_summary),
+        None,
+    )
+    .map_err(|err| CommandError::runtime("record-open-state-render-failed", err))?;
+
+    Ok(RecordSeed {
+        plan_title,
+        source_path: path_text(&bundle.source_file),
+        plan_path: path_text(&bundle.plan_file),
+        source_commit: source_snapshot.commit,
+        plan_commit: plan_snapshot.commit,
+        source_body,
+        plan_body,
+        state_body,
+    })
+}
+
 fn read_fixture_evidence(fixture_dir: &Path) -> Result<(String, String), CommandError> {
     let body_path = fixture_dir.join("issue-body.md");
     let comments_path = fixture_dir.join("comments.json");
@@ -598,68 +694,15 @@ fn run_record_open(
         args.plan_file.as_deref(),
         args.execution_state_file.as_deref(),
     )?;
-    let plan = parse_plan_for_record(&bundle.plan_file)?;
-    let plan_title = args.title.clone().unwrap_or_else(|| plan.title.clone());
-
-    let (source_snapshot, plan_snapshot) = resolve_bundle_snapshots(&bundle, args.allow_dirty)?;
-    let source_content = fs::read_to_string(&bundle.source_file).map_err(|err| {
-        CommandError::runtime(
-            "record-open-source-read-failed",
-            format!("failed to read {}: {err}", bundle.source_file.display()),
-        )
-    })?;
-    let plan_content = fs::read_to_string(&bundle.plan_file).map_err(|err| {
-        CommandError::runtime(
-            "record-open-plan-read-failed",
-            format!("failed to read {}: {err}", bundle.plan_file.display()),
-        )
-    })?;
-    let execution_state_content = bundle
-        .execution_state_file
-        .as_deref()
-        .map(|path| {
-            fs::read_to_string(path).map_err(|err| {
-                CommandError::runtime(
-                    "record-open-execution-state-read-failed",
-                    format!("failed to read {}: {err}", path.display()),
-                )
-            })
-        })
-        .transpose()?;
-
-    let source_body = lifecycle_record::render_record_snapshot_comment(
+    let seed = build_record_seed(
         args.profile,
-        crate::commands::record::LifecycleCommentKind::Source,
-        &source_snapshot,
-        &source_content,
-        None,
-    )
-    .map_err(|err| CommandError::runtime("record-open-source-render-failed", err))?;
-    let plan_body = lifecycle_record::render_record_snapshot_comment(
-        args.profile,
-        crate::commands::record::LifecycleCommentKind::Plan,
-        &plan_snapshot,
-        &plan_content,
-        None,
-    )
-    .map_err(|err| CommandError::runtime("record-open-plan-render-failed", err))?;
+        args.title.as_deref(),
+        &bundle,
+        args.allow_dirty,
+        "Initial execution state seeded by `plan-issue record open`.",
+    )?;
 
-    let initial_state = build_initial_state_payload(&plan);
-    let state_summary = execution_state_content
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Initial execution state seeded by `plan-issue record open`.");
-    let state_body = lifecycle_record::render_record_post_comment(
-        args.profile,
-        crate::commands::record::LifecycleCommentKind::State,
-        initial_state.clone(),
-        Some(state_summary),
-        None,
-    )
-    .map_err(|err| CommandError::runtime("record-open-state-render-failed", err))?;
-
-    let initial_dashboard = record_initial_dashboard(args.profile, &plan_title, None);
+    let initial_dashboard = record_initial_dashboard(args.profile, &seed.plan_title, None);
 
     let normalized_labels: Vec<String> = args
         .labels
@@ -671,15 +714,15 @@ fn run_record_open(
     let preview = json!({
         "issue_body_markdown": initial_dashboard,
         "comments": {
-            "source": source_body,
-            "plan": plan_body,
-            "state": state_body,
+            "source": &seed.source_body,
+            "plan": &seed.plan_body,
+            "state": &seed.state_body,
         },
-        "plan_title": plan_title,
-        "source_path": path_text(&bundle.source_file),
-        "plan_path": path_text(&bundle.plan_file),
-        "source_commit": source_snapshot.commit,
-        "plan_commit": plan_snapshot.commit,
+        "plan_title": &seed.plan_title,
+        "source_path": &seed.source_path,
+        "plan_path": &seed.plan_path,
+        "source_commit": &seed.source_commit,
+        "plan_commit": &seed.plan_commit,
         "labels": normalized_labels.clone(),
     });
 
@@ -700,20 +743,20 @@ fn run_record_open(
     let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
         .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
     let (issue_number, issue_url) = adapter
-        .create_issue(&repo, &plan_title, &body_path, &normalized_labels)
+        .create_issue(&repo, &seed.plan_title, &body_path, &normalized_labels)
         .map_err(|err| CommandError::runtime("record-open-issue-create-failed", err))?;
 
-    let source_path = write_temp_markdown("record-open-source-comment", &source_body)
+    let source_path = write_temp_markdown("record-open-source-comment", &seed.source_body)
         .map_err(|err| CommandError::runtime("record-open-source-write-failed", err))?;
     let source_url = adapter
         .comment_issue(&repo, issue_number, &source_path)
         .map_err(|err| CommandError::runtime("record-open-source-post-failed", err))?;
-    let plan_path = write_temp_markdown("record-open-plan-comment", &plan_body)
+    let plan_path = write_temp_markdown("record-open-plan-comment", &seed.plan_body)
         .map_err(|err| CommandError::runtime("record-open-plan-write-failed", err))?;
     let plan_url = adapter
         .comment_issue(&repo, issue_number, &plan_path)
         .map_err(|err| CommandError::runtime("record-open-plan-post-failed", err))?;
-    let state_path = write_temp_markdown("record-open-state-comment", &state_body)
+    let state_path = write_temp_markdown("record-open-state-comment", &seed.state_body)
         .map_err(|err| CommandError::runtime("record-open-state-write-failed", err))?;
     let state_url = adapter
         .comment_issue(&repo, issue_number, &state_path)
@@ -726,8 +769,11 @@ fn run_record_open(
     let audit =
         lifecycle_record::audit_record(Some(&body_after), &comments_json, Some(args.profile))
             .map_err(|err| CommandError::runtime("record-open-audit-failed", err))?;
-    let repaired =
-        lifecycle_record::render_dashboard_from_audit(&audit, Some(&plan_title), Some(&issue_url));
+    let repaired = lifecycle_record::render_dashboard_from_audit(
+        &audit,
+        Some(&seed.plan_title),
+        Some(&issue_url),
+    );
     let repaired_path = write_temp_markdown("record-open-dashboard", &repaired)
         .map_err(|err| CommandError::runtime("record-open-dashboard-write-failed", err))?;
     adapter
@@ -742,6 +788,101 @@ fn run_record_open(
         "issue": {"number": issue_number, "url": issue_url},
         "comments": {"source": source_url, "plan": plan_url, "state": state_url},
         "labels": normalized_labels,
+        "dashboard_markdown": repaired,
+    }))
+}
+
+fn run_record_attach(
+    binary: BinaryFlavor,
+    dry_run: bool,
+    force: bool,
+    repo_override: Option<&str>,
+    args: &RecordAttachArgs,
+) -> Result<Value, CommandError> {
+    let issue_number = parse_issue_reference(&args.issue)?;
+    let bundle = resolve_record_bundle(
+        args.bundle.as_deref(),
+        args.source_file.as_deref(),
+        args.plan_file.as_deref(),
+        args.execution_state_file.as_deref(),
+    )?;
+    let seed = build_record_seed(
+        args.profile,
+        args.title.as_deref(),
+        &bundle,
+        args.allow_dirty,
+        "Initial execution state attached by `plan-issue record attach`.",
+    )?;
+
+    let preview = json!({
+        "issue": args.issue,
+        "issue_number": issue_number,
+        "comments": {
+            "source": &seed.source_body,
+            "plan": &seed.plan_body,
+            "state": &seed.state_body,
+        },
+        "plan_title": &seed.plan_title,
+        "source_path": &seed.source_path,
+        "plan_path": &seed.plan_path,
+        "source_commit": &seed.source_commit,
+        "plan_commit": &seed.plan_commit,
+    });
+
+    if binary != BinaryFlavor::PlanIssue || dry_run {
+        return Ok(json!({
+            "operation": "record.attach",
+            "execution_mode": binary.execution_mode(),
+            "dry_run": true,
+            "mode": "dry-run",
+            "preview": preview,
+        }));
+    }
+
+    let repo = resolve_repo_for_live(binary, repo_override)?;
+    let issue_url = format!("https://github.com/{repo}/issues/{issue_number}");
+    let adapter = GhCliAdapter::new(force);
+
+    let source_path = write_temp_markdown("record-attach-source-comment", &seed.source_body)
+        .map_err(|err| CommandError::runtime("record-attach-source-write-failed", err))?;
+    let source_url = adapter
+        .comment_issue(&repo, issue_number, &source_path)
+        .map_err(|err| CommandError::runtime("record-attach-source-post-failed", err))?;
+    let plan_path = write_temp_markdown("record-attach-plan-comment", &seed.plan_body)
+        .map_err(|err| CommandError::runtime("record-attach-plan-write-failed", err))?;
+    let plan_url = adapter
+        .comment_issue(&repo, issue_number, &plan_path)
+        .map_err(|err| CommandError::runtime("record-attach-plan-post-failed", err))?;
+    let state_path = write_temp_markdown("record-attach-state-comment", &seed.state_body)
+        .map_err(|err| CommandError::runtime("record-attach-state-write-failed", err))?;
+    let state_url = adapter
+        .comment_issue(&repo, issue_number, &state_path)
+        .map_err(|err| CommandError::runtime("record-attach-state-post-failed", err))?;
+
+    let (body_after, comments_json) = adapter
+        .issue_evidence(&repo, issue_number)
+        .map_err(|err| CommandError::runtime("record-attach-evidence-read-failed", err))?;
+    let audit =
+        lifecycle_record::audit_record(Some(&body_after), &comments_json, Some(args.profile))
+            .map_err(|err| CommandError::runtime("record-attach-audit-failed", err))?;
+    let repaired = lifecycle_record::render_dashboard_from_audit(
+        &audit,
+        Some(&seed.plan_title),
+        Some(&issue_url),
+    );
+    let repaired_path = write_temp_markdown("record-attach-dashboard", &repaired)
+        .map_err(|err| CommandError::runtime("record-attach-dashboard-write-failed", err))?;
+    adapter
+        .edit_issue_body(&repo, issue_number, &repaired_path)
+        .map_err(|err| CommandError::runtime("record-attach-dashboard-edit-failed", err))?;
+
+    Ok(json!({
+        "operation": "record.attach",
+        "execution_mode": binary.execution_mode(),
+        "dry_run": false,
+        "mode": "live",
+        "issue": {"number": issue_number, "url": issue_url},
+        "comments": {"source": source_url, "plan": plan_url, "state": state_url},
         "dashboard_markdown": repaired,
     }))
 }

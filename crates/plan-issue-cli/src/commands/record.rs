@@ -15,6 +15,10 @@ pub enum RecordCommand {
     /// comments (v3 issue-backed plan record contract).
     Open(Box<RecordOpenArgs>),
 
+    /// Attach source, plan, and initial state lifecycle comments to an
+    /// existing provider issue.
+    Attach(Box<RecordAttachArgs>),
+
     /// Append a canonical lifecycle comment (state, session, validation,
     /// review, or closeout) to an existing plan record issue.
     Post(Box<RecordPostArgs>),
@@ -130,6 +134,43 @@ pub struct RecordOpenArgs {
     /// live provider calls.
     #[arg(long, value_name = "dir")]
     pub fixture: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct RecordAttachArgs {
+    /// Provider issue number or full URL.
+    #[arg(long, value_name = "issue")]
+    pub issue: String,
+
+    /// Lifecycle profile for the record.
+    #[arg(long, value_enum, default_value_t = RecordProfile::Tracking)]
+    pub profile: RecordProfile,
+
+    /// Plan bundle directory. The bundle directory contains the source,
+    /// plan, and execution-state Markdown files using the same naming
+    /// convention as `record open`.
+    #[arg(long, value_name = "dir")]
+    pub bundle: Option<PathBuf>,
+
+    /// Explicit source document path. Overrides bundle derivation.
+    #[arg(long = "source-file", value_name = "path")]
+    pub source_file: Option<PathBuf>,
+
+    /// Explicit plan document path. Overrides bundle derivation.
+    #[arg(long = "plan-file", value_name = "path")]
+    pub plan_file: Option<PathBuf>,
+
+    /// Explicit execution-state document path. Overrides bundle derivation.
+    #[arg(long = "execution-state-file", value_name = "path")]
+    pub execution_state_file: Option<PathBuf>,
+
+    /// Issue title for dashboard rendering. Defaults to the plan title.
+    #[arg(long, value_name = "text")]
+    pub title: Option<String>,
+
+    /// Allow attaching the record even when local plan files are dirty.
+    #[arg(long = "allow-dirty")]
+    pub allow_dirty: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize)]

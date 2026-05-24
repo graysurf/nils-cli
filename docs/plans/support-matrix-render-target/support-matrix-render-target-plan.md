@@ -136,8 +136,8 @@ already-open issues such as agent-runtime-kit #69.
   - `crates/plan-issue-cli/src/commands/record.rs`
   - `crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md`
   - `crates/plan-issue-cli/tests/integration/cli_contract.rs`
-- **Description**: Add `plan-issue record attach --issue <issue> --bundle
-  <dir>` for existing provider issues.
+- **Description**: Add `plan-issue record attach --issue ISSUE --bundle DIR`
+  for existing provider issues.
 - **Dependencies**:
   - none
 - **Complexity**: 4
@@ -228,7 +228,7 @@ local binaries.
   - `record audit` recognizes source, plan, and state evidence.
   - The dashboard points at the generated lifecycle comment URLs.
 - **Validation**:
-  - `plan-issue record audit --profile tracking --body-file /Users/terry/.local/state/agent-runtime-kit/out/projects/graysurf__agent-runtime-kit/20260525-013050-support-matrix-issue69/issue69-body.md --comments-json /Users/terry/.local/state/agent-runtime-kit/out/projects/graysurf__agent-runtime-kit/20260525-013050-support-matrix-issue69/issue69.json`
+  - `plan-issue record audit --profile tracking --body-file "$ARKIT_ISSUE_BODY" --comments-json "$ARKIT_ISSUE_JSON"`
 
 ## Validation Summary
 
