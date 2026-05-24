@@ -93,8 +93,8 @@ plan after this lands.
 
 ## Execution
 
-- Recommended plan: `docs/plans/gitlab-mr-unblock/gitlab-mr-unblock-plan.md`
-- Recommended execution state: `docs/plans/gitlab-mr-unblock/gitlab-mr-unblock-execution-state.md`
+- Recommended plan: docs/plans/gitlab-mr-unblock/gitlab-mr-unblock-plan.md
+- Recommended execution state: docs/plans/gitlab-mr-unblock/gitlab-mr-unblock-execution-state.md
 - Status: ready
 - Next-task source: this plan's Sprint 1
 
