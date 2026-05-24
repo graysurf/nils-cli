@@ -341,9 +341,17 @@ mod tests {
     use crate::backend::BackendOutput;
     use crate::cli::GlobalFlags;
 
+    /// One recorded backend call. We capture `(program, argv)` rather than
+    /// `call.plan_argv()` so the test does not race against any other test
+    /// that mutates `FORGE_CLI_GH_BIN` / `FORGE_CLI_GLAB_BIN` while running
+    /// in parallel — `plan_argv()` resolves the binary name through those
+    /// env vars, but the abstract `program` enum is set at construction time
+    /// inside `build_*_call` and is race-free.
+    type RecordedCall = (BackendProgram, Vec<String>);
+
     struct ScriptedRunner {
         outputs: RefCell<Vec<BackendSuccess>>,
-        calls: RefCell<Vec<Vec<String>>>,
+        calls: RefCell<Vec<RecordedCall>>,
     }
 
     impl ScriptedRunner {
@@ -354,14 +362,19 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<Vec<String>> {
+        fn calls(&self) -> Vec<RecordedCall> {
             self.calls.borrow().clone()
         }
     }
 
     impl crate::backend::BackendRunner for ScriptedRunner {
         fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
-            self.calls.borrow_mut().push(call.plan_argv());
+            let argv = call
+                .argv
+                .iter()
+                .map(|os| os.to_string_lossy().into_owned())
+                .collect();
+            self.calls.borrow_mut().push((call.program, argv));
             Ok(self.outputs.borrow_mut().remove(0))
         }
 
@@ -508,20 +521,16 @@ mod tests {
 
         let calls = runner.calls();
         assert_eq!(calls.len(), 2, "expected pr view + comments api call");
+        assert_eq!(calls[0].0, BackendProgram::Gh);
+        assert_eq!(calls[0].1[..2], ["pr".to_string(), "view".to_string()]);
+        assert_eq!(calls[1].0, BackendProgram::Gh);
         assert_eq!(
-            calls[0][..3],
-            ["gh".to_string(), "pr".to_string(), "view".to_string()]
-        );
-        assert_eq!(
-            calls[1][..3],
-            [
-                "gh".to_string(),
-                "api".to_string(),
-                "--paginate".to_string()
-            ]
+            calls[1].1[..2],
+            ["api".to_string(), "--paginate".to_string()]
         );
         assert!(
             calls[1]
+                .1
                 .iter()
                 .any(|s| s.contains("repos/o/r/issues/7/comments")),
             "comments path must reference owner/repo derived from view URL: {:?}",
@@ -562,9 +571,11 @@ mod tests {
 
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1][..2], ["glab".to_string(), "api".to_string()]);
+        assert_eq!(calls[1].0, BackendProgram::Glab);
+        assert_eq!(calls[1].1[..1], ["api".to_string()]);
         assert!(
             calls[1]
+                .1
                 .iter()
                 .any(|s| s.contains("projects/grp%2Fproj/merge_requests/12/notes")),
             "notes path must url-encode the project slug derived from MR web_url: {:?}",

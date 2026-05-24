@@ -28,7 +28,7 @@ pub const ENV_GLAB_BIN: &str = "FORGE_CLI_GLAB_BIN";
 pub const STDERR_TAIL_BYTES: usize = 2 * 1024;
 
 /// Backend program selector. Each variant maps to one external binary.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendProgram {
     Gh,
     Glab,
