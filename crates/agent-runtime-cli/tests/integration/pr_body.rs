@@ -91,7 +91,7 @@ fn pr_body_render_bug_writes_kind_specific_body_to_file() {
     );
     let reproduction = fixture.write(
         "reproduction.md",
-        "1. Render a legacy bug PR body.\n2. Run `forge-cli pr create --body-file`.\n",
+        "1. Render the previous bug PR body.\n2. Run `forge-cli pr create --body-file`.\n",
     );
     let issues = fixture.write(
         "issues.md",
