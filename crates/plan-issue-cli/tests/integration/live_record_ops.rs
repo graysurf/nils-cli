@@ -134,6 +134,60 @@ fn record_post_state_with_payload_file_renders_v2_marker_in_dry_run() {
 }
 
 #[test]
+fn record_post_state_summary_file_is_rendered_in_dry_run() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    let summary = tmp.path().join("summary.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "summary surface",
+            "tasks": [],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &summary,
+        "- Updated runtime-kit skills to the v3 surface.\n",
+    )
+    .expect("write summary");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--summary-file",
+        summary.to_str().expect("summary str"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let body = parsed["payload"]["result"]["comment_body"]
+        .as_str()
+        .expect("comment body");
+    assert!(
+        body.contains("- Updated runtime-kit skills to the v3 surface."),
+        "{body}"
+    );
+    assert!(
+        body.starts_with("<!-- plan-issue-record:v2 role=state profile=tracking -->"),
+        "{body}"
+    );
+}
+
+#[test]
 fn record_post_rejects_source_plan_and_closeout_kinds() {
     for kind in ["source", "plan", "closeout"] {
         let out = common::run_plan_issue_local(&[
@@ -223,6 +277,68 @@ fn record_repair_dashboard_renders_canonical_dashboard_from_body_and_comments() 
 }
 
 #[test]
+fn record_repair_dashboard_out_writes_local_dashboard_file() {
+    let tmp = TempDir::new().expect("tempdir");
+    let body_path = tmp.path().join("body.md");
+    let comments_path = tmp.path().join("comments.json");
+    let out_path = tmp.path().join("dashboard.md");
+    fs::write(&body_path, "## Current Dashboard\n\n- Status: stale\n").expect("write body");
+    fs::write(
+        &comments_path,
+        json!({
+            "comments": [
+                {
+                    "url": "https://github.com/owner/repo/issues/9#issuecomment-state",
+                    "body": v2_comment_body(
+                        "state",
+                        "tracking",
+                        json!({
+                            "status": "in-progress",
+                            "target_scope": "repair out",
+                            "current": "refresh dashboard",
+                            "next_action": "continue",
+                            "tasks": [],
+                            "prs": [],
+                            "blockers": [],
+                            "links": {}
+                        }),
+                    ),
+                    "created_at": "2026-05-23T10:00:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write comments");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "repair-dashboard",
+        "--body-file",
+        body_path.to_str().expect("body path"),
+        "--comments-json",
+        comments_path.to_str().expect("comments path"),
+        "--out",
+        out_path.to_str().expect("out path"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["mode"], "local");
+    assert_eq!(
+        result["out_path"],
+        out_path.to_string_lossy().as_ref(),
+        "{result}"
+    );
+    let dashboard = fs::read_to_string(&out_path).expect("read dashboard");
+    assert!(dashboard.starts_with("## Current Dashboard"), "{dashboard}");
+    assert!(dashboard.contains("- Status: in-progress"), "{dashboard}");
+}
+
+#[test]
 fn record_close_requires_non_empty_approval() {
     let out =
         common::run_plan_issue_local(&["--format", "json", "record", "close", "--issue", "9"]);
@@ -306,6 +422,43 @@ fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
             }
         ]
     })
+}
+
+#[test]
+fn record_close_body_file_mode_blocks_unresolved_linked_pr() {
+    let tmp = TempDir::new().expect("tempdir");
+    let body_path = tmp.path().join("body.md");
+    let comments_path = tmp.path().join("comments.json");
+    fs::write(&body_path, "## Current Dashboard\n").expect("write body");
+    fs::write(
+        &comments_path,
+        build_closeout_evidence("owner/repo#1").to_string(),
+    )
+    .expect("write comments");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "https://github.com/owner/repo/issues/9#issuecomment-approval",
+        "--body-file",
+        body_path.to_str().expect("body path"),
+        "--comments-json",
+        comments_path.to_str().expect("comments path"),
+    ]);
+
+    assert_ne!(out.code, 0, "missing provider PR evidence should block");
+    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    assert!(
+        joined.contains("linked-pr-not-merged"),
+        "expected linked-pr-not-merged without PR evidence: {joined}"
+    );
 }
 
 #[test]
