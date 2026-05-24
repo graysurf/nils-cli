@@ -135,22 +135,44 @@ fn build_comments_call(
                     Some(format!("url={}", view.url)),
                 )
             })?;
+            let host = gitlab_host_from_url(&view.url).ok_or_else(|| {
+                ForgeError::software(
+                    schema_err(),
+                    "unable to derive GitLab host from MR web_url",
+                    Some(format!("url={}", view.url)),
+                )
+            })?;
             let encoded = project.replace('/', "%2F");
             let path = format!(
                 "projects/{encoded}/merge_requests/{iid}/notes?per_page=100&order_by=created_at&sort=asc",
                 iid = view.number,
             );
+            let _ = ctx; // host derived from MR web_url, not ctx.host (see issue_view::build_gitlab_notes_call comment)
             Ok(BackendCall::new(
                 BackendProgram::Glab,
                 [
                     OsString::from("api"),
                     OsString::from("--paginate"),
                     OsString::from("--hostname"),
-                    OsString::from(ctx.host.as_str()),
+                    OsString::from(host),
                     OsString::from(path),
                 ],
             ))
         }
+    }
+}
+
+/// Extract the host (`<host>`) from an `https?://<host>/...` URL. Used to
+/// wire `glab api --hostname` against the actual GitLab instance the MR
+/// lives on rather than `ProviderContext::host` (which defaults to
+/// `gitlab.com` when `--provider gitlab` is forced).
+fn gitlab_host_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest)?;
+    let host = after_scheme.split_once('/').map(|(host, _)| host)?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }
 
