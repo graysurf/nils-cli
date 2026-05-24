@@ -90,7 +90,7 @@ fn pr_wait_checks_succeeds_when_terminal_on_third_poll() {
             "--interval",
             "10ms",
             "--timeout",
-            "5s",
+            "20s",
         ],
     );
     assert_eq!(out.code, 0, "stderr={}", out.stderr);

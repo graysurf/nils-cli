@@ -672,10 +672,262 @@ fn render_ensure_text(payload: &LabelEnsurePayload) {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn group(name: &str, prefix: &str, exclusive: bool, allow_extensions: bool) -> CatalogGroup {
+        CatalogGroup {
+            name: name.into(),
+            prefix: prefix.into(),
+            exclusive,
+            allow_extensions,
+        }
+    }
+
+    fn label(name: &str, group: &str, color: &str, description: &str) -> CatalogLabel {
+        CatalogLabel {
+            name: name.into(),
+            group: group.into(),
+            color: color.into(),
+            description: description.into(),
+            applies_to: Vec::new(),
+        }
+    }
+
+    fn ctx(provider: Provider, repo: Option<&str>) -> ProviderContext {
+        ProviderContext {
+            provider,
+            host: match provider {
+                Provider::GitHub => "github.com",
+                Provider::GitLab => "gitlab.com",
+            }
+            .into(),
+            source: crate::provider::DetectionSource::Flag,
+            repo: repo.map(str::to_string),
+        }
+    }
+
+    fn argv(call: &BackendCall) -> Vec<String> {
+        call.argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn write_catalog(dir: &Path, body: &str) -> String {
+        let path = dir.join("forge-labels.yaml");
+        std::fs::write(&path, body).expect("write label catalog");
+        path.to_string_lossy().into_owned()
+    }
 
     #[test]
     fn normalize_color_drops_hash_and_uppercases() {
         assert_eq!(normalize_color("#d73a4a"), "D73A4A");
+    }
+
+    #[test]
+    fn parse_list_output_accepts_provider_shapes() {
+        let output = BackendSuccess {
+            stdout: r##"[
+              {"id": 123, "name": "type::bug", "color": "#d73a4a", "description": "Bug"},
+              {"name": "area::runtime", "description": null}
+            ]"##
+            .into(),
+            stderr: String::new(),
+        };
+
+        let labels = parse_list_output(&ctx(Provider::GitHub, None), &output).expect("parse");
+
+        assert_eq!(
+            labels,
+            vec![
+                ProviderLabel {
+                    id: Some("123".into()),
+                    name: "type::bug".into(),
+                    color: "D73A4A".into(),
+                    description: "Bug".into(),
+                },
+                ProviderLabel {
+                    id: None,
+                    name: "area::runtime".into(),
+                    color: String::new(),
+                    description: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_list_output_rejects_invalid_json_shapes() {
+        let invalid = BackendSuccess {
+            stdout: "{not-json".into(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            parse_list_output(&ctx(Provider::GitHub, None), &invalid)
+                .expect_err("invalid json")
+                .kind(),
+            "software_error"
+        );
+
+        let object = BackendSuccess {
+            stdout: r#"{"labels":[]}"#.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            parse_list_output(&ctx(Provider::GitLab, None), &object)
+                .expect_err("array required")
+                .kind(),
+            "software_error"
+        );
+    }
+
+    #[test]
+    fn provider_calls_render_expected_backend_arguments() {
+        let expected = label("type::bug", "type", "D73A4A", "Bug");
+        let current = ProviderLabel {
+            id: Some("42".into()),
+            name: "type::bug".into(),
+            color: "FFFFFF".into(),
+            description: "Old".into(),
+        };
+
+        assert_eq!(
+            argv(&build_list_call(
+                &ctx(Provider::GitHub, Some("sympoies/nils-cli")),
+                25
+            )),
+            vec![
+                "label",
+                "list",
+                "--limit",
+                "25",
+                "--json",
+                "id,name,color,description",
+                "--repo",
+                "sympoies/nils-cli"
+            ]
+        );
+        assert_eq!(
+            argv(&build_create_call(&ctx(Provider::GitLab, None), &expected)),
+            vec![
+                "label",
+                "create",
+                "--name",
+                "type::bug",
+                "--color",
+                "#D73A4A",
+                "--description",
+                "Bug"
+            ]
+        );
+        assert_eq!(
+            argv(
+                &build_update_call(
+                    &ctx(Provider::GitLab, Some("group/project")),
+                    &expected,
+                    &current,
+                )
+                .expect("gitlab update")
+            ),
+            vec![
+                "label",
+                "edit",
+                "--label-id",
+                "42",
+                "--color",
+                "#D73A4A",
+                "--description",
+                "Bug",
+                "--repo",
+                "group/project"
+            ]
+        );
+        assert!(
+            build_update_call(
+                &ctx(Provider::GitLab, None),
+                &expected,
+                &ProviderLabel {
+                    id: None,
+                    ..current
+                },
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn audit_reports_missing_drift_and_unknown_shared_labels() {
+        let catalog = Catalog {
+            labels: vec![
+                label("type::bug", "type", "D73A4A", "Bug"),
+                label("status::blocked", "status", "B60205", "Blocked"),
+            ],
+            groups: vec![
+                group("type", "type::", true, false),
+                group("status", "status::", true, false),
+                group("area", "area::", false, true),
+            ],
+        };
+        let current = vec![
+            ProviderLabel {
+                id: None,
+                name: "type::bug".into(),
+                color: "FFFFFF".into(),
+                description: "Bug".into(),
+            },
+            ProviderLabel {
+                id: None,
+                name: "status::unknown".into(),
+                color: "000000".into(),
+                description: "Legacy".into(),
+            },
+            ProviderLabel {
+                id: None,
+                name: "area::repo-local".into(),
+                color: "000000".into(),
+                description: "Allowed extension".into(),
+            },
+        ];
+
+        let audit = audit_labels(&catalog, &current);
+
+        assert_eq!(audit.missing[0].name, "status::blocked");
+        assert_eq!(audit.drift[0].fields[0].field, "color");
+        assert_eq!(audit.unknown_shared[0].name, "status::unknown");
+    }
+
+    #[test]
+    fn catalog_loader_infers_groups_and_rejects_empty_catalogs() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = write_catalog(
+            tempdir.path(),
+            r##"
+groups:
+  - name: type
+    prefix: "type::"
+labels:
+  - name: "type::bug"
+    color: "#d73a4a"
+    description: Bug
+"##,
+        );
+
+        let catalog = load_catalog(&path).expect("catalog");
+        assert_eq!(catalog.labels[0].group, "type");
+        assert_eq!(catalog.labels[0].color, "D73A4A");
+
+        let empty = write_catalog(
+            tempdir.path(),
+            r##"
+groups: []
+labels: []
+"##,
+        );
+        assert_eq!(
+            load_catalog(&empty).expect_err("empty catalog").kind(),
+            "label_catalog_empty"
+        );
     }
 
     #[test]
@@ -718,5 +970,29 @@ mod tests {
             )
             .expect_err("exclusive conflict");
         assert_eq!(err.kind(), "label_group_conflict");
+    }
+
+    #[test]
+    fn validation_rejects_unknown_and_non_applicable_labels() {
+        let catalog = Catalog {
+            labels: vec![CatalogLabel {
+                name: "type::maintenance".into(),
+                group: "type".into(),
+                color: "0E8A16".into(),
+                description: String::new(),
+                applies_to: vec!["pr".into()],
+            }],
+            groups: vec![group("type", "type::", true, false)],
+        };
+
+        let unknown = catalog
+            .validate_selected_labels(&["area::local".into()], LabelTarget::Pr)
+            .expect_err("unknown label");
+        assert_eq!(unknown.kind(), "label_unknown");
+
+        let not_applicable = catalog
+            .validate_selected_labels(&["type::maintenance".into()], LabelTarget::Issue)
+            .expect_err("target mismatch");
+        assert_eq!(not_applicable.kind(), "label_not_applicable");
     }
 }
