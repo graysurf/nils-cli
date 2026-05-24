@@ -23,7 +23,7 @@ use crate::commands::sprint::{
 };
 use crate::commands::{Command as CliCommand, SplitStrategy, SummaryArgs};
 use crate::dispatch_record::{self, DispatchRecord};
-use crate::github::{GhCliAdapter, ProviderAdapter};
+use crate::github::ProviderAdapter;
 use crate::issue_body::{self, TaskRow};
 use crate::lifecycle_record::{self, DashboardInput};
 use crate::render::{self, SprintCommentInput, SprintCommentMode};
@@ -1487,7 +1487,7 @@ fn run_start_plan(
     if binary == BinaryFlavor::PlanIssue && !dry_run {
         let temp_body = write_temp_markdown("plan-issue-body", &issue_body)
             .map_err(|err| CommandError::runtime("issue-body-write-failed", err))?;
-        let adapter = GhCliAdapter::new(force);
+        let adapter = select_adapter_for_slug(&repo, force)?;
         let (number, url) = adapter
             .create_issue(&repo, &plan_title, &temp_body, &args.label)
             .map_err(|err| CommandError::runtime("github-issue-create-failed", err))?;
@@ -1560,7 +1560,10 @@ fn run_status_plan(
     repo_override: Option<&str>,
     args: &StatusPlanArgs,
 ) -> Result<Value, CommandError> {
-    let adapter = GhCliAdapter::new(force);
+    // Adapter is constructed lazily once the dispatcher knows whether it is
+    // in body-file mode (no adapter) or live mode (adapter selected from
+    // resolved repo provider).
+    let mut adapter: Option<Box<dyn crate::provider::ProviderAdapter>> = None;
 
     let (body, issue, repo, source) = if let Some(path) = &args.body_file {
         let body = fs::read_to_string(path).map_err(|err| {
@@ -1579,10 +1582,13 @@ fn run_status_plan(
             "status-plan --issue <number>",
             Some("plan-issue-local status-plan --body-file <path> --dry-run"),
         )?;
-        let repo = resolve_repo_for_live(binary, repo_override)?;
-        let body = adapter
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let live_adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
+        let body = live_adapter
             .issue_body(&repo, issue)
             .map_err(|err| CommandError::runtime("github-issue-read-failed", err))?;
+        adapter = Some(live_adapter);
         (body, Some(issue), Some(repo), format!("issue:{issue}"))
     };
 
@@ -1614,7 +1620,10 @@ fn run_status_plan(
     {
         let comment_path = write_temp_markdown("status-plan-comment", &comment_text)
             .map_err(|err| CommandError::runtime("comment-write-failed", err))?;
-        adapter
+        let live_adapter = adapter
+            .as_ref()
+            .expect("status-plan live comment branch ran the issue path that constructed adapter");
+        live_adapter
             .comment_issue(repo, issue, &comment_path)
             .map_err(|err| CommandError::runtime("github-comment-failed", err))?;
         live_mutations = true;
@@ -1980,7 +1989,7 @@ fn run_ready_plan(
     repo_override: Option<&str>,
     args: &ReadyPlanArgs,
 ) -> Result<Value, CommandError> {
-    let adapter = GhCliAdapter::new(force);
+    let mut adapter: Option<Box<dyn crate::provider::ProviderAdapter>> = None;
 
     let (body, issue, repo, source) = if let Some(path) = &args.body_file {
         let body = fs::read_to_string(path).map_err(|err| {
@@ -1999,10 +2008,13 @@ fn run_ready_plan(
             "ready-plan --issue <number>",
             Some("plan-issue-local ready-plan --body-file <path> --summary <text> --dry-run"),
         )?;
-        let repo = resolve_repo_for_live(binary, repo_override)?;
-        let body = adapter
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let live_adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
+        let body = live_adapter
             .issue_body(&repo, issue)
             .map_err(|err| CommandError::runtime("github-issue-read-failed", err))?;
+        adapter = Some(live_adapter);
         (body, Some(issue), Some(repo), format!("issue:{issue}"))
     };
 
@@ -2036,8 +2048,11 @@ fn run_ready_plan(
         && !dry_run
         && let (Some(issue), Some(repo)) = (issue, repo.as_deref())
     {
+        let live_adapter = adapter
+            .as_ref()
+            .expect("ready-plan live branch ran the issue path that constructed adapter");
         if args.label_update {
-            adapter
+            live_adapter
                 .edit_issue_labels(
                     repo,
                     issue,
@@ -2052,7 +2067,7 @@ fn run_ready_plan(
         if should_comment {
             let comment_path = write_temp_markdown("ready-plan-comment", &comment_text)
                 .map_err(|err| CommandError::runtime("comment-write-failed", err))?;
-            adapter
+            live_adapter
                 .comment_issue(repo, issue, &comment_path)
                 .map_err(|err| CommandError::runtime("github-comment-failed", err))?;
             comment_posted = true;
@@ -2091,7 +2106,7 @@ fn run_close_plan(
         ));
     }
 
-    let adapter = GhCliAdapter::new(force);
+    let mut adapter: Option<Box<dyn crate::provider::ProviderAdapter>> = None;
     let close_comment = load_close_comment(&args.close_comment)?;
 
     let (body, issue, repo, source) = if let Some(path) = &args.body_file {
@@ -2121,10 +2136,13 @@ fn run_close_plan(
                 "plan-issue-local close-plan --body-file <path> --approved-comment-url <url> --dry-run",
             ),
         )?;
-        let repo = resolve_repo_for_live(binary, repo_override)?;
-        let body = adapter
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let live_adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
+        let body = live_adapter
             .issue_body(&repo, issue)
             .map_err(|err| CommandError::runtime("github-issue-read-failed", err))?;
+        adapter = Some(live_adapter);
         (body, Some(issue), Some(repo), format!("issue:{issue}"))
     };
 
@@ -2150,7 +2168,14 @@ fn run_close_plan(
 
     let mut merge_checks_skipped = false;
     if let Some(repo) = repo.as_deref() {
-        ensure_prs_merged(&adapter, repo, &required_prs, "close-plan")
+        // Construct adapter lazily for the merge-gate check; the close-plan
+        // dispatcher may reach this in body-file mode where the issue path
+        // never ran (so `adapter` is still None).
+        if adapter.is_none() {
+            adapter = Some(select_adapter_for_slug(repo, force)?);
+        }
+        let adapter_ref = adapter.as_ref().unwrap().as_ref();
+        ensure_prs_merged(adapter_ref, repo, &required_prs, "close-plan")
             .map_err(|err| CommandError::runtime("close-gate-failed", err))?;
     } else {
         merge_checks_skipped = true;
@@ -2180,7 +2205,17 @@ fn run_close_plan(
             )
         })?;
 
-        adapter
+        let live_adapter = match adapter.as_ref() {
+            Some(a) => a,
+            None => {
+                // body-file mode resolved repo from `--repo` but didn't run
+                // through the issue path, so the adapter wasn't constructed
+                // yet. Build it now from the resolved slug.
+                adapter = Some(select_adapter_for_slug(repo, force)?);
+                adapter.as_ref().unwrap()
+            }
+        };
+        live_adapter
             .close_issue(repo, issue, args.reason, close_comment.as_deref())
             .map_err(|err| CommandError::runtime("github-issue-close-failed", err))?;
         issue_closed = true;
@@ -2215,8 +2250,9 @@ fn run_cleanup_worktrees(
 ) -> Result<Value, CommandError> {
     ensure_live_binary_for_command(binary, "cleanup-worktrees --issue <number>", None)?;
 
-    let repo = resolve_repo_for_live(binary, repo_override)?;
-    let adapter = GhCliAdapter::new(force);
+    let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+    let adapter = crate::provider::select_adapter(&repo_info, force);
+    let repo = repo_info.slug;
     let body = adapter
         .issue_body(&repo, args.issue)
         .map_err(|err| CommandError::runtime("github-issue-read-failed", err))?;
@@ -2296,13 +2332,17 @@ fn run_start_sprint(
         .clone()
         .unwrap_or_else(|| format!("Sprint {}", args.sprint));
 
-    let adapter = GhCliAdapter::new(force);
+    // Adapter is constructed lazily inside the live `BinaryFlavor::PlanIssue`
+    // branch below, where the resolved provider is known. body-file mode
+    // doesn't shell out to a provider so it never reaches the adapter.
     let mut issue_body_for_comment: Option<String> = None;
     let mut synced_rows = 0usize;
     let mut live_mutations = false;
 
     if binary == BinaryFlavor::PlanIssue {
-        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
         let body = adapter
             .issue_body(&repo, args.issue)
             .map_err(|err| CommandError::runtime("github-issue-read-failed", err))?;
@@ -2319,8 +2359,13 @@ fn run_start_sprint(
         }
 
         if args.sprint > 1 {
-            enforce_previous_sprint_gate(&adapter, &repo, table.rows(), i32::from(args.sprint))
-                .map_err(|err| CommandError::runtime("previous-sprint-gate-failed", err))?;
+            enforce_previous_sprint_gate(
+                adapter.as_ref(),
+                &repo,
+                table.rows(),
+                i32::from(args.sprint),
+            )
+            .map_err(|err| CommandError::runtime("previous-sprint-gate-failed", err))?;
         }
 
         artifact_rows = task_spec_rows_from_issue_rows(table.rows(), i32::from(args.sprint))
@@ -2504,7 +2549,9 @@ fn run_start_sprint(
 
     let should_comment = should_emit_comment(&args.comment_mode);
     if binary == BinaryFlavor::PlanIssue && should_comment && !dry_run {
-        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
         adapter
             .comment_issue(&repo, args.issue, &comment_out)
             .map_err(|err| CommandError::runtime("github-comment-failed", err))?;
@@ -2664,12 +2711,16 @@ fn run_ready_sprint(
         .clone()
         .unwrap_or_else(|| format!("Sprint {}", args.sprint));
 
-    let adapter = GhCliAdapter::new(force);
+    // Adapter is constructed lazily inside the live `BinaryFlavor::PlanIssue`
+    // branch below, where the resolved provider is known. body-file mode
+    // doesn't shell out to a provider so it never reaches the adapter.
     let mut issue_body_for_comment: Option<String> = None;
     let mut live_mutations = false;
 
     if binary == BinaryFlavor::PlanIssue {
-        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
         let body = adapter
             .issue_body(&repo, args.issue)
             .map_err(|err| CommandError::runtime("github-issue-read-failed", err))?;
@@ -2708,7 +2759,9 @@ fn run_ready_sprint(
 
     let should_comment = should_emit_comment(&args.comment_mode);
     if binary == BinaryFlavor::PlanIssue && should_comment && !dry_run {
-        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
         adapter
             .comment_issue(&repo, args.issue, &comment_out)
             .map_err(|err| CommandError::runtime("github-comment-failed", err))?;
@@ -2780,13 +2833,17 @@ fn run_accept_sprint(
         .clone()
         .unwrap_or_else(|| format!("Sprint {}", args.sprint));
 
-    let adapter = GhCliAdapter::new(force);
+    // Adapter is constructed lazily inside the live `BinaryFlavor::PlanIssue`
+    // branch below, where the resolved provider is known. body-file mode
+    // doesn't shell out to a provider so it never reaches the adapter.
     let mut issue_body_for_comment: Option<String> = None;
     let mut synced_done_rows = 0usize;
     let mut live_mutations = false;
 
     if binary == BinaryFlavor::PlanIssue {
-        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
         let body = adapter
             .issue_body(&repo, args.issue)
             .map_err(|err| CommandError::runtime("github-issue-read-failed", err))?;
@@ -2816,7 +2873,7 @@ fn run_accept_sprint(
 
         let required_prs = collect_required_prs(&sprint_rows, "accept-sprint")
             .map_err(|err| CommandError::runtime("sprint-acceptance-gate-failed", err))?;
-        ensure_prs_merged(&adapter, &repo, &required_prs, "accept-sprint")
+        ensure_prs_merged(adapter.as_ref(), &repo, &required_prs, "accept-sprint")
             .map_err(|err| CommandError::runtime("sprint-acceptance-gate-failed", err))?;
 
         for idx in sprint_indexes {
@@ -2862,7 +2919,9 @@ fn run_accept_sprint(
 
     let should_comment = should_emit_comment(&args.comment_mode);
     if binary == BinaryFlavor::PlanIssue && should_comment && !dry_run {
-        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
         adapter
             .comment_issue(&repo, args.issue, &comment_out)
             .map_err(|err| CommandError::runtime("github-comment-failed", err))?;
@@ -3383,6 +3442,22 @@ fn resolve_repo_info_for_live(
         .map_err(|err| CommandError::usage("repo-resolution-failed", err))
 }
 
+/// Pick the right [`crate::provider::ProviderAdapter`] for an already-resolved
+/// repo slug. Sprint 4 dispatchers (start-plan, status-plan, ready-plan,
+/// close-plan, cleanup-worktrees, start-sprint, ready-sprint, accept-sprint)
+/// construct the adapter near the top of the function before they know
+/// whether they will hit a live path or a body-file rehearsal path; this
+/// helper lets them swap in the GitLab adapter when `repo` resolves to a
+/// GitLab slug without restructuring the dispatcher's control flow.
+fn select_adapter_for_slug(
+    repo_slug: &str,
+    force: bool,
+) -> Result<Box<dyn crate::provider::ProviderAdapter>, CommandError> {
+    let info = crate::provider::resolve_repo(Some(repo_slug))
+        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+    Ok(crate::provider::select_adapter(&info, force))
+}
+
 fn render_plan_status_comment(rows: &[TaskRow]) -> String {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for row in rows {
@@ -3676,7 +3751,7 @@ fn collect_required_prs(rows: &[TaskRow], scope: &str) -> Result<Vec<u64>, Strin
 }
 
 fn ensure_prs_merged(
-    adapter: &impl ProviderAdapter,
+    adapter: &dyn ProviderAdapter,
     repo: &str,
     prs: &[u64],
     scope: &str,
@@ -3700,7 +3775,7 @@ fn ensure_prs_merged(
 }
 
 fn enforce_previous_sprint_gate(
-    adapter: &impl ProviderAdapter,
+    adapter: &dyn ProviderAdapter,
     repo: &str,
     rows: &[TaskRow],
     sprint: i32,
