@@ -276,6 +276,39 @@ path = "GLOBAL_POLICY.md"
 }
 
 #[test]
+fn load_configs_allows_global_scope_when_home_and_project_share_catalog() {
+    let repo = TempDir::new().expect("create shared repo dir");
+    write_config(
+        repo.path(),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "global"
+path = "GLOBAL_POLICY.md"
+
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "PROJECT_POLICY.md"
+"#,
+    );
+
+    let loaded = load_configs(repo.path(), repo.path()).expect("shared catalog should load");
+    let home_config = loaded.home.as_ref().expect("home config should load");
+    let project_config = loaded.project.as_ref().expect("project config should load");
+
+    assert_eq!(home_config.documents.len(), 2);
+    assert!(
+        home_config
+            .documents
+            .iter()
+            .any(|entry| entry.scope == Scope::Global)
+    );
+    assert_eq!(project_config.documents.len(), 1);
+    assert_eq!(project_config.documents[0].scope, Scope::Project);
+}
+
+#[test]
 fn load_scope_config_rejects_path_that_is_only_whitespace() {
     let home = TempDir::new().expect("create home dir");
     write_config(

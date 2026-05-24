@@ -27,13 +27,40 @@ pub fn load_configs(
     project_path: &Path,
 ) -> Result<LoadedConfigs, ConfigLoadError> {
     let home = load_scope_config(Scope::Home, docs_home)?;
-    let project = load_scope_config(Scope::Project, project_path)?;
+    let project_global_handling = if same_config_file(docs_home, project_path) {
+        ProjectGlobalHandling::Skip
+    } else {
+        ProjectGlobalHandling::Reject
+    };
+    let project = load_scope_config_with_project_global_handling(
+        Scope::Project,
+        project_path,
+        project_global_handling,
+    )?;
     Ok(LoadedConfigs { home, project })
 }
 
 pub fn load_scope_config(
     source_scope: Scope,
     root: &Path,
+) -> Result<Option<ConfigScopeFile>, ConfigLoadError> {
+    load_scope_config_with_project_global_handling(
+        source_scope,
+        root,
+        ProjectGlobalHandling::Reject,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectGlobalHandling {
+    Reject,
+    Skip,
+}
+
+fn load_scope_config_with_project_global_handling(
+    source_scope: Scope,
+    root: &Path,
+    project_global_handling: ProjectGlobalHandling,
 ) -> Result<Option<ConfigScopeFile>, ConfigLoadError> {
     let file_path = config_path_for_root(root);
     if !file_path.exists() {
@@ -47,7 +74,7 @@ pub fn load_scope_config(
         )
     })?;
     let parsed = parse_toml(&file_path, &raw)?;
-    let documents = parse_documents(source_scope, &file_path, &parsed)?;
+    let documents = parse_documents(source_scope, &file_path, &parsed, project_global_handling)?;
 
     Ok(Some(ConfigScopeFile {
         source_scope,
@@ -55,6 +82,14 @@ pub fn load_scope_config(
         file_path,
         documents,
     }))
+}
+
+fn same_config_file(docs_home: &Path, project_path: &Path) -> bool {
+    let home_config = config_path_for_root(docs_home);
+    let project_config = config_path_for_root(project_path);
+    let home = fs::canonicalize(&home_config).unwrap_or(home_config);
+    let project = fs::canonicalize(&project_config).unwrap_or(project_config);
+    home == project
 }
 
 fn parse_toml(file_path: &Path, raw: &str) -> Result<Value, ConfigLoadError> {
@@ -67,6 +102,7 @@ fn parse_documents(
     source_scope: Scope,
     file_path: &Path,
     parsed: &Value,
+    project_global_handling: ProjectGlobalHandling,
 ) -> Result<Vec<ConfigDocumentEntry>, ConfigLoadError> {
     let Some(root_table) = parsed.as_table() else {
         return Err(ConfigLoadError::validation_root(
@@ -101,6 +137,9 @@ fn parse_documents(
         validate_unknown_fields(file_path, index, table)?;
         let context = parse_context(file_path, index, table)?;
         let scope = parse_scope(file_path, index, table)?;
+        if should_skip_scope_for_source(source_scope, scope, project_global_handling) {
+            continue;
+        }
         validate_scope_for_source(source_scope, scope, file_path, index)?;
         let path = parse_path(file_path, index, table)?;
         let required = parse_required(file_path, index, table)?;
@@ -118,6 +157,16 @@ fn parse_documents(
     }
 
     Ok(documents)
+}
+
+fn should_skip_scope_for_source(
+    source_scope: Scope,
+    document_scope: Scope,
+    project_global_handling: ProjectGlobalHandling,
+) -> bool {
+    source_scope == Scope::Project
+        && document_scope == Scope::Global
+        && project_global_handling == ProjectGlobalHandling::Skip
 }
 
 fn validate_scope_for_source(
