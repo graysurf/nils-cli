@@ -496,6 +496,24 @@ fn cli_parse_contract_record_post_rejects_marker_family_flag() {
 }
 
 #[test]
+fn cli_parse_contract_record_rejects_retired_helper_subcommands() {
+    for subcommand in [
+        "render-dashboard",
+        "render-comment",
+        "closeout-gate",
+        "build-dispatch-ledger",
+    ] {
+        let err = Cli::try_parse_from(["plan-issue", "record", subcommand])
+            .expect_err(&format!("retired helper should not parse: {subcommand}"));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(subcommand) || rendered.contains("unrecognized subcommand"),
+            "expected rejection to mention {subcommand}: {rendered}",
+        );
+    }
+}
+
+#[test]
 fn cli_parse_contract_record_repair_dashboard_accepts_fixture_inputs() {
     let cli = Cli::try_parse_from([
         "plan-issue",

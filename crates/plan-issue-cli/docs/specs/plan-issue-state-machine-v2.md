@@ -85,7 +85,7 @@ auditable but do not satisfy gate requirements once superseded.
 
 When any check fails, `record close` returns exit 1, posts no mutations,
 and emits a machine-readable failure code matching the spec
-[Strict Closeout Gate](issue-backed-plan-record-contract-v2.md#strict-closeout-gate).
+[Strict Closeout Validation](issue-backed-plan-record-contract-v2.md#strict-closeout-validation).
 
 ## Dashboard Invariants
 

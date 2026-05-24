@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -96,24 +96,6 @@ pub struct CloseoutCheck {
     pub check: String,
     pub status: String,
     pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CloseoutGateResult {
-    pub ready: bool,
-    pub checks: Vec<CloseoutCheck>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CloseoutGateInput {
-    pub profile: RecordProfile,
-    pub require_complete: bool,
-    pub require_session: bool,
-    pub require_validation: bool,
-    pub require_review: bool,
-    pub require_closeout: bool,
-    pub approval: Option<String>,
-    pub linked_prs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -432,90 +414,6 @@ fn review_decision_label(value: ReviewDecision) -> &'static str {
     }
 }
 
-pub fn evaluate_closeout_gate(audit: &RecordAudit, input: CloseoutGateInput) -> CloseoutGateResult {
-    let mut checks = Vec::new();
-
-    push_evidence_check(&mut checks, audit, "source", "source snapshot");
-    push_evidence_check(&mut checks, audit, "plan", "plan snapshot");
-    push_evidence_check(&mut checks, audit, "state", "execution state");
-
-    if input.require_complete {
-        let (status, detail) = match audit
-            .evidence
-            .get("state")
-            .and_then(|hit| hit.status.as_deref())
-        {
-            Some(value) if value.eq_ignore_ascii_case("complete") => {
-                ("pass", "complete".to_string())
-            }
-            Some(value) => ("fail", format!("latest state status is `{value}`")),
-            None => ("fail", "missing execution state".to_string()),
-        };
-        checks.push(CloseoutCheck {
-            check: "execution completion".to_string(),
-            status: status.to_string(),
-            detail,
-        });
-    }
-
-    if input.require_session {
-        push_evidence_check(&mut checks, audit, "session", "completed session");
-    }
-    if input.require_validation {
-        push_evidence_check(&mut checks, audit, "validation", "validation evidence");
-    }
-    if input.require_review || input.profile == RecordProfile::Dispatch {
-        push_evidence_check(&mut checks, audit, "review", "review evidence");
-    }
-    if input.require_closeout {
-        push_evidence_check(&mut checks, audit, "closeout", "closeout comment");
-    }
-
-    let approval = input.approval.as_deref().unwrap_or("").trim();
-    let (status, detail) = if approval.is_empty() {
-        ("fail", "missing explicit approval".to_string())
-    } else {
-        ("pass", approval.to_string())
-    };
-    checks.push(CloseoutCheck {
-        check: "close approval".to_string(),
-        status: status.to_string(),
-        detail,
-    });
-
-    if !input.linked_prs.is_empty() {
-        let body_text = audit_text_for_pr_search(audit);
-        let missing = input
-            .linked_prs
-            .iter()
-            .filter(|pr| !body_text.contains(pr.trim()))
-            .map(|pr| pr.trim().to_string())
-            .collect::<Vec<_>>();
-        let (status, detail) = if missing.is_empty() {
-            (
-                "pass",
-                format!("linked PRs referenced: {}", input.linked_prs.join(", ")),
-            )
-        } else {
-            (
-                "fail",
-                format!(
-                    "linked PRs not found in lifecycle evidence: {}",
-                    missing.join(", ")
-                ),
-            )
-        };
-        checks.push(CloseoutCheck {
-            check: "linked PRs".to_string(),
-            status: status.to_string(),
-            detail,
-        });
-    }
-
-    let ready = checks.iter().all(|check| check.status == "pass");
-    CloseoutGateResult { ready, checks }
-}
-
 /// Render the canonical dashboard for an issue-backed plan record from
 /// audit evidence alone — callers no longer need to pass every per-role
 /// URL. Returns a `## Final Dashboard` when the latest state payload
@@ -685,21 +583,6 @@ fn evidence_url(audit: &RecordAudit, role: &str) -> Option<String> {
         .get(role)
         .and_then(|hit| hit.url.clone())
         .filter(|value| !value.trim().is_empty())
-}
-
-pub fn render_closeout_checks(checks: &[CloseoutCheck]) -> String {
-    let mut out = Vec::new();
-    out.push("| Check | Status | Detail |".to_string());
-    out.push("| --- | --- | --- |".to_string());
-    for check in checks {
-        out.push(format!(
-            "| {} | {} | {} |",
-            table_cell(&check.check),
-            table_cell(&check.status),
-            table_cell(&check.detail)
-        ));
-    }
-    finalize_markdown(out)
 }
 
 fn non_empty_join(values: &[String], fallback: &str) -> String {
@@ -910,47 +793,6 @@ fn inspect_body_sections(body: &str) -> BodySections {
         closeout_checks: body.contains("## Closeout Checks"),
         task_decomposition: body.contains("## Task Decomposition"),
     }
-}
-
-fn push_evidence_check(
-    checks: &mut Vec<CloseoutCheck>,
-    audit: &RecordAudit,
-    role: &str,
-    label: &str,
-) {
-    let (status, detail) = match audit.evidence.get(role) {
-        Some(hit) => (
-            "pass",
-            hit.url
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("present")
-                .to_string(),
-        ),
-        None => ("fail", format!("missing {label}")),
-    };
-    checks.push(CloseoutCheck {
-        check: label.to_string(),
-        status: status.to_string(),
-        detail,
-    });
-}
-
-fn audit_text_for_pr_search(audit: &RecordAudit) -> String {
-    let mut values = BTreeSet::new();
-    if !audit.evidence_text.trim().is_empty() {
-        values.insert(audit.evidence_text.clone());
-    }
-    for hit in audit.evidence.values() {
-        if let Some(url) = hit.url.as_deref() {
-            values.insert(url.to_string());
-        }
-    }
-    values.into_iter().collect::<Vec<_>>().join("\n")
-}
-
-fn table_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace('\n', "<br>")
 }
 
 fn finalize_markdown(lines: Vec<String>) -> String {
@@ -1647,12 +1489,7 @@ pub fn render_record_post_comment(
 }
 
 // -----------------------------------------------------------------------------
-// Strict closeout gate (Sprint 3)
-//
-// Sprint 3 introduces `evaluate_strict_closeout_gate` for `record close`. It
-// supersedes the v1 `evaluate_closeout_gate`, which is retained as a
-// transitional helper for the `record closeout-gate` subcommand until
-// Sprint 4 retires that surface.
+// Strict closeout gate for `record close`.
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]

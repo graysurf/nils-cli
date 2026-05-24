@@ -40,4 +40,3 @@ Current runtime ownership:
 - [plan-issue CLI contract v2 (Task Decomposition runtime metadata)](specs/plan-issue-cli-contract-v2.md)
 - [plan-issue state machine v1 (Task Decomposition runtime)](specs/plan-issue-state-machine-v1.md)
 - [plan-issue gate matrix v1](specs/plan-issue-gate-matrix-v1.md)
-- [issue-backed plan record contract v1 (retired)](specs/issue-backed-plan-record-contract-v1.md)
