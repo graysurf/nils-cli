@@ -16,6 +16,7 @@ pub mod pr_checks;
 pub mod pr_checks_gitlab;
 pub mod pr_close;
 pub mod pr_comment;
+pub mod pr_comments;
 pub mod pr_create;
 pub mod pr_edit;
 pub mod pr_list;

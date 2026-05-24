@@ -342,6 +342,13 @@ pub struct PrCommentArgs {
     pub body_file: Option<String>,
 }
 
+/// `pr comments` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct PrCommentsArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+}
+
 /// `pr ready` arguments.
 #[derive(Args, Debug, Clone)]
 pub struct PrReadyArgs {
@@ -528,6 +535,8 @@ pub enum PrCommand {
     Edit(PrEditArgs),
     /// Append a comment to a PR / MR.
     Comment(PrCommentArgs),
+    /// List the issue-style comment stream attached to a PR / MR.
+    Comments(PrCommentsArgs),
     /// Promote a draft PR / MR to ready-for-review.
     Ready(PrReadyArgs),
     /// Merge a ready PR / MR.
@@ -640,10 +649,7 @@ pub enum IssueCommand {
     /// Open a new issue.
     Create(IssueCreateArgs),
     /// Fetch a single issue.
-    View {
-        /// Numeric id.
-        id: u64,
-    },
+    View(IssueViewArgs),
     /// List issues filtered by state / labels / author / assignee.
     List(IssueListArgs),
     /// Mutate an issue.
@@ -813,6 +819,18 @@ pub struct IssueCreateArgs {
     pub assignees: Vec<String>,
 }
 
+/// `issue view` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct IssueViewArgs {
+    /// Numeric issue id.
+    pub id: u64,
+    /// Also fetch the issue's comment stream and embed it under `comments`
+    /// in the envelope payload. Adds one GitLab API call; for GitHub the
+    /// comments are pulled in the same `gh issue view --json` invocation.
+    #[arg(long = "with-comments", action = ArgAction::SetTrue)]
+    pub with_comments: bool,
+}
+
 /// `issue edit` arguments.
 #[derive(Args, Debug, Clone)]
 pub struct IssueEditArgs {
@@ -827,8 +845,9 @@ pub struct IssueEditArgs {
     /// Read body from a file. Use `-` for stdin.
     #[arg(long = "body-file")]
     pub body_file: Option<String>,
-    /// Add a label. Repeat to add multiple.
-    #[arg(long = "add-label", value_name = "NAME")]
+    /// Add a label. Repeat to add multiple. Accepts `--label` as a shorthand
+    /// matching `issue create --label`.
+    #[arg(long = "add-label", alias = "label", value_name = "NAME")]
     pub add_label: Vec<String>,
     /// Remove a label. Repeat to remove multiple.
     #[arg(long = "remove-label", value_name = "NAME")]
@@ -901,6 +920,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             command: Some(PrCommand::Comment(args)),
         })) => ops::pr_comment::run(&global, args, format),
         Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Comments(args)),
+        })) => ops::pr_comments::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Ready(args)),
         })) => ops::pr_ready::run(&global, args, format),
         Some(Command::Pr(PrArgs {
@@ -935,8 +957,8 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             command: Some(IssueCommand::Create(args)),
         })) => ops::issue_create::run(&global, args, format),
         Some(Command::Issue(IssueArgs {
-            command: Some(IssueCommand::View { id }),
-        })) => ops::issue_view::run(&global, id, format),
+            command: Some(IssueCommand::View(args)),
+        })) => ops::issue_view::run(&global, args, format),
         Some(Command::Issue(IssueArgs {
             command: Some(IssueCommand::List(args)),
         })) => ops::issue_list::run(&global, args, format),
