@@ -827,8 +827,9 @@ pub struct IssueEditArgs {
     /// Read body from a file. Use `-` for stdin.
     #[arg(long = "body-file")]
     pub body_file: Option<String>,
-    /// Add a label. Repeat to add multiple.
-    #[arg(long = "add-label", value_name = "NAME")]
+    /// Add a label. Repeat to add multiple. Accepts `--label` as a shorthand
+    /// matching `issue create --label`.
+    #[arg(long = "add-label", alias = "label", value_name = "NAME")]
     pub add_label: Vec<String>,
     /// Remove a label. Repeat to remove multiple.
     #[arg(long = "remove-label", value_name = "NAME")]
