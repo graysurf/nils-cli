@@ -13,8 +13,8 @@ use crate::common;
 const PAYLOAD_SCHEMA_V2: &str = "plan-issue-record.payload.v2";
 const PAYLOAD_FENCE_INFO: &str = "plan-issue-record-payload";
 
-/// Build a `plan-issue-record:v2` comment body with the payload fence
-/// carrying `data` for the given role/profile.
+/// Build an older `plan-issue-record:v2` comment body with a visible payload
+/// fence carrying `data` for the given role/profile.
 fn v2_comment_body(role: &str, profile: &str, data: Value) -> String {
     let envelope = json!({
         "schema": PAYLOAD_SCHEMA_V2,
@@ -50,6 +50,34 @@ fn write_pr_fixture(dir: &Path, repo: &str, pr: u64, value: Value) {
         serde_json::to_string(&value).expect("pr json"),
     )
     .expect("write pr fixture");
+}
+
+fn audit_single_comment_body(body: &str) -> Value {
+    let tmp = TempDir::new().expect("tempdir");
+    let comments_json = tmp.path().join("comments.json");
+    fs::write(
+        &comments_json,
+        json!({
+            "comments": [
+                {"body": body, "url": "https://github.com/owner/repo/issues/1#issuecomment-record"}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write comments json");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "audit",
+        "--comments-json",
+        comments_json.to_str().expect("comments path"),
+        "--profile",
+        "tracking",
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    parse_json(&out.stdout)["payload"]["result"]["audit"].clone()
 }
 
 #[test]
@@ -95,8 +123,14 @@ fn record_post_state_with_payload_file_renders_v2_marker_in_dry_run() {
         body.starts_with("<!-- plan-issue-record:v2 role=state profile=tracking -->"),
         "{body}"
     );
-    assert!(body.contains(&format!("```{PAYLOAD_FENCE_INFO}")), "{body}");
-    assert!(body.contains("\"target_scope\": \"scope\""), "{body}");
+    assert!(
+        !body.contains(&format!("```{PAYLOAD_FENCE_INFO}")),
+        "{body}"
+    );
+    assert!(
+        body.contains("<!-- plan-issue-record-payload:hex:"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -323,11 +357,18 @@ fn record_close_fixture_passes_strict_gate_with_complete_v2_evidence() {
         body.starts_with("<!-- plan-issue-record:v2 role=closeout profile=tracking -->"),
         "{body}"
     );
-    assert!(body.contains("\"final_status\": \"complete\""), "{body}");
     assert!(
-        body.contains("\"merge_sha\": \"deadbeefcafebabe\""),
+        !body.contains(&format!("```{PAYLOAD_FENCE_INFO}")),
         "{body}"
     );
+    assert!(
+        body.contains("<!-- plan-issue-record-payload:hex:"),
+        "{body}"
+    );
+    let audit = audit_single_comment_body(body);
+    let closeout = &audit["evidence"]["closeout"]["payload"]["data"];
+    assert_eq!(closeout["final_status"], "complete");
+    assert_eq!(closeout["linked_prs"][0]["merge_sha"], "deadbeefcafebabe");
     let final_dashboard = preview["final_dashboard"]
         .as_str()
         .expect("final dashboard");
@@ -632,12 +673,18 @@ fn record_open_dry_run_returns_preview_without_gh_calls() {
     fs::create_dir_all(&bundle).expect("create bundle dir");
     let source = bundle.join("sample-discussion-source.md");
     let plan = bundle.join("sample-plan.md");
+    let execution_state = bundle.join("sample-execution-state.md");
     fs::write(&source, "# Source\n\n- Decision: implement v2 lifecycle.\n").expect("write source");
     fs::write(
         &plan,
         "# Plan: Sample Plan\n\n## Overview\n\n- Sample plan body.\n\n## Read First\n\n- Primary source: docs/plans/sample/sample-discussion-source.md\n- Source type: discussion-to-implementation-doc\n- Open questions carried into execution: none\n\n## Scope\n\n- In scope:\n  - Demo plan.\n- Out of scope:\n  - none.\n\n## Assumptions\n\n1. Demo only.\n\n## Sprint 1: Demo\n\n**Goal**: Demo the surface.\n\n**PR grouping intent**: group\n**Execution Profile**: serial\n\n### Task 1.1: Demo task\n\n- **Location**:\n  - `docs/plans/sample/sample-plan.md`\n- **Description**: Demo task description.\n- **Dependencies**:\n  - none\n- **Complexity**: 1\n- **Acceptance criteria**:\n  - The demo task is complete.\n- **Validation**:\n  - `true`\n",
     )
     .expect("write plan");
+    fs::write(
+        &execution_state,
+        "# Sample Execution State\n\n<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n## Execution State\n\n- Status: pending\n- Target scope: Sample Plan\n",
+    )
+    .expect("write execution state");
     git(repo.path(), &["add", "."]);
     git(
         repo.path(),
@@ -682,6 +729,70 @@ fn record_open_dry_run_returns_preview_without_gh_calls() {
         source_comment.starts_with("<!-- plan-issue-record:v2 role=source profile=tracking -->"),
         "{source_comment}"
     );
+    let plan_comment = preview["comments"]["plan"].as_str().expect("plan comment");
+    let state_comment = preview["comments"]["state"]
+        .as_str()
+        .expect("state comment");
+    for (label, comment) in [
+        ("source", source_comment),
+        ("plan", plan_comment),
+        ("state", state_comment),
+    ] {
+        assert!(
+            !comment.contains(&format!("```{PAYLOAD_FENCE_INFO}")),
+            "{label} comment should not visibly leak payload JSON:\n{comment}"
+        );
+    }
+    assert!(
+        state_comment.contains("# Sample Execution State"),
+        "{state_comment}"
+    );
+    assert!(
+        state_comment.contains("- Status: pending"),
+        "{state_comment}"
+    );
+    assert!(
+        !state_comment.contains("Initial execution state seeded"),
+        "{state_comment}"
+    );
+
+    let comments_json = repo.path().join("comments.json");
+    fs::write(
+        &comments_json,
+        json!({
+            "comments": [
+                {"body": source_comment, "url": "https://github.com/owner/repo/issues/1#issuecomment-source"},
+                {"body": plan_comment, "url": "https://github.com/owner/repo/issues/1#issuecomment-plan"},
+                {"body": state_comment, "url": "https://github.com/owner/repo/issues/1#issuecomment-state"}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write comments json");
+
+    let audit = nils_test_support::cmd::run_resolved(
+        "plan-issue-local",
+        &[
+            "--format",
+            "json",
+            "record",
+            "audit",
+            "--comments-json",
+            comments_json.to_str().expect("comments path"),
+            "--profile",
+            "tracking",
+        ],
+        &opts,
+    );
+    assert_eq!(audit.code, 0, "stderr: {}", audit.stderr_text());
+    let parsed_audit: Value = serde_json::from_str(&audit.stdout_text()).expect("audit json");
+    let audit_result = &parsed_audit["payload"]["result"]["audit"];
+    assert_eq!(audit_result["recognized_count"], 3);
+    assert_eq!(
+        audit_result["missing_required"],
+        json!([]),
+        "{audit_result}"
+    );
 }
 
 /// Sprint 4 Task 4.3: exercise the v3 closeout end-to-end against a sanitized
@@ -720,18 +831,25 @@ fn agent_runtime_kit_lifecycle_fixture_passes_strict_v2_closeout_end_to_end() {
         .as_str()
         .expect("closeout body present");
     // Closeout comment uses the v2 marker and carries provider-verified
-    // merge_sha from the fixture PR snapshot.
+    // merge_sha from the fixture PR snapshot in the hidden payload.
     assert!(
         closeout_body.starts_with("<!-- plan-issue-record:v2 role=closeout profile=tracking -->"),
         "{closeout_body}"
     );
     assert!(
-        closeout_body.contains("\"merge_sha\": \"merge1111111111111111111111111111111111\""),
-        "merge_sha must come from PR fixture, not state payload: {closeout_body}"
+        !closeout_body.contains(&format!("```{PAYLOAD_FENCE_INFO}")),
+        "{closeout_body}"
     );
     assert!(
-        closeout_body.contains("\"final_status\": \"complete\""),
+        closeout_body.contains("<!-- plan-issue-record-payload:hex:"),
         "{closeout_body}"
+    );
+    let audit = audit_single_comment_body(closeout_body);
+    let closeout = &audit["evidence"]["closeout"]["payload"]["data"];
+    assert_eq!(closeout["final_status"], "complete");
+    assert_eq!(
+        closeout["linked_prs"][0]["merge_sha"], "merge1111111111111111111111111111111111",
+        "merge_sha must come from PR fixture, not state payload: {closeout_body}"
     );
     // Sanity: no v1 marker bleed-through.
     assert!(

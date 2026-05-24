@@ -89,12 +89,16 @@ families are not recognized as current lifecycle markers.
 
 ## Structured Payload Model
 
-Every lifecycle comment includes one fenced JSON block whose info-string is
-the literal token `plan-issue-record-payload`. The fence is the structured
-source of truth for audit, dashboard repair, and closeout gating. Visible
-Markdown around it is human commentary only. Implementations recognize the
-block by reading the opening fence line `<backticks>plan-issue-record-payload`
-(no language alias) and parsing the body as JSON.
+Every lifecycle comment includes one hidden HTML-comment payload carrier. The
+payload is the structured source of truth for audit, dashboard repair, and
+closeout gating. Visible Markdown around it is human commentary only.
+
+Implementations recognize current payloads by reading a comment whose inner
+text starts with `plan-issue-record-payload:hex:` and hex-decoding the
+following JSON envelope. For backward compatibility, audit still accepts the
+older visible fenced JSON block whose info-string is the literal token
+`plan-issue-record-payload`, but new provider-backed comments must not render
+that visible fence by default.
 
 The envelope shape is:
 
@@ -241,8 +245,9 @@ explicit file flags), and a title source (`--title` or plan-derived).
 High-level append-only comment command for `state`, `session`, `validation`,
 `review`, and `closeout` kinds.
 
-- Renders the canonical marker and structured payload from explicit fields
-  or a `--payload-file` JSON document.
+- Renders the canonical marker, human summary Markdown when supplied, and a
+  hidden structured payload from explicit fields or a `--payload-file` JSON
+  document.
 - Posts to the provider issue and returns the comment URL.
 - Supports `--dry-run` and `--fixture` modes.
 - `--kind closeout` is callable directly only when `record close` is not
