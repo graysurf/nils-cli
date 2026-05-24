@@ -2340,6 +2340,8 @@ fn schema_err() -> String {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn test_runtime() -> InboxRuntimeConfig {
         InboxRuntimeConfig {
@@ -2402,6 +2404,178 @@ mod tests {
         assert_eq!(items[0].reasons, vec!["review", "assigned"]);
         assert_eq!(items[0].source, "github_review_search");
         assert_eq!(items[0].updated_at, "2026-05-22T00:00:00Z");
+    }
+
+    #[test]
+    fn inbox_vpn_settings_parse_aliases_and_reject_invalid_values() {
+        assert_eq!(parse_vpn_mode("disabled").unwrap(), GitlabVpnMode::Off);
+        assert_eq!(parse_vpn_mode("true").unwrap(), GitlabVpnMode::Required);
+        assert_eq!(parse_vpn_mode("optional").unwrap(), GitlabVpnMode::Optional);
+        assert_eq!(
+            parse_vpn_mode("bogus").unwrap_err().kind(),
+            "vpn_mode_invalid"
+        );
+
+        assert!(matches!(
+            parse_vpn_check("openvpn").unwrap(),
+            VpnCheck::OpenVpn
+        ));
+        assert!(matches!(
+            parse_vpn_check("cmd: check-vpn").unwrap(),
+            VpnCheck::Cmd { program } if program == "check-vpn"
+        ));
+        assert!(matches!(
+            parse_vpn_check("tcp:gitlab.example.com:443").unwrap(),
+            VpnCheck::Tcp { host, port } if host == "gitlab.example.com" && port == 443
+        ));
+
+        for raw in [
+            "cmd:",
+            "tcp:gitlab.example.com:not-a-port",
+            "tcp::443",
+            "bogus",
+        ] {
+            assert_eq!(
+                parse_vpn_check(raw).unwrap_err().kind(),
+                "vpn_check_invalid"
+            );
+        }
+
+        assert_eq!(format_duration(Duration::from_millis(250)), "250ms");
+        assert_eq!(format_duration(Duration::from_millis(1_500)), "1500ms");
+        assert_eq!(format_duration(Duration::from_secs(2)), "2s");
+        assert_eq!(format_duration(Duration::from_secs(120)), "2m");
+    }
+
+    #[test]
+    fn inbox_required_vpn_defaults_to_gitlab_https_tcp_probe() {
+        let mut runtime = test_runtime();
+        runtime.gitlab_vpn_mode = GitlabVpnMode::Required;
+
+        let gitlab = ProviderTarget {
+            provider: Provider::GitLab,
+            host: "gitlab.example.com".into(),
+        };
+        assert!(matches!(
+            gitlab_vpn_check_for_target(&gitlab, &runtime),
+            Some(VpnCheck::Tcp { host, port }) if host == "gitlab.example.com" && port == 443
+        ));
+
+        let github = ProviderTarget {
+            provider: Provider::GitHub,
+            host: "github.com".into(),
+        };
+        assert!(gitlab_vpn_check_for_target(&github, &runtime).is_none());
+
+        runtime.gitlab_vpn_mode = GitlabVpnMode::Off;
+        assert!(gitlab_vpn_check_for_target(&gitlab, &runtime).is_none());
+    }
+
+    #[test]
+    fn inbox_tcp_vpn_probe_connects_and_reports_refused_ports() {
+        let mut runtime = test_runtime();
+        runtime.gitlab_vpn_check_timeout = Duration::from_millis(250);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        run_tcp_vpn_check("127.0.0.1", port, &runtime).expect("tcp probe connects");
+
+        drop(listener);
+        let err = run_tcp_vpn_check("127.0.0.1", port, &runtime)
+            .expect_err("closed listener should fail readiness");
+        assert_eq!(err.kind(), "vpn_unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inbox_cmd_vpn_probe_sanitizes_profile_and_reports_missing_command() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let profile = tmp.path().join("profile.ovpn");
+        std::fs::write(&profile, "client\n").expect("write profile");
+        let script = tmp.path().join("check-vpn");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho '{}' >&2\nexit 7\n", profile.display()),
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod script");
+
+        let mut runtime = test_runtime();
+        runtime.gitlab_vpn_check_timeout = Duration::from_millis(250);
+        runtime.gitlab_openvpn_profile = Some(profile.clone());
+        let target = ProviderTarget {
+            provider: Provider::GitLab,
+            host: "gitlab.example.com".into(),
+        };
+
+        let err = run_cmd_vpn_check(script.to_str().expect("script path"), &target, &runtime)
+            .expect_err("failing command should fail readiness");
+        assert_eq!(err.kind(), "vpn_unavailable");
+
+        let redacted = sanitize_sensitive(&format!("stderr: {}", profile.display()), &runtime);
+        assert!(!redacted.contains(&profile.to_string_lossy().to_string()));
+        assert!(redacted.contains("<redacted-openvpn-profile>"));
+
+        let missing = tmp.path().join("missing-check");
+        let err = run_cmd_vpn_check(missing.to_str().expect("missing path"), &target, &runtime)
+            .expect_err("missing command should be unavailable");
+        assert_eq!(err.kind(), "vpn_probe_dependency_missing");
+    }
+
+    #[test]
+    fn inbox_openvpn_probe_redacts_unreadable_profile_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let profile = tmp.path().join("missing.ovpn");
+        let mut runtime = test_runtime();
+        runtime.gitlab_openvpn_profile = Some(profile.clone());
+
+        let err = run_openvpn_check(&runtime).expect_err("missing profile should fail before exec");
+        let rendered = err.to_string();
+        assert_eq!(err.kind(), "vpn_unavailable");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(&profile.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn inbox_provider_cache_round_trips_items_as_stale() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut runtime = test_runtime();
+        runtime.cache.no_cache = false;
+        runtime.cache.fallback = true;
+        runtime.cache.dir = Some(tmp.path().to_path_buf());
+
+        let target = ProviderTarget {
+            provider: Provider::GitLab,
+            host: "gitlab.example.com:8443".into(),
+        };
+        let config = QueryConfig::new(vec![InboxKindFlag::Assigned], InboxItemTypeFlag::All, 5);
+        let items = vec![InboxItem {
+            provider: "gitlab".to_string(),
+            host: target.host.clone(),
+            kind: "assigned".into(),
+            reasons: vec!["assigned".into()],
+            repo: "team/widgets".into(),
+            number: 42,
+            title: "Review timeout handling".into(),
+            url: "https://gitlab.example.com/team/widgets/-/merge_requests/42".into(),
+            updated_at: "2026-05-24T00:00:00Z".into(),
+            author: Some("alice".into()),
+            source: "gitlab_merge_requests".to_string(),
+            stale: None,
+        }];
+
+        assert!(write_provider_cache(&target, &config, &runtime, &items).is_none());
+        let cached = read_provider_cache(&target, &config, &runtime, "provider_failed")
+            .expect("read provider cache");
+        assert_eq!(cached.items.len(), 1);
+        assert_eq!(cached.items[0].repo, "team/widgets");
+        let stale = cached.items[0].stale.as_ref().expect("stale metadata");
+        assert_eq!(stale.reason, "provider_failed");
+        assert!(cached.age_seconds <= runtime.cache.max_age.as_secs());
     }
 
     /// Fake runner that records concurrent-call peak via atomic counters.
