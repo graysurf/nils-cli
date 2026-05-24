@@ -19,6 +19,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+libc = "0.2"
 nils-common = { version = "0.19.0", path = "../nils-common", package = "nils-common" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }

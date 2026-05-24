@@ -103,6 +103,13 @@ partial-failure flows, prefer extending `details` over inventing
 crate-specific top-level fields. Free-form text never belongs anywhere
 in the error envelope.
 
+Provider aggregation commands that support strict partial-failure modes SHOULD
+put provider status rows under `error.details.providers[]` when failing. This
+keeps the failure shape machine-readable without returning a success `data`
+payload, and lets automation distinguish healthy, failed, timed-out, stale, or
+skipped providers from the same provider-row contract used in non-strict
+success envelopes.
+
 Reference implementation:
 [`nils_common::cli_contract::Envelope`](../../crates/nils-common/src/cli_contract.rs)
 and the worked example in

@@ -6,7 +6,12 @@
 //! subprocess is spawned.
 
 use std::ffi::{OsStr, OsString};
-use std::process::Command;
+use std::io;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use serde::Serialize;
 
@@ -116,6 +121,14 @@ pub struct BackendOutput {
 pub trait BackendRunner {
     fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError>;
 
+    fn run_with_timeout(
+        &self,
+        call: &BackendCall,
+        _timeout: Option<Duration>,
+    ) -> Result<BackendSuccess, ForgeError> {
+        self.run(call)
+    }
+
     fn run_raw(&self, call: &BackendCall) -> Result<BackendOutput, ForgeError> {
         self.run(call).map(|output| BackendOutput {
             stdout: output.stdout,
@@ -123,6 +136,14 @@ pub trait BackendRunner {
             status_success: true,
             exit_code: 0,
         })
+    }
+
+    fn run_raw_with_timeout(
+        &self,
+        call: &BackendCall,
+        _timeout: Option<Duration>,
+    ) -> Result<BackendOutput, ForgeError> {
+        self.run_raw(call)
     }
 }
 
@@ -132,7 +153,15 @@ pub struct ProcessRunner;
 
 impl BackendRunner for ProcessRunner {
     fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
-        let output = self.run_raw(call)?;
+        self.run_with_timeout(call, None)
+    }
+
+    fn run_with_timeout(
+        &self,
+        call: &BackendCall,
+        timeout: Option<Duration>,
+    ) -> Result<BackendSuccess, ForgeError> {
+        let output = self.run_raw_with_timeout(call, timeout)?;
         if output.status_success {
             return Ok(BackendSuccess {
                 stdout: output.stdout,
@@ -152,14 +181,22 @@ impl BackendRunner for ProcessRunner {
     }
 
     fn run_raw(&self, call: &BackendCall) -> Result<BackendOutput, ForgeError> {
+        self.run_raw_with_timeout(call, None)
+    }
+
+    fn run_raw_with_timeout(
+        &self,
+        call: &BackendCall,
+        timeout: Option<Duration>,
+    ) -> Result<BackendOutput, ForgeError> {
         let exe = call.program.executable();
         let mut cmd = Command::new(&exe);
         for arg in &call.argv {
             cmd.arg(arg);
         }
-        let output = match cmd.output() {
+        let output = match output_with_timeout(&mut cmd, timeout) {
             Ok(out) => out,
-            Err(err) => {
+            Err(ProcessOutputError::Io(err)) => {
                 let kind = err.kind();
                 if matches!(kind, std::io::ErrorKind::NotFound) {
                     return Err(ForgeError::backend_missing(
@@ -176,6 +213,20 @@ impl BackendRunner for ProcessRunner {
                     schema(),
                     format!("failed to launch {exe}: {err}", exe = exe.to_string_lossy()),
                     Some(err.to_string()),
+                ));
+            }
+            Err(ProcessOutputError::Timeout { timeout, output }) => {
+                let stderr_full = String::from_utf8_lossy(&output.stderr).into_owned();
+                let stderr = redact_and_tail(&stderr_full);
+                return Err(ForgeError::unavailable(
+                    schema(),
+                    "backend_timeout",
+                    format!(
+                        "{exe} timed out after {timeout}",
+                        exe = exe.to_string_lossy(),
+                        timeout = format_duration(timeout)
+                    ),
+                    (!stderr.is_empty()).then_some(stderr),
                 ));
             }
         };
@@ -211,6 +262,68 @@ impl BackendRunner for ProcessRunner {
             status_success,
             exit_code,
         })
+    }
+}
+
+fn output_with_timeout(
+    cmd: &mut Command,
+    timeout: Option<Duration>,
+) -> Result<std::process::Output, ProcessOutputError> {
+    let Some(timeout) = timeout.filter(|duration| !duration.is_zero()) else {
+        return cmd.output().map_err(ProcessOutputError::Io);
+    };
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_child_group(cmd);
+    let mut child = cmd.spawn().map_err(ProcessOutputError::Io)?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait().map_err(ProcessOutputError::Io)?.is_some() {
+            return child.wait_with_output().map_err(ProcessOutputError::Io);
+        }
+        if started.elapsed() >= timeout {
+            kill_child_group(&mut child);
+            let output = child.wait_with_output().map_err(ProcessOutputError::Io)?;
+            return Err(ProcessOutputError::Timeout { timeout, output });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+enum ProcessOutputError {
+    Io(io::Error),
+    Timeout {
+        timeout: Duration,
+        output: std::process::Output,
+    },
+}
+
+fn configure_child_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+}
+
+fn kill_child_group(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        let pgid = -(child.id() as libc::pid_t);
+        let _ = libc::kill(pgid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        format!("{millis}ms")
+    } else if millis.is_multiple_of(60_000) {
+        format!("{}m", millis / 60_000)
+    } else if millis.is_multiple_of(1_000) {
+        format!("{}s", millis / 1_000)
+    } else {
+        format!("{millis}ms")
     }
 }
 
@@ -431,5 +544,36 @@ mod tests {
             std::env::remove_var(ENV_GH_BIN);
         }
         assert_eq!(err.kind(), "backend_missing");
+    }
+
+    #[test]
+    fn process_runner_reports_backend_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 2\necho should-not-complete\n")
+            .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let runner = ProcessRunner;
+        unsafe {
+            std::env::set_var(ENV_GH_BIN, &stub);
+        }
+        let call = BackendCall::new(BackendProgram::Gh, ["search", "prs"]);
+        let started = std::time::Instant::now();
+        let err = runner
+            .run_with_timeout(&call, Some(Duration::from_millis(50)))
+            .expect_err("timeout");
+        unsafe {
+            std::env::remove_var(ENV_GH_BIN);
+        }
+        assert_eq!(err.kind(), "backend_timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout should kill the child promptly"
+        );
     }
 }

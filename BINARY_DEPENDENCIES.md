@@ -24,7 +24,8 @@ These tools are required for common command paths. Each row is anchored to at le
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
 | `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
 | `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
-| `gh` | `git-cli open *` GitHub helpers, `plan-issue-cli` GitHub I/O | Required for GitHub-facing flows | `brew install gh` |
+| `gh` | `git-cli open *` GitHub helpers, `plan-issue-cli` GitHub I/O, `forge-cli` GitHub backend | Required for GitHub-facing flows | `brew install gh` |
+| `glab` | `forge-cli` GitLab backend and GitLab inbox reads | Required for GitLab-facing `forge-cli` flows | `brew install glab` |
 
 ### 1.1 `image-processing` runtime policy
 
@@ -61,6 +62,7 @@ in `crates/*/src`.
 | `hs` (Hammerspoon CLI) | Preferred AX backend path for `macos-agent ax *` (fallback to JXA when unavailable) | `brew install --cask hammerspoon` |
 | `cliclick` | Probed by `macos-agent` preflight as an alternate input backend | `brew install cliclick` |
 | `im-select` | Required by `macos-agent input-source *` and macOS real E2E keyboard/input-source setup | `brew install im-select` |
+| `openvpn` | Optional `forge-cli inbox --gitlab-vpn-check openvpn` readiness dependency probe; `forge-cli` never starts or stops VPN | `brew install openvpn` |
 
 ## 3. Development and Validation Toolchain
 
@@ -138,7 +140,7 @@ cargo run -p agent-docs -- resolve --context project-dev --format checklist \
 ### 6.1 Base contributor profile
 
 ```bash
-brew install git gh fzf tree webp ffmpeg bat zsh python bash-completion rustup-init im-select
+brew install git gh glab fzf tree webp ffmpeg bat zsh python bash-completion rustup-init im-select
 ```
 
 ### 6.2 Linux extra profile (audio/clipboard/network ergonomics)
@@ -162,7 +164,7 @@ eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 ## 8. Quick Environment Verification
 
 ```bash
-for c in git gh fzf grpcurl tree file ffmpeg bat im-select curl; do
+for c in git gh glab fzf grpcurl tree file ffmpeg bat im-select curl; do
   if command -v "$c" >/dev/null 2>&1; then
     echo "[OK]   $c -> $(command -v "$c")"
   else

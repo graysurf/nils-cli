@@ -509,11 +509,22 @@ _arguments "${_arguments_options[@]}" : \
 pr\:"Include only pull requests / merge requests (and todos that target them)"
 issue\:"Include only issues (and todos that target them)"))' \
 '--limit=[Per-provider, per-query-family bounded result limit (default\: 30)]:LIMIT:_default' \
+'--gitlab-vpn=[GitLab VPN readiness policy for inbox calls]:GITLAB_VPN:((off\:"Do not run a GitLab VPN readiness probe (default)"
+optional\:"Run the probe when configured, but attempt GitLab even when it fails"
+required\:"Require readiness before any GitLab backend call"))' \
+'--gitlab-vpn-check=[GitLab VPN readiness check\: \`tcp\:<host>\:<port>\`, \`cmd\:<program>\`, or \`openvpn\`]:CHECK:_default' \
+'--gitlab-vpn-check-timeout=[GitLab VPN readiness check timeout (default\: 2s)]:GITLAB_VPN_CHECK_TIMEOUT:_default' \
+'--gitlab-openvpn-profile=[Local OpenVPN profile path for probe diagnostics. Redacted from output]:PATH:_files' \
+'--provider-timeout=[Per-backend-call timeout for GitLab inbox calls (default\: 20s; 0 disables)]:PROVIDER_TIMEOUT:_default' \
+'--cache-max-age=[Maximum age for opt-in cached fallback items (default\: 30m)]:CACHE_MAX_AGE:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--strict-providers[Fail when any selected inbox provider fails]' \
+'--cache-fallback[Include recent cached items when a selected provider is unavailable or times out]' \
+'--no-cache[Disable inbox cache reads and writes]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -527,11 +538,22 @@ _arguments "${_arguments_options[@]}" : \
 pr\:"Include only pull requests / merge requests (and todos that target them)"
 issue\:"Include only issues (and todos that target them)"))' \
 '--limit=[Per-provider, per-query-family bounded result limit (default\: 30)]:LIMIT:_default' \
+'--gitlab-vpn=[GitLab VPN readiness policy for inbox calls]:GITLAB_VPN:((off\:"Do not run a GitLab VPN readiness probe (default)"
+optional\:"Run the probe when configured, but attempt GitLab even when it fails"
+required\:"Require readiness before any GitLab backend call"))' \
+'--gitlab-vpn-check=[GitLab VPN readiness check\: \`tcp\:<host>\:<port>\`, \`cmd\:<program>\`, or \`openvpn\`]:CHECK:_default' \
+'--gitlab-vpn-check-timeout=[GitLab VPN readiness check timeout (default\: 2s)]:GITLAB_VPN_CHECK_TIMEOUT:_default' \
+'--gitlab-openvpn-profile=[Local OpenVPN profile path for probe diagnostics. Redacted from output]:PATH:_files' \
+'--provider-timeout=[Per-backend-call timeout for GitLab inbox calls (default\: 20s; 0 disables)]:PROVIDER_TIMEOUT:_default' \
+'--cache-max-age=[Maximum age for opt-in cached fallback items (default\: 30m)]:CACHE_MAX_AGE:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--strict-providers[Fail when any selected inbox provider fails]' \
+'--cache-fallback[Include recent cached items when a selected provider is unavailable or times out]' \
+'--no-cache[Disable inbox cache reads and writes]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -545,11 +567,22 @@ _arguments "${_arguments_options[@]}" : \
 pr\:"Include only pull requests / merge requests (and todos that target them)"
 issue\:"Include only issues (and todos that target them)"))' \
 '--limit=[Number of ranked items to return (default\: 5). Provider queries remain bounded at at least 30 candidates so ranking has enough input]:LIMIT:_default' \
+'--gitlab-vpn=[GitLab VPN readiness policy for inbox calls]:GITLAB_VPN:((off\:"Do not run a GitLab VPN readiness probe (default)"
+optional\:"Run the probe when configured, but attempt GitLab even when it fails"
+required\:"Require readiness before any GitLab backend call"))' \
+'--gitlab-vpn-check=[GitLab VPN readiness check\: \`tcp\:<host>\:<port>\`, \`cmd\:<program>\`, or \`openvpn\`]:CHECK:_default' \
+'--gitlab-vpn-check-timeout=[GitLab VPN readiness check timeout (default\: 2s)]:GITLAB_VPN_CHECK_TIMEOUT:_default' \
+'--gitlab-openvpn-profile=[Local OpenVPN profile path for probe diagnostics. Redacted from output]:PATH:_files' \
+'--provider-timeout=[Per-backend-call timeout for GitLab inbox calls (default\: 20s; 0 disables)]:PROVIDER_TIMEOUT:_default' \
+'--cache-max-age=[Maximum age for opt-in cached fallback items (default\: 30m)]:CACHE_MAX_AGE:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--strict-providers[Fail when any selected inbox provider fails]' \
+'--cache-fallback[Include recent cached items when a selected provider is unavailable or times out]' \
+'--no-cache[Disable inbox cache reads and writes]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \

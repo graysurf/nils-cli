@@ -7,6 +7,7 @@
 //! `SOFTWARE 70` so callers see a stable failure shape rather than a panic.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -252,6 +253,29 @@ impl InboxItemTypeFlag {
             InboxItemTypeFlag::All => "all",
             InboxItemTypeFlag::Pr => "pr",
             InboxItemTypeFlag::Issue => "issue",
+        }
+    }
+}
+
+/// GitLab VPN readiness mode for inbox calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum GitlabVpnModeFlag {
+    /// Do not run a GitLab VPN readiness probe (default).
+    #[default]
+    Off,
+    /// Run the probe when configured, but attempt GitLab even when it fails.
+    Optional,
+    /// Require readiness before any GitLab backend call.
+    Required,
+}
+
+impl GitlabVpnModeFlag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitlabVpnModeFlag::Off => "off",
+            GitlabVpnModeFlag::Optional => "optional",
+            GitlabVpnModeFlag::Required => "required",
         }
     }
 }
@@ -606,6 +630,33 @@ pub struct InboxQueryArgs {
     /// Per-provider, per-query-family bounded result limit (default: 30).
     #[arg(long, default_value_t = 30)]
     pub limit: u32,
+    /// GitLab VPN readiness policy for inbox calls.
+    #[arg(long = "gitlab-vpn", value_enum)]
+    pub gitlab_vpn: Option<GitlabVpnModeFlag>,
+    /// GitLab VPN readiness check: `tcp:<host>:<port>`, `cmd:<program>`, or `openvpn`.
+    #[arg(long = "gitlab-vpn-check", value_name = "CHECK")]
+    pub gitlab_vpn_check: Option<String>,
+    /// GitLab VPN readiness check timeout (default: 2s).
+    #[arg(long = "gitlab-vpn-check-timeout", value_parser = parse_duration)]
+    pub gitlab_vpn_check_timeout: Option<Duration>,
+    /// Local OpenVPN profile path for probe diagnostics. Redacted from output.
+    #[arg(long = "gitlab-openvpn-profile", value_name = "PATH")]
+    pub gitlab_openvpn_profile: Option<PathBuf>,
+    /// Per-backend-call timeout for GitLab inbox calls (default: 20s; 0 disables).
+    #[arg(long = "provider-timeout", value_parser = parse_duration)]
+    pub provider_timeout: Option<Duration>,
+    /// Fail when any selected inbox provider fails.
+    #[arg(long = "strict-providers", action = ArgAction::SetTrue)]
+    pub strict_providers: bool,
+    /// Include recent cached items when a selected provider is unavailable or times out.
+    #[arg(long = "cache-fallback", action = ArgAction::SetTrue)]
+    pub cache_fallback: bool,
+    /// Maximum age for opt-in cached fallback items (default: 30m).
+    #[arg(long = "cache-max-age", value_parser = parse_duration)]
+    pub cache_max_age: Option<Duration>,
+    /// Disable inbox cache reads and writes.
+    #[arg(long = "no-cache", action = ArgAction::SetTrue)]
+    pub no_cache: bool,
 }
 
 /// `inbox next` arguments.
@@ -627,6 +678,33 @@ pub struct InboxNextArgs {
     /// bounded at at least 30 candidates so ranking has enough input.
     #[arg(long, default_value_t = 5)]
     pub limit: u32,
+    /// GitLab VPN readiness policy for inbox calls.
+    #[arg(long = "gitlab-vpn", value_enum)]
+    pub gitlab_vpn: Option<GitlabVpnModeFlag>,
+    /// GitLab VPN readiness check: `tcp:<host>:<port>`, `cmd:<program>`, or `openvpn`.
+    #[arg(long = "gitlab-vpn-check", value_name = "CHECK")]
+    pub gitlab_vpn_check: Option<String>,
+    /// GitLab VPN readiness check timeout (default: 2s).
+    #[arg(long = "gitlab-vpn-check-timeout", value_parser = parse_duration)]
+    pub gitlab_vpn_check_timeout: Option<Duration>,
+    /// Local OpenVPN profile path for probe diagnostics. Redacted from output.
+    #[arg(long = "gitlab-openvpn-profile", value_name = "PATH")]
+    pub gitlab_openvpn_profile: Option<PathBuf>,
+    /// Per-backend-call timeout for GitLab inbox calls (default: 20s; 0 disables).
+    #[arg(long = "provider-timeout", value_parser = parse_duration)]
+    pub provider_timeout: Option<Duration>,
+    /// Fail when any selected inbox provider fails.
+    #[arg(long = "strict-providers", action = ArgAction::SetTrue)]
+    pub strict_providers: bool,
+    /// Include recent cached items when a selected provider is unavailable or times out.
+    #[arg(long = "cache-fallback", action = ArgAction::SetTrue)]
+    pub cache_fallback: bool,
+    /// Maximum age for opt-in cached fallback items (default: 30m).
+    #[arg(long = "cache-max-age", value_parser = parse_duration)]
+    pub cache_max_age: Option<Duration>,
+    /// Disable inbox cache reads and writes.
+    #[arg(long = "no-cache", action = ArgAction::SetTrue)]
+    pub no_cache: bool,
 }
 
 /// `issue list` arguments. Maps to

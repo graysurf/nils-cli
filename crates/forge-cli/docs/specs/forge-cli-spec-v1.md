@@ -200,6 +200,28 @@ Inbox-local flags:
 - With no `--provider`, inbox queries both default providers. `--provider
   github|gitlab` narrows the inbox just as it narrows lifecycle commands, but
   inbox does not reuse the single-provider remote resolver internally.
+- `--gitlab-vpn off|optional|required` controls an inbox-local GitLab
+  readiness gate. `required` runs a readiness check before any GitLab backend
+  call and reports `vpn_unavailable` without invoking `glab` when the check
+  fails. `optional` may report a warning but still attempts GitLab. `off` is
+  the default.
+- `--gitlab-vpn-check tcp:<host>:<port>|cmd:<program>|openvpn` selects the
+  readiness check. `tcp:` probes reachability, `cmd:` delegates to a local
+  operator script, and `openvpn` verifies local OpenVPN CLI/profile
+  prerequisites only; `forge-cli inbox` never starts or stops a VPN.
+- `--gitlab-openvpn-profile <path>` is local-only input for probes. Profile
+  paths are redacted from dry-run JSON, warnings, provider errors, cache files,
+  issue records, and docs examples.
+- `--gitlab-vpn-check-timeout <duration>` bounds readiness checks (default
+  `2s`). `--provider-timeout <duration>` bounds GitLab inbox identity/API
+  backend calls (default `20s`; `0s` disables). GitHub queries remain
+  independent from GitLab timeout behavior.
+- `--strict-providers` makes partial provider failure a non-zero
+  `provider_failed` failure envelope with `error.details.providers[]`.
+- `--cache-fallback` includes recent stale cached provider items when a
+  selected provider is VPN-unavailable or times out. Cache fallback is opt-in,
+  age-bounded by `--cache-max-age` (default `30m`), and disabled with
+  `--no-cache`.
 
 ## Atomic op surface
 
@@ -386,12 +408,22 @@ providers:
 - `reasons` is a deterministic de-duplicated array. Allowed v1 values are
   `review`, `assigned`, `todo`, `authored`, and `involved`.
 - Partial provider success exits `SUCCESS 0`: successful provider items remain
-  in `data.items[]`, failed providers are represented in `data.providers[].
-  error`, and top-level `warnings[]` carries string warnings under the shared
+  in `data.items[]`, failed providers are represented in
+  `data.providers[].error`, and top-level `warnings[]` carries string warnings under the shared
   workspace envelope contract.
+- With `--strict-providers`, any selected provider failure exits `RUNTIME 1`
+  with `error.code=provider_failed`; `error.details.providers[]` preserves the
+  same provider rows that a non-strict success envelope would have emitted.
 - If every selected provider fails, `inbox` exits non-zero through the normal
-  `ForgeError` / `cli_contract` failure envelope instead of returning an empty
-  successful inbox.
+  `cli_contract` failure envelope with `error.details.providers[]` instead of
+  returning an empty successful inbox.
+- GitLab VPN readiness failures use `vpn_unavailable` when the configured probe
+  failed and `vpn_probe_dependency_missing` when an optional probe dependency,
+  such as the `openvpn` CLI, is missing. GitLab backend subprocess timeouts use
+  `backend_timeout`.
+- Cached fallback items include a `stale` object with `reason`,
+  `cached_at_unix`, and `age_seconds`; the provider row remains `ok=false` and
+  carries `cache.used=true` so stale data never masquerades as live success.
 - GitLab rows come from host-aware `glab api --hostname <host>` calls. The user
   id and username are discovered with `glab api user --hostname <host>` for the
   current invocation and are not persisted. The identity lookup is skipped when
@@ -433,14 +465,14 @@ without exception:
 `nils_common::cli_contract::exit`. Discriminators go in
 `data.error.kind`, not in numeric exit codes.
 
-| Constant      | Value | `forge-cli` triggers                                                                  |
-| ------------- | ----- | ------------------------------------------------------------------------------------- |
-| `SUCCESS`     | `0`   | Op completed; required state achieved.                                                |
-| `RUNTIME`     | `1`   | Remote semantic failure: required checks failed, merge conflict, draft already ready. |
-| `USAGE`       | `64`  | Bad CLI syntax, unknown subcommand, unsupported provider.                             |
-| `DATA`        | `65`  | Lock-down policy violation (any rule above); body parse failure.                      |
-| `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks timeout.    |
-| `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).             |
+| Constant      | Value | `forge-cli` triggers                                                                                                          |
+| ------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `SUCCESS`     | `0`   | Op completed; required state achieved.                                                                                        |
+| `RUNTIME`     | `1`   | Remote semantic failure: required checks failed, merge conflict, draft already ready.                                         |
+| `USAGE`       | `64`  | Bad CLI syntax, unknown subcommand, unsupported provider.                                                                     |
+| `DATA`        | `65`  | Lock-down policy violation (any rule above); body parse failure; invalid VPN config.                                          |
+| `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks timeout, GitLab VPN probe failure, backend timeout. |
+| `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).                                                     |
 
 Callers (agent-kit skills, CI scripts) MUST branch on `error.kind`
 when finer granularity is needed. Numeric exit codes alone are
@@ -470,16 +502,39 @@ bug_prefix = "fix/"
 timeout = "30m"
 interval = "20s"
 required_only = true
+
+[inbox]
+gitlab_vpn = "off"                    # off | optional | required
+gitlab_vpn_check = "tcp:gitlab.example.com:443"
+gitlab_vpn_check_timeout = "2s"
+gitlab_openvpn_profile = "<local-openvpn-profile>"
+provider_timeout = "20s"
+strict_providers = false
+cache_fallback = false
+cache_max_age = "30m"
+no_cache = false
 ```
 
 Resolution order for any setting: explicit flag > `.forge-cli.toml` >
-spec default. Unknown keys produce a `warnings[]` entry, not an
-error — forward-compatibility for v2 fields.
+spec default. Inbox env vars sit between explicit flags and `.forge-cli.toml`.
+Unknown keys produce a `warnings[]` entry, not an error —
+forward-compatibility for v2 fields.
 
 Environment variables (read once at startup, all optional):
 
 - `FORGE_CLI_GH_BIN` — override `gh` discovery path (testing).
 - `FORGE_CLI_GLAB_BIN` — override `glab` discovery path (testing).
+- `FORGE_CLI_INBOX_GITLAB_HOST` — default GitLab host for inbox commands.
+- `FORGE_CLI_INBOX_GITLAB_VPN`,
+  `FORGE_CLI_INBOX_GITLAB_VPN_CHECK`,
+  `FORGE_CLI_INBOX_GITLAB_VPN_CHECK_TIMEOUT`, and
+  `FORGE_CLI_INBOX_GITLAB_OPENVPN_PROFILE` — local GitLab VPN readiness
+  settings. Profile values are input-only and redacted from output.
+- `FORGE_CLI_INBOX_PROVIDER_TIMEOUT`,
+  `FORGE_CLI_INBOX_STRICT_PROVIDERS`,
+  `FORGE_CLI_INBOX_CACHE_FALLBACK`,
+  `FORGE_CLI_INBOX_CACHE_MAX_AGE`, `FORGE_CLI_INBOX_NO_CACHE`, and
+  `FORGE_CLI_INBOX_CACHE_DIR` — inbox timeout/cache controls.
 - `FORGE_CLI_DEFAULT_PROVIDER` — fallback provider when remote URL
   doesn't auto-detect.
 

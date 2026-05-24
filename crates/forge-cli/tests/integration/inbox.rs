@@ -111,6 +111,11 @@ echo "glab unavailable" >&2
 exit 8
 "#;
 
+const GLAB_SLEEP_STUB: &str = r#"#!/bin/sh
+sleep 2
+echo "late glab"
+"#;
+
 #[test]
 fn inbox_github_dedupes_reasons_and_normalizes_items() {
     let stub = StubEnv::new().gh_stub(GH_INBOX_STUB);
@@ -127,7 +132,7 @@ fn inbox_github_dedupes_reasons_and_normalizes_items() {
             "9",
         ],
     );
-    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["schema_version"], "cli.forge-cli.inbox.list.v1");
     assert_eq!(env["data"]["providers"][0]["provider"], "github");
@@ -160,7 +165,7 @@ fn inbox_gitlab_passes_hostname_and_normalizes_api_rows() {
             "7",
         ],
     );
-    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["data"]["providers"][0]["host"], "gitlab.example.com");
     assert_eq!(env["data"]["providers"][0]["item_count"], 4);
@@ -193,7 +198,7 @@ fn inbox_gitlab_host_can_default_from_env() {
             "7",
         ],
     );
-    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["data"]["providers"][0]["host"], "gitlab.env.example");
 }
@@ -214,7 +219,7 @@ fn inbox_list_partial_success_keeps_successful_provider() {
             "gitlab.example.com",
         ],
     );
-    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["ok"], true);
     assert_eq!(env["data"]["providers"][0]["ok"], true);
@@ -228,6 +233,226 @@ fn inbox_list_partial_success_keeps_successful_provider() {
             .as_str()
             .unwrap()
             .contains("provider_failed: gitlab gitlab.example.com")
+    );
+}
+
+#[test]
+fn inbox_provider_timeout_is_provider_local_partial_failure() {
+    let stub = StubEnv::new()
+        .gh_stub(GH_EMPTY_STUB)
+        .glab_stub(GLAB_SLEEP_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--provider-timeout",
+            "1s",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["providers"][0]["ok"], true);
+    assert_eq!(env["data"]["providers"][1]["ok"], false);
+    assert_eq!(
+        env["data"]["providers"][1]["error"]["kind"],
+        "backend_timeout"
+    );
+}
+
+#[test]
+fn inbox_gitlab_only_timeout_is_nonzero() {
+    let stub = StubEnv::new().glab_stub(GLAB_SLEEP_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--provider-timeout",
+            "1s",
+        ],
+    );
+    assert_eq!(out.code, 1, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "backend_error");
+    assert_eq!(
+        env["error"]["details"]["providers"][0]["error"]["kind"],
+        "backend_timeout"
+    );
+}
+
+#[test]
+fn inbox_strict_providers_fails_partial_failure_with_provider_details() {
+    let stub = StubEnv::new()
+        .gh_stub(GH_EMPTY_STUB)
+        .glab_stub(GLAB_FAIL_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--strict-providers",
+        ],
+    );
+    assert_eq!(out.code, 1, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "provider_failed");
+    assert_eq!(env["error"]["details"]["providers"][0]["ok"], true);
+    assert_eq!(env["error"]["details"]["providers"][1]["ok"], false);
+}
+
+#[test]
+fn inbox_gitlab_vpn_required_skips_glab_when_probe_fails() {
+    let probe = r#"#!/bin/sh
+echo "vpn unavailable" >&2
+exit 2
+"#;
+    let stub = StubEnv::new().gh_stub(GH_EMPTY_STUB).glab_stub(
+        r#"#!/bin/sh
+echo "glab should not run" >&2
+exit 99
+"#,
+    );
+    let probe_path = stub.write_stub("vpn-check", probe);
+    let check = format!("cmd:{}", probe_path.to_string_lossy());
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--gitlab-vpn",
+            "required",
+            "--gitlab-vpn-check",
+            &check,
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["providers"][0]["ok"], true);
+    assert_eq!(env["data"]["providers"][1]["ok"], false);
+    assert_eq!(
+        env["data"]["providers"][1]["error"]["kind"],
+        "vpn_unavailable"
+    );
+    assert!(
+        !out.stderr.contains("glab should not run"),
+        "glab backend must be skipped when required VPN probe fails"
+    );
+}
+
+#[test]
+fn inbox_dry_run_redacts_openvpn_profile_path() {
+    let private_profile = "LOCAL_OPENVPN_PROFILE";
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "--dry-run",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--gitlab-vpn",
+            "required",
+            "--gitlab-vpn-check",
+            "openvpn",
+            "--gitlab-openvpn-profile",
+            private_profile,
+            "--provider-timeout",
+            "5s",
+            "--strict-providers",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    assert!(!out.stdout.contains(private_profile));
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["provider_timeout_seconds"], 5);
+    assert_eq!(env["data"]["strict_providers"], true);
+    assert_eq!(
+        env["data"]["providers"][0]["vpn"]["openvpn_profile"],
+        "<redacted>"
+    );
+}
+
+#[test]
+fn inbox_cache_fallback_marks_cached_items_stale_while_provider_failed() {
+    let cache_root = tempfile::TempDir::new().expect("cache dir");
+    let seed = StubEnv::new()
+        .env(
+            "FORGE_CLI_INBOX_CACHE_DIR",
+            cache_root.path().to_string_lossy(),
+        )
+        .glab_stub(GLAB_INBOX_STUB);
+    let seed_out = run_forge_cli(
+        &seed,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+        ],
+    );
+    assert_eq!(seed_out.code, 0, "stderr={}", seed_out.stderr);
+
+    let fallback = StubEnv::new()
+        .env(
+            "FORGE_CLI_INBOX_CACHE_DIR",
+            cache_root.path().to_string_lossy(),
+        )
+        .gh_stub(GH_EMPTY_STUB)
+        .glab_stub(GLAB_SLEEP_STUB);
+    let out = run_forge_cli(
+        &fallback,
+        &[
+            "--format",
+            "json",
+            "inbox",
+            "list",
+            "--gitlab-host",
+            "gitlab.example.com",
+            "--provider-timeout",
+            "250ms",
+            "--cache-fallback",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["providers"][1]["ok"], false);
+    assert_eq!(env["data"]["providers"][1]["cache"]["used"], true);
+    let items = env["data"]["items"].as_array().expect("items");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["stale"]["reason"] == "backend_timeout"),
+        "expected at least one stale cached item: {items:?}"
     );
 }
 

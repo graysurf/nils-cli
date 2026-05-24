@@ -2030,6 +2030,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "libc",
  "nils-common",
  "nils-test-support",
  "pretty_assertions",
