@@ -66,6 +66,11 @@ impl ForgeCliRunner for ProcessForgeCliRunner {
 
 /// `ProviderAdapter` implementation for GitLab repos.
 pub struct ForgeCliAdapter {
+    /// Mirrors `GhCliAdapter::force`. Sprint 2/3 trait methods do not consult
+    /// it because forge-cli's own markdown-validation gates already enforce
+    /// the same policy; this field is retained so the adapter can grow a
+    /// `--force` pass-through later without an API change.
+    #[allow(dead_code)]
     force: bool,
     runner: Box<dyn ForgeCliRunner + Send + Sync>,
 }
@@ -126,12 +131,6 @@ impl ForgeCliAdapter {
         path.to_str()
             .ok_or_else(|| format!("body file path is not valid UTF-8: {}", path.display()))
     }
-}
-
-fn not_implemented(op: &str) -> String {
-    format!(
-        "provider_not_implemented: GitLab `{op}` is wired up to the routing layer but not yet implemented (Sprint 2.2 only ships `record open`). Track sympoies/nils-cli#490."
-    )
 }
 
 impl ProviderAdapter for ForgeCliAdapter {
@@ -264,27 +263,119 @@ impl ProviderAdapter for ForgeCliAdapter {
 
     fn close_issue(
         &self,
-        _repo: &str,
-        _issue: u64,
+        repo: &str,
+        issue: u64,
         _reason: CloseReason,
-        _close_comment: Option<&str>,
+        close_comment: Option<&str>,
     ) -> Result<(), String> {
-        // Sprint 3 lands `record close`; today close_issue stays a stub so
-        // any caller that hits it learns the gap with a typed message.
-        let _ = self.force;
-        Err(not_implemented("issue close"))
+        // GitLab `glab issue close` has no `--reason` or `--comment` flag,
+        // and `forge-cli issue close` mirrors that today. To preserve the
+        // "post a final comment + close" semantic that GitHub callers rely
+        // on, decompose into two atomic calls: `issue comment --body <c>`
+        // (only when a comment is supplied) then `issue close`. The
+        // `CloseReason` argument is intentionally dropped — GitLab has no
+        // native concept; both `Completed` and `NotPlanned` resolve to the
+        // same "closed" state.
+        let issue_str = issue.to_string();
+        if let Some(comment) = close_comment
+            && !comment.trim().is_empty()
+        {
+            let mut args = self.base_args(repo);
+            args.extend(["issue", "comment", &issue_str, "--body", comment]);
+            self.run_envelope(&args)?;
+        }
+        let mut args = self.base_args(repo);
+        args.extend(["issue", "close", &issue_str]);
+        self.run_envelope(&args).map(|_| ())
     }
 
-    fn pr_is_merged(&self, _repo: &str, _pr: u64) -> Result<bool, String> {
-        Err(not_implemented("pr is-merged"))
+    fn pr_is_merged(&self, repo: &str, pr: u64) -> Result<bool, String> {
+        let pr_str = pr.to_string();
+        let mut args = self.base_args(repo);
+        args.extend(["pr", "view", &pr_str]);
+        let data = self.run_envelope(&args)?;
+        let state = data
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let merged_at_present = data.get("merged_at").map(|v| !v.is_null()).unwrap_or(false);
+        Ok(state.eq_ignore_ascii_case("merged") || merged_at_present)
     }
 
-    fn pr_merge_summary(&self, _repo: &str, _pr: u64) -> Result<PrMergeSummary, String> {
-        Err(not_implemented("pr merge-summary"))
+    fn pr_merge_summary(&self, repo: &str, pr: u64) -> Result<PrMergeSummary, String> {
+        // Compose `pr view` (state + merge_commit_sha) + `pr checks`
+        // (rolled-up status) — `pr view` payload exposes both fields after
+        // sympoies/nils-cli#495 (G3); `pr checks` was already there.
+        let pr_str = pr.to_string();
+
+        let mut view_args = self.base_args(repo);
+        view_args.extend(["pr", "view", &pr_str]);
+        let view = self.run_envelope(&view_args)?;
+        let state = view
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let merged_at_present = view.get("merged_at").map(|v| !v.is_null()).unwrap_or(false);
+        let merged = state.eq_ignore_ascii_case("merged") || merged_at_present;
+        let merge_sha = view
+            .get("merge_commit_sha")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+
+        let mut checks_args = self.base_args(repo);
+        checks_args.extend(["pr", "checks", &pr_str]);
+        // `pr checks` exits non-zero when the rollup is `failure` / `pending`
+        // — that is information we want, not an error. The forge-cli error
+        // path here would surface those as `Err`; today's pr_checks_gitlab
+        // also already handles the "no pipeline" case (#485) returning
+        // empty success. For pr_merge_summary we just want the `state`
+        // field. If forge-cli errors, treat checks as `None`.
+        let checks = match self.run_envelope(&checks_args) {
+            Ok(checks_data) => checks_data
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty()),
+            Err(_) => None,
+        };
+        Ok(PrMergeSummary {
+            state,
+            merged,
+            merge_sha,
+            checks,
+        })
     }
 
-    fn pr_comments(&self, _repo: &str, _pr: u64) -> Result<Vec<Value>, String> {
-        Err(not_implemented("pr comments"))
+    fn pr_comments(&self, repo: &str, pr: u64) -> Result<Vec<Value>, String> {
+        // forge-cli `pr comments` returns `{provider, number, url, comments:[
+        // {url, author, created_at, body}, ...]}`. The plan-issue
+        // `resolve-approval` consumer reads `body`, `html_url`, `created_at`
+        // off each entry — rename `url` → `html_url` to keep that consumer
+        // unchanged (the GitHub adapter returns gh's raw payload which uses
+        // `html_url`).
+        let pr_str = pr.to_string();
+        let mut args = self.base_args(repo);
+        args.extend(["pr", "comments", &pr_str]);
+        let data = self.run_envelope(&args)?;
+        let arr = data
+            .get("comments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let reshaped = arr
+            .into_iter()
+            .map(|mut item| {
+                if let Value::Object(ref mut obj) = item
+                    && let Some(url) = obj.remove("url")
+                {
+                    obj.insert("html_url".to_string(), url);
+                }
+                item
+            })
+            .collect();
+        Ok(reshaped)
     }
 }
 
@@ -554,31 +645,171 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_methods_still_return_provider_not_implemented() {
-        let (adapter, _) = adapter_with(vec![]);
+    fn close_issue_without_comment_invokes_only_issue_close() {
+        let (adapter, handle) = adapter_with(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.close.v1",
+            "data": {"provider":"gitlab","number":7,"url":"u","state":"closed"}
+        }"#,
+        ]);
+        adapter
+            .close_issue("g/p", 7, CloseReason::Completed, None)
+            .expect("close without comment");
+        let calls = handle.calls();
+        assert_eq!(calls.len(), 1, "expected only the close call");
         assert!(
-            adapter
-                .close_issue("g/p", 1, CloseReason::Completed, None)
-                .unwrap_err()
-                .contains("provider_not_implemented")
+            calls[0]
+                .windows(2)
+                .any(|w| w[0] == "issue" && w[1] == "close")
+        );
+        // Reason is dropped — GitLab has no equivalent.
+        assert!(!calls[0].iter().any(|s| s.contains("--reason")));
+    }
+
+    #[test]
+    fn close_issue_with_comment_posts_then_closes() {
+        let (adapter, handle) = adapter_with(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.issue.comment.v1","data":{"provider":"gitlab","number":7,"url":"https://x.com/g/p/-/issues/7#note_42"}}"#,
+            r#"{"ok":true,"schema_version":"cli.forge-cli.issue.close.v1","data":{"provider":"gitlab","number":7,"url":"u","state":"closed"}}"#,
+        ]);
+        adapter
+            .close_issue(
+                "g/p",
+                7,
+                CloseReason::NotPlanned,
+                Some("closing because of X"),
+            )
+            .expect("close with comment");
+        let calls = handle.calls();
+        assert_eq!(calls.len(), 2, "expected comment then close");
+        assert!(
+            calls[0]
+                .windows(2)
+                .any(|w| w[0] == "issue" && w[1] == "comment")
+        );
+        let body_idx = calls[0].iter().position(|s| s == "--body").unwrap();
+        assert_eq!(calls[0][body_idx + 1], "closing because of X");
+        assert!(
+            calls[1]
+                .windows(2)
+                .any(|w| w[0] == "issue" && w[1] == "close")
+        );
+    }
+
+    #[test]
+    fn close_issue_blank_comment_skips_the_comment_call() {
+        let (adapter, handle) = adapter_with(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.close.v1",
+            "data": {"provider":"gitlab","number":7,"url":"u","state":"closed"}
+        }"#,
+        ]);
+        adapter
+            .close_issue("g/p", 7, CloseReason::Completed, Some("   "))
+            .expect("close with blank comment");
+        assert_eq!(handle.calls().len(), 1, "blank comment must be skipped");
+    }
+
+    #[test]
+    fn pr_is_merged_returns_true_for_merged_state() {
+        let (adapter, _) = adapter_with(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.pr.view.v1",
+            "data": {"provider":"gitlab","number":7,"url":"u","state":"merged","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":"2025-01-01T00:00:00Z","merge_commit_sha":"abc","labels":[]}
+        }"#,
+        ]);
+        assert!(adapter.pr_is_merged("g/p", 7).expect("merged state"));
+    }
+
+    #[test]
+    fn pr_is_merged_returns_false_for_open_state() {
+        let (adapter, _) = adapter_with(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.pr.view.v1",
+            "data": {"provider":"gitlab","number":7,"url":"u","state":"open","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":null,"merge_commit_sha":null,"labels":[]}
+        }"#,
+        ]);
+        assert!(!adapter.pr_is_merged("g/p", 7).expect("open state"));
+    }
+
+    #[test]
+    fn pr_merge_summary_composes_view_and_checks() {
+        let (adapter, handle) = adapter_with(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"gitlab","number":7,"url":"u","state":"merged","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":"2025-01-01T00:00:00Z","merge_commit_sha":"deadbeef","labels":[]}}"#,
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.checks.v1","data":{"provider":"gitlab","state":"success","required_count":1,"success_count":1,"failed":[],"pending":[],"checks":[]}}"#,
+        ]);
+        let summary = adapter.pr_merge_summary("g/p", 7).expect("merge summary");
+        assert_eq!(summary.state, "merged");
+        assert!(summary.merged);
+        assert_eq!(summary.merge_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(summary.checks.as_deref(), Some("success"));
+        let calls = handle.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].windows(2).any(|w| w[0] == "pr" && w[1] == "view"));
+        assert!(
+            calls[1]
+                .windows(2)
+                .any(|w| w[0] == "pr" && w[1] == "checks")
+        );
+    }
+
+    #[test]
+    fn pr_merge_summary_tolerates_checks_failure_by_returning_none() {
+        // `pr checks` exits non-zero when the rollup is failing — we want
+        // pr_merge_summary to keep going (returning checks=None) so callers
+        // can still see the view-side state + merge_sha.
+        let (adapter, _) = adapter_with(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"gitlab","number":7,"url":"u","state":"open","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":null,"merge_commit_sha":null,"labels":[]}}"#,
+            r#"{"ok":false,"schema_version":"cli.forge-cli.error.v1","error":{"code":"backend_error","message":"checks rollup failure"}}"#,
+        ]);
+        let summary = adapter.pr_merge_summary("g/p", 7).expect("merge summary");
+        assert_eq!(summary.state, "open");
+        assert!(!summary.merged);
+        assert!(summary.merge_sha.is_none());
+        assert!(summary.checks.is_none(), "checks failure tolerated as None");
+    }
+
+    #[test]
+    fn pr_comments_reshapes_url_to_html_url_for_resolve_approval() {
+        let (adapter, _) = adapter_with(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.pr.comments.v1",
+            "data": {
+                "provider": "gitlab",
+                "number": 7,
+                "url": "https://x.com/g/p/-/merge_requests/7",
+                "comments": [
+                    {"url":"https://x.com/g/p/-/merge_requests/7#note_1","author":"alice","created_at":"2025-01-01T00:00:00Z","body":"- Decision: merge — approved"},
+                    {"url":"https://x.com/g/p/-/merge_requests/7#note_2","author":"bob","created_at":"2025-01-02T00:00:00Z","body":"some other note"}
+                ]
+            }
+        }"#,
+        ]);
+        let comments = adapter.pr_comments("g/p", 7).expect("comments");
+        assert_eq!(comments.len(), 2);
+        // resolve-approval reads `body`, `html_url`, `created_at`.
+        assert_eq!(
+            comments[0].get("html_url").and_then(Value::as_str),
+            Some("https://x.com/g/p/-/merge_requests/7#note_1")
         );
         assert!(
-            adapter
-                .pr_is_merged("g/p", 1)
-                .unwrap_err()
-                .contains("provider_not_implemented")
+            comments[0]
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("Decision: merge")
         );
-        assert!(
-            adapter
-                .pr_merge_summary("g/p", 1)
-                .unwrap_err()
-                .contains("provider_not_implemented")
+        assert_eq!(
+            comments[0].get("created_at").and_then(Value::as_str),
+            Some("2025-01-01T00:00:00Z")
         );
-        assert!(
-            adapter
-                .pr_comments("g/p", 1)
-                .unwrap_err()
-                .contains("provider_not_implemented")
-        );
+        // The forge-cli-native `url` key must be removed after the rename so
+        // consumers do not see two competing fields.
+        assert!(comments[0].get("url").is_none());
     }
 }
