@@ -141,6 +141,19 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':id -- Numeric PR / MR id:_default' \
 && ret=0
 ;;
+(comments)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric PR / MR id:_default' \
+&& ret=0
+;;
 (ready)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
@@ -268,6 +281,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (comment)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(comments)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -905,6 +922,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(comments)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (ready)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1280,6 +1301,7 @@ _forge-cli__subcmd__help__subcmd__pr_commands() {
 'list:List PRs / MRs' \
 'edit:Mutate PR / MR title, body, base, labels, reviewers' \
 'comment:Append a comment to a PR / MR' \
+'comments:List the issue-style comment stream attached to a PR / MR' \
 'ready:Promote a draft PR / MR to ready-for-review' \
 'merge:Merge a ready PR / MR' \
 'close:Close a PR / MR without merging' \
@@ -1303,6 +1325,11 @@ _forge-cli__subcmd__help__subcmd__pr__subcmd__close_commands() {
 _forge-cli__subcmd__help__subcmd__pr__subcmd__comment_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli help pr comment commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__comments_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__comments_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr comments commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__create_commands] )) ||
 _forge-cli__subcmd__help__subcmd__pr__subcmd__create_commands() {
@@ -1577,6 +1604,7 @@ _forge-cli__subcmd__pr_commands() {
 'list:List PRs / MRs' \
 'edit:Mutate PR / MR title, body, base, labels, reviewers' \
 'comment:Append a comment to a PR / MR' \
+'comments:List the issue-style comment stream attached to a PR / MR' \
 'ready:Promote a draft PR / MR to ready-for-review' \
 'merge:Merge a ready PR / MR' \
 'close:Close a PR / MR without merging' \
@@ -1602,6 +1630,11 @@ _forge-cli__subcmd__pr__subcmd__comment_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr comment commands' commands "$@"
 }
+(( $+functions[_forge-cli__subcmd__pr__subcmd__comments_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__comments_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr comments commands' commands "$@"
+}
 (( $+functions[_forge-cli__subcmd__pr__subcmd__create_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__create_commands() {
     local commands; commands=()
@@ -1625,6 +1658,7 @@ _forge-cli__subcmd__pr__subcmd__help_commands() {
 'list:List PRs / MRs' \
 'edit:Mutate PR / MR title, body, base, labels, reviewers' \
 'comment:Append a comment to a PR / MR' \
+'comments:List the issue-style comment stream attached to a PR / MR' \
 'ready:Promote a draft PR / MR to ready-for-review' \
 'merge:Merge a ready PR / MR' \
 'close:Close a PR / MR without merging' \
@@ -1649,6 +1683,11 @@ _forge-cli__subcmd__pr__subcmd__help__subcmd__close_commands() {
 _forge-cli__subcmd__pr__subcmd__help__subcmd__comment_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr help comment commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__comments_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__comments_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help comments commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__create_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__help__subcmd__create_commands() {

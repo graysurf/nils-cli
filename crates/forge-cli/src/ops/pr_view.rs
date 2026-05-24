@@ -98,7 +98,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     ))
 }
 
-fn build_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
+pub(crate) fn build_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => vec![
