@@ -26,7 +26,7 @@ const SCHEMA: &str = "pr.view";
 const SCHEMA_VERSION: u32 = 1;
 
 const GH_JSON_FIELDS: &str =
-    "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,labels";
+    "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels";
 
 /// Envelope payload for `cli.forge-cli.pr.view.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -41,6 +41,11 @@ pub struct PrViewPayload {
     pub base: String,
     pub mergeable: &'static str,
     pub merged_at: Option<String>,
+    /// Commit SHA of the merge commit when the PR/MR is merged. Always
+    /// emitted (the field defaults to `null` for non-merged PRs); GitHub
+    /// derives it from `mergeCommit.oid`, GitLab reads the top-level
+    /// `merge_commit_sha`.
+    pub merge_commit_sha: Option<String>,
     pub labels: Vec<String>,
 }
 
@@ -183,6 +188,12 @@ fn parse_github(
     } else {
         normalize_state(raw_state, ctx.provider)?
     };
+    let merge_commit_sha = value
+        .get("mergeCommit")
+        .and_then(|mc| mc.get("oid"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
     let labels = github_label_names(value);
     Ok(PrViewPayload {
         provider: ctx.provider.as_str(),
@@ -201,6 +212,7 @@ fn parse_github(
         base: required_str(value, "baseRefName")?,
         mergeable: normalize_mergeable_github(value.get("mergeable").and_then(|v| v.as_str())),
         merged_at,
+        merge_commit_sha,
         labels,
     })
 }
@@ -221,6 +233,11 @@ fn parse_gitlab(
         .and_then(|v| v.as_bool())
         .or_else(|| value.get("work_in_progress").and_then(|v| v.as_bool()))
         .unwrap_or(false);
+    let merge_commit_sha = value
+        .get("merge_commit_sha")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
     let labels = gitlab_label_names(value);
     Ok(PrViewPayload {
         provider: ctx.provider.as_str(),
@@ -236,6 +253,7 @@ fn parse_gitlab(
         base: required_str(value, "target_branch")?,
         mergeable: normalize_mergeable_gitlab(value.get("merge_status").and_then(|v| v.as_str())),
         merged_at,
+        merge_commit_sha,
         labels,
     })
 }
@@ -404,5 +422,71 @@ mod tests {
         assert_eq!(extract_first_iid(s), Some("42".into()));
         assert_eq!(extract_first_iid("[]"), None);
         assert_eq!(extract_first_iid("not json"), None);
+    }
+
+    #[test]
+    fn build_view_call_github_requests_merge_commit_field() {
+        let plan = build_view_call(&ctx(Provider::GitHub), "5").plan_argv();
+        let json_idx = plan.iter().position(|s| s == "--json").unwrap();
+        assert!(
+            plan[json_idx + 1].contains("mergeCommit"),
+            "GitHub --json field list must request mergeCommit so merge_commit_sha is populated"
+        );
+    }
+
+    #[test]
+    fn parse_github_merged_pr_extracts_merge_commit_sha() {
+        let output = BackendSuccess {
+            stdout: r#"{
+                "number":5,"url":"u","state":"CLOSED","isDraft":false,"title":"t",
+                "headRefName":"feat/x","baseRefName":"main","mergeable":"UNKNOWN",
+                "mergedAt":"2026-05-19T10:00:00Z",
+                "mergeCommit":{"oid":"abcdef0123456789"},
+                "labels":[]
+            }"#
+            .into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitHub), &output).unwrap();
+        assert_eq!(p.state, "merged");
+        assert_eq!(p.merge_commit_sha.as_deref(), Some("abcdef0123456789"));
+    }
+
+    #[test]
+    fn parse_github_open_pr_has_no_merge_commit_sha() {
+        let output = BackendSuccess {
+            stdout: r#"{"number":5,"url":"u","state":"OPEN","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"mergeCommit":null,"labels":[]}"#.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitHub), &output).unwrap();
+        assert_eq!(p.merge_commit_sha, None);
+    }
+
+    #[test]
+    fn parse_gitlab_merged_mr_extracts_merge_commit_sha() {
+        let output = BackendSuccess {
+            stdout: r#"{
+                "iid":7,"web_url":"u","state":"merged","draft":false,"title":"t",
+                "source_branch":"feat/x","target_branch":"main","merge_status":"can_be_merged",
+                "merged_at":"2026-05-19T10:00:00Z",
+                "merge_commit_sha":"1234567890abcdef",
+                "labels":[]
+            }"#
+            .into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitLab), &output).unwrap();
+        assert_eq!(p.state, "merged");
+        assert_eq!(p.merge_commit_sha.as_deref(), Some("1234567890abcdef"));
+    }
+
+    #[test]
+    fn parse_gitlab_open_mr_treats_empty_merge_commit_sha_as_none() {
+        let output = BackendSuccess {
+            stdout: r#"{"iid":7,"web_url":"u","state":"opened","draft":false,"title":"t","source_branch":"feat/x","target_branch":"main","merge_status":"can_be_merged","merge_commit_sha":"","labels":[]}"#.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitLab), &output).unwrap();
+        assert_eq!(p.merge_commit_sha, None);
     }
 }
