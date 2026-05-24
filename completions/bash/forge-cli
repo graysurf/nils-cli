@@ -1711,7 +1711,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue__view)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --with-comments --format --remote --provider --repo --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
