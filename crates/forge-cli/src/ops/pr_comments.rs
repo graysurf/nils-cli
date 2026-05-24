@@ -332,8 +332,58 @@ fn render_text(payload: &PrCommentsPayload) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::cell::RefCell;
+
+    use nils_common::cli_contract::OutputFormat;
     use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::backend::BackendOutput;
+    use crate::cli::GlobalFlags;
+
+    struct ScriptedRunner {
+        outputs: RefCell<Vec<BackendSuccess>>,
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl ScriptedRunner {
+        fn new(outputs: Vec<BackendSuccess>) -> Self {
+            Self {
+                outputs: RefCell::new(outputs),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl crate::backend::BackendRunner for ScriptedRunner {
+        fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+            self.calls.borrow_mut().push(call.plan_argv());
+            Ok(self.outputs.borrow_mut().remove(0))
+        }
+
+        fn run_raw(&self, call: &BackendCall) -> Result<BackendOutput, ForgeError> {
+            self.run(call).map(|s| BackendOutput {
+                exit_code: 0,
+                status_success: true,
+                stdout: s.stdout,
+                stderr: s.stderr,
+            })
+        }
+    }
+
+    fn json_global() -> GlobalFlags {
+        GlobalFlags {
+            format: Some(OutputFormat::Json),
+            remote: "origin".into(),
+            provider: Some(crate::cli::ProviderFlag::Github),
+            repo: Some("o/r".into()),
+            dry_run: false,
+        }
+    }
 
     #[test]
     fn github_repo_slug_from_pr_and_issue_urls() {
@@ -429,5 +479,124 @@ mod tests {
     fn split_concatenated_arrays_returns_empty_for_empty_stdout() {
         let chunks = split_concatenated_arrays("   \n").unwrap();
         assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn run_with_github_emits_envelope_and_invokes_two_backend_calls() {
+        // First call: `pr view 7 --json …`. Second call: `gh api --paginate
+        // repos/o/r/issues/7/comments?per_page=100`.
+        let runner = ScriptedRunner::new(vec![
+            BackendSuccess {
+                stdout: r#"{"number":7,"url":"https://github.com/o/r/pull/7","state":"OPEN","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}"#.into(),
+                stderr: String::new(),
+            },
+            BackendSuccess {
+                stdout: r#"[{"user":{"login":"alice"},"body":"hi","html_url":"https://github.com/o/r/pull/7#issuecomment-1","created_at":"2025-01-01T00:00:00Z"}]"#.into(),
+                stderr: String::new(),
+            },
+        ]);
+        let global = json_global();
+        let code = run_with(
+            &runner,
+            &global,
+            PrCommentsArgs { id: 7 },
+            OutputFormat::Json,
+            |_| Some("git@github.com:o/r.git".into()),
+        )
+        .expect("github run_with");
+        assert_eq!(code, nils_common::cli_contract::exit::SUCCESS);
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2, "expected pr view + comments api call");
+        assert_eq!(
+            calls[0][..3],
+            ["gh".to_string(), "pr".to_string(), "view".to_string()]
+        );
+        assert_eq!(
+            calls[1][..3],
+            [
+                "gh".to_string(),
+                "api".to_string(),
+                "--paginate".to_string()
+            ]
+        );
+        assert!(
+            calls[1]
+                .iter()
+                .any(|s| s.contains("repos/o/r/issues/7/comments")),
+            "comments path must reference owner/repo derived from view URL: {:?}",
+            calls[1]
+        );
+    }
+
+    #[test]
+    fn run_with_gitlab_builds_notes_path_from_mr_view_url() {
+        // GitLab path: `mr view -F json` then `glab api --paginate --hostname
+        // <h> /projects/<encoded>/merge_requests/12/notes…`.
+        let runner = ScriptedRunner::new(vec![
+            BackendSuccess {
+                stdout: r#"{"iid":12,"web_url":"https://gitlab.example.com/grp/proj/-/merge_requests/12","state":"opened","draft":false,"title":"t","source_branch":"feat/x","target_branch":"main","merge_status":"can_be_merged","labels":[]}"#.into(),
+                stderr: String::new(),
+            },
+            BackendSuccess {
+                stdout: r#"[{"id":9,"body":"hi","author":{"username":"alice"},"created_at":"t","system":false}]"#.into(),
+                stderr: String::new(),
+            },
+        ]);
+        let global = GlobalFlags {
+            format: Some(OutputFormat::Json),
+            remote: "origin".into(),
+            provider: Some(crate::cli::ProviderFlag::Gitlab),
+            repo: Some("grp/proj".into()),
+            dry_run: false,
+        };
+        let code = run_with(
+            &runner,
+            &global,
+            PrCommentsArgs { id: 12 },
+            OutputFormat::Json,
+            |_| Some("git@gitlab.example.com:grp/proj.git".into()),
+        )
+        .expect("gitlab run_with");
+        assert_eq!(code, nils_common::cli_contract::exit::SUCCESS);
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1][..2], ["glab".to_string(), "api".to_string()]);
+        assert!(
+            calls[1]
+                .iter()
+                .any(|s| s.contains("projects/grp%2Fproj/merge_requests/12/notes")),
+            "notes path must url-encode the project slug derived from MR web_url: {:?}",
+            calls[1]
+        );
+    }
+
+    #[test]
+    fn run_with_dry_run_emits_plan_envelope_without_running_comments_call() {
+        // Dry-run still runs the pr view call (used to derive the URL), then
+        // emits the comments call as a DryRunPayload without executing it.
+        let runner = ScriptedRunner::new(vec![BackendSuccess {
+            stdout: r#"{"number":7,"url":"https://github.com/o/r/pull/7","state":"OPEN","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}"#.into(),
+            stderr: String::new(),
+        }]);
+        let global = GlobalFlags {
+            dry_run: true,
+            ..json_global()
+        };
+        let code = run_with(
+            &runner,
+            &global,
+            PrCommentsArgs { id: 7 },
+            OutputFormat::Json,
+            |_| Some("git@github.com:o/r.git".into()),
+        )
+        .expect("dry-run");
+        assert_eq!(code, nils_common::cli_contract::exit::SUCCESS);
+        assert_eq!(
+            runner.calls().len(),
+            1,
+            "dry-run must not invoke the comments call"
+        );
     }
 }
