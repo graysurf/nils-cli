@@ -8,6 +8,7 @@ use crate::model::{
     ConfigScopeFile, Context, DocumentSource, DocumentStatus, FallbackMode, Scope,
 };
 use crate::paths::normalize_path;
+use crate::scope_rules;
 
 pub fn check_builtin_baseline(
     target: BaselineTarget,
@@ -28,11 +29,13 @@ pub fn check_builtin_baseline_with_mode(
 
     let configs = load_configs_from_roots(roots)?;
     let configs_in_load_order = configs.in_load_order();
+    let home_project_scope_applies = scope_rules::home_catalog_project_scope_applies(roots);
     items.extend(required_extension_items(
         target,
         roots,
         fallback_mode,
         &configs_in_load_order,
+        home_project_scope_applies,
         &builtin_keys,
     ));
 
@@ -263,18 +266,23 @@ fn required_extension_items(
     roots: &ResolvedRoots,
     fallback_mode: FallbackMode,
     configs_in_load_order: &[&ConfigScopeFile],
+    home_project_scope_applies: bool,
     builtin_keys: &HashSet<BaselineKey>,
 ) -> Vec<BaselineCheckItem> {
     let mut extension_items = Vec::new();
     let mut extension_indices: HashMap<BaselineKey, usize> = HashMap::new();
 
     for config in configs_in_load_order {
-        merge_required_extension_items(
+        let merge_context = RequiredExtensionMergeContext {
             target,
             roots,
             fallback_mode,
             config,
+            home_project_scope_applies,
             builtin_keys,
+        };
+        merge_required_extension_items(
+            &merge_context,
             &mut extension_items,
             &mut extension_indices,
         );
@@ -283,23 +291,40 @@ fn required_extension_items(
     extension_items
 }
 
-fn merge_required_extension_items(
+struct RequiredExtensionMergeContext<'a> {
     target: BaselineTarget,
-    roots: &ResolvedRoots,
+    roots: &'a ResolvedRoots,
     fallback_mode: FallbackMode,
-    config: &ConfigScopeFile,
-    builtin_keys: &HashSet<BaselineKey>,
+    config: &'a ConfigScopeFile,
+    home_project_scope_applies: bool,
+    builtin_keys: &'a HashSet<BaselineKey>,
+}
+
+fn merge_required_extension_items(
+    merge_context: &RequiredExtensionMergeContext<'_>,
     extension_items: &mut Vec<BaselineCheckItem>,
     extension_indices: &mut HashMap<BaselineKey, usize>,
 ) {
+    let config = merge_context.config;
     for (index, entry) in config.documents.iter().enumerate() {
-        if !entry.required || !target_includes_scope(target, entry.scope) {
+        if !entry.required || !target_includes_scope(merge_context.target, entry.scope) {
+            continue;
+        }
+        if !scope_rules::should_include_extension_entry(
+            config.source_scope,
+            entry.scope,
+            merge_context.home_project_scope_applies,
+        ) {
             continue;
         }
 
-        let path = resolve_extension_path_with_project_fallback(entry, roots, fallback_mode);
+        let path = resolve_extension_path_with_project_fallback(
+            entry,
+            merge_context.roots,
+            merge_context.fallback_mode,
+        );
         let key = BaselineKey::new(entry.context, entry.scope, path.clone());
-        if builtin_keys.contains(&key) {
+        if merge_context.builtin_keys.contains(&key) {
             continue;
         }
 
@@ -330,7 +355,7 @@ fn merge_required_extension_items(
 
 fn target_includes_scope(target: BaselineTarget, scope: Scope) -> bool {
     match target {
-        BaselineTarget::Home => scope == Scope::Home,
+        BaselineTarget::Home => scope == Scope::Home || scope == Scope::Global,
         BaselineTarget::Project => scope == Scope::Project,
         BaselineTarget::All => true,
     }
@@ -338,16 +363,13 @@ fn target_includes_scope(target: BaselineTarget, scope: Scope) -> bool {
 
 fn extension_source(source_scope: Scope) -> DocumentSource {
     match source_scope {
-        Scope::Home => DocumentSource::ExtensionHome,
+        Scope::Home | Scope::Global => DocumentSource::ExtensionHome,
         Scope::Project => DocumentSource::ExtensionProject,
     }
 }
 
 fn resolve_extension_path(entry: &ConfigDocumentEntry, roots: &ResolvedRoots) -> PathBuf {
-    let root = match entry.scope {
-        Scope::Home => &roots.docs_home,
-        Scope::Project => &roots.project_path,
-    };
+    let root = scope_rules::root_for_entry_scope(entry.scope, roots);
     normalize_path(&root.join(&entry.path))
 }
 
@@ -416,7 +438,9 @@ impl BaselineKey {
 
 fn suggested_actions(items: &[BaselineCheckItem]) -> Vec<String> {
     let has_home_missing_required = items.iter().any(|item| {
-        item.scope == Scope::Home && item.required && matches!(item.status, DocumentStatus::Missing)
+        (item.scope == Scope::Home || item.scope == Scope::Global)
+            && item.required
+            && matches!(item.status, DocumentStatus::Missing)
     });
     let has_project_missing_required = items.iter().any(|item| {
         item.scope == Scope::Project

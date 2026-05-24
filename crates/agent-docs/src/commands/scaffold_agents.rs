@@ -46,6 +46,7 @@ pub struct ScaffoldAgentsReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaffoldAgentsErrorKind {
     AlreadyExists,
+    UnsupportedTarget,
     Io,
 }
 
@@ -53,6 +54,7 @@ impl ScaffoldAgentsErrorKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AlreadyExists => "already-exists",
+            Self::UnsupportedTarget => "unsupported-target",
             Self::Io => "io",
         }
     }
@@ -87,6 +89,14 @@ impl ScaffoldAgentsError {
             message: message.into(),
         }
     }
+
+    fn unsupported_target(output_path: PathBuf) -> Self {
+        Self {
+            kind: ScaffoldAgentsErrorKind::UnsupportedTarget,
+            output_path,
+            message: "scaffold-agents supports only --target home or --target project".to_string(),
+        }
+    }
 }
 
 impl fmt::Display for ScaffoldAgentsError {
@@ -107,6 +117,15 @@ pub fn scaffold_agents(
     request: &ScaffoldAgentsRequest,
     roots: &ResolvedRoots,
 ) -> Result<ScaffoldAgentsReport, ScaffoldAgentsError> {
+    if request.target == Scope::Global {
+        return Err(ScaffoldAgentsError::unsupported_target(
+            request
+                .output
+                .clone()
+                .unwrap_or_else(|| roots.docs_home.join(DEFAULT_AGENTS_FILE_NAME)),
+        ));
+    }
+
     let output_path = request
         .output
         .clone()
@@ -140,6 +159,7 @@ pub fn default_output_path(target: Scope, roots: &ResolvedRoots) -> PathBuf {
     let base = match target {
         Scope::Home => &roots.docs_home,
         Scope::Project => &roots.project_path,
+        Scope::Global => &roots.docs_home,
     };
     base.join(DEFAULT_AGENTS_FILE_NAME)
 }

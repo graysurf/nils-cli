@@ -56,6 +56,7 @@ pub const SUPPORTED_CONTEXTS: [Context; 4] = [
 pub enum Scope {
     Home,
     Project,
+    Global,
 }
 
 impl Scope {
@@ -63,17 +64,19 @@ impl Scope {
         match self {
             Self::Home => "home",
             Self::Project => "project",
+            Self::Global => "global",
         }
     }
 
     pub const fn supported_values() -> &'static [&'static str] {
-        &["home", "project"]
+        &["home", "project", "global"]
     }
 
     pub fn from_config_value(value: &str) -> Option<Self> {
         match value {
             "home" => Some(Self::Home),
             "project" => Some(Self::Project),
+            "global" => Some(Self::Global),
             _ => None,
         }
     }

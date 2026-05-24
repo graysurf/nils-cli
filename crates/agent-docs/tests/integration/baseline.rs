@@ -44,6 +44,38 @@ fn baseline_check_target_home_reports_three_home_items() {
 }
 
 #[test]
+fn baseline_check_target_home_includes_required_global_extension_docs() {
+    let home = TempDir::new().expect("failed to create home tempdir");
+    let project = TempDir::new().expect("failed to create project tempdir");
+    write_markdown(&home.path().join("AGENTS.md"));
+    write_markdown(&home.path().join("GLOBAL_POLICY.md"));
+    write_text(
+        &home.path().join(CONFIG_FILE_NAME),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "global"
+path = "GLOBAL_POLICY.md"
+required = true
+when = "always"
+notes = "cross-repo global project-dev policy"
+"#,
+    );
+
+    let report = check_builtin_baseline(BaselineTarget::Home, &roots(&home, &project), false)
+        .expect("baseline check should succeed");
+    let global_item = report
+        .items
+        .iter()
+        .find(|item| item.scope == Scope::Global && item.path.ends_with("GLOBAL_POLICY.md"))
+        .expect("baseline --target home should include global extension docs");
+
+    assert_eq!(global_item.source, DocumentSource::ExtensionHome);
+    assert_eq!(global_item.status, DocumentStatus::Present);
+    assert_eq!(global_item.path, home.path().join("GLOBAL_POLICY.md"));
+}
+
+#[test]
 fn baseline_check_target_project_reports_present_and_missing_in_text_output() {
     let home = TempDir::new().expect("failed to create home tempdir");
     let project = TempDir::new().expect("failed to create project tempdir");
@@ -298,7 +330,7 @@ when = "always"
 }
 
 #[test]
-fn baseline_check_same_key_project_override_keeps_first_seen_extension_position() {
+fn baseline_check_skips_unrelated_home_project_entries_before_project_extensions() {
     let home = TempDir::new().expect("failed to create home tempdir");
     let project = TempDir::new().expect("failed to create project tempdir");
     write_markdown(&project.path().join("AGENTS.md"));
@@ -352,18 +384,12 @@ notes = "project-alpha"
         })
         .collect();
 
-    assert_eq!(extension_items.len(), 2);
+    assert_eq!(extension_items.len(), 1);
     assert_eq!(
         extension_items[0].path,
         project.path().join("EXTRA_ALPHA.md"),
-        "first-seen extension key position should remain stable after override"
+        "project config should supply the project-scope extension for unrelated repos"
     );
     assert_eq!(extension_items[0].source, DocumentSource::ExtensionProject);
     assert!(extension_items[0].why.contains("project-alpha"));
-    assert_eq!(
-        extension_items[1].path,
-        project.path().join("EXTRA_BETA.md")
-    );
-    assert_eq!(extension_items[1].source, DocumentSource::ExtensionHome);
-    assert!(extension_items[1].why.contains("home-beta"));
 }

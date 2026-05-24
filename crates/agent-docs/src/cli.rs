@@ -11,7 +11,7 @@ use crate::model::{
     name = "agent-docs",
     version,
     about = "Deterministic required-doc discovery for agent workflows",
-    long_about = "Resolve, scaffold, and validate required agent documentation for home and project scopes.",
+    long_about = "Resolve, scaffold, and validate required agent documentation for home, global, and project scopes.",
     after_help = "EXAMPLES:\n  agent-docs resolve --context startup --strict --format checklist\n  agent-docs --docs-home ~/.agents resolve --context project-dev --strict\n  agent-docs baseline --check --target all --strict\n  agent-docs completion zsh\n\nENVIRONMENT:\n  AGENT_DOCS_HOME  Default docs home when --docs-home is omitted.\n  PROJECT_PATH     Default project root when --project-path is omitted.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data",
     disable_help_subcommand = true
 )]

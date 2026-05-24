@@ -41,9 +41,18 @@ pub fn upsert_document(
     roots: &ResolvedRoots,
     request: AddDocumentRequest,
 ) -> Result<AddDocumentReport, ConfigLoadError> {
+    if request.target == Scope::Global {
+        return Err(ConfigLoadError::validation_root(
+            config_path_for_root(&roots.docs_home),
+            "target",
+            "--target global is not supported; use --target home for global-scope entries",
+        ));
+    }
+
     let target_root = match request.target {
         Scope::Home => roots.docs_home.as_path(),
         Scope::Project => roots.project_path.as_path(),
+        Scope::Global => unreachable!("global target rejected before root selection"),
     };
     upsert_document_at_root(target_root, request)
 }
@@ -54,6 +63,7 @@ pub fn upsert_document_at_root(
 ) -> Result<AddDocumentReport, ConfigLoadError> {
     let target = request.target;
     let config_path = config_path_for_root(target_root);
+    validate_request_scope(&request, &config_path)?;
     let entry = request.into_config_entry(&config_path)?;
 
     // Keep existing behavior: malformed existing config fails with a validation/parse error.
@@ -80,6 +90,29 @@ pub fn upsert_document_at_root(
         entry,
         document_count,
     })
+}
+
+fn validate_request_scope(
+    request: &AddDocumentRequest,
+    config_path: &Path,
+) -> Result<(), ConfigLoadError> {
+    if request.target == Scope::Global {
+        return Err(ConfigLoadError::validation_root(
+            config_path.to_path_buf(),
+            "target",
+            "--target global is not supported; use --target home for global-scope entries",
+        ));
+    }
+
+    if request.target == Scope::Project && request.scope == Scope::Global {
+        return Err(ConfigLoadError::validation_root(
+            config_path.to_path_buf(),
+            "scope",
+            "global scope is allowed only in the home catalog; use --target home --scope global or use scope = \"project\" for project-local requirements",
+        ));
+    }
+
+    Ok(())
 }
 
 fn load_document(config_path: &Path) -> Result<(DocumentMut, bool), ConfigLoadError> {

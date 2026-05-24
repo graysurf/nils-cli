@@ -2,9 +2,12 @@ use crate::common;
 use std::fs;
 
 use agent_docs::config::CONFIG_FILE_NAME;
+use agent_docs::env::ResolvedRoots;
 use agent_docs::model::{Context, DocumentSource, DocumentStatus, OutputFormat, ResolveFormat};
 use agent_docs::{output, resolver};
+use nils_test_support::git as test_git;
 use serde::Deserialize;
+use tempfile::TempDir;
 
 #[derive(Debug, Clone, Copy)]
 struct ExpectedDocument {
@@ -361,7 +364,7 @@ notes = "project-home-scope-entry"
     );
 
     let documents = &first.documents;
-    assert_eq!(documents.len(), 4);
+    assert_eq!(documents.len(), 3);
     assert_eq!(
         documents
             .iter()
@@ -376,17 +379,14 @@ notes = "project-home-scope-entry"
     assert_eq!(builtin.source, DocumentSource::Builtin);
     assert!(builtin.required);
 
-    let binary = &documents[1];
-    assert!(binary.path.ends_with("BINARY_DEPENDENCIES.md"));
-    assert_eq!(binary.source, DocumentSource::ExtensionHome);
-    assert!(binary.required);
-    assert_eq!(binary.status, DocumentStatus::Present);
     assert!(
-        binary.why.contains("home-binary-second"),
-        "later entries in one config should win"
+        documents
+            .iter()
+            .all(|doc| !doc.path.ends_with("BINARY_DEPENDENCIES.md")),
+        "home-catalog project-scope docs should be skipped for unrelated repos"
     );
 
-    let extra = &documents[2];
+    let extra = &documents[1];
     assert!(extra.path.ends_with("docs/EXTRA_POLICY.md"));
     assert_eq!(extra.source, DocumentSource::ExtensionProject);
     assert!(extra.required);
@@ -396,15 +396,140 @@ notes = "project-home-scope-entry"
         "project config should override home config duplicates"
     );
 
-    let home_scoped = &documents[3];
+    let home_scoped = &documents[2];
     assert!(home_scoped.path.ends_with("core/policies/cli-tools.md"));
     assert_eq!(home_scoped.source, DocumentSource::ExtensionProject);
     assert!(!home_scoped.required);
     assert_eq!(home_scoped.status, DocumentStatus::Present);
 
-    assert_eq!(first.summary.required_total, 3);
-    assert_eq!(first.summary.present_required, 3);
+    assert_eq!(first.summary.required_total, 2);
+    assert_eq!(first.summary.present_required, 2);
     assert_eq!(first.summary.missing_required, 0);
+}
+
+#[test]
+fn resolve_home_global_entry_is_inherited_cross_repo_and_resolves_from_docs_home() {
+    let workspace = common::FixtureWorkspace::from_fixtures();
+    common::write_text(
+        &workspace.docs_home.join("GLOBAL_POLICY.md"),
+        "# Fixture: global policy\n",
+    );
+    fs::write(
+        workspace.docs_home.join(CONFIG_FILE_NAME),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "global"
+path = "GLOBAL_POLICY.md"
+required = true
+when = "always"
+notes = "cross-repo global project-dev policy"
+"#,
+    )
+    .expect("write home config");
+
+    let report = resolver::resolve_builtin(Context::ProjectDev, &workspace.roots(), false);
+    let global_doc = report
+        .documents
+        .iter()
+        .find(|doc| doc.scope.as_str() == "global")
+        .expect("project-dev should include inherited global home-catalog docs");
+
+    assert_eq!(global_doc.source, DocumentSource::ExtensionHome);
+    assert_eq!(global_doc.status, DocumentStatus::Present);
+    assert_eq!(
+        global_doc.path,
+        workspace.docs_home.join("GLOBAL_POLICY.md")
+    );
+    assert_eq!(report.summary.required_total, 2);
+    assert_eq!(report.summary.present_required, 2);
+}
+
+#[test]
+fn resolve_home_project_entry_is_skipped_for_unrelated_project_repo() {
+    let workspace = common::FixtureWorkspace::from_fixtures();
+    common::write_text(
+        &workspace.project_path.join("HOME_PROJECT_ONLY.md"),
+        "# Fixture: unrelated project copy\n",
+    );
+    fs::write(
+        workspace.docs_home.join(CONFIG_FILE_NAME),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "HOME_PROJECT_ONLY.md"
+required = true
+when = "always"
+notes = "runtime-kit-only policy"
+"#,
+    )
+    .expect("write home config");
+
+    let report = resolver::resolve_builtin(Context::ProjectDev, &workspace.roots(), false);
+
+    assert!(
+        report
+            .documents
+            .iter()
+            .all(|doc| !doc.path.ends_with("HOME_PROJECT_ONLY.md")),
+        "home-catalog project-scope docs must not leak into unrelated repos: {:#?}",
+        report.documents
+    );
+    assert_eq!(report.summary.required_total, 1);
+}
+
+#[test]
+fn resolve_home_project_entry_applies_for_linked_worktree_identity() {
+    let repo = test_git::init_repo_with(test_git::InitRepoOptions::new().with_initial_commit());
+    fs::write(repo.path().join("DEVELOPMENT.md"), "# Development\n").expect("write development");
+    fs::write(
+        repo.path().join("RUNTIME_ONLY.md"),
+        "# Runtime-only policy\n",
+    )
+    .expect("write runtime-only policy");
+    fs::write(
+        repo.path().join(CONFIG_FILE_NAME),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "RUNTIME_ONLY.md"
+required = true
+when = "always"
+notes = "same-repo runtime-kit policy"
+"#,
+    )
+    .expect("write home config");
+    test_git::git(
+        repo.path(),
+        &["add", "DEVELOPMENT.md", "RUNTIME_ONLY.md", CONFIG_FILE_NAME],
+    );
+    test_git::git(repo.path(), &["commit", "-m", "add agent docs fixtures"]);
+
+    let workspace = TempDir::new().expect("create workspace");
+    let linked_worktree = workspace.path().join("linked");
+    test_git::worktree_add_branch(repo.path(), &linked_worktree, "linked-agent-docs");
+    fs::remove_file(linked_worktree.join(CONFIG_FILE_NAME))
+        .expect("remove linked worktree project-local config");
+    let roots = ResolvedRoots {
+        docs_home: repo.path().to_path_buf(),
+        project_path: linked_worktree.clone(),
+        is_linked_worktree: true,
+        git_common_dir: None,
+        primary_worktree_path: Some(repo.path().to_path_buf()),
+    };
+
+    let report = resolver::resolve_builtin(Context::ProjectDev, &roots, false);
+    let same_repo_doc = report
+        .documents
+        .iter()
+        .find(|doc| doc.path.ends_with("RUNTIME_ONLY.md"))
+        .expect("home-catalog project-scope doc should apply for linked worktrees");
+
+    assert_eq!(same_repo_doc.source, DocumentSource::ExtensionHome);
+    assert_eq!(same_repo_doc.status, DocumentStatus::Present);
+    assert_eq!(same_repo_doc.path, linked_worktree.join("RUNTIME_ONLY.md"));
 }
 
 fn all_contexts() -> [Context; 4] {

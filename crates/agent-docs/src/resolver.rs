@@ -9,6 +9,7 @@ use crate::model::{
     SUPPORTED_CONTEXTS, Scope,
 };
 use crate::paths::normalize_path;
+use crate::scope_rules;
 
 pub fn supported_contexts() -> &'static [Context] {
     &SUPPORTED_CONTEXTS
@@ -137,13 +138,19 @@ pub fn resolve_with_configs_with_mode(
     let mut extension_documents: Vec<ResolvedDocument> = Vec::new();
     let mut extension_indices: HashMap<ResolveKey, usize> = HashMap::new();
 
+    let home_project_scope_applies = scope_rules::home_catalog_project_scope_applies(roots);
+
     for config in configs.in_load_order() {
-        merge_extension_documents(
+        let merge_context = ExtensionMergeContext {
             context,
             roots,
             fallback_mode,
             config,
-            &builtin_keys,
+            home_project_scope_applies,
+            builtin_keys: &builtin_keys,
+        };
+        merge_extension_documents(
+            &merge_context,
             &mut extension_documents,
             &mut extension_indices,
         );
@@ -165,29 +172,45 @@ pub fn resolve_with_configs_with_mode(
     }
 }
 
-fn merge_extension_documents(
+struct ExtensionMergeContext<'a> {
     context: Context,
-    roots: &ResolvedRoots,
+    roots: &'a ResolvedRoots,
     fallback_mode: FallbackMode,
-    config: &ConfigScopeFile,
-    builtin_keys: &HashSet<ResolveKey>,
+    config: &'a ConfigScopeFile,
+    home_project_scope_applies: bool,
+    builtin_keys: &'a HashSet<ResolveKey>,
+}
+
+fn merge_extension_documents(
+    merge_context: &ExtensionMergeContext<'_>,
     extension_documents: &mut Vec<ResolvedDocument>,
     extension_indices: &mut HashMap<ResolveKey, usize>,
 ) {
+    let config = merge_context.config;
     for (index, entry) in config.documents.iter().enumerate() {
-        if entry.context != context {
+        if entry.context != merge_context.context {
+            continue;
+        }
+        if !scope_rules::should_include_extension_entry(
+            config.source_scope,
+            entry.scope,
+            merge_context.home_project_scope_applies,
+        ) {
             continue;
         }
 
-        let resolved_path =
-            resolve_extension_path_with_project_fallback(entry, roots, fallback_mode);
-        let key = ResolveKey::new(context, entry.scope, resolved_path.clone());
-        if builtin_keys.contains(&key) {
+        let resolved_path = resolve_extension_path_with_project_fallback(
+            entry,
+            merge_context.roots,
+            merge_context.fallback_mode,
+        );
+        let key = ResolveKey::new(merge_context.context, entry.scope, resolved_path.clone());
+        if merge_context.builtin_keys.contains(&key) {
             continue;
         }
 
         let document = ResolvedDocument {
-            context,
+            context: merge_context.context,
             scope: entry.scope,
             path: resolved_path.clone(),
             required: entry.required,
@@ -212,16 +235,13 @@ fn merge_extension_documents(
 
 fn extension_source(source_scope: Scope) -> DocumentSource {
     match source_scope {
-        Scope::Home => DocumentSource::ExtensionHome,
+        Scope::Home | Scope::Global => DocumentSource::ExtensionHome,
         Scope::Project => DocumentSource::ExtensionProject,
     }
 }
 
 fn resolve_extension_path(entry: &ConfigDocumentEntry, roots: &ResolvedRoots) -> PathBuf {
-    let root = match entry.scope {
-        Scope::Home => &roots.docs_home,
-        Scope::Project => &roots.project_path,
-    };
+    let root = scope_rules::root_for_entry_scope(entry.scope, roots);
     normalize_path(&root.join(&entry.path))
 }
 
