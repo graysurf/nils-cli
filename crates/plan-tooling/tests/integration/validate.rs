@@ -1353,7 +1353,7 @@ const MISSING_SOURCE_PATH_PLAN: &str = r#"# Plan: Missing source path
 ## Read First
 
 - Primary source: docs/source/missing.md
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 - Open questions carried into execution: none
 
 ## Sprint 1: First sprint

@@ -14,7 +14,7 @@ migration. Sprint 1 lands the smallest migrations (`semantic-commit`,
 
 - Primary source:
   docs/plans/cli-dispatch-modernization/cli-dispatch-modernization-review-source.md
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 - Open questions carried into execution:
   - Keep `git-cli` Groups as nested clap subcommands? Default: yes.
   - Keep `fzf-cli` interactive loops inside the handler with clap parsing only the entry args? Default: yes.

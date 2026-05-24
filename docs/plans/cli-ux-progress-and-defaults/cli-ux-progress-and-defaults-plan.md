@@ -12,7 +12,7 @@ helper. Sprint 2 covers the two user-visible default knobs: a
 ## Read First
 
 - Primary source: docs/plans/cli-ux-progress-and-defaults/cli-ux-progress-and-defaults-review-source.md
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 - Open questions carried into execution:
   - Add `truncated: true` to JSON output? Default: yes.
   - Should env be a default, flag override? Default: yes.
