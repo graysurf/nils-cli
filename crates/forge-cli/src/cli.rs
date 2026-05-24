@@ -640,10 +640,7 @@ pub enum IssueCommand {
     /// Open a new issue.
     Create(IssueCreateArgs),
     /// Fetch a single issue.
-    View {
-        /// Numeric id.
-        id: u64,
-    },
+    View(IssueViewArgs),
     /// List issues filtered by state / labels / author / assignee.
     List(IssueListArgs),
     /// Mutate an issue.
@@ -813,6 +810,18 @@ pub struct IssueCreateArgs {
     pub assignees: Vec<String>,
 }
 
+/// `issue view` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct IssueViewArgs {
+    /// Numeric issue id.
+    pub id: u64,
+    /// Also fetch the issue's comment stream and embed it under `comments`
+    /// in the envelope payload. Adds one GitLab API call; for GitHub the
+    /// comments are pulled in the same `gh issue view --json` invocation.
+    #[arg(long = "with-comments", action = ArgAction::SetTrue)]
+    pub with_comments: bool,
+}
+
 /// `issue edit` arguments.
 #[derive(Args, Debug, Clone)]
 pub struct IssueEditArgs {
@@ -935,8 +944,8 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             command: Some(IssueCommand::Create(args)),
         })) => ops::issue_create::run(&global, args, format),
         Some(Command::Issue(IssueArgs {
-            command: Some(IssueCommand::View { id }),
-        })) => ops::issue_view::run(&global, id, format),
+            command: Some(IssueCommand::View(args)),
+        })) => ops::issue_view::run(&global, args, format),
         Some(Command::Issue(IssueArgs {
             command: Some(IssueCommand::List(args)),
         })) => ops::issue_list::run(&global, args, format),
