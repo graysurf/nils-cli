@@ -380,7 +380,7 @@ _arguments "${_arguments_options[@]}" : \
 '--title=[New title (re-validated against \`title_length\`)]:TITLE:_default' \
 '(--body-file)--body=[New body. Mutually exclusive with \`--body-file\`]:BODY:_default' \
 '--body-file=[Read body from a file. Use \`-\` for stdin]:BODY_FILE:_default' \
-'*--add-label=[Add a label. Repeat to add multiple]:NAME:_default' \
+'*--add-label=[Add a label. Repeat to add multiple. Accepts \`--label\` as a shorthand matching \`issue create --label\`]:NAME:_default' \
 '*--remove-label=[Remove a label. Repeat to remove multiple]:NAME:_default' \
 '*--add-assignee=[Add an assignee. Repeat to assign multiple]:LOGIN:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"

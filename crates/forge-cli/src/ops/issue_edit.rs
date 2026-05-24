@@ -280,4 +280,23 @@ mod tests {
         assert_eq!(plan[al + 1], "bug");
         assert_eq!(plan[rl + 1], "stale");
     }
+
+    #[test]
+    fn cli_accepts_label_shorthand_for_add_label() {
+        use clap::Parser;
+
+        use crate::cli::{Cli, Command, IssueCommand};
+
+        let cli = Cli::try_parse_from(["forge-cli", "issue", "edit", "7", "--label", "type::test"])
+            .expect("cli should accept --label on issue edit");
+        let Some(Command::Issue(issue_args)) = cli.command else {
+            panic!("expected issue subcommand");
+        };
+        let Some(IssueCommand::Edit(args)) = issue_args.command else {
+            panic!("expected issue edit");
+        };
+        assert_eq!(args.id, 7);
+        assert_eq!(args.add_label, vec!["type::test".to_string()]);
+        assert!(args.remove_label.is_empty());
+    }
 }
