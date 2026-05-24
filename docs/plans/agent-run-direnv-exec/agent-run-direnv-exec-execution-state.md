@@ -15,7 +15,14 @@
   docs/plans/agent-run-direnv-exec/agent-run-direnv-exec-plan.md
 - Discussion source document:
   docs/plans/agent-run-direnv-exec/agent-run-direnv-exec-discussion-source.md
-- Source issue: https://github.com/sympoies/nils-cli/issues/467
+- Source issue: [#467](https://github.com/sympoies/nils-cli/issues/467)
+- Tracking issue: [#468](https://github.com/sympoies/nils-cli/issues/468)
+- Source snapshot:
+  [source snapshot](https://github.com/sympoies/nils-cli/issues/468#issuecomment-4528326114)
+- Plan snapshot:
+  [plan snapshot](https://github.com/sympoies/nils-cli/issues/468#issuecomment-4528326962)
+- Initial execution state snapshot:
+  [initial state snapshot](https://github.com/sympoies/nils-cli/issues/468#issuecomment-4528327593)
 - Direct source-doc execution waiver: not applicable
 
 ## Task Ledger
@@ -41,6 +48,7 @@
 | `AGENT_DOCS_HOME=/Users/terry/Project/graysurf/agent-runtime-kit agent-docs resolve --context task-tools --strict --format checklist` | pass | Task-tools preflight passed before GitHub issue work. | terminal log |
 | `plan-tooling validate --file docs/plans/agent-run-direnv-exec/agent-run-direnv-exec-plan.md --format text --explain` | pass | Plan-bundle validation passed after resolving format findings. | terminal log |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Docs-only nils-cli checks passed, including plan-bundle validation. | terminal log |
+| `plan-issue record audit --profile tracking --body-file <body-live.md> --comments-json <comments-live.json> --format json` | pass | Tracking issue audit passed with source, plan, and state markers recognized. | `agent-out` run directory |
 
 ## Runtime Findings
 
@@ -61,5 +69,8 @@
 - Validation passed with `plan-tooling validate --file
   docs/plans/agent-run-direnv-exec/agent-run-direnv-exec-plan.md --format text
   --explain` and `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`.
-- Next: commit, push, open the tracking issue, and continue implementation from
-  Task 1.1.
+- Opened tracking issue [#468](https://github.com/sympoies/nils-cli/issues/468)
+  and posted source, plan, and state snapshots.
+- Repaired the issue dashboard with exact snapshot URLs and verified it with
+  `plan-issue record audit --profile tracking`.
+- Next: continue implementation from Task 1.1.

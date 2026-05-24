@@ -13,7 +13,7 @@ machine-readable diagnostics, stable exit semantics, completions, and docs.
 - Primary source:
   `docs/plans/agent-run-direnv-exec/agent-run-direnv-exec-discussion-source.md`
 - Source type: discussion-to-implementation-doc
-- Source issue: https://github.com/sympoies/nils-cli/issues/467
+- Source issue: [#467](https://github.com/sympoies/nils-cli/issues/467)
 - Open questions carried into execution: none
 - Resolved v1 decisions carried into execution:
   - `agent-run env --format json` reports status and paths only; no environment
