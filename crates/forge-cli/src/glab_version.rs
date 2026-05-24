@@ -15,7 +15,7 @@
 pub const SUPPORTED_MAJOR: u32 = 1;
 /// Pinned minor version of `glab` whose text format we parse. Adjust this
 /// together with parser changes when `glab` ships a breaking text format.
-pub const SUPPORTED_MINOR: u32 = 45;
+pub const SUPPORTED_MINOR: u32 = 99;
 
 /// Result of parsing a `glab --version` first line. Tuple is
 /// `(major, minor, patch)`.

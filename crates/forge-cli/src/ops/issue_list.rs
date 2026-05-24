@@ -136,7 +136,7 @@ fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
                 argv.push(OsString::from("--assignee"));
                 argv.push(OsString::from(a));
             }
-            argv.push(OsString::from("-F"));
+            argv.push(OsString::from("--output"));
             argv.push(OsString::from("json"));
         }
     }
@@ -399,7 +399,8 @@ mod tests {
         let plan = call.plan_argv();
         assert!(plan.contains(&"--closed".to_string()));
         assert!(plan.contains(&"--per-page".to_string()));
-        assert!(plan.contains(&"-F".to_string()));
+        assert!(plan.contains(&"--output".to_string()));
+        assert!(!plan.contains(&"-F".to_string()));
         let label_count = plan.iter().filter(|s| *s == "--label").count();
         assert_eq!(
             label_count, 2,
@@ -468,6 +469,24 @@ mod tests {
             vec!["plan".to_string(), "support-matrix".to_string()]
         );
         assert_eq!(payload.items[0].author.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn parse_list_output_accepts_empty_array_for_both_providers() {
+        for provider in [Provider::GitHub, Provider::GitLab] {
+            let payload = parse_list_output(
+                &ctx(provider),
+                &BackendSuccess {
+                    stdout: "[]".into(),
+                    stderr: String::new(),
+                },
+            )
+            .unwrap();
+            assert!(
+                payload.items.is_empty(),
+                "{provider:?} should accept empty array without erroring"
+            );
+        }
     }
 
     #[test]
