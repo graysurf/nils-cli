@@ -47,6 +47,7 @@ in `crates/*/src`.
 | Tool | Behavior Impact | Install (brew/linuxbrew) |
 |---|---|---|
 | `tree` | Enables directory tree rendering in `git-scope` | `brew install tree` |
+| `direnv` | Enables `agent-run exec` to activate allowed project `.envrc` / `.env` files; required only when a project env file applies and `--direnv` is not `off` | `brew install direnv` |
 | `file` | MIME-based binary detection in `git-scope` and `git-cli commit context` | Usually preinstalled |
 | `lsof` | Preferred backend for `fzf-cli port` (fallback: `netstat`) | `brew install lsof` |
 | `netstat` | Fallback backend for `fzf-cli port` when `lsof` is missing | Usually preinstalled |

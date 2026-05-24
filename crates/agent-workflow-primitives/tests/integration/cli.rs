@@ -24,6 +24,7 @@ fn out_arg(path: &Path) -> String {
 fn all_binaries_export_zsh_completion() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     for bin in [
+        "agent-run",
         "browser-session",
         "canary-check",
         "docs-impact",

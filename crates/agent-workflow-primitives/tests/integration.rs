@@ -1,5 +1,7 @@
 // Consolidated integration test target.
 
+#[path = "integration/agent_run.rs"]
+mod agent_run;
 #[path = "integration/cli.rs"]
 mod cli;
 #[path = "integration/exit_codes.rs"]

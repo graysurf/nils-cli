@@ -1,6 +1,6 @@
 # Agent Run Direnv Exec Implementation Handoff
 
-- Status: open, ready for implementation planning
+- Status: open, ready for issue-backed implementation
 - Date: 2026-05-24
 - Source: converged discussion about making agent-executed project commands use
   the same project environment that developers rely on for local development
@@ -172,17 +172,19 @@ Out of scope:
 - Keep provider-specific agent behavior in skills or provider CLIs, not in
   `agent-run`.
 
-## Open Questions
+## Resolved V1 Decisions
 
-- Should `agent-run env --format json` include a redacted environment diff, or
-  should v1 report only status and paths? Recommended default: status and paths
-  only, with a future explicit `--include-env-diff` if needed.
-- Should `agent-run exec` always print a one-line stderr preface describing the
-  environment decision? Recommended default: print only on wrapper-level
-  warnings/errors, and expose normal decisions through `doctor` / `env`.
-- Should `agent-runtime doctor --check-project` probe `agent-run` in the first
-  implementation PR? Recommended default: defer until `agent-run` is released
-  and adopted by at least one skill.
+- `agent-run env --format json` reports status, paths, selected mode, and the
+  final execution decision only. It does not include an environment diff in v1.
+  If consumers later need diff visibility, add an explicit opt-in such as
+  `--include-env-diff` after defining the redaction contract.
+- `agent-run exec` does not print a one-line stderr preface on successful normal
+  execution. Wrapper output is reserved for warnings and errors; normal
+  environment decisions are exposed through `agent-run doctor` and
+  `agent-run env`.
+- `agent-runtime doctor --check-project` does not probe `agent-run` in the first
+  implementation PR. Defer that integration until `agent-run` is released and
+  at least one agent-facing skill has adopted it.
 
 ## Read-First References
 

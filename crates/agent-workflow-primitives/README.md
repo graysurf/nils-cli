@@ -11,7 +11,7 @@ provider credentials.
 | Field | Value |
 | ----- | ----- |
 | Package name | `nils-agent-workflow-primitives` |
-| Binary names | `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `review-specialists`, `skill-usage`, `test-first-evidence` |
+| Binary names | `agent-run`, `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `review-specialists`, `skill-usage`, `test-first-evidence` |
 
 Each binary supports `--version` and `completion <bash|zsh>`.
 
@@ -19,6 +19,7 @@ Each binary supports `--version` and `completion <bash|zsh>`.
 
 | Binary | Primary purpose | Record/artifact written |
 | ------ | --------------- | ----------------------- |
+| `agent-run` | Run project commands through the selected project environment, using `direnv` for applicable `.envrc` / `.env` files. | stdout/stderr passthrough for `exec`; stdout/JSON only for `doctor` and `env` |
 | `browser-session` | Record browser goals, steps, statuses, and evidence artifacts. | `browser-session.json` under `--out DIR` |
 | `canary-check` | Run one local command and persist a redacted pass/fail result. | `canary-check.json` under `--out DIR` |
 | `docs-impact` | Classify changed Git paths as docs or non-docs and suggest documentation review. | stdout/JSON only |
@@ -40,11 +41,15 @@ Most record-oriented binaries use this flow:
 4. optional `show --out DIR --format json`
 
 `canary-check` uses `run`, `verify`, and `show`. `docs-impact` uses `scan`.
+`agent-run` uses `exec`, `doctor`, and `env`.
 
 Examples:
 
 ```bash
 docs-impact scan --repo . --include-untracked --format json
+agent-run exec --cwd . -- cargo test
+agent-run exec --cwd . --direnv require -- npm test
+agent-run env --cwd . --format json
 repo-retro report --repo . --days 7 --mode team --format json
 repo-retro report --repo . --mode maintainer --format markdown
 canary-check run --out /tmp/canary --name smoke --command "cargo test smoke"
@@ -56,6 +61,38 @@ model-cross-check init --out /tmp/cross-check --prompt "review patch" --primary-
 skill-usage init --out /tmp/skill --skill tools/devex/review-evidence --intent "record review" --user-request-summary "review this PR"
 test-first-evidence init --out /tmp/test-first --classification behavior-change --production-path src/lib.rs
 ```
+
+## `agent-run` flow
+
+`agent-run` is an environment normalizer for agent-executed project commands. It
+is not a task runner and does not replace project scripts such as
+`scripts/check.sh`, `cargo test`, `npm test`, or `uv run pytest`.
+
+```bash
+agent-run exec --cwd . -- cargo test
+agent-run exec --cwd . --direnv require -- npm test
+agent-run doctor --cwd . --format json
+agent-run env --cwd . --format json
+```
+
+`--direnv auto` is the default. When no `.envrc` or `.env` applies, commands run
+directly. When `.envrc` applies, `agent-run exec` uses `direnv exec`. When a
+bare `.env` applies and `direnv status` does not report it as a loadable RC,
+`agent-run` uses `direnv dotenv json` to parse values and runs the child with
+those variables. If `direnv` is unavailable or the env file is blocked, `exec`
+fails before running the child command. `--direnv off` bypasses direnv
+intentionally; `--direnv require` fails when no env file applies.
+
+`agent-run` never runs `direnv allow`, `direnv edit`, or any trust-mutating
+command. A blocked `.envrc` or `.env` remains a user decision outside this
+primitive.
+
+Successful `agent-run exec` does not print wrapper prefaces. Child stdout,
+stderr, and normal exit codes are preserved. Use `agent-run doctor` or
+`agent-run env --format json` when a skill needs to explain whether validation
+ran directly, through direnv, was bypassed, or was blocked. The v1 JSON status
+reports mode, paths, availability, and decision only; it does not emit an
+environment variable diff or environment values.
 
 ## `review-specialists` flow
 
@@ -158,6 +195,7 @@ Exit codes:
 - `0`: success
 - `1`: runtime failure or incomplete evidence from `verify`
 - `64`: usage/configuration error
+- `69`: required external tool or project environment unavailable
 
 `repo-retro report --format json` uses the service envelope
 `cli.repo-retro.report.v1` and returns a `repo-retro.report.v1` result. The
