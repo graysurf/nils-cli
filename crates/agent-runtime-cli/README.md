@@ -4,12 +4,9 @@
 
 `agent-runtime-cli` is the Rust crate that ships the `agent-runtime` binary
 for [`graysurf/agent-runtime-kit`](https://github.com/graysurf/agent-runtime-kit).
-This Plan 01 release is a **stub**: every subcommand prints
-`agent-runtime <subcommand>: not implemented` to stderr and exits `1`.
-The crate exists so the rest of the install ladder — Homebrew tap,
-`scripts/setup.sh`, `required_clis` declarations — can be wired up against
-a real binary before Plan 02 lands the actual render / audit / install
-bodies.
+The binary owns deterministic runtime-kit tooling: render / install /
+audit / doctor flows, runtime state maintenance, and workflow-oriented helpers
+that should not live in provider wrappers such as `forge-cli`.
 
 ## Package vs binary name
 
@@ -21,11 +18,9 @@ bodies.
 Use the package name (`-p agent-runtime-cli`) for cargo commands and the
 binary name (`agent-runtime`) for installed-binary invocations.
 
-## Subcommands (Plan 01 stub — all exit 1)
+## Subcommands
 
-Enumeration is pinned by
-[Resolved Decision #2 in `docs/source/inventory-target-architecture.md`](https://github.com/graysurf/agent-runtime-kit/blob/main/docs/source/inventory-target-architecture.md)
-of the consuming repo:
+Core runtime-kit operations:
 
 - `render` — render `core/` + `targets/<product>/` into `build/<product>/`.
 - `install` — activate rendered output against a product's runtime home.
@@ -35,14 +30,43 @@ of the consuming repo:
 - `gc-backups` — prune old backups under `<state_home>/backups/`.
 - `restore-backups` — restore a runtime home from a recorded backup snapshot.
 - `purge-state` — purge runtime-managed state (use with caution).
+- `pr-body render` — render standardized feature / bug PR or MR bodies for
+  `forge-cli pr create` / `forge-cli pr deliver` flows.
 
-## Roadmap
+## PR body rendering
 
-- Plan 02 (`02-nils-cli-render-and-drift-audit`): implement `render` +
-  `audit-drift` bodies; cut a `0.1.0` release and re-pin the Homebrew
-  formula.
-- Plan 04 (`04-install-and-bootstrap`): implement `install` / `uninstall`
-  / `doctor` / `gc-backups` / `restore-backups` / `purge-state` bodies.
+`agent-runtime pr-body render` takes agent-authored section files and renders
+the fixed Markdown scaffolding. It intentionally does not infer PR narrative
+from git history or diffs.
 
-Track open work and discussion in
-[graysurf/agent-runtime-kit Issue #1](https://github.com/graysurf/agent-runtime-kit/issues/1).
+Feature body example:
+
+```bash
+agent-runtime pr-body render \
+  --kind feature \
+  --summary-file summary.md \
+  --changes-file changes.md \
+  --test-first-file test-first.md \
+  --test-plan-file test-plan.md \
+  --risk-file risk.md \
+  --out pr-body.md
+```
+
+Bug body example:
+
+```bash
+agent-runtime pr-body render \
+  --kind bug \
+  --summary-file summary.md \
+  --problem-file problem.md \
+  --reproduction-file reproduction.md \
+  --issues-file issues.md \
+  --fix-approach-file fix-approach.md \
+  --test-first-file test-first.md \
+  --test-plan-file test-plan.md \
+  --risk-file risk.md \
+  --out pr-body.md
+```
+
+The rendered body always uses `## Summary` and `## Test plan` so it satisfies
+the body-section gate enforced by `forge-cli`.

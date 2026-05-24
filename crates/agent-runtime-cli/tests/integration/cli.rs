@@ -18,6 +18,7 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "doctor",
     "audit-drift",
     "gc-backups",
+    "pr-body",
     "restore-backups",
     "purge-state",
 ];

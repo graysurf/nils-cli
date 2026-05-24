@@ -56,6 +56,8 @@ pub enum Command {
     AuditDrift(commands::audit_drift::AuditDriftArgs),
     /// Prune old backups under `<state_home>/backups/`.
     GcBackups(commands::gc_backups::GcBackupsArgs),
+    /// Render standardized PR / MR bodies for forge-cli create flows.
+    PrBody(commands::pr_body::PrBodyArgs),
     /// Restore a runtime home from a recorded backup snapshot.
     RestoreBackups(commands::restore_backups::RestoreBackupsArgs),
     /// Purge runtime-managed state (use with caution).
@@ -71,6 +73,7 @@ impl Command {
             Command::Doctor(_) => "doctor",
             Command::AuditDrift(_) => "audit-drift",
             Command::GcBackups(_) => "gc-backups",
+            Command::PrBody(_) => "pr-body",
             Command::RestoreBackups(_) => "restore-backups",
             Command::PurgeState(_) => "purge-state",
         }
@@ -127,6 +130,13 @@ pub fn run() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(err) => {
                 eprintln!("agent-runtime gc-backups: {err:#}");
+                ExitCode::from(2)
+            }
+        },
+        Command::PrBody(args) => match commands::pr_body::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime pr-body: {err:#}");
                 ExitCode::from(2)
             }
         },
