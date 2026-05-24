@@ -11,6 +11,7 @@ pub mod issue_edit;
 pub mod issue_list;
 pub mod issue_reopen;
 pub mod issue_view;
+pub mod label;
 pub mod pr_checks;
 pub mod pr_checks_gitlab;
 pub mod pr_close;

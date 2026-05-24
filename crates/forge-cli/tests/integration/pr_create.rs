@@ -86,6 +86,28 @@ fn well_formed_body() -> &'static str {
     "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified via cargo test.\n"
 }
 
+fn write_label_catalog() -> (TempDir, String) {
+    let tempdir = TempDir::new().expect("label catalog tempdir");
+    let path = tempdir.path().join("forge-labels.yaml");
+    fs::write(
+        &path,
+        r#"schema: forge-label-catalog.v1
+groups:
+  - name: type
+    prefix: "type::"
+    exclusive: true
+labels:
+  - name: "type::feature"
+    group: type
+    color: a2eeef
+    description: Feature work.
+    applies_to: [pr, mr]
+"#,
+    )
+    .expect("write catalog");
+    (tempdir, path.to_string_lossy().into_owned())
+}
+
 #[test]
 fn pr_create_dry_run_renders_plan_envelope() {
     let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
@@ -134,6 +156,45 @@ fn pr_create_dry_run_renders_plan_envelope() {
         plan_strings.contains(&"--draft".to_string()),
         "{plan_strings:?}"
     );
+}
+
+#[test]
+fn pr_create_strict_labels_rejects_unknown_catalog_label() {
+    let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+    let (_catalog_tempdir, catalog) = write_label_catalog();
+
+    let stub = StubEnv::new();
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--title",
+            "feat: strict labels",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+            "--label",
+            "priority::high",
+            "--label-catalog",
+            &catalog,
+            "--strict-labels",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "expected DATA 65, stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "label_unknown");
 }
 
 #[test]

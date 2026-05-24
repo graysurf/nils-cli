@@ -16,6 +16,8 @@ Goals:
 - Replace ad-hoc `gh`/`glab` invocations scattered across agent-kit
   skills with one binary that enforces branch / body / state policy at
   the type level.
+- Manage provider labels from a caller-supplied machine-readable catalog
+  without making `forge-cli` the taxonomy source of truth.
 - Make the GitHub and GitLab lanes byte-identical from the caller's
   point of view (same flags, same envelope, same exit codes).
 - Codify defaults that were previously only described in skill
@@ -29,7 +31,6 @@ Goals:
 Non-goals (v1):
 
 - Release management (`gh release`, GitLab releases).
-- Label management.
 - Arbitrary `gh api` / GitLab REST passthrough — no escape hatch in v1
   on purpose; if a workflow needs it, the call belongs in a focused
   follow-up op, not a generic shim. **Deferred to v2** — see "Open
@@ -52,12 +53,15 @@ In scope (v1):
   (blocking poll until terminal).
 - Issue lifecycle: `issue create`, `view`, `edit`, `comment`, `close`,
   `reopen`.
+- Repository label lifecycle: `label list`, `label audit`, and
+  `label ensure`.
 - Read-only helpers used by the macros: `auth status`, `repo view`.
 - Macro ops: `pr deliver` (kind = `feature` | `bug`), composing the
   atoms above into the agent-kit standard "open draft → wait CI →
   ready → merge → cleanup" flow.
 
-Out of scope (v1): inbox mutations, release management, labels, raw REST
+Out of scope (v1): inbox mutations, release management, label deletion or
+rename-by-default, raw REST
 passthrough, issue macros, repo creation, branch protection management, code
 review state mutation beyond `pr ready`. Each of these would either widen the
 parity gap (GitLab has no equivalent today) or remove the "lock down behaviour"
@@ -110,6 +114,9 @@ Parity matrix (v1):
 | `issue comment <id>`  | `gh issue comment <id> --body …`                                | `glab issue note <id> --message …`                   | exact                                |
 | `issue close <id>`    | `gh issue close <id>`                                           | `glab issue close <id>`                              | exact                                |
 | `issue reopen <id>`   | `gh issue reopen <id>`                                          | `glab issue reopen <id>`                             | exact                                |
+| `label list`          | `gh label list --json …`                                        | `glab label list --output json`                      | exact                                |
+| `label audit`         | read labels, compare with caller catalog                        | same                                                 | exact                                |
+| `label ensure`        | `gh label create/edit`                                          | `glab label create/edit`                             | exact (no delete/rename by default)  |
 | `auth status`         | `gh auth status`                                                | `glab auth status`                                   | exact (text → typed)                 |
 | `repo view`           | `gh repo view --json …`                                         | `glab repo view -F json`                             | exact                                |
 | `inbox list`          | `gh search prs/issues --json …`                                 | `glab api --hostname <host> …`                       | normalized aggregation               |
@@ -152,6 +159,10 @@ forge-cli
 │   ├── comment
 │   ├── close
 │   └── reopen
+├── label
+│   ├── list
+│   ├── audit
+│   └── ensure
 ├── inbox
 │   ├── status
 │   ├── list
@@ -172,7 +183,8 @@ Global flags (every subcommand):
   backend's `--repo` / `-R` equivalent).
 - `--dry-run` — render the backend command that *would* run plus all
   validation checks, but do not invoke it. Output envelope carries the
-  exact argv under `data.plan`.
+  exact argv under `data.plan` for atomic commands or `data.actions[].plan`
+  for `label ensure`.
 
 `forge-cli` itself does not expose `--token`, `--host`, or any auth
 override. Those belong to `gh`/`glab` and are configured there.
@@ -223,6 +235,19 @@ Inbox-local flags:
   age-bounded by `--cache-max-age` (default `30m`), and disabled with
   `--no-cache`.
 
+Label-local flags:
+
+- `forge-cli label list --limit <n>` reads provider labels and emits
+  `cli.forge-cli.label.list.v1`.
+- `forge-cli label audit --catalog <path> --limit <n>` compares provider
+  labels to the caller-owned catalog and reports missing labels, color /
+  description drift, and unknown shared labels.
+- `forge-cli label ensure --catalog <path> [--update-existing]` creates
+  missing labels and updates existing color / description drift only when
+  explicitly requested. It never deletes or renames labels by default.
+- `pr create` and `pr deliver` accept `--label <name>` repeatedly. Catalog
+  validation is opt-in via `--label-catalog <path> --strict-labels`.
+
 ## Atomic op surface
 
 The full machine-readable list lives in
@@ -235,7 +260,8 @@ backend mapping, validation rules, and output schema versions.
 - Input: `--head <branch>` (default current branch), `--base <branch>`
   (default repo default branch), `--title <str>`, `--body-file <path>`
   or `--body <str>`, `--kind feature|bug`, `--draft` (default `true`),
-  `--reviewer <user>...`, `--label <name>...`.
+  `--reviewer <user>...`, `--label <name>...`,
+  `--label-catalog <path>`, `--strict-labels`.
 - Validation (see "Lock-down policy" for the full list):
   - branch name MUST match `^(feat|fix)/[a-z0-9][a-z0-9-]{1,63}$` and
     align with `--kind`;
@@ -285,6 +311,22 @@ backend mapping, validation rules, and output schema versions.
 - Output schema: `cli.forge-cli.pr.merge.v1`,
   `data = { number, url, merge_sha, method, deleted_branch }`.
 
+### `label audit` / `label ensure`
+
+- Input: `--catalog <path>` pointing at a caller-owned YAML/JSON catalog with
+  `groups[]` and `labels[]`. Labels declare `name`, `group`, `color`,
+  `description`, and `applies_to`.
+- `label audit` emits `cli.forge-cli.label.audit.v1` with
+  `data = { provider, status, missing, drift, unknown_shared }`.
+- `label ensure` emits `cli.forge-cli.label.ensure.v1` with
+  `data.actions[]` create/update plans. Missing labels are created; existing
+  label drift is updated only with `--update-existing`.
+- Provider behavior:
+  - GitHub: `gh label list/create/edit`.
+  - GitLab: `glab label list/create/edit`.
+- Non-goals: deletion, rename-by-default, and moving catalog ownership into
+  `nils-cli`.
+
 (See `forge-cli-ops-v1.yaml` for the remaining ops.)
 
 ## Macro: `pr deliver`
@@ -303,6 +345,8 @@ forge-cli pr deliver \
   [--base <branch>] [--head <branch>] \
   [--method squash|merge|rebase] \
   [--reviewer <user>...] \
+  [--label <name>...] \
+  [--label-catalog <path> --strict-labels] \
   [--timeout <duration>] \
   [--no-merge]        # stop after wait-checks; useful in CI
 ```
@@ -612,8 +656,6 @@ and `glab mr create …` invocations are removed.
 
 - Releases (`gh release create / view / edit`) — GitLab requires
   glab + tag flow; could fit a `forge-cli release …` tree later.
-- Labels (`gh label create`) — currently used once in agent-kit
-  (label bootstrap on a new repo). Either v2 op or one-off script.
 - `gh api` passthrough — explicitly out of v1 because it defeats the
   lock-down value. Re-evaluate if a real workflow needs a non-CRUD
   call (e.g. CODEOWNERS, branch protection) and only then.

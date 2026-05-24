@@ -1,9 +1,9 @@
 # forge-cli
 
 Provider-neutral CLI for remote forge operations (personal inbox discovery,
-PR/MR lifecycle, Issue lifecycle, CI wait). Two backends ship together: GitHub
-(wraps `gh`) and GitLab (wraps `glab`). Adopts `cli-output-contract-v1` from
-day one.
+PR/MR lifecycle, Issue lifecycle, CI wait, and repository label catalog
+maintenance). Two backends ship together: GitHub (wraps `gh`) and GitLab
+(wraps `glab`). Adopts `cli-output-contract-v1` from day one.
 
 ## Read first
 
@@ -19,6 +19,7 @@ day one.
 cargo run -p nils-forge-cli -- --help
 cargo run -p nils-forge-cli -- inbox status --format json
 cargo run -p nils-forge-cli -- auth status --format json
+cargo run -p nils-forge-cli -- label audit --catalog labels.yaml --format json
 cargo run -p nils-forge-cli -- pr deliver --kind feature --dry-run --format json
 ```
 
@@ -104,6 +105,28 @@ forge-cli --dry-run --format json inbox list --item-type pr
 
 GitLab `todos` are classified by `target_type` (or the target URL); todos whose
 target cannot be classified appear only in `--item-type all` mode.
+
+## Label catalog operations
+
+`forge-cli label` keeps provider labels aligned with a caller-owned YAML/JSON
+catalog. The catalog remains outside `nils-cli`; `forge-cli` only validates,
+audits, and applies the provider operations.
+
+```sh
+forge-cli label list --format json
+forge-cli label audit --catalog manifests/forge-labels.yaml --format json
+forge-cli --dry-run label ensure --catalog manifests/forge-labels.yaml --update-existing --format json
+```
+
+`label audit` reports missing catalog labels, color / description drift, and
+unknown shared labels. `label ensure` creates missing labels and updates
+existing color / description drift only with `--update-existing`; it never
+deletes labels or renames labels by default.
+
+`pr create` and `pr deliver` accept repeated `--label <name>` flags. Add
+`--label-catalog <path> --strict-labels` when the caller wants `forge-cli` to
+reject unknown, not-applicable, or mutually exclusive labels before a PR/MR is
+opened.
 
 ### Latency notes
 

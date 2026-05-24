@@ -321,7 +321,9 @@ fn build_create_args(args: &PrDeliverArgs, default_branch: &str) -> PrCreateArgs
         kind: args.kind,
         no_draft: false,
         reviewers: args.reviewers.clone(),
-        labels: Vec::new(),
+        labels: args.labels.clone(),
+        label_catalog: args.label_catalog.clone(),
+        strict_labels: args.strict_labels,
     }
 }
 
@@ -431,6 +433,19 @@ fn pr_create_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String
         argv.extend_from_slice(&["--body", "<inline>"]);
     } else if args.body_file.is_some() {
         argv.extend_from_slice(&["--body-file", "<path>"]);
+    }
+    let joined_labels = args.labels.join(",");
+    match ctx.provider {
+        Provider::GitHub => {
+            for label in &args.labels {
+                argv.extend_from_slice(&["--label", label]);
+            }
+        }
+        Provider::GitLab => {
+            if !args.labels.is_empty() {
+                argv.extend_from_slice(&["--label", &joined_labels]);
+            }
+        }
     }
     let mut out = vec![
         BackendProgram::for_provider(ctx.provider)
@@ -621,6 +636,9 @@ mod tests {
             base: Some("main".into()),
             method: MergeMethodFlag::Squash,
             reviewers: Vec::new(),
+            labels: Vec::new(),
+            label_catalog: None,
+            strict_labels: false,
             timeout: std::time::Duration::from_secs(30 * 60),
             no_merge,
             allow_non_default_base: false,

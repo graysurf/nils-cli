@@ -64,12 +64,14 @@ _arguments "${_arguments_options[@]}" : \
 '--kind=[PR / MR kind (selects branch-prefix rule). Required]:KIND:(feature bug)' \
 '*--reviewer=[Add a reviewer (repeatable)]:USER:_default' \
 '*--label=[Add a label (repeatable)]:LABEL:_default' \
+'--label-catalog=[Validate labels against this catalog when \`--strict-labels\` is set]:PATH:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--no-draft[Open as ready-for-review instead of draft (default\: open as draft)]' \
+'--strict-labels[Fail when selected labels are missing, not applicable, or conflict]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -221,12 +223,15 @@ _arguments "${_arguments_options[@]}" : \
 '--base=[Target / base branch (defaults to the repo'\''s default branch)]:BASE:_default' \
 '--method=[Merge method (default\: squash)]:METHOD:(squash merge rebase)' \
 '*--reviewer=[Add a reviewer (repeatable)]:USER:_default' \
+'*--label=[Add a label to the created PR / MR (repeatable)]:LABEL:_default' \
+'--label-catalog=[Validate labels against this catalog when \`--strict-labels\` is set]:PATH:_default' \
 '--timeout=[CI-wait budget before declaring \`checks_timeout\` (default \`30m\`)]:TIMEOUT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--strict-labels[Fail when selected labels are missing, not applicable, or conflict]' \
 '--no-merge[Stop after \`pr.wait-checks\` — do not promote to ready or merge]' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
@@ -466,6 +471,104 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (reopen)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(label)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_forge-cli__subcmd__label_commands" \
+"*::: :->label" \
+&& ret=0
+
+    case $state in
+    (label)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-label-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'--limit=[Maximum labels to fetch from the provider]:LIMIT:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(audit)
+_arguments "${_arguments_options[@]}" : \
+'--catalog=[Path to the shared forge label catalog]:PATH:_default' \
+'--limit=[Maximum labels to fetch from the provider]:LIMIT:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(ensure)
+_arguments "${_arguments_options[@]}" : \
+'--catalog=[Path to the shared forge label catalog]:PATH:_default' \
+'--limit=[Maximum labels to fetch from the provider]:LIMIT:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--update-existing[Update color / description drift on existing labels]' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__label__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-label-help-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(audit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ensure)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -873,6 +976,34 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+(label)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__help__subcmd__label_commands" \
+"*::: :->label" \
+&& ret=0
+
+    case $state in
+    (label)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-help-label-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(audit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ensure)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (inbox)
 _arguments "${_arguments_options[@]}" : \
 ":: :_forge-cli__subcmd__help__subcmd__inbox_commands" \
@@ -963,6 +1094,7 @@ _forge-cli_commands() {
     local commands; commands=(
 'pr:Pull / merge request lifecycle' \
 'issue:Issue lifecycle' \
+'label:Repository label catalog audit and ensure operations' \
 'inbox:Personal cross-repo work inbox' \
 'repo:Repository helpers' \
 'auth:Backend authentication helpers' \
@@ -1012,6 +1144,7 @@ _forge-cli__subcmd__help_commands() {
     local commands; commands=(
 'pr:Pull / merge request lifecycle' \
 'issue:Issue lifecycle' \
+'label:Repository label catalog audit and ensure operations' \
 'inbox:Personal cross-repo work inbox' \
 'repo:Repository helpers' \
 'auth:Backend authentication helpers' \
@@ -1113,6 +1246,30 @@ _forge-cli__subcmd__help__subcmd__issue__subcmd__reopen_commands() {
 _forge-cli__subcmd__help__subcmd__issue__subcmd__view_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli help issue view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__label_commands] )) ||
+_forge-cli__subcmd__help__subcmd__label_commands() {
+    local commands; commands=(
+'list:List repository labels through the selected provider backend' \
+'audit:Compare repository labels against a machine-readable catalog' \
+'ensure:Create missing labels and optionally update color / description drift' \
+    )
+    _describe -t commands 'forge-cli help label commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__label__subcmd__audit_commands] )) ||
+_forge-cli__subcmd__help__subcmd__label__subcmd__audit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help label audit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__label__subcmd__ensure_commands] )) ||
+_forge-cli__subcmd__help__subcmd__label__subcmd__ensure_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help label ensure commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__label__subcmd__list_commands] )) ||
+_forge-cli__subcmd__help__subcmd__label__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help label list commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__pr_commands] )) ||
 _forge-cli__subcmd__help__subcmd__pr_commands() {
@@ -1355,6 +1512,61 @@ _forge-cli__subcmd__issue__subcmd__reopen_commands() {
 _forge-cli__subcmd__issue__subcmd__view_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli issue view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__label_commands] )) ||
+_forge-cli__subcmd__label_commands() {
+    local commands; commands=(
+'list:List repository labels through the selected provider backend' \
+'audit:Compare repository labels against a machine-readable catalog' \
+'ensure:Create missing labels and optionally update color / description drift' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli label commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__label__subcmd__audit_commands] )) ||
+_forge-cli__subcmd__label__subcmd__audit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli label audit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__label__subcmd__ensure_commands] )) ||
+_forge-cli__subcmd__label__subcmd__ensure_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli label ensure commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__label__subcmd__help_commands] )) ||
+_forge-cli__subcmd__label__subcmd__help_commands() {
+    local commands; commands=(
+'list:List repository labels through the selected provider backend' \
+'audit:Compare repository labels against a machine-readable catalog' \
+'ensure:Create missing labels and optionally update color / description drift' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli label help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__label__subcmd__help__subcmd__audit_commands] )) ||
+_forge-cli__subcmd__label__subcmd__help__subcmd__audit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli label help audit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__label__subcmd__help__subcmd__ensure_commands] )) ||
+_forge-cli__subcmd__label__subcmd__help__subcmd__ensure_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli label help ensure commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__label__subcmd__help__subcmd__help_commands] )) ||
+_forge-cli__subcmd__label__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli label help help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__label__subcmd__help__subcmd__list_commands] )) ||
+_forge-cli__subcmd__label__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli label help list commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__label__subcmd__list_commands] )) ||
+_forge-cli__subcmd__label__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli label list commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr_commands] )) ||
 _forge-cli__subcmd__pr_commands() {

@@ -67,6 +67,10 @@ validations_catalog:
     rule: "--keep-branch and --delete-branch are mutually exclusive"
     error_kind: keep_branch_conflict
     exit: DATA
+  label_catalog:
+    rule: "when --strict-labels is set, every selected label exists in --label-catalog, applies to the target, and exclusive groups do not conflict"
+    error_kind: label_unknown | label_not_applicable | label_group_conflict | label_catalog_missing
+    exit: DATA
 
 # ---------------------------------------------------------------------------
 # Global flags every subcommand inherits.
@@ -106,12 +110,15 @@ operations:
       - { name: --draft,       type: bool,           default: true }
       - { name: --reviewer,    type: list<string>,   default: [] }
       - { name: --label,       type: list<string>,   default: [] }
+      - { name: --label-catalog, type: path,          required: false }
+      - { name: --strict-labels, type: bool,          default: false }
     validations:
       - branch_name
       - branch_kind_matches
       - title_length
       - body_summary
       - body_test_plan
+      - label_catalog # only when --strict-labels is set
       - worktree_clean
       - head_pushed
     backends:
@@ -378,6 +385,62 @@ operations:
       github: { program: gh,   argv: [issue, reopen, "{id}"] }
       gitlab: { program: glab, argv: [issue, reopen, "{id}"] }
 
+  - id: label.list
+    schema_version: cli.forge-cli.label.list.v1
+    summary: List repository labels from the selected provider.
+    inputs:
+      - { name: --limit, type: integer, default: 200 }
+    validations: []
+    backends:
+      github: { program: gh,   argv: [label, list, --limit, "{limit}", --json, "id,name,color,description"] }
+      gitlab: { program: glab, argv: [label, list, --output, json, --per-page, "{limit}"] }
+    output:
+      data:
+        provider: enum<github|gitlab>
+        labels: list<{ id, name, color, description }>
+
+  - id: label.audit
+    schema_version: cli.forge-cli.label.audit.v1
+    summary: Compare repository labels against a caller-owned catalog.
+    inputs:
+      - { name: --catalog, type: path, required: true }
+      - { name: --limit,   type: integer, default: 200 }
+    validations: []
+    backends:
+      github: { derives_from: label.list }
+      gitlab: { derives_from: label.list }
+    output:
+      data:
+        provider: enum<github|gitlab>
+        status: enum<pass|fail>
+        missing: list<{ name, group, color, description, applies_to }>
+        drift: "list of { name, current, expected, fields }"
+        unknown_shared: list<{ id, name, color, description }>
+
+  - id: label.ensure
+    schema_version: cli.forge-cli.label.ensure.v1
+    summary: Create missing catalog labels and optionally update color / description drift.
+    inputs:
+      - { name: --catalog,         type: path, required: true }
+      - { name: --update-existing, type: bool, default: false }
+      - { name: --limit,           type: integer, default: 200 }
+    validations: []
+    backends:
+      github:
+        list: { derives_from: label.list }
+        create: { program: gh, argv: [label, create, "{name}", --color, "{color}", --description, "{description}"] }
+        update: { program: gh, argv: [label, edit, "{name}", --color, "{color}", --description, "{description}"] }
+      gitlab:
+        list: { derives_from: label.list }
+        create: { program: glab, argv: [label, create, --name, "{name}", --color, "#{color}", --description, "{description}"] }
+        update: { program: glab, argv: [label, edit, --label-id, "{id}", --color, "#{color}", --description, "{description}"] }
+    output:
+      data:
+        provider: enum<github|gitlab>
+        dry_run: bool
+        actions: "list of create/update action plans or applied actions"
+    notes: "Never deletes labels or renames labels by default. Existing color / description drift is updated only with --update-existing."
+
   - id: repo.view
     schema_version: cli.forge-cli.repo.view.v1
     summary: Resolve repo slug, default branch, default merge method.
@@ -495,6 +558,9 @@ macros:
       - { name: --base,                     type: string,                       default: repo-default-branch }
       - { name: --method,                   type: enum<squash|merge|rebase>,    default: squash }
       - { name: --reviewer,                 type: list<string>,                 default: [] }
+      - { name: --label,                    type: list<string>,                 default: [] }
+      - { name: --label-catalog,            type: path,                         required: false }
+      - { name: --strict-labels,            type: bool,                         default: false }
       - { name: --timeout,                  type: duration,                     default: 30m }
       - { name: --no-merge,                 type: bool,                         default: false }
       - { name: --allow-non-default-base,   type: bool,                         default: false }
