@@ -23,7 +23,7 @@ use crate::commands::sprint::{
 };
 use crate::commands::{Command as CliCommand, SplitStrategy, SummaryArgs};
 use crate::dispatch_record::{self, DispatchRecord};
-use crate::github::{GhCliAdapter, GitHubAdapter};
+use crate::github::{GhCliAdapter, ProviderAdapter};
 use crate::issue_body::{self, TaskRow};
 use crate::lifecycle_record::{self, DashboardInput};
 use crate::render::{self, SprintCommentInput, SprintCommentMode};
@@ -3333,8 +3333,22 @@ fn resolve_repo_for_live(
     repo_override: Option<&str>,
 ) -> Result<String, CommandError> {
     ensure_live_binary(binary)?;
-    crate::github::resolve_repo(repo_override)
-        .map_err(|err| CommandError::usage("repo-resolution-failed", err))
+    let info = crate::provider::resolve_repo(repo_override)
+        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+    if info.provider == crate::provider::Provider::GitLab {
+        // Sprint 2.1: routing layer is in place but the GitLab branch is a
+        // stub (see `forge_cli_adapter::ForgeCliAdapter`). Sprint 2.2 wires
+        // the actual `forge-cli` subprocess calls in.
+        return Err(CommandError::runtime(
+            "provider_not_implemented",
+            format!(
+                "plan-issue-cli GitLab support is wired to the routing layer but not yet active (Sprint 2.1 stub); track sympoies/nils-cli#490. Repo: {} at {}",
+                info.slug,
+                info.host.as_deref().unwrap_or("(unknown host)"),
+            ),
+        ));
+    }
+    Ok(info.slug)
 }
 
 fn render_plan_status_comment(rows: &[TaskRow]) -> String {
@@ -3630,7 +3644,7 @@ fn collect_required_prs(rows: &[TaskRow], scope: &str) -> Result<Vec<u64>, Strin
 }
 
 fn ensure_prs_merged(
-    adapter: &impl GitHubAdapter,
+    adapter: &impl ProviderAdapter,
     repo: &str,
     prs: &[u64],
     scope: &str,
@@ -3654,7 +3668,7 @@ fn ensure_prs_merged(
 }
 
 fn enforce_previous_sprint_gate(
-    adapter: &impl GitHubAdapter,
+    adapter: &impl ProviderAdapter,
     repo: &str,
     rows: &[TaskRow],
     sprint: i32,
@@ -4102,18 +4116,18 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct MockGitHubAdapter {
+    struct MockProviderAdapter {
         merged: HashMap<u64, Result<bool, String>>,
     }
 
-    impl MockGitHubAdapter {
+    impl MockProviderAdapter {
         fn with_merge(mut self, pr: u64, result: Result<bool, String>) -> Self {
             self.merged.insert(pr, result);
             self
         }
     }
 
-    impl GitHubAdapter for MockGitHubAdapter {
+    impl ProviderAdapter for MockProviderAdapter {
         fn issue_body(&self, _repo: &str, _issue: u64) -> Result<String, String> {
             unreachable!("issue_body is not needed in this test")
         }
@@ -4375,10 +4389,10 @@ mod tests {
         let err = collect_required_prs(&bad_rows, "close-plan").expect_err("missing pr");
         assert!(err.contains("requires concrete PR reference"), "{err}");
 
-        let adapter_ok = MockGitHubAdapter::default().with_merge(12, Ok(true));
+        let adapter_ok = MockProviderAdapter::default().with_merge(12, Ok(true));
         ensure_prs_merged(&adapter_ok, "sympoies/nils-cli", &[12], "scope").expect("merged");
 
-        let adapter_unmerged = MockGitHubAdapter::default().with_merge(12, Ok(false));
+        let adapter_unmerged = MockProviderAdapter::default().with_merge(12, Ok(false));
         let unmerged = ensure_prs_merged(&adapter_unmerged, "sympoies/nils-cli", &[12], "scope")
             .expect_err("unmerged should fail");
         assert!(
@@ -4387,7 +4401,7 @@ mod tests {
         );
 
         let adapter_error =
-            MockGitHubAdapter::default().with_merge(12, Err("gh failure".to_string()));
+            MockProviderAdapter::default().with_merge(12, Err("gh failure".to_string()));
         let query_err = ensure_prs_merged(&adapter_error, "sympoies/nils-cli", &[12], "scope")
             .expect_err("query failure should fail");
         assert!(
@@ -4402,7 +4416,7 @@ mod tests {
             task_row("S1T1", "issue/s1-t1", "wt-1", "#11", "done", "sprint=S1"),
             task_row("S2T1", "issue/s2-t1", "wt-2", "#21", "planned", "sprint=S2"),
         ];
-        let adapter_ok = MockGitHubAdapter::default().with_merge(11, Ok(true));
+        let adapter_ok = MockProviderAdapter::default().with_merge(11, Ok(true));
         enforce_previous_sprint_gate(&adapter_ok, "sympoies/nils-cli", &rows_ok, 2)
             .expect("gate should pass");
 
@@ -4454,7 +4468,7 @@ mod tests {
             "{pr_err}"
         );
 
-        let adapter_unmerged = MockGitHubAdapter::default().with_merge(11, Ok(false));
+        let adapter_unmerged = MockProviderAdapter::default().with_merge(11, Ok(false));
         let unmerged =
             enforce_previous_sprint_gate(&adapter_unmerged, "sympoies/nils-cli", &rows_ok, 2)
                 .expect_err("merge gate must fail");
