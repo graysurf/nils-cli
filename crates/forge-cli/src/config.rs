@@ -32,13 +32,24 @@ use crate::cli::parse_duration;
 pub const CONFIG_FILE_NAME: &str = ".forge-cli.toml";
 
 /// Top-level config sections recognised by this version.
-const KNOWN_SECTIONS: &[&str] = &["merge", "body", "branch", "checks"];
+const KNOWN_SECTIONS: &[&str] = &["merge", "body", "branch", "checks", "inbox"];
 
 /// Recognised keys per section.
 const KNOWN_MERGE_KEYS: &[&str] = &["method", "delete_branch"];
 const KNOWN_BODY_KEYS: &[&str] = &["summary_heading", "test_plan_heading"];
 const KNOWN_BRANCH_KEYS: &[&str] = &["feature_prefix", "bug_prefix"];
 const KNOWN_CHECKS_KEYS: &[&str] = &["timeout", "interval", "required_only"];
+const KNOWN_INBOX_KEYS: &[&str] = &[
+    "gitlab_vpn",
+    "gitlab_vpn_check",
+    "gitlab_vpn_check_timeout",
+    "gitlab_openvpn_profile",
+    "provider_timeout",
+    "strict_providers",
+    "cache_fallback",
+    "cache_max_age",
+    "no_cache",
+];
 
 /// Merge strategy choices supported by both backends. The string form matches
 /// the spec catalog and `[merge].method` in `.forge-cli.toml`.
@@ -92,6 +103,15 @@ pub struct ForgeConfig {
     pub checks_timeout: Option<Duration>,
     pub checks_interval: Option<Duration>,
     pub checks_required_only: Option<bool>,
+    pub inbox_gitlab_vpn: Option<String>,
+    pub inbox_gitlab_vpn_check: Option<String>,
+    pub inbox_gitlab_vpn_check_timeout: Option<Duration>,
+    pub inbox_gitlab_openvpn_profile: Option<PathBuf>,
+    pub inbox_provider_timeout: Option<Duration>,
+    pub inbox_strict_providers: Option<bool>,
+    pub inbox_cache_fallback: Option<bool>,
+    pub inbox_cache_max_age: Option<Duration>,
+    pub inbox_no_cache: Option<bool>,
     /// Forward-compat warnings collected while parsing (unknown keys, bad
     /// scalar types). Each entry is prefixed `unknown-config-key:` or
     /// `invalid-config-value:` so callers can render them verbatim under
@@ -251,6 +271,7 @@ fn parse_value(value: &Value) -> ForgeConfig {
             "body" => parse_body(section_table, &mut cfg),
             "branch" => parse_branch(section_table, &mut cfg),
             "checks" => parse_checks(section_table, &mut cfg),
+            "inbox" => parse_inbox(section_table, &mut cfg),
             _ => unreachable!("section filtered above"),
         }
     }
@@ -361,6 +382,64 @@ fn parse_checks(table: &toml::map::Map<String, Value>, cfg: &mut ForgeConfig) {
     }
 }
 
+fn parse_inbox(table: &toml::map::Map<String, Value>, cfg: &mut ForgeConfig) {
+    for (key, value) in table {
+        if !KNOWN_INBOX_KEYS.contains(&key.as_str()) {
+            cfg.warnings.push(format!("unknown-config-key:inbox.{key}"));
+            continue;
+        }
+        match key.as_str() {
+            "gitlab_vpn" | "gitlab_vpn_check" | "gitlab_openvpn_profile" => {
+                let Some(s) = value.as_str() else {
+                    cfg.warnings
+                        .push(format!("invalid-config-value:inbox.{key}:not_a_string"));
+                    continue;
+                };
+                match key.as_str() {
+                    "gitlab_vpn" => cfg.inbox_gitlab_vpn = Some(s.to_string()),
+                    "gitlab_vpn_check" => cfg.inbox_gitlab_vpn_check = Some(s.to_string()),
+                    "gitlab_openvpn_profile" => {
+                        cfg.inbox_gitlab_openvpn_profile = Some(PathBuf::from(s))
+                    }
+                    _ => unreachable!("key filtered above"),
+                }
+            }
+            "gitlab_vpn_check_timeout" | "provider_timeout" | "cache_max_age" => {
+                match value.as_str() {
+                    Some(s) => match parse_duration(s) {
+                        Ok(d) => match key.as_str() {
+                            "gitlab_vpn_check_timeout" => {
+                                cfg.inbox_gitlab_vpn_check_timeout = Some(d)
+                            }
+                            "provider_timeout" => cfg.inbox_provider_timeout = Some(d),
+                            "cache_max_age" => cfg.inbox_cache_max_age = Some(d),
+                            _ => unreachable!("key filtered above"),
+                        },
+                        Err(err) => cfg
+                            .warnings
+                            .push(format!("invalid-config-value:inbox.{key}:{err}")),
+                    },
+                    None => cfg
+                        .warnings
+                        .push(format!("invalid-config-value:inbox.{key}:not_a_string")),
+                }
+            }
+            "strict_providers" | "cache_fallback" | "no_cache" => match value.as_bool() {
+                Some(b) => match key.as_str() {
+                    "strict_providers" => cfg.inbox_strict_providers = Some(b),
+                    "cache_fallback" => cfg.inbox_cache_fallback = Some(b),
+                    "no_cache" => cfg.inbox_no_cache = Some(b),
+                    _ => unreachable!("key filtered above"),
+                },
+                None => cfg
+                    .warnings
+                    .push(format!("invalid-config-value:inbox.{key}:not_a_bool")),
+            },
+            _ => unreachable!("key filtered above"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +482,17 @@ bug_prefix = "bugfix/"
 timeout = "45m"
 interval = "5s"
 required_only = false
+
+[inbox]
+gitlab_vpn = "required"
+gitlab_vpn_check = "tcp:gitlab.example.com:443"
+gitlab_vpn_check_timeout = "2s"
+gitlab_openvpn_profile = "~/vpn/example.ovpn"
+provider_timeout = "20s"
+strict_providers = true
+cache_fallback = true
+cache_max_age = "30m"
+no_cache = false
 "###,
         );
         let cfg = ForgeConfig::load_from(tmp.path(), Some(tmp.path()));
@@ -419,6 +509,24 @@ required_only = false
         assert_eq!(cfg.checks_timeout, Some(Duration::from_secs(45 * 60)));
         assert_eq!(cfg.checks_interval, Some(Duration::from_secs(5)));
         assert_eq!(cfg.checks_required_only, Some(false));
+        assert_eq!(cfg.inbox_gitlab_vpn.as_deref(), Some("required"));
+        assert_eq!(
+            cfg.inbox_gitlab_vpn_check.as_deref(),
+            Some("tcp:gitlab.example.com:443")
+        );
+        assert_eq!(
+            cfg.inbox_gitlab_vpn_check_timeout,
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            cfg.inbox_gitlab_openvpn_profile,
+            Some(PathBuf::from("~/vpn/example.ovpn"))
+        );
+        assert_eq!(cfg.inbox_provider_timeout, Some(Duration::from_secs(20)));
+        assert_eq!(cfg.inbox_strict_providers, Some(true));
+        assert_eq!(cfg.inbox_cache_fallback, Some(true));
+        assert_eq!(cfg.inbox_cache_max_age, Some(Duration::from_secs(30 * 60)));
+        assert_eq!(cfg.inbox_no_cache, Some(false));
     }
 
     #[test]

@@ -43,6 +43,39 @@ default self-managed host, or use `--gitlab-host` for a per-command override.
 `status` reports bounded counts, and `next` returns a ranked bounded subset
 without mutating PRs, issues, merge requests, or todos.
 
+For VPN-dependent GitLab hosts, keep daily mixed-provider usage responsive by
+requiring a readiness check and bounding GitLab backend calls:
+
+```sh
+forge-cli inbox list --format json \
+  --gitlab-host gitlab.example.com \
+  --gitlab-vpn required \
+  --gitlab-vpn-check tcp:gitlab.example.com:443 \
+  --provider-timeout 20s
+```
+
+When the VPN check fails, mixed-provider mode still returns GitHub results with
+a GitLab `vpn_unavailable` provider row and warning. `--provider github`
+intentionally skips GitLab. `--provider gitlab` fails when GitLab is selected
+but VPN-unavailable or timed out. Add `--strict-providers` for automation that
+must fail any partial provider failure.
+
+`--gitlab-vpn-check cmd:<program>` delegates readiness to a local script, and
+`--gitlab-vpn-check openvpn` verifies local OpenVPN CLI/profile prerequisites
+without starting or stopping VPN. OpenVPN profile paths are local-only
+configuration and are redacted from JSON, warnings, issue records, docs, and
+cache files. Install optional OpenVPN CLI support with `brew install openvpn`.
+
+Successful provider reads write local cache snapshots. Stale fallback is
+opt-in:
+
+```sh
+forge-cli inbox list --format json --cache-fallback --cache-max-age 30m
+```
+
+Cached fallback items are marked with `stale` metadata and the provider row
+remains `ok=false`, so consumers can distinguish stale context from live data.
+
 ### Reason filter (`--kind`) vs item-type filter (`--item-type`)
 
 `--kind` selects inbox *reasons* — why an item should appear (`review`,

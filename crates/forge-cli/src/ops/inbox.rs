@@ -7,16 +7,28 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::env;
 use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nils_common::cli_contract::{OutputFormat, schema_version_for};
-use serde::Serialize;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
+use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, ProcessRunner};
 use crate::cli::{
-    BINARY, GlobalFlags, InboxCommand, InboxItemTypeFlag, InboxKindFlag, InboxNextArgs,
-    InboxQueryArgs,
+    BINARY, GitlabVpnModeFlag, GlobalFlags, InboxCommand, InboxItemTypeFlag, InboxKindFlag,
+    InboxNextArgs, InboxQueryArgs, parse_duration,
 };
+use crate::config::ForgeConfig;
 use crate::envelope::emit_success_with_warnings;
 use crate::error::ForgeError;
 use crate::provider::{Provider, classify_host, git_remote_url, parse_host};
@@ -26,8 +38,21 @@ const STATUS_SCHEMA: &str = "inbox.status";
 const NEXT_SCHEMA: &str = "inbox.next";
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_QUERY_LIMIT: u32 = 30;
+const DEFAULT_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_VPN_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 const GH_JSON_FIELDS: &str = "number,url,title,updatedAt,author,repository";
 const ENV_INBOX_GITLAB_HOST: &str = "FORGE_CLI_INBOX_GITLAB_HOST";
+const ENV_INBOX_GITLAB_VPN: &str = "FORGE_CLI_INBOX_GITLAB_VPN";
+const ENV_INBOX_GITLAB_VPN_CHECK: &str = "FORGE_CLI_INBOX_GITLAB_VPN_CHECK";
+const ENV_INBOX_GITLAB_VPN_CHECK_TIMEOUT: &str = "FORGE_CLI_INBOX_GITLAB_VPN_CHECK_TIMEOUT";
+const ENV_INBOX_GITLAB_OPENVPN_PROFILE: &str = "FORGE_CLI_INBOX_GITLAB_OPENVPN_PROFILE";
+const ENV_INBOX_PROVIDER_TIMEOUT: &str = "FORGE_CLI_INBOX_PROVIDER_TIMEOUT";
+const ENV_INBOX_STRICT_PROVIDERS: &str = "FORGE_CLI_INBOX_STRICT_PROVIDERS";
+const ENV_INBOX_CACHE_FALLBACK: &str = "FORGE_CLI_INBOX_CACHE_FALLBACK";
+const ENV_INBOX_CACHE_MAX_AGE: &str = "FORGE_CLI_INBOX_CACHE_MAX_AGE";
+const ENV_INBOX_NO_CACHE: &str = "FORGE_CLI_INBOX_NO_CACHE";
+const ENV_INBOX_CACHE_DIR: &str = "FORGE_CLI_INBOX_CACHE_DIR";
 
 #[derive(Debug, Clone)]
 struct ProviderTarget {
@@ -40,6 +65,59 @@ struct QueryConfig {
     reasons: Vec<InboxKindFlag>,
     item_type: InboxItemTypeFlag,
     query_limit: u32,
+}
+
+#[derive(Debug, Clone)]
+struct InboxRuntimeConfig {
+    gitlab_vpn_mode: GitlabVpnMode,
+    gitlab_vpn_check: Option<VpnCheck>,
+    gitlab_vpn_check_timeout: Duration,
+    gitlab_openvpn_profile: Option<PathBuf>,
+    provider_timeout: Option<Duration>,
+    strict_providers: bool,
+    cache: CachePolicy,
+}
+
+#[derive(Debug, Clone)]
+struct CachePolicy {
+    no_cache: bool,
+    fallback: bool,
+    max_age: Duration,
+    dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitlabVpnMode {
+    Off,
+    Optional,
+    Required,
+}
+
+impl GitlabVpnMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum VpnCheck {
+    Tcp { host: String, port: u16 },
+    Cmd { program: String },
+    OpenVpn,
+}
+
+impl VpnCheck {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Tcp { .. } => "tcp",
+            Self::Cmd { .. } => "cmd",
+            Self::OpenVpn => "openvpn",
+        }
+    }
 }
 
 /// Classification of a GitLab `todo` target. `Unknown` covers payloads where
@@ -57,6 +135,7 @@ enum TodoTarget {
 struct ProviderSuccess {
     items: Vec<InboxItem>,
     limited: bool,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +143,8 @@ struct InboxCollection {
     providers: Vec<InboxProviderStatus>,
     items: Vec<InboxItem>,
     warnings: Vec<String>,
+    successes: usize,
+    failures: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -75,6 +156,8 @@ pub struct InboxProviderStatus {
     pub limited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<InboxProviderError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<InboxProviderCacheStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -84,8 +167,23 @@ pub struct InboxProviderError {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InboxProviderCacheStatus {
+    pub used: bool,
+    pub stale: bool,
+    pub age_seconds: u64,
+    pub item_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InboxStaleMetadata {
+    pub reason: String,
+    pub cached_at_unix: u64,
+    pub age_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InboxItem {
-    pub provider: &'static str,
+    pub provider: String,
     pub host: String,
     pub kind: String,
     pub reasons: Vec<String>,
@@ -95,7 +193,9 @@ pub struct InboxItem {
     pub url: String,
     pub updated_at: String,
     pub author: Option<String>,
-    pub source: &'static str,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale: Option<InboxStaleMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +235,9 @@ struct InboxNextPayload {
 struct InboxDryRunPayload {
     providers: Vec<InboxDryRunProvider>,
     limit: u32,
+    provider_timeout_seconds: Option<u64>,
+    strict_providers: bool,
+    cache: InboxDryRunCache,
     #[serde(skip_serializing_if = "Option::is_none")]
     query_limit: Option<u32>,
 }
@@ -143,7 +246,25 @@ struct InboxDryRunPayload {
 struct InboxDryRunProvider {
     provider: &'static str,
     host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vpn: Option<InboxDryRunVpn>,
     plans: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InboxDryRunVpn {
+    mode: &'static str,
+    check_kind: &'static str,
+    check_timeout_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    openvpn_profile: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InboxDryRunCache {
+    enabled: bool,
+    fallback: bool,
+    max_age_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -161,11 +282,24 @@ struct GitlabIdentity {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct ItemKey {
-    provider: &'static str,
+    provider: String,
     host: String,
     repo: String,
     number: u64,
     url: String,
+}
+
+#[derive(Debug, Clone)]
+struct InboxOptionOverrides {
+    gitlab_vpn: Option<GitlabVpnModeFlag>,
+    gitlab_vpn_check: Option<String>,
+    gitlab_vpn_check_timeout: Option<Duration>,
+    gitlab_openvpn_profile: Option<PathBuf>,
+    provider_timeout: Option<Duration>,
+    strict_providers: bool,
+    cache_fallback: bool,
+    cache_max_age: Option<Duration>,
+    no_cache: bool,
 }
 
 pub fn run(
@@ -197,19 +331,29 @@ fn run_list<R: BackendRunner + Sync>(
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
     let targets = resolve_targets(global, args.gitlab_host.as_deref());
+    let runtime = InboxRuntimeConfig::from_overrides(&InboxOptionOverrides::from_query(&args))?;
     let config = QueryConfig::new(args.kinds, args.item_type, args.limit.max(1));
     if global.dry_run {
         return Ok(emit_dry_run(
             schema_version_for(BINARY, LIST_SCHEMA, SCHEMA_VERSION),
             &targets,
             &config,
+            &runtime,
             args.limit.max(1),
             None,
             format,
         ));
     }
 
-    let collection = collect_inbox(runner, &targets, &config)?;
+    let collection = collect_inbox(runner, &targets, &config, &runtime)?;
+    if let Some(code) = emit_failure_if_needed(
+        schema_version_for(BINARY, LIST_SCHEMA, SCHEMA_VERSION),
+        &collection,
+        &runtime,
+        format,
+    ) {
+        return Ok(code);
+    }
     let payload = InboxListPayload {
         providers: collection.providers,
         limit: config.query_limit,
@@ -231,19 +375,29 @@ fn run_status<R: BackendRunner + Sync>(
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
     let targets = resolve_targets(global, args.gitlab_host.as_deref());
+    let runtime = InboxRuntimeConfig::from_overrides(&InboxOptionOverrides::from_query(&args))?;
     let config = QueryConfig::new(args.kinds, args.item_type, args.limit.max(1));
     if global.dry_run {
         return Ok(emit_dry_run(
             schema_version_for(BINARY, STATUS_SCHEMA, SCHEMA_VERSION),
             &targets,
             &config,
+            &runtime,
             args.limit.max(1),
             None,
             format,
         ));
     }
 
-    let collection = collect_inbox(runner, &targets, &config)?;
+    let collection = collect_inbox(runner, &targets, &config, &runtime)?;
+    if let Some(code) = emit_failure_if_needed(
+        schema_version_for(BINARY, STATUS_SCHEMA, SCHEMA_VERSION),
+        &collection,
+        &runtime,
+        format,
+    ) {
+        return Ok(code);
+    }
     let counts = summarize_counts(&collection.providers, &collection.items);
     let payload = InboxStatusPayload {
         providers: collection.providers,
@@ -269,19 +423,29 @@ fn run_next<R: BackendRunner + Sync>(
     let targets = resolve_targets(global, args.gitlab_host.as_deref());
     let result_limit = args.limit.max(1);
     let query_limit = result_limit.max(DEFAULT_QUERY_LIMIT);
+    let runtime = InboxRuntimeConfig::from_overrides(&InboxOptionOverrides::from_next(&args))?;
     let config = QueryConfig::new(args.kinds, args.item_type, query_limit);
     if global.dry_run {
         return Ok(emit_dry_run(
             schema_version_for(BINARY, NEXT_SCHEMA, SCHEMA_VERSION),
             &targets,
             &config,
+            &runtime,
             result_limit,
             Some(query_limit),
             format,
         ));
     }
 
-    let mut collection = collect_inbox(runner, &targets, &config)?;
+    let mut collection = collect_inbox(runner, &targets, &config, &runtime)?;
+    if let Some(code) = emit_failure_if_needed(
+        schema_version_for(BINARY, NEXT_SCHEMA, SCHEMA_VERSION),
+        &collection,
+        &runtime,
+        format,
+    ) {
+        return Ok(code);
+    }
     collection.items.truncate(result_limit as usize);
     let payload = InboxNextPayload {
         providers: collection.providers,
@@ -352,6 +516,256 @@ impl QueryConfig {
         let authored_needs = self.wants(InboxKindFlag::Authored);
         review_needs || authored_needs
     }
+}
+
+impl InboxOptionOverrides {
+    fn from_query(args: &InboxQueryArgs) -> Self {
+        Self {
+            gitlab_vpn: args.gitlab_vpn,
+            gitlab_vpn_check: args.gitlab_vpn_check.clone(),
+            gitlab_vpn_check_timeout: args.gitlab_vpn_check_timeout,
+            gitlab_openvpn_profile: args.gitlab_openvpn_profile.clone(),
+            provider_timeout: args.provider_timeout,
+            strict_providers: args.strict_providers,
+            cache_fallback: args.cache_fallback,
+            cache_max_age: args.cache_max_age,
+            no_cache: args.no_cache,
+        }
+    }
+
+    fn from_next(args: &InboxNextArgs) -> Self {
+        Self {
+            gitlab_vpn: args.gitlab_vpn,
+            gitlab_vpn_check: args.gitlab_vpn_check.clone(),
+            gitlab_vpn_check_timeout: args.gitlab_vpn_check_timeout,
+            gitlab_openvpn_profile: args.gitlab_openvpn_profile.clone(),
+            provider_timeout: args.provider_timeout,
+            strict_providers: args.strict_providers,
+            cache_fallback: args.cache_fallback,
+            cache_max_age: args.cache_max_age,
+            no_cache: args.no_cache,
+        }
+    }
+}
+
+impl InboxRuntimeConfig {
+    fn from_overrides(overrides: &InboxOptionOverrides) -> Result<Self, ForgeError> {
+        let cfg = load_repo_config();
+        let gitlab_vpn_mode = resolve_vpn_mode(overrides.gitlab_vpn, &cfg)?;
+        let gitlab_vpn_check = resolve_vpn_check(overrides.gitlab_vpn_check.as_deref(), &cfg)?;
+        let gitlab_vpn_check_timeout = resolve_duration_setting(
+            overrides.gitlab_vpn_check_timeout,
+            ENV_INBOX_GITLAB_VPN_CHECK_TIMEOUT,
+            cfg.inbox_gitlab_vpn_check_timeout,
+            DEFAULT_VPN_CHECK_TIMEOUT,
+        )?;
+        let gitlab_openvpn_profile = overrides
+            .gitlab_openvpn_profile
+            .clone()
+            .or_else(|| env_path(ENV_INBOX_GITLAB_OPENVPN_PROFILE))
+            .or_else(|| cfg.inbox_gitlab_openvpn_profile.clone());
+        let provider_timeout = resolve_provider_timeout(overrides.provider_timeout, &cfg)?;
+        let strict_providers = overrides.strict_providers
+            || env_bool(ENV_INBOX_STRICT_PROVIDERS)?
+            || cfg.inbox_strict_providers.unwrap_or(false);
+        let no_cache = overrides.no_cache
+            || env_bool(ENV_INBOX_NO_CACHE)?
+            || cfg.inbox_no_cache.unwrap_or(false);
+        let cache_fallback = overrides.cache_fallback
+            || env_bool(ENV_INBOX_CACHE_FALLBACK)?
+            || cfg.inbox_cache_fallback.unwrap_or(false);
+        let cache_max_age = resolve_duration_setting(
+            overrides.cache_max_age,
+            ENV_INBOX_CACHE_MAX_AGE,
+            cfg.inbox_cache_max_age,
+            DEFAULT_CACHE_MAX_AGE,
+        )?;
+        Ok(Self {
+            gitlab_vpn_mode,
+            gitlab_vpn_check,
+            gitlab_vpn_check_timeout,
+            gitlab_openvpn_profile,
+            provider_timeout,
+            strict_providers,
+            cache: CachePolicy {
+                no_cache,
+                fallback: cache_fallback,
+                max_age: cache_max_age,
+                dir: cache_dir(),
+            },
+        })
+    }
+}
+
+fn load_repo_config() -> ForgeConfig {
+    let workdir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    ForgeConfig::load_from(&workdir, find_git_toplevel(&workdir).as_deref())
+}
+
+fn find_git_toplevel(start: &Path) -> Option<PathBuf> {
+    let mut cursor = Some(start.to_path_buf());
+    while let Some(dir) = cursor {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        cursor = dir.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+fn resolve_vpn_mode(
+    explicit: Option<GitlabVpnModeFlag>,
+    cfg: &ForgeConfig,
+) -> Result<GitlabVpnMode, ForgeError> {
+    if let Some(mode) = explicit {
+        return Ok(match mode {
+            GitlabVpnModeFlag::Off => GitlabVpnMode::Off,
+            GitlabVpnModeFlag::Optional => GitlabVpnMode::Optional,
+            GitlabVpnModeFlag::Required => GitlabVpnMode::Required,
+        });
+    }
+    if let Some(mode) = env_string(ENV_INBOX_GITLAB_VPN) {
+        return parse_vpn_mode(&mode);
+    }
+    if let Some(mode) = cfg.inbox_gitlab_vpn.as_deref() {
+        return parse_vpn_mode(mode);
+    }
+    Ok(GitlabVpnMode::Off)
+}
+
+fn parse_vpn_mode(raw: &str) -> Result<GitlabVpnMode, ForgeError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "off" | "false" | "disabled" => Ok(GitlabVpnMode::Off),
+        "optional" => Ok(GitlabVpnMode::Optional),
+        "required" | "true" | "on" => Ok(GitlabVpnMode::Required),
+        other => Err(ForgeError::validation(
+            schema_err(),
+            "vpn_mode_invalid",
+            format!("invalid GitLab VPN mode {other:?}; expected off, optional, or required"),
+            None,
+        )),
+    }
+}
+
+fn resolve_vpn_check(
+    explicit: Option<&str>,
+    cfg: &ForgeConfig,
+) -> Result<Option<VpnCheck>, ForgeError> {
+    let raw = explicit
+        .map(str::to_string)
+        .or_else(|| env_string(ENV_INBOX_GITLAB_VPN_CHECK))
+        .or_else(|| cfg.inbox_gitlab_vpn_check.clone());
+    raw.as_deref().map(parse_vpn_check).transpose()
+}
+
+fn parse_vpn_check(raw: &str) -> Result<VpnCheck, ForgeError> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("openvpn") {
+        return Ok(VpnCheck::OpenVpn);
+    }
+    if let Some(rest) = trimmed.strip_prefix("cmd:") {
+        let program = rest.trim();
+        if program.is_empty() {
+            return Err(vpn_check_invalid("cmd check must include a program"));
+        }
+        return Ok(VpnCheck::Cmd {
+            program: program.to_string(),
+        });
+    }
+    if let Some(rest) = trimmed.strip_prefix("tcp:") {
+        let Some((host, port)) = rest.rsplit_once(':') else {
+            return Err(vpn_check_invalid("tcp check must use tcp:<host>:<port>"));
+        };
+        let host = host.trim();
+        let port = port
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| vpn_check_invalid("tcp check port must be 1-65535"))?;
+        if host.is_empty() || port == 0 {
+            return Err(vpn_check_invalid(
+                "tcp check host and port must be non-empty",
+            ));
+        }
+        return Ok(VpnCheck::Tcp {
+            host: host.to_string(),
+            port,
+        });
+    }
+    Err(vpn_check_invalid(
+        "GitLab VPN check must be tcp:<host>:<port>, cmd:<program>, or openvpn",
+    ))
+}
+
+fn vpn_check_invalid(message: impl Into<String>) -> ForgeError {
+    ForgeError::validation(schema_err(), "vpn_check_invalid", message, None)
+}
+
+fn resolve_duration_setting(
+    explicit: Option<Duration>,
+    env_name: &str,
+    configured: Option<Duration>,
+    default: Duration,
+) -> Result<Duration, ForgeError> {
+    if let Some(duration) = explicit {
+        return Ok(duration);
+    }
+    if let Some(raw) = env_string(env_name) {
+        return parse_duration(&raw).map_err(|err| {
+            ForgeError::validation(
+                schema_err(),
+                "duration_invalid",
+                format!("{env_name} has invalid duration: {err}"),
+                None,
+            )
+        });
+    }
+    Ok(configured.unwrap_or(default))
+}
+
+fn resolve_provider_timeout(
+    explicit: Option<Duration>,
+    cfg: &ForgeConfig,
+) -> Result<Option<Duration>, ForgeError> {
+    let duration = resolve_duration_setting(
+        explicit,
+        ENV_INBOX_PROVIDER_TIMEOUT,
+        cfg.inbox_provider_timeout,
+        DEFAULT_PROVIDER_TIMEOUT,
+    )?;
+    Ok((!duration.is_zero()).then_some(duration))
+}
+
+fn env_string(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env_string(name).map(PathBuf::from)
+}
+
+fn env_bool(name: &str) -> Result<bool, ForgeError> {
+    let Some(raw) = env_string(name) else {
+        return Ok(false);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(ForgeError::validation(
+            schema_err(),
+            "bool_invalid",
+            format!("{name} must be true or false"),
+            None,
+        )),
+    }
+}
+
+fn cache_dir() -> Option<PathBuf> {
+    env_path(ENV_INBOX_CACHE_DIR)
+        .or_else(|| env_path("XDG_CACHE_HOME").map(|p| p.join("nils-cli/forge-cli/inbox")))
+        .or_else(|| env_path("HOME").map(|p| p.join(".cache/nils-cli/forge-cli/inbox")))
 }
 
 fn resolve_targets(global: &GlobalFlags, gitlab_host: Option<&str>) -> Vec<ProviderTarget> {
@@ -431,7 +845,7 @@ impl ProviderPlan {
     /// Render the argv list a dry-run would emit. GitLab queries that depend
     /// on identity are rendered with placeholder `<user_id>` / `<username>`
     /// values so callers can still inspect what the live path would call.
-    fn dry_run_argv(&self) -> Vec<Vec<String>> {
+    fn dry_run_argv(&self, runtime: &InboxRuntimeConfig) -> Vec<Vec<String>> {
         match self.target.provider {
             Provider::GitHub => github_queries(&self.config)
                 .into_iter()
@@ -439,6 +853,16 @@ impl ProviderPlan {
                 .collect(),
             Provider::GitLab => {
                 let mut out = Vec::new();
+                if gitlab_vpn_check_for_target(&self.target, runtime).is_some() {
+                    out.push(vec![
+                        "vpn-check".to_string(),
+                        runtime.gitlab_vpn_mode.as_str().to_string(),
+                        gitlab_vpn_check_for_target(&self.target, runtime)
+                            .expect("checked")
+                            .kind()
+                            .to_string(),
+                    ]);
+                }
                 let needs_identity = self.config.gitlab_identity_needed();
                 if needs_identity {
                     out.push(gitlab_identity_call(&self.target.host).plan_argv());
@@ -456,10 +880,14 @@ impl ProviderPlan {
         }
     }
 
-    fn execute<R: BackendRunner + Sync>(&self, runner: &R) -> Result<ProviderSuccess, ForgeError> {
+    fn execute<R: BackendRunner + Sync>(
+        &self,
+        runner: &R,
+        runtime: &InboxRuntimeConfig,
+    ) -> Result<ProviderSuccess, ForgeError> {
         match self.target.provider {
-            Provider::GitHub => execute_github(runner, &self.target, &self.config),
-            Provider::GitLab => execute_gitlab(runner, &self.target, &self.config),
+            Provider::GitHub => execute_github(runner, &self.target, &self.config, runtime),
+            Provider::GitLab => execute_gitlab(runner, &self.target, &self.config, runtime),
         }
     }
 }
@@ -468,6 +896,7 @@ fn collect_inbox<R: BackendRunner + Sync>(
     runner: &R,
     targets: &[ProviderTarget],
     config: &QueryConfig,
+    runtime: &InboxRuntimeConfig,
 ) -> Result<InboxCollection, ForgeError> {
     let plans: Vec<ProviderPlan> = targets
         .iter()
@@ -482,7 +911,7 @@ fn collect_inbox<R: BackendRunner + Sync>(
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(plans.len());
         for (i, plan) in plans.iter().enumerate() {
-            handles.push(s.spawn(move || (i, plan.execute(runner))));
+            handles.push(s.spawn(move || (i, plan.execute(runner, runtime))));
         }
         for h in handles {
             let (i, res) = h.join().expect("inbox provider task panicked");
@@ -511,14 +940,27 @@ fn collect_inbox<R: BackendRunner + Sync>(
                     item_count,
                     limited: success.limited,
                     error: None,
+                    cache: None,
                 });
                 items.extend(success.items);
+                warnings.extend(success.warnings);
+                if !runtime.cache.no_cache
+                    && let Some(warning) = write_provider_cache(
+                        target,
+                        config,
+                        runtime,
+                        &items_for_provider(&items, target),
+                    )
+                {
+                    warnings.push(warning);
+                }
             }
             Err(err) => {
                 let provider_error = InboxProviderError {
                     kind: err.kind(),
                     message: err.to_string(),
                 };
+                let cached = read_provider_cache(target, config, runtime, provider_error.kind);
                 failures.push(format!(
                     "{} {}: {}",
                     target.provider.as_str(),
@@ -531,24 +973,38 @@ fn collect_inbox<R: BackendRunner + Sync>(
                     target.host,
                     provider_error.message
                 ));
+                let (cached_items, cache_status) = match cached {
+                    Some(cached) => {
+                        warnings.push(format!(
+                            "provider_cache_fallback: {} {}: using {} stale item(s), age={}s",
+                            target.provider.as_str(),
+                            target.host,
+                            cached.items.len(),
+                            cached.age_seconds
+                        ));
+                        let status = InboxProviderCacheStatus {
+                            used: true,
+                            stale: true,
+                            age_seconds: cached.age_seconds,
+                            item_count: cached.items.len(),
+                        };
+                        (cached.items, Some(status))
+                    }
+                    None => (Vec::new(), None),
+                };
+                let item_count = cached_items.len();
+                items.extend(cached_items);
                 providers.push(InboxProviderStatus {
                     provider: target.provider.as_str(),
                     host: target.host.clone(),
                     ok: false,
-                    item_count: 0,
+                    item_count,
                     limited: false,
                     error: Some(provider_error),
+                    cache: cache_status,
                 });
             }
         }
-    }
-
-    if successes == 0 {
-        return Err(ForgeError::backend_error(
-            schema_err(),
-            "all selected inbox providers failed",
-            Some(failures.join("; ")),
-        ));
     }
 
     let mut items = dedupe_items(items);
@@ -566,6 +1022,8 @@ fn collect_inbox<R: BackendRunner + Sync>(
         providers,
         items,
         warnings,
+        successes,
+        failures: failures.len(),
     })
 }
 
@@ -573,9 +1031,11 @@ fn execute_github<R: BackendRunner + Sync>(
     runner: &R,
     target: &ProviderTarget,
     config: &QueryConfig,
+    runtime: &InboxRuntimeConfig,
 ) -> Result<ProviderSuccess, ForgeError> {
     let queries = github_queries(config);
-    let per_query = run_queries_in_parallel(runner, &queries, |query, output| {
+    let _ = runtime;
+    let per_query = run_queries_in_parallel(runner, &queries, None, |query, output| {
         parse_github_items(target, query, output)
     })?;
     Ok(aggregate_query_results(per_query, config.query_limit))
@@ -585,20 +1045,31 @@ fn execute_gitlab<R: BackendRunner + Sync>(
     runner: &R,
     target: &ProviderTarget,
     config: &QueryConfig,
+    runtime: &InboxRuntimeConfig,
 ) -> Result<ProviderSuccess, ForgeError> {
+    let mut warnings = Vec::new();
+    if let Some(warning) = check_gitlab_vpn(target, runtime)? {
+        warnings.push(warning);
+    }
     let identity = if config.gitlab_identity_needed() {
-        Some(parse_gitlab_identity(
-            &runner.run(&gitlab_identity_call(&target.host))?,
-        )?)
+        Some(parse_gitlab_identity(&runner.run_with_timeout(
+            &gitlab_identity_call(&target.host),
+            runtime.provider_timeout,
+        )?)?)
     } else {
         None
     };
     let queries = gitlab_queries(&target.host, identity.as_ref(), config);
     let item_type = config.item_type;
-    let per_query = run_queries_in_parallel(runner, &queries, |query, output| {
-        parse_gitlab_items(target, query, output, item_type)
-    })?;
-    Ok(aggregate_query_results(per_query, config.query_limit))
+    let per_query = run_queries_in_parallel(
+        runner,
+        &queries,
+        runtime.provider_timeout,
+        |query, output| parse_gitlab_items(target, query, output, item_type),
+    )?;
+    let mut success = aggregate_query_results(per_query, config.query_limit);
+    success.warnings.extend(warnings);
+    Ok(success)
 }
 
 /// Run a slice of independent provider query families concurrently and
@@ -608,6 +1079,7 @@ fn execute_gitlab<R: BackendRunner + Sync>(
 fn run_queries_in_parallel<R, F>(
     runner: &R,
     queries: &[ProviderQuery],
+    timeout: Option<Duration>,
     parse: F,
 ) -> Result<Vec<Vec<InboxItem>>, ForgeError>
 where
@@ -625,7 +1097,7 @@ where
         for (i, query) in queries.iter().enumerate() {
             handles.push(s.spawn(move || {
                 let result = runner
-                    .run(&query.call)
+                    .run_with_timeout(&query.call, timeout)
                     .and_then(|output| parse_ref(query, &output));
                 (i, result)
             }));
@@ -654,6 +1126,499 @@ fn aggregate_query_results(per_query: Vec<Vec<InboxItem>>, query_limit: u32) -> 
     ProviderSuccess {
         items: dedupe_items(items),
         limited,
+        warnings: Vec::new(),
+    }
+}
+
+fn gitlab_vpn_check_for_target(
+    target: &ProviderTarget,
+    runtime: &InboxRuntimeConfig,
+) -> Option<VpnCheck> {
+    if target.provider != Provider::GitLab || runtime.gitlab_vpn_mode == GitlabVpnMode::Off {
+        return None;
+    }
+    runtime.gitlab_vpn_check.clone().or_else(|| {
+        (runtime.gitlab_vpn_mode == GitlabVpnMode::Required).then(|| VpnCheck::Tcp {
+            host: target.host.clone(),
+            port: 443,
+        })
+    })
+}
+
+fn check_gitlab_vpn(
+    target: &ProviderTarget,
+    runtime: &InboxRuntimeConfig,
+) -> Result<Option<String>, ForgeError> {
+    let Some(check) = gitlab_vpn_check_for_target(target, runtime) else {
+        return Ok(None);
+    };
+    match run_vpn_check(&check, target, runtime) {
+        Ok(()) => Ok(None),
+        Err(err) if runtime.gitlab_vpn_mode == GitlabVpnMode::Optional => Ok(Some(format!(
+            "vpn_probe_failed: gitlab {}: {}",
+            target.host,
+            sanitize_sensitive(&err.to_string(), runtime)
+        ))),
+        Err(err) => Err(err),
+    }
+}
+
+fn run_vpn_check(
+    check: &VpnCheck,
+    target: &ProviderTarget,
+    runtime: &InboxRuntimeConfig,
+) -> Result<(), ForgeError> {
+    match check {
+        VpnCheck::Tcp { host, port } => run_tcp_vpn_check(host, *port, runtime),
+        VpnCheck::Cmd { program } => run_cmd_vpn_check(program, target, runtime),
+        VpnCheck::OpenVpn => run_openvpn_check(runtime),
+    }
+}
+
+fn run_tcp_vpn_check(
+    host: &str,
+    port: u16,
+    runtime: &InboxRuntimeConfig,
+) -> Result<(), ForgeError> {
+    let timeout = runtime.gitlab_vpn_check_timeout;
+    let host = host.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn({
+        let host = host.clone();
+        move || {
+            let _ = tx.send(resolve_and_connect_tcp_probe(&host, port, timeout));
+        }
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(TcpProbeError::Resolve(err))) => Err(vpn_unavailable(
+            format!("GitLab VPN TCP probe could not resolve host: {err}"),
+            None,
+        )),
+        Ok(Err(TcpProbeError::NoAddress)) => Err(vpn_unavailable(
+            "GitLab VPN TCP probe found no address",
+            None,
+        )),
+        Ok(Err(TcpProbeError::Connect(err))) => Err(vpn_unavailable(
+            format!(
+                "GitLab VPN TCP probe failed for {host}:{port} within {}: {err}",
+                format_duration(timeout)
+            ),
+            None,
+        )),
+        Ok(Err(TcpProbeError::Timeout)) | Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(vpn_unavailable(
+                format!(
+                    "GitLab VPN TCP probe timed out for {host}:{port} after {}",
+                    format_duration(timeout)
+                ),
+                None,
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(vpn_unavailable(
+            "GitLab VPN TCP probe worker ended without a result",
+            None,
+        )),
+    }
+}
+
+enum TcpProbeError {
+    Resolve(String),
+    NoAddress,
+    Connect(String),
+    Timeout,
+}
+
+fn resolve_and_connect_tcp_probe(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), TcpProbeError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| TcpProbeError::Resolve(err.to_string()))?;
+    let mut saw_addr = false;
+    let mut last_err = None;
+    for addr in addrs {
+        saw_addr = true;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(TcpProbeError::Timeout);
+        }
+        match TcpStream::connect_timeout(&addr, remaining) {
+            Ok(_) => return Ok(()),
+            Err(err) => last_err = Some(err.to_string()),
+        }
+    }
+    if saw_addr {
+        Err(TcpProbeError::Connect(
+            last_err.unwrap_or_else(|| "connection failed".to_string()),
+        ))
+    } else {
+        Err(TcpProbeError::NoAddress)
+    }
+}
+
+fn run_cmd_vpn_check(
+    program: &str,
+    target: &ProviderTarget,
+    runtime: &InboxRuntimeConfig,
+) -> Result<(), ForgeError> {
+    let mut cmd = Command::new(program);
+    cmd.env("FORGE_CLI_INBOX_GITLAB_HOST", &target.host);
+    if let Some(profile) = runtime.gitlab_openvpn_profile.as_ref() {
+        cmd.env(ENV_INBOX_GITLAB_OPENVPN_PROFILE, profile);
+    }
+    match command_output_with_timeout(&mut cmd, runtime.gitlab_vpn_check_timeout) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = sanitize_sensitive(
+                &crate::backend::redact_and_tail(&String::from_utf8_lossy(&output.stderr)),
+                runtime,
+            );
+            Err(vpn_unavailable(
+                "GitLab VPN readiness command failed",
+                (!stderr.is_empty()).then_some(stderr),
+            ))
+        }
+        Err(CommandProbeError::Timeout) => Err(vpn_unavailable(
+            format!(
+                "GitLab VPN readiness command timed out after {}",
+                format_duration(runtime.gitlab_vpn_check_timeout)
+            ),
+            None,
+        )),
+        Err(CommandProbeError::Io(err)) if err.kind() == io::ErrorKind::NotFound => Err(
+            vpn_probe_dependency_missing("GitLab VPN readiness command not found"),
+        ),
+        Err(CommandProbeError::Io(err)) => Err(vpn_unavailable(
+            format!("GitLab VPN readiness command could not run: {err}"),
+            None,
+        )),
+    }
+}
+
+fn run_openvpn_check(runtime: &InboxRuntimeConfig) -> Result<(), ForgeError> {
+    if let Some(profile) = runtime.gitlab_openvpn_profile.as_ref()
+        && !profile.is_file()
+    {
+        return Err(vpn_unavailable(
+            "OpenVPN profile is configured but is not readable (<redacted>)",
+            None,
+        ));
+    }
+    let mut cmd = Command::new("openvpn");
+    cmd.arg("--version");
+    match command_output_with_timeout(&mut cmd, runtime.gitlab_vpn_check_timeout) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = sanitize_sensitive(
+                &crate::backend::redact_and_tail(&String::from_utf8_lossy(&output.stderr)),
+                runtime,
+            );
+            Err(vpn_unavailable(
+                "openvpn probe failed",
+                (!stderr.is_empty()).then_some(stderr),
+            ))
+        }
+        Err(CommandProbeError::Timeout) => Err(vpn_unavailable(
+            format!(
+                "openvpn probe timed out after {}",
+                format_duration(runtime.gitlab_vpn_check_timeout)
+            ),
+            None,
+        )),
+        Err(CommandProbeError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
+            Err(vpn_probe_dependency_missing(
+                "openvpn not found on PATH; install it with Homebrew or choose a tcp/cmd check",
+            ))
+        }
+        Err(CommandProbeError::Io(err)) => Err(vpn_unavailable(
+            format!("openvpn probe could not run: {err}"),
+            None,
+        )),
+    }
+}
+
+fn vpn_unavailable(message: impl Into<String>, detail: Option<String>) -> ForgeError {
+    ForgeError::unavailable(schema_err(), "vpn_unavailable", message, detail)
+}
+
+fn vpn_probe_dependency_missing(message: impl Into<String>) -> ForgeError {
+    ForgeError::unavailable(schema_err(), "vpn_probe_dependency_missing", message, None)
+}
+
+enum CommandProbeError {
+    Io(io::Error),
+    Timeout,
+}
+
+fn command_output_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, CommandProbeError> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_child_group(cmd);
+    let mut child = cmd.spawn().map_err(CommandProbeError::Io)?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait().map_err(CommandProbeError::Io)?.is_some() {
+            return child.wait_with_output().map_err(CommandProbeError::Io);
+        }
+        if started.elapsed() >= timeout {
+            kill_child_group(&mut child);
+            let _ = child.wait();
+            return Err(CommandProbeError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn configure_child_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+}
+
+fn kill_child_group(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        let pgid = -(child.id() as libc::pid_t);
+        let _ = libc::kill(pgid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+fn emit_failure_if_needed(
+    schema_version: String,
+    collection: &InboxCollection,
+    runtime: &InboxRuntimeConfig,
+    format: OutputFormat,
+) -> Option<i32> {
+    if collection.successes == 0 {
+        return Some(emit_inbox_failure(
+            schema_version,
+            "backend_error",
+            "all selected inbox providers failed",
+            collection,
+            format,
+        ));
+    }
+    if runtime.strict_providers && collection.failures > 0 {
+        return Some(emit_inbox_failure(
+            schema_version,
+            "provider_failed",
+            "one or more selected inbox providers failed",
+            collection,
+            format,
+        ));
+    }
+    None
+}
+
+fn emit_inbox_failure(
+    schema_version: String,
+    code: &'static str,
+    message: &'static str,
+    collection: &InboxCollection,
+    format: OutputFormat,
+) -> i32 {
+    let details = serde_json::json!({
+        "providers": collection.providers,
+        "warnings": collection.warnings,
+        "item_count": collection.items.len(),
+    });
+    match format {
+        OutputFormat::Json => {
+            let envelope: Envelope<()> = Envelope::failure(
+                schema_version,
+                EnvelopeError::new(code, message).with_details(details),
+            );
+            println!(
+                "{}",
+                serde_json::to_string(&envelope).unwrap_or_else(|_| "{\"ok\":false}".to_string())
+            );
+        }
+        OutputFormat::Text => {
+            eprintln!("error: {code}: {message}");
+            for warning in &collection.warnings {
+                eprintln!("warning: {warning}");
+            }
+        }
+    }
+    exit::RUNTIME
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InboxCacheSnapshot {
+    schema_version: String,
+    provider: String,
+    host: String,
+    item_type: String,
+    reasons: Vec<String>,
+    query_limit: u32,
+    created_unix: u64,
+    items: Vec<InboxItem>,
+}
+
+struct CachedProviderItems {
+    age_seconds: u64,
+    items: Vec<InboxItem>,
+}
+
+fn write_provider_cache(
+    target: &ProviderTarget,
+    config: &QueryConfig,
+    runtime: &InboxRuntimeConfig,
+    items: &[InboxItem],
+) -> Option<String> {
+    let dir = runtime.cache.dir.as_ref()?;
+    if let Err(err) = fs::create_dir_all(dir) {
+        return Some(format!(
+            "provider_cache_write_failed: {} {}: {err}",
+            target.provider.as_str(),
+            target.host
+        ));
+    }
+    let path = cache_file_path(dir, target, config);
+    let snapshot = InboxCacheSnapshot {
+        schema_version: "forge-cli.inbox.cache.v1".to_string(),
+        provider: target.provider.as_str().to_string(),
+        host: target.host.clone(),
+        item_type: config.item_type.as_str().to_string(),
+        reasons: config
+            .reasons
+            .iter()
+            .map(|reason| reason.as_str().to_string())
+            .collect(),
+        query_limit: config.query_limit,
+        created_unix: now_unix(),
+        items: items.to_vec(),
+    };
+    match serde_json::to_vec_pretty(&snapshot)
+        .map_err(|err| err.to_string())
+        .and_then(|body| fs::write(&path, body).map_err(|err| err.to_string()))
+    {
+        Ok(()) => None,
+        Err(err) => Some(format!(
+            "provider_cache_write_failed: {} {}: {err}",
+            target.provider.as_str(),
+            target.host
+        )),
+    }
+}
+
+fn read_provider_cache(
+    target: &ProviderTarget,
+    config: &QueryConfig,
+    runtime: &InboxRuntimeConfig,
+    reason: &'static str,
+) -> Option<CachedProviderItems> {
+    if runtime.cache.no_cache || !runtime.cache.fallback {
+        return None;
+    }
+    let dir = runtime.cache.dir.as_ref()?;
+    let path = cache_file_path(dir, target, config);
+    let body = fs::read_to_string(path).ok()?;
+    let snapshot: InboxCacheSnapshot = serde_json::from_str(&body).ok()?;
+    if snapshot.provider != target.provider.as_str()
+        || snapshot.host != target.host
+        || snapshot.item_type != config.item_type.as_str()
+        || snapshot.query_limit != config.query_limit
+    {
+        return None;
+    }
+    let age_seconds = now_unix().saturating_sub(snapshot.created_unix);
+    if age_seconds > runtime.cache.max_age.as_secs() {
+        return None;
+    }
+    let items = snapshot
+        .items
+        .into_iter()
+        .map(|mut item| {
+            item.stale = Some(InboxStaleMetadata {
+                reason: reason.to_string(),
+                cached_at_unix: snapshot.created_unix,
+                age_seconds,
+            });
+            item
+        })
+        .collect();
+    Some(CachedProviderItems { age_seconds, items })
+}
+
+fn items_for_provider(items: &[InboxItem], target: &ProviderTarget) -> Vec<InboxItem> {
+    let provider = target.provider.as_str();
+    items
+        .iter()
+        .filter(|item| item.provider == provider && item.host == target.host)
+        .cloned()
+        .collect()
+}
+
+fn cache_file_path(dir: &Path, target: &ProviderTarget, config: &QueryConfig) -> PathBuf {
+    let reasons = config
+        .reasons
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect::<Vec<_>>()
+        .join("+");
+    dir.join(format!(
+        "{}-{}-{}-{}-{}.json",
+        target.provider.as_str(),
+        sanitize_filename(&target.host),
+        config.item_type.as_str(),
+        sanitize_filename(&reasons),
+        config.query_limit
+    ))
+}
+
+fn sanitize_filename(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn sanitize_sensitive(raw: &str, runtime: &InboxRuntimeConfig) -> String {
+    let mut out = raw.to_string();
+    if let Some(profile) = runtime.gitlab_openvpn_profile.as_ref() {
+        let profile = profile.to_string_lossy();
+        if !profile.is_empty() {
+            out = out.replace(profile.as_ref(), "<redacted-openvpn-profile>");
+        }
+    }
+    out
+}
+
+fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        format!("{millis}ms")
+    } else if millis.is_multiple_of(60_000) {
+        format!("{}m", millis / 60_000)
+    } else if millis.is_multiple_of(1_000) {
+        format!("{}s", millis / 1_000)
+    } else {
+        format!("{millis}ms")
     }
 }
 
@@ -872,7 +1837,7 @@ fn parse_github_items(
             let url = required_str(raw, "url")?;
             let repo = github_repo(raw).unwrap_or_else(|| repo_from_url(&url));
             Ok(InboxItem {
-                provider: Provider::GitHub.as_str(),
+                provider: Provider::GitHub.as_str().to_string(),
                 host: target.host.clone(),
                 kind: query.reason.as_str().to_string(),
                 reasons: vec![query.reason.as_str().to_string()],
@@ -882,7 +1847,8 @@ fn parse_github_items(
                 url,
                 updated_at: optional_str(raw, "updatedAt").unwrap_or_default(),
                 author: github_author(raw),
-                source: query.source,
+                source: query.source.to_string(),
+                stale: None,
             })
         })
         .collect()
@@ -961,7 +1927,7 @@ fn parse_gitlab_work_item(
         .ok_or_else(|| missing("iid"))?;
     let url = required_str(raw, "web_url")?;
     Ok(InboxItem {
-        provider: Provider::GitLab.as_str(),
+        provider: Provider::GitLab.as_str().to_string(),
         host: target.host.clone(),
         kind: query.reason.as_str().to_string(),
         reasons: vec![query.reason.as_str().to_string()],
@@ -971,7 +1937,8 @@ fn parse_gitlab_work_item(
         url,
         updated_at: optional_str(raw, "updated_at").unwrap_or_default(),
         author: gitlab_author(raw),
-        source: query.source,
+        source: query.source.to_string(),
+        stale: None,
     })
 }
 
@@ -991,7 +1958,7 @@ fn parse_gitlab_todo(
         .or_else(|| raw.get("id").and_then(|v| v.as_u64()))
         .ok_or_else(|| missing("target.iid"))?;
     Ok(InboxItem {
-        provider: Provider::GitLab.as_str(),
+        provider: Provider::GitLab.as_str().to_string(),
         host: target.host.clone(),
         kind: query.reason.as_str().to_string(),
         reasons: vec![query.reason.as_str().to_string()],
@@ -1013,7 +1980,8 @@ fn parse_gitlab_todo(
             .get("author")
             .and_then(gitlab_author_from_value)
             .or_else(|| raw.get("author").and_then(gitlab_author_from_value)),
-        source: query.source,
+        source: query.source.to_string(),
+        stale: None,
     })
 }
 
@@ -1143,7 +2111,7 @@ fn dedupe_items(items: Vec<InboxItem>) -> Vec<InboxItem> {
     let mut map: HashMap<ItemKey, InboxItem> = HashMap::new();
     for item in items {
         let key = ItemKey {
-            provider: item.provider,
+            provider: item.provider.clone(),
             host: item.host.clone(),
             repo: item.repo.clone(),
             number: item.number,
@@ -1187,7 +2155,7 @@ fn sort_items(items: &mut [InboxItem]) {
         reason_rank(a.kind.as_str())
             .cmp(&reason_rank(b.kind.as_str()))
             .then_with(|| b.updated_at.cmp(&a.updated_at))
-            .then_with(|| a.provider.cmp(b.provider))
+            .then_with(|| a.provider.cmp(&b.provider))
             .then_with(|| a.host.cmp(&b.host))
             .then_with(|| a.repo.cmp(&b.repo))
             .then_with(|| a.number.cmp(&b.number))
@@ -1215,11 +2183,11 @@ fn summarize_counts(providers: &[InboxProviderStatus], items: &[InboxItem]) -> V
         );
     }
 
-    let mut counts: HashMap<(&'static str, String, String), usize> = HashMap::new();
+    let mut counts: HashMap<(String, String, String), usize> = HashMap::new();
     for item in items {
         for reason in &item.reasons {
             *counts
-                .entry((item.provider, item.host.clone(), reason.clone()))
+                .entry((item.provider.clone(), item.host.clone(), reason.clone()))
                 .or_insert(0) += 1;
         }
     }
@@ -1227,13 +2195,13 @@ fn summarize_counts(providers: &[InboxProviderStatus], items: &[InboxItem]) -> V
     let mut rows: Vec<InboxCount> = counts
         .into_iter()
         .map(|((provider, host, reason), count)| InboxCount {
-            provider,
+            provider: provider_static(&provider),
             host: host.clone(),
             kind: reason.clone(),
             reason,
             count,
             limited: *limited_by_provider
-                .get(&(provider, host.as_str()))
+                .get(&(provider_static(&provider), host.as_str()))
                 .unwrap_or(&false),
         })
         .collect();
@@ -1253,10 +2221,19 @@ fn summarize_counts(providers: &[InboxProviderStatus], items: &[InboxItem]) -> V
     rows
 }
 
+fn provider_static(provider: &str) -> &'static str {
+    match provider {
+        "github" => Provider::GitHub.as_str(),
+        "gitlab" => Provider::GitLab.as_str(),
+        _ => "unknown",
+    }
+}
+
 fn emit_dry_run(
     schema_version: String,
     targets: &[ProviderTarget],
     config: &QueryConfig,
+    runtime: &InboxRuntimeConfig,
     limit: u32,
     query_limit: Option<u32>,
     format: OutputFormat,
@@ -1266,12 +2243,20 @@ fn emit_dry_run(
         .map(|target| InboxDryRunProvider {
             provider: target.provider.as_str(),
             host: target.host.clone(),
-            plans: dry_run_plans(target, config),
+            vpn: dry_run_vpn(target, runtime),
+            plans: dry_run_plans(target, config, runtime),
         })
         .collect();
     let payload = InboxDryRunPayload {
         providers,
         limit,
+        provider_timeout_seconds: runtime.provider_timeout.map(|d| d.as_secs()),
+        strict_providers: runtime.strict_providers,
+        cache: InboxDryRunCache {
+            enabled: !runtime.cache.no_cache,
+            fallback: runtime.cache.fallback,
+            max_age_seconds: runtime.cache.max_age.as_secs(),
+        },
         query_limit,
     };
     emit_success_with_warnings(schema_version, payload, Vec::new(), format, |payload| {
@@ -1283,8 +2268,27 @@ fn emit_dry_run(
     })
 }
 
-fn dry_run_plans(target: &ProviderTarget, config: &QueryConfig) -> Vec<Vec<String>> {
-    ProviderPlan::build(target, config).dry_run_argv()
+fn dry_run_plans(
+    target: &ProviderTarget,
+    config: &QueryConfig,
+    runtime: &InboxRuntimeConfig,
+) -> Vec<Vec<String>> {
+    ProviderPlan::build(target, config).dry_run_argv(runtime)
+}
+
+fn dry_run_vpn(target: &ProviderTarget, runtime: &InboxRuntimeConfig) -> Option<InboxDryRunVpn> {
+    if target.provider != Provider::GitLab {
+        return None;
+    }
+    gitlab_vpn_check_for_target(target, runtime).map(|check| InboxDryRunVpn {
+        mode: runtime.gitlab_vpn_mode.as_str(),
+        check_kind: check.kind(),
+        check_timeout_seconds: runtime.gitlab_vpn_check_timeout.as_secs(),
+        openvpn_profile: runtime
+            .gitlab_openvpn_profile
+            .as_ref()
+            .map(|_| "<redacted>"),
+    })
 }
 
 fn render_list_text(payload: &InboxListPayload) {
@@ -1336,6 +2340,25 @@ fn schema_err() -> String {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_runtime() -> InboxRuntimeConfig {
+        InboxRuntimeConfig {
+            gitlab_vpn_mode: GitlabVpnMode::Off,
+            gitlab_vpn_check: None,
+            gitlab_vpn_check_timeout: DEFAULT_VPN_CHECK_TIMEOUT,
+            gitlab_openvpn_profile: None,
+            provider_timeout: None,
+            strict_providers: false,
+            cache: CachePolicy {
+                no_cache: true,
+                fallback: false,
+                max_age: DEFAULT_CACHE_MAX_AGE,
+                dir: None,
+            },
+        }
+    }
 
     #[test]
     fn inbox_provider_resolver_defaults_to_both_providers() {
@@ -1356,7 +2379,7 @@ mod tests {
     #[test]
     fn inbox_contract_dedupes_reasons_by_priority() {
         let item = InboxItem {
-            provider: "github",
+            provider: "github".to_string(),
             host: "github.com".into(),
             kind: "assigned".into(),
             reasons: vec!["assigned".into()],
@@ -1366,12 +2389,13 @@ mod tests {
             url: "https://github.com/acme/widgets/pull/7".into(),
             updated_at: "2026-05-21T00:00:00Z".into(),
             author: Some("alice".into()),
-            source: "github_search_prs",
+            source: "github_search_prs".to_string(),
+            stale: None,
         };
         let mut duplicate = item.clone();
         duplicate.kind = "review".into();
         duplicate.reasons = vec!["review".into()];
-        duplicate.source = "github_review_search";
+        duplicate.source = "github_review_search".to_string();
         duplicate.updated_at = "2026-05-22T00:00:00Z".into();
 
         let items = dedupe_items(vec![item, duplicate]);
@@ -1380,6 +2404,178 @@ mod tests {
         assert_eq!(items[0].reasons, vec!["review", "assigned"]);
         assert_eq!(items[0].source, "github_review_search");
         assert_eq!(items[0].updated_at, "2026-05-22T00:00:00Z");
+    }
+
+    #[test]
+    fn inbox_vpn_settings_parse_aliases_and_reject_invalid_values() {
+        assert_eq!(parse_vpn_mode("disabled").unwrap(), GitlabVpnMode::Off);
+        assert_eq!(parse_vpn_mode("true").unwrap(), GitlabVpnMode::Required);
+        assert_eq!(parse_vpn_mode("optional").unwrap(), GitlabVpnMode::Optional);
+        assert_eq!(
+            parse_vpn_mode("bogus").unwrap_err().kind(),
+            "vpn_mode_invalid"
+        );
+
+        assert!(matches!(
+            parse_vpn_check("openvpn").unwrap(),
+            VpnCheck::OpenVpn
+        ));
+        assert!(matches!(
+            parse_vpn_check("cmd: check-vpn").unwrap(),
+            VpnCheck::Cmd { program } if program == "check-vpn"
+        ));
+        assert!(matches!(
+            parse_vpn_check("tcp:gitlab.example.com:443").unwrap(),
+            VpnCheck::Tcp { host, port } if host == "gitlab.example.com" && port == 443
+        ));
+
+        for raw in [
+            "cmd:",
+            "tcp:gitlab.example.com:not-a-port",
+            "tcp::443",
+            "bogus",
+        ] {
+            assert_eq!(
+                parse_vpn_check(raw).unwrap_err().kind(),
+                "vpn_check_invalid"
+            );
+        }
+
+        assert_eq!(format_duration(Duration::from_millis(250)), "250ms");
+        assert_eq!(format_duration(Duration::from_millis(1_500)), "1500ms");
+        assert_eq!(format_duration(Duration::from_secs(2)), "2s");
+        assert_eq!(format_duration(Duration::from_secs(120)), "2m");
+    }
+
+    #[test]
+    fn inbox_required_vpn_defaults_to_gitlab_https_tcp_probe() {
+        let mut runtime = test_runtime();
+        runtime.gitlab_vpn_mode = GitlabVpnMode::Required;
+
+        let gitlab = ProviderTarget {
+            provider: Provider::GitLab,
+            host: "gitlab.example.com".into(),
+        };
+        assert!(matches!(
+            gitlab_vpn_check_for_target(&gitlab, &runtime),
+            Some(VpnCheck::Tcp { host, port }) if host == "gitlab.example.com" && port == 443
+        ));
+
+        let github = ProviderTarget {
+            provider: Provider::GitHub,
+            host: "github.com".into(),
+        };
+        assert!(gitlab_vpn_check_for_target(&github, &runtime).is_none());
+
+        runtime.gitlab_vpn_mode = GitlabVpnMode::Off;
+        assert!(gitlab_vpn_check_for_target(&gitlab, &runtime).is_none());
+    }
+
+    #[test]
+    fn inbox_tcp_vpn_probe_connects_and_reports_refused_ports() {
+        let mut runtime = test_runtime();
+        runtime.gitlab_vpn_check_timeout = Duration::from_millis(250);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        run_tcp_vpn_check("127.0.0.1", port, &runtime).expect("tcp probe connects");
+
+        drop(listener);
+        let err = run_tcp_vpn_check("127.0.0.1", port, &runtime)
+            .expect_err("closed listener should fail readiness");
+        assert_eq!(err.kind(), "vpn_unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inbox_cmd_vpn_probe_sanitizes_profile_and_reports_missing_command() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let profile = tmp.path().join("profile.ovpn");
+        std::fs::write(&profile, "client\n").expect("write profile");
+        let script = tmp.path().join("check-vpn");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho '{}' >&2\nexit 7\n", profile.display()),
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod script");
+
+        let mut runtime = test_runtime();
+        runtime.gitlab_vpn_check_timeout = Duration::from_millis(250);
+        runtime.gitlab_openvpn_profile = Some(profile.clone());
+        let target = ProviderTarget {
+            provider: Provider::GitLab,
+            host: "gitlab.example.com".into(),
+        };
+
+        let err = run_cmd_vpn_check(script.to_str().expect("script path"), &target, &runtime)
+            .expect_err("failing command should fail readiness");
+        assert_eq!(err.kind(), "vpn_unavailable");
+
+        let redacted = sanitize_sensitive(&format!("stderr: {}", profile.display()), &runtime);
+        assert!(!redacted.contains(&profile.to_string_lossy().to_string()));
+        assert!(redacted.contains("<redacted-openvpn-profile>"));
+
+        let missing = tmp.path().join("missing-check");
+        let err = run_cmd_vpn_check(missing.to_str().expect("missing path"), &target, &runtime)
+            .expect_err("missing command should be unavailable");
+        assert_eq!(err.kind(), "vpn_probe_dependency_missing");
+    }
+
+    #[test]
+    fn inbox_openvpn_probe_redacts_unreadable_profile_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let profile = tmp.path().join("missing.ovpn");
+        let mut runtime = test_runtime();
+        runtime.gitlab_openvpn_profile = Some(profile.clone());
+
+        let err = run_openvpn_check(&runtime).expect_err("missing profile should fail before exec");
+        let rendered = err.to_string();
+        assert_eq!(err.kind(), "vpn_unavailable");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(&profile.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn inbox_provider_cache_round_trips_items_as_stale() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut runtime = test_runtime();
+        runtime.cache.no_cache = false;
+        runtime.cache.fallback = true;
+        runtime.cache.dir = Some(tmp.path().to_path_buf());
+
+        let target = ProviderTarget {
+            provider: Provider::GitLab,
+            host: "gitlab.example.com:8443".into(),
+        };
+        let config = QueryConfig::new(vec![InboxKindFlag::Assigned], InboxItemTypeFlag::All, 5);
+        let items = vec![InboxItem {
+            provider: "gitlab".to_string(),
+            host: target.host.clone(),
+            kind: "assigned".into(),
+            reasons: vec!["assigned".into()],
+            repo: "team/widgets".into(),
+            number: 42,
+            title: "Review timeout handling".into(),
+            url: "https://gitlab.example.com/team/widgets/-/merge_requests/42".into(),
+            updated_at: "2026-05-24T00:00:00Z".into(),
+            author: Some("alice".into()),
+            source: "gitlab_merge_requests".to_string(),
+            stale: None,
+        }];
+
+        assert!(write_provider_cache(&target, &config, &runtime, &items).is_none());
+        let cached = read_provider_cache(&target, &config, &runtime, "provider_failed")
+            .expect("read provider cache");
+        assert_eq!(cached.items.len(), 1);
+        assert_eq!(cached.items[0].repo, "team/widgets");
+        let stale = cached.items[0].stale.as_ref().expect("stale metadata");
+        assert_eq!(stale.reason, "provider_failed");
+        assert!(cached.age_seconds <= runtime.cache.max_age.as_secs());
     }
 
     /// Fake runner that records concurrent-call peak via atomic counters.
@@ -1449,7 +2645,8 @@ mod tests {
             host: "github.com".into(),
         };
         let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
-        let result = execute_github(&runner, &target, &config).expect("execute_github");
+        let result =
+            execute_github(&runner, &target, &config, &test_runtime()).expect("execute_github");
         assert!(result.items.is_empty(), "stub returns empty payloads");
 
         let calls = runner.call_count.load(std::sync::atomic::Ordering::SeqCst);
@@ -1480,7 +2677,8 @@ mod tests {
             },
         ];
         let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
-        let collection = collect_inbox(&runner, &targets, &config).expect("collect_inbox");
+        let collection =
+            collect_inbox(&runner, &targets, &config, &test_runtime()).expect("collect_inbox");
         assert_eq!(collection.providers.len(), 2);
         assert_eq!(collection.providers[0].provider, "github");
         assert_eq!(collection.providers[1].provider, "gitlab");
@@ -1534,7 +2732,8 @@ mod tests {
             },
         ];
         let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
-        let collection = collect_inbox(&runner, &targets, &config).expect("collect_inbox");
+        let collection =
+            collect_inbox(&runner, &targets, &config, &test_runtime()).expect("collect_inbox");
         assert_eq!(collection.providers.len(), 2);
         assert_eq!(collection.providers[0].provider, "github");
         assert!(collection.providers[0].ok);
@@ -1664,8 +2863,8 @@ mod tests {
             host: "gitlab.example.com".into(),
         };
         let config = QueryConfig::new(vec![InboxKindFlag::Review], InboxItemTypeFlag::Issue, 30);
-        let result =
-            execute_gitlab(&AssertNoIdentityRunner, &target, &config).expect("execute_gitlab");
+        let result = execute_gitlab(&AssertNoIdentityRunner, &target, &config, &test_runtime())
+            .expect("execute_gitlab");
         assert!(result.items.is_empty());
         assert!(!result.limited);
     }
@@ -1698,9 +2897,14 @@ mod tests {
             host: "github.com".into(),
         }];
         let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
-        let err = collect_inbox(&OneQueryFailsRunner, &targets, &config)
-            .expect_err("must fail when only provider failed");
-        assert_eq!(err.kind(), "backend_error");
+        let collection = collect_inbox(&OneQueryFailsRunner, &targets, &config, &test_runtime())
+            .expect("collect_inbox");
+        assert_eq!(collection.successes, 0);
+        assert_eq!(collection.failures, 1);
+        assert_eq!(
+            collection.providers[0].error.as_ref().expect("error").kind,
+            "backend_error"
+        );
     }
 
     /// Within a single provider, plan-order error determinism: even if a
@@ -1741,7 +2945,7 @@ mod tests {
             host: "github.com".into(),
         };
         let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
-        let err = execute_github(&PlanOrderRunner, &target, &config)
+        let err = execute_github(&PlanOrderRunner, &target, &config, &test_runtime())
             .expect_err("must propagate first plan-order error");
         assert!(
             err.to_string().contains("slow-early-error"),

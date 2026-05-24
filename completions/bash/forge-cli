@@ -998,7 +998,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox__list)
-            opts="-h --gitlab-host --kind --item-type --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --gitlab-host --kind --item-type --limit --gitlab-vpn --gitlab-vpn-check --gitlab-vpn-check-timeout --gitlab-openvpn-profile --provider-timeout --strict-providers --cache-fallback --cache-max-age --no-cache --format --remote --provider --repo --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1017,6 +1017,30 @@ _forge-cli() {
                     return 0
                     ;;
                 --limit)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-vpn)
+                    COMPREPLY=($(compgen -W "off optional required" -- "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-vpn-check)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-vpn-check-timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-openvpn-profile)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider-timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --cache-max-age)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1044,7 +1068,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox__next)
-            opts="-h --gitlab-host --kind --item-type --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --gitlab-host --kind --item-type --limit --gitlab-vpn --gitlab-vpn-check --gitlab-vpn-check-timeout --gitlab-openvpn-profile --provider-timeout --strict-providers --cache-fallback --cache-max-age --no-cache --format --remote --provider --repo --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1063,6 +1087,30 @@ _forge-cli() {
                     return 0
                     ;;
                 --limit)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-vpn)
+                    COMPREPLY=($(compgen -W "off optional required" -- "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-vpn-check)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-vpn-check-timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-openvpn-profile)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider-timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --cache-max-age)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1090,7 +1138,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox__status)
-            opts="-h --gitlab-host --kind --item-type --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --gitlab-host --kind --item-type --limit --gitlab-vpn --gitlab-vpn-check --gitlab-vpn-check-timeout --gitlab-openvpn-profile --provider-timeout --strict-providers --cache-fallback --cache-max-age --no-cache --format --remote --provider --repo --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1109,6 +1157,30 @@ _forge-cli() {
                     return 0
                     ;;
                 --limit)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-vpn)
+                    COMPREPLY=($(compgen -W "off optional required" -- "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-vpn-check)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-vpn-check-timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --gitlab-openvpn-profile)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider-timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --cache-max-age)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
