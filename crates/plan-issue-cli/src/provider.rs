@@ -59,6 +59,51 @@ pub struct Repo {
     pub host: Option<String>,
 }
 
+impl Repo {
+    fn default_host(&self) -> &str {
+        self.host.as_deref().unwrap_or(match self.provider {
+            Provider::GitHub => "github.com",
+            Provider::GitLab => "gitlab.com",
+        })
+    }
+
+    /// Canonical issue URL hint used by lifecycle dashboards. GitHub uses
+    /// `https://github.com/<slug>/issues/<n>`; GitLab uses
+    /// `https://<host>/<slug>/-/issues/<n>` (GitLab redirects this to the
+    /// Work Items surface when needed).
+    pub fn issue_url(&self, issue_number: u64) -> String {
+        match self.provider {
+            Provider::GitHub => format!(
+                "https://{host}/{slug}/issues/{issue_number}",
+                host = self.default_host(),
+                slug = self.slug,
+            ),
+            Provider::GitLab => format!(
+                "https://{host}/{slug}/-/issues/{issue_number}",
+                host = self.default_host(),
+                slug = self.slug,
+            ),
+        }
+    }
+
+    /// Canonical PR / MR URL. GitHub uses `<host>/<slug>/pull/<n>`; GitLab
+    /// uses `<host>/<slug>/-/merge_requests/<n>`.
+    pub fn pr_url(&self, pr_number: u64) -> String {
+        match self.provider {
+            Provider::GitHub => format!(
+                "https://{host}/{slug}/pull/{pr_number}",
+                host = self.default_host(),
+                slug = self.slug,
+            ),
+            Provider::GitLab => format!(
+                "https://{host}/{slug}/-/merge_requests/{pr_number}",
+                host = self.default_host(),
+                slug = self.slug,
+            ),
+        }
+    }
+}
+
 /// Resolve a [`Repo`] from `--repo` and/or the cwd's git remote, mirroring
 /// `forge-cli`'s detection ladder but kept local so plan-issue does not need
 /// to subprocess-shell-out to `forge-cli repo view` just to learn its own

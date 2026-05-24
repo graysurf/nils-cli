@@ -845,8 +845,8 @@ fn run_record_attach(
 
     let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
     let adapter = crate::provider::select_adapter(&repo_info, force);
+    let issue_url = repo_info.issue_url(issue_number);
     let repo = repo_info.slug;
-    let issue_url = format!("https://github.com/{repo}/issues/{issue_number}");
 
     let source_path = write_temp_markdown("record-attach-source-comment", &seed.source_body)
         .map_err(|err| CommandError::runtime("record-attach-source-write-failed", err))?;
@@ -1044,11 +1044,11 @@ fn run_record_repair_dashboard(
         let issue_number = parse_issue_reference(issue_value)?;
         let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
         let adapter = crate::provider::select_adapter(&repo_info, force);
+        let issue_url = repo_info.issue_url(issue_number);
         let repo = repo_info.slug;
         let (body, comments) = adapter
             .issue_evidence(&repo, issue_number)
             .map_err(|err| CommandError::runtime("record-repair-evidence-read-failed", err))?;
-        let issue_url = format!("https://github.com/{repo}/issues/{issue_number}");
         (
             body,
             comments,
@@ -1134,7 +1134,7 @@ fn run_record_close(
     {
         let (body, comments) = read_fixture_evidence(fixture_dir)?;
         let issue_number = parse_issue_reference(&args.issue)?;
-        (body, comments, None, issue_number)
+        (body, comments, None::<crate::provider::Repo>, issue_number)
     } else if let (Some(body_file), Some(comments_path)) = (&args.body_file, &args.comments_json) {
         let body = read_text_file(body_file, "record-close-body-read-failed")?;
         let comments = read_text_file(comments_path, "record-close-comments-read-failed")?;
@@ -1150,12 +1150,11 @@ fn run_record_close(
         )?;
         let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
         let adapter = crate::provider::select_adapter(&repo_info, force);
-        let repo = repo_info.slug;
         let issue_number = parse_issue_reference(&args.issue)?;
         let (body, comments) = adapter
-            .issue_evidence(&repo, issue_number)
+            .issue_evidence(&repo_info.slug, issue_number)
             .map_err(|err| CommandError::runtime("record-close-evidence-read-failed", err))?;
-        (body, comments, Some(repo), issue_number)
+        (body, comments, Some(repo_info), issue_number)
     };
 
     // Resolve linked PRs through provider/fixture for merge_sha + checks.
@@ -1169,6 +1168,7 @@ fn run_record_close(
             // Pick the adapter from the PR's repo, not the issue's repo —
             // record-close supports cross-repo linked PRs (the PR lives in a
             // different owner/repo from the tracking issue).
+            let _ = provider_repo;
             let pr_repo_info = crate::provider::resolve_repo(Some(&pr_repo))
                 .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
             let adapter = crate::provider::select_adapter(&pr_repo_info, force);
@@ -1182,7 +1182,7 @@ fn run_record_close(
             };
             linked_evidence.push(lifecycle_record::LinkedPrEvidence {
                 pr_ref: format!("{pr_repo}#{pr_number}"),
-                url: Some(format!("https://github.com/{pr_repo}/pull/{pr_number}")),
+                url: Some(pr_repo_info.pr_url(pr_number)),
                 merge_sha: if summary.merged {
                     summary.merge_sha
                 } else {
@@ -1209,7 +1209,7 @@ fn run_record_close(
     // Compute canonical final dashboard from audit.
     let issue_url_hint = repo_for_provider
         .as_ref()
-        .map(|repo| format!("https://github.com/{repo}/issues/{issue_number}"));
+        .map(|repo| repo.issue_url(issue_number));
     let canonical_dashboard =
         lifecycle_record::render_dashboard_from_audit(&audit, None, issue_url_hint.as_deref());
 
@@ -1304,10 +1304,10 @@ fn run_record_close(
         }));
     }
 
-    let repo = repo_for_provider.expect("live mode has repo");
-    let repo_info = crate::provider::resolve_repo(Some(&repo))
-        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+    let repo_info = repo_for_provider.expect("live mode has repo");
     let adapter = crate::provider::select_adapter(&repo_info, force);
+    let repo = repo_info.slug.clone();
+    let issue_url = repo_info.issue_url(issue_number);
     let closeout_path = write_temp_markdown("record-close-comment", &closeout_body)
         .map_err(|err| CommandError::runtime("record-close-comment-write-failed", err))?;
     let closeout_url = adapter
@@ -1321,11 +1321,8 @@ fn run_record_close(
     let audit_after =
         lifecycle_record::audit_record(Some(&body_after), &comments_after, Some(args.profile))
             .map_err(|err| CommandError::runtime("record-close-audit-reread-failed", err))?;
-    let final_dashboard = lifecycle_record::render_dashboard_from_audit(
-        &audit_after,
-        None,
-        Some(&format!("https://github.com/{repo}/issues/{issue_number}")),
-    );
+    let final_dashboard =
+        lifecycle_record::render_dashboard_from_audit(&audit_after, None, Some(&issue_url));
     let dashboard_path = write_temp_markdown("record-close-dashboard", &final_dashboard)
         .map_err(|err| CommandError::runtime("record-close-dashboard-write-failed", err))?;
     adapter
@@ -1353,7 +1350,7 @@ fn run_record_close(
         "mode": "live",
         "issue": {
             "number": issue_number,
-            "url": format!("https://github.com/{repo}/issues/{issue_number}"),
+            "url": issue_url,
         },
         "closeout_url": closeout_url,
         "linked_prs": linked_evidence,

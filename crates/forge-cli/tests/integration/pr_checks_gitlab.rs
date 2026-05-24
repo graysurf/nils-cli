@@ -180,7 +180,13 @@ exit 99
 fn pr_checks_glab_no_pipeline_is_success_zero_count() {
     let stub = StubEnv::new().glab_stub(&glab_stub_no_pipeline(VERSION_OK));
     let argv = vec![
-        "--provider", "gitlab", "--format", "json", "pr", "checks", "feat/sample",
+        "--provider",
+        "gitlab",
+        "--format",
+        "json",
+        "pr",
+        "checks",
+        "feat/sample",
     ];
     let out = run_forge_cli(&stub, &argv);
     let env = parse_envelope(&out.stdout);
