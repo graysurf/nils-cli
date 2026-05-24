@@ -45,19 +45,25 @@ decision.
 ## Confirmed facts
 
 - `crates/plan-issue-cli/src/github.rs` contains every provider call: ~1001 lines, all gh-specific. [F1]
-- Downstream `forge-cli` already exposes a working provider-neutral surface (`issue create/view/edit/comment/close/reopen`, `pr create/view/edit/...`, `label audit/ensure`). [F2]
+- Downstream `forge-cli` already exposes a working provider-neutral surface
+  (`issue create/view/edit/comment/close/reopen`, `pr create/view/edit/...`, `label audit/ensure`). [F2]
 - `plan-issue-cli` and `forge-cli` ship from the same workspace so a workspace-internal dep is mechanically fine. [F3]
-- The skill SKILL.md files (`dispatch/create-plan-tracking-issue` etc.) already document Outputs in provider-neutral terms; no skill-side rewrite is needed if the CLI starts honouring provider. [F4]
-- `forge-cli pr` and `forge-cli issue` follow `cli.forge-cli.*.v1` envelope contracts that `plan-issue-cli` can call as a subprocess (provider-neutral surface) or link to as a library if dependency boundaries allow. [F5]
+- The skill SKILL.md files (`dispatch/create-plan-tracking-issue` etc.) already document Outputs in provider-neutral terms;
+  no skill-side rewrite is needed if the CLI starts honouring provider. [F4]
+- `forge-cli pr` and `forge-cli issue` follow `cli.forge-cli.*.v1` envelope contracts that `plan-issue-cli` can call as a
+  subprocess (provider-neutral surface) or link to as a library if dependency boundaries allow. [F5]
 
 ## Decisions (carried forward unless Sprint 1 design changes them)
 
 1. **Provider abstraction lives inside `plan-issue-cli`**, not in a separate crate. The CLI is the boundary; abstraction below it is internal.
-2. **Route through `forge-cli`** for provider-neutral atoms (issue create / comment / edit / close, label ensure, body fetch) rather than re-implementing GitLab support in-tree. This avoids duplicating the gh/glab adapter layer.
-3. **No breaking changes to the `plan-issue` CLI surface**: existing callers must continue to work unchanged. Provider detection is automatic from the `--repo` / git remote, mirroring forge-cli's behavior.
+2. **Route through `forge-cli`** for provider-neutral atoms (issue create / comment / edit / close, label ensure, body fetch)
+   rather than re-implementing GitLab support in-tree. This avoids duplicating the gh/glab adapter layer.
+3. **No breaking changes to the `plan-issue` CLI surface**: existing callers must continue to work unchanged. Provider
+   detection is automatic from the `--repo` / git remote, mirroring forge-cli's behavior.
 4. **Sprint 1 is design only**: produce a short design note + minimal contract sketch before any code change.
 5. **Sprint 2 = open path**: `record open` must work for both `--profile tracking` and `--profile dispatch` on GitLab.
-6. **Sprint 3 = continue + close**: `record post` (state/session/validation/closeout), `record audit`, `record close`, `link-pr`, plus the dispatch family (`start-plan`, `start-sprint`, etc.) round out the surface.
+6. **Sprint 3 = continue + close**: `record post` (state/session/validation/closeout), `record audit`, `record close`,
+   `link-pr`, plus the dispatch family (`start-plan`, `start-sprint`, etc.) round out the surface.
 
 ## Scope
 
@@ -97,7 +103,8 @@ decision.
 ## Acceptance criteria
 
 - AC-1. `cargo test -p nils-plan-issue-cli` is green with the new provider trait + GitLab branch.
-- AC-2. Sandbox revalidation: `plan-issue record open --profile tracking --repo terrylin/agent-runtime-testing --bundle docs/plans/p8-smoke` succeeds end-to-end; downstream Tier D skills marked `pass` in the sandbox source doc.
+- AC-2. Sandbox revalidation: `plan-issue record open --profile tracking --repo terrylin/agent-runtime-testing --bundle
+  docs/plans/p8-smoke` succeeds end-to-end; downstream Tier D skills marked `pass` in the sandbox source doc.
 - AC-3. `forge-cli inbox`, `plan-issue record audit` etc. all read back lifecycle markers identically across providers.
 - AC-4. Existing nils-cli GitHub workflows (e.g. agent-run-direnv-exec tracking) continue to work unchanged.
 
@@ -110,18 +117,26 @@ decision.
 
 ## Open questions
 
-- **Q1**: Should provider routing happen via subprocess-to-`forge-cli` or via direct library linkage? Subprocess keeps the layering clean and matches today's `gh` shell-out style, but multiplies process count for every comment. Library linkage is faster but pulls `forge-cli` into the dep tree. Decide in Sprint 1.
-- **Q2**: How to handle "lightweight tracking" issue labels on GitLab when the catalogue is missing? Reuse `forge-cli label ensure` with the shared `manifests/forge-labels.yaml`? Or skip labels when no catalogue?
-- **Q3**: GitLab issue numbering uses `iid` (per-project) rather than the cross-org GitHub numbering. The comment payload schema today carries `number`; does it need a `provider` discriminator for clarity?
-- **Q4**: `create-dispatch-lane-pr` is a separate skill written GitHub-only. Should this plan absorb it (rename → `create-dispatch-lane-mr`/neutral), or leave it for a fast-follow once `plan-issue-cli` is provider-aware?
+- **Q1**: Should provider routing happen via subprocess-to-`forge-cli` or via direct library linkage? Subprocess keeps the
+  layering clean and matches today's `gh` shell-out style, but multiplies process count for every comment. Library linkage
+  is faster but pulls `forge-cli` into the dep tree. Decide in Sprint 1.
+- **Q2**: How to handle "lightweight tracking" issue labels on GitLab when the catalogue is missing? Reuse
+  `forge-cli label ensure` with the shared `manifests/forge-labels.yaml`? Or skip labels when no catalogue?
+- **Q3**: GitLab issue numbering uses `iid` (per-project) rather than the cross-org GitHub numbering. The comment payload
+  schema today carries `number`; does it need a `provider` discriminator for clarity?
+- **Q4**: `create-dispatch-lane-pr` is a separate skill written GitHub-only. Should this plan absorb it (rename
+  → `create-dispatch-lane-mr`/neutral), or leave it for a fast-follow once `plan-issue-cli` is provider-aware?
 - **Q5**: Should `plan-issue` detect provider from the git remote URL of the cwd when `--repo` is omitted (current convention is "explicit only")?
 
 ## Risks and guardrails
 
 - **R-1**: Regression on GitHub callers. Mitigation: keep all existing tests passing and add cross-provider tests for the new layer.
-- **R-2**: GitLab provider permissions or label catalogues unavailable. Mitigation: graceful fallback path mirroring how `forge-cli label audit` already behaves.
-- **R-3**: Subprocess-to-`forge-cli` introduces a runtime PATH dependency. Mitigation: explicit `FORGE_CLI_BIN` env override + clear error when forge-cli is missing.
-- **R-4**: Schema drift between `plan-issue` and `forge-cli`. Mitigation: pin the forge-cli minor in Cargo.toml or check binary version at startup.
+- **R-2**: GitLab provider permissions or label catalogues unavailable. Mitigation: graceful fallback path mirroring how
+  `forge-cli label audit` already behaves.
+- **R-3**: Subprocess-to-`forge-cli` introduces a runtime PATH dependency. Mitigation: explicit `FORGE_CLI_BIN` env override,
+  plus a clear error when forge-cli is missing.
+- **R-4**: Schema drift between `plan-issue` and `forge-cli`. Mitigation: pin the forge-cli minor in Cargo.toml or check
+  binary version at startup.
 
 ## Execution
 
@@ -138,7 +153,9 @@ adding future providers.
 
 ## Read-first references
 
-- Downstream sandbox source doc: `terrylin/agent-runtime-testing:docs/plans/gitlab-skill-validation/gitlab-skill-validation-discussion-source.md` (F-3 entry + evidence)
+- Downstream sandbox source doc:
+  `terrylin/agent-runtime-testing:docs/plans/gitlab-skill-validation/gitlab-skill-validation-discussion-source.md`
+  (F-3 entry + evidence)
 - `crates/plan-issue-cli/src/github.rs` (current implementation; ~1001 lines)
 - `crates/forge-cli/src/` (the provider-neutral target surface)
 - Companion tracking issue for `forge-cli` fixes: sympoies/nils-cli#483 + PR #485 (F-1, F-2, F-7)

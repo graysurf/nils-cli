@@ -241,7 +241,7 @@ state/session/validation comments to closeout on GitLab.
 
 - Commands:
   - Sandbox dispatch run end-to-end (one sprint, one task, single PR).
-  - SKILL.md grep for `gh `, GitHub-only language.
+  - SKILL.md grep for `gh issue create`, GitHub-only language.
 
 ### Task 4.1: Dispatch lifecycle GitLab path
 

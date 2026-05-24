@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::commands::plan::CloseReason;
 
-pub trait GitHubAdapter {
+pub trait ProviderAdapter {
     fn issue_body(&self, repo: &str, issue: u64) -> Result<String, String>;
 
     /// Fetch the issue body plus comments JSON, suitable for `audit_record`
@@ -128,7 +128,7 @@ impl GhCliAdapter {
     }
 }
 
-impl GitHubAdapter for GhCliAdapter {
+impl ProviderAdapter for GhCliAdapter {
     fn issue_body(&self, repo: &str, issue: u64) -> Result<String, String> {
         let args = vec![
             "issue".to_string(),
@@ -597,7 +597,7 @@ mod tests {
         normalize_repo_slug, rollup_status,
     };
     use crate::commands::plan::CloseReason;
-    use crate::github::{GhCliAdapter, GitHubAdapter, resolve_repo};
+    use crate::github::{GhCliAdapter, ProviderAdapter, resolve_repo};
     use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
     use nils_test_support::{CwdGuard, EnvGuard, GlobalStateLock, StubBinDir, prepend_path};
     use tempfile::TempDir;
