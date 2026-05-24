@@ -1,3 +1,4 @@
+pub mod agent_run;
 pub mod browser_session;
 pub mod canary_check;
 pub mod docs_impact;

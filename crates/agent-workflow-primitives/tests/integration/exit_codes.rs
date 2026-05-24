@@ -12,6 +12,7 @@ fn run(bin: &str, args: &[&str]) -> i32 {
 }
 
 const BINARIES: &[&str] = &[
+    "agent-run",
     "browser-session",
     "canary-check",
     "docs-impact",

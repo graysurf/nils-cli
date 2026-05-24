@@ -12,6 +12,10 @@ name = "agent_workflow_primitives"
 path = "src/lib.rs"
 
 [[bin]]
+name = "agent-run"
+path = "src/bin/agent-run.rs"
+
+[[bin]]
 name = "browser-session"
 path = "src/bin/browser-session.rs"
 
