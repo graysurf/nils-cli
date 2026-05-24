@@ -18,7 +18,7 @@ Run build commands before sharing changes:
 
 ## Test
 
-Run checks before delivery:
+Run project-defined local checks before delivery:
 
 ```bash
 {{TEST_COMMANDS}}

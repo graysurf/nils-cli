@@ -31,8 +31,8 @@ Outputs:
   and selected hotspot files/modules/functions.
 - A small test-maintenance change set that improves behavioral confidence,
   not only the percentage.
-- Focused validation for touched crates/tests, followed by the repo coverage
-  gate when the change is ready.
+- Focused validation for touched crates/tests, followed by fresh coverage
+  evidence from CI or an explicit local coverage run when the change is ready.
 - Follow-up issue evidence only when a clear bug or unresolved work is found
   outside the coverage-maintenance scope.
 
@@ -69,7 +69,7 @@ repository files.
 - If a relevant `target/coverage/lcov.info` already exists, summarize it:
   `bash scripts/ci/coverage-summary.sh target/coverage/lcov.info`.
 - If the artifact is missing or stale and the environment has the required
-  tooling, generate coverage with:
+  tooling, generate explicit local coverage with:
 
 ```bash
 NILS_CLI_TEST_RUNNER=nextest \
@@ -121,8 +121,10 @@ cargo nextest run -p <crate> <test-filter>
 cargo test -p <crate> <test-filter>
 ```
 
-- Run related crate or workspace checks after the focused loop is green.
-- Finish non-doc coverage-maintenance changes with:
+- Run related crate checks and the default local-fast gate after the focused
+  loop is green.
+- Finish non-doc coverage-maintenance changes with CI coverage evidence, or run
+  explicit local coverage when the feedback is needed before pushing:
 
 ```bash
 NILS_CLI_TEST_RUNNER=nextest \

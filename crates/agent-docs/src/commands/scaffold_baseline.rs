@@ -17,6 +17,7 @@ const CLI_TOOLS_TEMPLATE: &str = include_str!("../templates/cli_tools_default.md
 const SETUP_PLACEHOLDER: &str = "{{SETUP_COMMANDS}}";
 const BUILD_PLACEHOLDER: &str = "{{BUILD_COMMANDS}}";
 const TEST_PLACEHOLDER: &str = "{{TEST_COMMANDS}}";
+const CHECKS_ENTRYPOINT_PATH: &str = "scripts/ci/nils-cli-checks-entrypoint.sh";
 const CHECKS_SCRIPT_PATH: &str =
     ".agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh";
 
@@ -419,12 +420,16 @@ struct WorkflowCommands {
 fn detect_workflow_commands(root: &Path) -> WorkflowCommands {
     if root.join("Cargo.toml").exists() {
         let mut test = Vec::new();
-        if root.join(CHECKS_SCRIPT_PATH).exists() {
+        if root.join(CHECKS_ENTRYPOINT_PATH).exists() {
+            test.push(format!("bash {CHECKS_ENTRYPOINT_PATH} --local-fast"));
+        } else if root.join(CHECKS_SCRIPT_PATH).exists() {
             test.push(format!("./{CHECKS_SCRIPT_PATH}"));
         }
-        test.push("cargo fmt --all -- --check".to_string());
-        test.push("cargo clippy --all-targets --all-features -- -D warnings".to_string());
-        test.push("cargo test --workspace".to_string());
+        if test.is_empty() {
+            test.push("cargo fmt --all -- --check".to_string());
+            test.push("cargo clippy --all-targets --all-features -- -D warnings".to_string());
+            test.push("cargo test --workspace".to_string());
+        }
 
         return WorkflowCommands {
             setup: vec!["cargo fetch".to_string()],
@@ -657,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_baseline_uses_checks_script_when_present_for_cargo_projects() {
+    fn scaffold_baseline_uses_local_fast_entrypoint_when_present_for_cargo_projects() {
         let home = TempDir::new().expect("create home tempdir");
         let project = TempDir::new().expect("create project tempdir");
         fs::write(
@@ -665,7 +670,7 @@ mod tests {
             "[package]\nname = \"demo\"\n",
         )
         .expect("seed cargo file");
-        let checks_script = project.path().join(CHECKS_SCRIPT_PATH);
+        let checks_script = project.path().join(CHECKS_ENTRYPOINT_PATH);
         fs::create_dir_all(
             checks_script
                 .parent()
@@ -686,8 +691,8 @@ mod tests {
             fs::read_to_string(project.path().join("DEVELOPMENT.md")).expect("read development");
         assert!(
             development_written
-                .contains("./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh")
+                .contains("bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast")
         );
-        assert!(development_written.contains("cargo test --workspace"));
+        assert!(!development_written.contains("cargo test --workspace"));
     }
 }

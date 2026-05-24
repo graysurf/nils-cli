@@ -43,7 +43,7 @@ Failure modes:
 - Required policy documents are missing.
 - `agent-docs resolve --context project-dev --strict` fails.
 - JSON contract or parity requirements are underspecified and cannot be inferred.
-- Required repository checks fail.
+- Local changed-scope checks or CI-required checks fail.
 
 ## Scripts (only entrypoints)
 
@@ -67,8 +67,10 @@ Failure modes:
    - publishable crates follow workspace metadata conventions and release order checks,
    - internal-only crates explicitly set/document `publish = false`.
 6. Validate before delivery:
-   - `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`
+   - `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
    - if publishable: `scripts/publish-crates.sh --dry-run --crate <crate-package-name>`
+   - rely on the GitHub required checks for the full workspace and coverage
+     gates before merge.
 7. In the final response, include:
    - what was changed,
    - policy gates satisfied,

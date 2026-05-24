@@ -29,7 +29,7 @@ types before choosing a path.
 Only the following root-level documentation categories are allowed as canonical sources:
 
 - `/README.md` (workspace overview)
-- `/DEVELOPMENT.md` (workspace required checks and developer workflow)
+- `/DEVELOPMENT.md` (workspace validation and developer workflow)
 - `/AGENTS.md` (agent behavior policy)
 - `/BINARY_DEPENDENCIES.md` (workspace shared binary prerequisites)
 - `/docs/plans/*.md` (workspace planning documents)
@@ -117,8 +117,8 @@ Contributors SHOULD:
 
 ## Enforcement Reference
 
-`DEVELOPMENT.md` required checks reference this policy. Future automation and CI checks MUST enforce
-the same placement rules.
+`DEVELOPMENT.md` validation flows reference this policy. Future automation and
+CI checks MUST enforce the same placement rules.
 
 Recommended CI companions:
 

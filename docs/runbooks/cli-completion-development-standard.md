@@ -9,9 +9,9 @@ gates.
 
 - Global completion obligations and alias families:
   - `AGENTS.md`
-- Required checks and coverage policy:
+- Local validation and CI coverage policy:
   - `DEVELOPMENT.md`
-  - `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`
+  - `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
 - Workspace completion assets and tests:
   - `completions/zsh/`
   - `completions/bash/`
@@ -181,9 +181,10 @@ Validation expectation:
 - migration contracts must include explicit evidence for completion metadata checks
 - validation must include completion-mode toggle and alternate-dispatch grep checks for touched completion paths
 
-## Testing Requirements and Required Checks Linkage
+## Testing Requirements and Validation Linkage
 
-Completion work must satisfy completion-specific checks and repository gates.
+Completion work must satisfy completion-specific checks, local changed-scope
+validation, and GitHub required checks before merge.
 
 Mandatory completion-focused validation when completion code changes:
 
@@ -193,15 +194,17 @@ Mandatory completion-focused validation when completion code changes:
 4. export smoke check from CLI (example pattern):
    - `<cli> completion zsh | rg -- "--help|--version|--"`
 
-Mandatory repository checks:
+Mandatory local repository validation:
 
 - preferred single entrypoint:
-  - `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`
+  - `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
 - docs-only fast path (when all changed files are docs):
-  - `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh --docs-only`
-- for non-doc changes, coverage must remain `>= 85.00%` per `DEVELOPMENT.md`
+  - `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`
+- for non-doc changes, GitHub required checks enforce full workspace tests and
+  coverage `>= 85.00%` per `DEVELOPMENT.md`
 
-Completion changes are not deliverable until required checks pass.
+Completion changes are not merge-ready until local validation and GitHub
+required checks are green.
 
 ## Rollout Checklist: Migrating an Existing CLI
 
@@ -222,6 +225,6 @@ is captured, and acceptance criteria are checked.
 8. if dynamic values are needed, add `CompleteEnv` (or crate-local `__complete` only where justified)
 9. enforce single-path completion policy and metadata values (no runtime completion-mode gates or alternate completion functions)
 10. sync aliases in both alias files when alias-bearing CLIs are touched and update the contract `alias map` with any rewrite semantics
-11. run contract validation commands and required repository checks; record output in the contract, including completion metadata
+11. run contract validation commands and local repository validation; record output in the contract, including completion metadata and CI status
     verification evidence
 12. mark contract acceptance criteria complete and link the contract path in PR notes

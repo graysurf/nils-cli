@@ -104,8 +104,9 @@ else
 1) Ensure command contract covers human-readable mode and JSON mode.
 2) Add JSON contract tests (schema envelope, error envelope, no secret leakage).
 3) Align Cargo metadata and publishability rules.
-4) Run ./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh.
+4) Run bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast.
 5) If publishable, run scripts/publish-crates.sh --dry-run --crate <crate-package-name>.
+6) Use GitHub required checks for full workspace and coverage gates before merge.
 IMPLEMENT
 fi
 

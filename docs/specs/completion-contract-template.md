@@ -124,8 +124,9 @@ Record command-level and repository-level checks for this migration.
      crates/<crate>/docs/reports/<cli>-completion-migration-contract.md
    ```
 
-1. `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`
+1. `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
    - use `--docs-only` only when all changed files are docs.
+   - record GitHub required-check status before merge.
 
 ### test coverage mapping
 

@@ -6,7 +6,7 @@ usage() {
 Usage:
   nils-cli-verify-required-checks.sh [--docs-only] [--help]
 
-Runs the required pre-delivery checks from DEVELOPMENT.md:
+Runs the full CI/parity checks from DEVELOPMENT.md:
   - bash scripts/ci/docs-placement-audit.sh --strict
   - bash scripts/ci/docs-hygiene-audit.sh --strict
   - bash scripts/ci/markdownlint-audit.sh --strict
@@ -26,7 +26,7 @@ Runs the required pre-delivery checks from DEVELOPMENT.md:
 
 Modes:
   (default)
-    Run full required checks.
+    Run full CI/parity checks.
   --docs-only
     Run documentation-only checks:
       - bash scripts/ci/docs-placement-audit.sh --strict

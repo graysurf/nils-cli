@@ -16,9 +16,9 @@ Use these as the source of truth to avoid policy drift:
 
 - Global CLI priorities and completion expectations:
   - `AGENTS.md`
-- Required checks and coverage policy:
+- Local validation and CI coverage policy:
   - `DEVELOPMENT.md`
-  - `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`
+  - `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
 - Workspace completion architecture and migration rules:
   - `docs/runbooks/cli-completion-development-standard.md`
 - Publishing workflow and order:
@@ -44,7 +44,8 @@ If a crate is intentionally internal-only, keep this standard for UX/testing qua
 3. Implement behavior with parity/consistency to workspace conventions.
 4. Add tests for both human-readable and JSON contracts.
 5. Verify publish-readiness metadata and release order.
-6. Run required repository checks before delivery.
+6. Run local changed-scope validation before delivery; rely on GitHub required
+   checks for full workspace and coverage gates before merge.
 
 ## Crate Scaffold Rules
 
@@ -151,10 +152,10 @@ Minimum testing for new CLI crates:
 5. Completion architecture conformance to `docs/runbooks/cli-completion-development-standard.md` when completion assets are introduced or
    modified.
 
-Preferred single entrypoint:
+Preferred local validation entrypoint:
 
 ```bash
-./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh
+bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast
 ```
 
 Pre-commit docs placement audit (required):
@@ -163,7 +164,8 @@ Pre-commit docs placement audit (required):
 bash scripts/ci/docs-placement-audit.sh --strict
 ```
 
-For exact command set and coverage threshold, follow `DEVELOPMENT.md`.
+For exact command sets, optional full local parity, and the CI coverage
+threshold, follow `DEVELOPMENT.md`.
 
 ## Publish Readiness Checklist
 
@@ -212,4 +214,4 @@ agent-docs resolve --context project-dev --strict --format checklist
 - [ ] Error envelope is machine-consumable in JSON mode.
 - [ ] No sensitive fields leak in JSON output.
 - [ ] Publish-readiness items are complete (or crate is explicitly internal-only).
-- [ ] Required repository checks pass.
+- [ ] Local validation passes and GitHub required checks are green.

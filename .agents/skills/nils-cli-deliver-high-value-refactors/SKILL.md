@@ -44,7 +44,8 @@ Failure modes:
 - No candidate passes the value gate (avoid refactor-for-refactor).
 - Candidate requires behavior changes that break parity expectations.
 - Shared extraction crosses crate boundaries with unclear ownership or high regression risk.
-- Unable to run required validation commands in the current environment.
+- Unable to run targeted or local-fast validation commands in the current
+  environment.
 
 ## Scripts (only entrypoints)
 
@@ -92,8 +93,11 @@ Failure modes:
 5. Validation
 
 - Run targeted tests for touched crates first.
-- If scope is broad or cross-crate, run:
-  - `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`
+- Run the default changed-scope gate:
+  - `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
+- If debugging CI parity or release-quality risk locally, run the full stack
+  explicitly:
+  - `NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh`
 - Report exact commands and pass/fail status.
 
 6. Delivery (required for implemented changes)
@@ -101,7 +105,7 @@ Failure modes:
 - Run branch-intent preflight:
   - `deliver-feature-pr.sh preflight --base main`
 - Use `$create-feature-pr` to create branch/commit/open PR from confirmed base branch.
-- Wait for checks to become fully green:
+- Wait for GitHub required checks to become fully green:
   - `deliver-feature-pr.sh wait-ci --pr <number>`
 - If checks fail, fix on the same feature branch, push, and re-run `wait-ci` until green.
 - Close after CI is green:
