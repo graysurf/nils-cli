@@ -47,7 +47,7 @@ pub fn load_scope_config(
         )
     })?;
     let parsed = parse_toml(&file_path, &raw)?;
-    let documents = parse_documents(&file_path, &parsed)?;
+    let documents = parse_documents(source_scope, &file_path, &parsed)?;
 
     Ok(Some(ConfigScopeFile {
         source_scope,
@@ -64,6 +64,7 @@ fn parse_toml(file_path: &Path, raw: &str) -> Result<Value, ConfigLoadError> {
 }
 
 fn parse_documents(
+    source_scope: Scope,
     file_path: &Path,
     parsed: &Value,
 ) -> Result<Vec<ConfigDocumentEntry>, ConfigLoadError> {
@@ -100,6 +101,7 @@ fn parse_documents(
         validate_unknown_fields(file_path, index, table)?;
         let context = parse_context(file_path, index, table)?;
         let scope = parse_scope(file_path, index, table)?;
+        validate_scope_for_source(source_scope, scope, file_path, index)?;
         let path = parse_path(file_path, index, table)?;
         let required = parse_required(file_path, index, table)?;
         let when = parse_when(file_path, index, table)?;
@@ -116,6 +118,24 @@ fn parse_documents(
     }
 
     Ok(documents)
+}
+
+fn validate_scope_for_source(
+    source_scope: Scope,
+    document_scope: Scope,
+    file_path: &Path,
+    index: usize,
+) -> Result<(), ConfigLoadError> {
+    if source_scope == Scope::Project && document_scope == Scope::Global {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            index,
+            "scope",
+            "global scope is allowed only in the home catalog; use scope = \"project\" for project-local requirements",
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_unknown_fields(

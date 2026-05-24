@@ -7,7 +7,7 @@
 It resolves required Markdown documents by context and scope, with explicit precedence rules for:
 
 - startup policy files (`AGENTS.override.md` > `AGENTS.md`)
-- home vs project extension config (`AGENT_DOCS.toml`)
+- home, global, and project extension config (`AGENT_DOCS.toml`)
 - strict vs non-strict missing-doc behavior
 
 The CLI does not replace runtime `AGENTS.md` loading. It provides a testable resolution contract.
@@ -47,6 +47,8 @@ If neither is provided, the binary errors with
 
 - Paths are normalized lexically (`.` removed, duplicate separators collapsed).
 - Relative document paths in `AGENT_DOCS.toml` are resolved from their declared `scope` root.
+  `home` and `global` resolve from `AGENT_DOCS_HOME`; `project` resolves from
+  `PROJECT_PATH`.
 - Absolute document paths are kept absolute and ignore scope root joining.
 
 ## Scope and Context Model
@@ -55,6 +57,11 @@ If neither is provided, the binary errors with
 
 - `home`: rooted at effective `AGENT_DOCS_HOME`
 - `project`: rooted at effective `PROJECT_PATH`
+- `global`: rooted at effective `AGENT_DOCS_HOME` and inherited from the home catalog by every project repo
+
+Home-catalog `scope = "project"` entries apply only when `AGENT_DOCS_HOME` and
+`PROJECT_PATH` identify the same Git repository, including linked worktrees.
+Project-local `AGENT_DOCS.toml` files cannot declare `scope = "global"`.
 
 ### Built-in contexts
 
@@ -146,7 +153,7 @@ Flags:
 
 - `--target home|project` (required)
 - `--context startup|skill-dev|task-tools|project-dev` (required)
-- `--scope home|project` (required; target root for `path` resolution)
+- `--scope home|project|global` (required; target root for `path` resolution)
 - `--path <doc-path>` (required)
 - `--required` (set `required=true`; omitted means `required=false`)
 - `--when <condition>` (default: `always`)
@@ -176,6 +183,10 @@ agent-docs add \
 ```text
 add: target=project action=<inserted|updated> config=<PROJECT_PATH>/AGENT_DOCS.toml entries=<N>
 ```
+
+Use `--target home --scope global` for cross-repo home-catalog requirements.
+`--target project --scope global` is rejected because project-local catalogs
+cannot define global requirements.
 
 Verify both built-in and extension docs are present:
 
@@ -440,6 +451,8 @@ suggested_actions:
 1. Start with built-in baseline items for selected `--target`.
 2. Load extension configs in fixed order: `$AGENT_DOCS_HOME/AGENT_DOCS.toml` then `$PROJECT_PATH/AGENT_DOCS.toml`.
 3. Consider only extension entries with `required = true` and `scope` included by `--target`.
+   `--target home` includes `home` and `global`; `--target project` includes
+   `project`.
 4. Resolve each extension path, then de-dup by key: `(context, scope, normalized_path)`.
 5. Same-key override order:
    - within one config file, later `[[document]]` wins (last-write-wins)
@@ -471,14 +484,14 @@ notes = "Track required external CLIs for this project"
 
 ### Field contract
 
-| Field      | Type   | Required | Rules                                                       |
-| ---------- | ------ | -------- | ----------------------------------------------------------- |
-| `context`  | string | yes      | One of: `startup`, `skill-dev`, `task-tools`, `project-dev` |
-| `scope`    | string | yes      | One of: `home`, `project`                                   |
-| `path`     | string | yes      | Relative or absolute path to markdown doc                   |
-| `required` | bool   | no       | Default `false`                                             |
-| `when`     | string | no       | Default `always`; supported values: `always`                |
-| `notes`    | string | no       | Free text, default empty string                             |
+| Field      | Type   | Required | Rules                                                              |
+| ---------- | ------ | -------- | ------------------------------------------------------------------ |
+| `context`  | string | yes      | One of: `startup`, `skill-dev`, `task-tools`, `project-dev`        |
+| `scope`    | string | yes      | One of: `home`, `project`, `global`; `global` is home-catalog only |
+| `path`     | string | yes      | Relative or absolute path to markdown doc                          |
+| `required` | bool   | no       | Default `false`                                                    |
+| `when`     | string | no       | Default `always`; supported values: `always`                       |
+| `notes`    | string | no       | Free text, default empty string                                    |
 
 ### Deterministic merge contract
 
@@ -487,7 +500,10 @@ For `resolve --context <ctx>`:
 1. Start with built-in entries for `<ctx>`.
 2. Load entries from `$AGENT_DOCS_HOME/AGENT_DOCS.toml` (if file exists).
 3. Load entries from `$PROJECT_PATH/AGENT_DOCS.toml` (if file exists).
-4. Filter entries by exact `context == <ctx>`.
+4. Filter entries by exact `context == <ctx>` and catalog inheritance rules:
+   home-catalog `global` entries apply to every project; home-catalog
+   `project` entries apply only to the same Git repository; project-catalog
+   `global` entries are invalid.
 5. Normalize each entry path:
    - absolute path: keep as-is
    - relative path: join with root selected by entry `scope`

@@ -7,6 +7,7 @@ pub mod model;
 pub mod output;
 pub mod paths;
 pub mod resolver;
+mod scope_rules;
 
 use clap::Parser;
 
@@ -147,6 +148,9 @@ fn dispatch(cli: Cli) -> i32 {
                     match err.kind {
                         commands::scaffold_agents::ScaffoldAgentsErrorKind::AlreadyExists => {
                             EXIT_STRICT_MISSING_REQUIRED
+                        }
+                        commands::scaffold_agents::ScaffoldAgentsErrorKind::UnsupportedTarget => {
+                            EXIT_USAGE
                         }
                         commands::scaffold_agents::ScaffoldAgentsErrorKind::Io => EXIT_RUNTIME,
                     }

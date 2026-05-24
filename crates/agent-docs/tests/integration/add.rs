@@ -195,6 +195,93 @@ fn add_full_flow_for_home_and_project_scopes() {
     );
 }
 
+#[test]
+fn add_supports_global_scope_in_home_catalog() {
+    let workspace = common::FixtureWorkspace::from_fixtures();
+    common::write_text(
+        &workspace.docs_home.join("GLOBAL_POLICY.md"),
+        "# Fixture: global policy\n",
+    );
+
+    let output = common::run_agent_docs_command(
+        &workspace,
+        &[
+            "add",
+            "--target",
+            "home",
+            "--context",
+            "project-dev",
+            "--scope",
+            "global",
+            "--path",
+            "GLOBAL_POLICY.md",
+            "--required",
+            "--notes",
+            "global project-dev extension",
+        ],
+    );
+    assert!(
+        output.success(),
+        "add(home global) should succeed, got code={} stderr={}",
+        output.exit_code,
+        output.stderr
+    );
+
+    let loaded = load_scope_config(Scope::Home, &workspace.docs_home)
+        .expect("load home config")
+        .expect("home config should exist");
+    let global_entry = loaded
+        .documents
+        .iter()
+        .find(|entry| entry.path == Path::new("GLOBAL_POLICY.md"))
+        .expect("global extension entry should exist");
+    assert_eq!(global_entry.context, Context::ProjectDev);
+    assert_eq!(global_entry.scope, Scope::Global);
+    assert!(global_entry.required);
+    assert_eq!(
+        global_entry.notes.as_deref(),
+        Some("global project-dev extension")
+    );
+}
+
+#[test]
+fn add_rejects_global_scope_in_project_catalog() {
+    let workspace = common::FixtureWorkspace::from_fixtures();
+
+    let output = common::run_agent_docs_command(
+        &workspace,
+        &[
+            "add",
+            "--target",
+            "project",
+            "--context",
+            "project-dev",
+            "--scope",
+            "global",
+            "--path",
+            "GLOBAL_POLICY.md",
+            "--required",
+        ],
+    );
+
+    assert_eq!(
+        output.exit_code, 3,
+        "add(project global) should fail with config error, stdout=\n{}\nstderr=\n{}",
+        output.stdout, output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("global scope is allowed only in the home catalog"),
+        "stderr should explain the global-scope boundary:\n{}",
+        output.stderr
+    );
+    assert!(
+        !workspace.project_path.join(CONFIG_FILE_NAME).exists(),
+        "rejected add should not create a project AGENT_DOCS.toml"
+    );
+}
+
 fn run_home_task_tools_add_update(workspace: &common::FixtureWorkspace) -> common::CliOutput {
     common::run_agent_docs_command(
         workspace,

@@ -14,8 +14,7 @@ cd "$repo_root"
 
 normalize_paths() {
   sed \
-    -e "s|${PLAN_ISSUE_HOME%/}|\$PLAN_ISSUE_HOME|g" \
-    -e "s|$HOME/.config/agent-kit|\$AGENT_KIT_HOME|g"
+    -e "s|${PLAN_ISSUE_HOME%/}|\$PLAN_ISSUE_HOME|g"
 }
 
 run_plan_issue_local() {

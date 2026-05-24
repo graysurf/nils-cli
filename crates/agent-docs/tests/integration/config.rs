@@ -250,6 +250,32 @@ path = "AGENTS.md"
 }
 
 #[test]
+fn load_scope_config_rejects_global_scope_from_project_catalog() {
+    let project = TempDir::new().expect("create project dir");
+    write_config(
+        project.path(),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "global"
+path = "GLOBAL_POLICY.md"
+"#,
+    );
+
+    let err = load_scope_config(Scope::Project, project.path())
+        .expect_err("project catalog should reject global scope");
+    assert_eq!(err.kind, ConfigErrorKind::Validation);
+    assert_eq!(err.document_index, Some(0));
+    assert_eq!(err.field.as_deref(), Some("scope"));
+    assert!(
+        err.message
+            .contains("global scope is allowed only in the home catalog"),
+        "unexpected error message: {}",
+        err.message
+    );
+}
+
+#[test]
 fn load_scope_config_rejects_path_that_is_only_whitespace() {
     let home = TempDir::new().expect("create home dir");
     write_config(
