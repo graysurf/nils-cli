@@ -735,6 +735,16 @@ fn run_record_post(
         Some(path) => read_payload_data(path)?,
         None => Value::Null,
     };
+    lifecycle_record::validate_payload_data_for_kind(args.kind, &payload_data).map_err(|err| {
+        CommandError::runtime(
+            "record-post-payload-schema-invalid",
+            format!(
+                "`record post --kind {}` payload does not match the lifecycle record schema: {}",
+                args.kind.as_str(),
+                err
+            ),
+        )
+    })?;
     let summary = match &args.summary_file {
         Some(path) => Some(read_text_file(path, "record-post-summary-read-failed")?),
         None => None,

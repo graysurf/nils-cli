@@ -245,6 +245,9 @@ High-level append-only comment command for `state`, `session`, `validation`,
 - Renders the canonical marker, human summary Markdown when supplied, and a
   hidden structured payload from explicit fields or a `--payload-file` JSON
   document.
+- Validates the supplied payload against the selected lifecycle role schema
+  before rendering or posting, so invalid state/review/validation values cannot
+  become durable comments that later degrade dashboards to `pending`.
 - Posts to the provider issue and returns the comment URL.
 - Supports `--dry-run` and `--fixture` modes.
 - `--kind closeout` is callable directly only when `record close` is not
@@ -261,6 +264,8 @@ Returns typed evidence from the provider issue body and comments:
 - Output JSON exposes the latest marker URL, created timestamp, profile,
   role, status, and parsed payload per role.
 - Reports `missing_required` codes for each lifecycle role not satisfied.
+- Fails when a v2 lifecycle comment carries a malformed typed payload. A
+  marker with an invalid payload is not counted as valid evidence.
 
 ### `plan-issue record repair-dashboard`
 
@@ -271,6 +276,8 @@ Returns typed evidence from the provider issue body and comments:
   dashboard.
 - A complete record renders `## Final Dashboard`; otherwise `## Current
   Dashboard`.
+- Fails through audit when the latest lifecycle payload cannot be parsed,
+  rather than silently rendering summary fields as `pending`.
 
 ### `plan-issue record close`
 
