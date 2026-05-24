@@ -19,7 +19,7 @@ Each binary supports `--version` and `completion <bash|zsh>`.
 
 | Binary | Primary purpose | Record/artifact written |
 | ------ | --------------- | ----------------------- |
-| `agent-run` | Run project commands through the selected project environment, using `direnv exec` when an env file applies. | stdout/stderr passthrough for `exec`; stdout/JSON only for `doctor` and `env` |
+| `agent-run` | Run project commands through the selected project environment, using `direnv` for applicable `.envrc` / `.env` files. | stdout/stderr passthrough for `exec`; stdout/JSON only for `doctor` and `env` |
 | `browser-session` | Record browser goals, steps, statuses, and evidence artifacts. | `browser-session.json` under `--out DIR` |
 | `canary-check` | Run one local command and persist a redacted pass/fail result. | `canary-check.json` under `--out DIR` |
 | `docs-impact` | Classify changed Git paths as docs or non-docs and suggest documentation review. | stdout/JSON only |
@@ -76,13 +76,16 @@ agent-run env --cwd . --format json
 ```
 
 `--direnv auto` is the default. When no `.envrc` or `.env` applies, commands run
-directly. When an env file applies, `agent-run exec` uses `direnv exec`. If
-`direnv` is unavailable or the env file is blocked, `exec` fails before running
-the child command. `--direnv off` bypasses direnv intentionally; `--direnv
-require` fails when no env file applies.
+directly. When `.envrc` applies, `agent-run exec` uses `direnv exec`. When a
+bare `.env` applies and `direnv status` does not report it as a loadable RC,
+`agent-run` uses `direnv dotenv json` to parse values and runs the child with
+those variables. If `direnv` is unavailable or the env file is blocked, `exec`
+fails before running the child command. `--direnv off` bypasses direnv
+intentionally; `--direnv require` fails when no env file applies.
 
 `agent-run` never runs `direnv allow`, `direnv edit`, or any trust-mutating
-command. A blocked `.envrc` remains a user decision outside this primitive.
+command. A blocked `.envrc` or `.env` remains a user decision outside this
+primitive.
 
 Successful `agent-run exec` does not print wrapper prefaces. Child stdout,
 stderr, and normal exit codes are preserved. Use `agent-run doctor` or

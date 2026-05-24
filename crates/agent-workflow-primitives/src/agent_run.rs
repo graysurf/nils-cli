@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -54,7 +55,25 @@ fn run_exec(args: ExecArgs) -> i32 {
             DecisionStatus::Absent | DecisionStatus::Bypassed => {
                 run_child_direct(&plan.cwd, &args.command)
             }
-            DecisionStatus::Active => run_child_direnv(&plan.cwd, &args.command),
+            DecisionStatus::Active => match plan.decision.kind {
+                DecisionKind::Direnv => run_child_direnv(&plan.cwd, &args.command),
+                DecisionKind::Dotenv => match plan.env_file.as_ref() {
+                    Some(env_file) => run_child_dotenv(&plan.cwd, &env_file.path, &args.command),
+                    None => {
+                        eprintln!(
+                            "agent-run exec: error[project-env-missing]: .env decision had no env file"
+                        );
+                        EXIT_UNAVAILABLE
+                    }
+                },
+                DecisionKind::Direct | DecisionKind::Fail => {
+                    eprintln!(
+                        "agent-run exec: error[invalid-decision]: active decision cannot use {} execution",
+                        kind_str(plan.decision.kind)
+                    );
+                    EXIT_UNAVAILABLE
+                }
+            },
             DecisionStatus::RequiredMissing
             | DecisionStatus::MissingDirenv
             | DecisionStatus::Blocked => {
@@ -154,6 +173,85 @@ fn run_child_direnv(cwd: &Path, command: &[OsString]) -> i32 {
             EXIT_UNAVAILABLE
         }
     }
+}
+
+fn run_child_dotenv(cwd: &Path, env_file: &Path, command: &[OsString]) -> i32 {
+    let Some((program, args)) = command.split_first() else {
+        return EXIT_UNAVAILABLE;
+    };
+    let envs = match dotenv_env(env_file) {
+        Ok(envs) => envs,
+        Err(err) => {
+            eprintln!("agent-run exec: error[{}]: {}", err.code, err.message);
+            eprintln!("agent-run exec: env-file={}", env_file.display());
+            return err.exit_code;
+        }
+    };
+    match ProcessCommand::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .envs(envs)
+        .status()
+    {
+        Ok(status) => status_code(status),
+        Err(err) => {
+            eprintln!(
+                "agent-run exec: error[child-spawn-failed]: failed to run {}: {err}",
+                display_os(program)
+            );
+            EXIT_UNAVAILABLE
+        }
+    }
+}
+
+fn dotenv_env(env_file: &Path) -> Result<BTreeMap<String, String>, AgentRunError> {
+    let output = ProcessCommand::new("direnv")
+        .args(["dotenv", "json"])
+        .arg(env_file)
+        .output()
+        .map_err(|err| {
+            AgentRunError::unavailable(
+                "direnv-unavailable",
+                format!("failed to run direnv dotenv: {err}"),
+                Some(json!({ "env_file": display_path(env_file) })),
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(AgentRunError::unavailable(
+            "dotenv-parse-failed",
+            format!("failed to parse .env with direnv: {}", env_file.display()),
+            Some(json!({
+                "env_file": display_path(env_file),
+                "status_exit_code": output.status.code()
+            })),
+        ));
+    }
+
+    let parsed = serde_json::from_slice::<serde_json::Map<String, Value>>(&output.stdout).map_err(
+        |err| {
+            AgentRunError::unavailable(
+                "dotenv-parse-failed",
+                format!(
+                    "failed to parse direnv dotenv JSON for {}: {err}",
+                    env_file.display()
+                ),
+                Some(json!({ "env_file": display_path(env_file) })),
+            )
+        },
+    )?;
+    let mut envs = BTreeMap::new();
+    for (key, value) in parsed {
+        let Some(value) = value.as_str() else {
+            return Err(AgentRunError::unavailable(
+                "dotenv-parse-failed",
+                format!("direnv dotenv returned a non-string value for {key}"),
+                Some(json!({ "env_file": display_path(env_file), "key": key })),
+            ));
+        };
+        envs.insert(key, value.to_string());
+    }
+    Ok(envs)
 }
 
 fn status_code(status: ExitStatus) -> i32 {
@@ -275,21 +373,19 @@ fn decide(mode: DirenvMode, env_file: Option<&EnvFile>, direnv: &mut DirenvStatu
             if !direnv.available {
                 return Decision::new(DecisionKind::Fail, DecisionStatus::MissingDirenv);
             }
-            match direnv_env_file_status(direnv) {
-                DirenvEnvFileStatus::Allowed => {
+            match (direnv_env_file_status(direnv), env_file.kind) {
+                (DirenvEnvFileStatus::Allowed, _) => {
                     Decision::new(DecisionKind::Direnv, DecisionStatus::Active)
                 }
-                DirenvEnvFileStatus::Blocked => {
+                (DirenvEnvFileStatus::Blocked, _) => {
                     Decision::new(DecisionKind::Fail, DecisionStatus::Blocked)
                 }
-                DirenvEnvFileStatus::Unknown => match env_file.kind {
-                    EnvFileKind::Dotenv => {
-                        Decision::new(DecisionKind::Direnv, DecisionStatus::Active)
-                    }
-                    EnvFileKind::Envrc => {
-                        Decision::new(DecisionKind::Fail, DecisionStatus::Blocked)
-                    }
-                },
+                (DirenvEnvFileStatus::Unknown, EnvFileKind::Dotenv) => {
+                    Decision::new(DecisionKind::Dotenv, DecisionStatus::Active)
+                }
+                (DirenvEnvFileStatus::Unknown, EnvFileKind::Envrc) => {
+                    Decision::new(DecisionKind::Fail, DecisionStatus::Blocked)
+                }
             }
         }
     }
@@ -487,6 +583,7 @@ impl Decision {
 enum DecisionKind {
     Direct,
     Direnv,
+    Dotenv,
     Fail,
 }
 
@@ -682,6 +779,7 @@ fn kind_str(kind: DecisionKind) -> &'static str {
     match kind {
         DecisionKind::Direct => "direct",
         DecisionKind::Direnv => "direnv",
+        DecisionKind::Dotenv => "direnv-dotenv",
         DecisionKind::Fail => "fail",
     }
 }
@@ -712,6 +810,15 @@ impl AgentRunError {
             message: message.into(),
             details,
             exit_code: crate::common::EXIT_USAGE,
+        }
+    }
+
+    fn unavailable(code: &'static str, message: impl Into<String>, details: Option<Value>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details,
+            exit_code: EXIT_UNAVAILABLE,
         }
     }
 

@@ -143,6 +143,43 @@ fn allowed_env_file_runs_through_direnv_exec() {
 }
 
 #[test]
+fn dotenv_file_runs_with_direnv_dotenv_parser_when_status_has_no_rc() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir(&cwd).expect("repo");
+    fs::write(cwd.join(".env"), "FROM_DOTENV=dotenv-value\n").expect("env");
+    let fake_dir = tmp.path().join("bin");
+    fs::create_dir(&fake_dir).expect("bin");
+    let log = tmp.path().join("direnv.log");
+    write_fake_direnv(&fake_dir, FakeDirenv::Dotenv { log: log.clone() });
+    let cwd_arg = arg(&cwd);
+
+    let output = run(
+        &[
+            "exec",
+            "--cwd",
+            &cwd_arg,
+            "--",
+            "sh",
+            "-c",
+            "printf $FROM_DOTENV",
+        ],
+        &CmdOptions::new().with_path_prepend(&fake_dir),
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(output.stdout_text(), "dotenv-value");
+    assert_eq!(output.stderr_text(), "");
+    let log_text = fs::read_to_string(log).expect("direnv log");
+    assert!(log_text.contains("status --json"));
+    assert!(log_text.contains("dotenv json"));
+    assert!(
+        !log_text.contains("exec"),
+        ".env fallback must not call direnv exec"
+    );
+}
+
+#[test]
 fn blocked_env_file_fails_without_running_child() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cwd = tmp.path().join("repo");
@@ -212,6 +249,47 @@ fn env_json_reports_status_without_environment_diff() {
 }
 
 #[test]
+fn env_json_reports_dotenv_status_without_environment_diff() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir(&cwd).expect("repo");
+    fs::write(cwd.join(".env"), "SECRET_VALUE=hidden\n").expect("env");
+    let fake_dir = tmp.path().join("bin");
+    fs::create_dir(&fake_dir).expect("bin");
+    let log = tmp.path().join("direnv.log");
+    write_fake_direnv(&fake_dir, FakeDirenv::Dotenv { log: log.clone() });
+    let cwd_arg = arg(&cwd);
+
+    let output = run(
+        &["env", "--cwd", &cwd_arg, "--format", "json"],
+        &CmdOptions::new().with_path_prepend(&fake_dir),
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = json_stdout(&output);
+    assert_eq!(value["schema_version"], "cli.agent-run.env.v1");
+    assert_eq!(value["data"]["env_file"]["kind"], ".env");
+    assert_eq!(value["data"]["decision"]["kind"], "direnv-dotenv");
+    assert_eq!(value["data"]["decision"]["status"], "active");
+    let rendered = output.stdout_text();
+    assert_ne!(
+        rendered.contains("SECRET_VALUE"),
+        true,
+        "env JSON must not include an environment diff or values"
+    );
+    let log_text = fs::read_to_string(log).expect("direnv log");
+    assert!(log_text.contains("status --json"));
+    assert!(
+        !log_text.contains("dotenv json"),
+        "env status must not parse or emit .env values"
+    );
+    assert!(
+        !log_text.contains("exec"),
+        "env status must not execute direnv env loading"
+    );
+}
+
+#[test]
 fn doctor_json_reports_missing_direnv_when_env_file_applies() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cwd = tmp.path().join("repo");
@@ -237,6 +315,7 @@ fn doctor_json_reports_missing_direnv_when_env_file_applies() {
 
 enum FakeDirenv {
     Success { log: PathBuf },
+    Dotenv { log: PathBuf },
     Blocked,
 }
 
@@ -257,6 +336,26 @@ fi
 if [[ "${{1:-}}" == "status" ]]; then
   printf '{{"state":{{"foundRC":{{"path":"fake","allowed":0}}}}}}\n'
   exit 0
+fi
+	exit 2
+	"#,
+            shell_quote(&log)
+        ),
+        FakeDirenv::Dotenv { log } => format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> {}
+if [[ "${{1:-}}" == "status" ]]; then
+  printf '{{"state":{{"foundRC":null,"loadedRC":null}}}}\n'
+  exit 0
+fi
+if [[ "${{1:-}}" == "dotenv" && "${{2:-}}" == "json" ]]; then
+  printf '{{"FROM_DOTENV":"dotenv-value"}}\n'
+  exit 0
+fi
+if [[ "${{1:-}}" == "exec" ]]; then
+  printf 'direnv exec should not run for dotenv fallback\n' >&2
+  exit 12
 fi
 exit 2
 "#,

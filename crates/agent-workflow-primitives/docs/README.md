@@ -31,8 +31,9 @@ agent-run env --cwd . --format json
 ```
 
 `agent-run` keeps successful `exec` output unwrapped and exposes environment
-decisions through `doctor` and `env` status surfaces. It never runs
-`direnv allow`.
+decisions through `doctor` and `env` status surfaces. `.envrc` execution uses
+`direnv exec`; bare `.env` execution uses `direnv dotenv json` when `direnv`
+does not report the file as a loadable RC. It never runs `direnv allow`.
 
 ## `repo-retro` examples
 
