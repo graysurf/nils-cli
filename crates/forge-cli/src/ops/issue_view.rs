@@ -379,12 +379,17 @@ fn parse_gitlab_notes(
 
 /// Extract the GitLab project path (group/project, possibly nested) from an
 /// issue's `web_url`. Returns `None` when the URL does not look like a GitLab
-/// issue URL. Accepts both `/-/issues/<iid>` and `/issues/<iid>` shapes.
+/// issue URL. Accepts `/-/issues/<iid>`, `/issues/<iid>`, and the newer
+/// `/-/work_items/<iid>` shape that GitLab returns for projects that have
+/// migrated issues to the unified Work Items API (live-observed on
+/// gitlab.gamania.com).
 fn gitlab_project_path_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let path = after_scheme.split_once('/').map(|(_, rest)| rest)?;
     let path = path.trim_end_matches('/');
     let project_path = if let Some(idx) = path.find("/-/issues/") {
+        &path[..idx]
+    } else if let Some(idx) = path.find("/-/work_items/") {
         &path[..idx]
     } else if let Some(idx) = path.find("/issues/") {
         &path[..idx]
@@ -687,6 +692,14 @@ mod tests {
             )
             .as_deref(),
             Some("terrylin/agent-runtime-testing")
+        );
+        assert_eq!(
+            gitlab_project_path_from_url(
+                "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/work_items/6"
+            )
+            .as_deref(),
+            Some("terrylin/agent-runtime-testing"),
+            "GitLab projects migrated to the Work Items API surface issues at /-/work_items/<iid>",
         );
         assert_eq!(
             gitlab_project_path_from_url("https://gitlab.com/group/sub/project/-/issues/12")
