@@ -880,7 +880,7 @@ mod tests {
                 id: None,
                 name: "status::unknown".into(),
                 color: "000000".into(),
-                description: "Legacy".into(),
+                description: "Unknown shared".into(),
             },
             ProviderLabel {
                 id: None,
