@@ -1215,6 +1215,223 @@ fn agent_runtime_kit_lifecycle_fixture_passes_strict_v2_closeout_end_to_end() {
     );
 }
 
+/// Issue sympoies/nils-cli#479: `record open --label` exposes labels in the
+/// dry-run preview so downstream consumers can audit creation-time labels
+/// without hitting the provider.
+#[test]
+fn record_open_dry_run_includes_labels_in_preview() {
+    use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
+
+    let stub = StubBinDir::new();
+    stub.write_exe("gh", record_open_dry_run_gh_stub());
+
+    let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
+    let bundle = repo.path().join("docs/plans/sample");
+    fs::create_dir_all(&bundle).expect("create bundle dir");
+    let source = bundle.join("sample-discussion-source.md");
+    let plan = bundle.join("sample-plan.md");
+    let execution_state = bundle.join("sample-execution-state.md");
+    fs::write(&source, "# Source\n\n- Decision: implement v2 lifecycle.\n").expect("write source");
+    fs::write(
+        &plan,
+        "# Plan: Sample Plan\n\n## Overview\n\n- Sample plan body.\n\n## Read First\n\n- Primary source: docs/plans/sample/sample-discussion-source.md\n- Source type: discussion-to-implementation-doc\n- Open questions carried into execution: none\n\n## Scope\n\n- In scope:\n  - Demo plan.\n- Out of scope:\n  - none.\n\n## Assumptions\n\n1. Demo only.\n\n## Sprint 1: Demo\n\n**Goal**: Demo the surface.\n\n**PR grouping intent**: group\n**Execution Profile**: serial\n\n### Task 1.1: Demo task\n\n- **Location**:\n  - `docs/plans/sample/sample-plan.md`\n- **Description**: Demo task description.\n- **Dependencies**:\n  - none\n- **Complexity**: 1\n- **Acceptance criteria**:\n  - The demo task is complete.\n- **Validation**:\n  - `true`\n",
+    )
+    .expect("write plan");
+    fs::write(
+        &execution_state,
+        "# Sample Execution State\n\n<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n## Execution State\n\n- Status: pending\n- Target scope: Sample Plan\n",
+    )
+    .expect("write execution state");
+    git(repo.path(), &["add", "."]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "seed bundle",
+            "--no-gpg-sign",
+        ],
+    );
+
+    let opts = dry_run_cmd_options(stub.path()).with_cwd(repo.path());
+    let bundle_arg = bundle.to_string_lossy().to_string();
+    let out = nils_test_support::cmd::run_resolved(
+        "plan-issue-local",
+        &[
+            "--format",
+            "json",
+            "record",
+            "open",
+            "--bundle",
+            &bundle_arg,
+            "--label",
+            "workflow::plan",
+            "--label",
+            " state::needs-triage ",
+            "--label",
+            "",
+        ],
+        &opts,
+    );
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed: Value = serde_json::from_str(&out.stdout_text()).expect("json");
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["mode"], "dry-run");
+    let labels = result["preview"]["labels"]
+        .as_array()
+        .expect("preview.labels array");
+    let labels: Vec<&str> = labels.iter().filter_map(Value::as_str).collect();
+    assert_eq!(
+        labels,
+        vec!["workflow::plan", "state::needs-triage"],
+        "empty/whitespace labels must be dropped and non-empty values trimmed"
+    );
+}
+
+/// `record post --add-label / --remove-label` exposes the planned label
+/// mutation in dry-run output and in fixture mode without touching gh.
+#[test]
+fn record_post_dry_run_includes_label_mutations() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    fs::write(
+        &payload,
+        json!({"status": "blocked", "tasks": [], "prs": [], "blockers": [], "links": {}})
+            .to_string(),
+    )
+    .expect("write payload");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "--dry-run",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload path"),
+        "--add-label",
+        "state::blocked",
+        "--remove-label",
+        "state::in-progress",
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["mode"], "dry-run");
+    assert_eq!(result["labels"]["add"][0], "state::blocked");
+    assert_eq!(result["labels"]["remove"][0], "state::in-progress");
+}
+
+/// `record close --add-label / --remove-label` shows the planned closeout
+/// label transition in fixture preview output.
+#[test]
+fn record_close_fixture_includes_label_mutations() {
+    let fixture = Path::new("tests/fixtures/lifecycle/agent-runtime-kit-closeout").to_path_buf();
+    assert!(fixture.exists(), "fixture missing: {}", fixture.display());
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "42",
+        "--linked-pr",
+        "sympoies/agent-runtime-kit#1",
+        "--approval",
+        "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-approval",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+        "--add-label",
+        "state::closed",
+        "--remove-label",
+        "state::in-progress",
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let labels = &parsed["payload"]["result"]["preview"]["labels"];
+    assert_eq!(labels["add"][0], "state::closed");
+    assert_eq!(labels["remove"][0], "state::in-progress");
+}
+
+/// Same label name in `--add-label` and `--remove-label` is incoherent — the
+/// helper rejects it with a usage error so the live `gh issue edit` call is
+/// never built.
+#[test]
+fn record_post_rejects_conflicting_label_mutations() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    fs::write(
+        &payload,
+        json!({"status": "in-progress", "tasks": [], "prs": [], "blockers": [], "links": {}})
+            .to_string(),
+    )
+    .expect("write payload");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "--dry-run",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload path"),
+        "--add-label",
+        "state::needs-triage",
+        "--remove-label",
+        "state::needs-triage",
+    ]);
+    assert_ne!(out.code, 0, "conflicting label mutation should fail");
+    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    assert!(
+        joined.contains("record-label-mutation-conflict"),
+        "expected record-label-mutation-conflict code, got: {joined}"
+    );
+}
+
+#[test]
+fn record_close_rejects_conflicting_label_mutations() {
+    let fixture = Path::new("tests/fixtures/lifecycle/agent-runtime-kit-closeout").to_path_buf();
+    assert!(fixture.exists(), "fixture missing: {}", fixture.display());
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "42",
+        "--linked-pr",
+        "sympoies/agent-runtime-kit#1",
+        "--approval",
+        "ok",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+        "--add-label",
+        "state::closed",
+        "--remove-label",
+        "state::closed",
+    ]);
+    assert_ne!(out.code, 0, "conflicting label mutation should fail");
+    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    assert!(
+        joined.contains("record-label-mutation-conflict"),
+        "expected record-label-mutation-conflict code, got: {joined}"
+    );
+}
+
 /// Sprint 4 Task 4.3: same fixture, but force the strict gate to fail by
 /// flipping the PR snapshot to unmerged. Verifies the gate code surfaces.
 #[test]
