@@ -1292,6 +1292,69 @@ fn record_open_dry_run_includes_labels_in_preview() {
     );
 }
 
+#[test]
+fn record_attach_dry_run_renders_source_plan_and_state_comments() {
+    use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
+
+    let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
+    let bundle = repo.path().join("docs/plans/sample");
+    fs::create_dir_all(&bundle).expect("create bundle dir");
+    let source = bundle.join("sample-discussion-source.md");
+    let plan = bundle.join("sample-plan.md");
+    let execution_state = bundle.join("sample-execution-state.md");
+    fs::write(&source, "# Source\n\n- Decision: attach existing issue.\n").expect("write source");
+    fs::write(
+        &plan,
+        "# Plan: Existing Issue Attach\n\n## Overview\n\n- Attach v2 lifecycle comments.\n\n## Read First\n\n- Primary source: docs/plans/sample/sample-discussion-source.md\n- Source type: discussion-to-implementation-doc\n- Open questions carried into execution: none\n\n## Scope\n\n- In scope:\n  - Demo attach.\n- Out of scope:\n  - none.\n\n## Assumptions\n\n1. Demo only.\n\n## Sprint 1: Demo\n\n**Goal**: Demo the attach surface.\n\n**PR grouping intent**: group\n**Execution Profile**: serial\n\n### Task 1.1: Demo task\n\n- **Location**:\n  - `docs/plans/sample/sample-plan.md`\n- **Description**: Demo task description.\n- **Dependencies**:\n  - none\n- **Complexity**: 1\n- **Acceptance criteria**:\n  - The demo task is complete.\n- **Validation**:\n  - `true`\n",
+    )
+    .expect("write plan");
+    fs::write(
+        &execution_state,
+        "# Sample Execution State\n\n<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n## Execution State\n\n- Status: pending\n- Target scope: Existing Issue Attach\n",
+    )
+    .expect("write execution state");
+    git(repo.path(), &["add", "."]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "seed bundle",
+            "--no-gpg-sign",
+        ],
+    );
+
+    let bundle_arg = bundle.to_string_lossy().to_string();
+    let out = nils_test_support::cmd::run_resolved(
+        "plan-issue-local",
+        &[
+            "--format",
+            "json",
+            "--dry-run",
+            "record",
+            "attach",
+            "--issue",
+            "69",
+            "--bundle",
+            &bundle_arg,
+        ],
+        &nils_test_support::cmd::CmdOptions::new().with_cwd(repo.path()),
+    );
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed: Value = serde_json::from_str(&out.stdout_text()).expect("json");
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["mode"], "dry-run");
+    assert_eq!(result["preview"]["issue_number"], 69);
+    let comments = &result["preview"]["comments"];
+    assert!(comments["source"].as_str().unwrap().contains("role=source"));
+    assert!(comments["plan"].as_str().unwrap().contains("role=plan"));
+    assert!(comments["state"].as_str().unwrap().contains("role=state"));
+}
+
 /// `record post --add-label / --remove-label` exposes the planned label
 /// mutation in dry-run output and in fixture mode without touching gh.
 #[test]

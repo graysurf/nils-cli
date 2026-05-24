@@ -1,0 +1,42 @@
+schema_version: 1
+render:
+  target: support-matrix
+  root_view: SUPPORT_MATRIX.md
+  output: build/shared/SUPPORT_MATRIX.md
+surfaces:
+  - id: deterministic-surface
+    ordinal: 1
+    name: "deterministic surface"
+    products:
+      codex:
+        state: shipped
+        mechanism: "codex deterministic mechanism"
+        source_artifacts:
+          - AGENTS.md
+        min_product: "0.130.0"
+        min_nils_cli: "v0.20.0"
+        acceptance:
+          - kind: ci
+            note: "cargo test"
+            descriptive_only: true
+          - kind: live
+            note: "manual session"
+            descriptive_only: true
+        source_manifest:
+          - "manifests/runtime-roots.yaml:1"
+      claude:
+        state: shipped
+        mechanism: "claude deterministic mechanism"
+        source_artifacts:
+          - CLAUDE.md
+        min_product: "2.1.145"
+        min_nils_cli: "v0.20.0"
+        acceptance:
+          - kind: ci
+            note: "cargo test"
+            descriptive_only: true
+          - kind: live
+            note: "manual session"
+            descriptive_only: true
+        source_manifest:
+          - "manifests/runtime-roots.yaml:2"
