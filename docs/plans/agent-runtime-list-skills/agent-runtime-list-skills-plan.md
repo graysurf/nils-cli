@@ -129,8 +129,8 @@ adding docs or cross-repo work.
 - **Location**:
   - `crates/agent-runtime-cli/src/commands/list_skills.rs`
 - **Description**: Implement deterministic formatters. Text output emits one
-  tab-separated line per skill (`id\tlink_mode\tdestination`) sorted by
-  `id`. JSON output emits an object with `product`, `source_root`,
+  tab-separated line per skill (`id<TAB>link_mode<TAB>destination`) sorted
+  by `id`. JSON output emits an object with `product`, `source_root`,
   `live_home`, and `skills` (array of `SkillRecord`); arrays are sorted by
   `id`; nested `warnings` are sorted by `code` then `message`.
 - **Dependencies**:

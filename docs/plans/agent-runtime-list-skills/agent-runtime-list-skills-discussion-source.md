@@ -84,9 +84,9 @@ link-map + install-plan + skill-surface modules. No filesystem mutation.
 
 ### Text Output
 
-Single line per skill: `<id>\t<link_mode>\t<destination>`. Designed to be
-piped through `cut -f1 | sort > observed.txt` and diffed against the pinned
-`expected-skills.txt`.
+Single line per skill, tab-separated: `<id><TAB><link_mode><TAB><destination>`.
+Designed to be piped through `cut -f1 | sort > observed.txt` and diffed
+against the pinned `expected-skills.txt`.
 
 ## Out Of Scope
 
