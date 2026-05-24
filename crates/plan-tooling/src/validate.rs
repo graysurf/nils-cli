@@ -497,7 +497,7 @@ fn validate_read_first(plan_path: &str, plan: &Plan, repo_root: &Path) -> Vec<St
         errs.push(format!("{plan_path}: Read First missing Source type"));
     } else if !is_allowed_source_type(&source_type) {
         errs.push(format!(
-            "{plan_path}: invalid Read First Source type (expected discussion-to-implementation-doc|review-to-improvement-doc|existing issue/spec|plan-only waiver): {}",
+            "{plan_path}: invalid Read First Source type (expected discussion-to-implementation-doc|existing issue/spec|plan-only waiver): {}",
             crate::repr::py_repr(&source_type)
         ));
     }
@@ -555,10 +555,7 @@ fn clean_source_value(value: &str) -> String {
 fn is_allowed_source_type(value: &str) -> bool {
     matches!(
         value,
-        "discussion-to-implementation-doc"
-            | "review-to-improvement-doc"
-            | "existing issue/spec"
-            | "plan-only waiver"
+        "discussion-to-implementation-doc" | "existing issue/spec" | "plan-only waiver"
     )
 }
 
@@ -856,7 +853,7 @@ pub(crate) const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
         explain: ExplainEntry {
             class: "read-first-missing",
             rule: "Plans must start with a Read First section that names the primary source artifact.",
-            example: "## Read First\n\n- Primary source: docs/runbooks/example-source.md\n- Source type: review-to-improvement-doc\n- Open questions carried into execution: none",
+            example: "## Read First\n\n- Primary source: docs/runbooks/example-source.md\n- Source type: discussion-to-implementation-doc\n- Open questions carried into execution: none",
         },
     },
     ExplainCatalogEntry {
@@ -872,7 +869,7 @@ pub(crate) const EXPLAIN_CATALOG: &[ExplainCatalogEntry] = &[
         explain: ExplainEntry {
             class: "read-first-source-type-missing",
             rule: "Read First must declare a `Source type` value.",
-            example: "- Source type: review-to-improvement-doc",
+            example: "- Source type: discussion-to-implementation-doc",
         },
     },
     ExplainCatalogEntry {
@@ -1578,9 +1575,9 @@ mod tests {
     #[test]
     fn allowed_source_types_are_exact() {
         assert!(is_allowed_source_type("discussion-to-implementation-doc"));
-        assert!(is_allowed_source_type("review-to-improvement-doc"));
         assert!(is_allowed_source_type("existing issue/spec"));
         assert!(is_allowed_source_type("plan-only waiver"));
+        assert!(!is_allowed_source_type("review-to-improvement-doc"));
         assert!(!is_allowed_source_type("review"));
     }
 

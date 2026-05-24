@@ -13,7 +13,7 @@ grouping intent. Within-sprint tasks may run in parallel where they touch indepe
 
 - Primary source:
   docs/plans/plan-tooling-validate-ergonomics/plan-tooling-validate-ergonomics-review-source.md
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 - Open questions carried into execution:
   - Should `plan-tooling spec` (F6) ship as JSON schema or flat catalog? Default to flat catalog
     this round; schema is follow-up.

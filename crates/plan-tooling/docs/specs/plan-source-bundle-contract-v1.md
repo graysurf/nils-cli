@@ -50,11 +50,11 @@ The plan `Read First` section must use one accepted sibling source doc as `Prima
 - Open questions carried into execution: none
 ```
 
-Review-backed plans use:
+Review-backed source docs use the same source type — only the filename differs:
 
 ```md
 - Primary source: `docs/plans/<slug>/<slug>-review-source.md`
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 ```
 
 `Source type: plan-only waiver` remains valid for plan-only documents, but it opts out of bundle

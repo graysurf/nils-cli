@@ -12,7 +12,7 @@ appears, not before.
 ## Read First
 
 - Primary source: docs/plans/cli-destructive-operation-safety/cli-destructive-operation-safety-review-source.md
-- Source type: review-to-improvement-doc
+- Source type: discussion-to-implementation-doc
 - Open questions carried into execution:
   - For `memo-cli delete`: redefine `--hard` as a real mode (soft vs. hard) or remove? Default: redefine.
   - For `git-lock unlock --dry-run`: summary table vs. raw `git diff`? Default: summary table, `--verbose` for full diff.

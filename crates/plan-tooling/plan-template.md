@@ -5,7 +5,7 @@
 
 ## Read First
 - Primary source: <repo path, issue/ticket URL, or explicit plan-only waiver>
-- Source type: <discussion-to-implementation-doc | review-to-improvement-doc | existing issue/spec | plan-only waiver>
+- Source type: <discussion-to-implementation-doc | existing issue/spec | plan-only waiver>
 - Open questions carried into execution: none
 
 ## Scope
