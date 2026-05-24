@@ -736,9 +736,13 @@ fn run_record_open(
         }));
     }
 
-    // Live mode.
-    let repo = resolve_repo_for_live(binary, repo_override)?;
-    let adapter = GhCliAdapter::new(force);
+    // Live mode. Sprint 2.2 routes `record open` through the provider-aware
+    // adapter selector so GitLab repos exercise `forge_cli_adapter::ForgeCliAdapter`
+    // (which shells out to `forge-cli`). GitHub repos keep using `GhCliAdapter`
+    // unchanged.
+    let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+    let adapter = crate::provider::select_adapter(&repo_info, force);
+    let repo = repo_info.slug;
 
     let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
         .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
@@ -3332,23 +3336,26 @@ fn resolve_repo_for_live(
     binary: BinaryFlavor,
     repo_override: Option<&str>,
 ) -> Result<String, CommandError> {
+    // Sprint 2.2: stop early-rejecting GitLab. Dispatchers that still default
+    // to `GhCliAdapter` would now silently shell out to `gh` against a GitLab
+    // slug and fail with gh's error — that path is acceptable as a transitional
+    // failure mode because Sprint 3 / Sprint 4 will refactor those dispatchers
+    // to use [`crate::provider::select_adapter`]. The `record open` dispatcher
+    // already routes through `resolve_repo_info_for_live` + `select_adapter`,
+    // so it lands the GitLab path correctly.
+    Ok(resolve_repo_info_for_live(binary, repo_override)?.slug)
+}
+
+/// Provider-aware variant of `resolve_repo_for_live`. Used by dispatchers
+/// that route through [`crate::provider::select_adapter`] to pick the right
+/// `ProviderAdapter` implementation per provider.
+fn resolve_repo_info_for_live(
+    binary: BinaryFlavor,
+    repo_override: Option<&str>,
+) -> Result<crate::provider::Repo, CommandError> {
     ensure_live_binary(binary)?;
-    let info = crate::provider::resolve_repo(repo_override)
-        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
-    if info.provider == crate::provider::Provider::GitLab {
-        // Sprint 2.1: routing layer is in place but the GitLab branch is a
-        // stub (see `forge_cli_adapter::ForgeCliAdapter`). Sprint 2.2 wires
-        // the actual `forge-cli` subprocess calls in.
-        return Err(CommandError::runtime(
-            "provider_not_implemented",
-            format!(
-                "plan-issue-cli GitLab support is wired to the routing layer but not yet active (Sprint 2.1 stub); track sympoies/nils-cli#490. Repo: {} at {}",
-                info.slug,
-                info.host.as_deref().unwrap_or("(unknown host)"),
-            ),
-        ));
-    }
-    Ok(info.slug)
+    crate::provider::resolve_repo(repo_override)
+        .map_err(|err| CommandError::usage("repo-resolution-failed", err))
 }
 
 fn render_plan_status_comment(rows: &[TaskRow]) -> String {
