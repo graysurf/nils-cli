@@ -2,6 +2,7 @@ pub mod audit_drift;
 pub mod doctor;
 pub mod gc_backups;
 pub mod install;
+pub mod list_skills;
 pub mod pr_body;
 pub mod purge_state;
 pub mod render;
