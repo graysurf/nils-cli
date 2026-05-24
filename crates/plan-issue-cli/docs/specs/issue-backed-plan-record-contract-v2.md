@@ -4,7 +4,7 @@
 
 - This spec defines the breaking v3 issue-backed plan record lifecycle owned by
   the `plan-issue record ...` surface.
-- It replaces [issue-backed plan record contract v1](issue-backed-plan-record-contract-v1.md).
+- It replaces the previous low-level issue-backed record helper workflow.
 - It supersedes the prior `start-plan` / `start-sprint` Task Decomposition
   runtime for new agent-runtime-kit lifecycles; see
   [plan-issue state machine v2](plan-issue-state-machine-v2.md).
@@ -41,21 +41,18 @@ Out of scope:
 
 ## Breaking Changes vs v1
 
-The following v1 surfaces are retired in v2:
+The previous low-level helper surface is removed:
 
-- `--marker-family` argument and the dual `compat` / `shared` marker
-  families.
-- `record render-comment` and `record render-dashboard` as primary
-  user-facing commands. Comment rendering becomes an implementation detail of
-  `record post`; dashboard rendering moves under `record repair-dashboard`.
-- `record closeout-gate` as a standalone command and its
+- The retired marker-family selector and non-canonical marker families.
+- The standalone comment/dashboard render helpers. Comment rendering is an
+  implementation detail of `record open` / `record post`; dashboard rendering
+  is owned by `record repair-dashboard`.
+- The standalone closeout helper and its
   `--require-complete`, `--require-session`, `--require-validation`,
   `--require-review`, and `--require-closeout` flags. Closeout-gate
   evaluation moves inside `record close` and is strict by default.
-- Implicit acceptance of v1 `plan-tracking-issue:*`,
-  `execute-from-tracking-issue:*`, `tracking-issue-closeout:*`, and
-  `deliver-dispatch-plan:*` markers as current lifecycle evidence. They are
-  ignored or reported as unsupported.
+- Implicit acceptance of retired issue-record marker prefixes as current
+  lifecycle evidence. They are ignored or reported as unsupported.
 - Prose-Markdown status parsing (`- Status: complete`) as the authoritative
   signal for closeout state detection. The structured payload is the source
   of truth.
@@ -300,7 +297,7 @@ non-optional. Inputs are limited to:
 - `--fixture <dir>` + `--body-file` + `--comments-json` for tests.
 - `--dry-run` for non-mutating previews.
 
-## Strict Closeout Gate
+## Strict Closeout Validation
 
 Failure modes that block close:
 
@@ -357,37 +354,8 @@ in a coordinated release of the consumer (agent-runtime-kit) after the
 ## Consumer Migration
 
 The agent-runtime-kit dispatch skills are the primary downstream consumer
-of this contract. They currently call `plan-issue` 0.17.x with
-`--marker-family compat` and assemble closeout from `record render-comment`,
-`record render-dashboard`, and `record closeout-gate` by hand. The
-migration is a one-time replacement of those invocations with the new
-provider-backed surface.
-
-### Before (v1, retired)
-
-```bash
-# Open a tracking issue and seed snapshots manually.
-plan-issue record render-comment \
-  --marker-family compat --kind source --content-file source.md --commit "$SOURCE_SHA" \
-  --out source.md
-forge-cli --provider github issue create --repo "$REPO" --title "$TITLE" --body-file source.md
-
-# Post lifecycle comments manually.
-plan-issue record render-comment --marker-family compat --kind state \
-  --content-file state.md --out state.md
-forge-cli --provider github issue comment "$ISSUE" --repo "$REPO" --body-file state.md
-
-# Evaluate closeout gate explicitly.
-plan-issue record closeout-gate \
-  --body-file issue-body.md --comments-json comments.json \
-  --require-complete --require-validation --require-review --require-closeout \
-  --approval "$APPROVAL_URL"
-
-# Close issue manually.
-forge-cli --provider github issue close "$ISSUE" --repo "$REPO" --reason completed
-```
-
-### After (v2, current)
+of this contract. Migration is a one-time replacement of manual helper
+composition with the provider-backed surface below.
 
 ```bash
 # Open the tracking issue from a plan bundle.
@@ -409,9 +377,9 @@ plan-issue --repo "$REPO" record close \
 
 ### Migration checklist
 
-- [ ] Replace any `--marker-family compat` callsites with v2 invocations.
-- [ ] Replace `record render-comment | render-dashboard | closeout-gate`
-      composition with `record open | post | repair-dashboard | close`.
+- [ ] Replace any pre-v2 marker callsites with v2 invocations.
+- [ ] Replace manual lifecycle composition with
+      `record open | post | repair-dashboard | close`.
 - [ ] Switch JSON consumers from `audit.markers` (v1) to `audit.evidence`
       keyed by role (v2).
 - [ ] Re-pin the JSON envelope on `plan-issue-cli.record.<sub>.v2` before

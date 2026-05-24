@@ -293,11 +293,7 @@ impl RecordArgs {
             record::RecordCommand::Post(_) => "record.post",
             record::RecordCommand::RepairDashboard(_) => "record.repair-dashboard",
             record::RecordCommand::Close(_) => "record.close",
-            record::RecordCommand::RenderDashboard(_) => "record.render-dashboard",
-            record::RecordCommand::RenderComment(_) => "record.render-comment",
             record::RecordCommand::Audit(_) => "record.audit",
-            record::RecordCommand::CloseoutGate(_) => "record.closeout-gate",
-            record::RecordCommand::BuildDispatchLedger(_) => "record.build-dispatch-ledger",
         }
     }
 }

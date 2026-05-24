@@ -3,8 +3,8 @@
 ## Overview
 
 Rewrite `plan-issue` around one issue-backed lifecycle contract for
-agent-runtime-kit and future dispatch work. The new surface removes legacy
-compat markers, stops exposing closeout as a caller-assembled sequence, and
+agent-runtime-kit and future dispatch work. The new surface removes retired
+marker variants, stops exposing closeout as a caller-assembled sequence, and
 makes `plan-issue` own provider-backed issue record open, post, audit, repair,
 and close operations.
 
@@ -31,8 +31,8 @@ and close operations.
     workflow that exposed the current defects.
 - Out of scope:
   - Migrating agent-runtime-kit skills before a nils-cli release exists.
-  - Supporting legacy marker families.
-  - Preserving old `record closeout-gate --require-*` behavior.
+  - Supporting retired marker families.
+  - Preserving optional retired closeout helper flags.
   - Changing `plan-tooling` plan parsing.
   - Releasing Homebrew tap updates in the implementation PR itself.
 
@@ -41,7 +41,7 @@ and close operations.
 1. The target consumer is agent-runtime-kit on GitHub.
 2. GitHub support is sufficient for the first v3 implementation.
 3. The old `start-plan` / `start-sprint` Task Decomposition runtime can be
-   retired from the primary surface or moved behind an explicit legacy module.
+   retired from the primary surface or moved behind an archival module.
 4. The v3 CLI may break existing generated completions and docs because no
    backward compatibility is required.
 5. Provider-verified PR state is mandatory for live closeout, while local
@@ -58,7 +58,6 @@ model.
 ### Task 1.1: Replace the issue-backed record contract with v3
 
 - **Location**:
-  - `crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v1.md`
   - `crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md`
   - `crates/plan-issue-cli/docs/specs/plan-issue-state-machine-v1.md`
   - `crates/plan-issue-cli/docs/README.md`
@@ -70,7 +69,7 @@ model.
   - none
 - **Complexity**: 4
 - **Acceptance criteria**:
-  - The spec states that legacy compat markers are retired.
+  - The spec states that retired marker variants are not accepted.
   - The spec defines one marker family for source, plan, state, session,
     validation, review, and closeout comments.
   - The spec defines the provider-backed command boundary for open, post,
@@ -94,7 +93,7 @@ model.
   - Task 1.1
 - **Complexity**: 5
 - **Acceptance criteria**:
-  - `--marker-family` is removed.
+  - The retired marker-family selector is absent from the CLI parser.
   - `--require-complete`, `--require-session`, `--require-validation`,
     `--require-review`, and `--require-closeout` are removed from closeout.
   - `record close` accepts issue, linked PR, approval evidence, and optional
@@ -136,17 +135,17 @@ model.
 - **Location**:
   - `crates/plan-issue-cli/src/lifecycle_record.rs`
   - `crates/plan-issue-cli/tests/integration/lifecycle_record.rs`
-- **Description**: Remove compat marker rendering and parsing. Audit should
+- **Description**: Remove alternate marker rendering and parsing. Audit should
   recognize only the canonical v3 marker family and should reject quoted or
-  legacy markers.
+  retired markers.
 - **Dependencies**:
   - Task 1.3
 - **Complexity**: 5
 - **Acceptance criteria**:
   - `MarkerFamily` is removed.
-  - Tracking compat review marker errors disappear because there is no compat
-    branch.
-  - Legacy markers are ignored or reported as unsupported, not accepted as
+  - Retired review marker errors disappear because there is no alternate
+    marker branch.
+  - Retired markers are ignored or reported as unsupported, not accepted as
     current lifecycle evidence.
   - Latest-marker selection is deterministic by role and comment timestamp.
 - **Validation**:
@@ -284,10 +283,10 @@ generated assets.
   - `crates/plan-issue-cli/src/commands/sprint.rs`
   - `crates/plan-issue-cli/src/execute.rs`
   - `crates/plan-issue-cli/tests/integration/cli_contract.rs`
-- **Description**: Remove legacy `start-plan`, `status-plan`, `link-pr`,
+- **Description**: Remove retired `start-plan`, `status-plan`, `link-pr`,
   `ready-plan`, `close-plan`, `start-sprint`, `ready-sprint`, and
   `accept-sprint` from the primary `plan-issue` help surface, or place them
-  behind an explicit legacy-only binary if removal creates too much churn.
+  behind an archival-only binary if removal creates too much churn.
 - **Dependencies**:
   - Task 3.3
 - **Complexity**: 7

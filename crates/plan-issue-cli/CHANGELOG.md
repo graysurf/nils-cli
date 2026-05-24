@@ -13,14 +13,12 @@ versioning.
   [`docs/specs/issue-backed-plan-record-contract-v2.md`](docs/specs/issue-backed-plan-record-contract-v2.md)
   and [`docs/specs/plan-issue-state-machine-v2.md`](docs/specs/plan-issue-state-machine-v2.md)).
   Consumers (notably `agent-runtime-kit`) must migrate after upgrading to
-  the next plan-issue-cli release. There is no compat shim.
-  - The `--marker-family compat|shared` argument is removed. There is now
-    one canonical marker family
+  the next plan-issue-cli release. There is no migration shim.
+  - The retired marker-family selector is removed. There is now one canonical
+    marker family
     `<!-- plan-issue-record:v2 role=<role> profile=<profile> -->`. Pre-v2
-    markers (`plan-tracking-issue:`, `execute-from-tracking-issue:`,
-    `tracking-issue-closeout:`, `deliver-dispatch-plan:`, ...) are
-    reported by audit as `unsupported_markers` and ignored as current
-    lifecycle evidence.
+    markers are reported by audit as `unsupported_markers` and ignored as
+    current lifecycle evidence.
   - Audit JSON renames `audit.markers` to `audit.evidence` and indexes by
     role (`source`, `plan`, `state`, `session`, `validation`, `review`,
     `closeout`). Each entry exposes the latest URL, created timestamp,
@@ -32,7 +30,7 @@ versioning.
     of truth; older visible `plan-issue-record-payload` fences remain
     accepted for existing records. Prose-Markdown status parsing is no longer
     used.
-  - The `record closeout-gate` standalone command and its
+  - The standalone closeout helper command and its
     `--require-complete`, `--require-session`, `--require-validation`,
     `--require-review`, `--require-closeout` flags are retired.
     Closeout-gate evaluation now runs inside `record close` and is
@@ -42,13 +40,9 @@ versioning.
     `validation-failed`, `review-missing`, `review-rejected`,
     `review-unresolved-findings`, `linked-pr-not-merged`,
     `approval-missing`).
-  - `record render-comment`, `record render-dashboard`,
-    `record closeout-gate`, and `record build-dispatch-ledger` are
-    retired from the primary `record --help` surface via
-    `#[command(hide = true)]`. They remain callable as transitional
-    helpers until the next major release, but consumers should migrate
-    to `record open`, `record post`, `record repair-dashboard`, and
-    `record close` immediately.
+  - The retired record helper subcommands are removed from the CLI
+    parser. Consumers must use `record open`, `record post`,
+    `record repair-dashboard`, and `record close`.
   - `record close` now requires a non-empty `--approval` URL or text. The
     strict gate verifies linked PR evidence through provider state
     (`gh pr view --json state,mergeCommit,statusCheckRollup`) and
@@ -86,8 +80,7 @@ versioning.
   posted comment URL.
 - Agent-runtime-kit consumer handoff: see
   [`docs/specs/issue-backed-plan-record-contract-v2.md`](docs/specs/issue-backed-plan-record-contract-v2.md)
-  section "Consumer Migration" for example commands for replacing the
-  current `--marker-family compat` invocations.
+  section "Consumer Migration" for the canonical v3 commands.
 
 ### BREAKING
 
