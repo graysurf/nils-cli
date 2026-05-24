@@ -29,6 +29,8 @@ mod gc_backups;
 mod install_flags;
 #[path = "integration/install_pipeline.rs"]
 mod install_pipeline;
+#[path = "integration/list_skills.rs"]
+mod list_skills;
 #[path = "integration/managed_block.rs"]
 mod managed_block;
 #[path = "integration/pr_body.rs"]
