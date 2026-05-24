@@ -3,6 +3,7 @@ use nils_test_support::help::{HelpCase, assert_help_contains};
 #[test]
 fn help_snapshot_all_workflow_primitive_binaries() {
     for (bin, env_needle) in [
+        ("agent-run", "PATH"),
         ("browser-session", "none"),
         ("canary-check", "SHELL"),
         ("docs-impact", "none"),

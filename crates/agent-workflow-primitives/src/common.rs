@@ -18,6 +18,7 @@ pub const EXIT_RUNTIME: i32 = exit::RUNTIME;
 pub const EXIT_USAGE: i32 = exit::USAGE;
 #[allow(dead_code)]
 pub const EXIT_DATA: i32 = exit::DATA;
+pub const EXIT_UNAVAILABLE: i32 = exit::UNAVAILABLE;
 
 #[derive(Debug)]
 pub struct CliError(Box<CliErrorData>);
@@ -68,6 +69,19 @@ impl CliError {
             message: message.into(),
             details,
             exit_code: EXIT_RUNTIME,
+        }))
+    }
+
+    pub fn unavailable(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<Value>,
+    ) -> Self {
+        Self(Box::new(CliErrorData {
+            code: code.into(),
+            message: message.into(),
+            details,
+            exit_code: EXIT_UNAVAILABLE,
         }))
     }
 }

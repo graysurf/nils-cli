@@ -5,6 +5,8 @@ completion, release, and new-crate rules in the root `docs/` tree.
 
 ## Binary overview
 
+- `agent-run`: project command execution through normalized direct or direnv
+  environment decisions.
 - `docs-impact`: Git change classification for docs impact review.
 - `canary-check`: redacted local canary command records.
 - `review-evidence`: review finding and validation evidence records.
@@ -18,6 +20,19 @@ completion, release, and new-crate rules in the root `docs/` tree.
   failure handling records.
 - `test-first-evidence`: failing-test, waiver, and final-validation evidence
   records.
+
+## `agent-run` examples
+
+```bash
+agent-run exec --cwd . -- cargo test
+agent-run exec --cwd . --direnv require -- npm test
+agent-run doctor --cwd . --format json
+agent-run env --cwd . --format json
+```
+
+`agent-run` keeps successful `exec` output unwrapped and exposes environment
+decisions through `doctor` and `env` status surfaces. It never runs
+`direnv allow`.
 
 ## `repo-retro` examples
 
