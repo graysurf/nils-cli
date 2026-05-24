@@ -843,9 +843,10 @@ fn run_record_attach(
         }));
     }
 
-    let repo = resolve_repo_for_live(binary, repo_override)?;
+    let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+    let adapter = crate::provider::select_adapter(&repo_info, force);
+    let repo = repo_info.slug;
     let issue_url = format!("https://github.com/{repo}/issues/{issue_number}");
-    let adapter = GhCliAdapter::new(force);
 
     let source_path = write_temp_markdown("record-attach-source-comment", &seed.source_body)
         .map_err(|err| CommandError::runtime("record-attach-source-write-failed", err))?;
@@ -982,9 +983,10 @@ fn run_record_post(
         }));
     }
 
-    let repo = resolve_repo_for_live(binary, repo_override)?;
+    let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+    let adapter = crate::provider::select_adapter(&repo_info, force);
+    let repo = repo_info.slug;
     let issue_number = parse_issue_reference(&args.issue)?;
-    let adapter = GhCliAdapter::new(force);
     let comment_path = write_temp_markdown("record-post-comment", &body)
         .map_err(|err| CommandError::runtime("record-post-comment-write-failed", err))?;
     let url = adapter
@@ -1040,8 +1042,9 @@ fn run_record_repair_dashboard(
             ),
         )?;
         let issue_number = parse_issue_reference(issue_value)?;
-        let repo = resolve_repo_for_live(binary, repo_override)?;
-        let adapter = GhCliAdapter::new(force);
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
         let (body, comments) = adapter
             .issue_evidence(&repo, issue_number)
             .map_err(|err| CommandError::runtime("record-repair-evidence-read-failed", err))?;
@@ -1085,7 +1088,11 @@ fn run_record_repair_dashboard(
 
     let issue_number = issue_number.expect("live mode has issue number");
     let repo = repo.expect("live mode has repo");
-    let adapter = GhCliAdapter::new(force);
+    // Re-resolve provider so this dispatcher works when the early branch
+    // populated `repo` from the `--repo` slug alone (no Repo struct kept).
+    let repo_info = crate::provider::resolve_repo(Some(&repo))
+        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+    let adapter = crate::provider::select_adapter(&repo_info, force);
     let dashboard_path = write_temp_markdown("record-repair-dashboard", &dashboard)
         .map_err(|err| CommandError::runtime("record-repair-dashboard-write-failed", err))?;
     adapter
@@ -1141,9 +1148,10 @@ fn run_record_close(
                 "plan-issue-local record close --issue <n> --body-file <path> --comments-json <path> --approval <evidence>",
             ),
         )?;
-        let repo = resolve_repo_for_live(binary, repo_override)?;
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
         let issue_number = parse_issue_reference(&args.issue)?;
-        let adapter = GhCliAdapter::new(force);
         let (body, comments) = adapter
             .issue_evidence(&repo, issue_number)
             .map_err(|err| CommandError::runtime("record-close-evidence-read-failed", err))?;
@@ -1158,7 +1166,12 @@ fn run_record_close(
             let pr_ev = read_fixture_pr_snapshot(fixture_dir, &pr_repo, pr_number)?;
             linked_evidence.push(pr_ev);
         } else if let Some(provider_repo) = &repo_for_provider {
-            let adapter = GhCliAdapter::new(force);
+            // Pick the adapter from the PR's repo, not the issue's repo —
+            // record-close supports cross-repo linked PRs (the PR lives in a
+            // different owner/repo from the tracking issue).
+            let pr_repo_info = crate::provider::resolve_repo(Some(&pr_repo))
+                .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+            let adapter = crate::provider::select_adapter(&pr_repo_info, force);
             let summary = adapter
                 .pr_merge_summary(&pr_repo, pr_number)
                 .map_err(|err| CommandError::runtime("record-close-pr-summary-failed", err))?;
@@ -1292,7 +1305,9 @@ fn run_record_close(
     }
 
     let repo = repo_for_provider.expect("live mode has repo");
-    let adapter = GhCliAdapter::new(force);
+    let repo_info = crate::provider::resolve_repo(Some(&repo))
+        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+    let adapter = crate::provider::select_adapter(&repo_info, force);
     let closeout_path = write_temp_markdown("record-close-comment", &closeout_body)
         .map_err(|err| CommandError::runtime("record-close-comment-write-failed", err))?;
     let closeout_url = adapter
@@ -1656,7 +1671,10 @@ fn run_link_pr(
     repo_override: Option<&str>,
     args: &LinkPrArgs,
 ) -> Result<Value, CommandError> {
-    let adapter = GhCliAdapter::new(force);
+    // Adapter is constructed lazily once we know whether we're in body-file
+    // mode (no adapter needed) or live mode (adapter selected based on
+    // resolved repo provider).
+    let mut adapter: Option<Box<dyn crate::provider::ProviderAdapter>> = None;
 
     let (body, issue, repo, source, body_file_path) = if let Some(path) = &args.body_file {
         let body = fs::read_to_string(path).map_err(|err| {
@@ -1683,10 +1701,13 @@ fn run_link_pr(
                 "plan-issue-local link-pr --body-file <path> --task <task-id> --pr <ref> --dry-run",
             ),
         )?;
-        let repo = resolve_repo_for_live(binary, repo_override)?;
-        let body = adapter
+        let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        let live_adapter = crate::provider::select_adapter(&repo_info, force);
+        let repo = repo_info.slug;
+        let body = live_adapter
             .issue_body(&repo, issue)
             .map_err(|err| CommandError::runtime("github-issue-read-failed", err))?;
+        adapter = Some(live_adapter);
         (
             body,
             Some(issue),
@@ -1743,7 +1764,13 @@ fn run_link_pr(
         })?;
         let body_path = write_temp_markdown("link-pr-issue-body", &updated_body)
             .map_err(|err| CommandError::runtime("issue-body-write-failed", err))?;
-        adapter
+        // In live mode the adapter was constructed in the issue branch
+        // above; this `expect` is unreachable because that branch is the
+        // only way `repo` becomes `Some` without `body_file_path`.
+        let live_adapter = adapter
+            .as_ref()
+            .expect("link-pr live mode constructed adapter alongside repo");
+        live_adapter
             .edit_issue_body(repo, issue, &body_path)
             .map_err(|err| CommandError::runtime("github-issue-update-failed", err))?;
         live_mutations = true;
@@ -3014,9 +3041,10 @@ fn collect_approval_candidates(
         "resolve-approval --pr <number>",
         Some("plan-issue resolve-approval --pr <number> --repo <owner/repo>"),
     )?;
-    let repo = resolve_repo_for_live(binary, repo_override)?;
+    let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+    let adapter = crate::provider::select_adapter(&repo_info, force);
+    let repo = repo_info.slug;
 
-    let adapter = GhCliAdapter::new(force);
     let comments = adapter
         .pr_comments(&repo, pr)
         .map_err(|err| CommandError::runtime("github-pr-comments-failed", err))?;
