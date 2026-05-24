@@ -508,6 +508,39 @@ fn read_payload_data(path: &Path) -> Result<Value, CommandError> {
     })
 }
 
+/// Trim, drop empty values, and reject names that appear in both
+/// `--add-label` and `--remove-label`. Used by `record post` and
+/// `record close` to keep the live `edit_issue_labels` call coherent.
+fn normalize_label_mutations(
+    add: &[String],
+    remove: &[String],
+    command_code: &'static str,
+) -> Result<(Vec<String>, Vec<String>), CommandError> {
+    let normalize = |raw: &[String]| -> Vec<String> {
+        raw.iter()
+            .map(|label| label.trim().to_string())
+            .filter(|label| !label.is_empty())
+            .collect()
+    };
+    let add_clean = normalize(add);
+    let remove_clean = normalize(remove);
+    let conflicts: Vec<&str> = add_clean
+        .iter()
+        .filter(|label| remove_clean.iter().any(|other| other == *label))
+        .map(String::as_str)
+        .collect();
+    if !conflicts.is_empty() {
+        return Err(CommandError::usage(
+            "record-label-mutation-conflict",
+            format!(
+                "{command_code}: label(s) appear in both --add-label and --remove-label: {}",
+                conflicts.join(", ")
+            ),
+        ));
+    }
+    Ok((add_clean, remove_clean))
+}
+
 fn run_record_open(
     binary: BinaryFlavor,
     dry_run: bool,
@@ -628,6 +661,13 @@ fn run_record_open(
 
     let initial_dashboard = record_initial_dashboard(args.profile, &plan_title, None);
 
+    let normalized_labels: Vec<String> = args
+        .labels
+        .iter()
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .collect();
+
     let preview = json!({
         "issue_body_markdown": initial_dashboard,
         "comments": {
@@ -640,6 +680,7 @@ fn run_record_open(
         "plan_path": path_text(&bundle.plan_file),
         "source_commit": source_snapshot.commit,
         "plan_commit": plan_snapshot.commit,
+        "labels": normalized_labels.clone(),
     });
 
     if binary != BinaryFlavor::PlanIssue || dry_run {
@@ -659,7 +700,7 @@ fn run_record_open(
     let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
         .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
     let (issue_number, issue_url) = adapter
-        .create_issue(&repo, &plan_title, &body_path, &[])
+        .create_issue(&repo, &plan_title, &body_path, &normalized_labels)
         .map_err(|err| CommandError::runtime("record-open-issue-create-failed", err))?;
 
     let source_path = write_temp_markdown("record-open-source-comment", &source_body)
@@ -700,6 +741,7 @@ fn run_record_open(
         "mode": "live",
         "issue": {"number": issue_number, "url": issue_url},
         "comments": {"source": source_url, "plan": plan_url, "state": state_url},
+        "labels": normalized_labels,
         "dashboard_markdown": repaired,
     }))
 }
@@ -758,6 +800,14 @@ fn run_record_post(
     )
     .map_err(|err| CommandError::runtime("record-post-render-failed", err))?;
 
+    let (add_labels, remove_labels) =
+        normalize_label_mutations(&args.add_labels, &args.remove_labels, "record-post")?;
+    let label_mutation_planned = !add_labels.is_empty() || !remove_labels.is_empty();
+    let labels_preview = json!({
+        "add": add_labels.clone(),
+        "remove": remove_labels.clone(),
+    });
+
     // Fixture mode: just return the rendered body + simulated URL.
     if let Some(fixture_dir) = &args.fixture {
         let _ = fixture_dir;
@@ -770,6 +820,7 @@ fn run_record_post(
             "kind": args.kind.as_str(),
             "comment_body": body,
             "comment_url": null,
+            "labels": labels_preview,
         }));
     }
 
@@ -782,6 +833,7 @@ fn run_record_post(
             "issue": args.issue,
             "kind": args.kind.as_str(),
             "comment_body": body,
+            "labels": labels_preview,
         }));
     }
 
@@ -794,6 +846,12 @@ fn run_record_post(
         .comment_issue(&repo, issue_number, &comment_path)
         .map_err(|err| CommandError::runtime("record-post-comment-post-failed", err))?;
 
+    if label_mutation_planned {
+        adapter
+            .edit_issue_labels(&repo, issue_number, &add_labels, &remove_labels)
+            .map_err(|err| CommandError::runtime("record-post-label-edit-failed", err))?;
+    }
+
     Ok(json!({
         "operation": "record.post",
         "execution_mode": binary.execution_mode(),
@@ -802,6 +860,7 @@ fn run_record_post(
         "issue": args.issue,
         "kind": args.kind.as_str(),
         "comment_url": url,
+        "labels": labels_preview,
     }))
 }
 
@@ -1058,12 +1117,21 @@ fn run_record_close(
     )
     .map_err(|err| CommandError::runtime("record-close-render-failed", err))?;
 
+    let (add_labels, remove_labels) =
+        normalize_label_mutations(&args.add_labels, &args.remove_labels, "record-close")?;
+    let label_mutation_planned = !add_labels.is_empty() || !remove_labels.is_empty();
+    let labels_preview = json!({
+        "add": add_labels.clone(),
+        "remove": remove_labels.clone(),
+    });
+
     // Bundle preview for dry-run and fixture modes.
     let preview = json!({
         "closeout_comment_body": closeout_body,
         "final_dashboard": canonical_dashboard,
         "blocked_codes": gate.blocked_codes,
         "checks": gate.checks,
+        "labels": labels_preview.clone(),
     });
 
     if args.fixture.is_some() || dry_run || binary != BinaryFlavor::PlanIssue {
@@ -1112,6 +1180,12 @@ fn run_record_close(
         )
         .map_err(|err| CommandError::runtime("record-close-issue-close-failed", err))?;
 
+    if label_mutation_planned {
+        adapter
+            .edit_issue_labels(&repo, issue_number, &add_labels, &remove_labels)
+            .map_err(|err| CommandError::runtime("record-close-label-edit-failed", err))?;
+    }
+
     Ok(json!({
         "operation": "record.close",
         "execution_mode": binary.execution_mode(),
@@ -1124,6 +1198,7 @@ fn run_record_close(
         "closeout_url": closeout_url,
         "linked_prs": linked_evidence,
         "final_dashboard": final_dashboard,
+        "labels": labels_preview,
     }))
 }
 
