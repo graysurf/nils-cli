@@ -83,8 +83,10 @@ These are repository scripts (not third-party packages):
 
 - Install workspace binaries:
   - `./.agents/skills/nils-cli-install-local-release-binaries/scripts/nils-cli-install-local-release-binaries.sh`
-- Run required repository checks:
-  - `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`
+- Run default local changed-scope checks:
+  - `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
+- Run full CI parity checks when needed locally:
+  - `NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh`
 - Supporting utilities:
   - `scripts/generate-third-party-artifacts.sh`
   - `scripts/workspace-bins.sh`

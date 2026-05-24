@@ -4,7 +4,7 @@ This document is the local development contract for:
 
 - environment setup
 - local test/check execution
-- mandatory pre-commit and pre-delivery gates
+- local development validation and CI delivery gates
 
 For runtime dependency details and degradation behavior, see `BINARY_DEPENDENCIES.md`.
 
@@ -40,7 +40,7 @@ Local fast changed-scope checks also require:
 - `python3`
 - `cargo` for non-document changes
 
-Full required checks also require:
+CI/full parity checks also require:
 
 - `cargo`
 - `python3`
@@ -71,7 +71,12 @@ Desktop session with `$HOME/.agents` absent and legacy skill environment
 variables unset. Rationale:
 `docs/plans/codex-skill-surface-primitives/codex-skill-surface-primitives-discussion-source.md`.
 
-## 3. Canonical local test flows
+## 3. Canonical validation flows
+
+Local development defaults to changed-scope validation. The full workspace test
+stack and coverage gate are CI responsibilities for normal PRs; run them
+locally only when you need CI parity, release-quality verification, coverage
+maintenance, or explicit debugging evidence.
 
 Primary local entrypoint for day-to-day implementation work:
 
@@ -104,6 +109,8 @@ bash scripts/ci/nils-cli-checks-entrypoint.sh
 ```
 
 This delegates to `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`.
+It is what CI uses for the full `test` and `test_macos` jobs; it is not the
+default local development loop.
 
 ### 3.1 Docs-only changes fast path
 
@@ -148,7 +155,7 @@ The local fast gate is conservative. Changes to `nils-common`, `nils-term`,
 `.github/`, or other workspace-level paths use a workspace Rust gate because
 package-scoped checks can miss reverse-dependency breakage.
 
-### 3.3 CI-like required checks (optional local parity / CI gate)
+### 3.3 Full checks (CI gate / optional local parity)
 
 ```bash
 NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh
@@ -160,17 +167,18 @@ Notes:
 - Because doctests are not included in nextest, the entrypoint also runs
   `cargo test --workspace --doc` when `NILS_CLI_TEST_RUNNER=nextest`.
 
-### 3.4 Full coverage flow (CI/release gate)
+### 3.4 Full coverage flow (CI gate / explicit local parity)
 
-Coverage gate is mandatory in CI and release-quality verification for non-doc
-changes (total line coverage must stay `>= 85.00%`):
+Coverage gate is mandatory in CI for non-doc changes and in explicit
+release-quality verification (total line coverage must stay `>= 85.00%`).
+Normal local development does not need to run coverage before opening a PR:
 
 ```bash
 NILS_CLI_TEST_RUNNER=nextest \
   bash scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage
 ```
 
-`--with-coverage` runs, after required checks:
+`--with-coverage` runs, after the full check stack:
 
 ```bash
 mkdir -p target/coverage
@@ -179,13 +187,14 @@ bash scripts/ci/coverage-summary.sh target/coverage/lcov.info
 cargo test --workspace --doc
 ```
 
-Use the default threshold for delivery. To run a stricter local check, override the threshold:
+Use the default threshold for CI parity. To run a stricter local check, override
+the threshold:
 
 ```bash
 NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage
 ```
 
-## 4. Required checks included by the entrypoint
+## 4. Full checks included by the CI entrypoint
 
 `bash scripts/ci/nils-cli-checks-entrypoint.sh` includes:
 

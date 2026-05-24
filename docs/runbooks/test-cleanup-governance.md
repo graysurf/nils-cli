@@ -48,7 +48,8 @@ Before marking a candidate `remove`, include all of the following:
 - Candidate path and symbol evidence from stale-test inventory output.
 - Confirmation that `contract-allowlist.tsv` does not protect the candidate path.
 - Replacement test evidence when user-visible behavior could change.
-- Explicit validation command outputs in the PR (`test-stale-audit`, required checks, and coverage gate).
+- Explicit validation command outputs in the PR (`test-stale-audit`, focused or
+  local-fast checks, and CI coverage gate).
 
 For `rewrite`, document:
 
@@ -70,9 +71,13 @@ For `rewrite`, document:
   - Fails on new orphaned helper regressions relative to `scripts/ci/test-stale-audit-baseline.tsv`.
   - Fails when baseline contains entries outside the frozen S3T1 allowlist.
   - Fails on deprecated-path leftovers (`deprecated_path_marker`) in the current inventory.
-- `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`
-  - Must pass before delivery.
-- Coverage gate (non-docs changes):
+- `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
+  - Default local validation before delivery.
+- GitHub required checks (non-doc changes):
+  - `test`
+  - `test_macos`
+  - `coverage`
+- Coverage gate command used by CI:
   - `cargo llvm-cov nextest --profile ci --workspace --lcov --output-path target/coverage/lcov.info --fail-under-lines 85`
   - `scripts/ci/coverage-summary.sh target/coverage/lcov.info`
 
@@ -81,6 +86,6 @@ For `rewrite`, document:
 - Decision mode selected: `remove`, `keep`, `rewrite`, or `defer`.
 - Evidence links include crate/file/symbol and replacement assertions when required.
 - `bash scripts/ci/test-stale-audit.sh --strict` output is clean.
-- Required checks entrypoint passes.
-- Coverage gate result is attached for non-doc changes.
+- Local validation passes.
+- GitHub required checks are green, including coverage for non-doc changes.
 - Baseline updates are justified and limited to reviewed stale-helper removals.

@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
 #
-# nils-cli's /pre-pr gate stack. The global dispatcher
-# (~/.claude/scripts/pre-pr.sh) execs this when cwd is nils-cli.
+# nils-cli's /pre-pr gate stack. The global dispatcher execs this when cwd is
+# nils-cli.
 #
-# Mirrors the canonical pre-delivery command from AGENTS.md §Required
-# Local Check Entrypoints:
-#   NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage
+# Mirrors the default local development command from AGENTS.md:
+#   bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast
 #
-# Note: this dispatcher runs a SUPERSET of the `nils-cli-verify-required-checks`
-# skill (it adds an llvm-cov coverage gate). Codex / opencode users who
-# discover through .agents/skills/ should invoke that skill directly for
-# the base check stack; see claude-kit's docs/dispatcher-commands.md for the
-# multi-CLI mirror rule.
-#
-# The entrypoint runs the required-checks verify script, optionally under
-# xvfb, and optionally with the llvm-cov coverage gate. Extra args forward
-# straight through (e.g. `--docs-only` for docs-only changes).
+# The full workspace and coverage gates are CI responsibilities for normal PRs.
+# Use --full or --with-coverage when a local CI-parity run is explicitly needed.
+# Extra args forward straight through.
 #
 # Examples:
-#   /pre-pr                  # full pre-delivery check (nextest + coverage gate)
-#   /pre-pr --docs-only      # skip heavy cargo checks for docs-only PRs
+#   /pre-pr                  # changed-scope local-fast check
+#   /pre-pr --docs-only      # docs-only check
+#   /pre-pr --full           # local full CI-parity check with nextest
+#   /pre-pr --with-coverage  # local full CI-parity + coverage check
 #
 set -euo pipefail
 
@@ -35,18 +30,37 @@ if [[ ! -x "$entrypoint" ]]; then
   exit 2
 fi
 
-# The entrypoint rejects `--with-coverage` alongside `--docs-only`, so only
-# auto-enable the coverage gate on full runs.
 has_docs_only=0
+force_full=0
+declare -a entry_args=()
 for arg in "$@"; do
-  if [[ "$arg" == "--docs-only" ]]; then
-    has_docs_only=1
-    break
-  fi
+  case "$arg" in
+    --docs-only)
+      has_docs_only=1
+      entry_args+=("$arg")
+      ;;
+    --full)
+      force_full=1
+      ;;
+    --with-coverage)
+      force_full=1
+      entry_args+=("$arg")
+      ;;
+    *)
+      entry_args+=("$arg")
+      ;;
+  esac
 done
 
-export NILS_CLI_TEST_RUNNER=nextest
 if [[ "$has_docs_only" -eq 1 ]]; then
-  exec bash "$entrypoint" "$@"
+  if [[ "$force_full" -eq 1 ]]; then
+    echo "pre-pr: --docs-only cannot be combined with --full or --with-coverage" >&2
+    exit 2
+  fi
+  exec bash "$entrypoint" "${entry_args[@]}"
 fi
-exec bash "$entrypoint" --with-coverage "$@"
+if [[ "$force_full" -eq 1 ]]; then
+  export NILS_CLI_TEST_RUNNER=nextest
+  exec bash "$entrypoint" "${entry_args[@]}"
+fi
+exec bash "$entrypoint" --local-fast "${entry_args[@]}"
