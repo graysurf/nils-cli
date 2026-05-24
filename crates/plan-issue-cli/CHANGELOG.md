@@ -30,6 +30,10 @@ versioning.
     of truth; older visible `plan-issue-record-payload` fences remain
     accepted for existing records. Prose-Markdown status parsing is no longer
     used.
+  - `record post` validates `--payload-file` against the selected lifecycle
+    role before rendering or posting. Audit and dashboard repair now fail on
+    malformed typed v2 payloads instead of treating the marker as valid
+    evidence and rendering dashboard summary fields as `pending`.
   - The standalone closeout helper command and its
     `--require-complete`, `--require-session`, `--require-validation`,
     `--require-review`, `--require-closeout` flags are retired.

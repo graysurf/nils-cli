@@ -188,6 +188,53 @@ fn record_post_state_summary_file_is_rendered_in_dry_run() {
 }
 
 #[test]
+fn record_post_state_rejects_payload_that_cannot_drive_dashboard() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "schema drift",
+            "current": "PRs are open as drafts",
+            "next_action": "review draft PRs",
+            "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+            "prs": [
+                {"ref": "owner/repo#9", "url": "https://github.com/owner/repo/pull/9", "status": "draft-open"}
+            ],
+            "blockers": [
+                {"code": "live-home-drift", "status": "open", "detail": "extra surface"}
+            ],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+    ]);
+
+    assert_ne!(out.code, 0, "invalid state payload must fail");
+    assert!(
+        out.stderr.contains("record-post-payload-schema-invalid")
+            || out.stdout.contains("record-post-payload-schema-invalid"),
+        "expected schema-invalid error: stdout={} stderr={}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+#[test]
 fn record_post_rejects_source_plan_and_closeout_kinds() {
     for kind in ["source", "plan", "closeout"] {
         let out = common::run_plan_issue_local(&[
@@ -201,6 +248,142 @@ fn record_post_rejects_source_plan_and_closeout_kinds() {
             out.stderr
         );
     }
+}
+
+#[test]
+fn record_repair_dashboard_rejects_malformed_state_payload_instead_of_pending() {
+    let tmp = TempDir::new().expect("tempdir");
+    let body_path = tmp.path().join("body.md");
+    let comments_path = tmp.path().join("comments.json");
+    fs::write(&body_path, "## Current Dashboard\n\n- Status: pending\n").expect("write body");
+
+    fs::write(
+        &comments_path,
+        json!({
+            "comments": [
+                {
+                    "url": "https://github.com/owner/repo/issues/9#issuecomment-state",
+                    "body": v2_comment_body(
+                        "state",
+                        "tracking",
+                        json!({
+                            "status": "in-progress",
+                            "target_scope": "schema drift",
+                            "current": "PRs are open as drafts",
+                            "next_action": "review draft PRs",
+                            "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+                            "prs": [
+                                {"ref": "owner/repo#9", "url": "https://github.com/owner/repo/pull/9", "status": "draft-open-green"}
+                            ],
+                            "blockers": [
+                                {"code": "live-home-drift", "status": "open", "detail": "extra surface"}
+                            ],
+                            "links": {}
+                        }),
+                    ),
+                    "created_at": "2026-05-23T10:00:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write comments");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "repair-dashboard",
+        "--body-file",
+        body_path.to_str().expect("body path"),
+        "--comments-json",
+        comments_path.to_str().expect("comments path"),
+    ]);
+
+    assert_ne!(out.code, 0, "malformed state payload must fail repair");
+    assert!(
+        out.stderr.contains("malformed payload") || out.stdout.contains("malformed payload"),
+        "expected malformed payload error: stdout={} stderr={}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+#[test]
+fn record_repair_dashboard_allows_new_valid_state_to_supersede_old_malformed_state() {
+    let tmp = TempDir::new().expect("tempdir");
+    let body_path = tmp.path().join("body.md");
+    let comments_path = tmp.path().join("comments.json");
+    fs::write(&body_path, "## Current Dashboard\n\n- Status: pending\n").expect("write body");
+
+    fs::write(
+        &comments_path,
+        json!({
+            "comments": [
+                {
+                    "url": "https://github.com/owner/repo/issues/9#issuecomment-state-old",
+                    "body": v2_comment_body(
+                        "state",
+                        "tracking",
+                        json!({
+                            "status": "in-progress",
+                            "target_scope": "old schema drift",
+                            "prs": [{"ref": "owner/repo#9", "status": "draft-open"}],
+                            "blockers": [{"code": "x"}],
+                            "links": {}
+                        }),
+                    ),
+                    "created_at": "2026-05-23T10:00:00Z"
+                },
+                {
+                    "url": "https://github.com/owner/repo/issues/9#issuecomment-state-new",
+                    "body": v2_comment_body(
+                        "state",
+                        "tracking",
+                        json!({
+                            "status": "in-progress",
+                            "target_scope": "schema repaired",
+                            "current": "latest valid state",
+                            "next_action": "continue",
+                            "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+                            "prs": [{"ref": "owner/repo#9", "url": "https://github.com/owner/repo/pull/9", "status": "open"}],
+                            "blockers": ["older malformed state superseded"],
+                            "links": {}
+                        }),
+                    ),
+                    "created_at": "2026-05-23T11:00:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write comments");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "repair-dashboard",
+        "--body-file",
+        body_path.to_str().expect("body path"),
+        "--comments-json",
+        comments_path.to_str().expect("comments path"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let dashboard = parsed["payload"]["result"]["dashboard_markdown"]
+        .as_str()
+        .expect("dashboard markdown");
+    assert!(dashboard.contains("- Status: in-progress"), "{dashboard}");
+    assert!(
+        dashboard.contains("- Target scope: schema repaired"),
+        "{dashboard}"
+    );
+    assert!(
+        dashboard.contains("https://github.com/owner/repo/issues/9#issuecomment-state-new"),
+        "{dashboard}"
+    );
 }
 
 #[test]
