@@ -261,7 +261,10 @@ pub fn audit_record(
     comments_json: &str,
     profile_filter: Option<RecordProfile>,
 ) -> Result<RecordAudit, String> {
-    let comments = parse_comments_json(comments_json)?;
+    let mut comments = parse_comments_json(comments_json)?;
+    comments.sort_by(|left, right| {
+        compare_created_at(right.created_at.as_deref(), left.created_at.as_deref())
+    });
     let mut evidence: BTreeMap<String, LifecycleEvidence> = BTreeMap::new();
     let mut unsupported_markers = Vec::new();
     let mut recognized_count = 0usize;
@@ -289,6 +292,10 @@ pub fn audit_record(
                 }
                 let url = comment.url.clone().or_else(|| comment.html_url.clone());
                 let created_at = comment.created_at.clone();
+                let key = role.as_str().to_string();
+                if evidence.contains_key(&key) {
+                    continue;
+                }
                 let payload = match extract_payload(comment_body) {
                     Ok(payload) => Some(payload),
                     Err(err) if err.kind == PayloadErrorKind::NoFence => None,
@@ -300,6 +307,16 @@ pub fn audit_record(
                         ));
                     }
                 };
+                if let Some(payload) = payload.as_ref() {
+                    validate_payload_data_for_role(payload.role, &payload.data).map_err(|err| {
+                        format!(
+                            "comment at {} has malformed payload for role `{}`: {}",
+                            url.as_deref().unwrap_or("(unknown url)"),
+                            payload.role.as_str(),
+                            err
+                        )
+                    })?;
+                }
                 let status = payload.as_ref().and_then(derive_status_from_payload);
                 let candidate = LifecycleEvidence {
                     role,
@@ -309,22 +326,10 @@ pub fn audit_record(
                     status,
                     payload,
                 };
-                let key = role.as_str().to_string();
-                let supersedes = evidence
-                    .get(&key)
-                    .map(|existing| {
-                        compare_created_at(
-                            candidate.created_at.as_deref(),
-                            existing.created_at.as_deref(),
-                        ) != std::cmp::Ordering::Less
-                    })
-                    .unwrap_or(true);
-                if supersedes {
-                    evidence_text.push_str(comment_body);
-                    evidence_text.push('\n');
-                    recognized_count += 1;
-                    evidence.insert(key, candidate);
-                }
+                evidence_text.push_str(comment_body);
+                evidence_text.push('\n');
+                recognized_count += 1;
+                evidence.insert(key, candidate);
             }
             MarkerParse::Unsupported { prefix } => {
                 unsupported_markers.push(UnsupportedMarker {
@@ -1342,6 +1347,35 @@ impl RecordPayload {
         }
         serde_json::from_value::<T>(self.data.clone())
             .map_err(|err| PayloadError::new(PayloadErrorKind::InvalidJson, err.to_string()))
+    }
+}
+
+pub fn validate_payload_data_for_kind(
+    kind: LifecycleCommentKind,
+    data: &Value,
+) -> Result<(), PayloadError> {
+    validate_payload_data_for_role(payload_role_for_kind(kind), data)
+}
+
+fn validate_payload_data_for_role(role: PayloadRole, data: &Value) -> Result<(), PayloadError> {
+    let payload = RecordPayload {
+        schema: PAYLOAD_SCHEMA_V2.to_string(),
+        role,
+        profile: PayloadProfile::Tracking,
+        updated_at: None,
+        data: data.clone(),
+    };
+    validate_payload_data(&payload)
+}
+
+fn validate_payload_data(payload: &RecordPayload) -> Result<(), PayloadError> {
+    match payload.role {
+        PayloadRole::Source | PayloadRole::Plan => payload.parse_snapshot().map(|_| ()),
+        PayloadRole::State => payload.parse_state().map(|_| ()),
+        PayloadRole::Session => payload.parse_session().map(|_| ()),
+        PayloadRole::Validation => payload.parse_validation().map(|_| ()),
+        PayloadRole::Review => payload.parse_review().map(|_| ()),
+        PayloadRole::Closeout => payload.parse_closeout().map(|_| ()),
     }
 }
 

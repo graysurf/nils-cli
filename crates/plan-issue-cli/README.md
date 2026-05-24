@@ -50,9 +50,9 @@ Shell wrapper scripts are deprecated for this crate path. Use `plan-issue` / `pl
 ### Issue-backed records
 
 - `record open`: open a provider issue from a validated plan bundle and seed source, plan, and initial state lifecycle comments.
-- `record post`: append a canonical state, session, validation, or review lifecycle comment.
-- `record audit`: inspect issue body Markdown plus provider comments JSON for recognized lifecycle markers.
-- `record repair-dashboard`: recompute and update the mutable dashboard from audit evidence.
+- `record post`: append a canonical state, session, validation, or review lifecycle comment after validating the role-specific payload schema.
+- `record audit`: inspect issue body Markdown plus provider comments JSON for recognized lifecycle markers and reject malformed typed payloads.
+- `record repair-dashboard`: recompute and update the mutable dashboard from valid audit evidence.
 - `record close`: run strict closeout, post closeout evidence, repair the final dashboard, and close the issue.
 
 ## Global flags
