@@ -342,6 +342,13 @@ pub struct PrCommentArgs {
     pub body_file: Option<String>,
 }
 
+/// `pr comments` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct PrCommentsArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+}
+
 /// `pr ready` arguments.
 #[derive(Args, Debug, Clone)]
 pub struct PrReadyArgs {
@@ -528,6 +535,8 @@ pub enum PrCommand {
     Edit(PrEditArgs),
     /// Append a comment to a PR / MR.
     Comment(PrCommentArgs),
+    /// List the issue-style comment stream attached to a PR / MR.
+    Comments(PrCommentsArgs),
     /// Promote a draft PR / MR to ready-for-review.
     Ready(PrReadyArgs),
     /// Merge a ready PR / MR.
@@ -900,6 +909,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Comment(args)),
         })) => ops::pr_comment::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Comments(args)),
+        })) => ops::pr_comments::run(&global, args, format),
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Ready(args)),
         })) => ops::pr_ready::run(&global, args, format),

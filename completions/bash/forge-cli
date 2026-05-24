@@ -127,6 +127,9 @@ _forge-cli() {
             forge__cli__help__pr,comment)
                 cmd="forge__cli__help__pr__comment"
                 ;;
+            forge__cli__help__pr,comments)
+                cmd="forge__cli__help__pr__comments"
+                ;;
             forge__cli__help__pr,create)
                 cmd="forge__cli__help__pr__create"
                 ;;
@@ -259,6 +262,9 @@ _forge-cli() {
             forge__cli__pr,comment)
                 cmd="forge__cli__pr__comment"
                 ;;
+            forge__cli__pr,comments)
+                cmd="forge__cli__pr__comments"
+                ;;
             forge__cli__pr,create)
                 cmd="forge__cli__pr__create"
                 ;;
@@ -294,6 +300,9 @@ _forge-cli() {
                 ;;
             forge__cli__pr__help,comment)
                 cmd="forge__cli__pr__help__comment"
+                ;;
+            forge__cli__pr__help,comments)
+                cmd="forge__cli__pr__help__comments"
                 ;;
             forge__cli__pr__help,create)
                 cmd="forge__cli__pr__help__create"
@@ -797,7 +806,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__help__pr)
-            opts="create view list edit comment ready merge close checks wait-checks deliver"
+            opts="create view list edit comment comments ready merge close checks wait-checks deliver"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -839,6 +848,20 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__help__pr__comment)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__help__pr__comments)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -1951,7 +1974,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr)
-            opts="-h --format --remote --provider --repo --dry-run --help create view list edit comment ready merge close checks wait-checks deliver help"
+            opts="-h --format --remote --provider --repo --dry-run --help create view list edit comment comments ready merge close checks wait-checks deliver help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2059,6 +2082,36 @@ _forge-cli() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --remote)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider)
+                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__comments)
+            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0
@@ -2281,7 +2334,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__help)
-            opts="create view list edit comment ready merge close checks wait-checks deliver help"
+            opts="create view list edit comment comments ready merge close checks wait-checks deliver help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2323,6 +2376,20 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__help__comment)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__help__comments)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
