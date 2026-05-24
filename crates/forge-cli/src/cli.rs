@@ -108,6 +108,8 @@ pub enum Command {
     Pr(PrArgs),
     /// Issue lifecycle.
     Issue(IssueArgs),
+    /// Repository label catalog audit and ensure operations.
+    Label(LabelArgs),
     /// Personal cross-repo work inbox.
     Inbox(InboxArgs),
     /// Repository helpers.
@@ -128,6 +130,12 @@ pub struct PrArgs {
 pub struct IssueArgs {
     #[command(subcommand)]
     pub command: Option<IssueCommand>,
+}
+
+#[derive(Args, Debug)]
+pub struct LabelArgs {
+    #[command(subcommand)]
+    pub command: Option<LabelCommand>,
 }
 
 #[derive(Args, Debug)]
@@ -496,6 +504,12 @@ pub struct PrCreateArgs {
     /// Add a label (repeatable).
     #[arg(long = "label", value_name = "LABEL")]
     pub labels: Vec<String>,
+    /// Validate labels against this catalog when `--strict-labels` is set.
+    #[arg(long = "label-catalog", value_name = "PATH")]
+    pub label_catalog: Option<String>,
+    /// Fail when selected labels are missing, not applicable, or conflict.
+    #[arg(long = "strict-labels", action = ArgAction::SetTrue)]
+    pub strict_labels: bool,
 }
 
 /// `pr` subtree.
@@ -531,6 +545,47 @@ pub enum PrCommand {
     Deliver(PrDeliverArgs),
 }
 
+/// `label` subtree.
+#[derive(Subcommand, Debug)]
+pub enum LabelCommand {
+    /// List repository labels through the selected provider backend.
+    List(LabelListArgs),
+    /// Compare repository labels against a machine-readable catalog.
+    Audit(LabelAuditArgs),
+    /// Create missing labels and optionally update color / description drift.
+    Ensure(LabelEnsureArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LabelListArgs {
+    /// Maximum labels to fetch from the provider.
+    #[arg(long, default_value_t = 200)]
+    pub limit: u32,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LabelAuditArgs {
+    /// Path to the shared forge label catalog.
+    #[arg(long, value_name = "PATH")]
+    pub catalog: String,
+    /// Maximum labels to fetch from the provider.
+    #[arg(long, default_value_t = 200)]
+    pub limit: u32,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LabelEnsureArgs {
+    /// Path to the shared forge label catalog.
+    #[arg(long, value_name = "PATH")]
+    pub catalog: String,
+    /// Update color / description drift on existing labels.
+    #[arg(long = "update-existing", action = ArgAction::SetTrue)]
+    pub update_existing: bool,
+    /// Maximum labels to fetch from the provider.
+    #[arg(long, default_value_t = 200)]
+    pub limit: u32,
+}
+
 /// `pr deliver` arguments. Maps to
 /// `forge-cli-ops-v1.yaml::operations.pr.deliver` inputs.
 #[derive(Args, Debug, Clone)]
@@ -559,6 +614,15 @@ pub struct PrDeliverArgs {
     /// Add a reviewer (repeatable).
     #[arg(long = "reviewer", value_name = "USER")]
     pub reviewers: Vec<String>,
+    /// Add a label to the created PR / MR (repeatable).
+    #[arg(long = "label", value_name = "LABEL")]
+    pub labels: Vec<String>,
+    /// Validate labels against this catalog when `--strict-labels` is set.
+    #[arg(long = "label-catalog", value_name = "PATH")]
+    pub label_catalog: Option<String>,
+    /// Fail when selected labels are missing, not applicable, or conflict.
+    #[arg(long = "strict-labels", action = ArgAction::SetTrue)]
+    pub strict_labels: bool,
     /// CI-wait budget before declaring `checks_timeout` (default `30m`).
     #[arg(long, value_parser = parse_duration, default_value = "30m")]
     pub timeout: Duration,
@@ -888,6 +952,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Issue(IssueArgs {
             command: Some(IssueCommand::Reopen { id }),
         })) => ops::issue_reopen::run(&global, id, format),
+        Some(Command::Label(LabelArgs {
+            command: Some(command),
+        })) => ops::label::run(&global, command, format),
         Some(Command::Inbox(InboxArgs {
             command: Some(command),
         })) => ops::inbox::run(&global, command, format),
@@ -897,6 +964,7 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         | Some(Command::Repo(RepoArgs { command: None }))
         | Some(Command::Pr(PrArgs { command: None }))
         | Some(Command::Issue(IssueArgs { command: None }))
+        | Some(Command::Label(LabelArgs { command: None }))
         | Some(Command::Inbox(InboxArgs { command: None })) => {
             // No subcommand: print help and exit USAGE so callers don't
             // mistake the no-op for success.
@@ -1164,14 +1232,30 @@ mod tests {
 
     #[test]
     fn lists_every_issue_v1_subcommand() {
-        for sub in ["create", "view", "edit", "comment", "close", "reopen"] {
+        for sub in [
+            "create", "view", "list", "edit", "comment", "close", "reopen",
+        ] {
             let argv: Vec<&str> = match sub {
                 "create" => vec!["issue", "create", "--title", "demo"],
+                "list" => vec!["issue", "list"],
                 "comment" | "edit" => vec!["issue", sub, "1"],
                 _ => vec!["issue", sub, "1"],
             };
             let result = parse(&argv);
             assert!(result.is_ok(), "issue {sub} should parse, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn lists_every_label_v1_subcommand() {
+        for sub in ["list", "audit", "ensure"] {
+            let argv: Vec<&str> = match sub {
+                "list" => vec!["label", "list"],
+                "audit" | "ensure" => vec!["label", sub, "--catalog", "labels.yaml"],
+                _ => unreachable!(),
+            };
+            let result = parse(&argv);
+            assert!(result.is_ok(), "label {sub} should parse, got {result:?}");
         }
     }
 

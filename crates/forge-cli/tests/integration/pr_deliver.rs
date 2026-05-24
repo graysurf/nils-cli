@@ -174,6 +174,7 @@ fn pr_deliver_help_lists_every_documented_flag() {
         "--base",
         "--method",
         "--reviewer",
+        "--label",
         "--timeout",
         "--no-merge",
         "--allow-non-default-base",
@@ -184,4 +185,63 @@ fn pr_deliver_help_lists_every_documented_flag() {
             out.stdout
         );
     }
+}
+
+#[test]
+fn pr_deliver_dry_run_threads_labels_into_create_step() {
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "demo",
+            "--body",
+            "## Summary\nx\n\n## Test plan\ny\n",
+            "--label",
+            "type::feature",
+            "--label",
+            "area::cli",
+            "--label",
+            "size::m",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let create_plan = env["data"]["plan_steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["step"] == "create")
+        .expect("create step present")["plan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+    let label_count = create_plan
+        .iter()
+        .filter(|s| s.as_str() == "--label")
+        .count();
+    assert_eq!(label_count, 3, "{create_plan:?}");
+    assert!(
+        create_plan.iter().any(|s| s == "type::feature"),
+        "{create_plan:?}"
+    );
+    assert!(
+        create_plan.iter().any(|s| s == "area::cli"),
+        "{create_plan:?}"
+    );
+    assert!(
+        create_plan.iter().any(|s| s == "size::m"),
+        "{create_plan:?}"
+    );
 }

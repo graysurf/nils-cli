@@ -10,6 +10,7 @@ mod integration {
     mod fixture_lint;
     mod inbox;
     mod issue_atoms;
+    mod label_ops;
     mod parity;
     mod pr_checks_github;
     mod pr_checks_gitlab;

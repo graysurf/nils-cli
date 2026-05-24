@@ -32,6 +32,7 @@ use crate::backend::{
 use crate::cli::{BINARY, GlobalFlags, PrCreateArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
+use crate::ops::label::{LabelTarget, validate_label_inputs};
 use crate::ops::repo_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::{
@@ -173,6 +174,16 @@ pub fn run_with<R: BackendRunner>(
     title_length(&args.title)?;
     body_summary(&body, &env.headings)?;
     body_test_plan(&body, &env.headings)?;
+    let label_target = match ctx.provider {
+        Provider::GitHub => LabelTarget::Pr,
+        Provider::GitLab => LabelTarget::Mr,
+    };
+    validate_label_inputs(
+        &args.labels,
+        args.label_catalog.as_deref(),
+        args.strict_labels,
+        label_target,
+    )?;
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
     head_pushed(&env.workdir, |w| (env.head_state)(w))?;
 
@@ -237,6 +248,16 @@ pub fn compute<R: BackendRunner>(
     title_length(&args.title)?;
     body_summary(&body, &env.headings)?;
     body_test_plan(&body, &env.headings)?;
+    let label_target = match ctx.provider {
+        Provider::GitHub => LabelTarget::Pr,
+        Provider::GitLab => LabelTarget::Mr,
+    };
+    validate_label_inputs(
+        &args.labels,
+        args.label_catalog.as_deref(),
+        args.strict_labels,
+        label_target,
+    )?;
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
     head_pushed(&env.workdir, |w| (env.head_state)(w))?;
 
@@ -757,6 +778,8 @@ mod tests {
             no_draft: false,
             reviewers: Vec::new(),
             labels: Vec::new(),
+            label_catalog: None,
+            strict_labels: false,
         }
     }
 
