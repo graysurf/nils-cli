@@ -40,9 +40,9 @@
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
 | 1.1 | done | Replace issue-backed record contract with v3 | PR #449 (7aaf443) | Spec-first breaking change. |
-| 1.2 | done | Define high-level CLI surface | PR #449 (7aaf443) | Removed marker-family and optional closeout requirements. |
+| 1.2 | done | Define high-level CLI surface | PR #449 (7aaf443) | Removed retired marker selector and optional closeout requirements. |
 | 1.3 | done | Specify structured lifecycle payloads | PR #449 (7aaf443) | Audit no longer parses prose status lines. |
-| 2.1 | done | Collapse marker parsing to canonical family | PR #453 (eb6f383) | Removed compat marker support. |
+| 2.1 | done | Collapse marker parsing to canonical family | PR #453 (eb6f383) | Removed retired marker support. |
 | 2.2 | done | Implement structured audit output | PR #453 (eb6f383) | Provides typed evidence for closeout. |
 | 2.3 | done | Render dashboards from audit evidence | PR #453 (eb6f383) | Removes manual URL stitching. |
 | 3.1 | done | Implement `record open` | PR #454 (cef31ee) | Bundle-first live issue creation. |

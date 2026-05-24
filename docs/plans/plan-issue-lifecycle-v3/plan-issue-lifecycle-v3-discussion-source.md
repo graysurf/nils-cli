@@ -17,9 +17,8 @@ actually needs: one canonical marker family, high-level provider-backed
 commands, strict closeout gates, provider-verified PR evidence, and automatic
 dashboard repair from durable issue comments.
 
-This should be a breaking rewrite. No compatibility layer is required for the
-legacy `plan-tracking-issue:*`, `execute-from-tracking-issue:*`,
-`tracking-issue-closeout:*`, or `deliver-dispatch-plan:*` marker families.
+This should be a breaking rewrite. No migration layer is required for retired
+pre-v2 marker families.
 
 ## Source Tags
 
@@ -28,17 +27,17 @@ legacy `plan-tracking-issue:*`, `execute-from-tracking-issue:*`,
 - `[U2]` User asked for a complete, final rewrite of the nils-cli
   `plan-issue` surface, without backward-version support.
 - `[F1]` `crates/plan-issue-cli/src/commands/record.rs` currently exposes
-  low-level `record render-dashboard`, `render-comment`, `audit`,
-  `closeout-gate`, and `build-dispatch-ledger` commands.
-- `[F2]` `crates/plan-issue-cli/src/commands/record.rs` currently exposes both
-  `MarkerFamily::Shared` and `MarkerFamily::Compat`.
+  low-level issue-record helper commands rather than one provider-backed
+  lifecycle owner.
+- `[F2]` `crates/plan-issue-cli/src/commands/record.rs` currently exposes
+  multiple marker-family variants.
 - `[F3]` `crates/plan-issue-cli/src/lifecycle_record.rs` currently errors when
-  asked to render a tracking-profile compat review marker.
+  asked to render a tracking-profile review marker for the retired family.
 - `[F4]` `crates/plan-issue-cli/src/lifecycle_record.rs` currently extracts
   lifecycle status from visible Markdown lines such as `- Status: complete`.
-- `[F5]` `crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v1.md`
-  says `plan-issue record` never mutates provider issues and provider CRUD
-  remains outside the record command.
+- `[F5]` The prior issue-backed plan record contract says `plan-issue record`
+  never mutates provider issues and provider CRUD remains outside the record
+  command.
 - `[A1]` The shared Heuristic System closeout in agent-runtime-kit required a
   manual chain of `plan-issue record`, `forge-cli issue`, `gh issue view`, and
   dashboard repair commands.
@@ -46,8 +45,8 @@ legacy `plan-tracking-issue:*`, `execute-from-tracking-issue:*`,
   is not a valid current command shape.
 - `[I1]` Inference from `[F1]`, `[F5]`, and `[A1]`: agent-runtime-kit needs a
   high-level lifecycle owner, not more low-level rendering primitives.
-- `[I2]` Inference from `[F2]` and `[F3]`: retaining marker families keeps
-  compatibility complexity in the exact place where the new workflow needs
+- `[I2]` Inference from `[F2]` and `[F3]`: retaining multiple marker families
+  keeps migration complexity in the exact place where the new workflow needs
   determinism.
 - `[I3]` Inference from `[F4]`: audit and closeout should parse a structured
   lifecycle payload rather than prose Markdown.
@@ -86,8 +85,8 @@ legacy `plan-tracking-issue:*`, `execute-from-tracking-issue:*`,
 ## Non-Scope
 
 - Do not migrate agent-runtime-kit skills in this nils-cli plan.
-- Do not preserve legacy marker compatibility.
-- Do not preserve `record closeout-gate` optional `--require-*` semantics.
+- Do not preserve retired marker support.
+- Do not preserve optional retired closeout helper flags.
 - Do not make `forge-cli` issue close accept `--reason` as the primary fix.
 - Do not mutate live agent-runtime-kit runtime homes.
 - Do not ship an unreleased debug binary as the agent-runtime-kit consumer
