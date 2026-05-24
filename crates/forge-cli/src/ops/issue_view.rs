@@ -134,16 +134,26 @@ fn build_view_call_with(ctx: &ProviderContext, id: u64, with_comments: bool) -> 
 }
 
 /// Build the `glab api .../notes` call used by `--with-comments` on GitLab.
-/// The project path is derived from the issue's `web_url` so we do not need
-/// the user to pass `--repo`.
+/// Both the project path AND the GitLab host are derived from the issue's
+/// `web_url` so we do not need the user to pass `--repo` or `--remote`. This
+/// also avoids the bug where forcing `--provider gitlab` makes
+/// `ProviderContext::host` default to `gitlab.com` even when the repo lives
+/// on a self-hosted instance like `gitlab.gamania.com`.
 fn build_gitlab_notes_call(
-    ctx: &ProviderContext,
+    _ctx: &ProviderContext,
     view: &IssueViewPayload,
 ) -> Result<BackendCall, ForgeError> {
     let project_path = gitlab_project_path_from_url(&view.url).ok_or_else(|| {
         ForgeError::software(
             schema_err(),
             "unable to derive GitLab project path from issue web_url",
+            Some(format!("url={}", view.url)),
+        )
+    })?;
+    let host = gitlab_host_from_url(&view.url).ok_or_else(|| {
+        ForgeError::software(
+            schema_err(),
+            "unable to derive GitLab host from issue web_url",
             Some(format!("url={}", view.url)),
         )
     })?;
@@ -158,10 +168,24 @@ fn build_gitlab_notes_call(
             OsString::from("api"),
             OsString::from("--paginate"),
             OsString::from("--hostname"),
-            OsString::from(ctx.host.as_str()),
+            OsString::from(host),
             OsString::from(path),
         ],
     ))
+}
+
+/// Extract the host (`<host>`) from an `https?://<host>/...` URL. Used
+/// alongside [`gitlab_project_path_from_url`] to wire `glab api --hostname`
+/// against the actual GitLab instance hosting the issue, not whatever
+/// `ProviderContext::host` defaulted to when `--provider gitlab` was forced.
+fn gitlab_host_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest)?;
+    let host = after_scheme.split_once('/').map(|(host, _)| host)?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 pub fn parse_view_output(
@@ -682,6 +706,23 @@ mod tests {
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].body, "a");
         assert_eq!(comments[1].body, "b");
+    }
+
+    #[test]
+    fn gitlab_host_from_url_extracts_host_segment() {
+        assert_eq!(
+            gitlab_host_from_url(
+                "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/work_items/6"
+            )
+            .as_deref(),
+            Some("gitlab.gamania.com"),
+        );
+        assert_eq!(
+            gitlab_host_from_url("https://gitlab.com/group/sub/project/-/issues/12").as_deref(),
+            Some("gitlab.com"),
+        );
+        assert!(gitlab_host_from_url("/no-scheme/path/-/issues/1").is_none());
+        assert!(gitlab_host_from_url("https://no-path-here").is_none());
     }
 
     #[test]
