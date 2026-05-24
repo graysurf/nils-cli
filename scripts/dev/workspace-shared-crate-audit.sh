@@ -504,8 +504,8 @@ This rubric classifies findings into `migrate`, `extend-shared`, `keep-local`, o
 ## Test and Delivery Gates
 
 1. Characterization-first for high-risk work before helper extraction or behavior rewiring.
-2. Required checks from `DEVELOPMENT.md` must pass before delivery.
-3. Workspace coverage gate remains at or above the documented threshold.
+2. Local changed-scope checks from `DEVELOPMENT.md` must pass before delivery.
+3. GitHub required checks own full workspace and coverage gates before merge.
 4. Any parity-sensitive exception must include explicit tests and rationale in the PR.
 
 ## Classification Rules

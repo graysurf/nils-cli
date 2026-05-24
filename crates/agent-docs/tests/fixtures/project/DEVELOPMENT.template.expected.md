@@ -18,7 +18,7 @@ cargo build --workspace
 
 ## Test
 
-Run checks before delivery:
+Run project-defined local checks before delivery:
 
 ```bash
 cargo fmt --all -- --check

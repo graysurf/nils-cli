@@ -148,8 +148,13 @@ Local shell setup:
 
 Use [DEVELOPMENT.md](DEVELOPMENT.md) as the canonical checklist.
 
-- Full required checks: `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`
-- Docs-only fast path: `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh --docs-only`
+- Default local check: `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
+- Docs-only fast path: `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`
+- Full CI parity check, when needed locally:
+  `NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh`
+- Full coverage is enforced by CI for PRs; run
+  `NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage`
+  only for coverage/release/CI-debugging work.
 - Regenerate third-party license/notice artifacts after dependency or metadata changes:
   - `bash scripts/generate-third-party-artifacts.sh --write`
 - Verify third-party artifacts are current (fails on drift):

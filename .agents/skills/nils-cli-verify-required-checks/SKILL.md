@@ -1,6 +1,6 @@
 ---
 name: nils-cli-verify-required-checks
-description: Run the required nils-cli checks from DEVELOPMENT.md.
+description: Run the full nils-cli CI/parity checks from DEVELOPMENT.md.
 ---
 
 # Nils CLI Verify Required Checks
@@ -18,7 +18,7 @@ Inputs:
 
 Outputs:
 
-- Runs the required checks defined in `DEVELOPMENT.md`.
+- Runs the full CI/parity checks defined in `DEVELOPMENT.md`.
 - In `--docs-only` mode, runs only the documentation checks defined there.
 - Prints the failing command (if any) and exits non-zero on failure.
 
@@ -32,7 +32,7 @@ Failure modes:
 
 - Not in a git work tree (cannot resolve repo root).
 - Missing a required tool on `PATH`.
-- Any of the required lint/tests fail.
+- Any of the full-stack lint/tests fail.
 
 ## Scripts (only entrypoints)
 
@@ -40,20 +40,21 @@ Failure modes:
 
 ## Workflow
 
-- Run before you claim a task is done.
+- For day-to-day implementation, prefer the changed-scope local gate:
+  `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`.
+- Run this full stack locally only when you need CI parity, release-quality
+  verification, or CI debugging evidence.
 - For docs-only changes (`README.md` / `docs/**` / `*.md` only), prefer:
-  - `.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh --docs-only`
+  - `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`
 - If it fails, fix the reported issue and re-run until it exits `0`.
 
 ## Alternate entry points
 
-Claude Code's `/pre-pr` slash command covers the same intent via
-`<repo>/.agents/scripts/pre-pr.sh`, which runs a **superset** of these
-checks: `scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage` adds
-an llvm-cov coverage gate on top of the base audit stack. Invoke this
-skill's script directly when you want the base stack without the coverage
-gate, or when you are driving from a CLI that discovers through
-`.agents/skills/` (codex / opencode).
+Claude Code's `/pre-pr` slash command covers the default local intent via
+`<repo>/.agents/scripts/pre-pr.sh`, which runs
+`scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` by default. Use
+`/pre-pr --full` or this skill's script directly only for local CI parity; use
+`/pre-pr --with-coverage` when local coverage evidence is explicitly needed.
 
 See claude-kit's `docs/dispatcher-commands.md` for the multi-CLI mirror
 rule behind this pairing.

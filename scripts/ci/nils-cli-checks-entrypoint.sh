@@ -7,20 +7,22 @@ Usage:
   scripts/ci/nils-cli-checks-entrypoint.sh [--xvfb] [--local-fast] [--with-coverage] [verify-script args...]
 
 Description:
-  Canonical cross-platform entrypoint for CI verification jobs.
-  - Runs ./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh
+  Canonical cross-platform entrypoint for local-fast and CI verification jobs.
+  - By default, runs the full CI parity stack through
+    ./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh
   - Reuses the current Bash interpreter so nested audit scripts run with the same shell version.
   - Optionally wraps execution with xvfb-run for Linux runners.
-  - Optionally runs the local fast changed-scope gate.
-  - Optionally runs the local coverage gate and summary after required checks.
+  - Runs the local fast changed-scope gate with --local-fast; this is the
+    default day-to-day development and pre-PR path.
+  - Optionally runs the coverage gate and summary after the full CI stack.
 
 Options:
   --xvfb             Run checks under `xvfb-run -a`
   --local-fast       Run fast local changed-scope validation instead of the
-                     full required-checks script. Pass --base <ref>,
+                     full CI/parity script. Pass --base <ref>,
                      --plan-only, or --changed-file <path> through to
                      scripts/ci/nils-cli-local-fast.sh.
-  --with-coverage    Run coverage gate after required checks:
+  --with-coverage    Run coverage gate after the full CI stack:
                      cargo llvm-cov nextest --profile ci --workspace --lcov \
                        --output-path target/coverage/lcov.info --fail-under-lines <N>
                      bash scripts/ci/coverage-summary.sh target/coverage/lcov.info
@@ -178,4 +180,4 @@ run cargo llvm-cov nextest --profile ci --workspace --lcov --output-path target/
 run bash scripts/ci/coverage-summary.sh target/coverage/lcov.info
 run cargo test --workspace --doc
 
-echo "ok: required checks + coverage gate passed"
+echo "ok: full CI/parity checks + coverage gate passed"
