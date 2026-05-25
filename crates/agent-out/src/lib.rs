@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use cli::{AuditArgs, AuditFormat, Cli, Command, ProjectArgs, ProjectFormat};
 
 use nils_common::cli_contract::exit;
+use nils_common::fs::display_path;
 
 const EXIT_OK: i32 = exit::SUCCESS;
 const EXIT_AUDIT_VIOLATIONS: i32 = exit::RUNTIME;
@@ -718,10 +719,6 @@ struct ErrorBody<'a> {
     message: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<Value>,
-}
-
-fn display_path(path: &Path) -> String {
-    path.to_string_lossy().to_string()
 }
 
 #[cfg(test)]

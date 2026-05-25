@@ -16,7 +16,7 @@ use cli::{
     RecordWaiverArgs,
 };
 use nils_common::cli_contract::exit;
-use nils_common::fs::normalize_path;
+use nils_common::fs::{display_path, normalize_path};
 use nils_common::redact::redact_text;
 
 const EXIT_OK: i32 = exit::SUCCESS;
@@ -515,10 +515,6 @@ fn print_json_error(
 fn render_json_failure(err: serde_json::Error) -> i32 {
     eprintln!("test-first-evidence: error: failed to render json: {err}");
     EXIT_RUNTIME
-}
-
-fn display_path(path: &Path) -> String {
-    path.to_string_lossy().to_string()
 }
 
 #[derive(Debug)]
