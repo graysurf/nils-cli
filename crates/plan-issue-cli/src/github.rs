@@ -649,7 +649,6 @@ mod tests {
     };
     use crate::commands::plan::CloseReason;
     use crate::github::{GhCliAdapter, ProviderAdapter};
-    use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
     use nils_test_support::{EnvGuard, GlobalStateLock, StubBinDir, prepend_path};
     use tempfile::TempDir;
 
