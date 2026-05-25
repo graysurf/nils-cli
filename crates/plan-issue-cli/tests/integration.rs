@@ -19,6 +19,8 @@ mod help_snapshot;
 mod lifecycle_record;
 #[path = "integration/lifecycle_vnext_registry.rs"]
 mod lifecycle_vnext_registry;
+#[path = "integration/lifecycle_vnext_render.rs"]
+mod lifecycle_vnext_render;
 #[path = "integration/visible_lint.rs"]
 mod visible_lint;
 #[path = "integration/link_pr_flow.rs"]
@@ -37,6 +39,8 @@ mod parity_guardrails;
 mod record_audit;
 #[path = "integration/record_compat_baseline.rs"]
 mod record_compat_baseline;
+#[path = "integration/record_template.rs"]
+mod record_template;
 #[path = "integration/resolve_approval.rs"]
 mod resolve_approval;
 #[path = "integration/runtime_layout_parity.rs"]

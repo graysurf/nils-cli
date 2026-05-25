@@ -15,8 +15,9 @@ use crate::commands::plan::{
     ResolveApprovalArgs, StartPlanArgs, StatusPlanArgs,
 };
 use crate::commands::record::{
-    RecordArgs, RecordAttachArgs, RecordAuditArgs, RecordCloseArgs, RecordCommand, RecordOpenArgs,
-    RecordPostArgs, RecordRepairDashboardArgs,
+    LifecycleCommentKind, RecordArgs, RecordAttachArgs, RecordAuditArgs, RecordCloseArgs,
+    RecordCommand, RecordOpenArgs, RecordPostArgs, RecordRepairDashboardArgs, RecordTemplateArgs,
+    TemplateFormatArg,
 };
 use crate::commands::sprint::{
     AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs,
@@ -96,6 +97,7 @@ fn run_record(
         }
         RecordCommand::Close(args) => run_record_close(binary, dry_run, force, repo_override, args),
         RecordCommand::Audit(args) => run_record_audit(args),
+        RecordCommand::Template(args) => run_record_template(args),
     }
 }
 
@@ -1487,6 +1489,43 @@ fn run_record_close(
         "linked_prs": linked_evidence,
         "final_dashboard": final_dashboard,
         "labels": labels_preview,
+    }))
+}
+
+fn run_record_template(args: &RecordTemplateArgs) -> Result<Value, CommandError> {
+    use crate::lifecycle_record::PayloadRole;
+    use crate::lifecycle_vnext::templates;
+
+    let role = match args.kind {
+        LifecycleCommentKind::Source => PayloadRole::Source,
+        LifecycleCommentKind::Plan => PayloadRole::Plan,
+        LifecycleCommentKind::State => PayloadRole::State,
+        LifecycleCommentKind::Session => PayloadRole::Session,
+        LifecycleCommentKind::Validation => PayloadRole::Validation,
+        LifecycleCommentKind::Review => PayloadRole::Review,
+        LifecycleCommentKind::Closeout => PayloadRole::Closeout,
+    };
+    let format = match args.shape {
+        TemplateFormatArg::Markdown => templates::TemplateFormat::Markdown,
+        TemplateFormatArg::Json => templates::TemplateFormat::Json,
+    };
+    let template = templates::render_template(args.profile, role, format)
+        .map_err(|err| CommandError::runtime(err.code(), err.to_string()))?;
+
+    Ok(json!({
+        "operation": "template",
+        "profile": args.profile.as_str(),
+        "role": match args.kind {
+            LifecycleCommentKind::Source => "source",
+            LifecycleCommentKind::Plan => "plan",
+            LifecycleCommentKind::State => "state",
+            LifecycleCommentKind::Session => "session",
+            LifecycleCommentKind::Validation => "validation",
+            LifecycleCommentKind::Review => "review",
+            LifecycleCommentKind::Closeout => "closeout",
+        },
+        "shape": args.shape.as_str(),
+        "template": template,
     }))
 }
 

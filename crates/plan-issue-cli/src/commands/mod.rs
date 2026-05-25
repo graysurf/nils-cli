@@ -297,6 +297,7 @@ impl RecordArgs {
             record::RecordCommand::RepairDashboard(_) => "record.repair-dashboard",
             record::RecordCommand::Close(_) => "record.close",
             record::RecordCommand::Audit(_) => "record.audit",
+            record::RecordCommand::Template(_) => "record.template",
         }
     }
 }

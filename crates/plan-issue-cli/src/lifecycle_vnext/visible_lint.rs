@@ -324,18 +324,34 @@ fn task_ledger_appears_collapsed(body: &str) -> bool {
 }
 
 fn body_contains_validation_command_row(body: &str) -> bool {
-    body.lines().any(|line| {
+    // Walk lines and find table data rows under a validation-shaped header.
+    // The renderer in `lifecycle_record` does not necessarily wrap the
+    // command in backticks, so the lint accepts any non-empty data row
+    // beneath the `| Command | Status | Evidence |` header.
+    let mut in_validation_table = false;
+    let mut saw_separator = false;
+    for line in body.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with('|') {
-            return false;
+            in_validation_table = false;
+            saw_separator = false;
+            continue;
         }
-        // Reject header and separator rows.
-        if trimmed.contains("| Command") || trimmed.contains("---") {
-            return false;
+        if trimmed.contains("| Command") {
+            in_validation_table = true;
+            saw_separator = false;
+            continue;
         }
-        // A real command row is fenced with backticks somewhere in the row.
-        trimmed.contains('`')
-    })
+        if in_validation_table && trimmed.starts_with("| ---") {
+            saw_separator = true;
+            continue;
+        }
+        if in_validation_table && saw_separator {
+            // Any data row inside the validation table counts.
+            return true;
+        }
+    }
+    false
 }
 
 fn body_contains_review_disposition_row(body: &str) -> bool {

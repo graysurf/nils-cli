@@ -31,6 +31,10 @@ pub enum RecordCommand {
 
     /// Audit issue body and comments for lifecycle markers.
     Audit(Box<RecordAuditArgs>),
+
+    /// Preview the visible Markdown or JSON payload skeleton for a lifecycle
+    /// role. Non-mutating; backed by the vNext lifecycle role registry.
+    Template(Box<RecordTemplateArgs>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -66,6 +70,39 @@ pub enum TaskLedgerDisplay {
     Auto,
     Collapsed,
     Expanded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+pub enum TemplateFormatArg {
+    Markdown,
+    Json,
+}
+
+impl TemplateFormatArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct RecordTemplateArgs {
+    /// Lifecycle profile for the template preview.
+    #[arg(long, value_enum, default_value_t = RecordProfile::Tracking)]
+    pub profile: RecordProfile,
+
+    /// Lifecycle role to preview.
+    #[arg(long, value_enum)]
+    pub kind: LifecycleCommentKind,
+
+    /// Template output shape. `markdown` prints the visible body skeleton;
+    /// `json` prints the payload data skeleton. (Named `--shape` rather than
+    /// `--format` because the global `--format text|json` controls the
+    /// command envelope and would shadow a subcommand `--format` flag.)
+    #[arg(long, value_enum, default_value_t = TemplateFormatArg::Markdown)]
+    pub shape: TemplateFormatArg,
 }
 
 impl LifecycleCommentKind {
