@@ -84,7 +84,7 @@ in `crates/*/src`.
 These are repository scripts (not third-party packages):
 
 - Install workspace binaries:
-  - `./.agents/skills/nils-cli-install-local-release-binaries/scripts/nils-cli-install-local-release-binaries.sh`
+  - `./scripts/install-local-release-binaries.sh`
 - Run default local changed-scope checks:
   - `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
 - Run full CI parity checks when needed locally:
