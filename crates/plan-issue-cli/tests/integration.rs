@@ -57,6 +57,8 @@ mod tracking_reconcile;
 mod tracking_checkpoint_dry_run;
 #[path = "integration/tracking_checkpoint_refusals.rs"]
 mod tracking_checkpoint_refusals;
+#[path = "integration/tracking_close_ready.rs"]
+mod tracking_close_ready;
 #[path = "integration/tracking_run_state.rs"]
 mod tracking_run_state;
 #[path = "integration/tracking_run_update.rs"]

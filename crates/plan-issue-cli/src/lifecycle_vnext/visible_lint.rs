@@ -337,21 +337,26 @@ fn body_contains_validation_command_row(body: &str) -> bool {
             saw_separator = false;
             continue;
         }
-        if trimmed.contains("| Command") {
+        if trimmed.contains("Command") && trimmed.contains("Status") {
             in_validation_table = true;
             saw_separator = false;
             continue;
         }
-        if in_validation_table && trimmed.starts_with("| ---") {
+        if in_validation_table && is_table_separator(trimmed) {
             saw_separator = true;
             continue;
         }
         if in_validation_table && saw_separator {
-            // Any data row inside the validation table counts.
             return true;
         }
     }
     false
+}
+
+fn is_table_separator(line: &str) -> bool {
+    line.chars()
+        .all(|c| matches!(c, '|' | '-' | ' ' | ':'))
+        && line.contains("---")
 }
 
 fn body_contains_review_disposition_row(body: &str) -> bool {
