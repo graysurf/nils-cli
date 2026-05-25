@@ -1938,8 +1938,10 @@ fn render_closeout_payload_visible(closeout: &CloseoutData) -> String {
             ));
         }
     }
-    if !closeout.linked_prs.is_empty() {
-        out.push(String::new());
+    out.push(String::new());
+    if closeout.linked_prs.is_empty() {
+        out.push("- Linked PRs: none".to_string());
+    } else {
         out.push("| PR | Merge SHA | Checks | Required | Non-required failures |".to_string());
         out.push("| --- | --- | --- | --- | --- |".to_string());
         for pr in &closeout.linked_prs {
@@ -2930,6 +2932,24 @@ mod sprint3_tests {
         assert!(
             closeout.contains("- Observed failures: owner/repo#1: opt-in/lint"),
             "{closeout}"
+        );
+
+        let no_pr_closeout = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Closeout,
+            json!({
+                "final_status": "complete",
+                "approval": {"comment_url": "https://example.test/approval"},
+                "linked_prs": [],
+                "notes": "closed without linked PR"
+            }),
+            Some("Closeout summary."),
+            None,
+        )
+        .expect("closeout render");
+        assert!(
+            no_pr_closeout.contains("- Linked PRs: none"),
+            "{no_pr_closeout}"
         );
     }
 

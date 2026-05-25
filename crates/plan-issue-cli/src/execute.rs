@@ -1360,6 +1360,17 @@ fn run_record_close(
             "observed_non_required_failures": observed_failures,
         })
     });
+    let final_validation_url = audit
+        .evidence
+        .get("validation")
+        .and_then(|hit| hit.url.clone());
+    let closeout_notes = if linked_evidence.is_empty() {
+        Some(
+            "No linked PRs were provided; closeout relied on issue-visible state, validation, review, and approval evidence.",
+        )
+    } else {
+        None
+    };
     let closeout_payload = json!({
         "final_status": "complete",
         "approval": {"comment_url": approval_text},
@@ -1378,7 +1389,8 @@ fn run_record_close(
             })
             .collect::<Vec<_>>(),
         "non_required_check_override": override_block,
-        "notes": null,
+        "final_validation_url": final_validation_url,
+        "notes": closeout_notes,
     });
     let closeout_summary = if override_reason.is_some() {
         "Strict closeout gate passed with non-required-check failure override; record closed by `plan-issue record close`."
