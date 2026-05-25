@@ -45,6 +45,47 @@ pub fn identity_key_from_auth_file(path: &Path) -> Result<Option<String>, CoreEr
     Ok(Some(key))
 }
 
+pub fn resolve_secret_file_by_email(secret_dir: &Path, target: &str) -> SecretFileResolution {
+    let query = target.to_lowercase();
+    let want_full = target.contains('@');
+
+    let mut matches = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(secret_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let email = match email_from_auth_file(&path) {
+                Ok(Some(value)) => value,
+                _ => continue,
+            };
+            let email_lower = email.to_lowercase();
+            if want_full {
+                if email_lower == query {
+                    matches.push(file_name(&path));
+                }
+            } else if let Some(local_part) = email_lower.split('@').next()
+                && local_part == query
+            {
+                matches.push(file_name(&path));
+            }
+        }
+    }
+    matches.sort();
+
+    if matches.len() == 1 {
+        SecretFileResolution::Exact(matches.remove(0))
+    } else if matches.is_empty() {
+        SecretFileResolution::NotFound
+    } else {
+        SecretFileResolution::Ambiguous {
+            candidates: matches,
+        }
+    }
+}
+
 pub fn token_from_auth_json(value: &serde_json::Value) -> Option<String> {
     json::string_at(value, &["tokens", "id_token"])
         .or_else(|| json::string_at(value, &["id_token"]))
@@ -74,6 +115,20 @@ fn account_id_from_auth_json(value: &Value, payload: Option<&Value>) -> Option<S
                 .and_then(|sub| sub.as_str())
                 .map(json::strip_newlines)
         })
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretFileResolution {
+    Exact(String),
+    Ambiguous { candidates: Vec<String> },
+    NotFound,
 }
 
 #[cfg(test)]
@@ -138,5 +193,61 @@ mod tests {
             identity_key_from_auth_file(&path).expect("identity key"),
             None
         );
+    }
+
+    #[test]
+    fn resolve_secret_file_by_email_supports_full_and_local_part_lookup() {
+        let dir = TempDir::new().expect("tempdir");
+        write_auth_json(
+            &dir.path().join("alpha.json"),
+            &auth_json_for_email("alpha@example.com"),
+        );
+        write_auth_json(
+            &dir.path().join("beta.json"),
+            &auth_json_for_email("beta@example.com"),
+        );
+        write_auth_json(&dir.path().join("notes.txt"), "not json");
+
+        assert_eq!(
+            resolve_secret_file_by_email(dir.path(), "alpha@example.com"),
+            SecretFileResolution::Exact("alpha.json".to_string())
+        );
+        assert_eq!(
+            resolve_secret_file_by_email(dir.path(), "beta"),
+            SecretFileResolution::Exact("beta.json".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_secret_file_by_email_reports_ambiguous_and_not_found() {
+        let dir = TempDir::new().expect("tempdir");
+        write_auth_json(
+            &dir.path().join("alpha-1.json"),
+            &auth_json_for_email("alpha@example.com"),
+        );
+        write_auth_json(
+            &dir.path().join("alpha-2.json"),
+            &auth_json_for_email("alpha@example.com"),
+        );
+
+        match resolve_secret_file_by_email(dir.path(), "alpha@example.com") {
+            SecretFileResolution::Ambiguous { candidates } => {
+                assert_eq!(
+                    candidates,
+                    vec!["alpha-1.json".to_string(), "alpha-2.json".to_string()]
+                );
+            }
+            other => panic!("expected ambiguous match, got {other:?}"),
+        }
+
+        assert_eq!(
+            resolve_secret_file_by_email(dir.path(), "missing@example.com"),
+            SecretFileResolution::NotFound
+        );
+    }
+
+    fn auth_json_for_email(email: &str) -> String {
+        let token = jwt(serde_json::json!({ "email": email }));
+        format!(r#"{{"tokens":{{"id_token":"{token}"}}}}"#)
     }
 }

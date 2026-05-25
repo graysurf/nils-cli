@@ -6,6 +6,7 @@ use crate::auth;
 use crate::auth::output::{self, AuthUseResult};
 use crate::paths;
 use nils_common::fs;
+use nils_common::provider_runtime::auth::{SecretFileResolution, resolve_secret_file_by_email};
 
 pub fn run(target: &str) -> Result<i32> {
     run_with_json(target, false)
@@ -84,8 +85,8 @@ pub fn run_with_json(target: &str, output_json: bool) -> Result<i32> {
         return Ok(code);
     }
 
-    match resolve_by_email(&secret_dir, target) {
-        ResolveResult::Exact(name) => {
+    match resolve_secret_file_by_email(&secret_dir, target) {
+        SecretFileResolution::Exact(name) => {
             let (code, auth_file) = apply_secret(&secret_dir, &name, output_json)?;
             if output_json && code == 0 {
                 output::emit_result(
@@ -100,7 +101,7 @@ pub fn run_with_json(target: &str, output_json: bool) -> Result<i32> {
             }
             Ok(code)
         }
-        ResolveResult::Ambiguous { candidates } => {
+        SecretFileResolution::Ambiguous { candidates } => {
             if output_json {
                 output::emit_error(
                     "auth use",
@@ -117,7 +118,7 @@ pub fn run_with_json(target: &str, output_json: bool) -> Result<i32> {
             }
             Ok(2)
         }
-        ResolveResult::NotFound => {
+        SecretFileResolution::NotFound => {
             if output_json {
                 output::emit_error(
                     "auth use",
@@ -176,123 +177,17 @@ fn apply_secret(
     Ok((0, Some(auth_file.display().to_string())))
 }
 
-fn resolve_by_email(secret_dir: &Path, target: &str) -> ResolveResult {
-    let query = target.to_lowercase();
-    let want_full = target.contains('@');
-
-    let mut matches = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(secret_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let email = match auth::email_from_auth_file(&path) {
-                Ok(Some(value)) => value,
-                _ => continue,
-            };
-            let email_lower = email.to_lowercase();
-            if want_full {
-                if email_lower == query {
-                    matches.push(file_name(&path));
-                }
-            } else if let Some(local_part) = email_lower.split('@').next()
-                && local_part == query
-            {
-                matches.push(file_name(&path));
-            }
-        }
-    }
-
-    if matches.len() == 1 {
-        ResolveResult::Exact(matches.remove(0))
-    } else if matches.is_empty() {
-        ResolveResult::NotFound
-    } else {
-        ResolveResult::Ambiguous {
-            candidates: matches,
-        }
-    }
-}
-
 fn secret_timestamp_path(target_file: &Path) -> Result<PathBuf> {
     paths::resolve_secret_timestamp_path(target_file)
         .ok_or_else(|| anyhow::anyhow!("CODEX_SECRET_CACHE_DIR not resolved"))
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-#[derive(Debug)]
-enum ResolveResult {
-    Exact(String),
-    Ambiguous { candidates: Vec<String> },
-    NotFound,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ResolveResult, file_name, resolve_by_email, secret_timestamp_path};
+    use super::secret_timestamp_path;
     use nils_test_support::{EnvGuard, GlobalStateLock};
     use pretty_assertions::assert_eq;
     use std::path::Path;
-
-    const HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
-    const PAYLOAD_ALPHA: &str = "eyJzdWIiOiJ1c2VyXzEyMyIsImVtYWlsIjoiYWxwaGFAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoidXNlcl8xMjMiLCJlbWFpbCI6ImFscGhhQGV4YW1wbGUuY29tIn19";
-    const PAYLOAD_BETA: &str = "eyJzdWIiOiJ1c2VyXzQ1NiIsImVtYWlsIjoiYmV0YUBleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyXzQ1NiIsImVtYWlsIjoiYmV0YUBleGFtcGxlLmNvbSJ9fQ";
-
-    fn token(payload: &str) -> String {
-        format!("{HEADER}.{payload}.sig")
-    }
-
-    fn auth_json(payload: &str) -> String {
-        format!(
-            r#"{{"tokens":{{"id_token":"{}","access_token":"{}"}}}}"#,
-            token(payload),
-            token(payload)
-        )
-    }
-
-    #[test]
-    fn resolve_by_email_supports_full_and_local_part_lookup() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        std::fs::write(dir.path().join("alpha.json"), auth_json(PAYLOAD_ALPHA)).expect("alpha");
-        std::fs::write(dir.path().join("beta.json"), auth_json(PAYLOAD_BETA)).expect("beta");
-
-        match resolve_by_email(dir.path(), "alpha@example.com") {
-            ResolveResult::Exact(name) => assert_eq!(name, "alpha.json"),
-            other => panic!("expected exact alpha match, got {other:?}"),
-        }
-        match resolve_by_email(dir.path(), "beta") {
-            ResolveResult::Exact(name) => assert_eq!(name, "beta.json"),
-            other => panic!("expected exact beta match, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_by_email_reports_ambiguous_and_not_found() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        std::fs::write(dir.path().join("alpha-1.json"), auth_json(PAYLOAD_ALPHA)).expect("alpha-1");
-        std::fs::write(dir.path().join("alpha-2.json"), auth_json(PAYLOAD_ALPHA)).expect("alpha-2");
-
-        match resolve_by_email(dir.path(), "alpha@example.com") {
-            ResolveResult::Ambiguous { candidates } => {
-                assert_eq!(candidates.len(), 2);
-                assert!(candidates.contains(&"alpha-1.json".to_string()));
-                assert!(candidates.contains(&"alpha-2.json".to_string()));
-            }
-            other => panic!("expected ambiguous match, got {other:?}"),
-        }
-
-        match resolve_by_email(dir.path(), "missing@example.com") {
-            ResolveResult::NotFound => {}
-            other => panic!("expected not found, got {other:?}"),
-        }
-    }
 
     #[test]
     fn secret_timestamp_path_uses_cache_dir_and_default_file_name() {
@@ -309,11 +204,5 @@ mod tests {
 
         let without_name = secret_timestamp_path(Path::new("")).expect("timestamp path");
         assert_eq!(without_name, cache.join("auth.json.timestamp"));
-    }
-
-    #[test]
-    fn file_name_returns_empty_when_path_has_no_file_name() {
-        assert_eq!(file_name(Path::new("a/b/c.json")), "c.json");
-        assert_eq!(file_name(Path::new("")), "");
     }
 }
