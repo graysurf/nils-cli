@@ -2,9 +2,33 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+/// Lexically normalize `path`: drop `.` components, collapse `..` components by
+/// popping the previous segment, and preserve any root or prefix (Windows
+/// drive / UNC). The result is purely syntactic — the filesystem is not
+/// consulted.
+///
+/// Behavior matches the per-crate `normalize_absolute_path` / `normalize_path`
+/// helpers that previously lived in `agent-scope-lock`, `web-evidence`, and
+/// `agent-workflow-primitives::test_first_evidence`.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
 
 pub const SECRET_FILE_MODE: u32 = 0o600;
 const MAX_TEMP_PATH_ATTEMPTS: u32 = 10;
@@ -498,6 +522,32 @@ const ROUND_CONSTANTS: [u32; 64] = [
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn normalize_path_drops_curdir_components() {
+        assert_eq!(
+            normalize_path(Path::new("/a/./b/./c")),
+            PathBuf::from("/a/b/c")
+        );
+    }
+
+    #[test]
+    fn normalize_path_collapses_parent_components() {
+        assert_eq!(
+            normalize_path(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+    }
+
+    #[test]
+    fn normalize_path_preserves_root_when_collapsing_past_start() {
+        assert_eq!(normalize_path(Path::new("/../a")), PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn normalize_path_preserves_relative_paths() {
+        assert_eq!(normalize_path(Path::new("a/b/c")), PathBuf::from("a/b/c"));
+    }
 
     #[test]
     fn fs_replace_file_overwrites_existing_destination() {
