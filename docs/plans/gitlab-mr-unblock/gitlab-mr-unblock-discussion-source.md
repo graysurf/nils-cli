@@ -4,12 +4,12 @@
 | --- | --- |
 | Status | Ready for implementation |
 | Date | 2026-05-25 |
-| Source | Downstream sandbox validation in `terrylin/agent-runtime-testing` (gitlab.gamania.com); see Read-first references |
+| Source | Downstream sandbox validation in `graysury/nils-cli-gitlab-sandbox` (gitlab.com); originally performed in an internal GitLab sandbox that has since been migrated. See Read-first references. |
 | Intended next step | Land F-1 + F-2 fixes in this plan; F-3 spins out to a separate plan |
 
 ## Purpose
 
-A downstream sandbox sweep against `gitlab.gamania.com` revealed six findings in
+A downstream sandbox sweep against a GitLab instance revealed six findings in
 the `forge-cli` / `plan-issue` skill stack. This source captures the **two
 small, self-contained** findings (F-1, F-2) that block GitLab MR delivery via
 `forge-cli`. Landing them lets the sandbox finish validating
@@ -140,7 +140,7 @@ already there.
 ## Read-first references
 
 - Sandbox source doc (downstream):
-  `terrylin/agent-runtime-testing:docs/plans/gitlab-skill-validation/gitlab-skill-validation-discussion-source.md`
+  `graysury/nils-cli-gitlab-sandbox:docs/plans/gitlab-skill-validation/gitlab-skill-validation-discussion-source.md`
   — see Findings table for F-1 / F-2 evidence
 - `crates/forge-cli/src/ops/issue_list.rs:139-140` (F-1 fix site)
 - `crates/forge-cli/src/glab_version.rs:11-18` (F-2 fix site)

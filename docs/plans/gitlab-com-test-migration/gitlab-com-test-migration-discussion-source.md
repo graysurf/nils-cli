@@ -108,9 +108,11 @@ No CLI behavior or schema changes. No new test gating. No new env vars.
   the GitHub user `graysurf`).
 - R2. After Sprint 2, the only remaining references to `gitlab.gamania.com`
   in the whole worktree are in: (a) git history, (b) `THIRD_PARTY_*`
-  generated files if they happen to mention it (none expected). No
-  `docs/plans/**`, `crates/**/docs/**`, or top-level docs file references
-  the Gamania host or sandbox slug.
+  generated files if they happen to mention it (none expected), and
+  (c) `docs/plans/gitlab-com-test-migration/**` (this migration plan
+  itself, which must name what is being moved). No other `docs/plans/**`,
+  `crates/**/docs/**`, or top-level docs file references the Gamania host
+  or sandbox slug.
 - R3. After Sprint 3, `graysury/nils-cli-gitlab-sandbox` exists on
   `gitlab.com`, can be addressed by `forge-cli --repo`, and has at least
   one disposable MR successfully exercised through
@@ -126,7 +128,8 @@ No CLI behavior or schema changes. No new test gating. No new env vars.
 - AC-1. `rg -n 'gitlab\.gamania\.com|terrylin/agent-runtime-testing' --type rust`
   returns no matches.
 - AC-2. `rg -n 'gitlab\.gamania\.com|terrylin/agent-runtime-testing' docs/plans/ crates/*/docs/`
-  returns no matches.
+  returns matches only inside `docs/plans/gitlab-com-test-migration/` (this
+  migration plan itself).
 - AC-3. `cargo test --workspace` passes.
 - AC-4. `forge-cli --format json --repo graysury/nils-cli-gitlab-sandbox issue list --state all`
   returns an `ok=true` envelope against the live sandbox.

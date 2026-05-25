@@ -207,7 +207,7 @@ should cover any code change if one is still needed.
 
 **Decided**: yes, default to cwd auto-detect when `--repo` is omitted (matches
 forge-cli's behaviour). When `--repo <slug>` is explicit, parse the host from
-the slug if it includes one (`gitlab.gamania.com/group/project`); otherwise
+the slug if it includes one (`gitlab.example.com/group/project`); otherwise
 assume GitHub for bare `owner/repo` (matches existing GitHub-first
 expectation). This keeps existing GitHub workflows unchanged (R5).
 

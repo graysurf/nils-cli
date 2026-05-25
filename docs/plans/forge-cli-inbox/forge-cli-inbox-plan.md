@@ -323,13 +323,13 @@ and run the local validation gate.
 - Contract: JSON envelope shape for list, status, next, partial success,
   all-provider failure, empty results, and duplicate reasons.
 - Manual/live: optional post-implementation smoke for GitHub and
-  `gitlab.gamania.com` with `--format json`.
+  `gitlab.com` with `--format json`.
 
 ## Risks & gotchas
 
 - The inbox resolver must stay local to `inbox`; changing global provider
   detection would risk existing lifecycle commands.
-- GitLab API endpoint parameters may differ on the company self-managed host, so
+- GitLab API endpoint parameters may differ on self-managed instances, so
   offline fixtures should cover the intended shape and live smoke should be
   recorded separately.
 - Partial success can be misleading if text output hides warnings; both text and

@@ -21,8 +21,8 @@ a separate plan after this lands.
   `docs/plans/gitlab-mr-unblock/gitlab-mr-unblock-discussion-source.md`
 - Source type: discussion-to-implementation-doc
 - Open questions carried into execution: none
-- Downstream sandbox findings live in `terrylin/agent-runtime-testing`
-  (GitLab) under
+- Downstream sandbox findings live in `graysury/nils-cli-gitlab-sandbox`
+  (gitlab.com) under
   `docs/plans/gitlab-skill-validation/gitlab-skill-validation-discussion-source.md`.
 
 ## Scope
@@ -120,8 +120,8 @@ downstream sandbox MR-delivery path on GitLab.
 ### Task 1.4: Downstream sandbox revalidation
 
 - **Location**:
-  - Downstream sandbox repo: `terrylin/agent-runtime-testing` on
-    `gitlab.gamania.com`
+  - Downstream sandbox repo: `graysury/nils-cli-gitlab-sandbox` on
+    `gitlab.com`
 - **Description**: Re-run the sandbox sweep phases that F-1 / F-2
   previously blocked. Update the sandbox source doc Findings table marking
   F-1 / F-2 as resolved and linking the upstream PR.

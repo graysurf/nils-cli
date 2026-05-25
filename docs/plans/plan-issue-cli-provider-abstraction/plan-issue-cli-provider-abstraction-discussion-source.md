@@ -4,7 +4,7 @@
 | --- | --- |
 | Status | Ready for design + implementation (no code in this plan; design-first) |
 | Date | 2026-05-25 |
-| Source | Downstream sandbox validation in `terrylin/agent-runtime-testing` (gitlab.gamania.com); see F-3 in the sandbox source doc |
+| Source | Downstream sandbox validation in `graysury/nils-cli-gitlab-sandbox` (gitlab.com); see F-3 in the sandbox source doc |
 | Intended next step | Land an internal provider abstraction in `plan-issue-cli` so plan-tracking + dispatch lifecycle works on GitLab; iterate per Sprint plan |
 
 ## Purpose
@@ -28,11 +28,11 @@ Concrete failure mode reproduced in sandbox:
 
 ```text
 plan-issue --format json record open --profile tracking \
-  --repo terrylin/agent-runtime-testing --bundle docs/plans/...
+  --repo graysury/nils-cli-gitlab-sandbox --bundle docs/plans/...
 → status: error
   code: record-open-issue-create-failed
-  message: gh issue create --repo terrylin/agent-runtime-testing ... failed:
-           GraphQL: Could not resolve to a Repository with the name 'terrylin/agent-runtime-testing'
+  message: gh issue create --repo graysury/nils-cli-gitlab-sandbox ... failed:
+           GraphQL: Could not resolve to a Repository with the name 'graysury/nils-cli-gitlab-sandbox'
 ```
 
 The error message is the smoking gun: `plan-issue` invokes `gh` even when the
@@ -89,7 +89,7 @@ decision.
 
 - All provider mutations route through one internal trait or function group.
 - Tests cover both providers with stub backends, similar to the existing forge-cli integration test layout.
-- Live GitLab smoke uses the same sandbox repo (`terrylin/agent-runtime-testing`).
+- Live GitLab smoke uses the same sandbox repo (`graysury/nils-cli-gitlab-sandbox`).
 
 ## Requirements
 
@@ -103,7 +103,7 @@ decision.
 ## Acceptance criteria
 
 - AC-1. `cargo test -p nils-plan-issue-cli` is green with the new provider trait + GitLab branch.
-- AC-2. Sandbox revalidation: `plan-issue record open --profile tracking --repo terrylin/agent-runtime-testing --bundle
+- AC-2. Sandbox revalidation: `plan-issue record open --profile tracking --repo graysury/nils-cli-gitlab-sandbox --bundle
   docs/plans/p8-smoke` succeeds end-to-end; downstream Tier D skills marked `pass` in the sandbox source doc.
 - AC-3. `forge-cli inbox`, `plan-issue record audit` etc. all read back lifecycle markers identically across providers.
 - AC-4. Existing nils-cli GitHub workflows (e.g. agent-run-direnv-exec tracking) continue to work unchanged.
@@ -154,7 +154,7 @@ adding future providers.
 ## Read-first references
 
 - Downstream sandbox source doc:
-  `terrylin/agent-runtime-testing:docs/plans/gitlab-skill-validation/gitlab-skill-validation-discussion-source.md`
+  `graysury/nils-cli-gitlab-sandbox:docs/plans/gitlab-skill-validation/gitlab-skill-validation-discussion-source.md`
   (F-3 entry + evidence)
 - `crates/plan-issue-cli/src/github.rs` (current implementation; ~1001 lines)
 - `crates/forge-cli/src/` (the provider-neutral target surface)
