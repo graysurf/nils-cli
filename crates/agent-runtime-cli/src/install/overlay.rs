@@ -17,7 +17,7 @@
 //! / forbidden fields).
 
 use super::link_map::{CommentStyle, EntryKind, LinkEntry, LinkMap, LinkMapError, SCHEMA_VERSION};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Conventional location of the overlay file, relative to the agent-runtime-kit
@@ -112,7 +112,7 @@ impl LinkMapOverlay {
 /// this in dry-run / apply output so reviewers see at a glance that an
 /// overlay is in play (the architecture doc requires dry-run to expose
 /// the post-merge effective config).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct OverlaySummary {
     pub dropped: usize,
     pub replaced: usize,

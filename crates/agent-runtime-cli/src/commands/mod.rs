@@ -4,6 +4,7 @@ pub mod gc_backups;
 pub mod install;
 pub mod list_skills;
 pub mod pr_body;
+pub mod prune_stale;
 pub mod purge_state;
 pub mod render;
 pub mod restore_backups;
