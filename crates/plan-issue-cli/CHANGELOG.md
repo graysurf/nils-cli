@@ -6,6 +6,37 @@ versioning.
 
 ## [Unreleased]
 
+### Added (Plan-Issue vNext)
+
+- `plan-issue record template --kind <role> --shape markdown|json` —
+  non-mutating preview of every lifecycle role's visible body and JSON
+  payload skeleton, driven by the new vNext registry.
+- `plan-issue record audit --expect-visible` — opt-in visible
+  completeness lint over the latest comment body per role. Returns a
+  `visible` block with stable role-specific failure codes
+  (`state-missing-task-ledger`, `validation-missing-overall`, …) alongside
+  the existing hidden-payload audit result.
+- New `plan-issue tracking` surface covering:
+  - `tracking status` — reconcile provider issue evidence with optional
+    local run state and return the FSM state + recommended next action.
+  - `tracking run init` / `tracking run update` — typed local run-state
+    persistence (`plan-issue.execution-run.v1`) plus append-only
+    `events.jsonl` journal (`plan-issue.execution-event.v1`) under the
+    issue-scoped runtime root.
+  - `tracking checkpoint` — default dry-run rendering of role-allowed
+    lifecycle comments synthesized from the run state. `--live` opts in
+    to provider mutation; until the live adapter ships the controller
+    returns a `tracking-checkpoint-live-not-implemented` blocker.
+  - `tracking close-ready` — strict, non-mutating close-readiness probe
+    with role-specific blocked codes and visible-completeness gating.
+- `lifecycle_vnext` module tree (`registry`, `templates`, `visible_lint`,
+  `payloads`, `render`) plus `tracking` module tree (`run_state`,
+  `events`, `fsm`, `reconcile`, `checkpoint`, `close_ready`) so the
+  vNext controller has a clean boundary outside the catch-all executor.
+- `record_compat_baseline` integration tests locking the released
+  `record` subcommand surface, envelope, error shape, and tracking
+  schema constants before runtime-kit migrates.
+
 ### Fixed
 
 - `plan-issue record close` no longer collapses non-required GitHub
