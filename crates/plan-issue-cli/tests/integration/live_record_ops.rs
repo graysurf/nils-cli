@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use pretty_assertions::assert_eq;
+use pretty_assertions::{assert_eq, assert_ne};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -184,6 +184,196 @@ fn record_post_state_summary_file_is_rendered_in_dry_run() {
     assert!(
         body.starts_with("<!-- plan-issue-record:v2 role=state profile=tracking -->"),
         "{body}"
+    );
+}
+
+#[test]
+fn record_post_state_execution_state_file_collapses_non_final_in_dry_run() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    let execution_state = tmp.path().join("state.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "ledger surface",
+            "current": "working",
+            "next_action": "continue",
+            "tasks": [{"id": "1.1", "status": "pending", "title": "Demo task"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &execution_state,
+        "# Sample Execution State\n\n## Execution State\n\n- Status: in-progress\n\n## Task Ledger\n\n| ID | Status | Task |\n| --- | --- | --- |\n| 1.1 | pending | Demo task |\n\n## Validation\n\n| Command | Status |\n| --- | --- |\n| `true` | pass |\n",
+    )
+    .expect("write execution state");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let body = parsed["payload"]["result"]["comment_body"]
+        .as_str()
+        .expect("comment body");
+    assert!(body.contains("## Task Ledger"), "{body}");
+    assert!(body.contains("<details>"), "{body}");
+    assert!(
+        body.contains("<summary>Show task ledger</summary>"),
+        "{body}"
+    );
+    assert!(body.contains("| 1.1 | pending | Demo task |"), "{body}");
+    assert!(body.contains("## Validation"), "{body}");
+    assert!(
+        body.contains("<!-- plan-issue-record-payload:hex:"),
+        "{body}"
+    );
+    let details_start = body.find("<details>").expect("details start");
+    let validation_start = body.find("## Validation").expect("validation heading");
+    let payload_start = body
+        .find("<!-- plan-issue-record-payload:hex:")
+        .expect("payload marker");
+    assert!(details_start < validation_start, "{body}");
+    assert!(validation_start < payload_start, "{body}");
+}
+
+#[test]
+fn record_post_state_execution_state_file_expands_final_in_dry_run() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    let execution_state = tmp.path().join("state.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "complete",
+            "target_scope": "ledger surface",
+            "current": "done",
+            "next_action": "closeout",
+            "tasks": [{"id": "1.1", "status": "done", "title": "Demo task"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &execution_state,
+        "# Sample Execution State\n\n## Execution State\n\n- Status: complete\n\n## Task Ledger\n\n| ID | Status | Task |\n| --- | --- | --- |\n| 1.1 | done | Demo task |\n",
+    )
+    .expect("write execution state");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let body = parsed["payload"]["result"]["comment_body"]
+        .as_str()
+        .expect("comment body");
+    assert!(body.contains("## Task Ledger"), "{body}");
+    assert!(body.contains("| 1.1 | done | Demo task |"), "{body}");
+    assert!(!body.contains("<details>"), "{body}");
+}
+
+#[test]
+fn record_post_execution_state_file_requires_state_kind_and_task_ledger() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("validation.json");
+    let execution_state = tmp.path().join("state.md");
+    fs::write(
+        &payload,
+        json!({"overall": "pass", "commands": [], "waivers": []}).to_string(),
+    )
+    .expect("write payload");
+    fs::write(&execution_state, "# State\n").expect("write execution state");
+
+    let wrong_kind = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "validation",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+    assert_ne!(wrong_kind.code, 0);
+    assert!(
+        wrong_kind
+            .stdout
+            .contains("record-post-execution-state-file-kind-invalid"),
+        "{}",
+        wrong_kind.stdout
+    );
+
+    let state_payload = tmp.path().join("state.json");
+    fs::write(
+        &state_payload,
+        json!({
+            "status": "in-progress",
+            "tasks": [],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write state payload");
+    let missing_ledger = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        state_payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+    assert_ne!(missing_ledger.code, 0);
+    assert!(
+        missing_ledger
+            .stdout
+            .contains("record-post-execution-state-task-ledger-missing"),
+        "{}",
+        missing_ledger.stdout
     );
 }
 
