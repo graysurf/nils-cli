@@ -2163,7 +2163,7 @@ _forge-cli() {
                     return 0
                     ;;
                 --kind)
-                    COMPREPLY=($(compgen -W "feature bug" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "feature bug chore docs ci refactor" -- "${cur}"))
                     return 0
                     ;;
                 --reviewer)
@@ -2209,7 +2209,7 @@ _forge-cli() {
             fi
             case "${prev}" in
                 --kind)
-                    COMPREPLY=($(compgen -W "feature bug" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "feature bug chore docs ci refactor" -- "${cur}"))
                     return 0
                     ;;
                 --title)

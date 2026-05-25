@@ -68,12 +68,14 @@ pub struct PrefixArgs {
     #[arg(long, default_value = "subagent", value_name = "text")]
     pub owner_prefix: String,
 
-    /// Branch prefix.
-    #[arg(long, default_value = "issue", value_name = "text")]
+    /// Branch prefix. Defaults to `feat` so dispatch lane branches pass the
+    /// `forge-cli` Conventional Commits prefix rule
+    /// (`feat|fix|chore|docs|ci|refactor`).
+    #[arg(long, default_value = "feat", value_name = "text")]
     pub branch_prefix: String,
 
     /// Worktree prefix.
-    #[arg(long, default_value = "issue__", value_name = "text")]
+    #[arg(long, default_value = "feat__", value_name = "text")]
     pub worktree_prefix: String,
 }
 

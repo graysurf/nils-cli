@@ -29,7 +29,7 @@ fn validation_kinds_match_spec_catalog() {
     ];
 
     let errs: Vec<&'static str> = vec![
-        branch_name("docs/release").unwrap_err().kind(),
+        branch_name("hotfix/release").unwrap_err().kind(),
         branch_kind_matches(BranchPrefix::Feat, PrKind::Bug)
             .unwrap_err()
             .kind(),

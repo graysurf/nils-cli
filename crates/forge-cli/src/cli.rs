@@ -169,6 +169,10 @@ pub struct CompletionArgs {
 pub enum PrKindFlag {
     Feature,
     Bug,
+    Chore,
+    Docs,
+    Ci,
+    Refactor,
 }
 
 impl PrKindFlag {
@@ -176,6 +180,10 @@ impl PrKindFlag {
         match self {
             PrKindFlag::Feature => crate::validations::PrKind::Feature,
             PrKindFlag::Bug => crate::validations::PrKind::Bug,
+            PrKindFlag::Chore => crate::validations::PrKind::Chore,
+            PrKindFlag::Docs => crate::validations::PrKind::Docs,
+            PrKindFlag::Ci => crate::validations::PrKind::Ci,
+            PrKindFlag::Refactor => crate::validations::PrKind::Refactor,
         }
     }
 
@@ -183,6 +191,10 @@ impl PrKindFlag {
         match self {
             PrKindFlag::Feature => "feature",
             PrKindFlag::Bug => "bug",
+            PrKindFlag::Chore => "chore",
+            PrKindFlag::Docs => "docs",
+            PrKindFlag::Ci => "ci",
+            PrKindFlag::Refactor => "refactor",
         }
     }
 }
