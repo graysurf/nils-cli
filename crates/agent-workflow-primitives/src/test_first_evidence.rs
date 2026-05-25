@@ -5,11 +5,9 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
 
 use clap::Parser;
 use clap::error::ErrorKind;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -18,6 +16,7 @@ use cli::{
     RecordWaiverArgs,
 };
 use nils_common::cli_contract::exit;
+use nils_common::redact::redact_text;
 
 const EXIT_OK: i32 = exit::SUCCESS;
 const EXIT_RUNTIME: i32 = exit::RUNTIME;
@@ -411,64 +410,6 @@ fn redacted_strings(values: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn redact_text(input: &str) -> RedactedString {
-    let mut value = input.to_string();
-    let mut replacements = 0usize;
-
-    let assignment_replacements = assignment_secret_regex().captures_iter(&value).count();
-    if assignment_replacements > 0 {
-        value = assignment_secret_regex()
-            .replace_all(&value, "${key}${after_key}[REDACTED]")
-            .to_string();
-        replacements += assignment_replacements;
-    }
-
-    let token_replacements = token_secret_regex().find_iter(&value).count();
-    if token_replacements > 0 {
-        value = token_secret_regex()
-            .replace_all(&value, "[REDACTED]")
-            .to_string();
-        replacements += token_replacements;
-    }
-
-    RedactedString {
-        value,
-        replacements,
-    }
-}
-
-fn assignment_secret_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?ix)
-            (?P<key>\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|authorization|cookie|password|secret|session[_-]?id|token)\b)
-            (?P<after_key>"?\s*[:=]\s*)
-            (?P<value>"[^"]*"|'[^']*'|[^\s,;&}\]]+)
-            "#,
-        )
-        .expect("valid assignment secret regex")
-    })
-}
-
-fn token_secret_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?ix)
-            \b(
-                sk-(?:proj-)?[A-Za-z0-9_-]{8,}
-                | ghp_[A-Za-z0-9_]{8,}
-                | github_pat_[A-Za-z0-9_]{8,}
-                | xox[baprs]-[A-Za-z0-9-]{8,}
-                | bearer\s+[A-Za-z0-9._~+/=-]{8,}
-            )\b
-            "#,
-        )
-        .expect("valid token secret regex")
-    })
-}
-
 fn render_record_success(
     schema_version: &'static str,
     command: &'static str,
@@ -621,12 +562,6 @@ impl CliError {
             exit_code: EXIT_RUNTIME,
         }
     }
-}
-
-struct RedactedString {
-    value: String,
-    #[allow(dead_code)]
-    replacements: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
