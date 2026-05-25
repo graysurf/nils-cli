@@ -25,5 +25,5 @@
 - What could not be verified:
 
 ## Delivery
-- Branch:
-- PR:
+- PR: Not opened; no repo changes were made.
+- Final branch/worktree state:

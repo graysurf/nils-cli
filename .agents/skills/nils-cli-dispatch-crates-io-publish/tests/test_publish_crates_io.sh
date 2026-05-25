@@ -135,6 +135,25 @@ MOCK
   chmod +x "${dir}/gh"
 }
 
+create_mock_agent_out() {
+  local dir="$1"
+  cat > "${dir}/agent-out" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "project" ]]; then
+  out_dir="${MOCK_AGENT_OUT_DIR:?MOCK_AGENT_OUT_DIR is required}"
+  mkdir -p "$out_dir"
+  printf '%s\n' "$out_dir"
+  exit 0
+fi
+
+echo "unexpected agent-out command: $*" >&2
+exit 1
+MOCK
+  chmod +x "${dir}/agent-out"
+}
+
 create_mock_status_script() {
   local dir="$1"
   cat > "${dir}/crates-io-status.sh" <<'MOCK'
@@ -263,6 +282,30 @@ test_dry_run_no_wait_dispatches_workflow() {
   assert_contains "$report" 'Status snapshot: `skipped`'
 }
 
+test_default_report_file_uses_agent_out_project_dir() {
+  local tmp
+  tmp="$(mktemp -d)"
+  local repo="${tmp}/repo"
+  local bin_dir="${tmp}/bin"
+  local report_dir="${tmp}/agent-out-run"
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo"
+  create_mock_cargo "$bin_dir"
+  create_mock_gh "$bin_dir"
+  create_mock_agent_out "$bin_dir"
+
+  PATH="${bin_dir}:$PATH" \
+    MOCK_AGENT_OUT_DIR="$report_dir" \
+    "$entrypoint" --crate nils-a --dry-run-only --no-wait \
+    >"${tmp}/stdout.log" 2>"${tmp}/stderr.log"
+
+  local report
+  report="$(find "$report_dir" -type f -name 'crates-io-publish-report-*.md' -print -quit)"
+  [[ -n "$report" ]] || fail "expected default report under agent-out project dir"
+  assert_contains "$report" 'Mode: `dry-run`'
+  assert_contains "$report" 'Status snapshot: `skipped`'
+}
+
 if [[ ! -f "${skill_root}/SKILL.md" ]]; then
   echo "error: missing SKILL.md" >&2
   exit 1
@@ -279,5 +322,6 @@ fi
 test_publish_wait_success
 test_publish_wait_failure
 test_dry_run_no_wait_dispatches_workflow
+test_default_report_file_uses_agent_out_project_dir
 
 echo "ok: project skill smoke checks passed"

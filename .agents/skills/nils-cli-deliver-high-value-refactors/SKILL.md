@@ -1,6 +1,6 @@
 ---
 name: nils-cli-deliver-high-value-refactors
-description: Find and implement high-value test/stability/shared-foundation refactors across crates, then deliver via deliver-feature-pr.
+description: Find and implement high-value test/stability/shared-foundation refactors across crates, then deliver through the current GitHub PR workflow.
 ---
 
 # Nils CLI Deliver High Value Refactors
@@ -11,10 +11,12 @@ Prereqs:
 
 - Run inside the `nils-cli` git work tree.
 - Rust toolchain available on `PATH` (`cargo`, `rustfmt`, `clippy`).
-- `git`, `gh`, `semantic-commit`, and `git-scope` available when delivering the PR end-to-end.
+- `git`, `gh`, `agent-runtime`, `forge-cli`, `semantic-commit`, and
+  `review-specialists` available when delivering the PR end-to-end.
 - Use this skill together with:
-  - `$deliver-feature-pr` as the canonical delivery policy.
-  - `$create-feature-pr` and `$close-feature-pr` through `$deliver-feature-pr`.
+  - `$deliver-github-pr` as the canonical delivery policy.
+  - `$create-github-pr` / `$close-github-pr` only when the delivery workflow
+    explicitly needs a narrower PR lifecycle surface.
 
 Inputs:
 
@@ -27,10 +29,13 @@ Inputs:
 Outputs:
 
 - One of two outcomes:
-  - `Implement`: at least one high-value refactor is implemented with tests and validation evidence, then delivered via `$deliver-feature-pr`.
+  - `Implement`: at least one high-value refactor is implemented with tests and
+    validation evidence, then delivered via `$deliver-github-pr`.
   - `No Action`: no high-value target found; return concrete recommendations and potential issue list.
 - Reporting split (strict):
-  - `Implement`: use `$deliver-feature-pr` delivery contract end-to-end (open PR, wait CI green, close PR).
+  - `Implement`: use `$deliver-github-pr` delivery contract end-to-end
+    (open PR, wait checks, run the required review gate, merge unless
+    explicitly stopped with `--no-merge`).
   - `No Action`: use `.agents/skills/nils-cli-deliver-high-value-refactors/references/NO_ACTION_RESPONSE_TEMPLATE.md`.
 
 Exit codes:
@@ -50,7 +55,8 @@ Failure modes:
 ## Scripts (only entrypoints)
 
 - `.agents/skills/nils-cli-deliver-high-value-refactors/scripts/render-refactor-response-template.sh` (`No Action` response only)
-- `$AGENT_HOME/skills/workflows/pr/feature/deliver-feature-pr/scripts/deliver-feature-pr.sh` (`Implement` delivery only)
+- Implement delivery uses the released CLIs directly through `$deliver-github-pr`;
+  do not call a skill-owned or runtime-home delivery script.
 
 ## Workflow
 
@@ -102,23 +108,42 @@ Failure modes:
 
 6. Delivery (required for implemented changes)
 
-- Run branch-intent preflight:
-  - `deliver-feature-pr.sh preflight --base main`
-- Use `$create-feature-pr` to create branch/commit/open PR from confirmed base branch.
-- Wait for GitHub required checks to become fully green:
-  - `deliver-feature-pr.sh wait-ci --pr <number>`
-- If checks fail, fix on the same feature branch, push, and re-run `wait-ci` until green.
-- Close after CI is green:
-  - `deliver-feature-pr.sh close --pr <number>`
-- The `Implement` branch is not complete until `$deliver-feature-pr` workflow finishes successfully.
+- Confirm the working tree contains only the intended refactor change set. If
+  the active checkout has unrelated dirty state, isolate the work in a clean
+  sibling worktree from `main`.
+- Create or reuse a feature branch from the confirmed `main` base. Use
+  lowercase, hyphenated names such as `feat/<slug>` unless the active project
+  rules require a more specific prefix.
+- Commit with `semantic-commit`; direct `git commit` is not the delivery path.
+- Render the PR body with `agent-runtime pr-body render`, including concrete
+  `## Summary` and `## Test plan` content grounded in the actual diff and
+  validation evidence.
+- Deliver through `$deliver-github-pr` / `forge-cli pr deliver`:
+  - open a PR against `main`;
+  - wait for required provider checks;
+  - run the mandatory `code-review-pre-merge-gate` scope with at least
+    `testing` and `maintainability`;
+  - repair concrete findings on the same branch and rerun affected validation;
+  - merge through `forge-cli pr merge` unless the user explicitly requested
+    `--no-merge`.
+- After delivery, restore branch/worktree state:
+  - in the primary checkout, switch back to `main`;
+  - in a linked or temporary worktree, do not leave `main` checked out; detach
+    the worktree at `HEAD` or remove the worktree after confirming no local
+    changes remain.
+- The `Implement` branch is not complete until the PR URL, check state, review
+  gate outcome, merge or `--no-merge` stop state, and final branch/worktree
+  state are known.
 
 7. Response contract (always required)
 
-- `Implement` path: report `$deliver-feature-pr` artifacts:
+- `Implement` path: report `$deliver-github-pr` artifacts:
   - PR URL
-  - CI status summary
-  - merge commit SHA
-  - final branch state
-- `No Action` path: use the no-action template with concrete recommendation list and potential issues.
+  - check status summary
+  - pre-merge review gate outcome
+  - merge commit SHA, or the explicit `--no-merge` stop state
+  - final branch/worktree state
+- `No Action` path: use the no-action template with concrete recommendation
+  list and potential issues; do not open a PR when no repo changes were made.
 - Render helpers:
   - `./.agents/skills/nils-cli-deliver-high-value-refactors/scripts/render-refactor-response-template.sh --mode no-action`

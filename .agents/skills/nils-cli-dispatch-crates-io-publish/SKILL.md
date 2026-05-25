@@ -47,7 +47,10 @@ Outputs:
   - selected crate list and versions,
   - crates.io status snapshot metadata (json/text path + status).
 - Default report path:
-- `$AGENT_HOME/out/crates-io-publish-report-<timestamp>.md`
+  - a project run directory from
+    `agent-out project --topic crates-io-publish --mkdir`, when available;
+  - otherwise
+    `${CLAUDE_KIT_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit}/out/crates-io-publish/`.
 - Default status snapshot outputs:
   - `${report_file%.md}.status.json`
   - `${report_file%.md}.status.md`

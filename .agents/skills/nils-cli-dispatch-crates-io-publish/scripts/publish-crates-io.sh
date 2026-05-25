@@ -466,9 +466,17 @@ if errors:
 PY
 
 if [[ -z "$report_file" ]]; then
-  agent_home="${AGENT_HOME:-$HOME/.agents}"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  report_file="${agent_home}/out/crates-io-publish-report-${timestamp}.md"
+  report_dir=""
+  if command -v agent-out >/dev/null 2>&1; then
+    report_dir="$(agent-out project --topic crates-io-publish --mkdir 2>/dev/null || true)"
+  fi
+  if [[ -z "$report_dir" ]]; then
+    state_home="${CLAUDE_KIT_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit}"
+    report_dir="${state_home}/out/crates-io-publish"
+    mkdir -p "$report_dir"
+  fi
+  report_file="${report_dir}/crates-io-publish-report-${timestamp}.md"
 fi
 mkdir -p "$(dirname "$report_file")"
 
