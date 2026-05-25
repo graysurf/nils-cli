@@ -1,4 +1,5 @@
 use anyhow::Result;
+use nils_common::git as common_git;
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
 
 use crate::dates::{build_range_args, validate_date};
@@ -199,10 +200,14 @@ fn parse_numstat_totals(log: &str) -> (i64, i64) {
 
 fn is_lockfile_line(line: &str) -> bool {
     let trimmed = line.trim_end();
-    trimmed.ends_with("yarn.lock")
-        || trimmed.ends_with("package-lock.json")
-        || trimmed.ends_with("pnpm-lock.yaml")
-        || trimmed.ends_with(".lock")
+    if common_git::is_lockfile_path(trimmed) {
+        return true;
+    }
+    std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.ends_with(".lock"))
+        .unwrap_or(false)
 }
 
 struct Row {
@@ -288,5 +293,39 @@ mod tests {
         assert!(is_lockfile_line("nested/pnpm-lock.yaml"));
         assert!(is_lockfile_line("nested/other.lock"));
         assert!(!is_lockfile_line("nested/lockfile.txt"));
+    }
+
+    #[test]
+    fn lockfile_detection_catches_bun_and_npm_shrinkwrap() {
+        assert!(is_lockfile_line("bun.lockb"));
+        assert!(is_lockfile_line("nested/bun.lockb"));
+        assert!(is_lockfile_line("bun.lock"));
+        assert!(is_lockfile_line("npm-shrinkwrap.json"));
+        assert!(is_lockfile_line("frontend/npm-shrinkwrap.json"));
+    }
+
+    #[test]
+    fn lockfile_detection_uses_basename_for_known_names() {
+        assert!(!is_lockfile_line("fake-yarn.lock.txt"));
+        assert!(!is_lockfile_line("notyarn.lockb"));
+        assert!(!is_lockfile_line("package-lock.json.bak"));
+    }
+
+    #[test]
+    fn lockfile_detection_handles_trailing_whitespace() {
+        assert!(is_lockfile_line("yarn.lock\n"));
+        assert!(is_lockfile_line("nested/bun.lockb\n"));
+    }
+
+    #[test]
+    fn parse_numstat_totals_skips_bun_lockb_and_npm_shrinkwrap() {
+        let log = "\
+2024-01-01
+100\t50\tbun.lockb
+200\t75\tnpm-shrinkwrap.json
+5\t3\tsrc/lib.rs
+";
+        let (added, deleted) = parse_numstat_totals(log);
+        assert_eq!((added, deleted), (5, 3));
     }
 }
