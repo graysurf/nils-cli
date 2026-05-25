@@ -119,7 +119,7 @@ pub fn parse_backend_output(
 fn parse_github(text: &str, ctx: &ProviderContext) -> Result<AuthStatusPayload, ForgeError> {
     // gh prints:
     //   github.com
-    //     ✓ Logged in to github.com account graysurf (keyring)
+    //     ✓ Logged in to github.com account <user> (keyring)
     //     - Active account: true
     //     - Token scopes: 'repo', 'read:org'
     let host = find_first_match(text, "Logged in to", |after| {
@@ -146,7 +146,7 @@ fn parse_github(text: &str, ctx: &ProviderContext) -> Result<AuthStatusPayload, 
 fn parse_gitlab(text: &str, ctx: &ProviderContext) -> Result<AuthStatusPayload, ForgeError> {
     // glab prints:
     //   gitlab.com
-    //     ✓ Logged in to gitlab.com as graysurf (~/.config/glab-cli/config.yml)
+    //     ✓ Logged in to gitlab.com as <user> (~/.config/glab-cli/config.yml)
     //     ✓ Git operations for gitlab.com configured to use ssh protocol.
     //     ✓ API calls for gitlab.com are made over https protocol
     //     ✓ REST API Endpoint: https://gitlab.com/api/v4/
@@ -236,12 +236,12 @@ mod tests {
         let ctx = github_ctx();
         let output = BackendSuccess {
             stdout: String::new(),
-            stderr: "github.com\n  ✓ Logged in to github.com account graysurf (keyring)\n  - Active account: true\n  - Token scopes: 'repo', 'read:org'\n".into(),
+            stderr: "github.com\n  ✓ Logged in to github.com account testuser-gh (keyring)\n  - Active account: true\n  - Token scopes: 'repo', 'read:org'\n".into(),
         };
         let payload = parse_backend_output(&ctx, &output).expect("parse");
         assert_eq!(payload.provider, "github");
         assert_eq!(payload.host, "github.com");
-        assert_eq!(payload.user.as_deref(), Some("graysurf"));
+        assert_eq!(payload.user.as_deref(), Some("testuser-gh"));
         assert_eq!(
             payload.scopes,
             vec!["repo".to_string(), "read:org".to_string()]
@@ -253,12 +253,12 @@ mod tests {
         let ctx = gitlab_ctx();
         let output = BackendSuccess {
             stdout: String::new(),
-            stderr: "gitlab.com\n  ✓ Logged in to gitlab.com as graysurf (~/.config/glab-cli/config.yml)\n".into(),
+            stderr: "gitlab.com\n  ✓ Logged in to gitlab.com as testuser-glab (~/.config/glab-cli/config.yml)\n".into(),
         };
         let payload = parse_backend_output(&ctx, &output).expect("parse");
         assert_eq!(payload.provider, "gitlab");
         assert_eq!(payload.host, "gitlab.com");
-        assert_eq!(payload.user.as_deref(), Some("graysurf"));
+        assert_eq!(payload.user.as_deref(), Some("testuser-glab"));
         assert!(payload.scopes.is_empty());
     }
 

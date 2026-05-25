@@ -138,7 +138,7 @@ fn build_view_call_with(ctx: &ProviderContext, id: u64, with_comments: bool) -> 
 /// `web_url` so we do not need the user to pass `--repo` or `--remote`. This
 /// also avoids the bug where forcing `--provider gitlab` makes
 /// `ProviderContext::host` default to `gitlab.com` even when the repo lives
-/// on a self-hosted instance like `gitlab.gamania.com`.
+/// on a different GitLab instance.
 fn build_gitlab_notes_call(
     _ctx: &ProviderContext,
     view: &IssueViewPayload,
@@ -405,8 +405,7 @@ fn parse_gitlab_notes(
 /// issue's `web_url`. Returns `None` when the URL does not look like a GitLab
 /// issue URL. Accepts `/-/issues/<iid>`, `/issues/<iid>`, and the newer
 /// `/-/work_items/<iid>` shape that GitLab returns for projects that have
-/// migrated issues to the unified Work Items API (live-observed on
-/// gitlab.gamania.com).
+/// migrated issues to the unified Work Items API.
 fn gitlab_project_path_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let path = after_scheme.split_once('/').map(|(_, rest)| rest)?;
@@ -667,7 +666,7 @@ mod tests {
         };
         let comments = parse_gitlab_notes(
             &output,
-            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/issues/4",
+            "https://gitlab.com/graysury/nils-cli-gitlab-sandbox/-/issues/4",
         )
         .unwrap();
         assert_eq!(comments.len(), 2);
@@ -675,12 +674,12 @@ mod tests {
         assert_eq!(comments[0].body, "first");
         assert_eq!(
             comments[0].url,
-            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/issues/4#note_1"
+            "https://gitlab.com/graysury/nils-cli-gitlab-sandbox/-/issues/4#note_1"
         );
         assert_eq!(comments[1].author, "bob");
         assert_eq!(
             comments[1].url,
-            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/issues/4#note_3"
+            "https://gitlab.com/graysury/nils-cli-gitlab-sandbox/-/issues/4#note_3"
         );
     }
 
@@ -712,10 +711,10 @@ mod tests {
     fn gitlab_host_from_url_extracts_host_segment() {
         assert_eq!(
             gitlab_host_from_url(
-                "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/work_items/6"
+                "https://gitlab.com/graysury/nils-cli-gitlab-sandbox/-/work_items/6"
             )
             .as_deref(),
-            Some("gitlab.gamania.com"),
+            Some("gitlab.com"),
         );
         assert_eq!(
             gitlab_host_from_url("https://gitlab.com/group/sub/project/-/issues/12").as_deref(),
@@ -729,17 +728,17 @@ mod tests {
     fn gitlab_project_path_from_url_extracts_nested_groups() {
         assert_eq!(
             gitlab_project_path_from_url(
-                "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/issues/4"
+                "https://gitlab.com/graysury/nils-cli-gitlab-sandbox/-/issues/4"
             )
             .as_deref(),
-            Some("terrylin/agent-runtime-testing")
+            Some("graysury/nils-cli-gitlab-sandbox")
         );
         assert_eq!(
             gitlab_project_path_from_url(
-                "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/work_items/6"
+                "https://gitlab.com/graysury/nils-cli-gitlab-sandbox/-/work_items/6"
             )
             .as_deref(),
-            Some("terrylin/agent-runtime-testing"),
+            Some("graysury/nils-cli-gitlab-sandbox"),
             "GitLab projects migrated to the Work Items API surface issues at /-/work_items/<iid>",
         );
         assert_eq!(
