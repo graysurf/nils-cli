@@ -47,6 +47,16 @@ mod resolve_approval;
 mod runtime_layout_parity;
 #[path = "integration/runtime_truth_plan_and_sprint_flow.rs"]
 mod runtime_truth_plan_and_sprint_flow;
+#[path = "integration/tracking_events.rs"]
+mod tracking_events;
+#[path = "integration/tracking_fsm.rs"]
+mod tracking_fsm;
+#[path = "integration/tracking_reconcile.rs"]
+mod tracking_reconcile;
+#[path = "integration/tracking_run_state.rs"]
+mod tracking_run_state;
+#[path = "integration/tracking_status.rs"]
+mod tracking_status;
 #[path = "integration/start_plan_canonical.rs"]
 mod start_plan_canonical;
 #[path = "integration/start_sprint_canonical.rs"]

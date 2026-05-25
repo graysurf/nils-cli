@@ -72,6 +72,7 @@ pub fn execute(binary: BinaryFlavor, cli: &Cli) -> Result<Value, CommandError> {
         CliCommand::Record(args) => {
             run_record(binary, cli.dry_run, cli.force, cli.repo.as_deref(), args)
         }
+        CliCommand::Tracking(args) => run_tracking(cli.repo.as_deref(), args),
         CliCommand::Completion(_) => Err(CommandError::usage(
             "completion-direct-output-only",
             "completion output is emitted directly; run `<binary> completion <bash|zsh>`",
@@ -1652,6 +1653,142 @@ fn derive_lint_hints(
         _ => {}
     }
     hints
+}
+
+fn run_tracking(
+    _repo_override: Option<&str>,
+    args: &crate::commands::tracking::TrackingArgs,
+) -> Result<Value, CommandError> {
+    use crate::commands::tracking::TrackingCommand;
+    match &args.command {
+        TrackingCommand::Status(status) => run_tracking_status(status),
+    }
+}
+
+fn run_tracking_status(
+    args: &crate::commands::tracking::TrackingStatusArgs,
+) -> Result<Value, CommandError> {
+    use crate::lifecycle_record;
+    use crate::tracking::reconcile;
+    use crate::tracking::run_state;
+
+    let (body, comments_json) = resolve_tracking_status_inputs(args)?;
+    let audit = if let Some(comments) = comments_json.as_deref() {
+        Some(
+            lifecycle_record::audit_record(body.as_deref(), comments, Some(args.profile))
+                .map_err(|err| CommandError::runtime("tracking-status-audit-failed", err))?,
+        )
+    } else {
+        None
+    };
+
+    let run_state_value = match &args.run_state {
+        Some(path) => match run_state::read_run_state(path) {
+            Ok(value) => Some(value),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(CommandError::runtime(
+                    "tracking-status-run-state-read-failed",
+                    err.to_string(),
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let reconciled = reconcile::reconcile(audit.as_ref(), run_state_value.as_ref());
+
+    let mut payload = serde_json::json!({
+        "operation": "tracking.status",
+        "fsm_state": reconciled.state.as_str(),
+        "recommended_action": reconciled.recommended_action.as_str(),
+        "safe_transitions": reconciled.safe_transitions,
+        "missing_for_closeout": reconciled.missing_for_closeout,
+        "warnings": reconciled.warnings.iter().map(|w| serde_json::json!({
+            "code": w.code,
+            "message": w.message,
+        })).collect::<Vec<_>>(),
+        "blocked_reason": reconciled.blocked_reason,
+        "issue_truth": tracking_status_audit_summary(audit.as_ref()),
+        "run_state": tracking_status_run_state_summary(run_state_value.as_ref()),
+    });
+
+    if args.expect_visible {
+        if let (Some(audit), Some(comments)) = (audit.as_ref(), comments_json.as_deref()) {
+            let visible = run_record_audit_visible(audit, comments, Some(args.profile))?;
+            payload["visible"] = visible;
+        }
+    }
+
+    Ok(payload)
+}
+
+fn resolve_tracking_status_inputs(
+    args: &crate::commands::tracking::TrackingStatusArgs,
+) -> Result<(Option<String>, Option<String>), CommandError> {
+    if let Some(fixture) = &args.fixture {
+        let body_path = fixture.join("body.md");
+        let comments_path = fixture.join("comments.json");
+        let body = if body_path.exists() {
+            Some(read_text_file(&body_path, "tracking-status-body-read-failed")?)
+        } else {
+            None
+        };
+        let comments = if comments_path.exists() {
+            Some(read_text_file(
+                &comments_path,
+                "tracking-status-comments-read-failed",
+            )?)
+        } else {
+            None
+        };
+        return Ok((body, comments));
+    }
+    let body = match &args.body_file {
+        Some(path) => Some(read_text_file(path, "tracking-status-body-read-failed")?),
+        None => None,
+    };
+    let comments = match &args.comments_json {
+        Some(path) => Some(read_text_file(path, "tracking-status-comments-read-failed")?),
+        None => None,
+    };
+    if body.is_none() && comments.is_none() {
+        return Err(CommandError::usage(
+            "tracking-status-missing-input",
+            "tracking status requires --fixture <dir>, --comments-json <path>, or --body-file <path>",
+        ));
+    }
+    Ok((body, comments))
+}
+
+fn tracking_status_audit_summary(audit: Option<&crate::lifecycle_record::RecordAudit>) -> Value {
+    let Some(audit) = audit else {
+        return json!({"available": false});
+    };
+    let latest_roles: Vec<&String> = audit.evidence.keys().collect();
+    json!({
+        "available": true,
+        "recognized_count": audit.recognized_count,
+        "latest_roles": latest_roles,
+        "missing_required": audit.missing_required,
+    })
+}
+
+fn tracking_status_run_state_summary(
+    run: Option<&crate::tracking::run_state::ExecutionRun>,
+) -> Value {
+    let Some(run) = run else {
+        return json!({"available": false});
+    };
+    json!({
+        "available": true,
+        "run_id": run.run_id,
+        "phase": run.phase.as_str(),
+        "selected_task": run.selected_scope.as_ref().and_then(|s| s.task.clone()),
+        "branch": run.branch,
+        "pr": run.pr.as_ref().map(|p| p.r#ref.clone()),
+        "validation_overall": run.validation.as_ref().map(|v| v.overall.clone()),
+    })
 }
 
 fn run_build_task_spec(args: &BuildTaskSpecArgs) -> Result<Value, CommandError> {

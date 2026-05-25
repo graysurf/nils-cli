@@ -3,6 +3,7 @@ pub mod completion;
 pub mod plan;
 pub mod record;
 pub mod sprint;
+pub mod tracking;
 
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -18,6 +19,7 @@ use self::plan::{
 };
 use self::record::RecordArgs;
 use self::sprint::{AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs};
+use self::tracking::TrackingArgs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 pub enum PrGrouping {
@@ -185,6 +187,10 @@ pub enum Command {
     /// Render and audit issue-backed plan record dashboards and comments.
     Record(RecordArgs),
 
+    /// Run-state controller for the plan-tracking issue workflow
+    /// (`status`, `run init`, `run update`, `checkpoint`, `close-ready`).
+    Tracking(TrackingArgs),
+
     /// Export shell completion script.
     Completion(CompletionArgs),
 }
@@ -206,6 +212,7 @@ impl Command {
             Self::MultiSprintGuide(_) => "multi-sprint-guide",
             Self::ResolveApproval(_) => "resolve-approval",
             Self::Record(args) => args.command_id(),
+            Self::Tracking(args) => args.command_id(),
             Self::Completion(_) => "completion",
         }
     }
@@ -232,6 +239,7 @@ impl Command {
             // fields (`issue.url`, `comments.*`, `closeout_url`,
             // `final_dashboard`).
             Self::Record(_) => "v2",
+            Self::Tracking(_) => "v1",
             _ => "v1",
         };
         format!(
@@ -256,6 +264,7 @@ impl Command {
             Self::MultiSprintGuide(args) => serde_json::to_value(args),
             Self::ResolveApproval(args) => serde_json::to_value(args),
             Self::Record(args) => serde_json::to_value(args),
+            Self::Tracking(args) => serde_json::to_value(args),
             Self::Completion(args) => serde_json::to_value(args),
         };
 
@@ -279,6 +288,7 @@ impl Command {
             Self::LinkPr(args) => validate_link_pr_args(args),
             Self::MultiSprintGuide(args) => validate_multi_sprint_guide_args(args),
             Self::Record(_) => Ok(()),
+            Self::Tracking(_) => Ok(()),
             Self::Completion(_)
             | Self::StatusPlan(_)
             | Self::ReadyPlan(_)
@@ -298,6 +308,14 @@ impl RecordArgs {
             record::RecordCommand::Close(_) => "record.close",
             record::RecordCommand::Audit(_) => "record.audit",
             record::RecordCommand::Template(_) => "record.template",
+        }
+    }
+}
+
+impl TrackingArgs {
+    pub fn command_id(&self) -> &'static str {
+        match &self.command {
+            tracking::TrackingCommand::Status(_) => "tracking.status",
         }
     }
 }
