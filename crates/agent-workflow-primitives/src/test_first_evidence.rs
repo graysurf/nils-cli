@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -16,6 +16,7 @@ use cli::{
     RecordWaiverArgs,
 };
 use nils_common::cli_contract::exit;
+use nils_common::fs::normalize_path;
 use nils_common::redact::redact_text;
 
 const EXIT_OK: i32 = exit::SUCCESS;
@@ -372,22 +373,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf, CliError> {
         )
     })?;
     Ok(normalize_path(&current_dir.join(path)))
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
 }
 
 fn normalized_paths(paths: &[PathBuf]) -> Vec<String> {

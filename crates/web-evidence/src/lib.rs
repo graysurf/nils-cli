@@ -5,7 +5,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use cli::{CaptureArgs, Cli, Command, HttpMethod, OutputFormat};
 use nils_common::cli_contract::exit;
+use nils_common::fs::normalize_path as normalize_absolute_path;
 use nils_common::redact::{RedactedString, redact_text};
 
 const EXIT_OK: i32 = exit::SUCCESS;
@@ -727,22 +728,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf, CliError> {
         )
     })?;
     Ok(normalize_absolute_path(&current_dir.join(path)))
-}
-
-fn normalize_absolute_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
 }
 
 fn unix_seconds_now() -> u64 {

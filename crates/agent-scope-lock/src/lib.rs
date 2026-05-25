@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use cli::{ChangeMode, Cli, Command, CommonArgs, CreateArgs, OutputFormat, ValidateArgs};
 
 use nils_common::cli_contract::exit;
+use nils_common::fs::normalize_path as normalize_absolute_path;
 
 const EXIT_OK: i32 = exit::SUCCESS;
 const EXIT_RUNTIME_OR_SCOPE: i32 = exit::RUNTIME;
@@ -300,24 +301,6 @@ fn normalize_allowed_paths(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<St
     }
 
     Ok(normalized.into_iter().collect())
-}
-
-fn normalize_absolute_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-
-    normalized
 }
 
 fn repo_relative_path(path: &Path) -> Result<String, CliError> {
