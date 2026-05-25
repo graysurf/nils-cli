@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  nils-cli-install-local-release-binaries.sh [--help] [--prefix PATH] [--bin NAME]... [--skip-build]
+  install-local-release-binaries.sh [--help] [--prefix PATH] [--bin NAME]... [--skip-build]
 
 Builds the Rust workspace in release mode and installs the binaries into a local
 directory (default: ~/.local/nils-cli).
@@ -20,9 +20,9 @@ Default binaries:
   - Use --bin NAME (repeatable) to install a subset
 
 Example:
-  ./.agents/skills/nils-cli-install-local-release-binaries/scripts/nils-cli-install-local-release-binaries.sh
-  ./.agents/skills/nils-cli-install-local-release-binaries/scripts/nils-cli-install-local-release-binaries.sh --bin git-scope
-  ./.agents/skills/nils-cli-install-local-release-binaries/scripts/nils-cli-install-local-release-binaries.sh --prefix ~/.local/nils-cli
+  ./scripts/install-local-release-binaries.sh
+  ./scripts/install-local-release-binaries.sh --bin git-scope
+  ./scripts/install-local-release-binaries.sh --prefix ~/.local/nils-cli
 USAGE
 }
 

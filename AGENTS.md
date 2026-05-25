@@ -49,4 +49,4 @@
 
 - Recommended tooling bootstrap: `scripts/setup-rust-tooling.sh`
 - Local release install helper:
-  `./.agents/skills/nils-cli-install-local-release-binaries/scripts/nils-cli-install-local-release-binaries.sh`
+  `./scripts/install-local-release-binaries.sh`

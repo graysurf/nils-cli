@@ -242,5 +242,5 @@ Canonical completion policy and validation workflow:
 Build and install workspace binaries into `~/.local/nils-cli/`:
 
 ```bash
-./.agents/skills/nils-cli-install-local-release-binaries/scripts/nils-cli-install-local-release-binaries.sh
+./scripts/install-local-release-binaries.sh
 ```

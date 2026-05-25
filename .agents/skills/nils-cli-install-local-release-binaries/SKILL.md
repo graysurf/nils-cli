@@ -34,4 +34,4 @@ Exit codes:
 
 ## Scripts (only entrypoints)
 
-- `.agents/skills/nils-cli-install-local-release-binaries/scripts/nils-cli-install-local-release-binaries.sh`
+- `scripts/install-local-release-binaries.sh`
