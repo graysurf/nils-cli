@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `8afcf391970f1bdfb81343ae9de8b6eccd8333d01d4a3dc0f83a18173e4191b8`
+- Cargo.lock SHA256: `d5150ec2ca64820b80eff725a53457f476f9c53e144fd2c748f310d3a67006c7`
 - Third-party crates (`source != null`): 465
 - Workspace crates (`source == null`, excluded below): 31
 
@@ -210,8 +210,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | jaq-core | 3.0.0 | MIT | crates.io |
 | jaq-json | 2.0.0 | MIT | crates.io |
 | jaq-std | 3.0.0 | MIT | crates.io |
-| jiff | 0.2.24 | Unlicense OR MIT | crates.io |
-| jiff-static | 0.2.24 | Unlicense OR MIT | crates.io |
+| jiff | 0.2.25 | Unlicense OR MIT | crates.io |
+| jiff-static | 0.2.25 | Unlicense OR MIT | crates.io |
 | jiff-tzdb | 0.1.6 | Unlicense OR MIT | crates.io |
 | jiff-tzdb-platform | 0.1.3 | Unlicense OR MIT | crates.io |
 | jni | 0.22.4 | MIT OR Apache-2.0 | crates.io |
@@ -370,7 +370,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | slug | 0.1.6 | MIT/Apache-2.0 | crates.io |
 | smallvec | 1.15.1 | MIT OR Apache-2.0 | crates.io |
 | socket2 | 0.6.3 | MIT OR Apache-2.0 | crates.io |
-| sqlite-wasm-rs | 0.5.4 | MIT | crates.io |
+| sqlite-wasm-rs | 0.5.5 | MIT | crates.io |
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 | crates.io |
 | strict-num | 0.1.1 | MIT | crates.io |
 | strsim | 0.11.1 | MIT | crates.io |
