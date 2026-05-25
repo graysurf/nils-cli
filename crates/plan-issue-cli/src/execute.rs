@@ -520,17 +520,50 @@ fn read_fixture_pr_snapshot(
         .and_then(|rollup| rollup.get("state"))
         .and_then(Value::as_str)
         .map(|s| s.to_ascii_lowercase());
-    let checks = match checks_str.as_deref() {
-        Some("success") => lifecycle_record::CheckStatus::Pass,
-        Some("failure" | "error") => lifecycle_record::CheckStatus::Fail,
-        _ => lifecycle_record::CheckStatus::None,
-    };
+    let checks = check_status_from_state(checks_str.as_deref());
+    let required_state = value
+        .get("requiredCheckRollup")
+        .and_then(|rollup| rollup.get("state"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_ascii_lowercase());
+    let required_count = value
+        .get("requiredCheckRollup")
+        .and_then(|rollup| rollup.get("count"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok());
+    let required_state_enum = required_state
+        .as_deref()
+        .map(|s| check_status_from_state(Some(s)));
+    let non_required_failures = value
+        .get("nonRequiredFailures")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     Ok(lifecycle_record::LinkedPrEvidence {
         pr_ref: format!("{repo}#{pr}"),
         url: value.get("url").and_then(Value::as_str).map(str::to_string),
         merge_sha: if merged { merge_sha } else { None },
         checks,
+        required_state: required_state_enum,
+        required_count,
+        non_required_failures,
     })
+}
+
+fn check_status_from_state(state: Option<&str>) -> lifecycle_record::CheckStatus {
+    match state.map(str::to_ascii_lowercase).as_deref() {
+        Some("success" | "pass") => lifecycle_record::CheckStatus::Pass,
+        Some(
+            "failure" | "failed" | "error" | "cancelled" | "timed_out" | "action_required"
+            | "stale" | "startup_failure",
+        ) => lifecycle_record::CheckStatus::Fail,
+        _ => lifecycle_record::CheckStatus::None,
+    }
 }
 
 fn parse_issue_reference(value: &str) -> Result<u64, CommandError> {
@@ -1128,6 +1161,23 @@ fn run_record_close(
             )
         })?;
 
+    let override_reason = if args.allow_non_required_check_failure {
+        let reason = args
+            .allow_non_required_check_failure_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CommandError::usage(
+                    "record-close-override-reason-missing",
+                    "--allow-non-required-check-failure requires --allow-non-required-check-failure-reason <text>",
+                )
+            })?;
+        Some(reason.to_string())
+    } else {
+        None
+    };
+
     // Resolve evidence source.
     let (body, comments_json, repo_for_provider, issue_number) = if let Some(fixture_dir) =
         &args.fixture
@@ -1175,11 +1225,11 @@ fn run_record_close(
             let summary = adapter
                 .pr_merge_summary(&pr_repo, pr_number)
                 .map_err(|err| CommandError::runtime("record-close-pr-summary-failed", err))?;
-            let checks = match summary.checks.as_deref() {
-                Some("success") => lifecycle_record::CheckStatus::Pass,
-                Some("failure" | "error") => lifecycle_record::CheckStatus::Fail,
-                _ => lifecycle_record::CheckStatus::None,
-            };
+            let checks = check_status_from_state(summary.checks.as_deref());
+            let required_state = summary
+                .required_state
+                .as_deref()
+                .map(|s| check_status_from_state(Some(s)));
             linked_evidence.push(lifecycle_record::LinkedPrEvidence {
                 pr_ref: format!("{pr_repo}#{pr_number}"),
                 url: Some(pr_repo_info.pr_url(pr_number)),
@@ -1189,6 +1239,9 @@ fn run_record_close(
                     None
                 },
                 checks,
+                required_state,
+                required_count: summary.required_count,
+                non_required_failures: summary.non_required_failures,
             });
             let _ = provider_repo;
         } else {
@@ -1199,6 +1252,9 @@ fn run_record_close(
                 url: None,
                 merge_sha: None,
                 checks: lifecycle_record::CheckStatus::None,
+                required_state: None,
+                required_count: None,
+                non_required_failures: Vec::new(),
             });
         }
     }
@@ -1226,6 +1282,7 @@ fn run_record_close(
             // `record audit --strict` surface).
             current_body: None,
             expected_dashboard: None,
+            allow_non_required_check_failure: args.allow_non_required_check_failure,
         },
     );
 
@@ -1246,6 +1303,25 @@ fn run_record_close(
     }
 
     // Render closeout comment using the same renderer as record post.
+    let check_status_to_str = |status: lifecycle_record::CheckStatus| match status {
+        lifecycle_record::CheckStatus::Pass => "pass",
+        lifecycle_record::CheckStatus::Fail => "fail",
+        lifecycle_record::CheckStatus::None => "none",
+    };
+    let override_block = override_reason.as_ref().map(|reason| {
+        let observed_failures: Vec<String> = linked_evidence
+            .iter()
+            .flat_map(|pr| {
+                pr.non_required_failures
+                    .iter()
+                    .map(move |name| format!("{}: {name}", pr.pr_ref))
+            })
+            .collect();
+        json!({
+            "reason": reason,
+            "observed_non_required_failures": observed_failures,
+        })
+    });
     let closeout_payload = json!({
         "final_status": "complete",
         "approval": {"comment_url": approval_text},
@@ -1256,21 +1332,26 @@ fn run_record_close(
                     "ref": pr.pr_ref,
                     "url": pr.url,
                     "merge_sha": pr.merge_sha,
-                    "checks": match pr.checks {
-                        lifecycle_record::CheckStatus::Pass => "pass",
-                        lifecycle_record::CheckStatus::Fail => "fail",
-                        lifecycle_record::CheckStatus::None => "none",
-                    },
+                    "checks": check_status_to_str(pr.checks),
+                    "required_state": pr.required_state.map(check_status_to_str),
+                    "required_count": pr.required_count,
+                    "non_required_failures": pr.non_required_failures,
                 })
             })
             .collect::<Vec<_>>(),
+        "non_required_check_override": override_block,
         "notes": null,
     });
+    let closeout_summary = if override_reason.is_some() {
+        "Strict closeout gate passed with non-required-check failure override; record closed by `plan-issue record close`."
+    } else {
+        "Strict closeout gate passed; record closed by `plan-issue record close`."
+    };
     let closeout_body = lifecycle_record::render_record_post_comment(
         args.profile,
         crate::commands::record::LifecycleCommentKind::Closeout,
         closeout_payload.clone(),
-        Some("Strict closeout gate passed; record closed by `plan-issue record close`."),
+        Some(closeout_summary),
         None,
     )
     .map_err(|err| CommandError::runtime("record-close-render-failed", err))?;

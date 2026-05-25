@@ -316,6 +316,16 @@ Failure modes that block close:
   (any finding with disposition `residual` and severity `blocker` /
   `major`).
 - `linked-pr-missing` / `linked-pr-not-merged` / `linked-pr-checks-failed`.
+  `linked-pr-not-merged` is reserved for refs whose provider lookup reports
+  a missing `merge_commit_sha`. `linked-pr-checks-failed` is emitted when
+  the provider's required-check rollup reports failure (or when the
+  provider cannot classify required vs. non-required checks and the
+  aggregate rollup reports failure without
+  `--allow-non-required-check-failure`). Non-required check failures alone
+  never block.
+- `record-close-override-reason-missing` (only when
+  `--allow-non-required-check-failure` is set without
+  `--allow-non-required-check-failure-reason`).
 - `approval-missing` / `approval-invalid`.
 - `dashboard-out-of-date` (recomputed dashboard differs from issue body).
 
@@ -327,11 +337,20 @@ unblock action.
 Linked PR evidence is verified against the provider, not text matching:
 
 - Each linked PR ref resolves to a provider PR.
-- Provider state must be `merged`.
-- Provider check rollup must be `success` or explicitly waived in the
-  closeout payload `notes` (with reviewer approval recorded).
+- Provider state must be `merged` (`merge_commit_sha` present).
+- Provider's **required**-check rollup must be `success`, `none` (zero
+  required checks), or unresolved-with-override. Non-required failures
+  are recorded under `linked_prs[].non_required_failures` for evidence
+  but do not block the gate.
 - The provider's `merge_commit_sha` is recorded back into the closeout
-  payload `linked_prs[].merge_sha`.
+  payload `linked_prs[].merge_sha`. Per-PR check breakdown is recorded
+  under `linked_prs[].{required_state, required_count, non_required_failures}`.
+- When the provider cannot resolve a required-check rollup (e.g. GitLab,
+  or a degraded `gh` call) and aggregate checks fail, the gate stays
+  conservative and emits `linked-pr-checks-failed` unless the operator
+  passes `--allow-non-required-check-failure --allow-non-required-check-failure-reason <text>`.
+  Override use is recorded in the closeout payload under
+  `non_required_check_override = {reason, observed_non_required_failures[]}`.
 
 ## Result JSON Envelope
 

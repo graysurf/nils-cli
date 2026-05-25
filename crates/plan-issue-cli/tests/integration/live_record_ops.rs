@@ -813,6 +813,243 @@ fn record_close_fixture_blocks_when_review_request_changes() {
 }
 
 #[test]
+fn record_close_fixture_passes_with_non_required_failure_when_zero_required() {
+    // Regression for sympoies/nils-cli#502:
+    // PR merged, zero required checks, one non-required check failed.
+    // Strict closeout gate must not block on non-required failures.
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    let body = "## Current Dashboard\n\n- Status: in-progress\n";
+    write_fixture_files(&fixture, body, &build_closeout_evidence("owner/repo#1"));
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "deadbeefcafebabe"},
+            "statusCheckRollup": {"state": "failure"},
+            "requiredCheckRollup": {"state": "success", "count": 0},
+            "nonRequiredFailures": ["scripts/ci/all.sh"],
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "https://github.com/owner/repo/issues/9#issuecomment-approval",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let result = &parsed["payload"]["result"];
+    assert_eq!(result["operation"], "record.close");
+    let preview = &result["preview"];
+    assert!(
+        preview["blocked_codes"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "blocked_codes should be empty: {}",
+        preview["blocked_codes"]
+    );
+    let linked = &result["linked_prs"][0];
+    assert_eq!(linked["required_count"], 0);
+    assert_eq!(linked["required_state"], "pass");
+    assert_eq!(linked["non_required_failures"][0], "scripts/ci/all.sh");
+}
+
+#[test]
+fn record_close_fixture_passes_with_non_required_failure_when_required_pass() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    let body = "## Current Dashboard\n";
+    write_fixture_files(&fixture, body, &build_closeout_evidence("owner/repo#1"));
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "abc"},
+            "statusCheckRollup": {"state": "failure"},
+            "requiredCheckRollup": {"state": "success", "count": 3},
+            "nonRequiredFailures": ["lint-experimental"],
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "ok",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+}
+
+#[test]
+fn record_close_fixture_blocks_with_linked_pr_checks_failed_when_required_fail() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    let body = "## Current Dashboard\n";
+    write_fixture_files(&fixture, body, &build_closeout_evidence("owner/repo#1"));
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "abc"},
+            "statusCheckRollup": {"state": "failure"},
+            "requiredCheckRollup": {"state": "failure", "count": 2},
+            "nonRequiredFailures": [],
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "ok",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+
+    assert_ne!(out.code, 0, "required-check failure must block");
+    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    assert!(
+        joined.contains("linked-pr-checks-failed"),
+        "expected linked-pr-checks-failed: {joined}"
+    );
+    assert!(
+        !joined.contains("linked-pr-not-merged"),
+        "must not collapse into linked-pr-not-merged: {joined}"
+    );
+}
+
+#[test]
+fn record_close_fixture_override_passes_when_required_unknown_aggregate_fails() {
+    // When the adapter cannot resolve required-check state (`requiredCheckRollup`
+    // absent), the gate stays conservative and blocks on aggregate failure.
+    // The override flag unblocks it and records evidence in the closeout body.
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    let body = "## Current Dashboard\n";
+    write_fixture_files(&fixture, body, &build_closeout_evidence("owner/repo#1"));
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "abc"},
+            "statusCheckRollup": {"state": "failure"},
+            "nonRequiredFailures": ["opt-in/lint"],
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    // Without the override → blocked.
+    let blocked = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "ok",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+    assert_ne!(blocked.code, 0, "conservative block expected");
+    assert!(
+        format!("{}\n{}", blocked.stderr, blocked.stdout).contains("linked-pr-checks-failed"),
+        "expected linked-pr-checks-failed under unknown required state"
+    );
+
+    // With the override + reason → passes and records evidence.
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "ok",
+        "--allow-non-required-check-failure",
+        "--allow-non-required-check-failure-reason",
+        "operator verified opt-in/lint is non-required",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+
+    assert_eq!(out.code, 0, "override should unblock: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let body = parsed["payload"]["result"]["preview"]["closeout_comment_body"]
+        .as_str()
+        .expect("closeout body")
+        .to_string();
+    assert!(
+        body.contains("non-required-check failure override"),
+        "expected override summary in body: {body}"
+    );
+    let audit = audit_single_comment_body(&body);
+    let closeout = &audit["evidence"]["closeout"]["payload"]["data"];
+    let override_block = &closeout["non_required_check_override"];
+    assert_eq!(
+        override_block["reason"], "operator verified opt-in/lint is non-required",
+        "override block reason recorded"
+    );
+    assert!(
+        override_block["observed_non_required_failures"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|item| item == "owner/repo#1: opt-in/lint")),
+        "expected observed failure list to include opt-in/lint: {override_block}"
+    );
+}
+
+#[test]
 fn record_close_fixture_blocks_when_state_not_complete() {
     let tmp = TempDir::new().expect("tempdir");
     let fixture = tmp.path().join("fixture");

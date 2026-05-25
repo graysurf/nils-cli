@@ -340,11 +340,19 @@ impl ProviderAdapter for ForgeCliAdapter {
                 .filter(|s| !s.is_empty()),
             Err(_) => None,
         };
+        // GitLab has no first-class required-check concept: pipeline
+        // jobs are either reported by `glab` as a single rolled-up
+        // status, or not at all. We leave the required fields at
+        // `None`/empty so the close gate falls back to the aggregate
+        // `checks` value (matching pre-#502 GitLab behavior).
         Ok(PrMergeSummary {
             state,
             merged,
             merge_sha,
             checks,
+            required_state: None,
+            required_count: None,
+            non_required_failures: Vec::new(),
         })
     }
 

@@ -6,6 +6,29 @@ versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- `plan-issue record close` no longer collapses non-required GitHub
+  `statusCheckRollup` failures into `linked-pr-not-merged`. The strict
+  closeout gate now consults a separate required-check rollup (via
+  `gh pr checks <pr> --required`), passes when required checks succeed
+  even if non-required workflows failed, and emits the distinct
+  `linked-pr-checks-failed` blocker code when required checks actually
+  fail. Provider adapters return `required_state`, `required_count`, and
+  the list of non-required failures alongside the existing aggregate
+  rollup. (sympoies/nils-cli#502)
+
+### Added
+
+- `plan-issue record close` accepts
+  `--allow-non-required-check-failure` plus
+  `--allow-non-required-check-failure-reason <text>` as an explicit,
+  evidence-emitting override for the degraded-provider case where
+  required-check state cannot be resolved. The override decision and
+  observed non-required failures are recorded under
+  `non_required_check_override` in the closeout-comment payload, and the
+  comment summary advertises that the override was used.
+
 ### BREAKING (Plan-Issue Lifecycle v3)
 
 - The `plan-issue record` surface is rewritten around the v3 issue-backed

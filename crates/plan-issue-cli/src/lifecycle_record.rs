@@ -1077,7 +1077,29 @@ pub struct LinkedPrEvidence {
     pub url: Option<String>,
     #[serde(default)]
     pub merge_sha: Option<String>,
+    /// Aggregate rollup over every PR check (required and non-required
+    /// combined). Kept for backward compatibility with the closeout
+    /// payload schema; the close gate now consults `required_state`
+    /// first and only falls back to `checks` when required-check state
+    /// is unknown.
     pub checks: CheckStatus,
+    /// Required-check rollup when the provider exposes the
+    /// required/non-required distinction. `None` means the adapter
+    /// could not resolve a required-only summary (e.g. GitLab today,
+    /// or a degraded `gh` call), in which case the gate falls back to
+    /// the aggregate `checks` value.
+    #[serde(default)]
+    pub required_state: Option<CheckStatus>,
+    /// Number of required checks reported by the provider. `None`
+    /// when required-check classification is unavailable; `Some(0)`
+    /// means the PR has zero required checks.
+    #[serde(default)]
+    pub required_count: Option<u32>,
+    /// Names of non-required checks that ended in a failure-class
+    /// state. Surfaced as informational evidence in the closeout
+    /// comment; never blocks the gate on its own.
+    #[serde(default)]
+    pub non_required_failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -1546,6 +1568,12 @@ pub struct StrictCloseoutGateInput<'a> {
     /// not appear in the body.
     pub current_body: Option<&'a str>,
     pub expected_dashboard: Option<&'a str>,
+    /// When `true`, the linked-PR branch skips the conservative
+    /// "unknown required-check state with aggregate failure" check
+    /// and lets the gate pass on non-required failures alone. The
+    /// caller is responsible for surfacing the override decision in
+    /// closeout-comment evidence; the gate itself does not record it.
+    pub allow_non_required_check_failure: bool,
 }
 
 pub fn evaluate_strict_closeout_gate(
@@ -1755,28 +1783,62 @@ pub fn evaluate_strict_closeout_gate(
     if input.linked_prs.is_empty() {
         push_pass(&mut checks, "linked PRs", "none provided".to_string());
     } else {
-        let mut failing = Vec::new();
+        let mut unmerged: Vec<String> = Vec::new();
+        let mut required_failed: Vec<String> = Vec::new();
         for pr in input.linked_prs {
             let sha = pr.merge_sha.as_deref().map(str::trim).unwrap_or("");
             if sha.is_empty() {
-                failing.push(format!("{} (no merge_sha)", pr.pr_ref));
-            } else if !matches!(pr.checks, CheckStatus::Pass | CheckStatus::None) {
-                failing.push(format!("{} (checks={:?})", pr.pr_ref, pr.checks));
+                unmerged.push(format!("{} (no merge_sha)", pr.pr_ref));
+                continue;
+            }
+            match pr.required_state {
+                Some(CheckStatus::Fail) => {
+                    required_failed.push(format!("{} (required checks failed)", pr.pr_ref));
+                }
+                Some(CheckStatus::Pass | CheckStatus::None) => {
+                    // Required checks resolved cleanly (including the
+                    // `required_count == 0` case). Non-required failures
+                    // are informational only and never block.
+                }
+                None => {
+                    // Provider could not classify required-vs-non-required
+                    // (e.g. GitLab today, or a degraded `gh` call). Stay
+                    // conservative: aggregate failure blocks unless the
+                    // caller has set the explicit override flag.
+                    if matches!(pr.checks, CheckStatus::Fail)
+                        && !input.allow_non_required_check_failure
+                    {
+                        required_failed.push(format!(
+                            "{} (checks={:?}; required-state unknown)",
+                            pr.pr_ref, pr.checks
+                        ));
+                    }
+                }
             }
         }
-        if failing.is_empty() {
-            push_pass(
-                &mut checks,
-                "linked PRs",
-                format!("{} merged", input.linked_prs.len()),
-            );
-        } else {
+        if !unmerged.is_empty() {
             push_fail(
                 &mut checks,
                 &mut blocked_codes,
                 "linked PRs",
-                failing.join(", "),
+                unmerged.join(", "),
                 "linked-pr-not-merged",
+            );
+        }
+        if !required_failed.is_empty() {
+            push_fail(
+                &mut checks,
+                &mut blocked_codes,
+                "linked PRs required checks",
+                required_failed.join(", "),
+                "linked-pr-checks-failed",
+            );
+        }
+        if unmerged.is_empty() && required_failed.is_empty() {
+            push_pass(
+                &mut checks,
+                "linked PRs",
+                format!("{} merged", input.linked_prs.len()),
             );
         }
     }
@@ -1924,6 +1986,9 @@ mod sprint3_tests {
             url: Some("https://github.com/owner/repo/pull/1".to_string()),
             merge_sha: Some("abcdef1234567890".to_string()),
             checks: CheckStatus::Pass,
+            required_state: Some(CheckStatus::Pass),
+            required_count: Some(1),
+            non_required_failures: Vec::new(),
         }];
         let result = evaluate_strict_closeout_gate(
             &audit,
@@ -1933,6 +1998,7 @@ mod sprint3_tests {
                 linked_prs: &linked_prs,
                 current_body: None,
                 expected_dashboard: None,
+                allow_non_required_check_failure: false,
             },
         );
         assert!(result.ready, "gate should pass: {:?}", result.checks);
@@ -1964,6 +2030,7 @@ mod sprint3_tests {
                 linked_prs: &[],
                 current_body: None,
                 expected_dashboard: None,
+                allow_non_required_check_failure: false,
             },
         );
         assert!(!result.ready);
@@ -2002,6 +2069,7 @@ mod sprint3_tests {
                 linked_prs: &[],
                 current_body: None,
                 expected_dashboard: None,
+                allow_non_required_check_failure: false,
             },
         );
         assert!(res_rej.blocked_codes.iter().any(|c| c == "review-rejected"));
@@ -2030,6 +2098,7 @@ mod sprint3_tests {
                 linked_prs: &[],
                 current_body: None,
                 expected_dashboard: None,
+                allow_non_required_check_failure: false,
             },
         );
         assert!(
@@ -2062,6 +2131,9 @@ mod sprint3_tests {
             url: None,
             merge_sha: None,
             checks: CheckStatus::Pass,
+            required_state: Some(CheckStatus::Pass),
+            required_count: Some(0),
+            non_required_failures: Vec::new(),
         }];
         let res = evaluate_strict_closeout_gate(
             &audit,
@@ -2071,6 +2143,7 @@ mod sprint3_tests {
                 linked_prs: &linked,
                 current_body: None,
                 expected_dashboard: None,
+                allow_non_required_check_failure: false,
             },
         );
         assert!(
@@ -2078,6 +2151,156 @@ mod sprint3_tests {
                 .iter()
                 .any(|c| c == "linked-pr-not-merged")
         );
+    }
+
+    #[test]
+    fn strict_gate_passes_with_non_required_failure_when_required_pass() {
+        // Regression for sympoies/nils-cli#502: a non-required check
+        // failure with required-state success must not block the gate.
+        let audit = build_audit_with_evidence(vec![
+            (v2_body("source", json!({"path": "p", "commit": "c"})), "a"),
+            (v2_body("plan", json!({"path": "p", "commit": "c"})), "b"),
+            (
+                v2_body(
+                    "state",
+                    json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
+                ),
+                "c",
+            ),
+            (v2_body("validation", json!({"overall": "pass"})), "d"),
+            (v2_body("review", json!({"decision": "approve"})), "e"),
+        ]);
+        let linked = vec![LinkedPrEvidence {
+            pr_ref: "owner/repo#1".to_string(),
+            url: None,
+            merge_sha: Some("abc".to_string()),
+            checks: CheckStatus::Fail,
+            required_state: Some(CheckStatus::Pass),
+            required_count: Some(0),
+            non_required_failures: vec!["scripts/ci/all.sh".to_string()],
+        }];
+        let res = evaluate_strict_closeout_gate(
+            &audit,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("ok"),
+                linked_prs: &linked,
+                current_body: None,
+                expected_dashboard: None,
+                allow_non_required_check_failure: false,
+            },
+        );
+        assert!(res.ready, "blocked: {:?}", res.blocked_codes);
+        assert!(res.blocked_codes.is_empty(), "{:?}", res.blocked_codes);
+    }
+
+    #[test]
+    fn strict_gate_emits_linked_pr_checks_failed_when_required_fail() {
+        let audit = build_audit_with_evidence(vec![
+            (v2_body("source", json!({"path": "p", "commit": "c"})), "a"),
+            (v2_body("plan", json!({"path": "p", "commit": "c"})), "b"),
+            (
+                v2_body(
+                    "state",
+                    json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
+                ),
+                "c",
+            ),
+            (v2_body("validation", json!({"overall": "pass"})), "d"),
+            (v2_body("review", json!({"decision": "approve"})), "e"),
+        ]);
+        let linked = vec![LinkedPrEvidence {
+            pr_ref: "owner/repo#1".to_string(),
+            url: None,
+            merge_sha: Some("abc".to_string()),
+            checks: CheckStatus::Fail,
+            required_state: Some(CheckStatus::Fail),
+            required_count: Some(2),
+            non_required_failures: Vec::new(),
+        }];
+        let res = evaluate_strict_closeout_gate(
+            &audit,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("ok"),
+                linked_prs: &linked,
+                current_body: None,
+                expected_dashboard: None,
+                allow_non_required_check_failure: false,
+            },
+        );
+        assert!(
+            res.blocked_codes
+                .iter()
+                .any(|c| c == "linked-pr-checks-failed"),
+            "expected linked-pr-checks-failed, got {:?}",
+            res.blocked_codes
+        );
+        assert!(
+            !res.blocked_codes
+                .iter()
+                .any(|c| c == "linked-pr-not-merged"),
+            "must not collapse into linked-pr-not-merged"
+        );
+    }
+
+    #[test]
+    fn strict_gate_override_unblocks_unknown_required_state_aggregate_fail() {
+        let audit = build_audit_with_evidence(vec![
+            (v2_body("source", json!({"path": "p", "commit": "c"})), "a"),
+            (v2_body("plan", json!({"path": "p", "commit": "c"})), "b"),
+            (
+                v2_body(
+                    "state",
+                    json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
+                ),
+                "c",
+            ),
+            (v2_body("validation", json!({"overall": "pass"})), "d"),
+            (v2_body("review", json!({"decision": "approve"})), "e"),
+        ]);
+        let linked = vec![LinkedPrEvidence {
+            pr_ref: "owner/repo#1".to_string(),
+            url: None,
+            merge_sha: Some("abc".to_string()),
+            checks: CheckStatus::Fail,
+            required_state: None,
+            required_count: None,
+            non_required_failures: vec!["opt-in/lint".to_string()],
+        }];
+
+        let blocked = evaluate_strict_closeout_gate(
+            &audit,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("ok"),
+                linked_prs: &linked,
+                current_body: None,
+                expected_dashboard: None,
+                allow_non_required_check_failure: false,
+            },
+        );
+        assert!(
+            blocked
+                .blocked_codes
+                .iter()
+                .any(|c| c == "linked-pr-checks-failed"),
+            "conservative path blocks: {:?}",
+            blocked.blocked_codes
+        );
+
+        let unblocked = evaluate_strict_closeout_gate(
+            &audit,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("ok"),
+                linked_prs: &linked,
+                current_body: None,
+                expected_dashboard: None,
+                allow_non_required_check_failure: true,
+            },
+        );
+        assert!(unblocked.ready, "{:?}", unblocked.blocked_codes);
     }
 
     #[test]
@@ -2105,6 +2328,7 @@ mod sprint3_tests {
                 linked_prs: &[],
                 current_body: None,
                 expected_dashboard: None,
+                allow_non_required_check_failure: false,
             },
         );
         assert!(res.blocked_codes.iter().any(|c| c == "approval-missing"));
