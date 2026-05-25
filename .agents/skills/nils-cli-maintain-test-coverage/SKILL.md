@@ -33,6 +33,9 @@ Outputs:
   not only the percentage.
 - Focused validation for touched crates/tests, followed by fresh coverage
   evidence from CI or an explicit local coverage run when the change is ready.
+- When the workflow creates repository changes, a PR delivery path using
+  `semantic-commit`, `$deliver-github-pr`, and `forge-cli pr deliver` unless the
+  user explicitly requested local-only maintenance.
 - Follow-up issue evidence only when a clear bug or unresolved work is found
   outside the coverage-maintenance scope.
 
@@ -131,11 +134,33 @@ NILS_CLI_TEST_RUNNER=nextest \
   bash scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage
 ```
 
+6. Deliver changed repo state through PR.
+
+- If the workflow produced test or product-code changes, confirm the working
+  tree contains only the intended coverage-maintenance change set. Use a clean
+  sibling worktree from `main` when the active checkout has unrelated dirty
+  state.
+- Commit with `semantic-commit`; direct `git commit` is not the delivery path.
+- Render the PR body with `agent-runtime pr-body render`. Put the coverage
+  artifact path, hotspot summary, focused test commands, local-fast result, and
+  any explicit coverage run in `## Test plan`.
+- Deliver through `$deliver-github-pr` / `forge-cli pr deliver` against `main`.
+  Wait for required checks and the required pre-merge review gate unless the
+  user explicitly requested `--no-merge`.
+- After delivery, restore branch/worktree state:
+  - in the primary checkout, switch back to `main`;
+  - in a linked or temporary worktree, do not leave `main` checked out; detach
+    the worktree at `HEAD` or remove the worktree after confirming no local
+    changes remain.
+- If no repo changes were made, do not open a PR; report the coverage evidence
+  and rejected candidates instead.
+
 ## Boundary
 
 This skill guides coverage-maintenance work only. It does not lower the 85%
 coverage gate, edit CI thresholds, broaden snapshots for percentage-only gains,
-or require follow-up issues when no clear bug or unresolved work exists. If
-hotspot extraction needs to become a stable repository command, first extract
-that deterministic behavior into released `nils-cli` tooling and keep this
-skill as the orchestration layer.
+or require follow-up issues when no clear bug or unresolved work exists. PR
+delivery is limited to the coverage-maintenance changes this workflow created.
+If hotspot extraction needs to become a stable repository command, first
+extract that deterministic behavior into released `nils-cli` tooling and keep
+this skill as the orchestration layer.

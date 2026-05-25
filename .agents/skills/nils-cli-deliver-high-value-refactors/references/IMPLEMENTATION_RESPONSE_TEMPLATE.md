@@ -28,3 +28,7 @@
 ## Delivery
 - Branch:
 - PR:
+- Checks:
+- Review gate:
+- Merge commit or stop state:
+- Final branch/worktree state:
