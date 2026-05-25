@@ -275,7 +275,7 @@ fn command_guardrails_close_plan_requires_github_comment_url_format() {
     assert_eq!(payload["error"]["code"], "invalid-approval-comment-url");
     assert_eq!(
         payload["error"]["message"],
-        "--approved-comment-url must be a GitHub issue/pull comment URL"
+        "--approved-comment-url must be a GitHub issue/pull or GitLab issue/MR note comment URL"
     );
 }
 

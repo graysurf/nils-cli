@@ -2183,7 +2183,7 @@ fn run_close_plan(
     if !approval_comment_url_looks_valid(&args.approved_comment_url) {
         return Err(CommandError::usage(
             "invalid-approval-comment-url",
-            "--approved-comment-url must be a GitHub issue/pull comment URL",
+            "--approved-comment-url must be a GitHub issue/pull or GitLab issue/MR note comment URL",
         ));
     }
 
@@ -2872,7 +2872,7 @@ fn run_accept_sprint(
     if !approval_comment_url_looks_valid(&args.approved_comment_url) {
         return Err(CommandError::usage(
             "invalid-approval-comment-url",
-            "--approved-comment-url must be a GitHub issue/pull comment URL",
+            "--approved-comment-url must be a GitHub issue/pull or GitLab issue/MR note comment URL",
         ));
     }
 
@@ -3451,16 +3451,33 @@ fn load_close_comment(
 
 fn approval_comment_url_looks_valid(url: &str) -> bool {
     let trimmed = url.trim();
-    if !trimmed.starts_with("https://github.com/") {
-        return false;
+    if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
+        let Some((base, suffix)) = rest.split_once("#issuecomment-") else {
+            return false;
+        };
+        if !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            return false;
+        }
+        return base.contains("/issues/") || base.contains("/pull/");
     }
-    let Some((base, suffix)) = trimmed.split_once("#issuecomment-") else {
-        return false;
-    };
-    if !suffix.chars().all(|ch| ch.is_ascii_digit()) {
-        return false;
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        let Some((host, path)) = rest.split_once('/') else {
+            return false;
+        };
+        if !(host == "gitlab.com" || host.starts_with("gitlab.") || host.contains(".gitlab.")) {
+            return false;
+        }
+        let Some((base, suffix)) = path.split_once("#note_") else {
+            return false;
+        };
+        if !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            return false;
+        }
+        return base.contains("/-/issues/")
+            || base.contains("/-/merge_requests/")
+            || base.contains("/-/work_items/");
     }
-    base.contains("/issues/") || base.contains("/pull/")
+    false
 }
 
 fn path_text(path: &Path) -> String {
@@ -4397,11 +4414,26 @@ mod tests {
         assert!(approval_comment_url_looks_valid(
             "https://github.com/sympoies/nils-cli/pull/221#issuecomment-456"
         ));
+        assert!(approval_comment_url_looks_valid(
+            "https://gitlab.com/group/project/-/issues/12#note_789"
+        ));
+        assert!(approval_comment_url_looks_valid(
+            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/merge_requests/7#note_321"
+        ));
+        assert!(approval_comment_url_looks_valid(
+            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/work_items/13#note_654"
+        ));
         assert!(!approval_comment_url_looks_valid(
             "https://example.com/issues/217#issuecomment-123"
         ));
         assert!(!approval_comment_url_looks_valid(
             "https://github.com/sympoies/nils-cli/issues/217#comment-123"
+        ));
+        assert!(!approval_comment_url_looks_valid(
+            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/merge_requests/7#note_abc"
+        ));
+        assert!(!approval_comment_url_looks_valid(
+            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/merge_requests/7"
         ));
 
         assert!(should_emit_comment(&CommentModeArgs {
