@@ -13,10 +13,10 @@
 - Source document: docs/plans/plan-issue-close-non-required-checks/plan-issue-close-non-required-checks-plan.md
 - Discussion source document: `docs/plans/plan-issue-close-non-required-checks/plan-issue-close-non-required-checks-discussion-source.md`
 - Source issue: sympoies/nils-cli#502
-- Tracking issue: https://github.com/sympoies/nils-cli/issues/509
-- Source snapshot: https://github.com/sympoies/nils-cli/issues/509#issuecomment-4531384206
-- Plan snapshot: https://github.com/sympoies/nils-cli/issues/509#issuecomment-4531384284
-- Initial execution state snapshot: https://github.com/sympoies/nils-cli/issues/509#issuecomment-4531384371
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/509>
+- Source snapshot: <https://github.com/sympoies/nils-cli/issues/509#issuecomment-4531384206>
+- Plan snapshot: <https://github.com/sympoies/nils-cli/issues/509#issuecomment-4531384284>
+- Initial execution state snapshot: <https://github.com/sympoies/nils-cli/issues/509#issuecomment-4531384371>
 - Direct source-doc execution waiver: not applicable
 
 ## Task Ledger

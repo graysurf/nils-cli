@@ -230,4 +230,4 @@ override flag with explicit evidence emission.
   - Fixture-mode close runs with `ok=true` and an empty
     `blocked_codes` list for the original PR shape.
 - **Validation**:
-  - `plan-issue --format json record close --dry-run --fixture crates/plan-issue-cli/tests/fixtures/lifecycle/agent-runtime-kit-closeout --repo graysurf/agent-runtime-kit record-close 69 --linked-pr graysurf/agent-runtime-kit#103`
+  - `cargo test -p nils-plan-issue-cli record_close_fixture_passes_with_non_required_failure_when_zero_required`

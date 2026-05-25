@@ -69,6 +69,20 @@ pub struct PrMergeSummary {
     /// Rolled-up status check state when known
     /// (`success`, `failure`, `pending`, `error`, ...).
     pub checks: Option<String>,
+    /// Required-check rollup state when the adapter can resolve the
+    /// required/non-required distinction
+    /// (`success`, `failure`, `pending`, ...). `None` means the
+    /// adapter could not classify (e.g. GitLab today, or a degraded
+    /// `gh` call); the close gate falls back to `checks` in that case.
+    pub required_state: Option<String>,
+    /// Number of required checks reported by the provider. `None` when
+    /// classification is unavailable; `Some(0)` means zero required
+    /// checks were declared.
+    pub required_count: Option<u32>,
+    /// Names of non-required checks that ended in a failure-class
+    /// state. Used as informational evidence in the closeout comment;
+    /// the close gate never blocks on this alone.
+    pub non_required_failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -110,6 +124,105 @@ impl GhCliAdapter {
         markdown::validate_markdown_payload(payload).map_err(|err| {
             format!("{context}: {err}. Replace escaped controls or re-run with --force.")
         })
+    }
+
+    /// Resolve the required-check rollup for `repo#pr` via
+    /// `gh pr checks <pr> --required --json bucket,state,conclusion,name`.
+    ///
+    /// Returns `(required_state, required_count, non_required_failures)`.
+    /// All three are `None`/empty when `gh` rejects the call or the
+    /// JSON does not parse — the close gate then falls back to the
+    /// aggregate rollup carried in `checks`. The `rollup_value`
+    /// argument is the `statusCheckRollup` field harvested from
+    /// `gh pr view` and is used to compute the non-required failure
+    /// list (rollup names not in the required set).
+    fn pr_required_summary(
+        repo: &str,
+        pr: u64,
+        rollup_value: Option<&Value>,
+    ) -> (Option<String>, Option<u32>, Vec<String>) {
+        let args = vec![
+            "pr".to_string(),
+            "checks".to_string(),
+            pr.to_string(),
+            "--repo".to_string(),
+            repo.to_string(),
+            "--required".to_string(),
+            "--json".to_string(),
+            "bucket,state,conclusion,name".to_string(),
+        ];
+        let raw = match Self::run(&args) {
+            Ok(out) => out,
+            Err(_) => return (None, None, Vec::new()),
+        };
+        let required_array: Vec<Value> = match serde_json::from_str(raw.trim()) {
+            Ok(Value::Array(items)) => items,
+            Ok(_) => return (None, None, Vec::new()),
+            // `gh pr checks --required` prints nothing when the PR has
+            // no required checks; treat empty output as a zero-required
+            // success rollup so a non-required failure does not block
+            // the gate.
+            Err(_) if raw.trim().is_empty() => {
+                return (Some("success".to_string()), Some(0), Vec::new());
+            }
+            Err(_) => return (None, None, Vec::new()),
+        };
+        let required_count = u32::try_from(required_array.len()).unwrap_or(u32::MAX);
+        let required_state =
+            rollup_status(&Value::Array(required_array.clone())).unwrap_or_else(|| {
+                if required_array.is_empty() {
+                    "success".to_string()
+                } else {
+                    "unknown".to_string()
+                }
+            });
+
+        let required_names: std::collections::HashSet<String> = required_array
+            .iter()
+            .filter_map(|item| item.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+
+        let mut non_required_failures: Vec<String> = Vec::new();
+        if let Some(Value::Array(items)) = rollup_value {
+            for item in items {
+                let name = item
+                    .get("name")
+                    .or_else(|| item.get("context"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let state_str = item
+                    .get("conclusion")
+                    .or_else(|| item.get("state"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_ascii_lowercase());
+                let failed = matches!(
+                    state_str.as_deref(),
+                    Some(
+                        "failure"
+                            | "cancelled"
+                            | "timed_out"
+                            | "action_required"
+                            | "error"
+                            | "stale"
+                            | "startup_failure"
+                    )
+                );
+                if let Some(name) = name
+                    && failed
+                    && !required_names.contains(&name)
+                {
+                    non_required_failures.push(name);
+                }
+            }
+        }
+        non_required_failures.sort();
+        non_required_failures.dedup();
+
+        (
+            Some(required_state),
+            Some(required_count),
+            non_required_failures,
+        )
     }
 
     fn guard_markdown_file(&self, path: &Path, context: &str) -> Result<(), String> {
@@ -370,15 +483,20 @@ impl ProviderAdapter for GhCliAdapter {
             .and_then(Value::as_str)
             .map(str::to_string)
             .filter(|sha| !sha.is_empty());
-        let checks = json
-            .get("statusCheckRollup")
+        let rollup_value = json.get("statusCheckRollup");
+        let checks = rollup_value
             .and_then(rollup_status)
             .filter(|status| !status.is_empty());
+        let (required_state, required_count, non_required_failures) =
+            Self::pr_required_summary(repo, pr, rollup_value);
         Ok(PrMergeSummary {
             state,
             merged,
             merge_sha,
             checks,
+            required_state,
+            required_count,
+            non_required_failures,
         })
     }
 

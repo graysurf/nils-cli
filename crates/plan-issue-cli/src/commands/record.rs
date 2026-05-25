@@ -282,4 +282,22 @@ pub struct RecordCloseArgs {
     /// PR snapshots used in place of provider lookups.
     #[arg(long, value_name = "dir")]
     pub fixture: Option<PathBuf>,
+
+    /// Allow the linked-PR branch of the strict closeout gate to pass
+    /// even when the provider only reports a single aggregate check
+    /// state (no required/non-required breakdown) and that aggregate
+    /// state is `failure`. Use this when you have manually verified
+    /// that the failing checks are non-required. Requires
+    /// `--allow-non-required-check-failure-reason`. The override and
+    /// the observed non-required failures are recorded in the
+    /// closeout-comment evidence block.
+    #[arg(long = "allow-non-required-check-failure", default_value_t = false)]
+    pub allow_non_required_check_failure: bool,
+
+    /// Required when `--allow-non-required-check-failure` is set.
+    /// Non-empty free-form text describing why the operator verified
+    /// the failing checks are safe to ignore. Stored verbatim in the
+    /// closeout-comment evidence block.
+    #[arg(long = "allow-non-required-check-failure-reason", value_name = "text")]
+    pub allow_non_required_check_failure_reason: Option<String>,
 }

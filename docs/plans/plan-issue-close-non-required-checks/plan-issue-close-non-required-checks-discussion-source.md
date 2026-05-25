@@ -13,7 +13,7 @@
 GitHub's `statusCheckRollup` as a hard close blocker, even when the linked PR
 is already merged and the PR's required-check rollup is `success` (or has
 `required_count = 0`). This contradicts the contract documented in
-[issue-backed-plan-record-contract-v2](../../crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md):
+[issue-backed-plan-record-contract-v2](../../../crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md):
 `linked-pr-not-merged` should only fire when the PR is genuinely unmerged or
 required checks fail, not when a non-required workflow happens to be red.
 
