@@ -14,8 +14,16 @@ Options:
   --ci-gate-main          Require CI gate on main (pre-bump check): fail if the prior
                           origin/main commit's ci.yml run is not green.
   --skip-readme           Do not update README release tag examples.
-  --skip-push             Do not push commit or tag to origin (also disables tap stage).
-  --skip-ci-wait          Do not wait for ci.yml on the bump commit before the tap stage.
+  --direct-push           Opt out of the default PR-based flow and push the bump commit + tag
+                          directly to the current branch (legacy behavior). Fails when the
+                          branch is protected — use the default PR flow instead.
+  --release-branch <name> Override the release branch name used in PR mode
+                          (default: chore/release-X-Y-Z, where the version dots become dashes).
+                          Must start with 'chore/' so the forge-cli kind=chore prefix rule passes.
+  --skip-push             Do not push, do not open a PR, do not tag remote. Implies legacy
+                          direct-push semantics locally (commit + local tag) and disables the tap stage.
+  --skip-ci-wait          (direct-push mode only) Do not wait for ci.yml on the bump commit
+                          before the tap stage. Ignored in PR mode (PR delivery already gates CI).
   --allow-dirty           Allow dirty release-managed files only.
   --force-tag             Delete existing local/remote tag before re-tagging.
   --tap-dir <path>        Path to homebrew-tap work tree (overrides env + convention).
@@ -31,13 +39,20 @@ Options:
   -h, --help              Show help.
 
 Default behavior:
+  Bumping is delivered through a chore/release-X-Y-Z PR (`forge-cli pr deliver`), so the
+  bump commit lands on `main` only after the repo's required status checks (test,
+  test_macos, coverage, ...) pass. After the PR merges, the script tags `vX.Y.Z` on the
+  merge commit and pushes the tag to trigger `release.yml`. Use `--direct-push` to fall
+  back to the legacy "commit + tag directly on main" flow (only usable when the branch
+  is not protected); `--skip-push` keeps everything local without opening a PR.
+
   Local checks are minimal: refresh Cargo.lock, regenerate third-party artifacts,
   then run `cargo check --workspace --locked`. The full audit stack (clippy, nextest,
-  zsh completion, docs/audit scripts) runs on CI for every push — the bump commit
-  itself triggers ci.yml, and the tap stage waits for that run to be green before
-  bumping the homebrew formula. Use --full-checks to run the full audit locally
-  (slow); use --skip-ci-wait to fire-and-forget without gating on the bump commit's
-  ci.yml run.
+  zsh completion, docs/audit scripts) runs on CI for every PR — in PR mode the
+  delivery macro waits for it before merging; in direct-push mode the bump commit
+  triggers ci.yml and the tap stage waits for that run to be green. Use --full-checks
+  to run the full audit locally (slow); use --skip-ci-wait (direct-push only) to
+  fire-and-forget without gating on the bump commit's ci.yml run.
 
   After tagging the nils-cli release, the tap stage is run automatically when:
     - --skip-push is NOT set, AND
@@ -688,6 +703,8 @@ full_checks=0
 skip_checks=0  # backward-compat alias of new default; tracked for usage notes only
 ci_gate_main=0
 skip_readme=0
+direct_push=0
+release_branch_arg=""
 skip_push=0
 skip_ci_wait=0
 allow_dirty=0
@@ -725,6 +742,17 @@ while [[ $# -gt 0 ]]; do
     --skip-readme)
       skip_readme=1
       shift
+      ;;
+    --direct-push)
+      direct_push=1
+      shift
+      ;;
+    --release-branch)
+      if [[ $# -lt 2 ]]; then
+        die "--release-branch requires a value"
+      fi
+      release_branch_arg="${2:-}"
+      shift 2
       ;;
     --skip-push)
       skip_push=1
@@ -883,6 +911,44 @@ fi
 
 if [[ "$skip_checks" -eq 1 && "$full_checks" -eq 0 ]]; then
   note "--skip-checks is a deprecated alias of the new default (locked cargo check only); ignoring"
+fi
+
+# === Delivery mode resolution ================================================
+# PR mode (default) opens a chore/release-X-Y-Z PR via `forge-cli pr deliver`
+# so the bump commit lands on `main` only after required status checks pass.
+# `--direct-push` and `--skip-push` both fall back to legacy commit-on-current-branch.
+
+pr_mode=1
+if [[ "$direct_push" -eq 1 || "$skip_push" -eq 1 ]]; then
+  pr_mode=0
+fi
+
+release_branch=""
+if [[ "$pr_mode" -eq 1 ]]; then
+  command -v forge-cli >/dev/null 2>&1 \
+    || die "forge-cli is required for PR-based delivery (use --direct-push to opt out)"
+
+  if [[ -n "$release_branch_arg" ]]; then
+    release_branch="$release_branch_arg"
+  else
+    release_branch="chore/release-$(echo "$version" | tr . -)"
+  fi
+  if ! [[ "$release_branch" == chore/* ]]; then
+    die "--release-branch must start with 'chore/' to match forge-cli kind=chore (got: ${release_branch})"
+  fi
+
+  if [[ "$current_branch" == "$release_branch" ]]; then
+    note "already on release branch ${release_branch}; reusing"
+  elif [[ "$current_branch" == "main" ]]; then
+    if git rev-parse --verify "refs/heads/${release_branch}" >/dev/null 2>&1; then
+      die "release branch already exists locally: ${release_branch} (delete it or pass --release-branch to override)"
+    fi
+    note "creating release branch ${release_branch} from main"
+    git checkout -b "$release_branch"
+    current_branch="$release_branch"
+  else
+    die "PR mode requires starting from 'main' or '${release_branch}' (current=${current_branch:-detached}); use --direct-push to opt out"
+  fi
 fi
 
 python3 - "$version" <<'PY'
@@ -1085,40 +1151,94 @@ fi
   done
 } | semantic-commit commit
 
-if [[ "$skip_push" -eq 0 ]]; then
-  git push origin HEAD
-fi
+if [[ "$pr_mode" -eq 1 ]]; then
+  # === PR-based delivery ====================================================
+  note "pushing release branch ${release_branch} to origin"
+  git push -u origin HEAD
 
-if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-  if [[ "$force_tag" -eq 1 ]]; then
-    git tag -d "$tag"
-    if [[ "$skip_push" -eq 0 ]]; then
-      git push origin ":refs/tags/${tag}"
-    fi
-  else
-    die "tag already exists: ${tag} (use --force-tag to replace)"
+  pr_body_file="$(mktemp)"
+  {
+    printf '## Summary\n\n'
+    for line in "${body_lines[@]}"; do
+      printf '%s\n' "$line"
+    done
+    printf '\n## Test plan\n\n'
+    printf -- '- [ ] CI: required status checks green\n'
+    printf -- '- [ ] After merge: tag %s and confirm release.yml publishes artifacts\n' "$tag"
+    printf -- '- [ ] Tap stage updates homebrew formula\n'
+  } >"$pr_body_file"
+
+  note "opening + waiting + merging release PR via forge-cli pr deliver"
+  forge-cli pr deliver \
+    --kind chore \
+    --title "chore(release): bump cli versions to ${version}" \
+    --body-file "$pr_body_file" \
+    --method squash \
+    --timeout "${NILS_CLI_PR_WAIT:-30m}" \
+    || { rm -f "$pr_body_file"; die "forge-cli pr deliver failed; release branch ${release_branch} left in place for recovery"; }
+  rm -f "$pr_body_file"
+
+  note "switching back to main and fast-forwarding"
+  git checkout main
+  git fetch origin --quiet
+  git reset --hard origin/main
+  if git rev-parse --verify "refs/heads/${release_branch}" >/dev/null 2>&1; then
+    git branch -D "$release_branch" >/dev/null 2>&1 || true
   fi
-fi
 
-git tag -a "$tag" -m "$tag"
+  bump_sha="$(git rev-parse --verify HEAD)"
 
-if [[ "$skip_push" -eq 0 ]]; then
+  if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+    if [[ "$force_tag" -eq 1 ]]; then
+      git tag -d "$tag"
+      git push origin ":refs/tags/${tag}" || true
+    else
+      die "tag already exists: ${tag} (use --force-tag to replace)"
+    fi
+  fi
+
+  git tag -a "$tag" -m "$tag" "$bump_sha"
   git push origin "$tag"
-fi
+  note "release tag ${tag} created on ${bump_sha}"
+  if [[ "$skip_ci_wait" -eq 1 ]]; then
+    note "--skip-ci-wait set; ignored in PR mode (PR delivery already gated CI)"
+  fi
+else
+  # === Legacy direct-push delivery ==========================================
+  if [[ "$skip_push" -eq 0 ]]; then
+    git push origin HEAD
+  fi
 
-note "release tag ${tag} created"
+  if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+    if [[ "$force_tag" -eq 1 ]]; then
+      git tag -d "$tag"
+      if [[ "$skip_push" -eq 0 ]]; then
+        git push origin ":refs/tags/${tag}"
+      fi
+    else
+      die "tag already exists: ${tag} (use --force-tag to replace)"
+    fi
+  fi
 
-# === Wait for ci.yml on the bump commit (default safety gate) ===============
+  git tag -a "$tag" -m "$tag"
 
-if [[ "$skip_push" -eq 0 && "$skip_ci_wait" -eq 0 ]]; then
-  if ! command -v gh >/dev/null 2>&1; then
-    warn "gh not on PATH; skipping ci.yml wait on bump commit"
-  elif [[ -z "$source_repo_slug" || "$source_repo_slug" == *"/"*"/"* ]]; then
-    warn "could not determine source repo slug; skipping ci.yml wait"
-  else
-    bump_sha="$(git rev-parse --verify HEAD)"
-    note "waiting for ${source_repo_slug} ci.yml on bump commit ${bump_sha}"
-    wait_for_release_run "$source_repo_slug" "ci.yml" "$bump_sha" "${NILS_CLI_CI_WAIT_SECONDS:-1800}"
+  if [[ "$skip_push" -eq 0 ]]; then
+    git push origin "$tag"
+  fi
+
+  note "release tag ${tag} created"
+
+  # Wait for ci.yml on the bump commit (default direct-push safety gate)
+  if [[ "$skip_push" -eq 0 && "$skip_ci_wait" -eq 0 ]]; then
+    if ! command -v gh >/dev/null 2>&1; then
+      warn "gh not on PATH; skipping ci.yml wait on bump commit"
+    elif [[ -z "$source_repo_slug" || "$source_repo_slug" == *"/"*"/"* ]]; then
+      warn "could not determine source repo slug; skipping ci.yml wait"
+    else
+      bump_sha="$(git rev-parse --verify HEAD)"
+      note "waiting for ${source_repo_slug} ci.yml on bump commit ${bump_sha}"
+      wait_for_release_run "$source_repo_slug" "ci.yml" "$bump_sha" "${NILS_CLI_CI_WAIT_SECONDS:-1800}"
+    fi
   fi
 fi
 

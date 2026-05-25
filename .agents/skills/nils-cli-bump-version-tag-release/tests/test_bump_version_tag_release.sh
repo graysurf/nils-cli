@@ -734,6 +734,145 @@ PY
   assert_not_contains "$formula_path" 'v0.6.4/nils-cli-v0.6.4'
 }
 
+create_mock_forge_cli_deliver() {
+  # The mock simulates a successful PR deliver by fast-forwarding the bare
+  # remote's main to the freshly pushed release branch, then printing a final
+  # status line the way `forge-cli pr deliver` does.
+  local bin_dir="$1"
+  local bare_remote="$2"
+  cat > "${bin_dir}/forge-cli" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+log_file="\${MOCK_LOG:?}"
+echo "forge-cli:\$*" >> "\$log_file"
+
+if [[ "\${1:-}" != "pr" || "\${2:-}" != "deliver" ]]; then
+  echo "unexpected forge-cli command: \$*" >&2
+  exit 1
+fi
+
+# Determine the branch that was just pushed by inspecting the bare remote.
+release_branch="\$(git -C "${bare_remote}" symbolic-ref --short HEAD 2>/dev/null || true)"
+# Find which branch ref was most recently advanced ahead of main.
+for ref in \$(git -C "${bare_remote}" for-each-ref --format='%(refname:short)' refs/heads); do
+  if [[ "\$ref" == "main" ]]; then
+    continue
+  fi
+  release_branch="\$ref"
+  break
+done
+
+if [[ -z "\$release_branch" ]]; then
+  echo "mock forge-cli: could not detect release branch on remote" >&2
+  exit 1
+fi
+
+# Fast-forward main to the release branch on the bare remote (simulates squash-merge).
+release_sha="\$(git -C "${bare_remote}" rev-parse "refs/heads/\$release_branch")"
+git -C "${bare_remote}" update-ref refs/heads/main "\$release_sha"
+git -C "${bare_remote}" update-ref -d "refs/heads/\$release_branch"
+
+echo "merged #999 via squash → \$release_sha (branch deleted)"
+EOF
+  chmod +x "${bin_dir}/forge-cli"
+}
+
+test_pr_mode_default_opens_pr_and_tags_merge_commit() {
+  local tmp repo remote bin_dir log_file stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  remote="${tmp}/repo.git"
+  bin_dir="${tmp}/bin"
+  log_file="${tmp}/mock.log"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_cargo "$bin_dir"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+
+  git init --bare "$remote" >/dev/null
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null
+
+  create_mock_forge_cli_deliver "$bin_dir" "$remote"
+
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_LOG="$log_file" \
+      "$entrypoint" --version v0.6.5
+  ) >"${tmp}/stdout.log" 2>"${stderr_file}"
+
+  # forge-cli was invoked with the expected shape.
+  assert_contains "$log_file" 'forge-cli:pr deliver --kind chore'
+  assert_contains "$log_file" 'bump cli versions to 0.6.5'
+  assert_contains "$log_file" '--method squash'
+  # The release branch existed on the remote before merge and is gone now.
+  if git -C "$remote" rev-parse --verify "refs/heads/chore/release-0-6-5" >/dev/null 2>&1; then
+    fail "mock forge-cli left release branch behind on remote"
+  fi
+  # main on the remote contains the bump commit.
+  remote_main_msg="$(git -C "$remote" log -1 --pretty=%s main)"
+  if [[ "$remote_main_msg" != "chore(release): bump cli versions to 0.6.5" ]]; then
+    fail "remote main does not point at the bump commit (got: ${remote_main_msg})"
+  fi
+  # Local repo back on main with tag v0.6.5 pointing at the merge commit.
+  local current_branch
+  current_branch="$(git -C "$repo" branch --show-current)"
+  if [[ "$current_branch" != "main" ]]; then
+    fail "expected to be back on main after PR delivery (got: ${current_branch})"
+  fi
+  local tagged_sha local_main_sha
+  # ^{} dereferences annotated-tag objects down to the commit they tag.
+  tagged_sha="$(git -C "$repo" rev-parse --verify "refs/tags/v0.6.5^{}")"
+  local_main_sha="$(git -C "$repo" rev-parse --verify HEAD)"
+  if [[ "$tagged_sha" != "$local_main_sha" ]]; then
+    fail "tag v0.6.5 (${tagged_sha}) does not point at local main (${local_main_sha})"
+  fi
+}
+
+test_pr_mode_rejects_non_chore_release_branch() {
+  local tmp repo bin_dir stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  bin_dir="${tmp}/bin"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_cargo "$bin_dir"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+
+  # Provide a forge-cli stub so the up-front PATH check passes; the script
+  # should die on the prefix validation before invoking it.
+  cat > "${bin_dir}/forge-cli" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  chmod +x "${bin_dir}/forge-cli"
+
+  set +e
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${bin_dir}:$PATH" \
+      "$entrypoint" --version 0.6.5 --release-branch feat/release-0-6-5 \
+      >"${tmp}/stdout.log" 2>"${stderr_file}"
+  )
+  local rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    fail "expected --release-branch without chore/ prefix to exit non-zero"
+  fi
+  assert_contains "$stderr_file" "must start with 'chore/'"
+}
+
 if [[ ! -f "${skill_root}/SKILL.md" ]]; then
   fail "missing SKILL.md"
 fi
@@ -751,5 +890,7 @@ test_from_tap_without_tag_fails
 test_from_tap_with_skip_tap_is_mutually_exclusive
 test_from_tap_upgrades_installed_local_brew_formula
 test_formula_inplace_editor_idempotent
+test_pr_mode_default_opens_pr_and_tags_merge_commit
+test_pr_mode_rejects_non_chore_release_branch
 
 echo "ok: project skill smoke checks passed"
