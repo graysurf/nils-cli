@@ -53,8 +53,14 @@ mod tracking_events;
 mod tracking_fsm;
 #[path = "integration/tracking_reconcile.rs"]
 mod tracking_reconcile;
+#[path = "integration/tracking_checkpoint_dry_run.rs"]
+mod tracking_checkpoint_dry_run;
+#[path = "integration/tracking_checkpoint_refusals.rs"]
+mod tracking_checkpoint_refusals;
 #[path = "integration/tracking_run_state.rs"]
 mod tracking_run_state;
+#[path = "integration/tracking_run_update.rs"]
+mod tracking_run_update;
 #[path = "integration/tracking_status.rs"]
 mod tracking_status;
 #[path = "integration/start_plan_canonical.rs"]

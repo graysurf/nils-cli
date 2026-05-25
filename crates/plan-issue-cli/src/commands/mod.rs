@@ -316,6 +316,12 @@ impl TrackingArgs {
     pub fn command_id(&self) -> &'static str {
         match &self.command {
             tracking::TrackingCommand::Status(_) => "tracking.status",
+            tracking::TrackingCommand::Run(run) => match &run.command {
+                tracking::TrackingRunCommand::Init(_) => "tracking.run.init",
+                tracking::TrackingRunCommand::Update(_) => "tracking.run.update",
+            },
+            tracking::TrackingCommand::Checkpoint(_) => "tracking.checkpoint",
+            tracking::TrackingCommand::CloseReady(_) => "tracking.close-ready",
         }
     }
 }
