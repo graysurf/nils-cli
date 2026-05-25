@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use cli::{CaptureArgs, Cli, Command, HttpMethod, OutputFormat};
 use nils_common::cli_contract::exit;
-use nils_common::fs::normalize_path as normalize_absolute_path;
+use nils_common::fs::{display_path, normalize_path as normalize_absolute_path};
 use nils_common::redact::{RedactedString, redact_text};
 
 const EXIT_OK: i32 = exit::SUCCESS;
@@ -735,10 +735,6 @@ fn unix_seconds_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn display_path(path: &Path) -> String {
-    path.to_string_lossy().to_string()
 }
 
 #[derive(Debug)]

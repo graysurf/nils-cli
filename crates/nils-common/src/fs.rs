@@ -6,6 +6,13 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+/// Render `path` using `to_string_lossy` for use in CLI JSON envelopes and
+/// log messages. Lossy on purpose — non-UTF8 bytes are replaced with U+FFFD
+/// so the result is always serializable.
+pub fn display_path(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
 /// Lexically normalize `path`: drop `.` components, collapse `..` components by
 /// popping the previous segment, and preserve any root or prefix (Windows
 /// drive / UNC). The result is purely syntactic — the filesystem is not
@@ -522,6 +529,12 @@ const ROUND_CONSTANTS: [u32; 64] = [
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn display_path_renders_unicode_paths_losslessly() {
+        assert_eq!(display_path(Path::new("/tmp/repo")), "/tmp/repo");
+        assert_eq!(display_path(Path::new("")), "");
+    }
 
     #[test]
     fn normalize_path_drops_curdir_components() {
