@@ -233,6 +233,8 @@ fn record_post_state_execution_state_file_collapses_non_final_in_dry_run() {
     let body = parsed["payload"]["result"]["comment_body"]
         .as_str()
         .expect("comment body");
+    assert_eq!(body.matches("## Execution State").count(), 1, "{body}");
+    assert!(body.contains("- Profile: tracking"), "{body}");
     assert!(body.contains("## Task Ledger"), "{body}");
     assert!(body.contains("<details>"), "{body}");
     assert!(
@@ -300,9 +302,72 @@ fn record_post_state_execution_state_file_expands_final_in_dry_run() {
     let body = parsed["payload"]["result"]["comment_body"]
         .as_str()
         .expect("comment body");
+    assert_eq!(body.matches("## Execution State").count(), 1, "{body}");
+    assert!(body.contains("- Profile: tracking"), "{body}");
     assert!(body.contains("## Task Ledger"), "{body}");
     assert!(body.contains("| 1.1 | done | Demo task |"), "{body}");
     assert!(!body.contains("<details>"), "{body}");
+}
+
+#[test]
+fn record_post_state_execution_state_file_keeps_legacy_visible_fields() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    let execution_state = tmp.path().join("state.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "plan issue lifecycle comment visibility",
+            "current": "implement Sprint 1 in sympoies/nils-cli",
+            "next_action": "add lifecycle visible rendering support",
+            "tasks": [{"id": "1.1", "status": "pending", "title": "Renderer"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &execution_state,
+        "# Execution State: Plan Issue Lifecycle Comment Visibility\n\n<!-- execute-from-tracking-issue:state:v1 -->\n## Execution State\n\n- Status: tracking issue opened\n- Profile: tracking\n- Target scope: make plan-issue lifecycle comments visibly include detailed state, validation, review, session, and closeout evidence\n- Current task: implement Sprint 1 in sympoies/nils-cli.\n- Next task: add lifecycle visible rendering support to plan-issue record post and record close.\n- Last updated: 2026-05-25\n- Branch: feat/plan-issue-state-visibility\n- Source document: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-plan.md\n- Plan document: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-plan.md\n- Review source: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-review-source.md\n\n## Task Ledger\n\n| ID | Status | Task |\n| --- | --- | --- |\n| 1.1 | pending | Renderer |\n",
+    )
+    .expect("write execution state");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "115",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let body = parsed["payload"]["result"]["comment_body"]
+        .as_str()
+        .expect("comment body");
+    assert_eq!(body.matches("## Execution State").count(), 1, "{body}");
+    assert_eq!(body.matches("- Profile: tracking").count(), 1, "{body}");
+    assert!(!body.contains("# Execution State:"), "{body}");
+    assert!(body.contains("- Status: tracking issue opened"), "{body}");
+    assert!(body.contains("- Last updated: 2026-05-25"), "{body}");
+    assert!(
+        body.contains("- Branch: feat/plan-issue-state-visibility"),
+        "{body}"
+    );
+    assert!(body.contains("- Source document: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-plan.md"), "{body}");
+    assert!(body.contains("- Plan document: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-plan.md"), "{body}");
+    assert!(body.contains("- Review source: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-review-source.md"), "{body}");
+    assert!(body.contains("<details>"), "{body}");
 }
 
 #[test]

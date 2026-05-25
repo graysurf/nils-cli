@@ -1557,7 +1557,6 @@ pub fn render_record_post_comment_with_display(
     out.push(format!("## {heading}"));
     out.push(String::new());
     out.push(format!("- Profile: {}", profile.as_str()));
-    out.push(String::new());
     out.push(visible_content);
     out.push(String::new());
     out.push(envelope_carrier);
@@ -1637,6 +1636,7 @@ fn render_state_markdown_with_task_ledger_display(
     display: TaskLedgerDisplay,
     state: &StateData,
 ) -> Result<String, String> {
+    let markdown = normalize_state_markdown_for_comment(markdown)?;
     let effective = match display {
         TaskLedgerDisplay::Expanded => TaskLedgerDisplay::Expanded,
         TaskLedgerDisplay::Collapsed => TaskLedgerDisplay::Collapsed,
@@ -1649,10 +1649,10 @@ fn render_state_markdown_with_task_ledger_display(
         }
     };
     if effective == TaskLedgerDisplay::Expanded {
-        return Ok(markdown.trim().to_string());
+        return Ok(markdown);
     }
 
-    let lines: Vec<&str> = markdown.trim().lines().collect();
+    let lines: Vec<&str> = markdown.lines().collect();
     let Some(start) = lines
         .iter()
         .position(|line| line.trim() == "## Task Ledger")
@@ -1692,6 +1692,39 @@ fn render_state_markdown_with_task_ledger_display(
     Ok(finalize_markdown(out).trim().to_string())
 }
 
+fn normalize_state_markdown_for_comment(markdown: &str) -> Result<String, String> {
+    let stripped = markdown
+        .trim()
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with("<!-- plan-issue-record:")
+                && !trimmed.starts_with("<!-- execute-from-tracking-issue:")
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let Some(execution_heading) = stripped
+        .iter()
+        .position(|line| line.trim() == "## Execution State")
+    else {
+        return Err("execution-state markdown is missing `## Execution State`".to_string());
+    };
+
+    let mut out = stripped
+        .into_iter()
+        .skip(execution_heading + 1)
+        .filter(|line| !line.trim().starts_with("- Profile:"))
+        .collect::<Vec<_>>();
+    while out.first().is_some_and(|line| line.trim().is_empty()) {
+        out.remove(0);
+    }
+    let normalized = finalize_markdown(out).trim().to_string();
+    if normalized.is_empty() {
+        return Err("execution-state markdown has no visible state content".to_string());
+    }
+    Ok(normalized)
+}
+
 fn is_terminal_state(state: &StateData) -> bool {
     state.status == Some(StateStatus::Complete)
         && state
@@ -1713,14 +1746,14 @@ fn render_state_payload_visible(state: &StateData) -> String {
         out.push(format!("- Target scope: {value}"));
     }
     if let Some(value) = state.current.as_deref().filter(|value| !value.is_empty()) {
-        out.push(format!("- Current: {value}"));
+        out.push(format!("- Current task: {value}"));
     }
     if let Some(value) = state
         .next_action
         .as_deref()
         .filter(|value| !value.is_empty())
     {
-        out.push(format!("- Next action: {value}"));
+        out.push(format!("- Next task: {value}"));
     }
     if !state.tasks.is_empty() {
         out.push(String::new());
