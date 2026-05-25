@@ -873,6 +873,18 @@ fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
                 "created_at": "2026-05-23T10:00:00Z"
             },
             {
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-session",
+                "body": v2_comment_body(
+                    "session",
+                    "tracking",
+                    json!({
+                        "summary": "implementation session completed",
+                        "highlights": ["state, validation, and review evidence recorded"]
+                    }),
+                ),
+                "created_at": "2026-05-23T10:30:00Z"
+            },
+            {
                 "url": "https://github.com/owner/repo/issues/9#issuecomment-validation",
                 "body": v2_comment_body(
                     "validation",
@@ -900,6 +912,18 @@ fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
             }
         ]
     })
+}
+
+fn remove_session_comment(comments: &mut Value) {
+    comments["comments"]
+        .as_array_mut()
+        .expect("comments array")
+        .retain(|comment| {
+            !comment["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("role=session")
+        });
 }
 
 #[test]
@@ -1006,6 +1030,51 @@ fn record_close_fixture_passes_strict_gate_with_complete_v2_evidence() {
     assert!(
         final_dashboard.starts_with("## Final Dashboard"),
         "{final_dashboard}"
+    );
+}
+
+#[test]
+fn record_close_fixture_blocks_when_session_comment_missing() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    let mut comments = build_closeout_evidence("owner/repo#1");
+    remove_session_comment(&mut comments);
+    let body = "## Current Dashboard\n\n- Status: complete\n- Latest session: pending\n\n## Session Log\n\n- Notes embedded in state only.\n";
+    write_fixture_files(&fixture, body, &comments);
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "deadbeefcafebabe"},
+            "statusCheckRollup": {"state": "success"},
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "https://github.com/owner/repo/issues/9#issuecomment-approval",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+
+    assert_ne!(out.code, 0, "missing session must block closeout");
+    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    assert!(
+        joined.contains("session-missing"),
+        "expected session-missing, got: {joined}"
     );
 }
 

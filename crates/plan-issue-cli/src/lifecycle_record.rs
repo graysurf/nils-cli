@@ -2163,6 +2163,21 @@ pub fn evaluate_strict_closeout_gate(
         ),
     }
 
+    match audit.evidence.get("session") {
+        Some(hit) => push_pass(
+            &mut checks,
+            "execution session",
+            hit.url.as_deref().unwrap_or("present").to_string(),
+        ),
+        None => push_fail(
+            &mut checks,
+            &mut blocked_codes,
+            "execution session",
+            "missing role=session lifecycle record".to_string(),
+            "session-missing",
+        ),
+    }
+
     match audit.evidence.get("validation") {
         Some(hit) => match hit.status.as_deref() {
             Some("pass") => push_pass(&mut checks, "validation", "pass".to_string()),
@@ -2459,10 +2474,12 @@ mod sprint3_tests {
         );
         let source = v2_body("source", json!({"path": "p", "commit": "c"}));
         let plan = v2_body("plan", json!({"path": "p", "commit": "c"}));
+        let session = v2_body("session", json!({"summary": "session complete"}));
         let audit = build_audit_with_evidence(vec![
             (source, "u-src"),
             (plan, "u-plan"),
             (state, "u-state"),
+            (session, "u-session"),
             (validation, "u-val"),
             (review, "u-rev"),
         ]);
@@ -2499,12 +2516,14 @@ mod sprint3_tests {
         );
         let source = v2_body("source", json!({"path": "p", "commit": "c"}));
         let plan = v2_body("plan", json!({"path": "p", "commit": "c"}));
+        let session = v2_body("session", json!({"summary": "session complete"}));
         let validation = v2_body("validation", json!({"overall": "pass"}));
         let review = v2_body("review", json!({"decision": "approve"}));
         let audit = build_audit_with_evidence(vec![
             (source, "a"),
             (plan, "b"),
             (state, "c"),
+            (session, "d"),
             (validation, "d"),
             (review, "e"),
         ]);
@@ -2538,12 +2557,14 @@ mod sprint3_tests {
             "state",
             json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
         );
+        let session = v2_body("session", json!({"summary": "session complete"}));
         let validation = v2_body("validation", json!({"overall": "pass"}));
         let review_rejected = v2_body("review", json!({"decision": "request-changes"}));
         let audit_rej = build_audit_with_evidence(vec![
             (source.clone(), "a"),
             (plan.clone(), "b"),
             (state.clone(), "c"),
+            (session.clone(), "d"),
             (validation.clone(), "d"),
             (review_rejected, "e"),
         ]);
@@ -2573,6 +2594,7 @@ mod sprint3_tests {
             (source, "a"),
             (plan, "b"),
             (state, "c"),
+            (session, "d"),
             (validation, "d"),
             (review_unresolved, "e"),
         ]);
@@ -2603,12 +2625,14 @@ mod sprint3_tests {
             "state",
             json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
         );
+        let session = v2_body("session", json!({"summary": "session complete"}));
         let validation = v2_body("validation", json!({"overall": "pass"}));
         let review = v2_body("review", json!({"decision": "approve"}));
         let audit = build_audit_with_evidence(vec![
             (source, "a"),
             (plan, "b"),
             (state, "c"),
+            (session, "d"),
             (validation, "d"),
             (review, "e"),
         ]);
@@ -2653,6 +2677,10 @@ mod sprint3_tests {
                 ),
                 "c",
             ),
+            (
+                v2_body("session", json!({"summary": "session complete"})),
+                "d",
+            ),
             (v2_body("validation", json!({"overall": "pass"})), "d"),
             (v2_body("review", json!({"decision": "approve"})), "e"),
         ]);
@@ -2691,6 +2719,10 @@ mod sprint3_tests {
                     json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
                 ),
                 "c",
+            ),
+            (
+                v2_body("session", json!({"summary": "session complete"})),
+                "d",
             ),
             (v2_body("validation", json!({"overall": "pass"})), "d"),
             (v2_body("review", json!({"decision": "approve"})), "e"),
@@ -2741,6 +2773,10 @@ mod sprint3_tests {
                     json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
                 ),
                 "c",
+            ),
+            (
+                v2_body("session", json!({"summary": "session complete"})),
+                "d",
             ),
             (v2_body("validation", json!({"overall": "pass"})), "d"),
             (v2_body("review", json!({"decision": "approve"})), "e"),
@@ -2797,12 +2833,14 @@ mod sprint3_tests {
             "state",
             json!({"status": "complete", "tasks": [], "prs": [], "blockers": [], "links": {}}),
         );
+        let session = v2_body("session", json!({"summary": "session complete"}));
         let validation = v2_body("validation", json!({"overall": "pass"}));
         let review = v2_body("review", json!({"decision": "approve"}));
         let audit = build_audit_with_evidence(vec![
             (source, "a"),
             (plan, "b"),
             (state, "c"),
+            (session, "d"),
             (validation, "d"),
             (review, "e"),
         ]);
