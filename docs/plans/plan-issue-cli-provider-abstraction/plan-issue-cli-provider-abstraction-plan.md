@@ -4,7 +4,7 @@
 
 Make `plan-issue-cli` provider-aware so the issue-backed plan-tracking and
 dispatch lifecycles work on GitLab as well as GitHub. Downstream sandbox
-validation against `gitlab.gamania.com` confirmed every Tier D / Tier E skill
+validation against `gitlab.com` confirmed every Tier D / Tier E skill
 fails today because `plan-issue` shells out to `gh issue create` regardless of
 provider.
 
@@ -23,7 +23,7 @@ change.
   - Provider discriminator on lifecycle payload (Q3)
   - `create-dispatch-lane-pr` GitLab port (Q4; defer or absorb)
   - Auto-detect provider from cwd remote (Q5)
-- Downstream sandbox findings live in `terrylin/agent-runtime-testing`
+- Downstream sandbox findings live in `graysury/nils-cli-gitlab-sandbox`
   (GitLab) under
   `docs/plans/gitlab-skill-validation/gitlab-skill-validation-discussion-source.md`.
 - Companion tracking issue for `forge-cli` fixes: sympoies/nils-cli#483.
@@ -118,7 +118,7 @@ GitLab repo with the same lifecycle contract as the GitHub path.
 
 - Commands:
   - `cargo test -p nils-plan-issue-cli` (cross-provider)
-  - Live: `plan-issue --repo terrylin/agent-runtime-testing record open --profile tracking --bundle docs/plans/p8-smoke`
+  - Live: `plan-issue --repo graysury/nils-cli-gitlab-sandbox record open --profile tracking --bundle docs/plans/p8-smoke`
 - Verify: GitLab issue is opened, lifecycle comments are posted, dashboard
   body matches the GitHub-side shape.
 
@@ -162,7 +162,7 @@ GitLab repo with the same lifecycle contract as the GitHub path.
 ### Task 2.3: Sandbox revalidation
 
 - **Location**:
-  - Downstream sandbox: `terrylin/agent-runtime-testing`
+  - Downstream sandbox: `graysury/nils-cli-gitlab-sandbox`
 - **Description**: Build the rebuilt binary, run the live `record open`
   against the existing `docs/plans/p8-smoke` bundle, audit the issue, and
   update the sandbox source doc.

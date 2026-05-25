@@ -45,7 +45,7 @@ open PR in maintained repositories.
 - `[A1]` `forge-cli --provider github --format json --dry-run inbox list --limit
   30` reports 5 planned backend calls.
 - `[A2]` `forge-cli --provider gitlab --format json --dry-run inbox list
-  --gitlab-host gitlab.gamania.com --limit 30` reports 7 planned backend calls.
+  --gitlab-host gitlab.com --limit 30` reports 7 planned backend calls.
 - `[A3]` Live timing on 2026-05-22 with `forge-cli 0.17.2`, `gh 2.92.0`, and
   `glab 1.99.0`: GitHub-only default inbox list took about 6.62s, GitLab-only
   took about 1.37s, and mixed-provider list took about 8.15s.
@@ -177,7 +177,7 @@ open PR in maintained repositories.
 - `cargo test -p nils-forge-cli --test integration inbox`
 - `forge-cli --provider github --format json --dry-run inbox list --limit 30`
 - `forge-cli --provider github --format json --dry-run inbox list --limit 30 <new item-type flag>`
-- `forge-cli --provider gitlab --format json --dry-run inbox list --gitlab-host gitlab.gamania.com --limit 30 <new item-type flag>`
+- `forge-cli --provider gitlab --format json --dry-run inbox list --gitlab-host gitlab.com --limit 30 <new item-type flag>`
 - `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
 - For final delivery, run the repository-required gate selected by
   `DEVELOPMENT.md`.

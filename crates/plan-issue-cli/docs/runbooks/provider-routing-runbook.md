@@ -55,7 +55,7 @@ recognise both GitHub and GitLab remote forms. Recognised patterns include:
 Resolution rules:
 
 1. If `--repo` carries a host segment (for example
-   `gitlab.gamania.com/group/project`), parse the provider from that host.
+   `gitlab.example.com/group/project`), parse the provider from that host.
 2. If `--repo` is bare `owner/repo`, default to `Provider::GitHub` so existing
    GitHub workflows are unchanged.
 3. Otherwise read `git remote get-url origin` and detect GitHub vs GitLab from

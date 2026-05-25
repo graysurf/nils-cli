@@ -40,8 +40,8 @@ surface for work discovery and prioritization.
   `glab issue list` can filter by group or repo, but `glab search` is project
   code search rather than a personal cross-project inbox.
 - `[A3]` Local `glab auth status` confirms authenticated access to
-  `gitlab.gamania.com` as `terrylin`; `glab api user` reports user id `1435`
-  and username `terrylin`.
+  `gitlab.com` as `glab-user`; `glab api user` reports user id `1435`
+  and username `glab-user`.
 - `[A4]` Read-only GitLab probes for assigned MRs, review-requested MRs,
   assigned issues, authored MRs / issues, and pending to-dos returned empty
   samples during the discussion.
@@ -79,9 +79,9 @@ surface for work discovery and prioritization.
   reliable source for user-scoped cross-project aggregation. `[A2][A3]`
 - `glab api` supports `--hostname`; without it, non-git-directory calls default
   to `gitlab.com`, which is wrong for company-host scheduled jobs. `[A5]`
-- The local company GitLab identity is `terrylin` on `gitlab.gamania.com`, with
-  user id `1435`; implementation must discover these values dynamically instead
-  of hardcoding them. `[A3]`
+- The local GitLab identity used during the live probe was an authenticated
+  glab user with user id `1435`; implementation must discover these values
+  dynamically instead of hardcoding them. `[A3]`
 - Current `forge-cli pr list` is a repo-local lifecycle operation. Reusing it
   for cross-repo personal work discovery would blur the existing contract.
   `[F1][F2]`
@@ -261,7 +261,7 @@ semantics:
       },
       {
         "provider": "gitlab",
-        "host": "gitlab.gamania.com",
+        "host": "gitlab.com",
         "ok": false,
         "item_count": 0,
         "error": {
@@ -291,7 +291,7 @@ semantics:
     {
       "kind": "provider_failed",
       "provider": "gitlab",
-      "host": "gitlab.gamania.com",
+      "host": "gitlab.com",
       "message": "GitLab inbox query failed; GitHub results are still shown."
     }
   ]
@@ -331,9 +331,9 @@ lag public GitLab behavior.
 - `forge-cli inbox --help` shows the new command group and subcommands.
 - `forge-cli inbox list --provider github --format json` can parse stubbed
   `gh search prs` and `gh search issues` output.
-- `forge-cli inbox list --provider gitlab --gitlab-host gitlab.gamania.com
+- `forge-cli inbox list --provider gitlab --gitlab-host gitlab.com
   --format json` can parse stubbed `glab api user`, MR, issue, and todo output,
-  and every GitLab API invocation includes `--hostname gitlab.gamania.com`.
+  and every GitLab API invocation includes `--hostname gitlab.com`.
 - Combined-provider mode returns partial success with provider-specific warnings
   when one provider is unavailable.
 - All-selected-providers-failed mode exits non-zero through the normal error
@@ -370,7 +370,7 @@ lag public GitLab behavior.
   or merging the implementation PR.
 - Optional live smoke, run manually and recorded separately:
   - `forge-cli inbox status --provider github --format json`
-  - `forge-cli inbox status --provider gitlab --gitlab-host gitlab.gamania.com --format json`
+  - `forge-cli inbox status --provider gitlab --gitlab-host gitlab.com --format json`
 
 ## Risks And Guardrails
 
@@ -386,8 +386,9 @@ lag public GitLab behavior.
   caching.
 - Future scheduled agents must remain read-only until a separate approval model
   exists for automated mutation.
-- The implementation should not hardcode `terrylin`, user id `1435`, or
-  `gitlab.gamania.com`; those are live probe examples, not portable defaults.
+- The implementation should not hardcode the authenticated username, user id
+  `1435`, or a specific GitLab host; those are live probe examples, not
+  portable defaults.
 - The inbox-local `--gitlab-host` flag must not become a hidden global host
   override for lifecycle commands.
 

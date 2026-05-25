@@ -146,8 +146,8 @@ GitHub/GitLab query families before any backend call is planned or executed.
     know whether unclassified `todos` appear only in all-items mode.
 - **Validation**:
   - `cargo test -p nils-forge-cli inbox_item_type`
-  - `forge-cli --provider gitlab --format json --dry-run inbox list --gitlab-host gitlab.gamania.com --limit 30 --item-type pr`
-  - `forge-cli --provider gitlab --format json --dry-run inbox list --gitlab-host gitlab.gamania.com --limit 30 --item-type issue`
+  - `forge-cli --provider gitlab --format json --dry-run inbox list --gitlab-host gitlab.com --limit 30 --item-type pr`
+  - `forge-cli --provider gitlab --format json --dry-run inbox list --gitlab-host gitlab.com --limit 30 --item-type issue`
 
 ## Sprint 2: Deterministic Parallel Collection
 
