@@ -1,6 +1,6 @@
 [package]
 name = "nils-macos-agent"
-version = "0.22.3"
+version = "0.22.4"
 edition.workspace = true
 license.workspace = true
 
@@ -20,11 +20,11 @@ clap_complete = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = "1"
-nils-common = { version = "0.22.3", path = "../nils-common", package = "nils-common" }
-screen-record = { version = "0.22.3", path = "../screen-record", package = "nils-screen-record" }
+nils-common = { version = "0.22.4", path = "../nils-common", package = "nils-common" }
+screen-record = { version = "0.22.4", path = "../screen-record", package = "nils-screen-record" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
-nils-test-support = { version = "0.22.3", path = "../nils-test-support" }
+nils-test-support = { version = "0.22.4", path = "../nils-test-support" }
 tempfile = "3"
