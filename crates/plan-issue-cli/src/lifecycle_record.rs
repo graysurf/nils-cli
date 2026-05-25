@@ -2266,7 +2266,7 @@ mod sprint3_tests {
             checks: CheckStatus::Fail,
             required_state: None,
             required_count: None,
-            non_required_failures: vec!["legacy/lint".to_string()],
+            non_required_failures: vec!["opt-in/lint".to_string()],
         }];
 
         let blocked = evaluate_strict_closeout_gate(

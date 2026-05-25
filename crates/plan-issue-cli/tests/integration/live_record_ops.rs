@@ -979,7 +979,7 @@ fn record_close_fixture_override_passes_when_required_unknown_aggregate_fails() 
             "state": "MERGED",
             "mergeCommit": {"oid": "abc"},
             "statusCheckRollup": {"state": "failure"},
-            "nonRequiredFailures": ["legacy/lint"],
+            "nonRequiredFailures": ["opt-in/lint"],
             "url": "https://github.com/owner/repo/pull/1"
         }),
     );
@@ -1019,7 +1019,7 @@ fn record_close_fixture_override_passes_when_required_unknown_aggregate_fails() 
         "ok",
         "--allow-non-required-check-failure",
         "--allow-non-required-check-failure-reason",
-        "operator verified legacy/lint is non-required",
+        "operator verified opt-in/lint is non-required",
         "--fixture",
         fixture.to_str().expect("fixture path"),
     ]);
@@ -1038,14 +1038,14 @@ fn record_close_fixture_override_passes_when_required_unknown_aggregate_fails() 
     let closeout = &audit["evidence"]["closeout"]["payload"]["data"];
     let override_block = &closeout["non_required_check_override"];
     assert_eq!(
-        override_block["reason"], "operator verified legacy/lint is non-required",
+        override_block["reason"], "operator verified opt-in/lint is non-required",
         "override block reason recorded"
     );
     assert!(
         override_block["observed_non_required_failures"]
             .as_array()
-            .is_some_and(|arr| arr.iter().any(|item| item == "owner/repo#1: legacy/lint")),
-        "expected observed failure list to include legacy/lint: {override_block}"
+            .is_some_and(|arr| arr.iter().any(|item| item == "owner/repo#1: opt-in/lint")),
+        "expected observed failure list to include opt-in/lint: {override_block}"
     );
 }
 
