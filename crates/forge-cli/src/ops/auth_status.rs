@@ -241,7 +241,7 @@ mod tests {
         let payload = parse_backend_output(&ctx, &output).expect("parse");
         assert_eq!(payload.provider, "github");
         assert_eq!(payload.host, "github.com");
-        assert!(payload.user.is_some());
+        assert_eq!(payload.user.as_deref(), Some("testuser-gh"));
         assert_eq!(
             payload.scopes,
             vec!["repo".to_string(), "read:org".to_string()]
@@ -258,7 +258,7 @@ mod tests {
         let payload = parse_backend_output(&ctx, &output).expect("parse");
         assert_eq!(payload.provider, "gitlab");
         assert_eq!(payload.host, "gitlab.com");
-        assert!(payload.user.is_some());
+        assert_eq!(payload.user.as_deref(), Some("testuser-glab"));
         assert!(payload.scopes.is_empty());
     }
 
