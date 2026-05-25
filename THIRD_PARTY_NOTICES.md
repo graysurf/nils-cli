@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `8afcf391970f1bdfb81343ae9de8b6eccd8333d01d4a3dc0f83a18173e4191b8`
+- Cargo.lock SHA256: `d5150ec2ca64820b80eff725a53457f476f9c53e144fd2c748f310d3a67006c7`
 - Third-party crates (`source != null`): 465
 
 ## Notice Extraction Policy
@@ -1394,7 +1394,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### jiff 0.2.24
+### jiff 0.2.25
 
 - License: `Unlicense OR MIT`
 - Source: `crates.io`
@@ -1404,7 +1404,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `COPYING`
   - `UNLICENSE`
 
-### jiff-static 0.2.24
+### jiff-static 0.2.25
 
 - License: `Unlicense OR MIT`
 - Source: `crates.io`
@@ -2768,7 +2768,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### sqlite-wasm-rs 0.5.4
+### sqlite-wasm-rs 0.5.5
 
 - License: `MIT`
 - Source: `crates.io`
