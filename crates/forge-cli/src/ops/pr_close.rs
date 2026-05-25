@@ -134,8 +134,12 @@ fn render_text(payload: &PrClosePayload) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{BackendCall, BackendSuccess};
+    use crate::cli::ProviderFlag;
     use crate::provider::DetectionSource;
+    use nils_common::cli_contract::exit;
     use pretty_assertions::assert_eq;
+    use std::cell::RefCell;
 
     fn ctx(p: Provider) -> ProviderContext {
         ProviderContext {
@@ -144,6 +148,54 @@ mod tests {
             source: DetectionSource::Flag,
             repo: None,
         }
+    }
+
+    fn flags(provider: Option<ProviderFlag>, dry_run: bool) -> GlobalFlags {
+        GlobalFlags {
+            format: None,
+            remote: "origin".into(),
+            provider,
+            repo: None,
+            dry_run,
+        }
+    }
+
+    struct ScriptedRunner {
+        outputs: RefCell<Vec<String>>,
+        captured: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl ScriptedRunner {
+        fn with_stdout(outs: Vec<&str>) -> Self {
+            Self {
+                outputs: RefCell::new(outs.into_iter().map(|s| s.to_string()).collect()),
+                captured: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BackendRunner for ScriptedRunner {
+        fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+            self.captured.borrow_mut().push(call.plan_argv());
+            let mut q = self.outputs.borrow_mut();
+            assert!(!q.is_empty(), "ScriptedRunner ran out of stdout fixtures");
+            Ok(BackendSuccess {
+                stdout: q.remove(0),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn github_view_json(number: u64, state: &str) -> String {
+        format!(
+            r#"{{"number":{number},"url":"https://github.com/o/r/pull/{number}","state":"{state}","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}}"#
+        )
+    }
+
+    fn gitlab_view_json(iid: u64, state: &str) -> String {
+        format!(
+            r#"{{"iid":{iid},"web_url":"https://gitlab.com/o/r/-/merge_requests/{iid}","state":"{state}","title":"t","source_branch":"feat/y","target_branch":"main","merge_status":"can_be_merged","draft":false,"labels":[]}}"#
+        )
     }
 
     #[test]
@@ -164,5 +216,82 @@ mod tests {
             plan[1..],
             ["mr".to_string(), "close".to_string(), "7".to_string()]
         );
+    }
+
+    #[test]
+    fn build_close_call_pushes_repo_override() {
+        let mut c = ctx(Provider::GitHub);
+        c.repo = Some("acme/widget".into());
+        let plan = build_close_call(&c, 9).plan_argv();
+        let idx = plan.iter().position(|s| s == "--repo").expect("--repo");
+        assert_eq!(plan[idx + 1], "acme/widget");
+    }
+
+    #[test]
+    fn run_with_dry_run_emits_plan_envelope_github() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(Some(ProviderFlag::Github), true);
+        let code =
+            run_with(&runner, &global, 17, OutputFormat::Json, |_| None).expect("dry-run succeeds");
+        assert_eq!(code, exit::SUCCESS);
+        assert!(runner.captured.borrow().is_empty(), "dry-run skips backend");
+    }
+
+    #[test]
+    fn run_with_dry_run_text_path_renders_plan() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(Some(ProviderFlag::Github), true);
+        let code =
+            run_with(&runner, &global, 17, OutputFormat::Text, |_| None).expect("dry-run text");
+        assert_eq!(code, exit::SUCCESS);
+    }
+
+    #[test]
+    fn run_with_happy_github_closes_then_views() {
+        let runner = ScriptedRunner::with_stdout(vec!["", &github_view_json(42, "CLOSED")]);
+        let global = flags(Some(ProviderFlag::Github), false);
+        let code = run_with(&runner, &global, 42, OutputFormat::Json, |_| None)
+            .expect("happy github close");
+        assert_eq!(code, exit::SUCCESS);
+        let calls = runner.captured.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1..4], ["pr", "close", "42"]);
+        assert_eq!(calls[1][1..4], ["pr", "view", "42"]);
+    }
+
+    #[test]
+    fn run_with_happy_gitlab_closes_then_views() {
+        let runner = ScriptedRunner::with_stdout(vec!["", &gitlab_view_json(7, "closed")]);
+        let global = flags(Some(ProviderFlag::Gitlab), false);
+        let code = run_with(&runner, &global, 7, OutputFormat::Json, |_| None)
+            .expect("happy gitlab close");
+        assert_eq!(code, exit::SUCCESS);
+    }
+
+    #[test]
+    fn run_with_text_format_renders_close_summary() {
+        let runner = ScriptedRunner::with_stdout(vec!["", &github_view_json(42, "CLOSED")]);
+        let global = flags(Some(ProviderFlag::Github), false);
+        let code =
+            run_with(&runner, &global, 42, OutputFormat::Text, |_| None).expect("text format");
+        assert_eq!(code, exit::SUCCESS);
+    }
+
+    #[test]
+    fn run_with_propagates_provider_detection_failure() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(None, false);
+        let err = run_with(&runner, &global, 1, OutputFormat::Json, |_| None)
+            .expect_err("no remote, no flag");
+        assert_eq!(err.kind(), "provider_unsupported");
+    }
+
+    #[test]
+    fn run_with_bubbles_invalid_view_json_as_software_error() {
+        let runner = ScriptedRunner::with_stdout(vec!["", "not-json"]);
+        let global = flags(Some(ProviderFlag::Github), false);
+        let err = run_with(&runner, &global, 1, OutputFormat::Json, |_| None)
+            .expect_err("view JSON parse fails");
+        assert_eq!(err.kind(), "software_error");
     }
 }
