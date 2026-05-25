@@ -59,7 +59,7 @@ fn parity_shell_help_surface_tracks_current_command_contract() {
 
     for token in [
         "--repo <owner/repo>",
-        "Pass-through repository target for GitHub operations",
+        "Pass-through repository target for issue/PR/MR operations",
         "--dry-run",
         "Print write actions without mutating GitHub state",
         "--force",

@@ -1557,7 +1557,8 @@ fn run_start_plan(
         ));
     }
 
-    let repo = crate::github::resolve_repo(repo_override)
+    let repo = crate::provider::resolve_repo(repo_override)
+        .map(|info| info.slug)
         .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
     let repo_slug = runtime_layout::repo_slug(&repo);
 
@@ -1716,9 +1717,9 @@ fn run_status_plan(
     // resolves to (None when no remote is detected).
     let repo_slug = match repo.as_deref() {
         Some(repo) => Some(runtime_layout::repo_slug(repo)),
-        None => crate::github::resolve_repo(repo_override)
+        None => crate::provider::resolve_repo(repo_override)
             .ok()
-            .map(|repo| runtime_layout::repo_slug(&repo)),
+            .map(|info| runtime_layout::repo_slug(&info.slug)),
     };
 
     Ok(json!({
@@ -2462,7 +2463,8 @@ fn run_start_sprint(
         issue_body_for_comment = Some(body);
     }
 
-    let repo = crate::github::resolve_repo(repo_override)
+    let repo = crate::provider::resolve_repo(repo_override)
+        .map(|info| info.slug)
         .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
     let repo_slug = runtime_layout::repo_slug(&repo);
     let issue_root = IssueRoot::new(&repo_slug, args.issue)
@@ -3062,9 +3064,9 @@ fn run_multi_sprint_guide(
         ));
     }
 
-    let issue_body_path = match crate::github::resolve_repo(None) {
-        Ok(repo) => {
-            let slug = runtime_layout::repo_slug(&repo);
+    let issue_body_path = match crate::provider::resolve_repo(None) {
+        Ok(info) => {
+            let slug = runtime_layout::repo_slug(&info.slug);
             match IssueRoot::new(&slug, LOCAL_ISSUE_PLACEHOLDER) {
                 Ok(issue_root) => issue_root.plan_issue_body(),
                 Err(_) => render::default_plan_issue_body_path(&args.plan),

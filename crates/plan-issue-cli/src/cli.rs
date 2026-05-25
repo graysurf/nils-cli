@@ -20,7 +20,7 @@ pub enum OutputFormat {
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Pass-through repository target for GitHub operations.
+    /// Pass-through repository target for issue/PR/MR operations.
     #[arg(long, global = true, value_name = "owner/repo")]
     pub repo: Option<String>,
 
