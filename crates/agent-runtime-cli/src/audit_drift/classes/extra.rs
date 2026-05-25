@@ -5,12 +5,12 @@
 //! user's unrelated runtime state does not become audit input.
 
 use crate::audit_drift::{DriftReport, Finding, Severity};
-use crate::install::link_map::{EntryKind, LinkMap, LinkMapError};
+use crate::install::link_map::{LinkMap, LinkMapError};
+use crate::live_surface;
 use crate::render::manifest::{ManifestSet, ProductRoot, RuntimeRootsManifest, SourceRoot};
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 pub const CLASS: &str = "extra";
 
@@ -36,15 +36,16 @@ pub fn check(
         Err(err) => return Err(err.into()),
     };
 
-    let expected = expected_live_paths(root.path(), &link_map);
-    let scan_roots = scan_roots(&link_map);
+    let expected = live_surface::expected_live_paths(root.path(), &link_map);
+    let scan_roots = live_surface::scan_roots(&link_map);
     if scan_roots.is_empty() {
         return Ok(());
     }
 
-    let live_files = live_files_under_roots(&live_home, &scan_roots)?;
+    let live_files = live_surface::live_files_under_roots(&live_home, &scan_roots)
+        .with_context(|| format!("scan live home {}", live_home.display()))?;
     for rel in live_files {
-        if expected.contains(&rel) || ignored_live_file(&rel) {
+        if expected.contains(&rel) || live_surface::ignored_live_file(&rel) {
             continue;
         }
         report.push(Finding {
@@ -76,135 +77,6 @@ fn product_root<'a>(
 fn resolve_live_home(root: &ProductRoot) -> PathBuf {
     let env: BTreeMap<String, String> = std::env::vars().collect();
     PathBuf::from(expand_env_vars(&root.live_home, &env))
-}
-
-fn expected_live_paths(source_root: &Path, link_map: &LinkMap) -> BTreeSet<PathBuf> {
-    let mut out = BTreeSet::new();
-    for entry in &link_map.entries {
-        let Some(dest) = clean_rel_path(&entry.destination) else {
-            continue;
-        };
-        match entry.kind {
-            EntryKind::SymlinkedFile if entry.recursive => {
-                let Some(source) = entry.source.as_deref().and_then(clean_rel_path) else {
-                    continue;
-                };
-                let source_abs = source_root.join(source);
-                if source_abs.is_dir() {
-                    for rel in source_files(&source_abs) {
-                        out.insert(dest.join(rel));
-                    }
-                } else if source_abs.exists() {
-                    out.insert(dest);
-                }
-            }
-            EntryKind::SymlinkedFile
-            | EntryKind::PluginManifestCopy
-            | EntryKind::BackedUpOnReplace
-            | EntryKind::ManagedBlock => {
-                out.insert(dest);
-            }
-        }
-    }
-    out
-}
-
-fn scan_roots(link_map: &LinkMap) -> BTreeSet<PathBuf> {
-    let mut out = BTreeSet::new();
-    for entry in &link_map.entries {
-        let Some(dest) = clean_rel_path(&entry.destination) else {
-            continue;
-        };
-        match entry.kind {
-            EntryKind::SymlinkedFile if entry.recursive => {
-                out.insert(dest);
-            }
-            EntryKind::SymlinkedFile
-            | EntryKind::PluginManifestCopy
-            | EntryKind::BackedUpOnReplace => {
-                if let Some(parent) = dest.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    out.insert(parent.to_path_buf());
-                }
-            }
-            EntryKind::ManagedBlock => {}
-        }
-    }
-    out
-}
-
-fn source_files(root: &Path) -> BTreeSet<PathBuf> {
-    let mut out = BTreeSet::new();
-    collect_source_files(root, root, &mut out);
-    out
-}
-
-fn collect_source_files(root: &Path, dir: &Path, out: &mut BTreeSet<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            collect_source_files(root, &path, out);
-        } else if let Ok(rel) = path.strip_prefix(root) {
-            out.insert(rel.to_path_buf());
-        }
-    }
-}
-
-fn live_files_under_roots(
-    live_home: &Path,
-    roots: &BTreeSet<PathBuf>,
-) -> Result<BTreeSet<PathBuf>> {
-    let mut out = BTreeSet::new();
-    for rel_root in roots {
-        collect_live_files(live_home, rel_root, &mut out)?;
-    }
-    Ok(out)
-}
-
-fn collect_live_files(live_home: &Path, rel: &Path, out: &mut BTreeSet<PathBuf>) -> Result<()> {
-    let path = live_home.join(rel);
-    let Ok(meta) = fs::symlink_metadata(&path) else {
-        return Ok(());
-    };
-    if meta.file_type().is_symlink() || meta.is_file() {
-        out.insert(rel.to_path_buf());
-        return Ok(());
-    }
-    if !meta.is_dir() {
-        return Ok(());
-    }
-
-    let entries = fs::read_dir(&path).with_context(|| format!("read {}", path.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("read {}", path.display()))?;
-        collect_live_files(live_home, &rel.join(entry.file_name()), out)?;
-    }
-    Ok(())
-}
-
-fn clean_rel_path(path: impl AsRef<str>) -> Option<PathBuf> {
-    let path = Path::new(path.as_ref());
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return None;
-    }
-    if path
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return None;
-    }
-    Some(path.to_path_buf())
-}
-
-fn ignored_live_file(path: &Path) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some(".DS_Store")
 }
 
 fn expand_env_vars(raw: &str, env: &BTreeMap<String, String>) -> String {

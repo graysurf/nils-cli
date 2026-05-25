@@ -25,7 +25,9 @@ pub mod commands;
 pub mod doctor;
 pub mod gc_backups;
 pub mod install;
+pub mod live_surface;
 pub mod managed_block;
+pub mod prune_stale;
 pub mod purge_state;
 pub mod render;
 pub mod restore_backups;
@@ -60,6 +62,8 @@ pub enum Command {
     ListSkills(commands::list_skills::ListSkillsArgs),
     /// Render standardized PR / MR bodies for forge-cli create flows.
     PrBody(commands::pr_body::PrBodyArgs),
+    /// Remove stale managed runtime-home surfaces.
+    PruneStale(commands::prune_stale::PruneStaleArgs),
     /// Restore a runtime home from a recorded backup snapshot.
     RestoreBackups(commands::restore_backups::RestoreBackupsArgs),
     /// Purge runtime-managed state (use with caution).
@@ -77,6 +81,7 @@ impl Command {
             Command::GcBackups(_) => "gc-backups",
             Command::ListSkills(_) => "list-skills",
             Command::PrBody(_) => "pr-body",
+            Command::PruneStale(_) => "prune-stale",
             Command::RestoreBackups(_) => "restore-backups",
             Command::PurgeState(_) => "purge-state",
         }
@@ -147,6 +152,13 @@ pub fn run() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(err) => {
                 eprintln!("agent-runtime pr-body: {err:#}");
+                ExitCode::from(2)
+            }
+        },
+        Command::PruneStale(args) => match commands::prune_stale::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime prune-stale: {err:#}");
                 ExitCode::from(2)
             }
         },
