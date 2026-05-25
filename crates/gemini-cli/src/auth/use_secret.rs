@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::auth;
 use crate::auth::output;
+use nils_common::provider_runtime::auth::{SecretFileResolution, resolve_secret_file_by_email};
 
 pub fn run(target: &str) -> i32 {
     run_with_json(target, false)
@@ -75,8 +76,8 @@ pub fn run_with_json(target: &str, output_json: bool) -> i32 {
         return code;
     }
 
-    match resolve_by_email(&secret_dir, target) {
-        ResolveResult::Exact(name) => {
+    match resolve_secret_file_by_email(&secret_dir, target) {
+        SecretFileResolution::Exact(name) => {
             let (code, auth_file) = apply_secret(&secret_dir, &name, output_json);
             if output_json && code == 0 {
                 let _ = output::emit_result(
@@ -91,7 +92,7 @@ pub fn run_with_json(target: &str, output_json: bool) -> i32 {
             }
             code
         }
-        ResolveResult::Ambiguous { candidates } => {
+        SecretFileResolution::Ambiguous { candidates } => {
             if output_json {
                 let _ = output::emit_error(
                     "auth use",
@@ -111,7 +112,7 @@ pub fn run_with_json(target: &str, output_json: bool) -> i32 {
             }
             2
         }
-        ResolveResult::NotFound => {
+        SecretFileResolution::NotFound => {
             if output_json {
                 let _ = output::emit_error(
                     "auth use",
@@ -171,105 +172,6 @@ fn apply_secret(secret_dir: &Path, secret_name: &str, output_json: bool) -> (i32
     (0, Some(auth_file.display().to_string()))
 }
 
-fn resolve_by_email(secret_dir: &Path, target: &str) -> ResolveResult {
-    let query = target.to_lowercase();
-    let want_full = target.contains('@');
-
-    let mut matches = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(secret_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let email = match auth::email_from_auth_file(&path) {
-                Ok(Some(value)) => value,
-                _ => continue,
-            };
-            let email_lower = email.to_lowercase();
-            if want_full {
-                if email_lower == query {
-                    matches.push(file_name(&path));
-                }
-            } else if let Some(local_part) = email_lower.split('@').next()
-                && local_part == query
-            {
-                matches.push(file_name(&path));
-            }
-        }
-    }
-
-    if matches.len() == 1 {
-        ResolveResult::Exact(matches.remove(0))
-    } else if matches.is_empty() {
-        ResolveResult::NotFound
-    } else {
-        ResolveResult::Ambiguous {
-            candidates: matches,
-        }
-    }
-}
-
 fn secret_timestamp_path(target_file: &Path) -> Option<PathBuf> {
     crate::paths::resolve_secret_timestamp_path(target_file)
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-#[derive(Debug)]
-enum ResolveResult {
-    Exact(String),
-    Ambiguous { candidates: Vec<String> },
-    NotFound,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ResolveResult, resolve_by_email};
-
-    const HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
-    const PAYLOAD_ALPHA: &str = "eyJzdWIiOiJ1c2VyXzEyMyIsImVtYWlsIjoiYWxwaGFAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoidXNlcl8xMjMiLCJlbWFpbCI6ImFscGhhQGV4YW1wbGUuY29tIn19";
-    const PAYLOAD_BETA: &str = "eyJzdWIiOiJ1c2VyXzQ1NiIsImVtYWlsIjoiYmV0YUBleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyXzQ1NiIsImVtYWlsIjoiYmV0YUBleGFtcGxlLmNvbSJ9fQ";
-
-    fn token(payload: &str) -> String {
-        format!("{HEADER}.{payload}.sig")
-    }
-
-    fn auth_json(payload: &str) -> String {
-        format!(
-            r#"{{"tokens":{{"id_token":"{}","access_token":"{}"}}}}"#,
-            token(payload),
-            token(payload)
-        )
-    }
-
-    #[test]
-    fn resolve_by_email_supports_full_and_local_part_lookup() {
-        let dir = std::env::temp_dir().join(format!(
-            "gemini-use-test-{}-{}",
-            std::process::id(),
-            super::super::now_epoch_seconds()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-
-        std::fs::write(dir.join("alpha.json"), auth_json(PAYLOAD_ALPHA)).expect("alpha");
-        std::fs::write(dir.join("beta.json"), auth_json(PAYLOAD_BETA)).expect("beta");
-
-        match resolve_by_email(&dir, "alpha@example.com") {
-            ResolveResult::Exact(name) => assert_eq!(name, "alpha.json"),
-            other => panic!("expected exact alpha match, got {other:?}"),
-        }
-        match resolve_by_email(&dir, "beta") {
-            ResolveResult::Exact(name) => assert_eq!(name, "beta.json"),
-            other => panic!("expected exact beta match, got {other:?}"),
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
