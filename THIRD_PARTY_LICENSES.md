@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `ce4323e37e0a7b10e4b577e907e6033558ccea254a4064c27045ee6369a79e98`
+- Cargo.lock SHA256: `44d5eebd7c33137172f1c6278106bfd816eb8dacfa8793fc246b4b5fa6143e30`
 - Third-party crates (`source != null`): 465
 - Workspace crates (`source == null`, excluded below): 31
 
@@ -319,7 +319,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | regex-automata | 0.4.14 | MIT OR Apache-2.0 | crates.io |
 | regex-bites | 0.1.6 | MIT OR Apache-2.0 | crates.io |
 | regex-syntax | 0.8.10 | MIT OR Apache-2.0 | crates.io |
-| reqwest | 0.13.3 | MIT OR Apache-2.0 | crates.io |
+| reqwest | 0.13.4 | MIT OR Apache-2.0 | crates.io |
 | resvg | 0.47.0 | Apache-2.0 OR MIT | crates.io |
 | rgb | 0.8.53 | MIT | crates.io |
 | ring | 0.17.14 | Apache-2.0 AND ISC | crates.io |

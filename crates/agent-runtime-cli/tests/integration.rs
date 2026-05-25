@@ -35,6 +35,8 @@ mod list_skills;
 mod managed_block;
 #[path = "integration/pr_body.rs"]
 mod pr_body;
+#[path = "integration/prune_stale.rs"]
+mod prune_stale;
 #[path = "integration/purge_state.rs"]
 mod purge_state;
 #[path = "integration/render.rs"]

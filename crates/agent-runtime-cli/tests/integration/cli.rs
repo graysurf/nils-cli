@@ -20,6 +20,7 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "gc-backups",
     "list-skills",
     "pr-body",
+    "prune-stale",
     "restore-backups",
     "purge-state",
 ];
