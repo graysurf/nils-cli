@@ -309,7 +309,7 @@ fn pr_grouping_label(grouping: PrGrouping) -> &'static str {
 fn normalize_branch_prefix(value: &str) -> String {
     let trimmed = value.trim().trim_end_matches('/');
     if trimmed.is_empty() {
-        "issue".to_string()
+        "feat".to_string()
     } else {
         trimmed.to_string()
     }
@@ -318,7 +318,7 @@ fn normalize_branch_prefix(value: &str) -> String {
 fn normalize_worktree_prefix(value: &str) -> String {
     let trimmed = value.trim().trim_end_matches(['-', '_']);
     if trimmed.is_empty() {
-        "issue".to_string()
+        "feat".to_string()
     } else {
         trimmed.to_string()
     }

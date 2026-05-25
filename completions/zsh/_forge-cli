@@ -61,7 +61,7 @@ _arguments "${_arguments_options[@]}" : \
 '--title=[PR / MR title (required)]:TITLE:_default' \
 '(--body-file)--body=[PR / MR body / description text. Mutually exclusive with \`--body-file\`]:BODY:_default' \
 '--body-file=[Read PR / MR body from a file. Use \`-\` to read from stdin]:PATH:_default' \
-'--kind=[PR / MR kind (selects branch-prefix rule). Required]:KIND:(feature bug)' \
+'--kind=[PR / MR kind (selects branch-prefix rule). Required]:KIND:(feature bug chore docs ci refactor)' \
 '*--reviewer=[Add a reviewer (repeatable)]:USER:_default' \
 '*--label=[Add a label (repeatable)]:LABEL:_default' \
 '--label-catalog=[Validate labels against this catalog when \`--strict-labels\` is set]:PATH:_default' \
@@ -228,7 +228,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (deliver)
 _arguments "${_arguments_options[@]}" : \
-'--kind=[PR / MR kind (selects branch-prefix rule). Required]:KIND:(feature bug)' \
+'--kind=[PR / MR kind (selects branch-prefix rule). Required]:KIND:(feature bug chore docs ci refactor)' \
 '--title=[PR / MR title (required)]:TITLE:_default' \
 '(--body-file)--body=[PR / MR body / description text. Mutually exclusive with \`--body-file\`]:BODY:_default' \
 '--body-file=[Read PR / MR body from a file. Use \`-\` to read from stdin]:PATH:_default' \
