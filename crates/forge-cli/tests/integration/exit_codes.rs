@@ -15,7 +15,7 @@ const GH_AUTH_OK: &str = "\
 #!/bin/sh
 cat <<'EOF' 1>&2
 github.com
-  ✓ Logged in to github.com account graysurf (keyring)
+  ✓ Logged in to github.com account testuser-gh (keyring)
 EOF
 ";
 

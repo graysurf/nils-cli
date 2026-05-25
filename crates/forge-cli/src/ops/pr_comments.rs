@@ -440,10 +440,10 @@ mod tests {
     fn gitlab_project_path_from_mr_url_handles_nested_groups() {
         assert_eq!(
             gitlab_project_path_from_url(
-                "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/merge_requests/12"
+                "https://gitlab.com/graysury/nils-cli-gitlab-sandbox/-/merge_requests/12"
             )
             .as_deref(),
-            Some("terrylin/agent-runtime-testing")
+            Some("graysury/nils-cli-gitlab-sandbox")
         );
         assert_eq!(
             gitlab_project_path_from_url("https://gitlab.com/group/sub/project/-/merge_requests/3")
@@ -498,14 +498,14 @@ mod tests {
         };
         let comments = parse_gitlab_notes(
             &output,
-            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/merge_requests/12",
+            "https://gitlab.com/graysury/nils-cli-gitlab-sandbox/-/merge_requests/12",
         )
         .unwrap();
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].author, "alice");
         assert_eq!(
             comments[0].url,
-            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/merge_requests/12#note_1"
+            "https://gitlab.com/graysury/nils-cli-gitlab-sandbox/-/merge_requests/12#note_1"
         );
         assert_eq!(comments[1].author, "bob");
     }

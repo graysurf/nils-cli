@@ -54,7 +54,7 @@ pub struct Repo {
     /// `owner/repo` (GitHub) or `group[/subgroup]/project` (GitLab).
     pub slug: String,
     /// Provider host as it appears in the remote URL (e.g. `github.com`,
-    /// `gitlab.gamania.com`). `None` when the provider was inferred without
+    /// `gitlab.com`). `None` when the provider was inferred without
     /// a host (e.g. bare `--repo owner/repo` default).
     pub host: Option<String>,
 }
@@ -314,7 +314,6 @@ mod tests {
     fn classify_host_recognises_github_and_gitlab() {
         assert_eq!(classify_host("github.com"), Some(Provider::GitHub));
         assert_eq!(classify_host("gitlab.com"), Some(Provider::GitLab));
-        assert_eq!(classify_host("gitlab.gamania.com"), Some(Provider::GitLab));
         assert_eq!(classify_host("bitbucket.org"), None);
     }
 
@@ -328,10 +327,10 @@ mod tests {
                 "github.com",
             ),
             (
-                "git@gitlab.gamania.com:terrylin/agent-runtime-testing.git",
+                "git@gitlab.com:graysury/nils-cli-gitlab-sandbox.git",
                 Provider::GitLab,
-                "terrylin/agent-runtime-testing",
-                "gitlab.gamania.com",
+                "graysury/nils-cli-gitlab-sandbox",
+                "gitlab.com",
             ),
             (
                 "https://gitlab.com/group/sub/project",
@@ -358,9 +357,9 @@ mod tests {
                 Provider::GitHub,
             ),
             (
-                "https://gitlab.gamania.com/terrylin/agent-runtime-testing.git",
-                "terrylin/agent-runtime-testing",
-                "gitlab.gamania.com",
+                "https://gitlab.com/graysury/nils-cli-gitlab-sandbox.git",
+                "graysury/nils-cli-gitlab-sandbox",
+                "gitlab.com",
                 Provider::GitLab,
             ),
             (

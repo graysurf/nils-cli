@@ -150,7 +150,7 @@ case "$1 $2" in
   "auth status")
     cat <<'EOF' 1>&2
 github.com
-  ✓ Logged in to github.com account graysurf (keyring)
+  ✓ Logged in to github.com account testuser-gh (keyring)
   - Token scopes: 'repo', 'read:org'
 EOF
     ;;
