@@ -96,6 +96,13 @@ pub struct RecordAuditArgs {
     /// Expected profile. When omitted, all recognized markers are reported.
     #[arg(long, value_enum)]
     pub profile: Option<RecordProfile>,
+
+    /// Also run the visible-completeness lint against the latest comment body
+    /// per role. Produces stable role-specific failure codes
+    /// (`state-missing-task-ledger`, `validation-missing-overall`, …) in the
+    /// `visible` block of the audit result.
+    #[arg(long = "expect-visible", default_value_t = false)]
+    pub expect_visible: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize)]

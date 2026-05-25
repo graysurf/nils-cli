@@ -17,8 +17,9 @@
 
 use crate::lifecycle_record::PayloadRole;
 
-/// Heading text used in the visible body for a lifecycle role.
-pub const HEADING_SOURCE: &str = "## Plan Source Snapshot";
+/// Heading text used in the visible body for a lifecycle role. The headings
+/// match `docs/source/plan-issue-redesign/plan-tracking-issue-comment-taxonomy-v1.md`.
+pub const HEADING_SOURCE: &str = "## Source Snapshot";
 pub const HEADING_PLAN: &str = "## Plan Snapshot";
 pub const HEADING_STATE: &str = "## Execution State";
 pub const HEADING_SESSION: &str = "## Execution Session";
@@ -264,5 +265,63 @@ mod tests {
             .required_visible_sections
             .iter()
             .any(|h| *h == "## Task Ledger"));
+    }
+
+    #[test]
+    fn registry_headings_match_taxonomy_doc() {
+        // Canonical headings come from
+        // docs/source/plan-issue-redesign/plan-tracking-issue-comment-taxonomy-v1.md
+        // — keep in lockstep with the taxonomy table to prevent silent drift.
+        let expected: Vec<(PayloadRole, &'static str)> = vec![
+            (PayloadRole::Source, "## Source Snapshot"),
+            (PayloadRole::Plan, "## Plan Snapshot"),
+            (PayloadRole::State, "## Execution State"),
+            (PayloadRole::Session, "## Execution Session"),
+            (PayloadRole::Validation, "## Validation Evidence"),
+            (PayloadRole::Review, "## Review Evidence"),
+            (PayloadRole::Closeout, "## Tracking Issue Closeout"),
+        ];
+        for (role_id, heading) in expected {
+            assert_eq!(
+                role(role_id).default_heading,
+                heading,
+                "role {role_id:?} heading drift"
+            );
+        }
+    }
+
+    #[test]
+    fn every_role_has_visible_section_and_payload_schema() {
+        for spec in all_roles() {
+            assert!(
+                !spec.required_visible_sections.is_empty(),
+                "role {:?} has no required visible sections",
+                spec.role
+            );
+            // Every role advertises a payload schema identifier.
+            assert!(
+                !spec.payload_schema.as_str().is_empty(),
+                "role {:?} payload schema is empty",
+                spec.role
+            );
+        }
+    }
+
+    #[test]
+    fn direct_post_policy_matches_taxonomy() {
+        // source/plan are owned by record open|attach. closeout is owned by
+        // record close. All other roles allow direct record post.
+        for spec in all_roles() {
+            let expected = match spec.role {
+                PayloadRole::Source | PayloadRole::Plan => DirectPostPolicy::OpenAttachOnly,
+                PayloadRole::Closeout => DirectPostPolicy::RecordCloseOwned,
+                _ => DirectPostPolicy::Allowed,
+            };
+            assert_eq!(
+                spec.direct_post, expected,
+                "role {:?} direct-post policy drift",
+                spec.role
+            );
+        }
     }
 }

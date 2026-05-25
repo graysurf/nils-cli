@@ -360,6 +360,42 @@ pub fn audit_record(
     })
 }
 
+/// Return the latest visible comment body per lifecycle role, indexed by
+/// [`PayloadRole`]. Mirrors the latest-per-role selection inside
+/// [`audit_record`] and is the input the visible-completeness lint operates
+/// on (see [`crate::lifecycle_vnext::visible_lint`]).
+///
+/// `profile_filter` matches the same semantics as [`audit_record`] —
+/// comments whose marker carries a different profile are skipped.
+pub fn latest_role_bodies(
+    comments_json: &str,
+    profile_filter: Option<crate::commands::record::RecordProfile>,
+) -> Result<BTreeMap<PayloadRole, String>, String> {
+    let mut comments = parse_comments_json(comments_json)?;
+    comments.sort_by(|left, right| {
+        compare_created_at(right.created_at.as_deref(), left.created_at.as_deref())
+    });
+    let mut bodies: BTreeMap<PayloadRole, String> = BTreeMap::new();
+    for comment in comments {
+        let Some(body) = comment.body.as_deref() else {
+            continue;
+        };
+        let Some(first_marker) = first_comment_marker(body) else {
+            continue;
+        };
+        let Some(parsed) = parse_marker_line(first_marker) else {
+            continue;
+        };
+        if let MarkerParse::V2 { role, profile } = parsed {
+            if profile_filter.is_some_and(|expected| profile != PayloadProfile::from(expected)) {
+                continue;
+            }
+            bodies.entry(role).or_insert_with(|| body.to_string());
+        }
+    }
+    Ok(bodies)
+}
+
 /// Compare two RFC3339 created-at strings. `None` is considered older than
 /// any `Some(_)`. This keeps latest-by-role selection deterministic even
 /// when GitHub returns comments out of order.
@@ -825,7 +861,18 @@ pub const PAYLOAD_SCHEMA_V2: &str = "plan-issue-record.payload.v2";
 pub const PAYLOAD_FENCE_INFO: &str = "plan-issue-record-payload";
 const PAYLOAD_COMMENT_PREFIX: &str = "plan-issue-record-payload:hex:";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum PayloadRole {
     Source,

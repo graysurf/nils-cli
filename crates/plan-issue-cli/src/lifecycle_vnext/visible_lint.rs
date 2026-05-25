@@ -3,7 +3,6 @@
 //! The lint rejects Profile-only bodies and enforces role-specific visible
 //! sections from
 //! `docs/source/plan-issue-redesign/plan-tracking-issue-comment-taxonomy-v1.md`.
-//! Full rules implemented in Task 2.2.
 //!
 //! Reusable surface:
 //!
@@ -14,12 +13,45 @@
 use crate::lifecycle_record::PayloadRole;
 use crate::lifecycle_vnext::registry::{self, RoleSpec};
 
-/// Stable, role-specific failure code emitted by the lint.
-///
-/// Codes carry a structured prefix per role so runtime-kit and skill smoke
-/// can assert specific gaps (`state-missing-task-ledger`,
-/// `validation-missing-overall`, …). The full catalog is finalized in
-/// Task 2.2.
+/// Stable, role-specific failure codes emitted by the lint. Runtime-kit
+/// smoke and skill flows pattern-match on these strings, so each code is
+/// documented next to where it can be returned.
+pub mod codes {
+    // Generic.
+    pub const PROFILE_ONLY: &str = "profile-only";
+
+    // Heading presence (registry-driven).
+    pub const SOURCE_MISSING_HEADING: &str = "source-missing-heading";
+    pub const PLAN_MISSING_HEADING: &str = "plan-missing-heading";
+    pub const STATE_MISSING_HEADING: &str = "state-missing-heading";
+    pub const SESSION_MISSING_HEADING: &str = "session-missing-heading";
+    pub const VALIDATION_MISSING_HEADING: &str = "validation-missing-heading";
+    pub const REVIEW_MISSING_HEADING: &str = "review-missing-heading";
+    pub const CLOSEOUT_MISSING_HEADING: &str = "closeout-missing-heading";
+
+    // State.
+    pub const STATE_MISSING_TASK_LEDGER: &str = "state-missing-task-ledger";
+    pub const STATE_FINAL_TASK_LEDGER_NOT_EXPANDED: &str = "state-final-task-ledger-not-expanded";
+
+    // Session.
+    pub const SESSION_MISSING_SUMMARY: &str = "session-missing-summary";
+
+    // Validation.
+    pub const VALIDATION_MISSING_OVERALL: &str = "validation-missing-overall";
+    pub const VALIDATION_MISSING_COMMANDS_OR_WAIVER: &str =
+        "validation-missing-commands-or-waiver";
+
+    // Review.
+    pub const REVIEW_MISSING_DECISION: &str = "review-missing-decision";
+    pub const REVIEW_MISSING_DISPOSITION: &str = "review-missing-disposition";
+
+    // Closeout.
+    pub const CLOSEOUT_MISSING_FINAL_STATUS: &str = "closeout-missing-final-status";
+    pub const CLOSEOUT_MISSING_APPROVAL: &str = "closeout-missing-approval";
+    pub const CLOSEOUT_MISSING_LINKED_PR: &str = "closeout-missing-linked-pr";
+}
+
+/// Single lint finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisibleFinding {
     pub role: PayloadRole,
@@ -51,34 +83,51 @@ impl VisibleReport {
     pub fn push(&mut self, finding: VisibleFinding) {
         self.findings.push(finding);
     }
+
+    pub fn codes(&self) -> Vec<&'static str> {
+        self.findings.iter().map(|f| f.code).collect()
+    }
 }
 
-/// Hints that callers can pass to refine lint behavior. The full set is
-/// expanded in Task 2.2 (Task Ledger display mode, presence of findings,
-/// linked PRs, etc.).
+/// Hints that callers pass to refine lint behavior beyond the registry
+/// defaults. `state_is_final` and `review_has_findings` mirror the taxonomy
+/// rules from the comment taxonomy doc.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LintHints {
-    /// `true` when the caller is rendering the final state checkpoint and the
-    /// Task Ledger must be expanded. Non-final state may collapse rows.
+    /// `true` when the caller is rendering the final state checkpoint and
+    /// the Task Ledger must be expanded. Non-final state may collapse rows
+    /// but must keep the `## Task Ledger` heading visible.
     pub state_is_final: bool,
     /// `true` when review findings are present and the review comment must
     /// include a disposition row.
     pub review_has_findings: bool,
+    /// `true` when closeout intentionally has no linked PR (docs-only or
+    /// admin closeout). The closeout body must then carry an explicit
+    /// `Linked PRs: none` note instead of a PR row.
+    pub closeout_has_no_linked_pr_ok: bool,
 }
 
-/// Run the visible-completeness lint against a rendered Markdown body for the
-/// supplied lifecycle role.
-///
-/// The Task 1.1 skeleton only checks that the required headings from the
-/// registry appear verbatim. Task 2.2 expands the implementation to cover
-/// Task Ledger structure, validation status, review disposition, session
-/// summary, and closeout approval + linked PR evidence.
+/// Run the visible-completeness lint against a rendered Markdown body for
+/// the supplied lifecycle role.
 pub fn lint_visible(role: PayloadRole, body: &str, hints: LintHints) -> VisibleReport {
     let spec = registry::role(role);
     let mut report = VisibleReport::default();
+
+    check_profile_only(spec, body, &mut report);
     check_required_headings(spec, body, &mut report);
-    // Task 2.2 adds the role-specific rule blocks below this line.
-    let _ = hints;
+
+    match role {
+        PayloadRole::Source | PayloadRole::Plan => {
+            // Heading presence + non-Profile-only check is enough; snapshot
+            // bodies carry the `<details>` element from the taxonomy template.
+        }
+        PayloadRole::State => check_state(body, hints, &mut report),
+        PayloadRole::Session => check_session(body, &mut report),
+        PayloadRole::Validation => check_validation(body, &mut report),
+        PayloadRole::Review => check_review(body, hints, &mut report),
+        PayloadRole::Closeout => check_closeout(body, hints, &mut report),
+    }
+
     report
 }
 
@@ -97,18 +146,264 @@ fn check_required_headings(spec: &RoleSpec, body: &str, report: &mut VisibleRepo
     }
 }
 
+fn check_profile_only(spec: &RoleSpec, body: &str, report: &mut VisibleReport) {
+    if is_profile_only_body(body, spec.default_heading) {
+        report.push(VisibleFinding::new(
+            spec.role,
+            codes::PROFILE_ONLY,
+            format!(
+                "rendered {role} body has nothing beyond the role heading and `Profile:` line",
+                role = spec.marker_role
+            ),
+        ));
+    }
+}
+
+fn check_state(body: &str, hints: LintHints, report: &mut VisibleReport) {
+    if !body_contains_heading(body, "## Task Ledger") {
+        report.push(VisibleFinding::new(
+            PayloadRole::State,
+            codes::STATE_MISSING_TASK_LEDGER,
+            "state body must include a visible `## Task Ledger` heading",
+        ));
+    }
+    if hints.state_is_final && task_ledger_appears_collapsed(body) {
+        report.push(VisibleFinding::new(
+            PayloadRole::State,
+            codes::STATE_FINAL_TASK_LEDGER_NOT_EXPANDED,
+            "final state must expand the Task Ledger rows (no `<details>` wrapper)",
+        ));
+    }
+}
+
+fn check_session(body: &str, report: &mut VisibleReport) {
+    let summary_present = body.lines().any(|line| {
+        let trimmed = line.trim();
+        let prefix = "- Summary:";
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            !rest.trim().is_empty()
+        } else {
+            false
+        }
+    });
+    if !summary_present {
+        report.push(VisibleFinding::new(
+            PayloadRole::Session,
+            codes::SESSION_MISSING_SUMMARY,
+            "session body must contain a non-empty `- Summary:` line",
+        ));
+    }
+}
+
+fn check_validation(body: &str, report: &mut VisibleReport) {
+    let overall = body.lines().any(|line| {
+        let trimmed = line.trim();
+        let prefix = "- Overall:";
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            !rest.trim().is_empty()
+        } else {
+            false
+        }
+    });
+    if !overall {
+        report.push(VisibleFinding::new(
+            PayloadRole::Validation,
+            codes::VALIDATION_MISSING_OVERALL,
+            "validation body must contain a `- Overall: pass|partial|fail` line",
+        ));
+    }
+    // Commands table OR a Waivers section is required to back the overall.
+    let has_command_row = body_contains_validation_command_row(body);
+    let has_waiver = body_contains_heading(body, "### Waivers")
+        || body.lines().any(|line| line.trim_start().starts_with("- `"));
+    if !has_command_row && !has_waiver {
+        report.push(VisibleFinding::new(
+            PayloadRole::Validation,
+            codes::VALIDATION_MISSING_COMMANDS_OR_WAIVER,
+            "validation body must include at least one command row or an explicit waiver",
+        ));
+    }
+}
+
+fn check_review(body: &str, hints: LintHints, report: &mut VisibleReport) {
+    let decision_present = body.lines().any(|line| {
+        let trimmed = line.trim();
+        let prefix = "- Decision:";
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            !rest.trim().is_empty()
+        } else {
+            false
+        }
+    });
+    if !decision_present {
+        report.push(VisibleFinding::new(
+            PayloadRole::Review,
+            codes::REVIEW_MISSING_DECISION,
+            "review body must contain a `- Decision:` line with approve|request-changes|comments-only",
+        ));
+    }
+    if hints.review_has_findings && !body_contains_review_disposition_row(body) {
+        report.push(VisibleFinding::new(
+            PayloadRole::Review,
+            codes::REVIEW_MISSING_DISPOSITION,
+            "review body has findings but no disposition row in the findings table",
+        ));
+    }
+}
+
+fn check_closeout(body: &str, hints: LintHints, report: &mut VisibleReport) {
+    let final_status_present = body.lines().any(|line| {
+        let trimmed = line.trim();
+        let prefix = "- Final status:";
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            !rest.trim().is_empty()
+        } else {
+            false
+        }
+    });
+    if !final_status_present {
+        report.push(VisibleFinding::new(
+            PayloadRole::Closeout,
+            codes::CLOSEOUT_MISSING_FINAL_STATUS,
+            "closeout body must contain a `- Final status:` line",
+        ));
+    }
+    let approval_present = body.lines().any(|line| {
+        let trimmed = line.trim();
+        let prefix = "- Approval:";
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            !rest.trim().is_empty()
+        } else {
+            false
+        }
+    });
+    if !approval_present {
+        report.push(VisibleFinding::new(
+            PayloadRole::Closeout,
+            codes::CLOSEOUT_MISSING_APPROVAL,
+            "closeout body must contain a `- Approval:` line",
+        ));
+    }
+    if !hints.closeout_has_no_linked_pr_ok && !body_contains_closeout_linked_pr_evidence(body) {
+        report.push(VisibleFinding::new(
+            PayloadRole::Closeout,
+            codes::CLOSEOUT_MISSING_LINKED_PR,
+            "closeout body must include linked PR evidence or an explicit no-PR note",
+        ));
+    }
+}
+
 fn body_contains_heading(body: &str, heading: &str) -> bool {
     body.lines().any(|line| line.trim_end() == heading)
 }
 
+fn task_ledger_appears_collapsed(body: &str) -> bool {
+    // Heuristic: look at the section between `## Task Ledger` and the next
+    // h2 heading. If a `<details>` opens before any table row appears, the
+    // ledger is collapsed.
+    let mut in_section = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed == "## Task Ledger" {
+            in_section = true;
+            continue;
+        }
+        if in_section && trimmed.starts_with("## ") {
+            return false;
+        }
+        if in_section {
+            if trimmed.starts_with("<details") {
+                return true;
+            }
+            if trimmed.starts_with("| ") {
+                return false;
+            }
+        }
+    }
+    false
+}
+
+fn body_contains_validation_command_row(body: &str) -> bool {
+    body.lines().any(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            return false;
+        }
+        // Reject header and separator rows.
+        if trimmed.contains("| Command") || trimmed.contains("---") {
+            return false;
+        }
+        // A real command row is fenced with backticks somewhere in the row.
+        trimmed.contains('`')
+    })
+}
+
+fn body_contains_review_disposition_row(body: &str) -> bool {
+    let dispositions = ["fixed", "residual", "follow-up", "deferred", "no-action"];
+    body.lines().any(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            return false;
+        }
+        if trimmed.contains("Disposition") || trimmed.contains("---") {
+            return false;
+        }
+        dispositions.iter().any(|d| trimmed.contains(d))
+    })
+}
+
+fn body_contains_closeout_linked_pr_evidence(body: &str) -> bool {
+    // Accept either a Markdown table row with a PR-looking cell or an
+    // explicit `- Linked PRs:` line.
+    let table_row = body.lines().any(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') || trimmed.contains("---") || trimmed.contains("| PR ") {
+            return false;
+        }
+        trimmed.contains('#') || trimmed.contains("http")
+    });
+    let linked_line = body.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("- Linked PR")
+            || trimmed.starts_with("- PR:")
+            || trimmed.starts_with("- Linked PRs:")
+    });
+    table_row || linked_line
+}
+
+fn is_profile_only_body(body: &str, default_heading: &str) -> bool {
+    let mut saw_heading = false;
+    let mut saw_profile = false;
+    let mut saw_other_content = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("<!--") || trimmed.ends_with("-->") {
+            continue;
+        }
+        if trimmed == default_heading {
+            saw_heading = true;
+            continue;
+        }
+        if trimmed.starts_with("- Profile:") {
+            saw_profile = true;
+            continue;
+        }
+        saw_other_content = true;
+    }
+    saw_heading && saw_profile && !saw_other_content
+}
+
 fn missing_heading_code(role: PayloadRole) -> &'static str {
     match role {
-        PayloadRole::Source => "source-missing-heading",
-        PayloadRole::Plan => "plan-missing-heading",
-        PayloadRole::State => "state-missing-heading",
-        PayloadRole::Session => "session-missing-heading",
-        PayloadRole::Validation => "validation-missing-heading",
-        PayloadRole::Review => "review-missing-heading",
-        PayloadRole::Closeout => "closeout-missing-heading",
+        PayloadRole::Source => codes::SOURCE_MISSING_HEADING,
+        PayloadRole::Plan => codes::PLAN_MISSING_HEADING,
+        PayloadRole::State => codes::STATE_MISSING_HEADING,
+        PayloadRole::Session => codes::SESSION_MISSING_HEADING,
+        PayloadRole::Validation => codes::VALIDATION_MISSING_HEADING,
+        PayloadRole::Review => codes::REVIEW_MISSING_HEADING,
+        PayloadRole::Closeout => codes::CLOSEOUT_MISSING_HEADING,
     }
 }

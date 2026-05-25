@@ -17,6 +17,10 @@ mod grouping_default;
 mod help_snapshot;
 #[path = "integration/lifecycle_record.rs"]
 mod lifecycle_record;
+#[path = "integration/lifecycle_vnext_registry.rs"]
+mod lifecycle_vnext_registry;
+#[path = "integration/visible_lint.rs"]
+mod visible_lint;
 #[path = "integration/link_pr_flow.rs"]
 mod link_pr_flow;
 #[path = "integration/live_issue_ops.rs"]
@@ -29,6 +33,8 @@ mod live_start_sprint_runtime_truth;
 mod output_contract;
 #[path = "integration/parity_guardrails.rs"]
 mod parity_guardrails;
+#[path = "integration/record_audit.rs"]
+mod record_audit;
 #[path = "integration/record_compat_baseline.rs"]
 mod record_compat_baseline;
 #[path = "integration/resolve_approval.rs"]

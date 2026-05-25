@@ -1499,10 +1499,120 @@ fn run_record_audit(args: &RecordAuditArgs) -> Result<Value, CommandError> {
     let audit = lifecycle_record::audit_record(body.as_deref(), &comments_json, args.profile)
         .map_err(|err| CommandError::runtime("record-audit-failed", err))?;
 
-    Ok(json!({
+    let mut payload = json!({
         "operation": "audit",
         "audit": audit,
+    });
+
+    if args.expect_visible {
+        let visible = run_record_audit_visible(&audit, &comments_json, args.profile)?;
+        payload["visible"] = visible;
+    }
+
+    Ok(payload)
+}
+
+fn run_record_audit_visible(
+    audit: &lifecycle_record::RecordAudit,
+    comments_json: &str,
+    profile_filter: Option<crate::commands::record::RecordProfile>,
+) -> Result<Value, CommandError> {
+    use crate::lifecycle_vnext::registry;
+    use crate::lifecycle_vnext::visible_lint;
+
+    let bodies = lifecycle_record::latest_role_bodies(comments_json, profile_filter)
+        .map_err(|err| CommandError::runtime("record-audit-visible-failed", err))?;
+
+    let mut role_reports: Vec<Value> = Vec::new();
+    let mut all_codes: Vec<&'static str> = Vec::new();
+    let mut overall_pass = true;
+
+    // Walk roles in canonical order so the output is deterministic regardless
+    // of HashMap iteration order.
+    for spec in registry::all_roles() {
+        let key = spec.marker_role.to_string();
+        let evidence = audit.evidence.get(&key);
+        let body = bodies.get(&spec.role);
+
+        let mut report_value = json!({
+            "role": spec.marker_role,
+            "present": evidence.is_some(),
+            "checked": body.is_some(),
+        });
+
+        if let Some(body) = body {
+            let hints = derive_lint_hints(spec.role, evidence);
+            let report = visible_lint::lint_visible(spec.role, body, hints);
+            let codes: Vec<&'static str> = report.codes();
+            if !report.is_pass() {
+                overall_pass = false;
+            }
+            all_codes.extend(report.codes());
+            let findings: Vec<Value> = report
+                .findings
+                .iter()
+                .map(|f| {
+                    json!({
+                        "code": f.code,
+                        "message": f.message,
+                    })
+                })
+                .collect();
+            report_value["pass"] = Value::Bool(report.is_pass());
+            report_value["codes"] = json!(codes);
+            report_value["findings"] = Value::Array(findings);
+        } else {
+            // No comment for this role; nothing to lint here. The
+            // `audit.missing_required` block already names whether the role
+            // is mandatory.
+            report_value["pass"] = Value::Bool(true);
+            report_value["codes"] = json!([] as [&str; 0]);
+            report_value["findings"] = Value::Array(Vec::new());
+        }
+
+        role_reports.push(report_value);
+    }
+
+    Ok(json!({
+        "expect_visible": true,
+        "overall_pass": overall_pass,
+        "codes": all_codes,
+        "roles": role_reports,
     }))
+}
+
+fn derive_lint_hints(
+    role: crate::lifecycle_record::PayloadRole,
+    evidence: Option<&crate::lifecycle_record::LifecycleEvidence>,
+) -> crate::lifecycle_vnext::visible_lint::LintHints {
+    use crate::lifecycle_record::PayloadRole;
+    use crate::lifecycle_vnext::visible_lint::LintHints;
+
+    let mut hints = LintHints::default();
+    let payload = evidence.and_then(|ev| ev.payload.as_ref());
+
+    match role {
+        PayloadRole::State => {
+            // Final state when the structured payload reports `complete`.
+            if let Some(payload) = payload {
+                if let Ok(state) = payload.parse_state() {
+                    hints.state_is_final = matches!(
+                        state.status,
+                        Some(crate::lifecycle_record::StateStatus::Complete)
+                    );
+                }
+            }
+        }
+        PayloadRole::Review => {
+            if let Some(payload) = payload {
+                if let Ok(review) = payload.parse_review() {
+                    hints.review_has_findings = !review.findings.is_empty();
+                }
+            }
+        }
+        _ => {}
+    }
+    hints
 }
 
 fn run_build_task_spec(args: &BuildTaskSpecArgs) -> Result<Value, CommandError> {

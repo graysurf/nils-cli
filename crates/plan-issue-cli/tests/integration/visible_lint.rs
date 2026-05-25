@@ -1,0 +1,344 @@
+//! Visible-completeness lint coverage (Task 2.2).
+//!
+//! For every lifecycle role, exercise one passing fixture and one or more
+//! failing fixtures so failure codes stay stable and Hidden-payload success
+//! alone cannot satisfy visible completeness.
+//!
+//! Source: `docs/source/plan-issue-redesign/plan-tracking-issue-comment-taxonomy-v1.md`.
+
+use plan_issue_cli::lifecycle_record::PayloadRole;
+use plan_issue_cli::lifecycle_vnext::visible_lint::{LintHints, codes, lint_visible};
+
+fn body_pass_state_non_final() -> String {
+    "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n\
+     ## Execution State\n\n\
+     - Profile: tracking\n\
+     - Status: in-progress\n\
+     - Target scope: vNext sprint 2\n\
+     - Current task: 2.2\n\n\
+     ## Task Ledger\n\n\
+     <details><summary>Show task ledger</summary>\n\n\
+     | ID | Status | Task |\n\
+     | --- | --- | --- |\n\
+     | 2.1 | done | registry |\n\
+     | 2.2 | in-progress | visible-lint |\n\n\
+     </details>\n"
+        .to_string()
+}
+
+fn body_pass_state_final_expanded() -> String {
+    "## Execution State\n\n\
+     - Profile: tracking\n\
+     - Status: complete\n\
+     - Target scope: vNext sprint 2\n\n\
+     ## Task Ledger\n\n\
+     | ID | Status | Task |\n\
+     | --- | --- | --- |\n\
+     | 2.1 | done | registry |\n\
+     | 2.2 | done | visible-lint |\n"
+        .to_string()
+}
+
+#[test]
+fn visible_lint_state_passing_non_final() {
+    let report = lint_visible(
+        PayloadRole::State,
+        &body_pass_state_non_final(),
+        LintHints::default(),
+    );
+    assert!(
+        report.is_pass(),
+        "non-final state should lint clean; findings={:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn visible_lint_state_final_must_expand_task_ledger() {
+    let hints = LintHints {
+        state_is_final: true,
+        ..LintHints::default()
+    };
+    let collapsed = body_pass_state_non_final();
+    let report = lint_visible(PayloadRole::State, &collapsed, hints);
+    assert!(
+        report
+            .codes()
+            .contains(&codes::STATE_FINAL_TASK_LEDGER_NOT_EXPANDED),
+        "final state with collapsed ledger should fail; codes={:?}",
+        report.codes()
+    );
+}
+
+#[test]
+fn visible_lint_state_final_expanded_passes() {
+    let hints = LintHints {
+        state_is_final: true,
+        ..LintHints::default()
+    };
+    let report = lint_visible(PayloadRole::State, &body_pass_state_final_expanded(), hints);
+    assert!(
+        report.is_pass(),
+        "expanded final state should lint clean; findings={:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn visible_lint_state_missing_task_ledger_is_blocked() {
+    let body = "## Execution State\n\n- Profile: tracking\n- Status: in-progress\n";
+    let report = lint_visible(PayloadRole::State, body, LintHints::default());
+    assert!(
+        report.codes().contains(&codes::STATE_MISSING_TASK_LEDGER),
+        "codes={:?}",
+        report.codes()
+    );
+}
+
+#[test]
+fn visible_lint_session_requires_non_empty_summary() {
+    let pass = "## Execution Session\n\n- Profile: tracking\n- Summary: implemented vNext registry\n";
+    let fail = "## Execution Session\n\n- Profile: tracking\n- Summary: \n";
+
+    let ok = lint_visible(PayloadRole::Session, pass, LintHints::default());
+    assert!(ok.is_pass(), "{:?}", ok.findings);
+
+    let bad = lint_visible(PayloadRole::Session, fail, LintHints::default());
+    assert!(
+        bad.codes().contains(&codes::SESSION_MISSING_SUMMARY),
+        "codes={:?}",
+        bad.codes()
+    );
+}
+
+#[test]
+fn visible_lint_validation_requires_overall_and_evidence() {
+    let pass = "## Validation Evidence\n\n\
+                - Profile: tracking\n\
+                - Overall: pass\n\n\
+                | Command | Status | Evidence |\n\
+                | --- | --- | --- |\n\
+                | `cargo test` | pass | log.txt |\n";
+    let no_overall = "## Validation Evidence\n\n- Profile: tracking\n\n| Command |\n|---|\n| `cargo test` |\n";
+    let no_evidence = "## Validation Evidence\n\n- Profile: tracking\n- Overall: pass\n";
+
+    let ok = lint_visible(PayloadRole::Validation, pass, LintHints::default());
+    assert!(ok.is_pass(), "{:?}", ok.findings);
+
+    let bad1 = lint_visible(PayloadRole::Validation, no_overall, LintHints::default());
+    assert!(
+        bad1.codes().contains(&codes::VALIDATION_MISSING_OVERALL),
+        "codes={:?}",
+        bad1.codes()
+    );
+
+    let bad2 = lint_visible(PayloadRole::Validation, no_evidence, LintHints::default());
+    assert!(
+        bad2.codes()
+            .contains(&codes::VALIDATION_MISSING_COMMANDS_OR_WAIVER),
+        "codes={:?}",
+        bad2.codes()
+    );
+}
+
+#[test]
+fn visible_lint_review_decision_and_disposition() {
+    let pass_with_findings = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: approve\n\n\
+        | ID | Severity | Disposition | Summary |\n\
+        | --- | --- | --- | --- |\n\
+        | F1 | minor | fixed | tiny nit |\n";
+    let pass_no_findings = "## Review Evidence\n\n- Profile: tracking\n- Decision: comments-only\n";
+    let no_decision = "## Review Evidence\n\n- Profile: tracking\n";
+    let with_findings_no_disposition = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: approve\n\n\
+        | ID | Severity | Disposition | Summary |\n\
+        | --- | --- | --- | --- |\n\
+        | F1 | minor | TBD | tiny nit |\n";
+
+    let hints_findings = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    let ok = lint_visible(PayloadRole::Review, pass_with_findings, hints_findings);
+    assert!(ok.is_pass(), "{:?}", ok.findings);
+
+    let ok_empty = lint_visible(
+        PayloadRole::Review,
+        pass_no_findings,
+        LintHints::default(),
+    );
+    assert!(ok_empty.is_pass(), "{:?}", ok_empty.findings);
+
+    let bad_no_decision = lint_visible(PayloadRole::Review, no_decision, LintHints::default());
+    assert!(
+        bad_no_decision
+            .codes()
+            .contains(&codes::REVIEW_MISSING_DECISION),
+        "codes={:?}",
+        bad_no_decision.codes()
+    );
+
+    let bad_missing_disposition = lint_visible(
+        PayloadRole::Review,
+        with_findings_no_disposition,
+        hints_findings,
+    );
+    assert!(
+        bad_missing_disposition
+            .codes()
+            .contains(&codes::REVIEW_MISSING_DISPOSITION),
+        "codes={:?}",
+        bad_missing_disposition.codes()
+    );
+}
+
+#[test]
+fn visible_lint_closeout_requires_approval_and_linked_pr() {
+    let pass = "## Tracking Issue Closeout\n\n\
+        - Profile: tracking\n\
+        - Final status: complete\n\
+        - Approval: https://example.com/approval\n\n\
+        | PR | Merge SHA | Checks |\n\
+        | --- | --- | --- |\n\
+        | owner/repo#123 | abc123 | pass |\n";
+    let no_approval = "## Tracking Issue Closeout\n\n\
+        - Profile: tracking\n\
+        - Final status: complete\n\n\
+        | PR | Merge SHA |\n\
+        | --- | --- |\n\
+        | owner/repo#1 | x |\n";
+    let no_pr = "## Tracking Issue Closeout\n\n\
+        - Profile: tracking\n\
+        - Final status: complete\n\
+        - Approval: approver text\n";
+    let no_pr_with_note = "## Tracking Issue Closeout\n\n\
+        - Profile: tracking\n\
+        - Final status: complete\n\
+        - Approval: approver text\n\
+        - Linked PRs: none (docs-only)\n";
+
+    let ok = lint_visible(PayloadRole::Closeout, pass, LintHints::default());
+    assert!(ok.is_pass(), "{:?}", ok.findings);
+
+    let bad1 = lint_visible(PayloadRole::Closeout, no_approval, LintHints::default());
+    assert!(
+        bad1.codes().contains(&codes::CLOSEOUT_MISSING_APPROVAL),
+        "codes={:?}",
+        bad1.codes()
+    );
+
+    let bad2 = lint_visible(PayloadRole::Closeout, no_pr, LintHints::default());
+    assert!(
+        bad2.codes().contains(&codes::CLOSEOUT_MISSING_LINKED_PR),
+        "codes={:?}",
+        bad2.codes()
+    );
+
+    let allow_no_pr = LintHints {
+        closeout_has_no_linked_pr_ok: true,
+        ..LintHints::default()
+    };
+    let bad_should_pass = lint_visible(PayloadRole::Closeout, no_pr_with_note, allow_no_pr);
+    assert!(
+        bad_should_pass.is_pass(),
+        "explicit no-PR note should satisfy linked-PR rule: {:?}",
+        bad_should_pass.findings
+    );
+}
+
+#[test]
+fn visible_lint_source_and_plan_reject_profile_only() {
+    let source_pass = "## Source Snapshot\n\n\
+        - Profile: tracking\n\
+        - Path: `docs/plans/foo/foo.md`\n\
+        - Commit: `abc1234`\n";
+    let source_profile_only = "## Source Snapshot\n\n- Profile: tracking\n";
+
+    let ok = lint_visible(PayloadRole::Source, source_pass, LintHints::default());
+    assert!(ok.is_pass(), "{:?}", ok.findings);
+
+    let bad = lint_visible(PayloadRole::Source, source_profile_only, LintHints::default());
+    assert!(
+        bad.codes().contains(&codes::PROFILE_ONLY),
+        "codes={:?}",
+        bad.codes()
+    );
+
+    let plan_pass = "## Plan Snapshot\n\n\
+        - Profile: tracking\n\
+        - Path: `docs/plans/foo/foo-plan.md`\n";
+    let plan_profile_only = "## Plan Snapshot\n\n- Profile: tracking\n";
+
+    let ok_plan = lint_visible(PayloadRole::Plan, plan_pass, LintHints::default());
+    assert!(ok_plan.is_pass(), "{:?}", ok_plan.findings);
+
+    let bad_plan = lint_visible(PayloadRole::Plan, plan_profile_only, LintHints::default());
+    assert!(
+        bad_plan.codes().contains(&codes::PROFILE_ONLY),
+        "codes={:?}",
+        bad_plan.codes()
+    );
+}
+
+#[test]
+fn visible_lint_rejects_profile_only_state_body() {
+    let body = "## Execution State\n\n- Profile: tracking\n";
+    let report = lint_visible(PayloadRole::State, body, LintHints::default());
+    // Profile-only state also missing Task Ledger; both codes should be
+    // reported so callers can act on either path.
+    assert!(report.codes().contains(&codes::PROFILE_ONLY));
+    assert!(report.codes().contains(&codes::STATE_MISSING_TASK_LEDGER));
+}
+
+#[test]
+fn visible_lint_missing_heading_returns_role_specific_code() {
+    let bodies: Vec<(PayloadRole, &str, &str)> = vec![
+        (
+            PayloadRole::Source,
+            "- Profile: tracking\n",
+            codes::SOURCE_MISSING_HEADING,
+        ),
+        (
+            PayloadRole::Plan,
+            "- Profile: tracking\n",
+            codes::PLAN_MISSING_HEADING,
+        ),
+        (
+            PayloadRole::State,
+            "- Profile: tracking\n",
+            codes::STATE_MISSING_HEADING,
+        ),
+        (
+            PayloadRole::Session,
+            "- Profile: tracking\n",
+            codes::SESSION_MISSING_HEADING,
+        ),
+        (
+            PayloadRole::Validation,
+            "- Profile: tracking\n",
+            codes::VALIDATION_MISSING_HEADING,
+        ),
+        (
+            PayloadRole::Review,
+            "- Profile: tracking\n",
+            codes::REVIEW_MISSING_HEADING,
+        ),
+        (
+            PayloadRole::Closeout,
+            "- Profile: tracking\n",
+            codes::CLOSEOUT_MISSING_HEADING,
+        ),
+    ];
+    for (role_id, body, expected) in bodies {
+        let report = lint_visible(role_id, body, LintHints::default());
+        assert!(
+            report.codes().contains(&expected),
+            "role {role_id:?} missing-heading code drift: {:?}",
+            report.codes()
+        );
+    }
+}
