@@ -20,10 +20,12 @@ private, default branch `main`). Tracker: [sympoies/nils-cli#514](https://github
 | # | Command shape | Envelope | Result |
 | --- | --- | --- | --- |
 | 1 | `forge-cli issue list --state all --repo graysury/nils-cli-gitlab-sandbox` | `01-issue-list.json` | `ok=true`, empty list |
-| 2 | `forge-cli auth status --repo graysury/nils-cli-gitlab-sandbox` | `02-auth-status.json` | `ok=true`, host=`gitlab.com`, user=`graysury` |
+| 2 | `forge-cli auth status --repo graysury/nils-cli-gitlab-sandbox` | `02-auth-status.json` | `ok=true`, host=`gitlab.com`, user=`<authenticated-user>` (redacted) |
 | 3 | `forge-cli pr create --kind feature --head feat/sweep-test --base main` | `03-pr-create.json` | `ok=true`, MR #1 opened as draft |
 | 4 | `forge-cli pr view 1` | `04-pr-view.json` | `ok=true`, state=`open`, draft=`true` |
 | 5 | `forge-cli pr close 1` | `05-pr-close.json` | `ok=true`, state=`closed` |
+
+The `user` field in `02-auth-status.json` was redacted to `<authenticated-user>` to keep the plan's "no pinned maintainer identity" intent consistent with the committed evidence; the live response surfaced the actual gitlab.com username, which is not load-bearing for the AC.
 
 All envelopes are `ok=true`. Plan AC-5 satisfied:
 
