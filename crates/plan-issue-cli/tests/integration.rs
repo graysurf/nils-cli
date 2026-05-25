@@ -29,6 +29,8 @@ mod live_start_sprint_runtime_truth;
 mod output_contract;
 #[path = "integration/parity_guardrails.rs"]
 mod parity_guardrails;
+#[path = "integration/record_compat_baseline.rs"]
+mod record_compat_baseline;
 #[path = "integration/resolve_approval.rs"]
 mod resolve_approval;
 #[path = "integration/runtime_layout_parity.rs"]

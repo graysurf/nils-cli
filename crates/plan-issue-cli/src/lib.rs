@@ -7,12 +7,14 @@ mod forge_cli_adapter;
 mod github;
 mod issue_body;
 pub mod lifecycle_record;
+pub mod lifecycle_vnext;
 pub mod output;
 mod provider;
 mod render;
 pub mod runtime_layout;
 pub mod state;
 mod task_spec;
+pub mod tracking;
 
 use std::ffi::OsString;
 
