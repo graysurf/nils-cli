@@ -61,6 +61,13 @@ pub enum LifecycleCommentKind {
     Closeout,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+pub enum TaskLedgerDisplay {
+    Auto,
+    Collapsed,
+    Expanded,
+}
+
 impl LifecycleCommentKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -192,9 +199,25 @@ pub struct RecordPostArgs {
     #[arg(long = "payload-file", value_name = "path")]
     pub payload_file: Option<PathBuf>,
 
+    /// Markdown execution-state document for state lifecycle comments.
+    #[arg(
+        long = "execution-state-file",
+        value_name = "path",
+        conflicts_with = "summary_file"
+    )]
+    pub execution_state_file: Option<PathBuf>,
+
     /// Visible Markdown commentary appended after the structured payload.
     #[arg(long = "summary-file", value_name = "path")]
     pub summary_file: Option<PathBuf>,
+
+    /// Task Ledger display mode for state lifecycle comments.
+    #[arg(
+        long = "task-ledger-display",
+        value_enum,
+        default_value_t = TaskLedgerDisplay::Auto
+    )]
+    pub task_ledger_display: TaskLedgerDisplay,
 
     /// Add a label alongside the lifecycle comment in live mode. Repeatable.
     #[arg(long = "add-label", value_name = "NAME")]

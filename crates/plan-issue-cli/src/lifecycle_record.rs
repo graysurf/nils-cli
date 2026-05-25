@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::commands::record::{LifecycleCommentKind, RecordProfile};
+use crate::commands::record::{LifecycleCommentKind, RecordProfile, TaskLedgerDisplay};
 
 #[derive(Debug, Clone)]
 pub struct DashboardInput {
@@ -1109,6 +1109,8 @@ pub struct CloseoutData {
     #[serde(default)]
     pub linked_prs: Vec<LinkedPrEvidence>,
     #[serde(default)]
+    pub non_required_check_override: Option<Value>,
+    #[serde(default)]
     pub final_validation_url: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
@@ -1507,6 +1509,24 @@ pub fn render_record_post_comment(
     summary: Option<&str>,
     updated_at: Option<&str>,
 ) -> Result<String, String> {
+    render_record_post_comment_with_display(
+        profile,
+        kind,
+        payload_data,
+        summary,
+        updated_at,
+        TaskLedgerDisplay::Auto,
+    )
+}
+
+pub fn render_record_post_comment_with_display(
+    profile: RecordProfile,
+    kind: LifecycleCommentKind,
+    payload_data: Value,
+    summary: Option<&str>,
+    updated_at: Option<&str>,
+    task_ledger_display: TaskLedgerDisplay,
+) -> Result<String, String> {
     if matches!(
         kind,
         LifecycleCommentKind::Source | LifecycleCommentKind::Plan
@@ -1517,6 +1537,8 @@ pub fn render_record_post_comment(
         ));
     }
 
+    let visible_content =
+        render_visible_post_content(kind, &payload_data, summary, task_ledger_display)?;
     let envelope = RecordPayload {
         schema: PAYLOAD_SCHEMA_V2.to_string(),
         role: payload_role_for_kind(kind),
@@ -1535,13 +1557,477 @@ pub fn render_record_post_comment(
     out.push(format!("## {heading}"));
     out.push(String::new());
     out.push(format!("- Profile: {}", profile.as_str()));
-    if let Some(text) = summary.map(str::trim).filter(|value| !value.is_empty()) {
-        out.push(String::new());
-        out.push(text.to_string());
-    }
+    out.push(visible_content);
     out.push(String::new());
     out.push(envelope_carrier);
     Ok(finalize_markdown(out))
+}
+
+fn render_visible_post_content(
+    kind: LifecycleCommentKind,
+    payload_data: &Value,
+    summary: Option<&str>,
+    task_ledger_display: TaskLedgerDisplay,
+) -> Result<String, String> {
+    let summary = summary.map(str::trim).filter(|value| !value.is_empty());
+    let generated = match kind {
+        LifecycleCommentKind::State => {
+            let state = serde_json::from_value::<StateData>(payload_data.clone())
+                .map_err(|err| format!("state payload invalid for visible rendering: {err}"))?;
+            match summary {
+                Some(text) if text.contains("## Task Ledger") => {
+                    render_state_markdown_with_task_ledger_display(
+                        text,
+                        task_ledger_display,
+                        &state,
+                    )?
+                }
+                Some(text) => text.to_string(),
+                None => render_state_payload_visible(&state),
+            }
+        }
+        LifecycleCommentKind::Session => {
+            let session = serde_json::from_value::<SessionData>(payload_data.clone())
+                .map_err(|err| format!("session payload invalid for visible rendering: {err}"))?;
+            combine_summary_and_generated(
+                summary,
+                render_session_payload_visible(&session, payload_data),
+            )
+        }
+        LifecycleCommentKind::Validation => {
+            let validation = serde_json::from_value::<ValidationData>(payload_data.clone())
+                .map_err(|err| {
+                    format!("validation payload invalid for visible rendering: {err}")
+                })?;
+            combine_summary_and_generated(summary, render_validation_payload_visible(&validation))
+        }
+        LifecycleCommentKind::Review => {
+            let review = serde_json::from_value::<ReviewData>(payload_data.clone())
+                .map_err(|err| format!("review payload invalid for visible rendering: {err}"))?;
+            combine_summary_and_generated(summary, render_review_payload_visible(&review))
+        }
+        LifecycleCommentKind::Closeout => {
+            let closeout = serde_json::from_value::<CloseoutData>(payload_data.clone())
+                .map_err(|err| format!("closeout payload invalid for visible rendering: {err}"))?;
+            combine_summary_and_generated(summary, render_closeout_payload_visible(&closeout))
+        }
+        LifecycleCommentKind::Source | LifecycleCommentKind::Plan => unreachable!(),
+    };
+
+    if generated.trim().is_empty() {
+        return Err(format!(
+            "`record post --kind {}` would render no visible lifecycle content",
+            kind.as_str()
+        ));
+    }
+    Ok(generated)
+}
+
+fn combine_summary_and_generated(summary: Option<&str>, generated: String) -> String {
+    match (summary, generated.trim().is_empty()) {
+        (Some(text), false) => format!("{}\n\n{}", text.trim(), generated.trim()),
+        (Some(text), true) => text.trim().to_string(),
+        (None, _) => generated,
+    }
+}
+
+fn render_state_markdown_with_task_ledger_display(
+    markdown: &str,
+    display: TaskLedgerDisplay,
+    state: &StateData,
+) -> Result<String, String> {
+    let markdown = normalize_state_markdown_for_comment(markdown)?;
+    let effective = match display {
+        TaskLedgerDisplay::Expanded => TaskLedgerDisplay::Expanded,
+        TaskLedgerDisplay::Collapsed => TaskLedgerDisplay::Collapsed,
+        TaskLedgerDisplay::Auto => {
+            if is_terminal_state(state) {
+                TaskLedgerDisplay::Expanded
+            } else {
+                TaskLedgerDisplay::Collapsed
+            }
+        }
+    };
+    if effective == TaskLedgerDisplay::Expanded {
+        return Ok(markdown);
+    }
+
+    let lines: Vec<&str> = markdown.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|line| line.trim() == "## Task Ledger")
+    else {
+        return Err("execution-state markdown is missing `## Task Ledger`".to_string());
+    };
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(idx, line)| {
+            if line.starts_with("## ") {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(lines.len());
+    let body = lines[start + 1..end].join("\n").trim().to_string();
+    if body.is_empty() {
+        return Err("execution-state Task Ledger section is empty".to_string());
+    }
+
+    let mut out = Vec::new();
+    out.extend(lines[..=start].iter().map(|line| (*line).to_string()));
+    out.push(String::new());
+    out.push("<details>".to_string());
+    out.push("<summary>Show task ledger</summary>".to_string());
+    out.push(String::new());
+    out.push(body);
+    out.push(String::new());
+    out.push("</details>".to_string());
+    if end < lines.len() {
+        out.push(String::new());
+        out.extend(lines[end..].iter().map(|line| (*line).to_string()));
+    }
+    Ok(finalize_markdown(out).trim().to_string())
+}
+
+fn normalize_state_markdown_for_comment(markdown: &str) -> Result<String, String> {
+    let stripped = markdown
+        .trim()
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with("<!-- plan-issue-record:")
+                && !trimmed.starts_with("<!-- execute-from-tracking-issue:")
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let Some(execution_heading) = stripped
+        .iter()
+        .position(|line| line.trim() == "## Execution State")
+    else {
+        return Err("execution-state markdown is missing `## Execution State`".to_string());
+    };
+
+    let mut out = stripped
+        .into_iter()
+        .skip(execution_heading + 1)
+        .filter(|line| !line.trim().starts_with("- Profile:"))
+        .collect::<Vec<_>>();
+    while out.first().is_some_and(|line| line.trim().is_empty()) {
+        out.remove(0);
+    }
+    let normalized = finalize_markdown(out).trim().to_string();
+    if normalized.is_empty() {
+        return Err("execution-state markdown has no visible state content".to_string());
+    }
+    Ok(normalized)
+}
+
+fn is_terminal_state(state: &StateData) -> bool {
+    state.status == Some(StateStatus::Complete)
+        && state
+            .tasks
+            .iter()
+            .all(|task| matches!(task.status, TaskRowStatus::Done | TaskRowStatus::Deferred))
+}
+
+fn render_state_payload_visible(state: &StateData) -> String {
+    let mut out = Vec::new();
+    if let Some(status) = state.status {
+        out.push(format!("- Status: {}", status_state_label(status)));
+    }
+    if let Some(value) = state
+        .target_scope
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        out.push(format!("- Target scope: {value}"));
+    }
+    if let Some(value) = state.current.as_deref().filter(|value| !value.is_empty()) {
+        out.push(format!("- Current task: {value}"));
+    }
+    if let Some(value) = state
+        .next_action
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        out.push(format!("- Next task: {value}"));
+    }
+    if !state.tasks.is_empty() {
+        out.push(String::new());
+        out.push("## Task Ledger".to_string());
+        out.push(String::new());
+        out.push("| ID | Status | Task |".to_string());
+        out.push("| --- | --- | --- |".to_string());
+        for task in &state.tasks {
+            out.push(format!(
+                "| {} | {} | {} |",
+                table_cell(&task.id),
+                table_cell(task_row_status_label(task.status)),
+                table_cell(task.title.as_deref().unwrap_or(""))
+            ));
+        }
+    }
+    finalize_markdown(out).trim().to_string()
+}
+
+fn render_session_payload_visible(session: &SessionData, raw: &Value) -> String {
+    let mut out = vec![format!("- Summary: {}", session.summary.trim())];
+    if !session.highlights.is_empty() {
+        out.push(String::new());
+        out.push("### Highlights".to_string());
+        out.push(String::new());
+        for item in &session.highlights {
+            out.push(format!("- {}", item.trim()));
+        }
+    }
+    if !session.links.is_empty() {
+        out.push(String::new());
+        out.push("### Links".to_string());
+        out.push(String::new());
+        for (key, value) in &session.links {
+            out.push(format!("- {}: {}", key.trim(), value.trim()));
+        }
+    }
+    if let Some(object) = raw.as_object() {
+        let extras = object
+            .iter()
+            .filter(|(key, value)| {
+                !matches!(key.as_str(), "summary" | "highlights" | "links") && !value.is_null()
+            })
+            .collect::<Vec<_>>();
+        if !extras.is_empty() {
+            out.push(String::new());
+            out.push("### Session Fields".to_string());
+            out.push(String::new());
+            for (key, value) in extras {
+                out.push(format!("- {}: {}", key.trim(), visible_value(value)));
+            }
+        }
+    }
+    finalize_markdown(out).trim().to_string()
+}
+
+fn render_validation_payload_visible(validation: &ValidationData) -> String {
+    let mut out = vec![format!(
+        "- Overall: {}",
+        validation_overall_label(validation.overall)
+    )];
+    if !validation.commands.is_empty() {
+        out.push(String::new());
+        out.push("| Command | Status | Evidence |".to_string());
+        out.push("| --- | --- | --- |".to_string());
+        for command in &validation.commands {
+            out.push(format!(
+                "| {} | {} | {} |",
+                table_cell(&command.command),
+                table_cell(validation_command_status_label(command.status)),
+                table_cell(command.evidence.as_deref().unwrap_or(""))
+            ));
+        }
+    }
+    if !validation.waivers.is_empty() {
+        out.push(String::new());
+        out.push("### Waivers".to_string());
+        out.push(String::new());
+        for waiver in &validation.waivers {
+            out.push(format!(
+                "- `{}`: {}",
+                waiver.command.trim(),
+                waiver.reason.trim()
+            ));
+        }
+    }
+    finalize_markdown(out).trim().to_string()
+}
+
+fn render_review_payload_visible(review: &ReviewData) -> String {
+    let mut out = vec![format!(
+        "- Decision: {}",
+        review_decision_label(review.decision)
+    )];
+    if !review.lenses.is_empty() {
+        out.push(format!("- Lenses: {}", review.lenses.join(", ")));
+    }
+    if let Some(url) = review
+        .outcome_comment_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        out.push(format!("- Outcome comment: {}", url.trim()));
+    }
+    if !review.findings.is_empty() {
+        out.push(String::new());
+        out.push("| ID | Severity | Disposition | Summary |".to_string());
+        out.push("| --- | --- | --- | --- |".to_string());
+        for finding in &review.findings {
+            out.push(format!(
+                "| {} | {} | {} | {} |",
+                table_cell(&finding.id),
+                table_cell(finding_severity_label(finding.severity)),
+                table_cell(finding_disposition_label(finding.disposition)),
+                table_cell(&finding.summary)
+            ));
+        }
+    }
+    finalize_markdown(out).trim().to_string()
+}
+
+fn render_closeout_payload_visible(closeout: &CloseoutData) -> String {
+    let mut out = vec![format!("- Final status: {}", closeout.final_status.trim())];
+    if let Some(approver) = closeout
+        .approval
+        .approver
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        out.push(format!("- Approver: {}", approver.trim()));
+    }
+    if let Some(url) = closeout
+        .approval
+        .comment_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        out.push(format!("- Approval: {}", url.trim()));
+    }
+    if let Some(url) = closeout
+        .final_validation_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        out.push(format!("- Final validation: {}", url.trim()));
+    }
+    if let Some(notes) = closeout
+        .notes
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        out.push(format!("- Notes: {}", notes.trim()));
+    }
+    if let Some(override_block) = closeout
+        .non_required_check_override
+        .as_ref()
+        .filter(|value| !value.is_null())
+    {
+        out.push(String::new());
+        out.push("### Non-required Check Override".to_string());
+        out.push(String::new());
+        if let Some(reason) = override_block
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            out.push(format!("- Reason: {}", reason.trim()));
+        }
+        if let Some(failures) = override_block
+            .get("observed_non_required_failures")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+        {
+            out.push(format!(
+                "- Observed failures: {}",
+                failures
+                    .iter()
+                    .map(visible_value)
+                    .filter(|value| !value.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    out.push(String::new());
+    if closeout.linked_prs.is_empty() {
+        out.push("- Linked PRs: none".to_string());
+    } else {
+        out.push("| PR | Merge SHA | Checks | Required | Non-required failures |".to_string());
+        out.push("| --- | --- | --- | --- | --- |".to_string());
+        for pr in &closeout.linked_prs {
+            let pr_label = pr.url.as_deref().unwrap_or(&pr.pr_ref);
+            let required = pr
+                .required_state
+                .map(check_status_label)
+                .unwrap_or("unknown");
+            let required_count = pr
+                .required_count
+                .map(|count| format!(" ({count})"))
+                .unwrap_or_default();
+            out.push(format!(
+                "| {} | {} | {} | {}{} | {} |",
+                table_cell(pr_label),
+                table_cell(pr.merge_sha.as_deref().unwrap_or("")),
+                table_cell(check_status_label(pr.checks)),
+                table_cell(required),
+                required_count,
+                table_cell(&non_empty_join(&pr.non_required_failures, "none"))
+            ));
+        }
+    }
+    finalize_markdown(out).trim().to_string()
+}
+
+fn task_row_status_label(status: TaskRowStatus) -> &'static str {
+    match status {
+        TaskRowStatus::Pending => "pending",
+        TaskRowStatus::InProgress => "in-progress",
+        TaskRowStatus::Done => "done",
+        TaskRowStatus::Deferred => "deferred",
+    }
+}
+
+fn validation_command_status_label(status: ValidationCommandStatus) -> &'static str {
+    match status {
+        ValidationCommandStatus::Pass => "pass",
+        ValidationCommandStatus::Fail => "fail",
+        ValidationCommandStatus::Skipped => "skipped",
+    }
+}
+
+fn finding_severity_label(severity: FindingSeverity) -> &'static str {
+    match severity {
+        FindingSeverity::Blocker => "blocker",
+        FindingSeverity::Major => "major",
+        FindingSeverity::Minor => "minor",
+        FindingSeverity::Nit => "nit",
+    }
+}
+
+fn finding_disposition_label(disposition: FindingDisposition) -> &'static str {
+    match disposition {
+        FindingDisposition::Fixed => "fixed",
+        FindingDisposition::Residual => "residual",
+        FindingDisposition::FollowUp => "follow-up",
+        FindingDisposition::Deferred => "deferred",
+        FindingDisposition::NoAction => "no-action",
+    }
+}
+
+fn check_status_label(status: CheckStatus) -> &'static str {
+    match status {
+        CheckStatus::Pass => "pass",
+        CheckStatus::Fail => "fail",
+        CheckStatus::None => "none",
+    }
+}
+
+fn table_cell(value: &str) -> String {
+    value.trim().replace('|', "\\|").replace('\n', "<br>")
+}
+
+fn visible_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Array(items) => items
+            .iter()
+            .map(visible_value)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Object(_) => value.to_string(),
+        Value::Null => String::new(),
+        _ => value.to_string(),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2357,6 +2843,114 @@ mod sprint3_tests {
         assert_eq!(payload.schema, PAYLOAD_SCHEMA_V2);
         assert_eq!(payload.role, PayloadRole::State);
         assert!(body.contains("session summary"), "{body}");
+    }
+
+    #[test]
+    fn render_record_post_comment_synthesizes_validation_review_and_closeout() {
+        let validation = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Validation,
+            json!({
+                "overall": "pass",
+                "commands": [{"command": "cargo test", "status": "pass", "evidence": "ok"}],
+                "waivers": []
+            }),
+            None,
+            None,
+        )
+        .expect("validation render");
+        assert!(validation.contains("- Overall: pass"), "{validation}");
+        assert!(
+            validation.contains("| cargo test | pass | ok |"),
+            "{validation}"
+        );
+        assert!(validation.contains(PAYLOAD_COMMENT_PREFIX), "{validation}");
+
+        let review = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Review,
+            json!({
+                "decision": "approve",
+                "lenses": ["testing", "maintainability"],
+                "findings": [{
+                    "id": "F1",
+                    "severity": "minor",
+                    "disposition": "fixed",
+                    "summary": "covered"
+                }],
+                "outcome_comment_url": "https://example.test/review"
+            }),
+            None,
+            None,
+        )
+        .expect("review render");
+        assert!(review.contains("- Decision: approve"), "{review}");
+        assert!(
+            review.contains("- Lenses: testing, maintainability"),
+            "{review}"
+        );
+        assert!(
+            review.contains("| F1 | minor | fixed | covered |"),
+            "{review}"
+        );
+
+        let closeout = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Closeout,
+            json!({
+                "final_status": "complete",
+                "approval": {"comment_url": "https://example.test/approval"},
+                "linked_prs": [{
+                    "ref": "owner/repo#1",
+                    "url": "https://example.test/pr/1",
+                    "merge_sha": "abc123",
+                    "checks": "pass",
+                    "required_state": "pass",
+                    "required_count": 2,
+                    "non_required_failures": []
+                }],
+                "non_required_check_override": {
+                    "reason": "operator accepted non-required lint",
+                    "observed_non_required_failures": ["owner/repo#1: opt-in/lint"]
+                },
+                "notes": "closed"
+            }),
+            Some("Closeout summary."),
+            None,
+        )
+        .expect("closeout render");
+        assert!(closeout.contains("Closeout summary."), "{closeout}");
+        assert!(closeout.contains("- Final status: complete"), "{closeout}");
+        assert!(
+            closeout.contains("| https://example.test/pr/1 | abc123 | pass | pass (2) | none |"),
+            "{closeout}"
+        );
+        assert!(
+            closeout.contains("- Reason: operator accepted non-required lint"),
+            "{closeout}"
+        );
+        assert!(
+            closeout.contains("- Observed failures: owner/repo#1: opt-in/lint"),
+            "{closeout}"
+        );
+
+        let no_pr_closeout = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Closeout,
+            json!({
+                "final_status": "complete",
+                "approval": {"comment_url": "https://example.test/approval"},
+                "linked_prs": [],
+                "notes": "closed without linked PR"
+            }),
+            Some("Closeout summary."),
+            None,
+        )
+        .expect("closeout render");
+        assert!(
+            no_pr_closeout.contains("- Linked PRs: none"),
+            "{no_pr_closeout}"
+        );
     }
 
     #[test]

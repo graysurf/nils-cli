@@ -5,7 +5,9 @@ use pretty_assertions::assert_eq;
 
 use plan_issue_cli::cli::{Cli, OutputFormat};
 use plan_issue_cli::commands::plan::LinkPrStatus;
-use plan_issue_cli::commands::record::{LifecycleCommentKind, RecordCommand, RecordProfile};
+use plan_issue_cli::commands::record::{
+    LifecycleCommentKind, RecordCommand, RecordProfile, TaskLedgerDisplay,
+};
 use plan_issue_cli::commands::{Command, PrGrouping, SplitStrategy};
 
 use crate::common;
@@ -782,6 +784,42 @@ fn cli_parse_contract_record_post_accepts_add_remove_label() {
             RecordCommand::Post(post) => {
                 assert_eq!(post.add_labels, vec!["state::blocked"]);
                 assert_eq!(post.remove_labels, vec!["state::in-progress"]);
+            }
+            other => panic!("unexpected record subcommand: {other:?}"),
+        },
+        other => panic!("unexpected command parsed: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_parse_contract_record_post_accepts_execution_state_file_and_display() {
+    let cli = Cli::try_parse_from([
+        "plan-issue",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--execution-state-file",
+        "docs/plans/example/example-execution-state.md",
+        "--task-ledger-display",
+        "collapsed",
+    ])
+    .expect("parse record post with execution state file");
+
+    cli.validate().expect("validation");
+
+    match &cli.command {
+        Command::Record(args) => match &args.command {
+            RecordCommand::Post(post) => {
+                assert_eq!(
+                    post.execution_state_file,
+                    Some(PathBuf::from(
+                        "docs/plans/example/example-execution-state.md"
+                    ))
+                );
+                assert_eq!(post.task_ledger_display, TaskLedgerDisplay::Collapsed);
             }
             other => panic!("unexpected record subcommand: {other:?}"),
         },

@@ -951,6 +951,22 @@ fn run_record_post(
         }
         _ => {}
     }
+    if args.execution_state_file.is_some()
+        && args.kind != crate::commands::record::LifecycleCommentKind::State
+    {
+        return Err(CommandError::usage(
+            "record-post-execution-state-file-kind-invalid",
+            "`record post --execution-state-file` is only valid with `--kind state`",
+        ));
+    }
+    if args.kind != crate::commands::record::LifecycleCommentKind::State
+        && args.task_ledger_display != crate::commands::record::TaskLedgerDisplay::Auto
+    {
+        return Err(CommandError::usage(
+            "record-post-task-ledger-display-kind-invalid",
+            "`record post --task-ledger-display` is only configurable with `--kind state`",
+        ));
+    }
 
     let payload_data = match &args.payload_file {
         Some(path) => read_payload_data(path)?,
@@ -966,16 +982,38 @@ fn run_record_post(
             ),
         )
     })?;
-    let summary = match &args.summary_file {
-        Some(path) => Some(read_text_file(path, "record-post-summary-read-failed")?),
-        None => None,
+    let summary = match (&args.execution_state_file, &args.summary_file) {
+        (Some(path), None) => {
+            let text = read_text_file(path, "record-post-execution-state-read-failed")?;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(CommandError::usage(
+                    "record-post-execution-state-empty",
+                    format!("execution-state file {} is empty", path.display()),
+                ));
+            }
+            if !trimmed.contains("## Task Ledger") {
+                return Err(CommandError::usage(
+                    "record-post-execution-state-task-ledger-missing",
+                    format!(
+                        "execution-state file {} must contain `## Task Ledger`",
+                        path.display()
+                    ),
+                ));
+            }
+            Some(text)
+        }
+        (None, Some(path)) => Some(read_text_file(path, "record-post-summary-read-failed")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both summary inputs"),
     };
-    let body = lifecycle_record::render_record_post_comment(
+    let body = lifecycle_record::render_record_post_comment_with_display(
         args.profile,
         args.kind,
         payload_data,
         summary.as_deref(),
         None,
+        args.task_ledger_display,
     )
     .map_err(|err| CommandError::runtime("record-post-render-failed", err))?;
 
@@ -1322,6 +1360,17 @@ fn run_record_close(
             "observed_non_required_failures": observed_failures,
         })
     });
+    let final_validation_url = audit
+        .evidence
+        .get("validation")
+        .and_then(|hit| hit.url.clone());
+    let closeout_notes = if linked_evidence.is_empty() {
+        Some(
+            "No linked PRs were provided; closeout relied on issue-visible state, validation, review, and approval evidence.",
+        )
+    } else {
+        None
+    };
     let closeout_payload = json!({
         "final_status": "complete",
         "approval": {"comment_url": approval_text},
@@ -1340,7 +1389,8 @@ fn run_record_close(
             })
             .collect::<Vec<_>>(),
         "non_required_check_override": override_block,
-        "notes": null,
+        "final_validation_url": final_validation_url,
+        "notes": closeout_notes,
     });
     let closeout_summary = if override_reason.is_some() {
         "Strict closeout gate passed with non-required-check failure override; record closed by `plan-issue record close`."

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use pretty_assertions::assert_eq;
+use pretty_assertions::{assert_eq, assert_ne};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -30,6 +30,21 @@ fn v2_comment_body(role: &str, profile: &str, data: Value) -> String {
 
 fn parse_json(stdout: &str) -> Value {
     serde_json::from_str(stdout).expect("stdout is valid JSON")
+}
+
+fn assert_comment_visible_prefix(body: &str, expected: &str) {
+    let payload_start = body
+        .find("<!-- plan-issue-record-payload:hex:")
+        .expect("hidden payload carrier");
+    assert_eq!(&body[..payload_start], expected, "{body}");
+    assert!(
+        body[payload_start..].ends_with(" -->\n"),
+        "payload carrier should terminate the comment body:\n{body}"
+    );
+    assert!(
+        !body.contains(&format!("```{PAYLOAD_FENCE_INFO}")),
+        "payload must remain hidden:\n{body}"
+    );
 }
 
 fn write_fixture_files(dir: &Path, body: &str, comments: &Value) {
@@ -184,6 +199,286 @@ fn record_post_state_summary_file_is_rendered_in_dry_run() {
     assert!(
         body.starts_with("<!-- plan-issue-record:v2 role=state profile=tracking -->"),
         "{body}"
+    );
+}
+
+#[test]
+fn record_post_state_execution_state_file_collapses_non_final_in_dry_run() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    let execution_state = tmp.path().join("state.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "ledger surface",
+            "current": "working",
+            "next_action": "continue",
+            "tasks": [{"id": "1.1", "status": "pending", "title": "Demo task"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &execution_state,
+        "# Sample Execution State\n\n## Execution State\n\n- Status: in-progress\n\n## Task Ledger\n\n| ID | Status | Task |\n| --- | --- | --- |\n| 1.1 | pending | Demo task |\n\n## Validation\n\n| Command | Status |\n| --- | --- |\n| `true` | pass |\n",
+    )
+    .expect("write execution state");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let body = parsed["payload"]["result"]["comment_body"]
+        .as_str()
+        .expect("comment body");
+    assert_comment_visible_prefix(
+        body,
+        concat!(
+            "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n",
+            "## Execution State\n\n",
+            "- Profile: tracking\n",
+            "- Status: in-progress\n\n",
+            "## Task Ledger\n\n",
+            "<details>\n",
+            "<summary>Show task ledger</summary>\n\n",
+            "| ID | Status | Task |\n",
+            "| --- | --- | --- |\n",
+            "| 1.1 | pending | Demo task |\n\n",
+            "</details>\n\n",
+            "## Validation\n\n",
+            "| Command | Status |\n",
+            "| --- | --- |\n",
+            "| `true` | pass |\n\n",
+        ),
+    );
+    let details_start = body.find("<details>").expect("details start");
+    let validation_start = body.find("## Validation").expect("validation heading");
+    let payload_start = body
+        .find("<!-- plan-issue-record-payload:hex:")
+        .expect("payload marker");
+    assert!(details_start < validation_start, "{body}");
+    assert!(validation_start < payload_start, "{body}");
+}
+
+#[test]
+fn record_post_state_execution_state_file_expands_final_in_dry_run() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    let execution_state = tmp.path().join("state.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "complete",
+            "target_scope": "ledger surface",
+            "current": "done",
+            "next_action": "closeout",
+            "tasks": [{"id": "1.1", "status": "done", "title": "Demo task"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &execution_state,
+        "# Sample Execution State\n\n## Execution State\n\n- Status: complete\n\n## Task Ledger\n\n| ID | Status | Task |\n| --- | --- | --- |\n| 1.1 | done | Demo task |\n",
+    )
+    .expect("write execution state");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let body = parsed["payload"]["result"]["comment_body"]
+        .as_str()
+        .expect("comment body");
+    assert_comment_visible_prefix(
+        body,
+        concat!(
+            "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n",
+            "## Execution State\n\n",
+            "- Profile: tracking\n",
+            "- Status: complete\n\n",
+            "## Task Ledger\n\n",
+            "| ID | Status | Task |\n",
+            "| --- | --- | --- |\n",
+            "| 1.1 | done | Demo task |\n\n",
+        ),
+    );
+}
+
+#[test]
+fn record_post_state_execution_state_file_preserves_execution_metadata_fields() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    let execution_state = tmp.path().join("state.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "plan issue lifecycle comment visibility",
+            "current": "implement Sprint 1 in sympoies/nils-cli",
+            "next_action": "add lifecycle visible rendering support",
+            "tasks": [{"id": "1.1", "status": "pending", "title": "Renderer"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &execution_state,
+        "# Execution State: Plan Issue Lifecycle Comment Visibility\n\n<!-- execute-from-tracking-issue:state:v1 -->\n## Execution State\n\n- Status: tracking issue opened\n- Profile: tracking\n- Target scope: make plan-issue lifecycle comments visibly include detailed state, validation, review, session, and closeout evidence\n- Current task: implement Sprint 1 in sympoies/nils-cli.\n- Next task: add lifecycle visible rendering support to plan-issue record post and record close.\n- Last updated: 2026-05-25\n- Branch: feat/plan-issue-state-visibility\n- Source document: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-plan.md\n- Plan document: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-plan.md\n- Review source: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-review-source.md\n\n## Task Ledger\n\n| ID | Status | Task |\n| --- | --- | --- |\n| 1.1 | pending | Renderer |\n",
+    )
+    .expect("write execution state");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "115",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parsed = parse_json(&out.stdout);
+    let body = parsed["payload"]["result"]["comment_body"]
+        .as_str()
+        .expect("comment body");
+    assert_comment_visible_prefix(
+        body,
+        concat!(
+            "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n",
+            "## Execution State\n\n",
+            "- Profile: tracking\n",
+            "- Status: tracking issue opened\n",
+            "- Target scope: make plan-issue lifecycle comments visibly include detailed state, validation, review, session, and closeout evidence\n",
+            "- Current task: implement Sprint 1 in sympoies/nils-cli.\n",
+            "- Next task: add lifecycle visible rendering support to plan-issue record post and record close.\n",
+            "- Last updated: 2026-05-25\n",
+            "- Branch: feat/plan-issue-state-visibility\n",
+            "- Source document: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-plan.md\n",
+            "- Plan document: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-plan.md\n",
+            "- Review source: docs/plans/plan-issue-lifecycle-comment-visibility/plan-issue-lifecycle-comment-visibility-review-source.md\n\n",
+            "## Task Ledger\n\n",
+            "<details>\n",
+            "<summary>Show task ledger</summary>\n\n",
+            "| ID | Status | Task |\n",
+            "| --- | --- | --- |\n",
+            "| 1.1 | pending | Renderer |\n\n",
+            "</details>\n\n",
+        ),
+    );
+}
+
+#[test]
+fn record_post_execution_state_file_requires_state_kind_and_task_ledger() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("validation.json");
+    let execution_state = tmp.path().join("state.md");
+    fs::write(
+        &payload,
+        json!({"overall": "pass", "commands": [], "waivers": []}).to_string(),
+    )
+    .expect("write payload");
+    fs::write(&execution_state, "# State\n").expect("write execution state");
+
+    let wrong_kind = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "validation",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+    assert_ne!(wrong_kind.code, 0);
+    assert!(
+        wrong_kind
+            .stdout
+            .contains("record-post-execution-state-file-kind-invalid"),
+        "{}",
+        wrong_kind.stdout
+    );
+
+    let state_payload = tmp.path().join("state.json");
+    fs::write(
+        &state_payload,
+        json!({
+            "status": "in-progress",
+            "tasks": [],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write state payload");
+    let missing_ledger = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        state_payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+    assert_ne!(missing_ledger.code, 0);
+    assert!(
+        missing_ledger
+            .stdout
+            .contains("record-post-execution-state-task-ledger-missing"),
+        "{}",
+        missing_ledger.stdout
     );
 }
 
