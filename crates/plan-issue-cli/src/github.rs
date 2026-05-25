@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::Path;
 
-use nils_common::git as common_git;
 use nils_common::markdown;
 use nils_common::process as common_process;
 use serde_json::Value;
@@ -635,71 +634,6 @@ fn rollup_status(rollup: &Value) -> Option<String> {
     }
 }
 
-pub fn resolve_repo(repo_override: Option<&str>) -> Result<String, String> {
-    if let Some(repo) = repo_override {
-        return normalize_repo_slug(repo).ok_or_else(|| format!("invalid --repo value: {repo}"));
-    }
-
-    let output = common_git::run_output(&["remote", "get-url", "origin"])
-        .map_err(|err| format!("failed to run `git remote get-url origin`: {err}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!(
-            "failed to resolve repository from git remote: {}",
-            if stderr.is_empty() {
-                "unknown error"
-            } else {
-                &stderr
-            }
-        ));
-    }
-
-    let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    normalize_repo_slug(&remote).ok_or_else(|| {
-        format!(
-            "unable to derive owner/repo from origin remote `{remote}`; pass --repo <owner/repo>"
-        )
-    })
-}
-
-fn normalize_repo_slug(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let candidate = trimmed
-        .strip_prefix("git@github.com:")
-        .or_else(|| trimmed.strip_prefix("https://github.com/"))
-        .or_else(|| trimmed.strip_prefix("http://github.com/"))
-        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"));
-
-    if let Some(candidate) = candidate {
-        let normalized = candidate.trim_end_matches(".git").trim_end_matches('/');
-        if is_owner_repo(normalized) {
-            return Some(normalized.to_string());
-        }
-    }
-
-    if is_owner_repo(trimmed) {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
-}
-
-fn is_owner_repo(value: &str) -> bool {
-    if value.contains(':') || value.contains("://") || value.ends_with(".git") {
-        return false;
-    }
-
-    let mut parts = value.split('/');
-    let owner = parts.next().unwrap_or_default().trim();
-    let repo = parts.next().unwrap_or_default().trim();
-    parts.next().is_none() && !owner.is_empty() && !repo.is_empty()
-}
-
 fn issue_number_from_url(url: &str) -> Option<u64> {
     let trimmed = url.trim().trim_end_matches('/');
     let tail = trimmed.rsplit('/').next()?;
@@ -711,13 +645,11 @@ mod tests {
     use std::fs;
 
     use super::{
-        extract_issue_comment_url, is_issue_comment_url, issue_number_from_url,
-        normalize_repo_slug, rollup_status,
+        extract_issue_comment_url, is_issue_comment_url, issue_number_from_url, rollup_status,
     };
     use crate::commands::plan::CloseReason;
-    use crate::github::{GhCliAdapter, ProviderAdapter, resolve_repo};
-    use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
-    use nils_test_support::{CwdGuard, EnvGuard, GlobalStateLock, StubBinDir, prepend_path};
+    use crate::github::{GhCliAdapter, ProviderAdapter};
+    use nils_test_support::{EnvGuard, GlobalStateLock, StubBinDir, prepend_path};
     use tempfile::TempDir;
 
     fn gh_stub_script() -> &'static str {
@@ -774,26 +706,6 @@ case "$cmd $sub" in
     ;;
 esac
 "#
-    }
-
-    #[test]
-    fn normalize_repo_slug_accepts_common_remote_forms() {
-        let samples = [
-            ("sympoies/nils-cli", "sympoies/nils-cli"),
-            ("git@github.com:sympoies/nils-cli.git", "sympoies/nils-cli"),
-            (
-                "https://github.com/sympoies/nils-cli.git",
-                "sympoies/nils-cli",
-            ),
-            (
-                "ssh://git@github.com/sympoies/nils-cli.git",
-                "sympoies/nils-cli",
-            ),
-        ];
-
-        for (raw, expected) in samples {
-            assert_eq!(normalize_repo_slug(raw).as_deref(), Some(expected));
-        }
     }
 
     #[test]
@@ -944,58 +856,6 @@ esac
             .pr_is_merged("sympoies/nils-cli", 221)
             .expect_err("gh failure should surface");
         assert!(run_err.contains("gh pr view"), "{run_err}");
-    }
-
-    #[test]
-    fn resolve_repo_supports_override_and_origin_remote_detection() {
-        assert_eq!(
-            resolve_repo(Some("sympoies/nils-cli")).expect("override"),
-            "sympoies/nils-cli"
-        );
-        assert!(resolve_repo(Some("https://example.com/repo")).is_err());
-
-        let lock = GlobalStateLock::new();
-        let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
-        git(
-            repo.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:sympoies/nils-cli.git",
-            ],
-        );
-        let _cwd = CwdGuard::set(&lock, repo.path()).expect("set cwd");
-        assert_eq!(
-            resolve_repo(None).expect("resolve from origin"),
-            "sympoies/nils-cli"
-        );
-    }
-
-    #[test]
-    fn resolve_repo_reports_missing_or_unparseable_origin() {
-        let lock = GlobalStateLock::new();
-
-        let missing = init_repo_with(InitRepoOptions::new().with_branch("main"));
-        let _cwd_missing = CwdGuard::set(&lock, missing.path()).expect("set cwd missing");
-        let err_missing = resolve_repo(None).expect_err("missing origin should fail");
-        assert!(
-            err_missing.contains("failed to resolve repository from git remote"),
-            "{err_missing}"
-        );
-        drop(_cwd_missing);
-
-        let unparseable = init_repo_with(InitRepoOptions::new().with_branch("main"));
-        git(
-            unparseable.path(),
-            &["remote", "add", "origin", "ssh://example.com/project.git"],
-        );
-        let _cwd_unparseable = CwdGuard::set(&lock, unparseable.path()).expect("set cwd parse");
-        let err_unparseable = resolve_repo(None).expect_err("unparseable origin should fail");
-        assert!(
-            err_unparseable.contains("unable to derive owner/repo"),
-            "{err_unparseable}"
-        );
     }
 
     // Sprint 3 PR-454 specialist review follow-ups (testing + security).
