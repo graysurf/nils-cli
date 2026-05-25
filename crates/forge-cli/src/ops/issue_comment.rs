@@ -195,4 +195,181 @@ mod tests {
             "inline"
         );
     }
+
+    mod run_with {
+        use super::*;
+        use crate::backend::{BackendCall, BackendSuccess};
+        use crate::cli::ProviderFlag;
+        use nils_common::cli_contract::exit;
+        use pretty_assertions::assert_eq;
+        use std::cell::RefCell;
+        use std::io::Write as _;
+
+        fn flags(provider: Option<ProviderFlag>, dry_run: bool) -> GlobalFlags {
+            GlobalFlags {
+                format: None,
+                remote: "origin".into(),
+                provider,
+                repo: None,
+                dry_run,
+            }
+        }
+
+        fn args(id: u64, body: Option<&str>, body_file: Option<&str>) -> IssueCommentArgs {
+            IssueCommentArgs {
+                id,
+                body: body.map(str::to_string),
+                body_file: body_file.map(str::to_string),
+            }
+        }
+
+        struct ScriptedRunner {
+            outputs: RefCell<Vec<String>>,
+            captured: RefCell<Vec<Vec<String>>>,
+        }
+
+        impl ScriptedRunner {
+            fn with_stdout(outs: Vec<&str>) -> Self {
+                Self {
+                    outputs: RefCell::new(outs.into_iter().map(|s| s.to_string()).collect()),
+                    captured: RefCell::new(Vec::new()),
+                }
+            }
+        }
+
+        impl BackendRunner for ScriptedRunner {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                self.captured.borrow_mut().push(call.plan_argv());
+                let mut q = self.outputs.borrow_mut();
+                assert!(!q.is_empty(), "ScriptedRunner ran out of fixtures");
+                Ok(BackendSuccess {
+                    stdout: q.remove(0),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        fn github_view_json(number: u64) -> String {
+            format!(
+                r#"{{"number":{number},"url":"https://github.com/o/r/issues/{number}","state":"OPEN","title":"t","body":"","labels":[],"assignees":[]}}"#
+            )
+        }
+
+        fn gitlab_view_json(iid: u64) -> String {
+            format!(
+                r#"{{"iid":{iid},"web_url":"https://gitlab.com/o/r/-/issues/{iid}","state":"opened","title":"t","description":"","labels":[],"assignees":[]}}"#
+            )
+        }
+
+        #[test]
+        fn rejects_empty_body() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(Some(ProviderFlag::Github), false);
+            let err = run_with(
+                &runner,
+                &global,
+                args(1, Some("   "), None),
+                OutputFormat::Json,
+                |_| None,
+            )
+            .expect_err("blank");
+            assert_eq!(err.kind(), "body_missing_summary");
+        }
+
+        #[test]
+        fn dry_run_github_emits_plan_envelope() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(Some(ProviderFlag::Github), true);
+            let code = run_with(
+                &runner,
+                &global,
+                args(7, Some("hello"), None),
+                OutputFormat::Json,
+                |_| None,
+            )
+            .expect("dry-run");
+            assert_eq!(code, exit::SUCCESS);
+            assert!(runner.captured.borrow().is_empty());
+        }
+
+        #[test]
+        fn happy_github_inline_body() {
+            let runner = ScriptedRunner::with_stdout(vec!["", &github_view_json(42)]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let code = run_with(
+                &runner,
+                &global,
+                args(42, Some("nice work"), None),
+                OutputFormat::Json,
+                |_| None,
+            )
+            .expect("happy github");
+            assert_eq!(code, exit::SUCCESS);
+            let calls = runner.captured.borrow();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0][1..4], ["issue", "comment", "42"]);
+        }
+
+        #[test]
+        fn happy_gitlab_inline_body_text_format() {
+            let runner = ScriptedRunner::with_stdout(vec!["", &gitlab_view_json(7)]);
+            let global = flags(Some(ProviderFlag::Gitlab), false);
+            let code = run_with(
+                &runner,
+                &global,
+                args(7, Some("hi"), None),
+                OutputFormat::Text,
+                |_| None,
+            )
+            .expect("happy gitlab text");
+            assert_eq!(code, exit::SUCCESS);
+        }
+
+        #[test]
+        fn reads_body_from_file_and_proceeds() {
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(b"file body").unwrap();
+            let runner = ScriptedRunner::with_stdout(vec!["", &github_view_json(11)]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let code = run_with(
+                &runner,
+                &global,
+                args(11, None, Some(tmp.path().to_str().unwrap())),
+                OutputFormat::Json,
+                |_| None,
+            )
+            .expect("happy with body file");
+            assert_eq!(code, exit::SUCCESS);
+        }
+
+        #[test]
+        fn missing_body_file_is_software_error() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(Some(ProviderFlag::Github), false);
+            let err = run_with(
+                &runner,
+                &global,
+                args(1, None, Some("/no/such/path")),
+                OutputFormat::Json,
+                |_| None,
+            )
+            .expect_err("missing");
+            assert_eq!(err.kind(), "software_error");
+        }
+
+        #[test]
+        fn propagates_provider_detection_failure() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(None, false);
+            let err = run_with(
+                &runner,
+                &global,
+                args(1, Some("hi"), None),
+                OutputFormat::Json,
+                |_| None,
+            )
+            .expect_err("no provider");
+            assert_eq!(err.kind(), "provider_unsupported");
+        }
+    }
 }

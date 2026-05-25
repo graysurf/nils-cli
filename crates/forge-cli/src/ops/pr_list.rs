@@ -365,4 +365,176 @@ mod tests {
         let l_idx = plan.iter().position(|s| s == "--limit").unwrap();
         assert_eq!(plan[l_idx + 1], "1");
     }
+
+    mod run_with {
+        use super::*;
+        use crate::cli::ProviderFlag;
+        use nils_common::cli_contract::exit;
+        use pretty_assertions::assert_eq;
+        use std::cell::RefCell;
+
+        fn flags(provider: Option<ProviderFlag>, dry_run: bool) -> GlobalFlags {
+            GlobalFlags {
+                format: None,
+                remote: "origin".into(),
+                provider,
+                repo: None,
+                dry_run,
+            }
+        }
+
+        struct ScriptedRunner {
+            outputs: RefCell<Vec<String>>,
+            captured: RefCell<Vec<Vec<String>>>,
+        }
+
+        impl ScriptedRunner {
+            fn with_stdout(outs: Vec<&str>) -> Self {
+                Self {
+                    outputs: RefCell::new(outs.into_iter().map(|s| s.to_string()).collect()),
+                    captured: RefCell::new(Vec::new()),
+                }
+            }
+        }
+
+        impl BackendRunner for ScriptedRunner {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                self.captured.borrow_mut().push(call.plan_argv());
+                let mut q = self.outputs.borrow_mut();
+                assert!(!q.is_empty(), "ScriptedRunner ran out of fixtures");
+                Ok(BackendSuccess {
+                    stdout: q.remove(0),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        fn github_list_json() -> &'static str {
+            r#"[{"number":1,"url":"u1","state":"OPEN","title":"a","headRefName":"feat/a","author":{"login":"alice"}}]"#
+        }
+
+        fn gitlab_list_json() -> &'static str {
+            r#"[{"iid":1,"web_url":"u1","state":"opened","title":"a","source_branch":"feat/a","author":{"username":"alice"}}]"#
+        }
+
+        #[test]
+        fn dry_run_github_emits_plan_envelope() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(Some(ProviderFlag::Github), true);
+            let code = run_with(&runner, &global, default_args(), OutputFormat::Json, |_| {
+                None
+            })
+            .expect("dry-run");
+            assert_eq!(code, exit::SUCCESS);
+            assert!(runner.captured.borrow().is_empty());
+        }
+
+        #[test]
+        fn dry_run_text_format() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(Some(ProviderFlag::Gitlab), true);
+            let code = run_with(&runner, &global, default_args(), OutputFormat::Text, |_| {
+                None
+            })
+            .expect("dry-run text");
+            assert_eq!(code, exit::SUCCESS);
+        }
+
+        #[test]
+        fn happy_github_returns_items() {
+            let runner = ScriptedRunner::with_stdout(vec![github_list_json()]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let code = run_with(&runner, &global, default_args(), OutputFormat::Json, |_| {
+                None
+            })
+            .expect("happy github");
+            assert_eq!(code, exit::SUCCESS);
+            let calls = runner.captured.borrow();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0][1..3], ["pr", "list"]);
+        }
+
+        #[test]
+        fn happy_gitlab_returns_items_text_format() {
+            let runner = ScriptedRunner::with_stdout(vec![gitlab_list_json()]);
+            let global = flags(Some(ProviderFlag::Gitlab), false);
+            let code = run_with(&runner, &global, default_args(), OutputFormat::Text, |_| {
+                None
+            })
+            .expect("happy gitlab text");
+            assert_eq!(code, exit::SUCCESS);
+        }
+
+        #[test]
+        fn render_text_handles_missing_author() {
+            let runner = ScriptedRunner::with_stdout(vec![
+                r#"[{"number":3,"url":"u3","state":"OPEN","title":"c","headRefName":"feat/c"}]"#,
+            ]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let code = run_with(&runner, &global, default_args(), OutputFormat::Text, |_| {
+                None
+            })
+            .expect("happy github text no-author");
+            assert_eq!(code, exit::SUCCESS);
+        }
+
+        #[test]
+        fn propagates_provider_detection_failure() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(None, false);
+            let err = run_with(&runner, &global, default_args(), OutputFormat::Json, |_| {
+                None
+            })
+            .expect_err("no provider");
+            assert_eq!(err.kind(), "provider_unsupported");
+        }
+
+        #[test]
+        fn invalid_json_array_is_software_error() {
+            let runner = ScriptedRunner::with_stdout(vec!["not-json"]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let err = run_with(&runner, &global, default_args(), OutputFormat::Json, |_| {
+                None
+            })
+            .expect_err("invalid");
+            assert_eq!(err.kind(), "software_error");
+        }
+
+        #[test]
+        fn non_array_json_is_software_error() {
+            let runner = ScriptedRunner::with_stdout(vec!["{}"]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let err = run_with(&runner, &global, default_args(), OutputFormat::Json, |_| {
+                None
+            })
+            .expect_err("not array");
+            assert_eq!(err.kind(), "software_error");
+        }
+
+        #[test]
+        fn parse_item_missing_number_is_software_error() {
+            let runner = ScriptedRunner::with_stdout(vec![
+                r#"[{"url":"u","state":"OPEN","title":"t","headRefName":"h"}]"#,
+            ]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let err = run_with(&runner, &global, default_args(), OutputFormat::Json, |_| {
+                None
+            })
+            .expect_err("missing number");
+            assert_eq!(err.kind(), "software_error");
+        }
+
+        #[test]
+        fn parse_item_unknown_state_is_software_error() {
+            let runner = ScriptedRunner::with_stdout(vec![
+                r#"[{"number":1,"url":"u","state":"INVENTED","title":"t","headRefName":"h"}]"#,
+            ]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let err = run_with(&runner, &global, default_args(), OutputFormat::Json, |_| {
+                None
+            })
+            .expect_err("unknown state");
+            assert_eq!(err.kind(), "software_error");
+        }
+    }
 }

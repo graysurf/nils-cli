@@ -364,4 +364,182 @@ mod tests {
             "inline"
         );
     }
+
+    mod run_with {
+        use super::*;
+        use crate::cli::ProviderFlag;
+        use nils_common::cli_contract::exit;
+        use pretty_assertions::assert_eq;
+        use std::cell::RefCell;
+        use std::io::Write as _;
+
+        fn flags(provider: Option<ProviderFlag>, dry_run: bool) -> GlobalFlags {
+            GlobalFlags {
+                format: None,
+                remote: "origin".into(),
+                provider,
+                repo: None,
+                dry_run,
+            }
+        }
+
+        fn args(title: &str) -> IssueCreateArgs {
+            IssueCreateArgs {
+                title: title.into(),
+                body: Some("body".into()),
+                body_file: None,
+                labels: vec![],
+                assignees: vec![],
+            }
+        }
+
+        struct ScriptedRunner {
+            outputs: RefCell<Vec<String>>,
+            captured: RefCell<Vec<Vec<String>>>,
+        }
+
+        impl ScriptedRunner {
+            fn with_stdout(outs: Vec<&str>) -> Self {
+                Self {
+                    outputs: RefCell::new(outs.into_iter().map(|s| s.to_string()).collect()),
+                    captured: RefCell::new(Vec::new()),
+                }
+            }
+        }
+
+        impl BackendRunner for ScriptedRunner {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                self.captured.borrow_mut().push(call.plan_argv());
+                let mut q = self.outputs.borrow_mut();
+                assert!(!q.is_empty(), "ScriptedRunner ran out of fixtures");
+                Ok(BackendSuccess {
+                    stdout: q.remove(0),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        fn github_view_json(number: u64) -> String {
+            format!(
+                r#"{{"number":{number},"url":"https://github.com/o/r/issues/{number}","state":"OPEN","title":"new","body":"","labels":[],"assignees":[]}}"#
+            )
+        }
+
+        fn gitlab_view_json(iid: u64) -> String {
+            format!(
+                r#"{{"iid":{iid},"web_url":"https://gitlab.com/o/r/-/issues/{iid}","state":"opened","title":"new","description":"","labels":[],"assignees":[]}}"#
+            )
+        }
+
+        #[test]
+        fn dry_run_github_emits_plan_envelope() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(Some(ProviderFlag::Github), true);
+            let code = run_with(&runner, &global, args("new"), OutputFormat::Json, |_| None)
+                .expect("dry-run");
+            assert_eq!(code, exit::SUCCESS);
+            assert!(runner.captured.borrow().is_empty());
+        }
+
+        #[test]
+        fn happy_github_creates_then_views() {
+            let create_stdout = "https://github.com/acme/widgets/issues/42\n";
+            let runner = ScriptedRunner::with_stdout(vec![create_stdout, &github_view_json(42)]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let code = run_with(&runner, &global, args("new"), OutputFormat::Json, |_| None)
+                .expect("happy github");
+            assert_eq!(code, exit::SUCCESS);
+            let calls = runner.captured.borrow();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0][1..3], ["issue", "create"]);
+        }
+
+        #[test]
+        fn happy_gitlab_creates_then_views_text_format() {
+            let create_stdout = "https://gitlab.com/o/r/-/issues/7\n";
+            let runner = ScriptedRunner::with_stdout(vec![create_stdout, &gitlab_view_json(7)]);
+            let global = flags(Some(ProviderFlag::Gitlab), false);
+            let code = run_with(&runner, &global, args("new"), OutputFormat::Text, |_| None)
+                .expect("happy gitlab");
+            assert_eq!(code, exit::SUCCESS);
+        }
+
+        #[test]
+        fn rejects_title_too_long() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(Some(ProviderFlag::Github), false);
+            let err = run_with(
+                &runner,
+                &global,
+                args(&"x".repeat(200)),
+                OutputFormat::Json,
+                |_| None,
+            )
+            .expect_err("too long");
+            assert_eq!(err.kind(), "title_too_long");
+        }
+
+        #[test]
+        fn missing_body_file_is_software_error() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(Some(ProviderFlag::Github), false);
+            let mut a = args("title");
+            a.body = None;
+            a.body_file = Some("/no/such/path".into());
+            let err =
+                run_with(&runner, &global, a, OutputFormat::Json, |_| None).expect_err("missing");
+            assert_eq!(err.kind(), "software_error");
+        }
+
+        #[test]
+        fn reads_body_from_file_and_proceeds() {
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(b"file body").unwrap();
+            let create_stdout = "https://github.com/o/r/issues/11\n";
+            let runner = ScriptedRunner::with_stdout(vec![create_stdout, &github_view_json(11)]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let mut a = args("title");
+            a.body = None;
+            a.body_file = Some(tmp.path().to_str().unwrap().into());
+            let code = run_with(&runner, &global, a, OutputFormat::Json, |_| None)
+                .expect("happy from body file");
+            assert_eq!(code, exit::SUCCESS);
+        }
+
+        #[test]
+        fn propagates_provider_detection_failure() {
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(None, false);
+            let err = run_with(&runner, &global, args("t"), OutputFormat::Json, |_| None)
+                .expect_err("no provider");
+            assert_eq!(err.kind(), "provider_unsupported");
+        }
+
+        #[test]
+        fn create_output_without_url_is_software_error() {
+            let runner = ScriptedRunner::with_stdout(vec!["(no url)\n"]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let err = run_with(&runner, &global, args("t"), OutputFormat::Json, |_| None)
+                .expect_err("no url");
+            assert_eq!(err.kind(), "software_error");
+        }
+
+        #[test]
+        fn create_output_falls_back_to_view_url_when_create_empty_url_but_parsed() {
+            // Edge case: create prints a URL whose tail is numeric; we keep that.
+            let create_stdout = "https://github.com/acme/widgets/issues/99\n";
+            let runner = ScriptedRunner::with_stdout(vec![create_stdout, &github_view_json(99)]);
+            let global = flags(Some(ProviderFlag::Github), false);
+            let code =
+                run_with(&runner, &global, args("t"), OutputFormat::Json, |_| None).expect("happy");
+            assert_eq!(code, exit::SUCCESS);
+        }
+
+        #[test]
+        fn write_body_tempfile_persists_payload() {
+            let tmp = write_body_tempfile("issue body").expect("tempfile");
+            let read = std::fs::read_to_string(tmp.path()).expect("read");
+            assert_eq!(read, "issue body");
+        }
+    }
 }

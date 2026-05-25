@@ -261,8 +261,13 @@ fn render_text(payload: &PrViewPayload) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{BackendCall, BackendSuccess};
+    use crate::cli::ProviderFlag;
     use crate::provider::{DetectionSource, Provider};
+    use nils_common::cli_contract::exit;
     use pretty_assertions::assert_eq;
+    use std::cell::RefCell;
+    use std::io::Write as _;
 
     fn ctx(p: Provider) -> ProviderContext {
         ProviderContext {
@@ -270,6 +275,16 @@ mod tests {
             host: "x".into(),
             source: DetectionSource::Flag,
             repo: None,
+        }
+    }
+
+    fn flags(provider: Option<ProviderFlag>, dry_run: bool) -> GlobalFlags {
+        GlobalFlags {
+            format: None,
+            remote: "origin".into(),
+            provider,
+            repo: None,
+            dry_run,
         }
     }
 
@@ -284,6 +299,46 @@ mod tests {
             remove_labels: vec![],
             add_reviewers: vec![],
         }
+    }
+
+    struct ScriptedRunner {
+        outputs: RefCell<Vec<String>>,
+        captured: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl ScriptedRunner {
+        fn with_stdout(outs: Vec<&str>) -> Self {
+            Self {
+                outputs: RefCell::new(outs.into_iter().map(|s| s.to_string()).collect()),
+                captured: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BackendRunner for ScriptedRunner {
+        fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+            self.captured.borrow_mut().push(call.plan_argv());
+            let mut q = self.outputs.borrow_mut();
+            assert!(!q.is_empty(), "ScriptedRunner ran out of fixtures");
+            Ok(BackendSuccess {
+                stdout: q.remove(0),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    const VALID_BODY: &str = "## Summary\n\nDoes the thing.\n\n## Test plan\n\n- cargo test\n";
+
+    fn github_view_json(number: u64) -> String {
+        format!(
+            r#"{{"number":{number},"url":"https://github.com/o/r/pull/{number}","state":"OPEN","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}}"#
+        )
+    }
+
+    fn gitlab_view_json(iid: u64) -> String {
+        format!(
+            r#"{{"iid":{iid},"web_url":"https://gitlab.com/o/r/-/merge_requests/{iid}","state":"opened","title":"t","source_branch":"feat/y","target_branch":"main","merge_status":"can_be_merged","draft":false,"labels":[]}}"#
+        )
     }
 
     #[test]
@@ -344,5 +399,144 @@ mod tests {
         let plan = call.plan_argv();
         let d_idx = plan.iter().position(|s| s == "--description").unwrap();
         assert_eq!(plan[d_idx + 1], "inline body");
+    }
+
+    #[test]
+    fn run_with_dry_run_github_with_body_writes_tempfile_and_returns_plan() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(Some(ProviderFlag::Github), true);
+        let mut a = args(42);
+        a.title = Some("update".into());
+        a.body = Some(VALID_BODY.into());
+        let code =
+            run_with(&runner, &global, a, OutputFormat::Json, |_| None).expect("dry-run with body");
+        assert_eq!(code, exit::SUCCESS);
+        assert!(runner.captured.borrow().is_empty());
+    }
+
+    #[test]
+    fn run_with_dry_run_gitlab_uses_description_inline() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(Some(ProviderFlag::Gitlab), true);
+        let mut a = args(7);
+        a.body = Some(VALID_BODY.into());
+        a.add_labels = vec!["ready".into()];
+        let code =
+            run_with(&runner, &global, a, OutputFormat::Json, |_| None).expect("dry-run gitlab");
+        assert_eq!(code, exit::SUCCESS);
+    }
+
+    #[test]
+    fn run_with_happy_github_title_only_text_format() {
+        let runner = ScriptedRunner::with_stdout(vec!["", &github_view_json(42)]);
+        let global = flags(Some(ProviderFlag::Github), false);
+        let mut a = args(42);
+        a.title = Some("retitled".into());
+        let code =
+            run_with(&runner, &global, a, OutputFormat::Text, |_| None).expect("happy edit github");
+        assert_eq!(code, exit::SUCCESS);
+        let calls = runner.captured.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1..4], ["pr", "edit", "42"]);
+    }
+
+    #[test]
+    fn run_with_happy_gitlab_labels_only_json_format() {
+        let runner = ScriptedRunner::with_stdout(vec!["", &gitlab_view_json(7)]);
+        let global = flags(Some(ProviderFlag::Gitlab), false);
+        let mut a = args(7);
+        a.add_labels = vec!["ready".into()];
+        a.remove_labels = vec!["wip".into()];
+        a.add_reviewers = vec!["alice".into()];
+        a.base = Some("main".into());
+        let code =
+            run_with(&runner, &global, a, OutputFormat::Json, |_| None).expect("happy edit gitlab");
+        assert_eq!(code, exit::SUCCESS);
+        let calls = runner.captured.borrow();
+        assert_eq!(calls[0][1..3], ["mr", "update"]);
+    }
+
+    #[test]
+    fn run_with_reads_body_from_file_and_proceeds() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(VALID_BODY.as_bytes()).unwrap();
+        let runner = ScriptedRunner::with_stdout(vec!["", &github_view_json(11)]);
+        let global = flags(Some(ProviderFlag::Github), false);
+        let mut a = args(11);
+        a.body_file = Some(tmp.path().to_str().unwrap().into());
+        let code = run_with(&runner, &global, a, OutputFormat::Json, |_| None)
+            .expect("happy with body file");
+        assert_eq!(code, exit::SUCCESS);
+    }
+
+    #[test]
+    fn run_with_rejects_title_too_long() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(Some(ProviderFlag::Github), false);
+        let mut a = args(1);
+        a.title = Some("x".repeat(200));
+        let err =
+            run_with(&runner, &global, a, OutputFormat::Json, |_| None).expect_err("too long");
+        assert_eq!(err.kind(), "title_too_long");
+    }
+
+    #[test]
+    fn run_with_rejects_body_missing_summary() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(Some(ProviderFlag::Github), false);
+        let mut a = args(1);
+        a.body = Some("## Test plan\n\n- yes\n".into());
+        let err = run_with(&runner, &global, a, OutputFormat::Json, |_| None)
+            .expect_err("missing summary");
+        assert_eq!(err.kind(), "body_missing_summary");
+    }
+
+    #[test]
+    fn run_with_rejects_body_missing_test_plan() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(Some(ProviderFlag::Github), false);
+        let mut a = args(1);
+        a.body = Some("## Summary\n\nyes.\n".into());
+        let err = run_with(&runner, &global, a, OutputFormat::Json, |_| None)
+            .expect_err("missing test plan");
+        assert_eq!(err.kind(), "body_missing_test_plan");
+    }
+
+    #[test]
+    fn run_with_missing_body_file_returns_software_error() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(Some(ProviderFlag::Github), false);
+        let mut a = args(1);
+        a.body_file = Some("/no/such/path".into());
+        let err = run_with(&runner, &global, a, OutputFormat::Json, |_| None)
+            .expect_err("missing body file");
+        assert_eq!(err.kind(), "software_error");
+    }
+
+    #[test]
+    fn run_with_propagates_provider_detection_failure() {
+        let runner = ScriptedRunner::with_stdout(Vec::new());
+        let global = flags(None, false);
+        let err = run_with(&runner, &global, args(1), OutputFormat::Json, |_| None)
+            .expect_err("no provider");
+        assert_eq!(err.kind(), "provider_unsupported");
+    }
+
+    #[test]
+    fn run_with_invalid_view_json_is_software_error() {
+        let runner = ScriptedRunner::with_stdout(vec!["", "not-json"]);
+        let global = flags(Some(ProviderFlag::Github), false);
+        let mut a = args(1);
+        a.title = Some("ok".into());
+        let err = run_with(&runner, &global, a, OutputFormat::Json, |_| None)
+            .expect_err("view parse fails");
+        assert_eq!(err.kind(), "software_error");
+    }
+
+    #[test]
+    fn write_body_tempfile_persists_payload() {
+        let tmp = write_body_tempfile("hello tempfile").expect("tempfile");
+        let read = std::fs::read_to_string(tmp.path()).expect("read");
+        assert_eq!(read, "hello tempfile");
     }
 }
