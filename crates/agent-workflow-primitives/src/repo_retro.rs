@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
+use nils_markdown::Engine;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -15,6 +16,38 @@ use time::{Date, Duration, Month, OffsetDateTime};
 
 use crate::common::{CliError, OutputFormat, display_path, render_error};
 use crate::completion::{self, CompletionShell};
+
+const REPO_RETRO_TEMPLATE: &str = include_str!("../templates/repo_retro.md.tera");
+const REPO_RETRO_TEMPLATE_NAME: &str = "repo_retro";
+
+#[derive(Debug, Serialize)]
+struct RepoRetroView<'a> {
+    repo_name: &'a str,
+    generated_at: &'a str,
+    mode: &'a str,
+    window_label: &'a str,
+    window_start: &'a str,
+    window_end: &'a str,
+    repo_root: &'a str,
+    commit_count: usize,
+    changed_lines: i64,
+    insertions: i64,
+    deletions: i64,
+    active_days_count: usize,
+    test_related_commits: usize,
+    themes_block: String,
+    attention_items_block: String,
+    hotspots_block: String,
+    validation_signals_block: String,
+    heuristic_state: &'a str,
+    heuristic_active_inbox_total: usize,
+    heuristic_movement_summary: &'a str,
+    heuristic_op_records_changed: usize,
+    heuristic_aging_summary: &'a str,
+    follow_up_questions_block: String,
+    show_warnings: bool,
+    warnings_block: String,
+}
 
 const REPORT_ENVELOPE_SCHEMA_VERSION: &str = "cli.repo-retro.report.v1";
 const REPORT_SCHEMA_VERSION: &str = "repo-retro.report.v1";
@@ -1831,99 +1864,106 @@ fn high_severity_count(by_severity: &BTreeMap<String, usize>) -> usize {
         .sum()
 }
 
+fn format_bullet_block<'a, I>(items: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut iter = items.into_iter().peekable();
+    if iter.peek().is_none() {
+        return String::new();
+    }
+    let mut text = iter
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push('\n');
+    text
+}
+
 fn render_markdown(report: &RepoRetroReport) -> String {
     let git = &report.git;
     let heuristic = &report.heuristic_system;
-    let mut lines = vec![
-        format!("# Project Retro: {}", report.repo.name),
-        String::new(),
-        format!("- Generated: {}", report.generated_at),
-        format!("- Mode: {}", report.mode),
-        format!(
-            "- Window: {} ({} to {})",
-            report.window.label, report.window.start, report.window.end
-        ),
-        format!("- Repo: `{}`", report.repo.root),
-        String::new(),
-        "## Summary".to_string(),
-        String::new(),
-        format!("- Commits: {}", git.summary.commit_count),
-        format!(
-            "- Changed lines: {} (+{} / -{})",
-            git.summary.changed_lines, git.summary.insertions, git.summary.deletions
-        ),
-        format!("- Active days: {}", git.summary.active_days.len()),
-        format!(
-            "- Test-related commits: {}",
-            git.test_signals.test_related_commit_count
-        ),
-        String::new(),
-        "## Themes".to_string(),
-        String::new(),
-    ];
-    for item in &report.analysis.themes {
-        lines.push(format!("- {item}"));
-    }
-    lines.extend([
-        String::new(),
-        "## Attention Items".to_string(),
-        String::new(),
-    ]);
-    for item in &report.analysis.attention_items {
-        lines.push(format!("- {item}"));
-    }
-    lines.extend([String::new(), "## Hotspots".to_string(), String::new()]);
-    if git.file_hotspots.top_files.is_empty() {
-        lines.push("- No changed files in the selected window.".to_string());
+
+    // Each `*_block` ends with a trailing `\n` when non-empty so the
+    // template can put the next `## Heading` directly on the next line
+    // and still produce one blank line between the block and the
+    // heading. Empty blocks render as the empty string and the
+    // template-side `\n` becomes the single blank line between
+    // adjacent headings (matching the pre-migration `format!` output's
+    // double-`String::new()`-around-empty-loop quirk).
+    let themes_block = format_bullet_block(report.analysis.themes.iter().map(String::as_str));
+    let attention_items_block =
+        format_bullet_block(report.analysis.attention_items.iter().map(String::as_str));
+    let hotspots_block = if git.file_hotspots.top_files.is_empty() {
+        "- No changed files in the selected window.\n".to_string()
     } else {
-        for item in git.file_hotspots.top_files.iter().take(5) {
-            lines.push(format!(
-                "- `{}`: {} changed lines across {} commit(s)",
-                item.path, item.changed_lines, item.commits
-            ));
-        }
-    }
-    lines.extend([
-        String::new(),
-        "## Validation Signals".to_string(),
-        String::new(),
-    ]);
-    for item in &report.analysis.validation_signals {
-        lines.push(format!("- {item}"));
-    }
-    lines.extend([
-        String::new(),
-        "## HEURISTIC_SYSTEM".to_string(),
-        String::new(),
-        format!("- State: {}", heuristic.state),
-        format!("- Active inbox entries: {}", heuristic.active_inbox.total),
-        format!(
-            "- Error inbox movement: {}",
-            report.analysis.heuristic_system_review.movement_summary
-        ),
-        format!(
-            "- Operation records changed: {}",
-            heuristic.operation_records.changed_count
-        ),
-        format!(
-            "- Aging: {}",
-            report.analysis.heuristic_system_review.aging_summary
-        ),
-        String::new(),
-        "## Follow-Up Questions".to_string(),
-        String::new(),
-    ]);
-    for item in &report.analysis.follow_up_questions {
-        lines.push(format!("- {item}"));
-    }
-    if !report.warnings.is_empty() {
-        lines.extend([String::new(), "## Warnings".to_string(), String::new()]);
-        for warning in &report.warnings {
-            lines.push(format!("- {warning}"));
-        }
-    }
-    lines.push(String::new());
-    lines.join("\n")
+        let mut text = git
+            .file_hotspots
+            .top_files
+            .iter()
+            .take(5)
+            .map(|item| {
+                format!(
+                    "- `{}`: {} changed lines across {} commit(s)",
+                    item.path, item.changed_lines, item.commits
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push('\n');
+        text
+    };
+    let validation_signals_block = format_bullet_block(
+        report
+            .analysis
+            .validation_signals
+            .iter()
+            .map(String::as_str),
+    );
+    let follow_up_questions_block = format_bullet_block(
+        report
+            .analysis
+            .follow_up_questions
+            .iter()
+            .map(String::as_str),
+    );
+    let warnings_block = format_bullet_block(report.warnings.iter().map(String::as_str));
+
+    let view = RepoRetroView {
+        repo_name: &report.repo.name,
+        generated_at: &report.generated_at,
+        mode: &report.mode,
+        window_label: &report.window.label,
+        window_start: &report.window.start,
+        window_end: &report.window.end,
+        repo_root: &report.repo.root,
+        commit_count: git.summary.commit_count,
+        changed_lines: git.summary.changed_lines,
+        insertions: git.summary.insertions,
+        deletions: git.summary.deletions,
+        active_days_count: git.summary.active_days.len(),
+        test_related_commits: git.test_signals.test_related_commit_count,
+        themes_block,
+        attention_items_block,
+        hotspots_block,
+        validation_signals_block,
+        heuristic_state: &heuristic.state,
+        heuristic_active_inbox_total: heuristic.active_inbox.total,
+        heuristic_movement_summary: &report.analysis.heuristic_system_review.movement_summary,
+        heuristic_op_records_changed: heuristic.operation_records.changed_count,
+        heuristic_aging_summary: &report.analysis.heuristic_system_review.aging_summary,
+        follow_up_questions_block,
+        show_warnings: !report.warnings.is_empty(),
+        warnings_block,
+    };
+
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(REPO_RETRO_TEMPLATE_NAME, REPO_RETRO_TEMPLATE)
+        .expect("repo_retro template registers");
+    engine
+        .render(REPO_RETRO_TEMPLATE_NAME, &view)
+        .expect("repo_retro template renders")
 }
 
 fn expand_user(path: &Path) -> PathBuf {
@@ -1954,5 +1994,178 @@ fn slugify(value: &str) -> String {
         "repo".to_string()
     } else {
         slug
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("repo_retro")
+            .join(name)
+    }
+
+    fn assert_or_bless(name: &str, actual: &str) {
+        let path = fixture_path(name);
+        if std::env::var_os("BLESS_REPO_RETRO_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir fixture dir");
+            std::fs::write(&path, actual).expect("write fixture");
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read fixture {}: {err}", path.display()));
+        pretty_assertions::assert_eq!(expected, actual, "golden mismatch for {name}");
+    }
+
+    fn sample_report() -> RepoRetroReport {
+        RepoRetroReport {
+            schema: REPORT_SCHEMA_VERSION.to_string(),
+            mode: "git+heuristic".to_string(),
+            generated_at: "2026-05-26T07:00:00Z".to_string(),
+            repo: RepoIdentity {
+                root: "/tmp/sample".to_string(),
+                name: "sample".to_string(),
+                slug: "sample".to_string(),
+                branch: "main".to_string(),
+                head: "abc1234".to_string(),
+                remote: None,
+            },
+            window: Window {
+                mode: "explicit".to_string(),
+                label: "last 5 days".to_string(),
+                start: "2026-05-21".to_string(),
+                end: "2026-05-26".to_string(),
+                days: 5,
+            },
+            git: GitReport {
+                summary: CommitSummary {
+                    commit_count: 12,
+                    active_days: vec!["2026-05-22".to_string(), "2026-05-24".to_string()],
+                    first_commit_date: Some("2026-05-22".to_string()),
+                    last_commit_date: Some("2026-05-24".to_string()),
+                    insertions: 240,
+                    deletions: 80,
+                    changed_lines: 320,
+                },
+                commit_types: BTreeMap::new(),
+                authors: vec![],
+                file_hotspots: FileHotspots {
+                    top_files: vec![FileChangeSummary {
+                        path: "src/main.rs".to_string(),
+                        commits: 4,
+                        insertions: 100,
+                        deletions: 20,
+                        changed_lines: 120,
+                    }],
+                    top_areas: vec![],
+                },
+                test_signals: TestSignals {
+                    changed_test_files: vec![],
+                    changed_test_file_count: 0,
+                    test_related_commit_count: 3,
+                    test_changed_lines: 40,
+                    test_loc_ratio: None,
+                },
+                recent_commits: vec![],
+            },
+            heuristic_system: HeuristicSystemReport {
+                state: "stable".to_string(),
+                active_inbox: ActiveInboxSummary {
+                    state: "stable".to_string(),
+                    total: 2,
+                    by_status: BTreeMap::new(),
+                    by_severity: BTreeMap::new(),
+                    entries: vec![],
+                },
+                error_inbox_movement: ErrorInboxMovement {
+                    added: MovementBucket {
+                        count: 0,
+                        paths: vec![],
+                    },
+                    modified: MovementBucket {
+                        count: 0,
+                        paths: vec![],
+                    },
+                    archived: MovementBucket {
+                        count: 0,
+                        paths: vec![],
+                    },
+                    removed: MovementBucket {
+                        count: 0,
+                        paths: vec![],
+                    },
+                },
+                operation_records: OperationRecords {
+                    changed_count: 1,
+                    by_status: BTreeMap::new(),
+                    paths: vec![],
+                },
+                aging: HeuristicAging {
+                    oldest_open_days: None,
+                    entries_over_30_days: vec![],
+                },
+                boundary: "local".to_string(),
+            },
+            optional_inputs: BTreeMap::new(),
+            history: HistoryMetadata {
+                enabled: false,
+                write: false,
+                history_dir: None,
+                intended: None,
+                written: vec![],
+                comparison: HistoryComparison {
+                    status: "absent".to_string(),
+                    prior_schema: None,
+                    prior_window: None,
+                    prior_commit_count: None,
+                    commit_count_delta: None,
+                },
+            },
+            analysis: Analysis {
+                themes: vec!["Refactor: extracted helper".to_string()],
+                attention_items: vec!["No tests added for the new helper".to_string()],
+                follow_up_questions: vec!["Should we add an integration test?".to_string()],
+                validation_signals: vec!["cargo test -p sample passes".to_string()],
+                heuristic_system_review: HeuristicSystemReview {
+                    boundary: "local".to_string(),
+                    active_inbox_total: 2,
+                    high_severity_count: 0,
+                    movement_summary: "no movement in window".to_string(),
+                    aging_summary: "no entries over 30 days".to_string(),
+                },
+                history_comparison: HistoryComparison {
+                    status: "absent".to_string(),
+                    prior_schema: None,
+                    prior_window: None,
+                    prior_commit_count: None,
+                    commit_count_delta: None,
+                },
+            },
+            warnings: vec![],
+            sources: Sources { commands: vec![] },
+        }
+    }
+
+    #[test]
+    fn render_markdown_matches_golden_sample() {
+        let report = sample_report();
+        let out = render_markdown(&report);
+        assert_or_bless("sample.md", &out);
+    }
+
+    #[test]
+    fn render_markdown_matches_golden_with_warnings() {
+        let mut report = sample_report();
+        report.warnings = vec![
+            "test-fixture missing".to_string(),
+            "config file outdated".to_string(),
+        ];
+        let out = render_markdown(&report);
+        assert_or_bless("with_warnings.md", &out);
     }
 }
