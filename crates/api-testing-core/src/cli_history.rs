@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{Result, cli_util, history};
+use crate::{Result, auth_env::CliAuthSource, cli_util, history};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestCallHistoryAuth<'a> {
@@ -56,6 +56,24 @@ pub struct RequestCallHistoryRecord<'a> {
     pub auth: RequestCallHistoryAuth<'a>,
     pub request_arg: &'a str,
     pub extra_flags: &'a [RequestCallHistoryFlag<'a>],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RequestCallHistoryAppend<'a> {
+    pub enabled: bool,
+    pub history_writer: &'a history::HistoryWriter,
+    pub exit_code: i32,
+    pub setup_dir: &'a Path,
+    pub invocation_dir: &'a Path,
+    pub command_name: &'a str,
+    pub endpoint_label_used: &'a str,
+    pub endpoint_value_used: &'a str,
+    pub log_url: bool,
+    pub auth_source: &'a CliAuthSource,
+    pub token_name_for_log: &'a str,
+    pub request_arg: &'a str,
+    pub extra_flags: &'a [RequestCallHistoryFlag<'a>],
+    pub warning_label: &'a str,
 }
 
 pub fn resolve_history_file<F>(
@@ -127,6 +145,57 @@ pub fn run_history_command(
     }
 
     0
+}
+
+pub fn append_request_call_history_best_effort(
+    spec: RequestCallHistoryAppend<'_>,
+    stderr: &mut dyn Write,
+) {
+    if !spec.enabled {
+        return;
+    }
+
+    let stamp = cli_util::history_timestamp_now().unwrap_or_default();
+    let auth = match spec.auth_source {
+        CliAuthSource::TokenProfile => RequestCallHistoryAuth::HeaderAndFlag {
+            header_key: "token",
+            header_value: spec.token_name_for_log,
+            flag_name: "token",
+            flag_value: spec.token_name_for_log,
+        },
+        CliAuthSource::EnvFallback { env_name } => RequestCallHistoryAuth::HeaderOnly {
+            key: "auth",
+            value: env_name,
+        },
+        CliAuthSource::None => RequestCallHistoryAuth::None,
+    };
+
+    let record = build_request_call_history_record(RequestCallHistoryRecord {
+        stamp: &stamp,
+        exit_code: spec.exit_code,
+        setup_dir: spec.setup_dir,
+        invocation_dir: spec.invocation_dir,
+        command_name: spec.command_name,
+        endpoint_label_used: spec.endpoint_label_used,
+        endpoint_value_used: spec.endpoint_value_used,
+        log_url: spec.log_url,
+        auth,
+        request_arg: spec.request_arg,
+        extra_flags: spec.extra_flags,
+    });
+
+    if let Err(err) = spec.history_writer.append(&record) {
+        let warning_label = spec.warning_label.trim();
+        let warning_label = if warning_label.is_empty() {
+            spec.command_name
+        } else {
+            warning_label
+        };
+        let _ = writeln!(
+            stderr,
+            "warning: failed to append {warning_label} history: {err}"
+        );
+    }
 }
 
 pub fn build_request_call_history_record(spec: RequestCallHistoryRecord<'_>) -> String {

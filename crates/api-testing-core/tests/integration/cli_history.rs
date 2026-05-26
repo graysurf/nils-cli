@@ -1,4 +1,11 @@
-use api_testing_core::cli_history::{resolve_history_file, run_history_command};
+use api_testing_core::{
+    auth_env::CliAuthSource,
+    cli_history::{
+        RequestCallHistoryAppend, RequestCallHistoryFlag, append_request_call_history_best_effort,
+        resolve_history_file, run_history_command,
+    },
+    history::{HistoryWriter, RotationPolicy},
+};
 use nils_test_support::{EnvGuard, GlobalStateLock};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -64,4 +71,49 @@ fn cli_history_resolves_env_override_under_setup_dir() {
 
     let setup_dir_abs = std::fs::canonicalize(&setup_dir).unwrap();
     assert_eq!(history_file, setup_dir_abs.join("custom.history"));
+}
+
+#[test]
+fn cli_history_appends_shared_request_call_record() {
+    let tmp = TempDir::new().unwrap();
+    let setup_dir = tmp.path().join("setup/websocket");
+    std::fs::create_dir_all(&setup_dir).unwrap();
+    let history_file = tmp.path().join(".ws_history");
+    let history_writer = HistoryWriter::new(
+        history_file.clone(),
+        RotationPolicy {
+            max_mb: 10,
+            keep: 5,
+        },
+    );
+    let format_flag = [RequestCallHistoryFlag::raw("format", "json")];
+    let auth_source = CliAuthSource::TokenProfile;
+
+    append_request_call_history_best_effort(
+        RequestCallHistoryAppend {
+            enabled: true,
+            history_writer: &history_writer,
+            exit_code: 0,
+            setup_dir: &setup_dir,
+            invocation_dir: tmp.path(),
+            command_name: "api-websocket",
+            endpoint_label_used: "url",
+            endpoint_value_used: "ws://127.0.0.1:9001/ws",
+            log_url: false,
+            auth_source: &auth_source,
+            token_name_for_log: "svc",
+            request_arg: "/abs/requests/health.ws.json",
+            extra_flags: &format_flag,
+            warning_label: "api-websocket",
+        },
+        &mut std::io::sink(),
+    );
+
+    let text = std::fs::read_to_string(&history_file).unwrap();
+    assert!(text.contains("api-websocket call \\"));
+    assert!(text.contains("url=<omitted>"));
+    assert!(text.contains("token=svc"));
+    assert!(text.contains("--token 'svc'"));
+    assert!(text.contains("--format json"));
+    assert!(!text.contains("--url "));
 }

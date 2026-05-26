@@ -1,6 +1,7 @@
+use std::io::Write;
 use std::path::Path;
 
-use crate::{Result, cli_util, env_file};
+use crate::{Result, cli_util, env_file, jwt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileTokenSource {
@@ -16,12 +17,69 @@ pub enum CliAuthSource {
     EnvFallback { env_name: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliJwtValidationEnv<'a> {
+    pub enabled_var: &'a str,
+    pub strict_var: &'a str,
+    pub leeway_var: &'a str,
+    pub tool_label: &'a str,
+}
+
 impl From<ProfileTokenSource> for CliAuthSource {
     fn from(value: ProfileTokenSource) -> Self {
         match value {
             ProfileTokenSource::None => Self::None,
             ProfileTokenSource::Profile => Self::TokenProfile,
             ProfileTokenSource::EnvFallback { env_name } => Self::EnvFallback { env_name },
+        }
+    }
+}
+
+pub fn validate_cli_bearer_jwt(
+    bearer_token: &str,
+    auth_source: &CliAuthSource,
+    token_name: &str,
+    env: CliJwtValidationEnv<'_>,
+    stderr: &mut dyn Write,
+) -> Result<()> {
+    let enabled = cli_util::bool_from_env(
+        std::env::var(env.enabled_var).ok(),
+        env.enabled_var,
+        true,
+        Some(env.tool_label),
+        stderr,
+    );
+    let strict = cli_util::bool_from_env(
+        std::env::var(env.strict_var).ok(),
+        env.strict_var,
+        false,
+        Some(env.tool_label),
+        stderr,
+    );
+    let leeway_seconds = cli_util::parse_u64_default(std::env::var(env.leeway_var).ok(), 0, 0);
+
+    let label = match auth_source {
+        CliAuthSource::TokenProfile => format!("token profile '{token_name}'"),
+        CliAuthSource::EnvFallback { env_name } => env_name.to_string(),
+        CliAuthSource::None => "token".to_string(),
+    };
+
+    let opts = jwt::JwtValidationOptions {
+        enabled,
+        strict,
+        leeway_seconds: i64::try_from(leeway_seconds).unwrap_or(i64::MAX),
+    };
+
+    match jwt::check_bearer_jwt(bearer_token, &label, opts)? {
+        jwt::JwtCheck::Ok => Ok(()),
+        jwt::JwtCheck::Warn(msg) => {
+            let tool_label = env.tool_label.trim();
+            if tool_label.is_empty() {
+                let _ = writeln!(stderr, "warning: {msg}");
+            } else {
+                let _ = writeln!(stderr, "{tool_label}: warning: {msg}");
+            }
+            Ok(())
         }
     }
 }
@@ -150,6 +208,15 @@ mod tests {
         std::fs::write(path, contents).expect("write");
     }
 
+    fn test_jwt_env() -> CliJwtValidationEnv<'static> {
+        CliJwtValidationEnv {
+            enabled_var: "TEST_JWT_VALIDATE_ENABLED",
+            strict_var: "TEST_JWT_VALIDATE_STRICT",
+            leeway_var: "TEST_JWT_VALIDATE_LEEWAY_SECONDS",
+            tool_label: "api-test",
+        }
+    }
+
     #[test]
     fn resolve_env_fallback_prefers_order() {
         let lock = GlobalStateLock::new();
@@ -179,6 +246,51 @@ mod tests {
             CliAuthSource::EnvFallback {
                 env_name: "ACCESS_TOKEN".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn validate_cli_bearer_jwt_warns_when_non_strict() {
+        let lock = GlobalStateLock::new();
+        let _enabled = EnvGuard::set(&lock, "TEST_JWT_VALIDATE_ENABLED", "true");
+        let _strict = EnvGuard::set(&lock, "TEST_JWT_VALIDATE_STRICT", "false");
+        let _leeway = EnvGuard::remove(&lock, "TEST_JWT_VALIDATE_LEEWAY_SECONDS");
+
+        let mut stderr = Vec::new();
+        validate_cli_bearer_jwt(
+            "not.a.jwt",
+            &CliAuthSource::None,
+            "default",
+            test_jwt_env(),
+            &mut stderr,
+        )
+        .expect("non-strict invalid token should warn");
+
+        let msg = String::from_utf8(stderr).expect("utf8");
+        assert!(msg.contains("api-test: warning:"));
+        assert!(msg.contains("token for token is not a valid JWT"));
+    }
+
+    #[test]
+    fn validate_cli_bearer_jwt_errors_when_strict_invalid() {
+        let lock = GlobalStateLock::new();
+        let _enabled = EnvGuard::set(&lock, "TEST_JWT_VALIDATE_ENABLED", "true");
+        let _strict = EnvGuard::set(&lock, "TEST_JWT_VALIDATE_STRICT", "true");
+        let _leeway = EnvGuard::remove(&lock, "TEST_JWT_VALIDATE_LEEWAY_SECONDS");
+
+        let mut stderr = Vec::new();
+        let err = validate_cli_bearer_jwt(
+            "not.a.jwt",
+            &CliAuthSource::TokenProfile,
+            "svc",
+            test_jwt_env(),
+            &mut stderr,
+        )
+        .expect_err("strict invalid token should fail");
+
+        assert!(
+            err.to_string()
+                .contains("invalid JWT for token profile 'svc'")
         );
     }
 
