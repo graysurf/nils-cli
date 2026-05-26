@@ -29,7 +29,15 @@ fn record_template_help_lists_template_under_record() {
 
 #[test]
 fn record_template_markdown_renders_every_role() {
-    for role in ["source", "plan", "state", "session", "validation", "review", "closeout"] {
+    for role in [
+        "source",
+        "plan",
+        "state",
+        "session",
+        "validation",
+        "review",
+        "closeout",
+    ] {
         let out = common::run_plan_issue(&[
             "--format",
             "json",
@@ -66,7 +74,15 @@ fn record_template_markdown_renders_every_role() {
 
 #[test]
 fn record_template_json_renders_every_role() {
-    for role in ["source", "plan", "state", "session", "validation", "review", "closeout"] {
+    for role in [
+        "source",
+        "plan",
+        "state",
+        "session",
+        "validation",
+        "review",
+        "closeout",
+    ] {
         let out = common::run_plan_issue(&[
             "--format",
             "json",
@@ -95,14 +111,7 @@ fn record_template_json_renders_every_role() {
 #[test]
 fn record_template_state_markdown_includes_task_ledger() {
     let out = common::run_plan_issue(&[
-        "--format",
-        "json",
-        "record",
-        "template",
-        "--kind",
-        "state",
-        "--shape",
-        "markdown",
+        "--format", "json", "record", "template", "--kind", "state", "--shape", "markdown",
     ]);
     assert_eq!(out.code, 0);
     let envelope = json_stdout(&out);
@@ -129,7 +138,10 @@ fn record_template_envelope_shape_is_stable() {
     ]);
     assert_eq!(out.code, 0);
     let envelope = json_stdout(&out);
-    assert_eq!(envelope["schema_version"], "plan-issue-cli.record.template.v2");
+    assert_eq!(
+        envelope["schema_version"],
+        "plan-issue-cli.record.template.v2"
+    );
     assert_eq!(envelope["command"], "record.template");
     assert_eq!(envelope["status"], "ok");
     let result = &envelope["payload"]["result"];
@@ -141,7 +153,15 @@ fn record_template_envelope_shape_is_stable() {
 
 #[test]
 fn record_template_dispatch_profile_renders_for_every_role() {
-    for role in ["source", "plan", "state", "session", "validation", "review", "closeout"] {
+    for role in [
+        "source",
+        "plan",
+        "state",
+        "session",
+        "validation",
+        "review",
+        "closeout",
+    ] {
         let out = common::run_plan_issue(&[
             "--format",
             "json",

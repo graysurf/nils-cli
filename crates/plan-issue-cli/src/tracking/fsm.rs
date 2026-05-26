@@ -266,7 +266,9 @@ pub fn run_state_is_stale(audit: Option<&RecordAudit>, run: &ExecutionRun) -> bo
     };
     // If the run state still says implementing but the issue already has a
     // closeout comment, run state is stale.
-    if audit.evidence.contains_key("closeout") && !matches!(run.phase, crate::tracking::run_state::RunPhase::Closed) {
+    if audit.evidence.contains_key("closeout")
+        && !matches!(run.phase, crate::tracking::run_state::RunPhase::Closed)
+    {
         return true;
     }
     false
@@ -304,9 +306,7 @@ pub fn missing_payload_roles(audit: Option<&RecordAudit>) -> Vec<PayloadRole> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle_record::{
-        BodySections, LifecycleEvidence, PayloadProfile, RecordAudit,
-    };
+    use crate::lifecycle_record::{BodySections, LifecycleEvidence, PayloadProfile, RecordAudit};
     use std::collections::BTreeMap;
 
     fn evidence_for(role: PayloadRole, status: Option<&str>) -> LifecycleEvidence {

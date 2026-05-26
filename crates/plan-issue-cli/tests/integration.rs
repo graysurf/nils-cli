@@ -21,8 +21,6 @@ mod lifecycle_record;
 mod lifecycle_vnext_registry;
 #[path = "integration/lifecycle_vnext_render.rs"]
 mod lifecycle_vnext_render;
-#[path = "integration/visible_lint.rs"]
-mod visible_lint;
 #[path = "integration/link_pr_flow.rs"]
 mod link_pr_flow;
 #[path = "integration/live_issue_ops.rs"]
@@ -47,27 +45,29 @@ mod resolve_approval;
 mod runtime_layout_parity;
 #[path = "integration/runtime_truth_plan_and_sprint_flow.rs"]
 mod runtime_truth_plan_and_sprint_flow;
-#[path = "integration/tracking_events.rs"]
-mod tracking_events;
-#[path = "integration/tracking_fsm.rs"]
-mod tracking_fsm;
-#[path = "integration/tracking_reconcile.rs"]
-mod tracking_reconcile;
-#[path = "integration/tracking_checkpoint_dry_run.rs"]
-mod tracking_checkpoint_dry_run;
-#[path = "integration/tracking_checkpoint_refusals.rs"]
-mod tracking_checkpoint_refusals;
-#[path = "integration/tracking_close_ready.rs"]
-mod tracking_close_ready;
-#[path = "integration/tracking_run_state.rs"]
-mod tracking_run_state;
-#[path = "integration/tracking_run_update.rs"]
-mod tracking_run_update;
-#[path = "integration/tracking_status.rs"]
-mod tracking_status;
 #[path = "integration/start_plan_canonical.rs"]
 mod start_plan_canonical;
 #[path = "integration/start_sprint_canonical.rs"]
 mod start_sprint_canonical;
 #[path = "integration/task_spec_flow.rs"]
 mod task_spec_flow;
+#[path = "integration/tracking_checkpoint_dry_run.rs"]
+mod tracking_checkpoint_dry_run;
+#[path = "integration/tracking_checkpoint_refusals.rs"]
+mod tracking_checkpoint_refusals;
+#[path = "integration/tracking_close_ready.rs"]
+mod tracking_close_ready;
+#[path = "integration/tracking_events.rs"]
+mod tracking_events;
+#[path = "integration/tracking_fsm.rs"]
+mod tracking_fsm;
+#[path = "integration/tracking_reconcile.rs"]
+mod tracking_reconcile;
+#[path = "integration/tracking_run_state.rs"]
+mod tracking_run_state;
+#[path = "integration/tracking_run_update.rs"]
+mod tracking_run_update;
+#[path = "integration/tracking_status.rs"]
+mod tracking_status;
+#[path = "integration/visible_lint.rs"]
+mod visible_lint;

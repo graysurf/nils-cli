@@ -15,11 +15,11 @@ use crate::render::cache::{CACHE_FILE, CacheEntry, RenderCache};
 use crate::render::helpers::{HelperContext, register_all};
 use crate::render::manifest::{ManifestSet, Skill, SourceRoot};
 use anyhow::{Context, Result, anyhow};
+use nils_markdown::Engine;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tera::Tera;
 
 pub const SKILL_TEMPLATE_FILE: &str = "SKILL.md.tera";
 const TERA_EXT: &str = "tera";
@@ -359,9 +359,10 @@ fn render_template(
         current_skill_required_clis: skill.required_clis.clone(),
         current_skill_state_out_mode: skill.state_out_mode,
     };
-    let mut tera = Tera::default();
-    register_all(&mut tera, Arc::new(ctx));
-    tera.render_str(template_body, &tera::Context::new())
+    let mut engine = Engine::builder().build();
+    register_all(&mut engine, Arc::new(ctx));
+    engine
+        .render_str(template_body, &serde_json::Value::Null)
         .with_context(|| format!("render skill {}", skill.id))
 }
 

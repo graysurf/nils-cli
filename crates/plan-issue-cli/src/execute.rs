@@ -1634,20 +1634,20 @@ fn derive_lint_hints(
     match role {
         PayloadRole::State => {
             // Final state when the structured payload reports `complete`.
-            if let Some(payload) = payload {
-                if let Ok(state) = payload.parse_state() {
-                    hints.state_is_final = matches!(
-                        state.status,
-                        Some(crate::lifecycle_record::StateStatus::Complete)
-                    );
-                }
+            if let Some(payload) = payload
+                && let Ok(state) = payload.parse_state()
+            {
+                hints.state_is_final = matches!(
+                    state.status,
+                    Some(crate::lifecycle_record::StateStatus::Complete)
+                );
             }
         }
         PayloadRole::Review => {
-            if let Some(payload) = payload {
-                if let Ok(review) = payload.parse_review() {
-                    hints.review_has_findings = !review.findings.is_empty();
-                }
+            if let Some(payload) = payload
+                && let Ok(review) = payload.parse_review()
+            {
+                hints.review_has_findings = !review.findings.is_empty();
             }
         }
         _ => {}
@@ -1677,18 +1677,13 @@ fn run_tracking_run_init(
 ) -> Result<Value, CommandError> {
     use crate::runtime_layout;
     use crate::tracking::events::{self, ExecutionEvent, ExecutionEventKind};
-    use crate::tracking::run_state::{
-        ExecutionRun, RunPhase, RunRoot, SelectedScope,
-    };
+    use crate::tracking::run_state::{ExecutionRun, RunPhase, RunRoot, SelectedScope};
 
     let run_id = args
         .run_id
         .clone()
         .unwrap_or_else(|| default_run_id(args.issue, args.now.as_deref()));
-    let now = args
-        .now
-        .clone()
-        .unwrap_or_else(default_now);
+    let now = args.now.clone().unwrap_or_else(default_now);
     let mut run = ExecutionRun::new(
         run_id.clone(),
         args.provider_repo.clone(),
@@ -1724,8 +1719,9 @@ fn run_tracking_run_init(
         (out.clone(), events_path)
     } else {
         let repo_slug = runtime_layout::repo_slug(&args.provider_repo);
-        let root = RunRoot::new(&repo_slug, args.issue, run_id.clone())
-            .map_err(|err| CommandError::runtime("tracking-run-init-layout-failed", err.to_string()))?;
+        let root = RunRoot::new(&repo_slug, args.issue, run_id.clone()).map_err(|err| {
+            CommandError::runtime("tracking-run-init-layout-failed", err.to_string())
+        })?;
         root.ensure_layout().map_err(|err| {
             CommandError::runtime("tracking-run-init-mkdir-failed", err.to_string())
         })?;
@@ -1763,13 +1759,9 @@ fn run_tracking_run_update(
         self, LinkedPr, RunPhase, ValidationCommandRow, ValidationSummary,
     };
 
-    let mut run = run_state::read_run_state(&args.run_state).map_err(|err| {
-        CommandError::runtime("tracking-run-update-read-failed", err.to_string())
-    })?;
-    let now = args
-        .now
-        .clone()
-        .unwrap_or_else(default_now);
+    let mut run = run_state::read_run_state(&args.run_state)
+        .map_err(|err| CommandError::runtime("tracking-run-update-read-failed", err.to_string()))?;
+    let now = args.now.clone().unwrap_or_else(default_now);
     let mut changes = Vec::new();
     if let Some(phase) = args.phase {
         let new_phase = match phase {
@@ -1816,9 +1808,7 @@ fn run_tracking_run_update(
         if let Some(overall) = &args.validation_overall {
             summary.overall = overall.clone();
         }
-        if let (Some(command), Some(status)) =
-            (&args.validation_command, &args.validation_status)
-        {
+        if let (Some(command), Some(status)) = (&args.validation_command, &args.validation_status) {
             summary.commands.push(ValidationCommandRow {
                 command: command.clone(),
                 status: status.clone(),
@@ -1829,13 +1819,14 @@ fn run_tracking_run_update(
         changes.push("validation");
     }
     if let Some(decision) = &args.review_decision {
-        let mut review = run.review.clone().unwrap_or_else(|| {
-            crate::tracking::run_state::ReviewSummary {
-                decision: decision.clone(),
-                findings_disposition: Vec::new(),
-                evidence: None,
-            }
-        });
+        let mut review =
+            run.review
+                .clone()
+                .unwrap_or_else(|| crate::tracking::run_state::ReviewSummary {
+                    decision: decision.clone(),
+                    findings_disposition: Vec::new(),
+                    evidence: None,
+                });
         review.decision = decision.clone();
         run.review = Some(review);
         changes.push("review");
@@ -1854,8 +1845,12 @@ fn run_tracking_run_update(
     if let Some(parent) = args.run_state.parent() {
         let events_path = parent.join("events.jsonl");
         let detail = serde_json::json!({"changed": changes});
-        let event = ExecutionEvent::new(run.run_id.clone(), ExecutionEventKind::RunUpdated, now.clone())
-            .with_detail(detail);
+        let event = ExecutionEvent::new(
+            run.run_id.clone(),
+            ExecutionEventKind::RunUpdated,
+            now.clone(),
+        )
+        .with_detail(detail);
         events::append_event(&events_path, &event).map_err(|err| {
             CommandError::runtime("tracking-run-update-event-append-failed", err.to_string())
         })?;
@@ -1916,9 +1911,7 @@ fn run_tracking_checkpoint(
     let audit = if let Some(comments) = comments_json.as_deref() {
         Some(
             lifecycle_record::audit_record(body.as_deref(), comments, Some(args.profile))
-                .map_err(|err| {
-                    CommandError::runtime("tracking-checkpoint-audit-failed", err)
-                })?,
+                .map_err(|err| CommandError::runtime("tracking-checkpoint-audit-failed", err))?,
         )
     } else {
         None
@@ -1939,11 +1932,7 @@ fn run_tracking_checkpoint(
             "suggested_unblock": "run `plan-issue tracking status` and update run state before checkpoint",
         }));
     }
-    if reconciled
-        .recommended_action
-        .as_str()
-        == "open_record"
-    {
+    if reconciled.recommended_action.as_str() == "open_record" {
         blocked.push(json!({
             "code": "issue-evidence-missing",
             "message": "record has not been opened yet",
@@ -2245,7 +2234,10 @@ fn resolve_checkpoint_inputs(
         return Ok((body, comments));
     }
     let body = match &args.body_file {
-        Some(path) => Some(read_text_file(path, "tracking-checkpoint-body-read-failed")?),
+        Some(path) => Some(read_text_file(
+            path,
+            "tracking-checkpoint-body-read-failed",
+        )?),
         None => None,
     };
     let comments = match &args.comments_json {
@@ -2269,16 +2261,17 @@ fn run_tracking_close_ready(
     let audit = if let Some(comments) = comments_json.as_deref() {
         Some(
             lifecycle_record::audit_record(body.as_deref(), comments, Some(args.profile))
-                .map_err(|err| {
-                    CommandError::runtime("tracking-close-ready-audit-failed", err)
-                })?,
+                .map_err(|err| CommandError::runtime("tracking-close-ready-audit-failed", err))?,
         )
     } else {
         None
     };
     let run = match &args.run_state {
         Some(path) => Some(run_state::read_run_state(path).map_err(|err| {
-            CommandError::runtime("tracking-close-ready-run-state-read-failed", err.to_string())
+            CommandError::runtime(
+                "tracking-close-ready-run-state-read-failed",
+                err.to_string(),
+            )
         })?),
         None => None,
     };
@@ -2287,21 +2280,19 @@ fn run_tracking_close_ready(
     let mut blockers: Vec<Value> = Vec::new();
     let mut linked_prs: Vec<String> = args.linked_pr.clone();
 
-    if let Some(audit) = audit.as_ref() {
-        if let Some(state_evidence) = audit.evidence.get("state") {
-            if let Some(payload) = state_evidence.payload.as_ref() {
-                if let Ok(state) = payload.parse_state() {
-                    for pr in state.prs {
-                        linked_prs.push(pr.pr_ref);
-                    }
-                }
-            }
+    if let Some(audit) = audit.as_ref()
+        && let Some(state_evidence) = audit.evidence.get("state")
+        && let Some(payload) = state_evidence.payload.as_ref()
+        && let Ok(state) = payload.parse_state()
+    {
+        for pr in state.prs {
+            linked_prs.push(pr.pr_ref);
         }
     }
-    if let Some(run) = run.as_ref() {
-        if let Some(pr) = run.pr.as_ref() {
-            linked_prs.push(pr.r#ref.clone());
-        }
+    if let Some(run) = run.as_ref()
+        && let Some(pr) = run.pr.as_ref()
+    {
+        linked_prs.push(pr.r#ref.clone());
     }
     linked_prs.sort();
     linked_prs.dedup();
@@ -2324,27 +2315,30 @@ fn run_tracking_close_ready(
 
     // Visible completeness check (Task 6.2 deep gate).
     let mut visible_summary = json!({"checked": false});
-    if args.expect_visible {
-        if let (Some(audit), Some(comments)) = (audit.as_ref(), comments_json.as_deref()) {
-            let visible = run_record_audit_visible(audit, comments, Some(args.profile))?;
-            let overall_pass = visible["overall_pass"].as_bool().unwrap_or(false);
-            visible_summary = json!({
-                "checked": true,
-                "pass": overall_pass,
-                "report": visible,
-            });
-            if !overall_pass {
-                blockers.push(json!({
-                    "code": "visible-completeness-failed",
-                    "message": "visible-completeness lint reported missing sections",
-                    "suggested_unblock": "fix the rendered lifecycle comments before close",
-                }));
-            }
+    if args.expect_visible
+        && let (Some(audit), Some(comments)) = (audit.as_ref(), comments_json.as_deref())
+    {
+        let visible = run_record_audit_visible(audit, comments, Some(args.profile))?;
+        let overall_pass = visible["overall_pass"].as_bool().unwrap_or(false);
+        visible_summary = json!({
+            "checked": true,
+            "pass": overall_pass,
+            "report": visible,
+        });
+        if !overall_pass {
+            blockers.push(json!({
+                "code": "visible-completeness-failed",
+                "message": "visible-completeness lint reported missing sections",
+                "suggested_unblock": "fix the rendered lifecycle comments before close",
+            }));
         }
     }
 
     let ready = blockers.is_empty()
-        && matches!(reconciled.state, crate::tracking::fsm::RecordState::RecordReadyForClose);
+        && matches!(
+            reconciled.state,
+            crate::tracking::fsm::RecordState::RecordReadyForClose
+        );
 
     Ok(json!({
         "operation": "tracking.close-ready",
@@ -2463,11 +2457,11 @@ fn run_tracking_status(
         "run_state": tracking_status_run_state_summary(run_state_value.as_ref()),
     });
 
-    if args.expect_visible {
-        if let (Some(audit), Some(comments)) = (audit.as_ref(), comments_json.as_deref()) {
-            let visible = run_record_audit_visible(audit, comments, Some(args.profile))?;
-            payload["visible"] = visible;
-        }
+    if args.expect_visible
+        && let (Some(audit), Some(comments)) = (audit.as_ref(), comments_json.as_deref())
+    {
+        let visible = run_record_audit_visible(audit, comments, Some(args.profile))?;
+        payload["visible"] = visible;
     }
 
     Ok(payload)
@@ -2480,7 +2474,10 @@ fn resolve_tracking_status_inputs(
         let body_path = fixture.join("body.md");
         let comments_path = fixture.join("comments.json");
         let body = if body_path.exists() {
-            Some(read_text_file(&body_path, "tracking-status-body-read-failed")?)
+            Some(read_text_file(
+                &body_path,
+                "tracking-status-body-read-failed",
+            )?)
         } else {
             None
         };
@@ -2499,7 +2496,10 @@ fn resolve_tracking_status_inputs(
         None => None,
     };
     let comments = match &args.comments_json {
-        Some(path) => Some(read_text_file(path, "tracking-status-comments-read-failed")?),
+        Some(path) => Some(read_text_file(
+            path,
+            "tracking-status-comments-read-failed",
+        )?),
         None => None,
     };
     if body.is_none() && comments.is_none() {

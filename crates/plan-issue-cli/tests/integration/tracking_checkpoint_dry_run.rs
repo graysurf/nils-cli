@@ -118,13 +118,13 @@ fn tracking_checkpoint_dry_run_renders_state_role_from_run_state() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert!(planned.contains(&"state"), "planned={planned:?} full={result}");
+    assert!(
+        planned.contains(&"state"),
+        "planned={planned:?} full={result}"
+    );
     let rendered = &result["rendered"];
     assert!(rendered.is_array() && !rendered.as_array().unwrap().is_empty());
-    let body = rendered[0]["body"]
-        .as_str()
-        .expect("body")
-        .to_string();
+    let body = rendered[0]["body"].as_str().expect("body").to_string();
     assert!(body.starts_with("<!-- plan-issue-record:v2 role=state"));
     assert!(body.contains("## Task Ledger"));
 }
@@ -225,5 +225,9 @@ fn tracking_checkpoint_dry_run_writes_rendered_bodies_under_run_dir() {
     let result = json_stdout(&out)["payload"]["result"].clone();
     assert_eq!(result["mode"], "dry-run");
     let written = rendered_dir.join("state-comment.md");
-    assert!(written.exists(), "rendered file not written: {}", written.display());
+    assert!(
+        written.exists(),
+        "rendered file not written: {}",
+        written.display()
+    );
 }

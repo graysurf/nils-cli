@@ -58,7 +58,10 @@ fn tracking_run_state_round_trips_disk_io() {
     assert_eq!(loaded.bundle, run.bundle);
     assert_eq!(loaded.execution_state_file, run.execution_state_file);
     assert_eq!(loaded.branch, run.branch);
-    assert_eq!(loaded.pr.as_ref().map(|p| p.r#ref.clone()), Some("owner/repo#456".to_string()));
+    assert_eq!(
+        loaded.pr.as_ref().map(|p| p.r#ref.clone()),
+        Some("owner/repo#456".to_string())
+    );
     assert_eq!(
         loaded.validation.as_ref().map(|v| v.overall.clone()),
         Some("pass".to_string())

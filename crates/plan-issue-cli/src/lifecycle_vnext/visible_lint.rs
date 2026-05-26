@@ -38,8 +38,7 @@ pub mod codes {
 
     // Validation.
     pub const VALIDATION_MISSING_OVERALL: &str = "validation-missing-overall";
-    pub const VALIDATION_MISSING_COMMANDS_OR_WAIVER: &str =
-        "validation-missing-commands-or-waiver";
+    pub const VALIDATION_MISSING_COMMANDS_OR_WAIVER: &str = "validation-missing-commands-or-waiver";
 
     // Review.
     pub const REVIEW_MISSING_DECISION: &str = "review-missing-decision";
@@ -215,7 +214,9 @@ fn check_validation(body: &str, report: &mut VisibleReport) {
     // Commands table OR a Waivers section is required to back the overall.
     let has_command_row = body_contains_validation_command_row(body);
     let has_waiver = body_contains_heading(body, "### Waivers")
-        || body.lines().any(|line| line.trim_start().starts_with("- `"));
+        || body
+            .lines()
+            .any(|line| line.trim_start().starts_with("- `"));
     if !has_command_row && !has_waiver {
         report.push(VisibleFinding::new(
             PayloadRole::Validation,
@@ -354,9 +355,7 @@ fn body_contains_validation_command_row(body: &str) -> bool {
 }
 
 fn is_table_separator(line: &str) -> bool {
-    line.chars()
-        .all(|c| matches!(c, '|' | '-' | ' ' | ':'))
-        && line.contains("---")
+    line.chars().all(|c| matches!(c, '|' | '-' | ' ' | ':')) && line.contains("---")
 }
 
 fn body_contains_review_disposition_row(body: &str) -> bool {

@@ -57,10 +57,7 @@ fn lifecycle_vnext_registry_headings_match_taxonomy() {
 fn lifecycle_vnext_registry_state_requires_task_ledger() {
     let state = registry::role(PayloadRole::State);
     assert!(
-        state
-            .required_visible_sections
-            .iter()
-            .any(|h| *h == "## Task Ledger"),
+        state.required_visible_sections.contains(&"## Task Ledger"),
         "state visible sections missing ## Task Ledger: {:?}",
         state.required_visible_sections
     );

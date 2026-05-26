@@ -68,7 +68,10 @@ pub fn reconcile(audit: Option<&RecordAudit>, run: Option<&ExecutionRun>) -> Rec
                     "provider issue lifecycle evidence is newer than local run state; refuse live mutation until reconciled".to_string(),
             });
         }
-        if run.validation.as_ref().is_some_and(|v| v.overall.eq_ignore_ascii_case("pass"))
+        if run
+            .validation
+            .as_ref()
+            .is_some_and(|v| v.overall.eq_ignore_ascii_case("pass"))
             && !audit.evidence.contains_key("validation")
         {
             warnings.push(ReconciliationWarning {
@@ -163,7 +166,10 @@ mod tests {
         ]);
         let result = reconcile(Some(&audit), None);
         assert_eq!(result.state, RecordState::RecordOpenActive);
-        assert_eq!(result.recommended_action, RecommendedAction::RecordValidation);
+        assert_eq!(
+            result.recommended_action,
+            RecommendedAction::RecordValidation
+        );
     }
 
     #[test]
@@ -172,12 +178,7 @@ mod tests {
         let run = fixture_run(RunPhase::Implementing);
         let result = reconcile(Some(&audit), Some(&run));
         assert!(result.is_stale(), "expected stale warning: {result:?}");
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.code == "run-state-stale")
-        );
+        assert!(result.warnings.iter().any(|w| w.code == "run-state-stale"));
     }
 
     #[test]

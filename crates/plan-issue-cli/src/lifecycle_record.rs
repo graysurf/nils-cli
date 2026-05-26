@@ -862,16 +862,7 @@ pub const PAYLOAD_FENCE_INFO: &str = "plan-issue-record-payload";
 const PAYLOAD_COMMENT_PREFIX: &str = "plan-issue-record-payload:hex:";
 
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum PayloadRole {

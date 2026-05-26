@@ -8,9 +8,7 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
 
-use plan_issue_cli::tracking::events::{
-    self, EVENT_SCHEMA, ExecutionEvent, ExecutionEventKind,
-};
+use plan_issue_cli::tracking::events::{self, EVENT_SCHEMA, ExecutionEvent, ExecutionEventKind};
 
 #[test]
 fn tracking_events_schema_identifier_is_stable() {
@@ -23,8 +21,7 @@ fn tracking_events_appends_run_start_through_checkpoint_in_order() {
     let path = tmp.path().join("nested/events.jsonl");
     let sequence: Vec<ExecutionEvent> = vec![
         ExecutionEvent::new("run-1", ExecutionEventKind::RunStarted, "t1"),
-        ExecutionEvent::new("run-1", ExecutionEventKind::TaskSelected, "t2")
-            .with_task("1.2"),
+        ExecutionEvent::new("run-1", ExecutionEventKind::TaskSelected, "t2").with_task("1.2"),
         ExecutionEvent::new("run-1", ExecutionEventKind::ValidationRecorded, "t3")
             .with_detail(json!({"status": "pass"})),
         ExecutionEvent::new("run-1", ExecutionEventKind::Reconciled, "t4")
@@ -98,8 +95,10 @@ fn tracking_events_large_detail_can_be_stored_as_path_pointer() {
         }));
     events::append_event(&path, &event).expect("append");
     let read = events::read_events(&path).expect("read");
-    assert!(read[0].detail["evidence_path"]
-        .as_str()
-        .unwrap_or_default()
-        .ends_with("artifacts/validation/log.txt"));
+    assert!(
+        read[0].detail["evidence_path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("artifacts/validation/log.txt")
+    );
 }

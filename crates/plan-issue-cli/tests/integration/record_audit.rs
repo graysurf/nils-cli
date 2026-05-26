@@ -30,7 +30,9 @@ fn v2_comment(role: &str, profile: &str, data: Value, visible: &str) -> String {
     )
 }
 
-fn write_fixture(role_bodies: &[(&str, Value, &str)]) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+fn write_fixture(
+    role_bodies: &[(&str, Value, &str)],
+) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let tmp = TempDir::new().expect("tmp");
     let body = tmp.path().join("body.md");
     fs::write(&body, "## Current Dashboard\n").expect("body");
@@ -47,11 +49,7 @@ fn write_fixture(role_bodies: &[(&str, Value, &str)]) -> (TempDir, std::path::Pa
         })
         .collect();
     let comments_path = tmp.path().join("comments.json");
-    fs::write(
-        &comments_path,
-        json!({"comments": comments}).to_string(),
-    )
-    .expect("comments");
+    fs::write(&comments_path, json!({"comments": comments}).to_string()).expect("comments");
     (tmp, body, comments_path)
 }
 
@@ -129,7 +127,15 @@ fn record_audit_expect_visible_passes_for_complete_evidence() {
     let role_names: Vec<&str> = roles.iter().map(|r| r["role"].as_str().unwrap()).collect();
     assert_eq!(
         role_names,
-        vec!["source", "plan", "state", "session", "validation", "review", "closeout"]
+        vec![
+            "source",
+            "plan",
+            "state",
+            "session",
+            "validation",
+            "review",
+            "closeout"
+        ]
     );
 }
 
@@ -201,7 +207,9 @@ fn record_audit_expect_visible_blocks_profile_only_session() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert!(
-        codes.iter().any(|c| *c == "session-missing-summary" || *c == "profile-only"),
+        codes
+            .iter()
+            .any(|c| *c == "session-missing-summary" || *c == "profile-only"),
         "expected session-missing-summary or profile-only; got {codes:?}"
     );
 }

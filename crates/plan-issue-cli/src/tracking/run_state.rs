@@ -227,9 +227,8 @@ impl std::error::Error for RunStateError {}
 /// Parse a `run-state.json` body and validate the schema id and required
 /// fields.
 pub fn parse_run_state(raw: &str) -> Result<ExecutionRun, RunStateError> {
-    let value: Value = serde_json::from_str(raw).map_err(|err| {
-        RunStateError::Malformed(format!("failed to parse JSON: {err}"))
-    })?;
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|err| RunStateError::Malformed(format!("failed to parse JSON: {err}")))?;
     let schema = value
         .get("schema")
         .and_then(Value::as_str)
@@ -239,7 +238,15 @@ pub fn parse_run_state(raw: &str) -> Result<ExecutionRun, RunStateError> {
             actual: schema.to_string(),
         });
     }
-    for required in ["run_id", "repo", "issue", "profile", "phase", "created_at", "updated_at"] {
+    for required in [
+        "run_id",
+        "repo",
+        "issue",
+        "profile",
+        "phase",
+        "created_at",
+        "updated_at",
+    ] {
         if value.get(required).is_none() {
             return Err(RunStateError::MissingField(name_for(required)));
         }
@@ -277,8 +284,8 @@ pub fn write_run_state(path: &Path, run: &ExecutionRun) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         runtime_layout::ensure_dir(parent)?;
     }
-    let rendered = render_run_state(run)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let rendered =
+        render_run_state(run).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     fs::write(path, rendered)
 }
 
@@ -393,10 +400,7 @@ mod tests {
         assert_eq!(parsed.issue, run.issue);
         assert_eq!(parsed.phase, run.phase);
         assert_eq!(
-            parsed
-                .selected_scope
-                .as_ref()
-                .and_then(|s| s.task.clone()),
+            parsed.selected_scope.as_ref().and_then(|s| s.task.clone()),
             Some("1.2".to_string())
         );
         assert_eq!(

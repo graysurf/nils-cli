@@ -88,7 +88,10 @@ fn tracking_status_emits_stable_envelope_for_fixture_input() {
     ]);
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     let envelope = json_stdout(&out);
-    assert_eq!(envelope["schema_version"], "plan-issue-cli.tracking.status.v1");
+    assert_eq!(
+        envelope["schema_version"],
+        "plan-issue-cli.tracking.status.v1"
+    );
     assert_eq!(envelope["command"], "tracking.status");
     assert_eq!(envelope["status"], "ok");
     let result = &envelope["payload"]["result"];
@@ -146,19 +149,17 @@ fn tracking_status_blocked_state_recommends_resolve_blocker() {
 
 #[test]
 fn tracking_status_reports_stale_run_state_when_issue_closed() {
-    let fixture = write_fixture(&[
-        (
-            "closeout",
-            json!({
-                "final_status": "complete",
-                "approval": {"approver": "x"},
-                "linked_prs": [],
-                "final_validation_url": null,
-            }),
-            "## Tracking Issue Closeout\n\n- Profile: tracking\n- Final status: complete\n- Approval: x",
-            "2026-05-26T00:00:00Z",
-        ),
-    ]);
+    let fixture = write_fixture(&[(
+        "closeout",
+        json!({
+            "final_status": "complete",
+            "approval": {"approver": "x"},
+            "linked_prs": [],
+            "final_validation_url": null,
+        }),
+        "## Tracking Issue Closeout\n\n- Profile: tracking\n- Final status: complete\n- Approval: x",
+        "2026-05-26T00:00:00Z",
+    )]);
     let tmp = TempDir::new().expect("tmp");
     let run_state_path = tmp.path().join("run-state.json");
     fs::write(
@@ -197,7 +198,7 @@ fn tracking_status_reports_stale_run_state_when_issue_closed() {
         .map(|w| w["code"].as_str().unwrap())
         .collect();
     assert!(
-        warnings.iter().any(|c| *c == "run-state-stale"),
+        warnings.contains(&"run-state-stale"),
         "warnings: {warnings:?}"
     );
 }
@@ -254,7 +255,12 @@ fn tracking_status_ready_for_close_emits_run_close_ready() {
     let result = json_stdout(&out)["payload"]["result"].clone();
     assert_eq!(result["fsm_state"], "RECORD_READY_FOR_CLOSE");
     assert_eq!(result["recommended_action"], "run_close_ready");
-    assert!(result["missing_for_closeout"].as_array().unwrap().is_empty());
+    assert!(
+        result["missing_for_closeout"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -284,12 +290,19 @@ fn tracking_status_expect_visible_flows_through_to_visible_lint() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert!(codes.contains(&"state-missing-task-ledger"), "codes={codes:?}");
+    assert!(
+        codes.contains(&"state-missing-task-ledger"),
+        "codes={codes:?}"
+    );
 }
 
 #[test]
 fn tracking_status_help_lists_status_subcommand() {
     let out = common::run_plan_issue(&["tracking", "--help"]);
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    assert!(out.stdout.contains("status"), "missing status: {}", out.stdout);
+    assert!(
+        out.stdout.contains("status"),
+        "missing status: {}",
+        out.stdout
+    );
 }

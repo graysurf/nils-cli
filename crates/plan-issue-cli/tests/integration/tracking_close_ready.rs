@@ -170,7 +170,7 @@ fn tracking_close_ready_blocks_when_missing_validation() {
         .iter()
         .map(|b| b["code"].as_str().unwrap())
         .collect();
-    assert!(codes.iter().any(|c| *c == "validation-missing"));
+    assert!(codes.contains(&"validation-missing"));
 }
 
 #[test]
