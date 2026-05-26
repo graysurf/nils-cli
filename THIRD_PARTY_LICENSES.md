@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `fafbd98f4a6a3ce54528e2885d41672b51139b7d1eb4aed81edf5b3412345b12`
+- Cargo.lock SHA256: `25416cc34b53f76824cdf3a848c8f4f73057989559e3e21034776028f3f60e61`
 - Third-party crates (`source != null`): 465
 - Workspace crates (`source == null`, excluded below): 32
 
@@ -210,8 +210,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | jaq-core | 3.0.0 | MIT | crates.io |
 | jaq-json | 2.0.0 | MIT | crates.io |
 | jaq-std | 3.0.0 | MIT | crates.io |
-| jiff | 0.2.25 | Unlicense OR MIT | crates.io |
-| jiff-static | 0.2.25 | Unlicense OR MIT | crates.io |
+| jiff | 0.2.27 | Unlicense OR MIT | crates.io |
+| jiff-static | 0.2.27 | Unlicense OR MIT | crates.io |
 | jiff-tzdb | 0.1.6 | Unlicense OR MIT | crates.io |
 | jiff-tzdb-platform | 0.1.3 | Unlicense OR MIT | crates.io |
 | jni | 0.22.4 | MIT OR Apache-2.0 | crates.io |
