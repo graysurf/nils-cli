@@ -8,6 +8,7 @@
 
 pub mod cli;
 pub mod completion;
+pub mod migrate;
 pub mod scrub;
 pub mod validate;
 

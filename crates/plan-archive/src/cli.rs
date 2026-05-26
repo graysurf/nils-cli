@@ -74,8 +74,34 @@ enum Command {
         input: String,
     },
 
-    /// (Sprint 3) Migrate a closed plan folder into the archive repo.
+    /// Migrate a closed plan folder into the archive repo.
+    /// Dry-run by default; use `--apply` to write and commit.
     Migrate {
+        /// Plan folder relative to the source repo root, e.g.
+        /// `docs/plans/2026-05-27-my-plan/`.
+        #[arg(long)]
+        plan: PathBuf,
+        /// Source working repo. Defaults to the current git repo
+        /// root.
+        #[arg(long)]
+        source_repo: Option<PathBuf>,
+        /// Archive clone path. Defaults to the machine-local
+        /// config's `archive_clone_path`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Path to the archive `config/hosts.yaml`. Defaults to
+        /// `<archive>/config/hosts.yaml`.
+        #[arg(long)]
+        hosts: Option<PathBuf>,
+        /// Issue URL to record in `metadata.yaml`.
+        #[arg(long)]
+        issue: Option<String>,
+        /// Pull request URL to record in `metadata.yaml`.
+        #[arg(long)]
+        pr: Option<String>,
+        /// Merge request URL to record in `metadata.yaml`.
+        #[arg(long)]
+        mr: Option<String>,
         /// Apply the migration. Without this flag the command runs in
         /// dry-run mode.
         #[arg(long)]
@@ -154,9 +180,27 @@ pub fn run() -> i32 {
         Command::ValidateLocal { input } => dispatch_local(&input, format),
         Command::ValidateMetadata { input } => dispatch_metadata(&input, format),
         Command::Completion { shell } => crate::completion::run(shell),
-        Command::Migrate { .. } | Command::Refresh { .. } | Command::Query { .. } => {
-            unimplemented_subcommand(format)
-        }
+        Command::Migrate {
+            plan,
+            source_repo,
+            archive,
+            hosts,
+            issue,
+            pr,
+            mr,
+            apply,
+        } => crate::migrate::dispatch(crate::migrate::DispatchArgs {
+            plan,
+            source_repo,
+            archive,
+            hosts,
+            issue,
+            pr,
+            mr,
+            apply,
+            format,
+        }),
+        Command::Refresh { .. } | Command::Query { .. } => unimplemented_subcommand(format),
     }
 }
 

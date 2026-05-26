@@ -63,6 +63,13 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (migrate)
 _arguments "${_arguments_options[@]}" : \
+'--plan=[Plan folder relative to the source repo root, e.g. \`docs/plans/2026-05-27-my-plan/\`]:PLAN:_files' \
+'--source-repo=[Source working repo. Defaults to the current git repo root]:SOURCE_REPO:_files' \
+'--archive=[Archive clone path. Defaults to the machine-local config'\''s \`archive_clone_path\`]:ARCHIVE:_files' \
+'--hosts=[Path to the archive \`config/hosts.yaml\`. Defaults to \`<archive>/config/hosts.yaml\`]:HOSTS:_files' \
+'--issue=[Issue URL to record in \`metadata.yaml\`]:ISSUE:_default' \
+'--pr=[Pull request URL to record in \`metadata.yaml\`]:PR:_default' \
+'--mr=[Merge request URL to record in \`metadata.yaml\`]:MR:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--apply[Apply the migration. Without this flag the command runs in dry-run mode]' \
@@ -167,7 +174,7 @@ _plan-archive_commands() {
 'validate-hosts:Validate an archive \`config/hosts.yaml\` document' \
 'validate-local:Validate a machine-local \`agent-plan-archive/config.yaml\` document. Missing files return documented defaults with exit code 0' \
 'validate-metadata:Validate an archived plan'\''s \`metadata.yaml\` document' \
-'migrate:(Sprint 3) Migrate a closed plan folder into the archive repo' \
+'migrate:Migrate a closed plan folder into the archive repo. Dry-run by default; use \`--apply\` to write and commit' \
 'refresh:(Sprint 4) Fetch provider payloads and append scrubbed snapshots to \`_index/\`' \
 'completion:Print a shell completion script for \`plan-archive\`' \
 'query:(Sprint 5) Read or aggregate cached snapshots' \
@@ -186,7 +193,7 @@ _plan-archive__subcmd__help_commands() {
 'validate-hosts:Validate an archive \`config/hosts.yaml\` document' \
 'validate-local:Validate a machine-local \`agent-plan-archive/config.yaml\` document. Missing files return documented defaults with exit code 0' \
 'validate-metadata:Validate an archived plan'\''s \`metadata.yaml\` document' \
-'migrate:(Sprint 3) Migrate a closed plan folder into the archive repo' \
+'migrate:Migrate a closed plan folder into the archive repo. Dry-run by default; use \`--apply\` to write and commit' \
 'refresh:(Sprint 4) Fetch provider payloads and append scrubbed snapshots to \`_index/\`' \
 'completion:Print a shell completion script for \`plan-archive\`' \
 'query:(Sprint 5) Read or aggregate cached snapshots' \

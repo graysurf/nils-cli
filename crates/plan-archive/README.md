@@ -62,6 +62,52 @@ earliest, widest span; the same secret is never reported twice. The
 scrub log itself never contains the secret value — only pattern id,
 byte offset, span length, and replacement length.
 
+## Sprint 3 surface
+
+Sprint 3 (Plan 1) lands `plan-archive migrate`, which moves a closed
+plan folder out of a working repo into the archive repo. Dry-run is
+the default; `--apply` performs the writes and commits.
+
+```bash
+plan-archive migrate \
+  --plan docs/plans/2026-05-27-my-plan \
+  --issue https://github.com/org/repo/issues/123 \
+  [--source-repo <path>] [--archive <path>] [--hosts <path>] \
+  [--pr <url>] [--mr <url>] [--apply]
+```
+
+- `--source-repo` defaults to the current git repo root; `--archive`
+  defaults to the machine-local config's `archive_clone_path`;
+  `--hosts` defaults to `<archive>/config/hosts.yaml`.
+- At least one of `--issue` / `--pr` / `--mr` is required so the
+  archived `metadata.yaml` always carries a provider reference.
+- Dry-run resolves the source identity from the `origin` remote
+  (host, org/group path, repo, branch, HEAD SHA), classifies the host
+  against `config/hosts.yaml`, enumerates the tracked plan files via
+  `git ls-files`, and assembles the `metadata.yaml` payload — without
+  touching any working tree.
+- Apply copies the files under
+  `plans/<host>/<org>/<repo>/<folder>/`, writes `metadata.yaml`,
+  commits the archive via the released `semantic-commit` binary,
+  pushes the archive, and only on push success deletes the source
+  folder and commits that deletion in the working repo.
+
+Stable error codes (Sprint 3):
+
+| Code | When |
+| --- | --- |
+| `migrate-source-repo-not-found` | source repo path is not a git repo |
+| `migrate-plan-folder-missing` | `--plan` folder absent in the source repo |
+| `migrate-archive-clone-missing` | archive clone path not found |
+| `migrate-unknown-host` | source host absent from `config/hosts.yaml` |
+| `migrate-hosts-load-failed` / `migrate-hosts-parse-failed` | hosts config unreadable/invalid |
+| `migrate-no-refs-supplied` | none of `--issue`/`--pr`/`--mr` given |
+| `migrate-identity-failed` | could not read remote/branch/HEAD |
+| `migrate-archive-target-exists` | archive target already present (apply) |
+| `migrate-source-repo-dirty` | uncommitted changes in the plan folder (apply) |
+| `migrate-subprocess-failed` | a git or semantic-commit subprocess failed |
+| `migrate-io-error` | filesystem failure |
+
 ## Output contracts
 
 Both human-readable text (default) and a versioned JSON envelope
