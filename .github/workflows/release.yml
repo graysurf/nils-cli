@@ -96,7 +96,7 @@ jobs:
           while IFS= read -r bin; do
             [[ -n "${bin}" ]] || continue
             bins+=( "${bin}" )
-          done < <(bash scripts/workspace-bins.sh)
+          done < <(bash scripts/workspace-bins.sh --release-default)
 
           if [[ ${#bins[@]} -eq 0 ]]; then
             echo "error: no workspace binaries found" >&2
