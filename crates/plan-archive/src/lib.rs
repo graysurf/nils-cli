@@ -8,8 +8,10 @@
 
 pub mod cli;
 pub mod completion;
+pub mod scrub;
 pub mod validate;
 
+pub use scrub::{Match, PATTERN_SET, REDACTION_TOKEN, ScrubResult, pattern_ids, scrub_text};
 pub use validate::{
     hosts::{HostsConfig, HostsValidation, HostsValidationData, validate_hosts_yaml},
     local::{
