@@ -3,13 +3,15 @@
 
 ## Execution State
 
-- Status: in-progress
+- Status: complete
 - Target scope: whole plan
 - Execution window: whole plan (single sprint)
-- Current task: Task 1.2
-- Next task: open PR for review + delivery
+- Current task: complete
+- Next task: closeout via `plan-tracking-issue-closeout`
 - Last updated: 2026-05-26 Asia/Taipei
-- Branch/commit/PR/release: `fix/plan-issue-557-gitlab-required-none`; PR pending
+- Branch/commit/PR/release:
+  `fix/plan-issue-557-gitlab-required-none`;
+  PR sympoies/nils-cli#567 squash-merged at `ef0a139` on `main`
 - Source document: docs/plans/plan-issue-closeout-gitlab-required-parity/plan-issue-closeout-gitlab-required-parity-plan.md
 - Discussion source document: docs/plans/plan-issue-closeout-gitlab-required-parity/plan-issue-closeout-gitlab-required-parity-discussion-source.md
 - Source issue: sympoies/nils-cli#557
@@ -21,10 +23,10 @@
 
 ## Task Ledger
 
-| ID       | Status | Task                                                  | Evidence                  | Notes                                                                                                                                                                              |
-| -------- | ------ | ----------------------------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Task 1.1 | done   | Swap GitLab adapter return triple and refresh comment | local commit pending push | struct literal swap at `forge_cli_adapter.rs:343-356`; comment refresh references #557; returns `Some("success".to_string()), Some(0), Vec::new()`                                 |
-| Task 1.2 | done   | Extend adapter unit test and CHANGELOG entry          | local commit pending push | extended `pr_merge_summary_composes_view_and_checks` with `required_state.as_deref()==Some("success")` + `required_count==Some(0)`; CHANGELOG `[Unreleased] ### Fixed` entry added |
+| ID       | Status | Task                                                  | Evidence                                            | Notes                                                                                                                                                                              |
+| -------- | ------ | ----------------------------------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Task 1.1 | done   | Swap GitLab adapter return triple and refresh comment | PR sympoies/nils-cli#567 squash-merged at `ef0a139` | struct literal swap at `forge_cli_adapter.rs:343-356`; comment refresh references #557; returns `Some("success".to_string()), Some(0), Vec::new()`                                 |
+| Task 1.2 | done   | Extend adapter unit test and CHANGELOG entry          | PR sympoies/nils-cli#567 squash-merged at `ef0a139` | extended `pr_merge_summary_composes_view_and_checks` with `required_state.as_deref()==Some("success")` + `required_count==Some(0)`; CHANGELOG `[Unreleased] ### Fixed` entry added |
 
 ## Validation
 
@@ -71,4 +73,16 @@
   of the renderer-layer `CheckStatus::Pass`. Full validation matrix
   passes locally: `plan-tooling validate`, docs-only CI gate, per-crate
   `cargo test` / `clippy` / locked-build, and workspace `cargo nextest`
-  (4041/4041). PR pending.
+  (4041/4041).
+- 2026-05-26: PR sympoies/nils-cli#567 opened via `forge-cli pr
+  create` against `main`. Non-required CI (test / test_macos /
+  coverage / CodeQL × 4) all pass. Lifecycle comments posted on the
+  tracking issue: validation (#4545517315), session (#4545520988),
+  state-implementing (#4545525788), review self-approval
+  (#4545567260), state-complete (#4545570821). PR squash-merged at
+  `ef0a1394844c9f644b26752527839ef1803c8055`; branch deleted.
+  `plan-issue tracking close-ready --expect-visible` returns
+  `ready: true`, `fsm_state: RECORD_READY_FOR_CLOSE`, no blockers, all
+  six lifecycle roles present (source / plan / state / session /
+  validation / review). Ready to hand off to
+  `plan-tracking-issue-closeout`.
