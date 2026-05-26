@@ -405,22 +405,33 @@ pre-migration output.
 
 - **Location**:
   - crates/plan-issue-cli/src/render.rs
-  - crates/plan-issue-cli/templates/dashboard.md.tera (new)
-  - crates/plan-issue-cli/templates/lifecycle_record.md.tera (preview only; full migration in Task 2.5)
-  - crates/plan-issue-cli/tests/golden/dashboard/ (new fixture dir)
-- **Description**: Dashboard rendering (549 lines source, 24 sites).
-  Provider-visible byte stability matters most here. Migrate
-  dashboard composition; leave `lifecycle_record` for Task 2.5.
+  - crates/plan-issue-cli/templates/render/plan_issue_body.md.tera (new)
+  - crates/plan-issue-cli/templates/render/sprint_comment.md.tera (new)
+  - crates/plan-issue-cli/tests/golden/render/ (new fixture dir)
+- **Description**: Provider-visible Markdown emitters in render.rs
+  (549 lines, ~21 `format!`/`out.push` sites): `render_plan_issue_body`
+  (initial plan-issue body, including the Task 2.1 task-decomposition
+  table) and `render_sprint_comment` (sprint Start / Ready / Accepted
+  comments). The discussion source calls these "dashboards"; the file
+  itself names them `render_plan_issue_body` and
+  `render_sprint_comment`. The actual dashboard (`render_dashboard`,
+  `render_dashboard_from_audit`) lives in `lifecycle_record.rs` and is
+  Task 2.5's scope. This task also wires `render_plan_issue_body` to
+  reuse the `render_task_decomposition_block` helper introduced in
+  Task 2.1 (closes the dead-code allowance there).
 - **Dependencies**:
   - Task 2.3
 - **Complexity**:
   - 6
 - **Acceptance criteria**:
-  - Dashboard output byte-identical to capture for at least three
-    representative inputs (no tasks, mixed-status tasks, all done).
+  - `render_plan_issue_body` output byte-identical to capture for at
+    least three representative inputs (no rows, mixed-status rows,
+    all-done rows).
+  - `render_sprint_comment` output byte-identical to capture for
+    Sprint Start / Ready / Accepted modes.
 - **Validation**:
-  - `cargo test -p plan-issue-cli render::dashboard`
-  - `cargo test -p plan-issue-cli --test golden_dashboard`
+  - `cargo test -p plan-issue-cli render`
+  - `cargo test -p plan-issue-cli --test golden_render`
 
 ### Task 2.5: Migrate `plan-issue-cli/src/lifecycle_record.rs`
 

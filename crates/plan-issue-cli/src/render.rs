@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use nils_markdown::Engine;
+use serde::Serialize;
+
 use crate::commands::SplitStrategy;
 use crate::issue_body;
 use crate::task_spec::{
@@ -10,6 +13,40 @@ use crate::task_spec::{
 use nils_common::fs as common_fs;
 use nils_common::git as common_git;
 use nils_common::markdown as common_markdown;
+
+const PLAN_ISSUE_BODY_TEMPLATE: &str = include_str!("../templates/render/plan_issue_body.md.tera");
+const PLAN_ISSUE_BODY_TEMPLATE_NAME: &str = "render_plan_issue_body";
+
+const SPRINT_COMMENT_TEMPLATE: &str = include_str!("../templates/render/sprint_comment.md.tera");
+const SPRINT_COMMENT_TEMPLATE_NAME: &str = "render_sprint_comment";
+
+#[derive(Debug, Serialize)]
+struct PlanIssueBodyView<'a> {
+    pre_table: String,
+    task_table_block: String,
+    plan_file_display: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct SprintCommentView<'a> {
+    heading: String,
+    sprint: i32,
+    sprint_name: &'a str,
+    task_count: usize,
+    lead: &'static str,
+    mode: &'static str,
+    approval_comment_url: Option<&'a str>,
+    sprint_section: Option<String>,
+    note_text: Option<String>,
+    task_rows: Vec<SprintTaskRowView<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct SprintTaskRowView<'a> {
+    task: &'a str,
+    summary: String,
+    third_col: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SprintCommentMode {
@@ -84,82 +121,75 @@ pub fn render_plan_issue_body(
         plan_title.trim().to_string()
     };
 
-    let mut out: Vec<String> = load_pre_sprint_plan_lines(plan_file)
+    let mut header_lines = load_pre_sprint_plan_lines(plan_file)
         .filter(|lines| !lines.is_empty())
         .unwrap_or_else(|| vec![format!("# {fallback_title}")]);
-
-    if out.last().is_some_and(|line| !line.trim().is_empty()) {
-        out.push(String::new());
+    while header_lines
+        .last()
+        .map(|line| line.trim().is_empty())
+        .unwrap_or(false)
+    {
+        header_lines.pop();
     }
-
-    out.extend([
-        "## Task Decomposition".to_string(),
-        String::new(),
-        issue_body::task_decomposition_header_row(),
-        issue_body::task_decomposition_separator_row(),
-    ]);
+    let pre_table = header_lines.join("\n");
 
     let runtime_lane_metadata = runtime_lane_metadata_by_task(rows, strategy);
+    let task_rows: Vec<issue_body::TaskRow> = rows
+        .iter()
+        .map(|row| {
+            let lane = runtime_lane_metadata.get(&row.task_id);
+            let owner = lane
+                .map(|metadata| metadata.owner.clone())
+                .unwrap_or_else(|| row.owner.clone());
+            let branch = lane
+                .map(|metadata| metadata.branch.clone())
+                .unwrap_or_else(|| row.branch.clone());
+            let worktree = lane
+                .map(|metadata| metadata.worktree.clone())
+                .unwrap_or_else(|| row.worktree.clone());
+            let execution_mode = lane
+                .map(|metadata| metadata.execution_mode.clone())
+                .unwrap_or_else(|| "pr-isolated".to_string());
+            let notes = lane
+                .map(|metadata| metadata.notes.trim().to_string())
+                .unwrap_or_else(|| row.notes.trim().to_string());
+            let notes = common_markdown::canonicalize_table_cell(&notes);
+            let notes = if notes.trim().is_empty() {
+                "-".to_string()
+            } else {
+                notes
+            };
+            issue_body::TaskRow {
+                task: row.task_id.clone(),
+                summary: row.summary.clone(),
+                owner,
+                branch,
+                worktree,
+                execution_mode,
+                pr: "TBD".to_string(),
+                status: "planned".to_string(),
+                notes,
+                line_index: 0,
+            }
+        })
+        .collect();
 
-    for row in rows {
-        let lane = runtime_lane_metadata.get(&row.task_id);
-        let owner = lane
-            .map(|metadata| metadata.owner.clone())
-            .unwrap_or_else(|| row.owner.clone());
-        let branch = lane
-            .map(|metadata| metadata.branch.clone())
-            .unwrap_or_else(|| row.branch.clone());
-        let worktree = lane
-            .map(|metadata| metadata.worktree.clone())
-            .unwrap_or_else(|| row.worktree.clone());
-        let execution_mode = lane
-            .map(|metadata| metadata.execution_mode.clone())
-            .unwrap_or_else(|| "pr-isolated".to_string());
-        let notes = lane
-            .map(|metadata| metadata.notes.trim().to_string())
-            .unwrap_or_else(|| row.notes.trim().to_string());
-        let notes = common_markdown::canonicalize_table_cell(&notes);
-        let notes = if notes.trim().is_empty() {
-            "-".to_string()
-        } else {
-            notes
-        };
-        out.push(issue_body::format_task_decomposition_row([
-            &row.task_id,
-            &row.summary,
-            &owner,
-            &branch,
-            &worktree,
-            &execution_mode,
-            "TBD",
-            "planned",
-            &notes,
-        ]));
-    }
+    let task_table_block = issue_body::render_task_decomposition_block(&task_rows)
+        .expect("task-decomposition block renders");
 
-    out.extend([
-        String::new(),
-        "## Consistency Rules".to_string(),
-        String::new(),
-        "- `Status` must be one of: `planned`, `in-progress`, `blocked`, `done`.".to_string(),
-        "- `Status` = `in-progress` or `done` requires non-`TBD` execution metadata (`Owner`, `Branch`, `Worktree`, `Execution Mode`, `PR`).".to_string(),
-        "- `Owner` must be a subagent identifier (contains `subagent`) once the task is assigned; `main-agent` ownership is invalid for implementation tasks.".to_string(),
-        "- `Execution Mode` should be one of: `per-sprint`, `pr-isolated`, `pr-shared` (or `TBD` before assignment).".to_string(),
-        "- `Branch` and `Worktree` uniqueness is enforced only for rows using `Execution Mode = pr-isolated`.".to_string(),
-        String::new(),
-        "## Risks / Uncertainties".to_string(),
-        String::new(),
-        "- Sprint approvals may be recorded before final close; issue stays open until final plan acceptance.".to_string(),
-        "- Close gate fails if task statuses or PR merge states in the issue body are incomplete.".to_string(),
-        String::new(),
-        "## Evidence".to_string(),
-        String::new(),
-        format!("- Plan source: `{plan_file_display}`"),
-        "- Sprint approvals: issue comments (one comment per accepted sprint)".to_string(),
-        "- Final approval: issue/pull comment URL passed to `close-plan`".to_string(),
-    ]);
+    let view = PlanIssueBodyView {
+        pre_table,
+        task_table_block,
+        plan_file_display,
+    };
 
-    format!("{}\n", out.join("\n"))
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(PLAN_ISSUE_BODY_TEMPLATE_NAME, PLAN_ISSUE_BODY_TEMPLATE)
+        .expect("plan_issue_body template registers");
+    engine
+        .render(PLAN_ISSUE_BODY_TEMPLATE_NAME, &view)
+        .expect("plan_issue_body template renders")
 }
 
 fn load_pre_sprint_plan_lines(plan_file: &Path) -> Option<Vec<String>> {
@@ -237,118 +267,104 @@ pub fn render_sprint_comment(input: SprintCommentInput<'_>) -> Result<String, St
         .map(parse_issue_pr_values)
         .unwrap_or_default();
 
-    let mut out: Vec<String> = Vec::new();
-    let (heading, lead) = match mode {
+    let (heading, lead, mode_token) = match mode {
         SprintCommentMode::Start => (
             format!("## Sprint {sprint} Start"),
             "Main-agent starts this sprint on the plan issue and dispatches implementation to subagents.",
+            "start",
         ),
         SprintCommentMode::Ready => (
             format!("## Sprint {sprint} Ready for Review"),
             "Main-agent requests sprint-level review before merge/acceptance on the plan issue (the issue remains open).",
+            "ready",
         ),
         SprintCommentMode::Accepted => (
             format!("## Sprint {sprint} Accepted"),
             "Main-agent records sprint acceptance after merge gate passes and sprint rows are synced to done (issue remains open for remaining sprints).",
+            "accepted",
         ),
     };
 
-    out.push(heading);
-    out.push(String::new());
-    out.push(format!("- Sprint: {sprint} ({sprint_name})"));
-    out.push(format!("- Tasks in sprint: {}", rows.len()));
-    out.push(format!("- Note: {lead}"));
-    if mode == SprintCommentMode::Start {
-        out.push(
-            "- Execution Mode comes from current Task Decomposition for each sprint task."
-                .to_string(),
-        );
-    } else {
-        out.push(
-            "- PR values come from current Task Decomposition; unresolved tasks remain `TBD` until PRs are linked."
-                .to_string(),
-        );
-    }
+    let approval_url = approval_comment_url
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty());
 
-    if let Some(url) = approval_comment_url {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            out.push(format!("- Approval comment URL: {trimmed}"));
-        }
-    }
-
-    out.push(String::new());
-    match mode {
-        SprintCommentMode::Start => {
-            out.push("| Task | Summary | Execution Mode |".to_string());
-            out.push("| --- | --- | --- |".to_string());
-            for row in rows {
-                let execution_mode = execution_modes
+    let task_rows: Vec<SprintTaskRowView<'_>> = rows
+        .iter()
+        .map(|row| {
+            let summary = if row.summary.is_empty() {
+                "-".to_string()
+            } else {
+                row.summary.clone()
+            };
+            let third_col = match mode {
+                SprintCommentMode::Start => execution_modes
                     .get(&row.task_id)
-                    .map(String::as_str)
-                    .unwrap_or("pr-isolated");
-                out.push(format!(
-                    "| {} | {} | {} |",
-                    row.task_id,
-                    if row.summary.is_empty() {
-                        "-"
-                    } else {
-                        &row.summary
-                    },
-                    execution_mode
-                ));
-            }
-
-            let sprint_section = extract_sprint_section(plan_file, sprint)?;
-            if !sprint_section.is_empty() {
-                out.push(String::new());
-                out.push(sprint_section);
-            }
-        }
-        SprintCommentMode::Ready | SprintCommentMode::Accepted => {
-            out.push("| Task | Summary | PR |".to_string());
-            out.push("| --- | --- | --- |".to_string());
-            for row in rows {
-                let mut pr_value = issue_pr_values
-                    .get(&row.task_id)
-                    .map(|v| normalize_pr_display(v))
-                    .unwrap_or_default();
-                if pr_value.is_empty() {
-                    let execution_mode = execution_modes
+                    .cloned()
+                    .unwrap_or_else(|| "pr-isolated".to_string()),
+                SprintCommentMode::Ready | SprintCommentMode::Accepted => {
+                    let mut pr_value = issue_pr_values
                         .get(&row.task_id)
-                        .map(String::as_str)
-                        .unwrap_or("pr-isolated");
-                    pr_value = if execution_mode == "per-sprint" {
-                        "TBD (per-sprint)".to_string()
-                    } else {
-                        format!("TBD (group:{})", row.pr_group)
-                    };
-                }
-                out.push(format!(
-                    "| {} | {} | {} |",
-                    row.task_id,
-                    if row.summary.is_empty() {
-                        "-"
-                    } else {
-                        &row.summary
-                    },
+                        .map(|v| normalize_pr_display(v))
+                        .unwrap_or_default();
+                    if pr_value.is_empty() {
+                        let execution_mode = execution_modes
+                            .get(&row.task_id)
+                            .map(String::as_str)
+                            .unwrap_or("pr-isolated");
+                        pr_value = if execution_mode == "per-sprint" {
+                            "TBD (per-sprint)".to_string()
+                        } else {
+                            format!("TBD (group:{})", row.pr_group)
+                        };
+                    }
                     pr_value
-                ));
+                }
+            };
+            SprintTaskRowView {
+                task: &row.task_id,
+                summary,
+                third_col,
             }
-        }
-    }
+        })
+        .collect();
 
-    if let Some(note) = note_text {
-        let trimmed = note.trim();
-        if !trimmed.is_empty() {
-            out.push(String::new());
-            out.push("## Main-Agent Notes".to_string());
-            out.push(String::new());
-            out.push(trimmed.to_string());
+    let sprint_section = if mode == SprintCommentMode::Start {
+        let section = extract_sprint_section(plan_file, sprint)?;
+        if section.is_empty() {
+            None
+        } else {
+            Some(section)
         }
-    }
+    } else {
+        None
+    };
 
-    Ok(format!("{}\n", out.join("\n")))
+    let note_text_owned = note_text
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(str::to_string);
+
+    let view = SprintCommentView {
+        heading,
+        sprint,
+        sprint_name,
+        task_count: rows.len(),
+        lead,
+        mode: mode_token,
+        approval_comment_url: approval_url,
+        sprint_section,
+        note_text: note_text_owned,
+        task_rows,
+    };
+
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(SPRINT_COMMENT_TEMPLATE_NAME, SPRINT_COMMENT_TEMPLATE)
+        .map_err(|err| format!("sprint_comment template register failed: {err}"))?;
+    engine
+        .render(SPRINT_COMMENT_TEMPLATE_NAME, &view)
+        .map_err(|err| format!("sprint_comment template render failed: {err}"))
 }
 
 pub fn write_rendered(path: &Path, content: &str) -> Result<(), String> {
