@@ -80,9 +80,11 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (refresh)
 _arguments "${_arguments_options[@]}" : \
-'(--repo --since)--ref=[Reference to refresh (issue/PR/MR URL or shorthand)]:REF:_default' \
-'(--ref --since)--repo=[Refresh every reference for the given repo]:REPO:_default' \
-'(--ref --repo)--since=[Refresh every reference modified since the given date]:SINCE:_default' \
+'(--repo --since)--ref=[Reference to refresh (issue/PR/MR URL)]:REF:_default' \
+'(--ref --since)--repo=[Refresh every open reference for the given \`host/org/repo\`]:REPO:_default' \
+'(--ref)--since=[With \`--repo\`, only refresh refs updated on or after this \`YYYY-MM-DD\` date]:SINCE:_default' \
+'--archive=[Archive clone path. Defaults to the machine-local config'\''s \`archive_clone_path\`]:ARCHIVE:_files' \
+'--hosts=[Path to the archive \`config/hosts.yaml\`. Defaults to \`<archive>/config/hosts.yaml\`]:HOSTS:_files' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '(--format)--json[Hidden alias for \`--format json\` kept for symmetry with neighbouring CLIs]' \
@@ -175,7 +177,7 @@ _plan-archive_commands() {
 'validate-local:Validate a machine-local \`agent-plan-archive/config.yaml\` document. Missing files return documented defaults with exit code 0' \
 'validate-metadata:Validate an archived plan'\''s \`metadata.yaml\` document' \
 'migrate:Migrate a closed plan folder into the archive repo. Dry-run by default; use \`--apply\` to write and commit' \
-'refresh:(Sprint 4) Fetch provider payloads and append scrubbed snapshots to \`_index/\`' \
+'refresh:Fetch provider payloads and append scrubbed snapshots to \`_index/\`. Writes and scrubs but does not commit; the scrub log (if any) must be reviewed before committing' \
 'completion:Print a shell completion script for \`plan-archive\`' \
 'query:(Sprint 5) Read or aggregate cached snapshots' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -194,7 +196,7 @@ _plan-archive__subcmd__help_commands() {
 'validate-local:Validate a machine-local \`agent-plan-archive/config.yaml\` document. Missing files return documented defaults with exit code 0' \
 'validate-metadata:Validate an archived plan'\''s \`metadata.yaml\` document' \
 'migrate:Migrate a closed plan folder into the archive repo. Dry-run by default; use \`--apply\` to write and commit' \
-'refresh:(Sprint 4) Fetch provider payloads and append scrubbed snapshots to \`_index/\`' \
+'refresh:Fetch provider payloads and append scrubbed snapshots to \`_index/\`. Writes and scrubs but does not commit; the scrub log (if any) must be reviewed before committing' \
 'completion:Print a shell completion script for \`plan-archive\`' \
 'query:(Sprint 5) Read or aggregate cached snapshots' \
 'help:Print this message or the help of the given subcommand(s)' \

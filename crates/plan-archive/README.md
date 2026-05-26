@@ -108,6 +108,49 @@ Stable error codes (Sprint 3):
 | `migrate-subprocess-failed` | a git or semantic-commit subprocess failed |
 | `migrate-io-error` | filesystem failure |
 
+## Sprint 4 surface
+
+Sprint 4 (Plan 1) lands `plan-archive refresh`, which fetches
+provider payloads through `forge-cli`, scrubs them with the Sprint 2
+library, and appends an `<ISO8601>.json` snapshot under `_index/`.
+Refresh **writes and scrubs but never commits** — when a snapshot
+triggers redactions it emits the `.scrub.log` sibling and flags
+`requires_review: true`; the wrapping skill/user reviews the log and
+commits separately.
+
+```bash
+plan-archive refresh --ref https://github.com/org/repo/issues/123
+plan-archive refresh --repo github.com/org/repo [--since 2026-05-01]
+  [--archive <path>] [--hosts <path>]
+```
+
+- `--ref` refreshes a single issue/PR/MR URL. `--repo` lists open
+  refs through `forge-cli … list --state open` and refreshes each;
+  `--since YYYY-MM-DD` narrows the batch. The two selectors are
+  mutually exclusive.
+- Provider API access is delegated to `forge-cli` (override the binary
+  with `PLAN_ARCHIVE_FORGE_CLI`); the host is mapped to `github` for
+  `github.com` and `gitlab` otherwise. `config/hosts.yaml` gates which
+  hosts are allowed and drives the `_index/` path.
+- Snapshots are append-only: each refresh writes a new
+  `<ISO8601>.json` (basic-format UTC, no colons) and never overwrites
+  or deletes a prior one. A batch isolates per-ref failures into the
+  `failed` array instead of aborting.
+
+Stable error codes (Sprint 4):
+
+| Code | When |
+| --- | --- |
+| `refresh-no-selector` | neither `--ref` nor `--repo` supplied |
+| `refresh-unparseable-ref` | `--ref` is not an issue/PR/MR URL |
+| `refresh-unparseable-repo` | `--repo` is not `host/org/repo` |
+| `refresh-unknown-host` | host absent from `config/hosts.yaml` |
+| `refresh-invalid-since` | `--since` is not `YYYY-MM-DD` |
+| `refresh-archive-clone-missing` | archive clone path not found |
+| `refresh-hosts-load-failed` / `refresh-hosts-parse-failed` | hosts config unreadable/invalid |
+| `refresh-forge-fetch-failed` | forge-cli fetch failed (per-ref in batch) |
+| `refresh-io-error` | filesystem failure |
+
 ## Output contracts
 
 Both human-readable text (default) and a versioned JSON envelope
