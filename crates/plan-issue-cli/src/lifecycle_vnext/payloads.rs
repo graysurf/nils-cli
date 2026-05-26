@@ -14,6 +14,6 @@
 pub use crate::lifecycle_record::{
     CloseoutData, PayloadProfile, PayloadRole, PrLifecycleStatus, PrRefPayload, RecordPayload,
     ReviewData, ReviewDecision, SessionData, SnapshotData, StateData, StateStatus, TaskRowPayload,
-    TaskRowStatus, ValidationCommand, ValidationCommandStatus, ValidationData,
-    ValidationOverall, ValidationWaiver,
+    TaskRowStatus, ValidationCommand, ValidationCommandStatus, ValidationData, ValidationOverall,
+    ValidationWaiver,
 };

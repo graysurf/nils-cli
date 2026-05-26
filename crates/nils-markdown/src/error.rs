@@ -85,11 +85,14 @@ mod tests {
 
     #[test]
     fn serialize_error_renders_source() {
-        let source = serde_json::from_str::<serde_json::Value>("{ not json")
-            .expect_err("invalid json");
+        let source =
+            serde_json::from_str::<serde_json::Value>("{ not json").expect_err("invalid json");
         let err = RenderError::Serialize { source };
         let printed = format!("{err}");
-        assert!(printed.starts_with("view serialization failed"), "{printed}");
+        assert!(
+            printed.starts_with("view serialization failed"),
+            "{printed}"
+        );
     }
 
     #[test]
@@ -103,4 +106,3 @@ mod tests {
         assert!(printed.contains("missing variable"), "{printed}");
     }
 }
-

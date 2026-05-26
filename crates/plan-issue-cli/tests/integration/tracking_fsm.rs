@@ -7,9 +7,7 @@ use pretty_assertions::assert_eq;
 use plan_issue_cli::lifecycle_record::{
     BodySections, LifecycleEvidence, PayloadProfile, PayloadRole, RecordAudit,
 };
-use plan_issue_cli::tracking::fsm::{
-    self, RecommendedAction, RecordState,
-};
+use plan_issue_cli::tracking::fsm::{self, RecommendedAction, RecordState};
 
 fn evidence_for(role: PayloadRole, status: Option<&str>) -> LifecycleEvidence {
     LifecycleEvidence {
@@ -148,6 +146,16 @@ fn tracking_fsm_safe_transitions_are_stable_per_state() {
         (PayloadRole::State, Some("in-progress")),
         (PayloadRole::Session, None),
     ])));
-    assert!(active.safe_transitions.iter().any(|s| s == "record_validation"));
-    assert!(active.safe_transitions.iter().any(|s| s == "checkpoint_progress"));
+    assert!(
+        active
+            .safe_transitions
+            .iter()
+            .any(|s| s == "record_validation")
+    );
+    assert!(
+        active
+            .safe_transitions
+            .iter()
+            .any(|s| s == "checkpoint_progress")
+    );
 }

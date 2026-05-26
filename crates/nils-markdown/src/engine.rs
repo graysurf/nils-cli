@@ -279,7 +279,10 @@ mod tests {
             RenderError::TemplateParse { name, source } => {
                 assert_eq!(name, "broken");
                 let printed = format!("{source}");
-                assert!(!printed.is_empty(), "tera error message should not be empty");
+                assert!(
+                    !printed.is_empty(),
+                    "tera error message should not be empty"
+                );
             }
             other => panic!("expected TemplateParse, got {other:?}"),
         }
@@ -288,7 +291,9 @@ mod tests {
     #[test]
     fn render_runtime_error_surfaces_name() {
         let mut engine = build();
-        engine.register_template("strict", "{{ value | upper }}").unwrap();
+        engine
+            .register_template("strict", "{{ value | upper }}")
+            .unwrap();
         let err = engine
             .render_value("strict", &serde_json::json!({"value": 42}))
             .unwrap_err();
@@ -355,7 +360,9 @@ mod tests {
         engine
             .register_template("greet", r#"hey, {{ shout(v="world") }}!"#)
             .unwrap();
-        let out = engine.render_value("greet", &serde_json::json!({})).unwrap();
+        let out = engine
+            .render_value("greet", &serde_json::json!({}))
+            .unwrap();
         assert_eq!(out, "hey, WORLD!");
     }
 }

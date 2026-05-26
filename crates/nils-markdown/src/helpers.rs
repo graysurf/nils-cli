@@ -12,9 +12,8 @@
 //! duplication.
 
 pub use nils_common::markdown::{
-    canonicalize_table_cell, code_block, format_json_pretty_sorted, heading,
-    markdown_payload_violations, validate_markdown_payload, MarkdownPayloadError,
-    MarkdownPayloadViolation,
+    MarkdownPayloadError, MarkdownPayloadViolation, canonicalize_table_cell, code_block,
+    format_json_pretty_sorted, heading, markdown_payload_violations, validate_markdown_payload,
 };
 
 #[cfg(test)]

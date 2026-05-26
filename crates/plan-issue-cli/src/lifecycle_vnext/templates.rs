@@ -287,9 +287,8 @@ mod tests {
     #[test]
     fn markdown_template_includes_role_heading_and_marker() {
         for spec in registry::all_roles() {
-            let out =
-                render_template(RecordProfile::Tracking, spec.role, TemplateFormat::Markdown)
-                    .expect("render");
+            let out = render_template(RecordProfile::Tracking, spec.role, TemplateFormat::Markdown)
+                .expect("render");
             assert!(
                 out.contains("<!-- plan-issue-record:v2"),
                 "role {:?} missing marker: {out}",
@@ -318,9 +317,8 @@ mod tests {
     #[test]
     fn json_template_includes_envelope_schema_and_role() {
         for spec in registry::all_roles() {
-            let out =
-                render_template(RecordProfile::Tracking, spec.role, TemplateFormat::Json)
-                    .expect("render");
+            let out = render_template(RecordProfile::Tracking, spec.role, TemplateFormat::Json)
+                .expect("render");
             let value: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
             assert_eq!(value["schema"], "plan-issue-record.payload.v2");
             assert_eq!(value["role"], spec.marker_role);

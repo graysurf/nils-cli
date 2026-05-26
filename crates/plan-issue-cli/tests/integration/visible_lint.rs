@@ -97,7 +97,8 @@ fn visible_lint_state_missing_task_ledger_is_blocked() {
 
 #[test]
 fn visible_lint_session_requires_non_empty_summary() {
-    let pass = "## Execution Session\n\n- Profile: tracking\n- Summary: implemented vNext registry\n";
+    let pass =
+        "## Execution Session\n\n- Profile: tracking\n- Summary: implemented vNext registry\n";
     let fail = "## Execution Session\n\n- Profile: tracking\n- Summary: \n";
 
     let ok = lint_visible(PayloadRole::Session, pass, LintHints::default());
@@ -119,7 +120,8 @@ fn visible_lint_validation_requires_overall_and_evidence() {
                 | Command | Status | Evidence |\n\
                 | --- | --- | --- |\n\
                 | `cargo test` | pass | log.txt |\n";
-    let no_overall = "## Validation Evidence\n\n- Profile: tracking\n\n| Command |\n|---|\n| `cargo test` |\n";
+    let no_overall =
+        "## Validation Evidence\n\n- Profile: tracking\n\n| Command |\n|---|\n| `cargo test` |\n";
     let no_evidence = "## Validation Evidence\n\n- Profile: tracking\n- Overall: pass\n";
 
     let ok = lint_visible(PayloadRole::Validation, pass, LintHints::default());
@@ -166,11 +168,7 @@ fn visible_lint_review_decision_and_disposition() {
     let ok = lint_visible(PayloadRole::Review, pass_with_findings, hints_findings);
     assert!(ok.is_pass(), "{:?}", ok.findings);
 
-    let ok_empty = lint_visible(
-        PayloadRole::Review,
-        pass_no_findings,
-        LintHints::default(),
-    );
+    let ok_empty = lint_visible(PayloadRole::Review, pass_no_findings, LintHints::default());
     assert!(ok_empty.is_pass(), "{:?}", ok_empty.findings);
 
     let bad_no_decision = lint_visible(PayloadRole::Review, no_decision, LintHints::default());
@@ -261,7 +259,11 @@ fn visible_lint_source_and_plan_reject_profile_only() {
     let ok = lint_visible(PayloadRole::Source, source_pass, LintHints::default());
     assert!(ok.is_pass(), "{:?}", ok.findings);
 
-    let bad = lint_visible(PayloadRole::Source, source_profile_only, LintHints::default());
+    let bad = lint_visible(
+        PayloadRole::Source,
+        source_profile_only,
+        LintHints::default(),
+    );
     assert!(
         bad.codes().contains(&codes::PROFILE_ONLY),
         "codes={:?}",

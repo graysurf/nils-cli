@@ -150,8 +150,12 @@ mod tests {
 
     #[test]
     fn tracking_events_round_trip_single_event() {
-        let event = ExecutionEvent::new("run-1", ExecutionEventKind::RunStarted, "2026-05-26T00:00:00Z")
-            .with_note("session start");
+        let event = ExecutionEvent::new(
+            "run-1",
+            ExecutionEventKind::RunStarted,
+            "2026-05-26T00:00:00Z",
+        )
+        .with_note("session start");
         let raw = serde_json::to_string(&event).expect("serialize");
         let parsed: ExecutionEvent = serde_json::from_str(&raw).expect("parse");
         assert_eq!(parsed.run_id, "run-1");

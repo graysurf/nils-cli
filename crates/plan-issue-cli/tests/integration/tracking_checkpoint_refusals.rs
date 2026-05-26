@@ -130,7 +130,10 @@ fn tracking_checkpoint_refusals_block_when_run_state_stale_vs_issue_closed() {
         codes.contains(&"run-state-stale"),
         "blocked codes: {codes:?}"
     );
-    assert!(result["roles_planned"].as_array().unwrap().is_empty() == false || result["blocked"].as_array().unwrap().is_empty() == false);
+    assert!(
+        result["roles_planned"].as_array().unwrap().is_empty() == false
+            || result["blocked"].as_array().unwrap().is_empty() == false
+    );
 }
 
 #[test]
@@ -204,5 +207,8 @@ fn tracking_checkpoint_refusals_block_unknown_role() {
     ]);
     assert_ne!(out.code, 0);
     let envelope = json_stdout(&out);
-    assert_eq!(envelope["error"]["code"], "tracking-checkpoint-unknown-role");
+    assert_eq!(
+        envelope["error"]["code"],
+        "tracking-checkpoint-unknown-role"
+    );
 }

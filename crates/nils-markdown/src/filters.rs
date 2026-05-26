@@ -79,26 +79,17 @@ mod tests {
 
     #[test]
     fn bool_and_number_are_canonicalized() {
-        let true_out = render(
-            "{{ value | md_cell }}",
-            serde_json::json!({"value": true}),
-        );
+        let true_out = render("{{ value | md_cell }}", serde_json::json!({"value": true}));
         assert_eq!(true_out, "true");
 
-        let num_out = render(
-            "{{ value | md_cell }}",
-            serde_json::json!({"value": 42}),
-        );
+        let num_out = render("{{ value | md_cell }}", serde_json::json!({"value": 42}));
         assert_eq!(num_out, "42");
     }
 
     #[test]
     fn md_cell_matches_canonicalize_table_cell() {
         let input = "first|second\r\nthird\ndone";
-        let out = render(
-            "{{ value | md_cell }}",
-            serde_json::json!({"value": input}),
-        );
+        let out = render("{{ value | md_cell }}", serde_json::json!({"value": input}));
         assert_eq!(out, canonicalize_table_cell(input));
     }
 }

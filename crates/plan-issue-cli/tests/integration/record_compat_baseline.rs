@@ -241,7 +241,14 @@ fn plan_issue_local_keeps_record_subcommand_help() {
         "plan-issue-local record --help should exit success; stderr: {}",
         out.stderr
     );
-    for sub in ["open", "attach", "post", "repair-dashboard", "close", "audit"] {
+    for sub in [
+        "open",
+        "attach",
+        "post",
+        "repair-dashboard",
+        "close",
+        "audit",
+    ] {
         assert!(
             out.stdout.contains(sub),
             "plan-issue-local record --help missing `{sub}`: {}",

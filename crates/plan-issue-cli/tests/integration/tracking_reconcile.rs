@@ -88,10 +88,12 @@ fn tracking_reconcile_emits_run_state_ahead_for_unposted_validation() {
         evidence_path: None,
     });
     let report = reconcile::reconcile(Some(&audit), Some(&run));
-    assert!(report
-        .warnings
-        .iter()
-        .any(|w| w.code == "run-state-validation-not-posted"));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.code == "run-state-validation-not-posted")
+    );
 }
 
 #[test]
@@ -122,6 +124,14 @@ fn tracking_reconcile_safe_transitions_match_fsm() {
         (PayloadRole::Session, None),
     ]);
     let report = reconcile::reconcile(Some(&audit), None);
-    assert!(report.safe_transitions.iter().any(|s| s == "record_validation"));
-    assert_eq!(report.recommended_action, RecommendedAction::RecordValidation);
+    assert!(
+        report
+            .safe_transitions
+            .iter()
+            .any(|s| s == "record_validation")
+    );
+    assert_eq!(
+        report.recommended_action,
+        RecommendedAction::RecordValidation
+    );
 }

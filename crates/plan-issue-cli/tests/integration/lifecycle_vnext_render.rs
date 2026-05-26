@@ -246,8 +246,7 @@ fn lifecycle_vnext_render_source_and_plan_via_record_attach() {
     let source = bundle.join("sample-discussion-source.md");
     let plan = bundle.join("sample-plan.md");
     let execution_state = bundle.join("sample-execution-state.md");
-    fs::write(&source, "# Source\n\n- Decision: render source fixture.\n")
-        .expect("write source");
+    fs::write(&source, "# Source\n\n- Decision: render source fixture.\n").expect("write source");
     fs::write(
         &plan,
         "# Plan: Render Fixture\n\n## Overview\n\n- Demo plan.\n\n## Read First\n\n- Primary source: docs/plans/sample/sample-discussion-source.md\n- Source type: discussion-to-implementation-doc\n- Open questions carried into execution: none\n\n## Scope\n\n- In scope:\n  - Demo.\n- Out of scope:\n  - none.\n\n## Assumptions\n\n1. Demo only.\n\n## Sprint 1: Demo\n\n**Goal**: Demo.\n\n**PR grouping intent**: group\n**Execution Profile**: serial\n\n### Task 1.1: Demo\n\n- **Location**:\n  - `docs/plans/sample/sample-plan.md`\n- **Description**: Demo.\n- **Dependencies**:\n  - none\n- **Complexity**: 1\n- **Acceptance criteria**:\n  - Demo.\n- **Validation**:\n  - `true`\n",
@@ -293,10 +292,7 @@ fn lifecycle_vnext_render_source_and_plan_via_record_attach() {
     let parsed = json_stdout(&out.stdout_text());
     let comments = &parsed["payload"]["result"]["preview"]["comments"];
 
-    for (role_name, role_id) in [
-        ("source", PayloadRole::Source),
-        ("plan", PayloadRole::Plan),
-    ] {
+    for (role_name, role_id) in [("source", PayloadRole::Source), ("plan", PayloadRole::Plan)] {
         let body = comments[role_name].as_str().unwrap_or_default().to_string();
         assert_marker_and_carrier_shape(&body, role_id);
         let report = lint_visible(role_id, &body, LintHints::default());
