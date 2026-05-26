@@ -1,4 +1,5 @@
 use crate::common;
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
@@ -11,6 +12,10 @@ fn as_str(output: &[u8]) -> String {
 fn stage_file(repo: &Path, name: &str, contents: &str) {
     common::write_file(repo, name, contents);
     common::git(repo, &["add", name]);
+}
+
+fn git_trim(repo: &Path, args: &[&str]) -> String {
+    common::git(repo, args).trim().to_string()
 }
 
 fn deterministic_env(path: &str) -> Vec<(&'static str, String)> {
@@ -82,6 +87,10 @@ fn commit_help_flag_prints_usage() {
         as_str(&output.stdout)
             .contains("semantic-commit commit [--message <text>|--message-file <path>] [options]")
     );
+    assert!(as_str(&output.stdout).contains("--amend"));
+    assert!(as_str(&output.stdout).contains("--message-only"));
+    assert!(as_str(&output.stdout).contains("--format <mode>"));
+    assert!(as_str(&output.stdout).contains("--body-bullet <text>"));
 }
 
 #[test]
@@ -453,6 +462,313 @@ fn commit_dry_run_validates_and_checks_staged_without_committing() {
 }
 
 #[test]
+fn commit_json_outputs_result_metadata() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &["commit", "--json", "--message", "feat(core): add thing"],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).expect("commit json");
+    assert_eq!(json["schema_version"], "cli.semantic-commit.commit.v1");
+    assert_eq!(json["operation"], "commit");
+    assert_eq!(json["dry_run"], false);
+    assert_eq!(json["staged"]["file_count"], 1);
+    assert_eq!(json["staged"]["files"][0]["path"], "a.txt");
+    assert_eq!(
+        json["commit"]["sha"].as_str().expect("sha"),
+        git_trim(repo.path(), &["rev-parse", "HEAD"])
+    );
+    assert!(as_str(&output.stderr).trim().is_empty());
+}
+
+#[test]
+fn commit_amend_no_edit_reuses_head_message() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+    let first = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): add thing",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(first.status.code(), Some(0));
+
+    stage_file(repo.path(), "b.txt", "world\n");
+    let amend = common::run_semantic_commit_output(
+        repo.path(),
+        &["commit", "--amend", "--no-edit", "--no-summary"],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        amend.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&amend.stderr)
+    );
+    assert_eq!(git_trim(repo.path(), &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(
+        git_trim(repo.path(), &["show", "-s", "--format=%s", "HEAD"]),
+        "feat(core): add thing"
+    );
+    assert_eq!(git_trim(repo.path(), &["show", "HEAD:b.txt"]), "world");
+}
+
+#[test]
+fn commit_message_only_amend_updates_message_without_staged_changes() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+    let first = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): add thing",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(first.status.code(), Some(0));
+
+    let amend = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--amend",
+            "--message-only",
+            "--message",
+            "fix(core): improve subject",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        amend.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&amend.stderr)
+    );
+    assert_eq!(git_trim(repo.path(), &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(
+        git_trim(repo.path(), &["show", "-s", "--format=%s", "HEAD"]),
+        "fix(core): improve subject"
+    );
+}
+
+#[test]
+fn commit_message_only_rejects_staged_changes() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+    let first = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): add thing",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(first.status.code(), Some(0));
+
+    stage_file(repo.path(), "b.txt", "world\n");
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--amend",
+            "--message-only",
+            "--message",
+            "fix(core): improve subject",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(as_str(&output.stderr).contains("--message-only requires no staged changes"));
+}
+
+#[test]
+fn commit_require_clean_rejects_unstaged_changes() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+    common::write_file(repo.path(), "b.txt", "unstaged\n");
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--dry-run",
+            "--require-clean",
+            "--message",
+            "feat(core): add thing",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(as_str(&output.stderr).contains("unstaged or untracked changes present"));
+}
+
+#[test]
+fn commit_expect_head_rejects_mismatch() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+    let first = common::run_semantic_commit_output(
+        repo.path(),
+        &["commit", "--message", "feat(core): first", "--no-summary"],
+        &[],
+        None,
+    );
+    assert_eq!(first.status.code(), Some(0));
+    let first_sha = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+
+    stage_file(repo.path(), "b.txt", "world\n");
+    let second = common::run_semantic_commit_output(
+        repo.path(),
+        &["commit", "--message", "feat(core): second", "--no-summary"],
+        &[],
+        None,
+    );
+    assert_eq!(second.status.code(), Some(0));
+
+    stage_file(repo.path(), "c.txt", "again\n");
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--dry-run",
+            "--expect-head",
+            &first_sha,
+            "--message",
+            "feat(core): third",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(as_str(&output.stderr).contains("HEAD mismatch"));
+}
+
+#[test]
+fn commit_structured_message_builds_valid_commit_message() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--type",
+            "Feat",
+            "--scope",
+            "Core",
+            "--subject",
+            "add thing",
+            "--body-bullet",
+            "add supporting behavior",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    assert_eq!(
+        git_trim(repo.path(), &["show", "-s", "--format=%s", "HEAD"]),
+        "feat(core): add thing"
+    );
+    let body = common::git(repo.path(), &["show", "-s", "--format=%B", "HEAD"]);
+    assert!(body.contains("- Add supporting behavior"));
+}
+
+#[test]
+fn commit_trailer_appends_git_trailer() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): add thing",
+            "--trailer",
+            "Refs: #573",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    let body = common::git(repo.path(), &["show", "-s", "--format=%B", "HEAD"]);
+    assert!(body.contains("Refs: #573"));
+}
+
+#[test]
+fn commit_signoff_appends_committer_signoff() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "a.txt", "hello\n");
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): add thing",
+            "--signoff",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    let body = common::git(repo.path(), &["show", "-s", "--format=%B", "HEAD"]);
+    assert!(body.contains("Signed-off-by: Test User <test@example.com>"));
+}
+
+#[test]
 fn commit_default_summary_falls_back_to_git_show_when_git_scope_missing() {
     let repo = common::init_repo();
     stage_file(repo.path(), "a.txt", "hello\n");
@@ -818,4 +1134,112 @@ fn commit_repo_flag_commits_from_external_cwd() {
         head.status.success(),
         "expected commit to be created in --repo target"
     );
+}
+
+#[test]
+fn fixup_creates_fixup_commit_for_target() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "base.txt", "base\n");
+    let base = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): base change",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(base.status.code(), Some(0));
+
+    stage_file(repo.path(), "fix.txt", "fix\n");
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &["fixup", "--target", "HEAD", "--no-summary"],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    assert_eq!(
+        git_trim(repo.path(), &["show", "-s", "--format=%s", "HEAD"]),
+        "fixup! feat(core): base change"
+    );
+}
+
+#[test]
+fn squash_json_dry_run_reports_target_without_committing() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "base.txt", "base\n");
+    let base = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): base change",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(base.status.code(), Some(0));
+    let base_sha = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+
+    stage_file(repo.path(), "squash.txt", "squash\n");
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &["squash", "--target", "HEAD", "--json", "--dry-run"],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).expect("squash json");
+    assert_eq!(json["operation"], "squash");
+    assert_eq!(json["dry_run"], true);
+    assert_eq!(json["target"]["sha"], base_sha);
+    assert_eq!(json["generated_subject"], "squash! feat(core): base change");
+    assert_eq!(git_trim(repo.path(), &["rev-parse", "HEAD"]), base_sha);
+}
+
+#[test]
+fn fixup_invalid_target_fails_without_commit() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "base.txt", "base\n");
+    let base = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): base change",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(base.status.code(), Some(0));
+    let base_sha = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+
+    stage_file(repo.path(), "fix.txt", "fix\n");
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &["fixup", "--target", "missing-target"],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(as_str(&output.stderr).contains("target revision not found"));
+    assert_eq!(git_trim(repo.path(), &["rev-parse", "HEAD"]), base_sha);
 }

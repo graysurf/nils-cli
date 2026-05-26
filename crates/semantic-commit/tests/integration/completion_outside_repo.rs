@@ -17,6 +17,10 @@ fn completion_export_succeeds_outside_git_repo() {
         as_str(&output.stderr)
     );
     assert!(as_str(&output.stdout).contains("#compdef semantic-commit"));
+    assert!(as_str(&output.stdout).contains("fixup"));
+    assert!(as_str(&output.stdout).contains("squash"));
+    assert!(as_str(&output.stdout).contains("--amend"));
+    assert!(as_str(&output.stdout).contains("--body-bullet"));
 }
 
 #[test]

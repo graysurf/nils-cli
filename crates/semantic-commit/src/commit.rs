@@ -1,6 +1,7 @@
 use crate::git;
 use nils_common::git as common_git;
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
+use serde_json::json;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ const EXIT_MESSAGE_REQUIRED: i32 = 3;
 const EXIT_VALIDATION_FAILED: i32 = 4;
 const EXIT_DEPENDENCY_ERROR: i32 = 5;
 const CAT_PAGER_ENV: [(&str, &str); 2] = [("GIT_PAGER", "cat"), ("PAGER", "cat")];
+const COMMIT_RESULT_SCHEMA_VERSION: &str = "cli.semantic-commit.commit.v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SummaryMode {
@@ -31,18 +33,158 @@ impl SummaryMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+impl OutputFormat {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitOperation {
+    Create,
+    Amend,
+    MessageOnlyAmend,
+}
+
+impl CommitOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "commit",
+            Self::Amend => "amend",
+            Self::MessageOnlyAmend => "message_only_amend",
+        }
+    }
+
+    fn progress_label(self) -> &'static str {
+        match self {
+            Self::Create => "git commit",
+            Self::Amend | Self::MessageOnlyAmend => "git commit --amend",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StructuredMessage {
+    typ: Option<String>,
+    scope: Option<String>,
+    subject: Option<String>,
+    body_bullets: Vec<String>,
+}
+
+impl StructuredMessage {
+    fn has_any(&self) -> bool {
+        self.typ.is_some()
+            || self.scope.is_some()
+            || self.subject.is_some()
+            || !self.body_bullets.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommitMetadata {
+    sha: String,
+    subject: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StagedEntry {
+    status: String,
+    path: String,
+    old_path: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupOperation {
+    Fixup,
+    Squash,
+}
+
+impl CleanupOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixup => "fixup",
+            Self::Squash => "squash",
+        }
+    }
+
+    fn git_flag(self) -> &'static str {
+        match self {
+            Self::Fixup => "--fixup",
+            Self::Squash => "--squash",
+        }
+    }
+
+    fn subject_prefix(self) -> &'static str {
+        match self {
+            Self::Fixup => "fixup!",
+            Self::Squash => "squash!",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CleanupOptions {
+    target: Option<String>,
+    summary_mode: SummaryMode,
+    output_format: OutputFormat,
+    no_progress: bool,
+    quiet: bool,
+    dry_run: bool,
+    allow_empty: bool,
+    require_clean: bool,
+    expect_head: Option<String>,
+    repo: Option<PathBuf>,
+}
+
+impl CleanupOptions {
+    fn new(_operation: CleanupOperation) -> Self {
+        Self {
+            target: None,
+            summary_mode: SummaryMode::GitScope,
+            output_format: OutputFormat::Text,
+            no_progress: false,
+            quiet: false,
+            dry_run: false,
+            allow_empty: false,
+            require_clean: false,
+            expect_head: None,
+            repo: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CommitOptions {
     message: Option<String>,
     message_file: Option<String>,
     message_out: Option<PathBuf>,
     summary_mode: SummaryMode,
+    output_format: OutputFormat,
     no_progress: bool,
     quiet: bool,
     automation: bool,
     validate_only: bool,
     dry_run: bool,
     auto_fix: bool,
+    amend: bool,
+    no_edit: bool,
+    message_only: bool,
+    allow_empty: bool,
+    require_clean: bool,
+    expect_head: Option<String>,
+    signoff: bool,
+    trailers: Vec<String>,
+    structured: StructuredMessage,
     repo: Option<PathBuf>,
     max_header_width: usize,
 }
@@ -54,12 +196,27 @@ impl Default for CommitOptions {
             message_file: None,
             message_out: None,
             summary_mode: SummaryMode::GitScope,
+            output_format: OutputFormat::Text,
             no_progress: false,
             quiet: false,
             automation: false,
             validate_only: false,
             dry_run: false,
             auto_fix: false,
+            amend: false,
+            no_edit: false,
+            message_only: false,
+            allow_empty: false,
+            require_clean: false,
+            expect_head: None,
+            signoff: false,
+            trailers: Vec::new(),
+            structured: StructuredMessage {
+                typ: None,
+                scope: None,
+                subject: None,
+                body_bullets: Vec::new(),
+            },
             repo: None,
             max_header_width: DEFAULT_MAX_HEADER_WIDTH,
         }
@@ -71,15 +228,23 @@ pub fn run(args: &[String]) -> i32 {
         Ok(options) => options,
         Err(code) => return code,
     };
+    let operation = commit_operation(&options);
 
     if !git::command_exists("git") {
         eprintln!("error: git is required (ensure it is installed and on PATH)");
         return EXIT_DEPENDENCY_ERROR;
     }
 
-    if options.quiet {
+    if options.output_format == OutputFormat::Json {
         options.no_progress = true;
         options.summary_mode = SummaryMode::None;
+    }
+
+    if options.quiet {
+        options.no_progress = true;
+        if options.output_format == OutputFormat::Text {
+            options.summary_mode = SummaryMode::None;
+        }
     }
 
     let mut message_contents = match read_message_contents(&options) {
@@ -117,6 +282,9 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     if options.validate_only {
+        if options.output_format == OutputFormat::Json {
+            print_commit_json_result(operation, true, false, None, None, Vec::new());
+        }
         return 0;
     }
 
@@ -125,19 +293,56 @@ pub fn run(args: &[String]) -> i32 {
         return EXIT_ERROR;
     }
 
-    match git::has_staged_changes(options.repo.as_deref()) {
-        Ok(true) => {}
-        Ok(false) => {
-            eprintln!("error: no staged changes (stage files with git add first)");
-            return EXIT_NO_STAGED_CHANGES;
-        }
+    if let Some(expected) = options.expect_head.as_deref()
+        && let Err(code) = ensure_expected_head(options.repo.as_deref(), expected)
+    {
+        return code;
+    }
+
+    if options.require_clean
+        && let Err(code) = ensure_no_unstaged_or_untracked(options.repo.as_deref())
+    {
+        return code;
+    }
+
+    let has_staged_changes = match git::has_staged_changes(options.repo.as_deref()) {
+        Ok(value) => value,
         Err(err) => {
             eprintln!("{err:#}");
             return EXIT_ERROR;
         }
+    };
+
+    if operation == CommitOperation::MessageOnlyAmend && has_staged_changes {
+        eprintln!("error: --message-only requires no staged changes");
+        return EXIT_ERROR;
     }
 
+    if !has_staged_changes && !options.allow_empty && operation != CommitOperation::MessageOnlyAmend
+    {
+        eprintln!("error: no staged changes (stage files with git add first)");
+        return EXIT_NO_STAGED_CHANGES;
+    }
+
+    let staged_entries = match staged_entries(options.repo.as_deref()) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("{err:#}");
+            return EXIT_ERROR;
+        }
+    };
+
     if options.dry_run {
+        if options.output_format == OutputFormat::Json {
+            print_commit_json_result(
+                operation,
+                false,
+                true,
+                current_head_metadata(options.repo.as_deref()),
+                None,
+                staged_entries,
+            );
+        }
         return 0;
     }
 
@@ -152,11 +357,11 @@ pub fn run(args: &[String]) -> i32 {
     };
 
     if let Some(progress) = &progress {
-        progress.set_message("git commit");
+        progress.set_message(operation.progress_label());
         progress.tick();
     }
 
-    let status = git_commit(tmpfile.path(), options.repo.as_deref());
+    let status = git_commit(tmpfile.path(), &options, operation);
 
     if let Some(progress) = &progress {
         progress.finish_and_clear();
@@ -173,6 +378,148 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("{err:#}");
             return EXIT_ERROR;
         }
+    }
+
+    let commit = current_head_metadata(options.repo.as_deref());
+    if options.output_format == OutputFormat::Json {
+        print_commit_json_result(operation, false, false, commit, None, staged_entries);
+        return 0;
+    }
+
+    print_summary(options.summary_mode, options.repo.as_deref())
+}
+
+fn commit_operation(options: &CommitOptions) -> CommitOperation {
+    if options.message_only {
+        CommitOperation::MessageOnlyAmend
+    } else if options.amend {
+        CommitOperation::Amend
+    } else {
+        CommitOperation::Create
+    }
+}
+
+pub fn run_fixup(args: &[String]) -> i32 {
+    run_cleanup(args, CleanupOperation::Fixup)
+}
+
+pub fn run_squash(args: &[String]) -> i32 {
+    run_cleanup(args, CleanupOperation::Squash)
+}
+
+fn run_cleanup(args: &[String], operation: CleanupOperation) -> i32 {
+    let mut options = match parse_cleanup_args(args, operation) {
+        Ok(options) => options,
+        Err(code) => return code,
+    };
+
+    if !git::command_exists("git") {
+        eprintln!("error: git is required (ensure it is installed and on PATH)");
+        return EXIT_DEPENDENCY_ERROR;
+    }
+
+    if options.output_format == OutputFormat::Json {
+        options.no_progress = true;
+        options.summary_mode = SummaryMode::None;
+    }
+
+    if options.quiet {
+        options.no_progress = true;
+        if options.output_format == OutputFormat::Text {
+            options.summary_mode = SummaryMode::None;
+        }
+    }
+
+    if !git::is_inside_work_tree(options.repo.as_deref()) {
+        eprintln!("error: must run inside a git work tree");
+        return EXIT_ERROR;
+    }
+
+    let target = match resolve_target_metadata(options.repo.as_deref(), options.target.as_deref()) {
+        Ok(target) => target,
+        Err(code) => return code,
+    };
+
+    if let Some(expected) = options.expect_head.as_deref()
+        && let Err(code) = ensure_expected_head(options.repo.as_deref(), expected)
+    {
+        return code;
+    }
+
+    if options.require_clean
+        && let Err(code) = ensure_no_unstaged_or_untracked(options.repo.as_deref())
+    {
+        return code;
+    }
+
+    let has_staged_changes = match git::has_staged_changes(options.repo.as_deref()) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("{err:#}");
+            return EXIT_ERROR;
+        }
+    };
+    if !has_staged_changes && !options.allow_empty {
+        eprintln!("error: no staged changes (stage files with git add first)");
+        return EXIT_NO_STAGED_CHANGES;
+    }
+
+    let staged_entries = match staged_entries(options.repo.as_deref()) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("{err:#}");
+            return EXIT_ERROR;
+        }
+    };
+
+    if options.dry_run {
+        if options.output_format == OutputFormat::Json {
+            print_cleanup_json_result(operation, true, None, target, staged_entries);
+        }
+        return 0;
+    }
+
+    let progress = if !options.no_progress {
+        Some(Progress::spinner(
+            ProgressOptions::default()
+                .with_prefix("semantic-commit ")
+                .with_finish(ProgressFinish::Clear),
+        ))
+    } else {
+        None
+    };
+
+    if let Some(progress) = &progress {
+        progress.set_message(format!("git commit --{}", operation.as_str()));
+        progress.tick();
+    }
+
+    let status = git_cleanup_commit(&options, operation, &target.sha);
+
+    if let Some(progress) = &progress {
+        progress.finish_and_clear();
+    }
+
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            let rc = status.code().unwrap_or(EXIT_ERROR);
+            eprintln!(
+                "error: git commit --{} failed (exit code: {rc})",
+                operation.as_str()
+            );
+            return rc;
+        }
+        Err(err) => {
+            eprintln!("{err:#}");
+            return EXIT_ERROR;
+        }
+    }
+
+    let commit = current_head_metadata(options.repo.as_deref());
+    if options.output_format == OutputFormat::Json {
+        print_cleanup_json_result(operation, false, commit, target, staged_entries);
+        return 0;
     }
 
     print_summary(options.summary_mode, options.repo.as_deref())
@@ -250,6 +597,27 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
                 options.summary_mode = SummaryMode::None;
                 i += 1;
             }
+            "--format" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("error: --format requires a value");
+                        print_usage_stderr();
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                let Some(format) = OutputFormat::parse(value) else {
+                    eprintln!("error: invalid --format value: {value} (expected: text, json)");
+                    print_usage_stderr();
+                    return Err(EXIT_ERROR);
+                };
+                options.output_format = format;
+                i += 2;
+            }
+            "--json" => {
+                options.output_format = OutputFormat::Json;
+                i += 1;
+            }
             "--no-progress" => {
                 options.no_progress = true;
                 i += 1;
@@ -273,6 +641,102 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
             "--auto-fix" => {
                 options.auto_fix = true;
                 i += 1;
+            }
+            "--amend" => {
+                options.amend = true;
+                i += 1;
+            }
+            "--no-edit" => {
+                options.no_edit = true;
+                i += 1;
+            }
+            "--message-only" => {
+                options.message_only = true;
+                i += 1;
+            }
+            "--allow-empty" => {
+                options.allow_empty = true;
+                i += 1;
+            }
+            "--require-clean" | "--no-unstaged" => {
+                options.require_clean = true;
+                i += 1;
+            }
+            "--expect-head" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("error: --expect-head requires a revision");
+                        print_usage_stderr();
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.expect_head = Some(value);
+                i += 2;
+            }
+            "--signoff" => {
+                options.signoff = true;
+                i += 1;
+            }
+            "--trailer" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("error: --trailer requires a value");
+                        print_usage_stderr();
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.trailers.push(value);
+                i += 2;
+            }
+            "--type" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("error: --type requires a value");
+                        print_usage_stderr();
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.structured.typ = Some(value);
+                i += 2;
+            }
+            "--scope" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("error: --scope requires a value");
+                        print_usage_stderr();
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.structured.scope = Some(value);
+                i += 2;
+            }
+            "--subject" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("error: --subject requires a value");
+                        print_usage_stderr();
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.structured.subject = Some(value);
+                i += 2;
+            }
+            "--body-bullet" | "--bullet" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("error: {} requires a value", args[i]);
+                        print_usage_stderr();
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.structured.body_bullets.push(value);
+                i += 2;
             }
             "--repo" => {
                 let value = match args.get(i + 1) {
@@ -312,8 +776,180 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
         return Err(EXIT_ERROR);
     }
 
+    if options.no_edit && !options.amend {
+        eprintln!("error: --no-edit requires --amend");
+        return Err(EXIT_ERROR);
+    }
+
+    if options.message_only && !options.amend {
+        eprintln!("error: --message-only requires --amend");
+        return Err(EXIT_ERROR);
+    }
+
+    if options.no_edit && options.message_only {
+        eprintln!("error: use only one of --no-edit or --message-only");
+        return Err(EXIT_ERROR);
+    }
+
+    if options.no_edit
+        && (options.message.is_some()
+            || options.message_file.is_some()
+            || options.structured.has_any()
+            || options.auto_fix)
+    {
+        eprintln!("error: --no-edit cannot be combined with message input or --auto-fix");
+        return Err(EXIT_ERROR);
+    }
+
+    if options.structured.has_any() && (options.message.is_some() || options.message_file.is_some())
+    {
+        eprintln!(
+            "error: structured message fields cannot be combined with --message or --message-file"
+        );
+        return Err(EXIT_ERROR);
+    }
+
+    if options.structured.has_any()
+        && (options.structured.typ.is_none() || options.structured.subject.is_none())
+    {
+        eprintln!("error: structured message fields require --type and --subject");
+        return Err(EXIT_ERROR);
+    }
+
+    if let Err(message) = validate_trailers(&options.trailers) {
+        eprintln!("error: {message}");
+        return Err(EXIT_ERROR);
+    }
+
     if !max_header_width_from_flag {
         options.max_header_width = env_header_width()?;
+    }
+
+    Ok(options)
+}
+
+fn parse_cleanup_args(args: &[String], operation: CleanupOperation) -> Result<CleanupOptions, i32> {
+    let mut options = CleanupOptions::new(operation);
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_cleanup_usage_stdout(operation);
+                return Err(0);
+            }
+            "--target" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("error: --target requires a revision");
+                        print_cleanup_usage_stderr(operation);
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.target = Some(value);
+                i += 2;
+            }
+            "--summary" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("error: --summary requires a value");
+                        print_cleanup_usage_stderr(operation);
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                let Some(mode) = SummaryMode::parse(value) else {
+                    eprintln!(
+                        "error: invalid --summary value: {value} (expected: git-scope, git-show, none)"
+                    );
+                    print_cleanup_usage_stderr(operation);
+                    return Err(EXIT_ERROR);
+                };
+                options.summary_mode = mode;
+                i += 2;
+            }
+            "--no-summary" => {
+                options.summary_mode = SummaryMode::None;
+                i += 1;
+            }
+            "--format" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("error: --format requires a value");
+                        print_cleanup_usage_stderr(operation);
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                let Some(format) = OutputFormat::parse(value) else {
+                    eprintln!("error: invalid --format value: {value} (expected: text, json)");
+                    print_cleanup_usage_stderr(operation);
+                    return Err(EXIT_ERROR);
+                };
+                options.output_format = format;
+                i += 2;
+            }
+            "--json" => {
+                options.output_format = OutputFormat::Json;
+                i += 1;
+            }
+            "--dry-run" => {
+                options.dry_run = true;
+                i += 1;
+            }
+            "--allow-empty" => {
+                options.allow_empty = true;
+                i += 1;
+            }
+            "--require-clean" | "--no-unstaged" => {
+                options.require_clean = true;
+                i += 1;
+            }
+            "--expect-head" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("error: --expect-head requires a revision");
+                        print_cleanup_usage_stderr(operation);
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.expect_head = Some(value);
+                i += 2;
+            }
+            "--repo" => {
+                let value = match args.get(i + 1) {
+                    Some(value) => value.clone(),
+                    None => {
+                        eprintln!("error: --repo requires a path");
+                        print_cleanup_usage_stderr(operation);
+                        return Err(EXIT_ERROR);
+                    }
+                };
+                options.repo = Some(PathBuf::from(value));
+                i += 2;
+            }
+            "--no-progress" => {
+                options.no_progress = true;
+                i += 1;
+            }
+            "--quiet" => {
+                options.quiet = true;
+                i += 1;
+            }
+            other => {
+                eprintln!("error: unknown argument: {other}");
+                print_cleanup_usage_stderr(operation);
+                return Err(EXIT_ERROR);
+            }
+        }
+    }
+
+    if options.target.is_none() {
+        eprintln!("error: --target is required");
+        print_cleanup_usage_stderr(operation);
+        return Err(EXIT_ERROR);
     }
 
     Ok(options)
@@ -350,7 +986,79 @@ fn parse_positive_width(value: &str, label: &str) -> Result<usize, i32> {
     Ok(parsed)
 }
 
+fn validate_trailers(trailers: &[String]) -> Result<(), String> {
+    for trailer in trailers {
+        if !is_valid_trailer_line(trailer) {
+            return Err(format!(
+                "invalid --trailer value: {trailer} (expected 'Token: value' or 'Token=value')"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_structured_message(structured: &StructuredMessage) -> Result<String, i32> {
+    let typ = structured
+        .typ
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            eprintln!("error: --type must not be empty");
+            EXIT_MESSAGE_REQUIRED
+        })?;
+    let subject = structured
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            eprintln!("error: --subject must not be empty");
+            EXIT_MESSAGE_REQUIRED
+        })?;
+
+    let typ = typ.to_ascii_lowercase();
+    let header = match structured
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(scope) => format!("{}({}): {subject}", typ, scope.to_ascii_lowercase()),
+        None => format!("{typ}: {subject}"),
+    };
+
+    let mut lines = vec![header];
+    if !structured.body_bullets.is_empty() {
+        lines.push(String::new());
+        for bullet in &structured.body_bullets {
+            let trimmed = bullet.trim();
+            if trimmed.is_empty() {
+                eprintln!("error: --body-bullet must not be empty");
+                return Err(EXIT_MESSAGE_REQUIRED);
+            }
+            let body = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+            let line = capitalize_bullet_first_char(&format!("- {body}"));
+            lines.extend(wrap_body_line(&line, BODY_LINE_WIDTH));
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
 fn read_message_contents(options: &CommitOptions) -> Result<String, i32> {
+    if options.no_edit {
+        let Some(contents) = commit_message_for_rev(options.repo.as_deref(), "HEAD")? else {
+            eprintln!("error: --no-edit requires an existing HEAD commit");
+            return Err(EXIT_ERROR);
+        };
+        return Ok(contents);
+    }
+
+    if options.structured.has_any() {
+        return build_structured_message(&options.structured);
+    }
+
     let message_contents = match (&options.message, &options.message_file) {
         (Some(text), None) => text.clone(),
         (None, Some(path)) => match std::fs::read_to_string(path) {
@@ -401,6 +1109,14 @@ fn run_git_output_with_pager(repo: Option<&Path>, args: &[&str]) -> std::io::Res
     }
 }
 
+fn run_git_output_with_pager_owned(
+    repo: Option<&Path>,
+    args: &[String],
+) -> std::io::Result<Output> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_git_output_with_pager(repo, &refs)
+}
+
 fn run_git_status_inherit_with_pager(
     repo: Option<&Path>,
     args: &[&str],
@@ -413,16 +1129,267 @@ fn run_git_status_inherit_with_pager(
 
 fn git_commit(
     message_path: &Path,
-    repo: Option<&Path>,
+    options: &CommitOptions,
+    operation: CommitOperation,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let message_path = message_path.to_string_lossy();
-    let output = run_git_output_with_pager(repo, &["commit", "-F", message_path.as_ref()])?;
+    let mut args = vec!["commit".to_string()];
+    if matches!(
+        operation,
+        CommitOperation::Amend | CommitOperation::MessageOnlyAmend
+    ) {
+        args.push("--amend".to_string());
+    }
+    if options.allow_empty {
+        args.push("--allow-empty".to_string());
+    }
+    if options.signoff {
+        args.push("--signoff".to_string());
+    }
+    for trailer in &options.trailers {
+        args.push("--trailer".to_string());
+        args.push(trailer.clone());
+    }
+    if options.no_edit {
+        args.push("--no-edit".to_string());
+    } else {
+        args.push("-F".to_string());
+        args.push(message_path.to_string());
+    }
+
+    let output = run_git_output_with_pager_owned(options.repo.as_deref(), &args)?;
 
     if !output.stderr.is_empty() {
         std::io::stderr().write_all(&output.stderr)?;
     }
 
     Ok(output.status)
+}
+
+fn git_cleanup_commit(
+    options: &CleanupOptions,
+    operation: CleanupOperation,
+    target_sha: &str,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let mut args = vec!["commit".to_string()];
+    if options.allow_empty {
+        args.push("--allow-empty".to_string());
+    }
+    args.push(format!("{}={target_sha}", operation.git_flag()));
+
+    let output = run_git_output_with_pager_owned(options.repo.as_deref(), &args)?;
+
+    if !output.stderr.is_empty() {
+        std::io::stderr().write_all(&output.stderr)?;
+    }
+
+    Ok(output.status)
+}
+
+fn resolve_target_metadata(
+    repo: Option<&Path>,
+    target: Option<&str>,
+) -> Result<CommitMetadata, i32> {
+    let target = target.expect("target checked by parser");
+    let rev = format!("{target}^{{commit}}");
+    let Some(sha) = git_stdout(repo, &["rev-parse", "--verify", &rev]) else {
+        eprintln!("error: target revision not found: {target}");
+        return Err(EXIT_ERROR);
+    };
+    let Some(subject) = git_stdout(repo, &["show", "-s", "--format=%s", &sha]) else {
+        eprintln!("error: failed to read target subject: {target}");
+        return Err(EXIT_ERROR);
+    };
+    Ok(CommitMetadata { sha, subject })
+}
+
+fn current_head_metadata(repo: Option<&Path>) -> Option<CommitMetadata> {
+    let sha = git_stdout(repo, &["rev-parse", "--verify", "HEAD"])?;
+    let subject = git_stdout(repo, &["show", "-s", "--format=%s", "HEAD"])?;
+    Some(CommitMetadata { sha, subject })
+}
+
+fn commit_message_for_rev(repo: Option<&Path>, rev: &str) -> Result<Option<String>, i32> {
+    let output =
+        run_git_output_with_pager(repo, &["log", "-1", "--format=%B", rev]).map_err(|err| {
+            eprintln!("error: failed to read {rev} commit message: {err}");
+            EXIT_ERROR
+        })?;
+    if output.status.success() {
+        Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn git_stdout(repo: Option<&Path>, args: &[&str]) -> Option<String> {
+    let output = run_git_output_with_pager(repo, args).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn ensure_expected_head(repo: Option<&Path>, expected: &str) -> Result<(), i32> {
+    let Some(current) = git_stdout(repo, &["rev-parse", "--verify", "HEAD"]) else {
+        eprintln!("error: --expect-head requires an existing HEAD commit");
+        return Err(EXIT_ERROR);
+    };
+    let rev = format!("{expected}^{{commit}}");
+    let Some(expected_sha) = git_stdout(repo, &["rev-parse", "--verify", &rev]) else {
+        eprintln!("error: --expect-head revision not found: {expected}");
+        return Err(EXIT_ERROR);
+    };
+    if current != expected_sha {
+        eprintln!("error: HEAD mismatch (expected {expected_sha}, found {current})");
+        return Err(EXIT_ERROR);
+    }
+    Ok(())
+}
+
+fn ensure_no_unstaged_or_untracked(repo: Option<&Path>) -> Result<(), i32> {
+    if has_unstaged_or_untracked(repo)? {
+        eprintln!("error: unstaged or untracked changes present");
+        return Err(EXIT_ERROR);
+    }
+    Ok(())
+}
+
+fn has_unstaged_or_untracked(repo: Option<&Path>) -> Result<bool, i32> {
+    let output =
+        run_git_output_with_pager(repo, &["status", "--porcelain", "--untracked-files=all"])
+            .map_err(|err| {
+                eprintln!("error: failed to inspect worktree status: {err}");
+                EXIT_ERROR
+            })?;
+    if !output.status.success() {
+        eprintln!("error: failed to inspect worktree status");
+        return Err(EXIT_ERROR);
+    }
+    let status = String::from_utf8_lossy(&output.stdout);
+    Ok(status
+        .lines()
+        .any(|line| line.starts_with("??") || line.as_bytes().get(1).is_some_and(|b| *b != b' ')))
+}
+
+fn staged_entries(repo: Option<&Path>) -> anyhow::Result<Vec<StagedEntry>> {
+    let output = run_git_output_with_pager(
+        repo,
+        &[
+            "-c",
+            "core.quotepath=false",
+            "diff",
+            "--cached",
+            "--name-status",
+            "-z",
+        ],
+    )?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let entries =
+        common_git::parse_name_status_z(&output.stdout).map_err(|err| anyhow::anyhow!("{err}"))?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| StagedEntry {
+            status: String::from_utf8_lossy(entry.status_raw).to_string(),
+            path: String::from_utf8_lossy(entry.path).to_string(),
+            old_path: entry
+                .old_path
+                .map(|path| String::from_utf8_lossy(path).to_string()),
+        })
+        .collect())
+}
+
+fn print_commit_json_result(
+    operation: CommitOperation,
+    validate_only: bool,
+    dry_run: bool,
+    commit: Option<CommitMetadata>,
+    target: Option<CommitMetadata>,
+    staged_entries: Vec<StagedEntry>,
+) {
+    let files: Vec<_> = staged_entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "status": entry.status,
+                "path": entry.path,
+                "old_path": entry.old_path,
+            })
+        })
+        .collect();
+    let commit_json = commit.map(|commit| {
+        json!({
+            "sha": commit.sha,
+            "subject": commit.subject,
+        })
+    });
+    let target_json = target.map(|target| {
+        json!({
+            "sha": target.sha,
+            "subject": target.subject,
+        })
+    });
+    let payload = json!({
+        "schema_version": COMMIT_RESULT_SCHEMA_VERSION,
+        "ok": true,
+        "operation": operation.as_str(),
+        "validate_only": validate_only,
+        "dry_run": dry_run,
+        "commit": commit_json,
+        "target": target_json,
+        "staged": {
+            "file_count": files.len(),
+            "files": files,
+        },
+    });
+    println!("{payload}");
+}
+
+fn print_cleanup_json_result(
+    operation: CleanupOperation,
+    dry_run: bool,
+    commit: Option<CommitMetadata>,
+    target: CommitMetadata,
+    staged_entries: Vec<StagedEntry>,
+) {
+    let generated_subject = format!("{} {}", operation.subject_prefix(), target.subject);
+    let files: Vec<_> = staged_entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "status": entry.status,
+                "path": entry.path,
+                "old_path": entry.old_path,
+            })
+        })
+        .collect();
+    let commit_json = commit.map(|commit| {
+        json!({
+            "sha": commit.sha,
+            "subject": commit.subject,
+        })
+    });
+    let payload = json!({
+        "schema_version": COMMIT_RESULT_SCHEMA_VERSION,
+        "ok": true,
+        "operation": operation.as_str(),
+        "validate_only": false,
+        "dry_run": dry_run,
+        "commit": commit_json,
+        "target": {
+            "sha": target.sha,
+            "subject": target.subject,
+        },
+        "generated_subject": generated_subject,
+        "staged": {
+            "file_count": files.len(),
+            "files": files,
+        },
+    });
+    println!("{payload}");
 }
 
 fn print_summary(summary_mode: SummaryMode, repo: Option<&Path>) -> i32 {
@@ -553,17 +1520,37 @@ fn validate_commit_message_with_width(path: &Path, max_header_width: usize) -> R
         }
 
         let mut prev_was_body_line = false;
+        let mut trailer_mode = false;
         for (idx, line) in lines.iter().enumerate().skip(2) {
             let line_no = idx + 1;
             if line.is_empty() {
+                if prev_was_body_line && !trailer_mode {
+                    trailer_mode = true;
+                    prev_was_body_line = false;
+                    continue;
+                }
                 return fail_validation(&format!(
-                    "commit body line {line_no} is empty; body lines must start with '- ' followed by uppercase letter (or '  ' to continue the previous bullet)"
+                    "commit body line {line_no} is empty; body lines must start with '- ' followed by uppercase letter, a trailer, or '  ' to continue the previous bullet"
                 ));
             }
             if line.chars().count() > BODY_LINE_WIDTH {
                 return fail_validation(&format!(
                     "commit body line {line_no} exceeds {BODY_LINE_WIDTH} characters (max {BODY_LINE_WIDTH})"
                 ));
+            }
+
+            if trailer_mode {
+                if !is_valid_trailer_line(line) {
+                    return fail_validation(&format!(
+                        "commit trailer line {line_no} must use 'Token: value' or 'Token=value'"
+                    ));
+                }
+                continue;
+            }
+
+            if !prev_was_body_line && is_valid_trailer_line(line) {
+                trailer_mode = true;
+                continue;
             }
 
             let is_bullet = line.starts_with("- ")
@@ -574,7 +1561,7 @@ fn validate_commit_message_with_width(path: &Path, max_header_width: usize) -> R
 
             if !is_bullet && !is_continuation {
                 return fail_validation(&format!(
-                    "commit body line {line_no} must start with '- ' followed by uppercase letter (or '  ' to continue the previous bullet)"
+                    "commit body line {line_no} must start with '- ' followed by uppercase letter, a trailer, or '  ' to continue the previous bullet"
                 ));
             }
             prev_was_body_line = true;
@@ -630,6 +1617,28 @@ fn is_valid_header(header: &str) -> bool {
     }
 
     true
+}
+
+fn is_valid_trailer_line(line: &str) -> bool {
+    let Some((token, value)) = split_trailer(line) else {
+        return false;
+    };
+    !token.is_empty()
+        && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !value.trim().is_empty()
+}
+
+fn split_trailer(line: &str) -> Option<(&str, &str)> {
+    let colon = line.find(':');
+    let equals = line.find('=');
+    let idx = match (colon, equals) {
+        (Some(colon), Some(equals)) => colon.min(equals),
+        (Some(colon), None) => colon,
+        (None, Some(equals)) => equals,
+        (None, None) => return None,
+    };
+    let (token, rest) = line.split_at(idx);
+    Some((token.trim(), rest[1..].trim()))
 }
 
 const DEFAULT_MAX_HEADER_WIDTH: usize = 100;
@@ -808,6 +1817,14 @@ fn print_usage(stderr: bool) {
     );
     let _ = writeln!(
         out,
+        "      --format <mode>          Output mode: text | json"
+    );
+    let _ = writeln!(
+        out,
+        "      --json                   Equivalent to --format json"
+    );
+    let _ = writeln!(
+        out,
         "      --repo <path>            Run git commands against repo path"
     );
     let _ = writeln!(
@@ -832,6 +1849,58 @@ fn print_usage(stderr: bool) {
     );
     let _ = writeln!(
         out,
+        "      --amend                  Amend HEAD instead of creating a new commit"
+    );
+    let _ = writeln!(
+        out,
+        "      --no-edit                Reuse HEAD message with --amend"
+    );
+    let _ = writeln!(
+        out,
+        "      --message-only           Amend only the HEAD message and require no staged changes"
+    );
+    let _ = writeln!(
+        out,
+        "      --allow-empty            Allow a commit operation without staged changes"
+    );
+    let _ = writeln!(
+        out,
+        "      --require-clean          Require no unstaged or untracked changes"
+    );
+    let _ = writeln!(
+        out,
+        "      --no-unstaged            Alias for --require-clean"
+    );
+    let _ = writeln!(
+        out,
+        "      --expect-head <rev>      Require HEAD to match rev before committing"
+    );
+    let _ = writeln!(
+        out,
+        "      --signoff                Pass --signoff to git commit"
+    );
+    let _ = writeln!(
+        out,
+        "      --trailer <token: value> Add a git trailer (repeatable)"
+    );
+    let _ = writeln!(
+        out,
+        "      --type <type>            Structured message type"
+    );
+    let _ = writeln!(
+        out,
+        "      --scope <scope>          Structured message scope"
+    );
+    let _ = writeln!(
+        out,
+        "      --subject <subject>      Structured message subject"
+    );
+    let _ = writeln!(
+        out,
+        "      --body-bullet <text>     Structured message body bullet (repeatable)"
+    );
+    let _ = writeln!(
+        out,
         "      --no-progress            Disable progress spinner"
     );
     let _ = writeln!(
@@ -849,6 +1918,82 @@ fn print_usage(stderr: bool) {
     let _ = writeln!(
         out,
         "  semantic-commit commit -F ./message.txt --summary git-show"
+    );
+}
+
+fn print_cleanup_usage_stdout(operation: CleanupOperation) {
+    print_cleanup_usage(operation, false);
+}
+
+fn print_cleanup_usage_stderr(operation: CleanupOperation) {
+    print_cleanup_usage(operation, true);
+}
+
+fn print_cleanup_usage(operation: CleanupOperation, stderr: bool) {
+    let out: &mut dyn std::io::Write = if stderr {
+        &mut std::io::stderr()
+    } else {
+        &mut std::io::stdout()
+    };
+    let name = operation.as_str();
+    let _ = writeln!(out, "Usage:");
+    let _ = writeln!(out, "  semantic-commit {name} --target <rev> [options]");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Create a {}! commit for staged changes.",
+        operation.as_str()
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Options:");
+    let _ = writeln!(out, "      --target <rev>          Target commit revision");
+    let _ = writeln!(
+        out,
+        "      --summary <mode>        Summary mode: git-scope | git-show | none"
+    );
+    let _ = writeln!(
+        out,
+        "      --no-summary            Equivalent to --summary none"
+    );
+    let _ = writeln!(
+        out,
+        "      --format <mode>         Output mode: text | json"
+    );
+    let _ = writeln!(
+        out,
+        "      --json                  Equivalent to --format json"
+    );
+    let _ = writeln!(
+        out,
+        "      --dry-run               Validate target and staged checks without committing"
+    );
+    let _ = writeln!(
+        out,
+        "      --allow-empty           Allow a cleanup commit without staged changes"
+    );
+    let _ = writeln!(
+        out,
+        "      --require-clean         Require no unstaged or untracked changes"
+    );
+    let _ = writeln!(
+        out,
+        "      --no-unstaged           Alias for --require-clean"
+    );
+    let _ = writeln!(
+        out,
+        "      --expect-head <rev>     Require HEAD to match rev before committing"
+    );
+    let _ = writeln!(
+        out,
+        "      --repo <path>           Run git commands against repo path"
+    );
+    let _ = writeln!(
+        out,
+        "      --no-progress           Disable progress spinner"
+    );
+    let _ = writeln!(
+        out,
+        "      --quiet                 Suppress progress and summary output"
     );
 }
 
