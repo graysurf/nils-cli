@@ -126,6 +126,7 @@ fn history_records_service_token_env_source() {
 
     let server = start_server();
     write_text(&root.join("q.graphql"), "query Q { ok }\n");
+    write_text(&root.join("vars.json"), r#"{"id":7}"#);
 
     let out = run_api_gql_with(
         root,
@@ -136,6 +137,7 @@ fn history_records_service_token_env_source() {
             "--url",
             &server.url(),
             "q.graphql",
+            "vars.json",
         ],
         &[
             ("GQL_HISTORY_ENABLED", "true"),
@@ -148,6 +150,9 @@ fn history_records_service_token_env_source() {
 
     let history_file = setup_dir.join(".gql_history");
     let content = std::fs::read_to_string(&history_file).expect("read history");
+    assert!(content.contains("--config-dir 'setup/graphql'"));
+    assert!(content.contains("'q.graphql'"));
+    assert!(content.contains("'vars.json'"));
     assert!(content.contains("token=SERVICE_TOKEN"));
     assert!(!content.contains("token=ACCESS_TOKEN"));
 }

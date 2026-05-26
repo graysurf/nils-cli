@@ -199,6 +199,13 @@ pub fn append_request_call_history_best_effort(
 }
 
 pub fn build_request_call_history_record(spec: RequestCallHistoryRecord<'_>) -> String {
+    build_request_call_history_record_with_extra_args(spec, &[])
+}
+
+pub fn build_request_call_history_record_with_extra_args(
+    spec: RequestCallHistoryRecord<'_>,
+    extra_args: &[&str],
+) -> String {
     let setup_rel = cli_util::maybe_relpath(spec.setup_dir, spec.invocation_dir);
     let config_rel = cli_util::shell_quote(&setup_rel);
     let request_rel = relative_cli_arg(spec.request_arg, spec.invocation_dir);
@@ -287,6 +294,10 @@ pub fn build_request_call_history_record(spec: RequestCallHistoryRecord<'_>) -> 
     }
 
     record.push_str(&format!("  {} \\\n", cli_util::shell_quote(&request_rel)));
+    for arg in extra_args {
+        let rel = relative_cli_arg(arg, spec.invocation_dir);
+        record.push_str(&format!("  {} \\\n", cli_util::shell_quote(&rel)));
+    }
     record.push_str("| jq .\n\n");
     record
 }
@@ -304,7 +315,7 @@ fn relative_cli_arg(arg: &str, invocation_dir: &Path) -> String {
 mod tests {
     use super::{
         RequestCallHistoryAuth, RequestCallHistoryFlag, RequestCallHistoryRecord,
-        build_request_call_history_record,
+        build_request_call_history_record, build_request_call_history_record_with_extra_args,
     };
     use pretty_assertions::assert_eq;
     use std::path::Path;
@@ -400,6 +411,46 @@ mod tests {
                 "  --config-dir 'setup/websocket' \\\n",
                 "  --format json \\\n",
                 "  'requests/health.ws.json' \\\n",
+                "| jq .\n\n",
+            )
+        );
+    }
+
+    #[test]
+    fn request_call_history_appends_extra_positional_args_after_request_arg() {
+        let extra_args = ["vars.json"];
+        let record = build_request_call_history_record_with_extra_args(
+            RequestCallHistoryRecord {
+                stamp: "2026-03-06T10:00:00Z",
+                exit_code: 0,
+                setup_dir: Path::new("/tmp/ws/setup/graphql"),
+                invocation_dir: Path::new("/tmp/ws"),
+                command_name: "api-gql",
+                endpoint_label_used: "url",
+                endpoint_value_used: "https://api.example/graphql",
+                log_url: true,
+                auth: RequestCallHistoryAuth::HeaderAndFlag {
+                    header_key: "jwt",
+                    header_value: "admin",
+                    flag_name: "jwt",
+                    flag_value: "admin",
+                },
+                request_arg: "q.graphql",
+                extra_flags: &[],
+            },
+            &extra_args,
+        );
+
+        assert_eq!(
+            record,
+            concat!(
+                "# 2026-03-06T10:00:00Z exit=0 setup_dir=setup/graphql url=https://api.example/graphql jwt=admin\n",
+                "api-gql call \\\n",
+                "  --config-dir 'setup/graphql' \\\n",
+                "  --url 'https://api.example/graphql' \\\n",
+                "  --jwt 'admin' \\\n",
+                "  'q.graphql' \\\n",
+                "  'vars.json' \\\n",
                 "| jq .\n\n",
             )
         );
