@@ -64,15 +64,32 @@ the same engine over JSON input.
 4. `nils-markdown` is publishable; the release-order list places it
    after `nils-common` and `nils-term` and before every consumer.
 5. The existing four helpers in
-   `crates/agent-runtime-cli/src/render/helpers/` are byte-stable and
-   can be relocated without semantic change.
+   `crates/agent-runtime-cli/src/render/helpers/`
+   (`cli_ref / script / skill_ref / state_out`) are domain-specific
+   to agent-runtime-cli (they bind `ManifestSet`, `Skill`,
+   `StateOutMode`, `CliToolsManifest`); `nils-markdown` exposes a
+   generic `Engine::register_helper(name, F)` extension point that
+   `agent-runtime-cli` consumes to re-register them in-place. The
+   helper bodies stay where they are; only the engine construction
+   site (`crates/agent-runtime-cli/src/render/writer.rs`) and the
+   helpers' `register_all` site move from `tera::Tera` to
+   `nils_markdown::Engine`.
 
 ## Sprint 1: nils-markdown foundation
 
-**Goal**: Land `nils-markdown` with the engine builder, helpers,
-`md_cell` filter, and golden harness. Migrate `agent-runtime-cli` to
-depend on it. Existing `agent-runtime-cli` render output and golden
-fixtures stay byte-identical.
+**Goal**: Land `nils-markdown` with the engine builder, the `md_cell`
+filter, a re-export bridge to `nils_common::markdown::*`, a generic
+`register_helper` extension point, and a new byte-equality
+`assert_render` harness. Migrate `agent-runtime-cli` to build its
+Tera engine through `nils_markdown::Engine` and to register its
+existing domain-specific helpers
+(`cli_ref / script / skill_ref / state_out`) via the new extension
+point. The four agent-runtime-cli helpers stay in
+`agent-runtime-cli` because they depend on its manifest domain
+(`ManifestSet`, `Skill`, `StateOutMode`, `CliToolsManifest`); moving
+them into `nils-markdown` would force the lowest layer to depend on
+agent-runtime-cli domain types. Existing `agent-runtime-cli` render
+output and golden fixtures stay byte-identical.
 
 **Demo/Validation**:
 
@@ -180,67 +197,81 @@ fixtures stay byte-identical.
   - `cargo test -p nils-markdown filters`
   - `cargo test -p nils-markdown helpers`
 
-### Task 1.4: Relocate `agent-runtime-cli` helpers
+### Task 1.4: Migrate `agent-runtime-cli` engine construction to `nils-markdown`
 
 - **Location**:
-  - crates/nils-markdown/src/helpers/cli_ref.rs (new)
-  - crates/nils-markdown/src/helpers/script.rs (new)
-  - crates/nils-markdown/src/helpers/skill_ref.rs (new)
-  - crates/nils-markdown/src/helpers/state_out.rs (new)
-  - crates/nils-markdown/src/helpers/mod.rs (new)
-  - crates/agent-runtime-cli/src/render/helpers/cli_ref.rs (removed or re-exported)
-  - crates/agent-runtime-cli/src/render/helpers/script.rs (removed or re-exported)
-  - crates/agent-runtime-cli/src/render/helpers/skill_ref.rs (removed or re-exported)
-  - crates/agent-runtime-cli/src/render/helpers/state_out.rs (removed or re-exported)
-  - crates/agent-runtime-cli/src/render/helpers/mod.rs
+  - crates/nils-markdown/src/engine.rs
   - crates/agent-runtime-cli/Cargo.toml
-- **Description**: Move `cli_ref`, `script`, `skill_ref`, `state_out`
-  Tera functions from `agent-runtime-cli/src/render/helpers/` to
-  `nils-markdown/src/helpers/`. Move their unit tests with them.
-  `agent-runtime-cli` adds a path dep on `nils-markdown` and either
-  deletes the local helpers or re-exports from `nils-markdown` if any
-  call site uses the local path. No behavior change.
+  - crates/agent-runtime-cli/src/render/writer.rs
+  - crates/agent-runtime-cli/src/render/helpers/mod.rs
+- **Description**: Expose
+  `Engine::register_helper(name: &str, f: F) where F: tera::Function + 'static`
+  on `nils-markdown` so consumers can attach domain-specific Tera
+  helpers without `nils-markdown` knowing the consumer's domain.
+  Migrate `agent-runtime-cli/src/render/writer.rs` to construct its
+  engine through `nils_markdown::Engine::builder()` and migrate
+  `agent-runtime-cli/src/render/helpers/mod.rs::register_all` to call
+  `Engine::register_helper` instead of `Tera::register_function`. The
+  four agent-runtime-cli helper bodies
+  (`cli_ref / script / skill_ref / state_out`) and their `HelperContext`
+  stay in `agent-runtime-cli`; only the engine construction site and
+  the registration call site change. No behavior change to rendered
+  output. `agent-runtime-cli/Cargo.toml` adds a path dep on
+  `nils-markdown`.
 - **Dependencies**:
   - Task 1.3
 - **Complexity**:
-  - 5
+  - 4
 - **Acceptance criteria**:
-  - All four helpers live in `crates/nils-markdown/src/helpers/`.
-  - `cargo test -p nils-markdown helpers` passes the migrated unit
-    tests.
+  - `Engine::register_helper` is publicly exported from `nils-markdown`
+    and accepts any `tera::Function + 'static`.
+  - `agent-runtime-cli/src/render/writer.rs` constructs its engine via
+    `nils_markdown::Engine::builder()` and no longer calls
+    `Tera::default()` for the render path.
+  - `agent-runtime-cli/src/render/helpers/mod.rs::register_all` takes a
+    `&mut nils_markdown::Engine` (or equivalent) and registers each
+    helper through `Engine::register_helper`.
   - `cargo test -p agent-runtime-cli` passes without modification to
     its golden fixtures.
-  - `grep -rn 'use tera' crates/agent-runtime-cli/src/render/helpers/`
+  - `grep -n 'tera::Tera\|use tera::Tera' crates/agent-runtime-cli/src/render/writer.rs`
     returns nothing.
 - **Validation**:
-  - `cargo test -p nils-markdown`
+  - `cargo test -p nils-markdown engine`
   - `cargo test -p agent-runtime-cli`
 
-### Task 1.5: Golden harness lift
+### Task 1.5: New byte-equality `assert_render` harness
 
 - **Location**:
   - crates/nils-markdown/src/golden.rs (new)
-  - crates/agent-runtime-cli/src/render/golden.rs
-- **Description**: Lift the byte-equality assertion helper from
-  `agent-runtime-cli/src/render/golden.rs` into
-  `nils-markdown::golden`. The lifted helper takes a fixture path, a
-  `serde::Serialize` view struct, and an `Engine`; it renders, reads
-  the fixture, and asserts equality with `pretty_assertions`. The
-  existing `agent-runtime-cli` golden tests call the lifted helper
-  from `nils-markdown` and keep their fixture paths.
+  - crates/nils-markdown/tests/golden_smoke.rs (new)
+- **Description**: Add a new byte-equality assertion helper at
+  `nils_markdown::golden::assert_render(fixture_path: &Path, engine: &Engine, template_name: &str, view: &impl Serialize)`.
+  The helper registers the named template body if needed, renders
+  against `view`, reads the fixture file from disk, and asserts
+  byte-for-byte equality with `pretty_assertions`. This is a new
+  utility, not a lift: `crates/agent-runtime-cli/src/render/golden.rs`
+  is the `--update-golden` mode that copies rendered files from
+  `build/<product>/` into `tests/golden/<product>/expected/`; it
+  is a different responsibility (fixture refresh, not per-template
+  byte-equality assertion) and stays in `agent-runtime-cli`
+  unchanged. Sprint 2 Tier A migrations consume `assert_render`;
+  agent-runtime-cli does not need to switch its existing golden
+  tests in Sprint 1.
 - **Dependencies**:
   - Task 1.4
 - **Complexity**:
-  - 4
+  - 3
 - **Acceptance criteria**:
-  - `nils_markdown::golden::assert_render(...)` is publicly exported.
-  - `agent-runtime-cli` golden tests pass via the new helper.
-  - The original `agent-runtime-cli/src/render/golden.rs` becomes a
-    thin wrapper or is deleted entirely.
+  - `nils_markdown::golden::assert_render` is publicly exported and
+    accepts any `serde::Serialize` view.
+  - `crates/nils-markdown/tests/golden_smoke.rs` renders a fixture
+    template against a view struct, reads a captured `.golden.md`
+    file, and asserts byte equality (positive case) plus a negative
+    case that surfaces a `pretty_assertions` diff.
+  - `crates/agent-runtime-cli/src/render/golden.rs` is unchanged.
 - **Validation**:
   - `cargo test -p nils-markdown golden`
-  - `cargo test -p agent-runtime-cli --test` (workspace test
-    runner)
+  - `cargo test -p nils-markdown --test golden_smoke`
 
 ### Task 1.6: Workspace gate
 
