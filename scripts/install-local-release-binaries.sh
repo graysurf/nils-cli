@@ -94,7 +94,7 @@ if [[ ${#bins[@]} -eq 0 ]]; then
   while IFS= read -r bin; do
     [[ -n "$bin" ]] || continue
     bins+=( "$bin" )
-  done < <(bash "$bins_script")
+  done < <(bash "$bins_script" --release-default)
 
   if [[ ${#bins[@]} -eq 0 ]]; then
     echo "error: no workspace binaries found" >&2
