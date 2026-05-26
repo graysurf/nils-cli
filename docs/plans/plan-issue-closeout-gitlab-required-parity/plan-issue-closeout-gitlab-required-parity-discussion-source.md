@@ -254,7 +254,8 @@ implies and why it is consistent with #502.
 2. `cargo clippy -p plan-issue-cli --all-targets --all-features -- -D
    warnings` for clippy hygiene.
 3. `cargo build -p plan-issue-cli --locked` (Cargo.lock locked-build CI
-   gate, captured in [F-nils-cli-new-crate-ci]).
+   gate, previously captured in local feedback note
+   `feedback_nils_cli_new_crate_ci.md`).
 4. `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` for the
    docs-only hygiene gate (rumdl fmt / third-party / completion-asset
    audit don't apply to this diff, but the docs-only entrypoint covers
@@ -346,4 +347,3 @@ captures the architectural rationale for the five-label set.
   extended test in one commit.
 
 [rcr-source]: ../plan-issue-closeout-required-check-rendering/plan-issue-closeout-required-check-rendering-discussion-source.md
-[F-nils-cli-new-crate-ci]: $HOME.config/agent-memory/global/feedback_nils_cli_new_crate_ci.md
