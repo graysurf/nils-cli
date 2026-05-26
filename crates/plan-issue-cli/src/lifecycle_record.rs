@@ -2059,8 +2059,7 @@ fn render_closeout_payload_visible(closeout: &CloseoutData) -> String {
             .iter()
             .map(|pr| {
                 let pr_label = pr.url.as_deref().unwrap_or(&pr.pr_ref);
-                let required_label =
-                    required_check_label(pr.required_state, pr.required_count);
+                let required_label = required_check_label(pr.required_state, pr.required_count);
                 CloseoutPrRow {
                     label: table_cell(pr_label),
                     merge_sha: table_cell(pr.merge_sha.as_deref().unwrap_or("")),

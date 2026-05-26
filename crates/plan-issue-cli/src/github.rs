@@ -1119,8 +1119,7 @@ esac
                     success: false,
                     exit_code: Some(1),
                     stdout: String::new(),
-                    stderr: "no required checks reported on the 'feature/x' branch\n"
-                        .to_string(),
+                    stderr: "no required checks reported on the 'feature/x' branch\n".to_string(),
                 })
             },
             "auth" => |_| {
