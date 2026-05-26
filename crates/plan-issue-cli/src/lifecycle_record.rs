@@ -1,9 +1,66 @@
 use std::collections::BTreeMap;
 
+use nils_markdown::Engine;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::commands::record::{LifecycleCommentKind, RecordProfile, TaskLedgerDisplay};
+
+const DASHBOARD_TEMPLATE: &str = include_str!("../templates/lifecycle_record/dashboard.md.tera");
+const DASHBOARD_TEMPLATE_NAME: &str = "lifecycle_record_dashboard";
+
+#[derive(Debug, Serialize)]
+struct DashboardView<'a> {
+    title: &'static str,
+    status: String,
+    profile: &'a str,
+    target_scope: String,
+    current: String,
+    next_action: String,
+    validation: String,
+    linked_prs: String,
+    blockers: String,
+    approval: String,
+    source_link: String,
+    plan_link: String,
+    state_link: String,
+    session_link: String,
+    validation_link: String,
+    review_link: String,
+    show_review: bool,
+    closeout_link: String,
+    tracker_block: String,
+}
+
+fn render_tracker_block(title: Option<&str>, issue_url: Option<&str>) -> String {
+    let title = title.map(str::trim).filter(|value| !value.is_empty());
+    let issue_url = issue_url.map(str::trim).filter(|value| !value.is_empty());
+    if title.is_none() && issue_url.is_none() {
+        return String::new();
+    }
+    let mut out = vec![
+        String::new(),
+        "## Original Tracker".to_string(),
+        String::new(),
+    ];
+    if let Some(value) = title {
+        out.push(format!("- Title: {value}"));
+    }
+    if let Some(value) = issue_url {
+        out.push(format!("- Issue: {value}"));
+    }
+    out.join("\n")
+}
+
+fn render_dashboard_with_template(view: &DashboardView<'_>) -> String {
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(DASHBOARD_TEMPLATE_NAME, DASHBOARD_TEMPLATE)
+        .expect("dashboard template registers");
+    engine
+        .render(DASHBOARD_TEMPLATE_NAME, view)
+        .expect("dashboard template renders")
+}
 
 #[derive(Debug, Clone)]
 pub struct DashboardInput {
@@ -107,94 +164,38 @@ struct CommentJson {
 }
 
 pub fn render_dashboard(input: DashboardInput) -> String {
-    let linked_prs = non_empty_join(&input.linked_prs, "none yet");
-    let blockers = non_empty_join(&input.blockers, "none");
-
-    let mut out = Vec::new();
-    let dashboard_title = if input.status.trim().eq_ignore_ascii_case("complete") {
+    let title = if input.status.trim().eq_ignore_ascii_case("complete") {
         "## Final Dashboard"
     } else {
         "## Current Dashboard"
     };
-    out.push(dashboard_title.to_string());
-    out.push(String::new());
-    out.push("This issue is the durable tracking surface for an issue-backed plan execution. The full source, plan, and execution logs remain in".to_string());
-    out.push("append-only issue comments.".to_string());
-    out.push(String::new());
-    out.push(format!("- Status: {}", input.status.trim()));
-    out.push(format!("- Profile: {}", input.profile.as_str()));
-    out.push(format!("- Target scope: {}", input.target_scope.trim()));
-    out.push(format!("- Current task: {}", input.current.trim()));
-    out.push(format!("- Next action: {}", input.next_action.trim()));
-    out.push(format!("- Validation: {}", input.validation.trim()));
-    out.push(format!("- Linked PRs: {linked_prs}"));
-    out.push(format!("- Blockers: {blockers}"));
-    out.push(format!("- Review approval: {}", input.approval.trim()));
-    out.push(String::new());
-    out.push("## Durable Record".to_string());
-    out.push(String::new());
-    out.push(format!(
-        "- Source snapshot: {}",
-        dashboard_link(input.source_url.as_deref(), "source snapshot")
-    ));
-    out.push(format!(
-        "- Plan snapshot: {}",
-        dashboard_link(input.plan_url.as_deref(), "plan snapshot")
-    ));
-    out.push(format!(
-        "- Execution state: {}",
-        dashboard_link(input.state_url.as_deref(), "execution state")
-    ));
-    out.push(format!(
-        "- Latest session: {}",
-        dashboard_link(input.session_url.as_deref(), "Execution Session")
-    ));
-    out.push(format!(
-        "- Latest validation: {}",
-        dashboard_link(input.validation_url.as_deref(), "Validation Evidence")
-    ));
-    if input.profile == RecordProfile::Dispatch || input.review_url.is_some() {
-        out.push(format!(
-            "- Latest review: {}",
-            dashboard_link(input.review_url.as_deref(), "Review Evidence")
-        ));
-    }
-    out.push(format!(
-        "- Closeout comment: {}",
-        dashboard_link(input.closeout_url.as_deref(), "closeout")
-    ));
-    out.push(String::new());
-    out.push("## Guardrails".to_string());
-    out.push(String::new());
-    out.push("- The issue body is a mutable dashboard only.".to_string());
-    out.push("- Append-only issue comments are the durable source of truth.".to_string());
-    out.push(
-        "- `plan-tooling` owns plan parsing, validation, batching, and PR split modeling only."
-            .to_string(),
-    );
-    out.push("- Provider create, comment, edit, and close operations remain owned by `forge-cli` or provider atoms.".to_string());
 
-    if input.title.is_some() || input.issue_url.is_some() {
-        out.push(String::new());
-        out.push("## Original Tracker".to_string());
-        out.push(String::new());
-        if let Some(title) = input
-            .title
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            out.push(format!("- Title: {}", title.trim()));
-        }
-        if let Some(url) = input
-            .issue_url
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            out.push(format!("- Issue: {}", url.trim()));
-        }
-    }
+    let show_review = input.profile == RecordProfile::Dispatch || input.review_url.is_some();
+    let tracker_block = render_tracker_block(input.title.as_deref(), input.issue_url.as_deref());
 
-    finalize_markdown(out)
+    let view = DashboardView {
+        title,
+        status: input.status.trim().to_string(),
+        profile: input.profile.as_str(),
+        target_scope: input.target_scope.trim().to_string(),
+        current: input.current.trim().to_string(),
+        next_action: input.next_action.trim().to_string(),
+        validation: input.validation.trim().to_string(),
+        linked_prs: non_empty_join(&input.linked_prs, "none yet"),
+        blockers: non_empty_join(&input.blockers, "none"),
+        approval: input.approval.trim().to_string(),
+        source_link: dashboard_link(input.source_url.as_deref(), "source snapshot"),
+        plan_link: dashboard_link(input.plan_url.as_deref(), "plan snapshot"),
+        state_link: dashboard_link(input.state_url.as_deref(), "execution state"),
+        session_link: dashboard_link(input.session_url.as_deref(), "Execution Session"),
+        validation_link: dashboard_link(input.validation_url.as_deref(), "Validation Evidence"),
+        review_link: dashboard_link(input.review_url.as_deref(), "Review Evidence"),
+        show_review,
+        closeout_link: dashboard_link(input.closeout_url.as_deref(), "closeout"),
+        tracker_block,
+    };
+
+    render_dashboard_with_template(&view)
 }
 
 pub fn render_comment(input: CommentInput) -> Result<String, String> {
@@ -534,88 +535,39 @@ pub fn render_dashboard_from_audit(
         .and_then(|data| data.approval.comment_url)
         .unwrap_or_else(|| "pending".to_string());
 
-    let mut out = Vec::new();
-    out.push(dashboard_title.to_string());
-    out.push(String::new());
-    out.push("This issue is the durable tracking surface for an issue-backed plan execution. The full source, plan, and execution logs remain in".to_string());
-    out.push("append-only issue comments.".to_string());
-    out.push(String::new());
-    out.push(format!("- Status: {status_value}"));
-    out.push(format!("- Profile: {profile_str}"));
-    out.push(format!("- Target scope: {target_scope}"));
-    out.push(format!("- Current task: {current}"));
-    out.push(format!("- Next action: {next_action}"));
-    out.push(format!("- Validation: {validation_status}"));
-    out.push(format!(
-        "- Linked PRs: {}",
-        non_empty_join(&linked_prs, "none yet")
-    ));
-    out.push(format!("- Blockers: {}", non_empty_join(&blockers, "none")));
-    out.push(format!("- Review approval: {approval}"));
-    out.push(String::new());
-    out.push("## Durable Record".to_string());
-    out.push(String::new());
-    out.push(format!(
-        "- Source snapshot: {}",
-        dashboard_link(evidence_url(audit, "source").as_deref(), "source snapshot")
-    ));
-    out.push(format!(
-        "- Plan snapshot: {}",
-        dashboard_link(evidence_url(audit, "plan").as_deref(), "plan snapshot")
-    ));
-    out.push(format!(
-        "- Execution state: {}",
-        dashboard_link(evidence_url(audit, "state").as_deref(), "execution state")
-    ));
-    out.push(format!(
-        "- Latest session: {}",
-        dashboard_link(
-            evidence_url(audit, "session").as_deref(),
-            "Execution Session"
-        )
-    ));
-    out.push(format!(
-        "- Latest validation: {}",
-        dashboard_link(
-            evidence_url(audit, "validation").as_deref(),
-            "Validation Evidence"
-        )
-    ));
     let is_dispatch_profile = profile_str == "dispatch";
-    if is_dispatch_profile || audit.evidence.contains_key("review") {
-        out.push(format!(
-            "- Latest review: {}",
-            dashboard_link(evidence_url(audit, "review").as_deref(), "Review Evidence")
-        ));
-    }
-    out.push(format!(
-        "- Closeout comment: {}",
-        dashboard_link(evidence_url(audit, "closeout").as_deref(), "closeout")
-    ));
-    out.push(String::new());
-    out.push("## Guardrails".to_string());
-    out.push(String::new());
-    out.push("- The issue body is a mutable dashboard only.".to_string());
-    out.push("- Append-only issue comments are the durable source of truth.".to_string());
-    out.push(
-        "- `plan-tooling` owns plan parsing, validation, batching, and PR split modeling only."
-            .to_string(),
-    );
-    out.push("- Provider create, comment, edit, and close operations remain owned by `forge-cli` or provider atoms.".to_string());
+    let show_review = is_dispatch_profile || audit.evidence.contains_key("review");
+    let tracker_block = render_tracker_block(title, issue_url);
 
-    if title.is_some() || issue_url.is_some() {
-        out.push(String::new());
-        out.push("## Original Tracker".to_string());
-        out.push(String::new());
-        if let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) {
-            out.push(format!("- Title: {title}"));
-        }
-        if let Some(url) = issue_url.map(str::trim).filter(|value| !value.is_empty()) {
-            out.push(format!("- Issue: {url}"));
-        }
-    }
+    let view = DashboardView {
+        title: dashboard_title,
+        status: status_value,
+        profile: &profile_str,
+        target_scope,
+        current,
+        next_action,
+        validation: validation_status,
+        linked_prs: non_empty_join(&linked_prs, "none yet"),
+        blockers: non_empty_join(&blockers, "none"),
+        approval,
+        source_link: dashboard_link(evidence_url(audit, "source").as_deref(), "source snapshot"),
+        plan_link: dashboard_link(evidence_url(audit, "plan").as_deref(), "plan snapshot"),
+        state_link: dashboard_link(evidence_url(audit, "state").as_deref(), "execution state"),
+        session_link: dashboard_link(
+            evidence_url(audit, "session").as_deref(),
+            "Execution Session",
+        ),
+        validation_link: dashboard_link(
+            evidence_url(audit, "validation").as_deref(),
+            "Validation Evidence",
+        ),
+        review_link: dashboard_link(evidence_url(audit, "review").as_deref(), "Review Evidence"),
+        show_review,
+        closeout_link: dashboard_link(evidence_url(audit, "closeout").as_deref(), "closeout"),
+        tracker_block,
+    };
 
-    finalize_markdown(out)
+    render_dashboard_with_template(&view)
 }
 
 fn evidence_url(audit: &RecordAudit, role: &str) -> Option<String> {
