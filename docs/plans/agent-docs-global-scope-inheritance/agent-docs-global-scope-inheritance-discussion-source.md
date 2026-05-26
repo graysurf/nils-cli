@@ -32,7 +32,7 @@ is retired.
 
 - `[U1]` The user wants to keep `AGENT_DOCS_HOME` set to the
   `agent-runtime-kit` checkout, but only inherit entries from
-  `/Users/terry/Project/graysurf/agent-runtime-kit/AGENT_DOCS.toml` when those
+  `$HOMEProject/graysurf/agent-runtime-kit/AGENT_DOCS.toml` when those
   entries use `scope = "global"`.
 - `[U2]` The user wants
   `crates/plan-issue-cli/tests/fixtures/shell_parity/regenerate.sh` to stop
@@ -52,7 +52,7 @@ is retired.
   unsupported scope values are rejected, so adding `global` changes the schema
   contract.
 - `[F6]`
-  `/Users/terry/Project/graysurf/agent-runtime-kit/AGENT_DOCS.toml` currently
+  `$HOMEProject/graysurf/agent-runtime-kit/AGENT_DOCS.toml` currently
   contains a `scope = "project"` docs-placement requirement intended for the
   runtime-kit source repo, but today it leaks into nils-cli when used as the
   home catalog.
@@ -139,7 +139,7 @@ Out of scope:
   primary acceptance harness.
 - `crates/plan-issue-cli/tests/fixtures/shell_parity/` owns the fixture
   normalization rule and shell parity README.
-- `/Users/terry/Project/graysurf/agent-runtime-kit/AGENT_DOCS.toml` is a
+- `$HOMEProject/graysurf/agent-runtime-kit/AGENT_DOCS.toml` is a
   coordinated downstream config update. It must not use `scope = "global"` in
   a runtime environment that still runs an older released `agent-docs` binary.
 
@@ -164,14 +164,14 @@ Out of scope:
 
 ## Acceptance Criteria
 
-- With `docs_home=/Users/terry/Project/graysurf/agent-runtime-kit` and
-  `project_path=/Users/terry/Project/sympoies/nils-cli`, `agent-docs resolve
+- With `docs_home=$HOMEProject/graysurf/agent-runtime-kit` and
+  `project_path=$HOMEProject/sympoies/nils-cli`, `agent-docs resolve
   --context project-dev --format json` includes home-catalog `global` entries
   from runtime-kit and nils-cli project entries, but does not include
   runtime-kit home-catalog `project` entries.
 - In that cross-repo case, inherited global document paths point at
-  `/Users/terry/Project/graysurf/agent-runtime-kit/...`, not
-  `/Users/terry/Project/sympoies/nils-cli/...`.
+  `$HOMEProject/graysurf/agent-runtime-kit/...`, not
+  `$HOMEProject/sympoies/nils-cli/...`.
 - With both `docs_home` and `project_path` pointing at runtime-kit, runtime-kit
   home-catalog `project` entries are included.
 - A fixture where a project `AGENT_DOCS.toml` declares `scope = "global"` fails
@@ -191,11 +191,11 @@ Out of scope:
 
 For the source document PR:
 
-- `agent-docs resolve --docs-home /Users/terry/Project/sympoies/nils-cli
-  --project-path /Users/terry/Project/sympoies/nils-cli --context startup
+- `agent-docs resolve --docs-home $HOMEProject/sympoies/nils-cli
+  --project-path $HOMEProject/sympoies/nils-cli --context startup
   --strict --format checklist`
-- `agent-docs resolve --docs-home /Users/terry/Project/sympoies/nils-cli
-  --project-path /Users/terry/Project/sympoies/nils-cli --context project-dev
+- `agent-docs resolve --docs-home $HOMEProject/sympoies/nils-cli
+  --project-path $HOMEProject/sympoies/nils-cli --context project-dev
   --strict --format checklist`
 - `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`
 

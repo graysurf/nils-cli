@@ -43,9 +43,9 @@
 
 | Command | Status | Summary | Artifact |
 | --- | --- | --- | --- |
-| `AGENT_DOCS_HOME=/Users/terry/Project/graysurf/agent-runtime-kit agent-docs resolve --context startup --strict --format checklist` | pass | Required startup preflight passed. | terminal log |
-| `AGENT_DOCS_HOME=/Users/terry/Project/graysurf/agent-runtime-kit agent-docs resolve --context project-dev --strict --format checklist` | pass | Project-dev preflight passed. | terminal log |
-| `AGENT_DOCS_HOME=/Users/terry/Project/graysurf/agent-runtime-kit agent-docs resolve --context task-tools --strict --format checklist` | pass | Task-tools preflight passed before GitHub issue work. | terminal log |
+| `AGENT_DOCS_HOME=$HOMEProject/graysurf/agent-runtime-kit agent-docs resolve --context startup --strict --format checklist` | pass | Required startup preflight passed. | terminal log |
+| `AGENT_DOCS_HOME=$HOMEProject/graysurf/agent-runtime-kit agent-docs resolve --context project-dev --strict --format checklist` | pass | Project-dev preflight passed. | terminal log |
+| `AGENT_DOCS_HOME=$HOMEProject/graysurf/agent-runtime-kit agent-docs resolve --context task-tools --strict --format checklist` | pass | Task-tools preflight passed before GitHub issue work. | terminal log |
 | `plan-issue record audit --profile tracking --body-file <body-live.md> --comments-json <comments-live.json> --format json` | pass | Tracking issue audit passed with source, plan, and state markers recognized. | `agent-out` run directory |
 | `plan-tooling validate --file docs/plans/agent-run-direnv-exec/agent-run-direnv-exec-plan.md --format text --explain` | pass | Plan-bundle validation passed after resolving format findings. | terminal log |
 | `cargo test -p nils-agent-workflow-primitives agent_run` | pass | Unit and integration filtered tests passed for the `agent-run` surface. | terminal log |

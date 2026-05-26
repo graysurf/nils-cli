@@ -212,7 +212,7 @@ local binaries.
   - Agent-runtime-kit can copy or promote the generated output into the root
     support matrix without manual row editing.
 - **Validation**:
-  - `agent-runtime render --source-root /Users/terry/.codex/worktrees/f43c/agent-runtime-kit --target support-matrix`
+  - `agent-runtime render --source-root $HOME.codex/worktrees/f43c/agent-runtime-kit --target support-matrix`
 
 ### Task 3.2: Attach v3 lifecycle comments to #69
 

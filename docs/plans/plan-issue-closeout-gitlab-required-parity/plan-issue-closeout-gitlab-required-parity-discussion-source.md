@@ -346,4 +346,4 @@ captures the architectural rationale for the five-label set.
   extended test in one commit.
 
 [rcr-source]: ../plan-issue-closeout-required-check-rendering/plan-issue-closeout-required-check-rendering-discussion-source.md
-[F-nils-cli-new-crate-ci]: /Users/terry/.config/agent-memory/global/feedback_nils_cli_new_crate_ci.md
+[F-nils-cli-new-crate-ci]: $HOME.config/agent-memory/global/feedback_nils_cli_new_crate_ci.md
