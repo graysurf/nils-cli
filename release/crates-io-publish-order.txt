@@ -19,6 +19,7 @@ nils-git-lock
 nils-git-scope
 nils-git-summary
 nils-image-processing
+nils-plan-archive
 nils-plan-tooling
 nils-plan-issue-cli
 nils-semantic-commit

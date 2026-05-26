@@ -20,6 +20,7 @@ members = [
   "crates/api-websocket",
   "crates/api-test",
   "crates/semantic-commit",
+  "crates/plan-archive",
   "crates/plan-tooling",
   "crates/plan-issue-cli",
   "crates/agent-docs",

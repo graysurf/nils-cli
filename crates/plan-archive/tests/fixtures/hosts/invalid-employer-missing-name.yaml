@@ -1,0 +1,4 @@
+version: 1
+hosts:
+  gitlab.example.com:
+    class: employer
