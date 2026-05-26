@@ -2,17 +2,15 @@
 
 ## Execution State
 
-- Status: open (plan tracker just created; no implementation work
-  started)
+- Status: in-progress (Sprint 1 amended; Task 1.1 next)
 - Target scope: whole plan
 - Execution window: Sprint 1 → Sprint 2 (9 PRs) → Sprint 3 (4 PRs)
-- Staged execution confirmation: pending — Sprint 1 has not been
-  picked up yet
-- Current task: none
+- Staged execution confirmation: Sprint 1 scope reconciled with
+  agent-runtime-cli reality (commit e297751)
+- Current task: none (preflight + plan amendment complete)
 - Next task: Task 1.1 — Scaffold `nils-markdown` crate
 - Last updated: 2026-05-26
-- Branch/commit: feat/markdown-render-template-layer-plan (initial
-  bundle commit pending push)
+- Branch/commit: feat/markdown-render-template-layer-plan @ e297751
 - Source document:
   docs/plans/markdown-render-template-layer/markdown-render-template-layer-plan.md
 - Direct source-doc execution waiver: not applicable
@@ -53,4 +51,16 @@
 
 ## Session Log
 
-(empty — execution has not started)
+- 2026-05-26: Pre-execution scoping found two factual gaps between
+  the plan and `agent-runtime-cli/src/render/`: Task 1.4 framed the
+  four helpers (`cli_ref / script / skill_ref / state_out`) as
+  relocatable, but each binds `ManifestSet / Skill / StateOutMode /
+  CliToolsManifest` and cannot move into the lowest layer; Task 1.5
+  named `agent-runtime-cli/src/render/golden.rs` as a byte-equality
+  helper, but that file is the `--update-golden` fixture-refresh
+  mode. Both tasks rewritten on `feat/markdown-render-template-layer-plan`
+  (commit e297751): Sprint 1 now exposes
+  `Engine::register_helper(name, F)` for consumers and adds a new
+  `nils_markdown::golden::assert_render` helper; the four
+  agent-runtime-cli helpers stay in place. Plan validates with
+  `plan-tooling validate` exit 0.
