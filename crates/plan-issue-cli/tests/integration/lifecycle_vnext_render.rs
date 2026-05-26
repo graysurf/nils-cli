@@ -4,7 +4,7 @@
 //! existing CLI dry-run path and assert:
 //!
 //! - first-line v2 marker shape
-//! - hidden payload carrier shape (HTML comment, not the legacy fenced
+//! - hidden payload carrier shape (HTML comment, not the pre-v2 fenced
 //!   `plan-issue-record-payload` code block)
 //! - canonical visible heading from the registry
 //! - visible completeness via `lifecycle_vnext::visible_lint`
@@ -57,7 +57,7 @@ fn assert_marker_and_carrier_shape(body: &str, role: PayloadRole) {
     );
     assert!(
         !body.contains("```plan-issue-record-payload"),
-        "role {role:?} contains legacy visible fenced payload: {body}"
+        "role {role:?} contains pre-v2 visible fenced payload: {body}"
     );
     assert!(
         body.contains(spec.default_heading),

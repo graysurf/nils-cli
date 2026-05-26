@@ -18,7 +18,7 @@
 //! - [`visible_lint`] enforces visible-completeness rules for rendered
 //!   lifecycle comments (Task Ledger heading, validation status,
 //!   review decision, session summary, closeout approval, …).
-//! - [`payloads`] exposes typed payload helpers built on top of the legacy
+//! - [`payloads`] exposes typed payload helpers built on top of the existing
 //!   [`crate::lifecycle_record`] data types until the catch-all
 //!   `lifecycle_record.rs` is fully migrated.
 //! - [`render`] is the registry-driven rendering surface used by `record post`

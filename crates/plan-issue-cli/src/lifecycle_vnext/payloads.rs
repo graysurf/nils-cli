@@ -1,11 +1,11 @@
 //! Typed payload helpers built on the existing [`crate::lifecycle_record`]
 //! data shapes.
 //!
-//! Task 1.1 keeps the legacy payload definitions (`RecordPayload`,
+//! Task 1.1 keeps the existing payload definitions (`RecordPayload`,
 //! `StateData`, `SessionData`, `ValidationData`, `ReviewData`,
 //! `CloseoutData`, `SnapshotData`) as the canonical structs. As the vNext
 //! registry, lint, and render modules mature, this module is the boundary
-//! that hides the legacy file from new consumers.
+//! that hides the catch-all file from new consumers.
 //!
 //! Re-exports surface only the types that vNext code needs so we can move
 //! the underlying definitions during Task 6.3 (migrate record rendering

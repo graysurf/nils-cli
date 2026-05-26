@@ -56,10 +56,10 @@ fn record_template_markdown_renders_every_role() {
             template.contains("<!-- plan-issue-record-payload:hex:"),
             "role {role} markdown missing payload placeholder: {template}"
         );
-        // Templates must not render the legacy visible fenced payload.
+        // Templates must not render the pre-v2 visible fenced payload.
         assert!(
             !template.contains("```plan-issue-record-payload"),
-            "role {role} markdown contains legacy fenced payload: {template}"
+            "role {role} markdown contains pre-v2 fenced payload: {template}"
         );
     }
 }
