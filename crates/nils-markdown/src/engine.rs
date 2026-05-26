@@ -59,7 +59,8 @@ impl Engine {
     /// `serde_json::to_value` conversion and the Tera render in one
     /// step.
     pub fn render<T: Serialize>(&self, name: &str, view: &T) -> Result<String, RenderError> {
-        let value = serde_json::to_value(view).map_err(|source| RenderError::Serialize { source })?;
+        let value =
+            serde_json::to_value(view).map_err(|source| RenderError::Serialize { source })?;
         self.render_value(name, &value)
     }
 
@@ -69,7 +70,11 @@ impl Engine {
     /// supplied view. This is the migration path for callers that
     /// today use `Tera::render_str` directly and treat every render
     /// as a fresh one-shot template.
-    pub fn render_str<T: Serialize>(&mut self, body: &str, view: &T) -> Result<String, RenderError> {
+    pub fn render_str<T: Serialize>(
+        &mut self,
+        body: &str,
+        view: &T,
+    ) -> Result<String, RenderError> {
         const INLINE_NAME: &str = "<inline>";
         if contains_now_call(body) {
             return Err(RenderError::NonDeterministicTemplate {
@@ -269,9 +274,7 @@ mod tests {
     #[test]
     fn template_parse_error_surfaces_name_and_source() {
         let mut engine = build();
-        let err = engine
-            .register_template("broken", "{% if %}")
-            .unwrap_err();
+        let err = engine.register_template("broken", "{% if %}").unwrap_err();
         match err {
             RenderError::TemplateParse { name, source } => {
                 assert_eq!(name, "broken");
