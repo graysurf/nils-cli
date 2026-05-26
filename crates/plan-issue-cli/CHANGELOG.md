@@ -40,6 +40,18 @@ versioning.
 ### Fixed
 
 - `plan-issue record close` closeout-comment table renders the
+  `Required` column as `none required` for GitLab linked-PR rows
+  instead of the misleading `unknown` label that the GitLab adapter
+  produced before this fix. GitLab has no first-class required-check
+  concept, so `forge_cli_adapter::pr_merge_summary` now reports zero
+  required checks (`required_state=Some("success"), required_count=
+  Some(0)`) — the same shape the GitHub adapter returns for a branch
+  without a required-check rule — and the close gate treats this as a
+  clean resolve per the #502 "non-required failures never block close"
+  contract. The `closeout.v1` payload wire format is unchanged; only
+  the rendered Markdown cell changes. (sympoies/nils-cli#557, follow-up
+  to #563)
+- `plan-issue record close` closeout-comment table renders the
   `Required` column as `none required` (zero required checks defined),
   `pass (N)`, `fail (N)`, `none`, or `unknown` instead of collapsing
   every `required_state == None` cause into the single misleading

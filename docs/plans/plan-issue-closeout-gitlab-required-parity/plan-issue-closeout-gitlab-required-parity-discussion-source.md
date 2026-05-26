@@ -1,11 +1,11 @@
 # plan-issue closeout GitLab `Required` column parity — Source
 
-| Field              | Value                                                                                                                            |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| Status             | Ready for implementation                                                                                                         |
-| Date               | 2026-05-26                                                                                                                       |
-| Source             | sympoies/nils-cli#557 — GitLab adapter renders `Required: unknown`; follow-up to the GitHub-side render fix landed in #563        |
-| Intended next step | Implement the GitLab adapter change in a single small PR that closes #557                                                        |
+| Field              | Value                                                                                                                      |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| Status             | Ready for implementation                                                                                                   |
+| Date               | 2026-05-26                                                                                                                 |
+| Source             | sympoies/nils-cli#557 — GitLab adapter renders `Required: unknown`; follow-up to the GitHub-side render fix landed in #563 |
+| Intended next step | Implement the GitLab adapter change in a single small PR that closes #557                                                  |
 
 ## Purpose
 
@@ -25,10 +25,16 @@ for every PR, because GitLab has no first-class required-check concept and
 reads `Required: unknown` even when the pipeline is green and there is no
 required-check rule to satisfy.
 
-The fix is to make the GitLab adapter return the same label that the
-GitHub side now uses for branches without a required-check rule:
-`required_state: Some(CheckStatus::Pass), required_count: Some(0)`,
-yielding the `none required` render branch. The semantic intent of #502
+The fix is to make the GitLab adapter return the same shape the
+GitHub side now uses for branches without a required-check rule. At
+the `PrMergeSummary` layer (`crates/plan-issue-cli/src/github.rs:76`)
+`required_state` is an `Option<String>`; the rendering chain converts
+that via `check_status_from_state` (`execute.rs:595-604`) to
+`Option<CheckStatus>` before reaching the renderer. So the adapter
+returns `required_state: Some("success".to_string()), required_count:
+Some(0)`, the renderer's `required_check_label` then sees
+`(Some(CheckStatus::Pass), Some(0))` and produces the `none required`
+label. The semantic intent of #502
 (close gate keys on required checks only; non-required failures never
 block) is preserved — see Decision 2 for the explicit semantic shift this
 implies and why it is consistent with #502.
@@ -91,13 +97,16 @@ implies and why it is consistent with #502.
        merged,
        merge_sha,
        checks,
-       required_state: Some(CheckStatus::Pass),
+       required_state: Some("success".to_string()),
        required_count: Some(0),
        non_required_failures: Vec::new(),
    }
    ```
 
-   The renderer already produces `none required` for that triple, so no
+   `check_status_from_state` (`execute.rs:595-604`) converts the
+   `"success"` string to `CheckStatus::Pass` before the renderer's
+   `required_check_label` runs, and that helper already produces
+   `none required` for `(Some(CheckStatus::Pass), Some(0))`, so no
    render-layer change is needed. The label is the same one the GitHub
    adapter now emits for a branch without a required-check rule, which
    keeps the cross-provider closeout output consistent.
@@ -136,7 +145,7 @@ implies and why it is consistent with #502.
    `forge_cli_adapter.rs:748-766` so it also asserts:
 
    ```text
-   summary.required_state == Some(CheckStatus::Pass)
+   summary.required_state.as_deref() == Some("success")
    summary.required_count == Some(0)
    summary.non_required_failures.is_empty()
    ```
@@ -149,7 +158,7 @@ implies and why it is consistent with #502.
 
 5. **No schema change.** `closeout.v1` and the `LinkedPrEvidence` /
    `PrMergeSummary` Rust types are unchanged. The `Option<CheckStatus>`
-   /  `Option<u32>` field shapes carry the new values without any
+   / `Option<u32>` field shapes carry the new values without any
    serialization migration. Historical closeout records continue to
    parse, and their hex-encoded payloads do not need re-encoding.
 
@@ -161,7 +170,9 @@ implies and why it is consistent with #502.
 
 - `crates/plan-issue-cli/src/forge_cli_adapter.rs`:
   - Replace the `(None, None, [])` return triple in `pr_merge_summary`
-    with `(Some(CheckStatus::Pass), Some(0), Vec::new())`.
+    with `(Some("success".to_string()), Some(0), Vec::new())`. The
+    string is converted to `CheckStatus::Pass` downstream of the
+    adapter by `execute.rs::check_status_from_state`.
   - Replace the inline comment per Decision 3.
   - Extend `pr_merge_summary_composes_view_and_checks` (or add a sibling
     test in the same `#[cfg(test)] mod tests` block) to assert the new
@@ -188,17 +199,23 @@ implies and why it is consistent with #502.
 - The change is a single struct-literal swap plus a comment rewrite plus
   one extended test. No new helper functions, no module reorganisation,
   no new dependencies.
-- The new values must reuse the existing `CheckStatus::Pass` enum
-  variant; do not introduce a new variant or a GitLab-specific marker.
+- The new adapter-layer values must reuse the canonical `"success"`
+  string (the same value `pr_required_summary` returns from `gh pr
+  checks --required` on GitHub) so `check_status_from_state` maps it to
+  `CheckStatus::Pass`; do not introduce a new string or a
+  GitLab-specific marker.
 - The test must run without `glab` on PATH (uses the existing fake-process
   adapter wiring at `adapter_with(vec![...])`).
 
 ## Requirements
 
 - **R1.** `pr_merge_summary` on the GitLab adapter returns
-  `required_state: Some(CheckStatus::Pass)`,
+  `required_state: Some("success".to_string())`,
   `required_count: Some(0)`, and an empty `non_required_failures` vector
-  for every PR, regardless of pipeline outcome.
+  for every PR, regardless of pipeline outcome. Downstream of the
+  adapter, `check_status_from_state` converts that to
+  `CheckStatus::Pass` so the renderer's `required_check_label` hits
+  the `(Some(Pass), Some(0)) → "none required"` arm.
 - **R2.** A closeout comment posted by `plan-issue record close` against
   a GitLab PR renders that PR's `Required` column as `none required`
   via the existing `required_check_label` mapping.
@@ -216,7 +233,7 @@ implies and why it is consistent with #502.
 - **AC-2.** A new (or extended) unit test in `forge_cli_adapter.rs`'s
   test module asserts the full new triple for
   `pr_merge_summary_composes_view_and_checks` (or a sibling test):
-  `summary.required_state == Some(CheckStatus::Pass)`,
+  `summary.required_state.as_deref() == Some("success")`,
   `summary.required_count == Some(0)`,
   `summary.non_required_failures.is_empty()`.
 - **AC-3.** The renderer test
@@ -227,6 +244,7 @@ implies and why it is consistent with #502.
 - **AC-4.** The diff does not modify `lifecycle_record.rs`,
   `github.rs`, or any `closeout.v1` serialization site.
 - **AC-5.** The new comment at `forge_cli_adapter.rs:343-347` cites
+
   #557 (and references the new contract: GitLab reports zero required
   checks; close-gate treats as clean resolve per #502).
 
@@ -249,13 +267,13 @@ implies and why it is consistent with #502.
 
 ## Findings table
 
-| ID  | Source                                                   | Disposition                                                                                     |
-| --- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| F-1 | `crates/plan-issue-cli/src/forge_cli_adapter.rs:343-356` | In scope — replace `(None, None, [])` with `(Some(Pass), Some(0), [])` plus comment refresh     |
-| F-2 | `crates/plan-issue-cli/src/forge_cli_adapter.rs:748-766` | In scope — extend the fixture-backed test to assert the new triple                              |
-| F-3 | `crates/plan-issue-cli/src/lifecycle_record.rs:2154-2160`| Confirmed read-only — label table already maps the new triple to `none required`                |
-| F-4 | `crates/plan-issue-cli/src/lifecycle_record.rs:2446-2469`| Confirmed read-only — semantic shift accepted per Decision 2; no code change needed             |
-| F-5 | sympoies/nils-cli#502 / #512 / #563                      | Read-first context — close-gate contract and GitHub render fix; this PR is the GitLab follow-up |
+| ID  | Source                                                    | Disposition                                                                                     |
+| --- | --------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| F-1 | `crates/plan-issue-cli/src/forge_cli_adapter.rs:343-356`  | In scope — replace `(None, None, [])` with `(Some(Pass), Some(0), [])` plus comment refresh     |
+| F-2 | `crates/plan-issue-cli/src/forge_cli_adapter.rs:748-766`  | In scope — extend the fixture-backed test to assert the new triple                              |
+| F-3 | `crates/plan-issue-cli/src/lifecycle_record.rs:2154-2160` | Confirmed read-only — label table already maps the new triple to `none required`                |
+| F-4 | `crates/plan-issue-cli/src/lifecycle_record.rs:2446-2469` | Confirmed read-only — semantic shift accepted per Decision 2; no code change needed             |
+| F-5 | sympoies/nils-cli#502 / #512 / #563                       | Read-first context — close-gate contract and GitHub render fix; this PR is the GitLab follow-up |
 
 ## Risks and guardrails
 

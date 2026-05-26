@@ -7,12 +7,16 @@ the GitLab branch of
 `crates/plan-issue-cli/src/forge_cli_adapter.rs::pr_merge_summary` from
 returning `required_state: None, required_count: None,
 non_required_failures: []` to returning
-`required_state: Some(CheckStatus::Pass), required_count: Some(0),
-non_required_failures: []`. The render-layer five-label table (landed in
-sympoies/nils-cli#563) already maps the new triple to `none required`,
-so the closeout-comment `Required` column will stop reading `unknown`
-for every GitLab PR while the wire format (`closeout.v1`) and the
-close-gate match arms in `lifecycle_record.rs:2446-2469` stay unchanged.
+`required_state: Some("success".to_string()), required_count: Some(0),
+non_required_failures: []`. The `PrMergeSummary.required_state` field
+is `Option<String>` at the adapter boundary; downstream of the adapter
+`execute.rs::check_status_from_state` converts `"success"` to
+`CheckStatus::Pass`, and the render-layer five-label table (landed in
+sympoies/nils-cli#563) already maps `(Some(Pass), Some(0))` to
+`none required`. So the closeout-comment `Required` column will stop
+reading `unknown` for every GitLab PR while the wire format
+(`closeout.v1`) and the close-gate match arms in
+`lifecycle_record.rs:2446-2469` stay unchanged.
 
 The change is a single struct-literal swap plus a comment rewrite plus
 one extended adapter test. No new helpers, no module reorganisation, no
@@ -38,7 +42,7 @@ schema bump. Source: this bundle's discussion source doc.
 - In scope:
   - Replace the `(None, None, [])` return triple in
     `crates/plan-issue-cli/src/forge_cli_adapter.rs::pr_merge_summary`
-    (GitLab branch) with `(Some(CheckStatus::Pass), Some(0), [])`.
+    (GitLab branch) with `(Some("success".to_string()), Some(0), [])`.
   - Refresh the inline comment at
     `crates/plan-issue-cli/src/forge_cli_adapter.rs:343-347` to state
     the new contract (GitLab reports zero required checks; close-gate
@@ -103,7 +107,9 @@ format.
   - `crates/plan-issue-cli/src/forge_cli_adapter.rs:343-356`
 - **Description**: Replace the `(None, None, [])` triple in the GitLab
   branch of `pr_merge_summary` with
-  `(Some(CheckStatus::Pass), Some(0), Vec::new())`. Rewrite the inline
+  `(Some("success".to_string()), Some(0), Vec::new())`. The string is
+  converted to `CheckStatus::Pass` downstream of the adapter by
+  `execute.rs::check_status_from_state`. Rewrite the inline
   comment at `forge_cli_adapter.rs:343-347` to state the new contract:
   GitLab has no first-class required-check concept, so the adapter
   reports zero required checks (mirroring the shape the GitHub adapter
@@ -115,7 +121,7 @@ format.
 - **Complexity**: 1
 - **Acceptance criteria**:
   - `pr_merge_summary` on the GitLab adapter returns
-    `required_state == Some(CheckStatus::Pass)`,
+    `required_state.as_deref() == Some("success")`,
     `required_count == Some(0)`, and an empty `non_required_failures`
     vector for every PR.
   - The inline comment cites #557 and states the new contract; the
@@ -133,7 +139,7 @@ format.
 - **Description**: Extend `pr_merge_summary_composes_view_and_checks`
   (or add a focused sibling test) to assert the new triple alongside
   the existing `state` / `merged` / `merge_sha` / `checks` assertions:
-  `summary.required_state == Some(CheckStatus::Pass)`,
+  `summary.required_state.as_deref() == Some("success")`,
   `summary.required_count == Some(0)`,
   `summary.non_required_failures.is_empty()`. Add a CHANGELOG entry
   under the `[Unreleased]` `### Fixed` (or equivalent) block referencing
