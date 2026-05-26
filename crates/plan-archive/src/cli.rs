@@ -136,26 +136,36 @@ enum Command {
         shell: crate::completion::CompletionShell,
     },
 
-    /// (Sprint 5) Read or aggregate cached snapshots.
+    /// Read or aggregate cached `_index/` snapshots.
     Query {
         /// Reference to look up (single-ref read).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["plan", "refs_from"])]
         r#ref: Option<String>,
-        /// Filter by host FQDN.
-        #[arg(long)]
+        /// Filter by host FQDN (aggregate mode).
+        #[arg(long, conflicts_with_all = ["ref", "plan", "refs_from"])]
         host: Option<String>,
-        /// Filter by org or GitLab group path.
-        #[arg(long)]
+        /// Filter by org or GitLab group path (aggregate mode).
+        #[arg(long, conflicts_with_all = ["ref", "plan", "refs_from"])]
         org: Option<String>,
-        /// Filter by repo slug.
-        #[arg(long)]
+        /// Filter by repo slug (aggregate mode).
+        #[arg(long, conflicts_with_all = ["ref", "plan", "refs_from"])]
         repo: Option<String>,
-        /// Filter by plan path inside the archive (link traversal).
-        #[arg(long)]
+        /// Only snapshots fetched on or after this `YYYY-MM-DD`
+        /// (aggregate mode).
+        #[arg(long, conflicts_with_all = ["ref", "plan", "refs_from"])]
+        since: Option<String>,
+        /// Resolve refs from an archived plan path inside the archive
+        /// (link traversal: plan → refs).
+        #[arg(long, conflicts_with_all = ["ref", "host", "org", "repo", "since", "refs_from"])]
         plan: Option<String>,
-        /// Read refs from an archived `metadata.yaml`.
-        #[arg(long)]
+        /// Read refs from a `metadata.yaml` path (link traversal:
+        /// metadata → refs).
+        #[arg(long, conflicts_with_all = ["ref", "host", "org", "repo", "since", "plan"])]
         refs_from: Option<String>,
+        /// Archive clone path. Defaults to the machine-local config's
+        /// `archive_clone_path`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
     },
 }
 
@@ -224,7 +234,26 @@ pub fn run() -> i32 {
             hosts,
             format,
         }),
-        Command::Query { .. } => unimplemented_subcommand(format),
+        Command::Query {
+            r#ref,
+            host,
+            org,
+            repo,
+            since,
+            plan,
+            refs_from,
+            archive,
+        } => crate::query::dispatch(crate::query::DispatchArgs {
+            r#ref,
+            host,
+            org,
+            repo,
+            since,
+            plan,
+            refs_from,
+            archive,
+            format,
+        }),
     }
 }
 
@@ -436,16 +465,6 @@ fn emit_error(
             exit::DATA
         }
     }
-}
-
-fn unimplemented_subcommand(format: OutputFormat) -> i32 {
-    emit_error(
-        format,
-        "subcommand",
-        "subcommand-not-implemented",
-        "this plan-archive subcommand lands in a later sprint (see docs/plans/plan-archive-nils-cli/)",
-        Some("Sprint 1 only ships the validate-* subcommands"),
-    )
 }
 
 fn detect_format_from_argv() -> OutputFormat {
