@@ -2220,6 +2220,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "nils-common",
+ "nils-markdown",
  "nils-plan-tooling",
  "nils-test-support",
  "pretty_assertions",

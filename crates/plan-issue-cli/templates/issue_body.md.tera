@@ -1,0 +1,5 @@
+| Task | Summary | Owner | Branch | Worktree | Execution Mode | PR | Status | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+{%- for row in rows %}
+| {{ row.task | md_cell }} | {{ row.summary | md_cell }} | {{ row.owner | md_cell }} | {{ row.branch | md_cell }} | {{ row.worktree | md_cell }} | {{ row.execution_mode | md_cell }} | {{ row.pr | md_cell }} | {{ row.status | md_cell }} | {{ row.notes | md_cell }} |
+{%- endfor %}
