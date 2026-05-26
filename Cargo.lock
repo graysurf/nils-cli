@@ -2183,6 +2183,7 @@ version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
+ "clap_complete",
  "indexmap",
  "nils-common",
  "nils-markdown",

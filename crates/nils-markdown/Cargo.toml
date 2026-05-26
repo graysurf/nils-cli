@@ -10,13 +10,13 @@ repository = "https://github.com/sympoies/nils-cli"
 name = "nils_markdown"
 path = "src/lib.rs"
 
-# `[[bin]]` for `md-render` is added in Sprint 3 Task 3.1. Sprint 1
-# only declares the `bin-cli` feature so the manifest dependency
-# wiring is final; the binary main + manifest target arrive together
-# with the implementation in Sprint 3.
+[[bin]]
+name = "md-render"
+path = "src/bin/md-render/main.rs"
+required-features = ["bin-cli"]
 
 [features]
-bin-cli = ["dep:anyhow", "dep:clap"]
+bin-cli = ["dep:anyhow", "dep:clap", "dep:clap_complete"]
 # Enables the `golden::assert_render` byte-equality harness for
 # consumer dev-dependencies (Tier A migration golden tests).
 test-support = ["dep:pretty_assertions"]
@@ -24,6 +24,7 @@ test-support = ["dep:pretty_assertions"]
 [dependencies]
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
+clap_complete = { workspace = true, optional = true }
 indexmap = { workspace = true }
 nils-common = { version = "0.23.0", path = "../nils-common", package = "nils-common" }
 pretty_assertions = { workspace = true, optional = true }
@@ -34,6 +35,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
-nils-markdown = { path = ".", features = ["test-support"] }
+nils-markdown = { path = ".", features = ["bin-cli", "test-support"] }
 nils-test-support = { version = "0.23.0", path = "../nils-test-support" }
 tempfile = "3"

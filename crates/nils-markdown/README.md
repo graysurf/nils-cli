@@ -32,10 +32,23 @@ Markdown in `format!` chains. Helpers compose, never duplicate, the
 
 The crate also ships an opt-in `md-render` binary (Cargo feature
 `bin-cli`). The binary reads a template path and a JSON view file, runs
-the same engine, and writes the rendered Markdown to `stdout`. The
-implementation lands in Sprint 3 of the rollout plan; the manifest
-target is wired up in Sprint 1 so the feature gate compiles
-end-to-end.
+the same engine, and writes the rendered Markdown to `stdout`. It
+supports both the text envelope (default; rendered Markdown body
+written to stdout) and the JSON envelope (`--format json`; the
+`cli.md-render.render.v1` envelope wraps the body alongside the
+template name).
+
+Usage:
+
+```text
+md-render --template <PATH> --data <PATH> [--format text|json]
+md-render completion <bash|zsh>
+```
+
+The `--template` flag accepts any `.md.tera` or `.tera` file and the
+template is registered under its file stem. The `--data` flag accepts
+a JSON object that is passed to `Engine::render_value` as the
+template's view.
 
 ## Rollout
 
