@@ -1,0 +1,12 @@
+schema: agent-plan-archive.hosts.v1
+version: 1
+hosts:
+  github.com:
+    class: personal
+    primary_identity: graysurf
+  gitlab.com:
+    class: personal
+  gitlab.example.com:
+    class: employer
+    employer: ExampleCorp
+    retention: delete-on-termination

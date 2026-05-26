@@ -1,0 +1,8 @@
+schema: agent-plan-archive.hosts.v1
+version: 1
+hosts:
+  github.com:
+    class: personal
+    primary_identity: graysurf
+  gitlab.com:
+    class: personal

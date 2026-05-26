@@ -1,0 +1,7 @@
+version: 1
+archive_clone_path: ~/Project/graysurf/agent-plan-archive
+working_repo_roots:
+  - ~/Project
+  - /workspace/src
+performance:
+  refresh_batch_size: 25

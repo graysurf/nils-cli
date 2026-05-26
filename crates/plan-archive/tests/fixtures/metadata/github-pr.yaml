@@ -1,0 +1,14 @@
+version: 1
+source:
+  host: github.com
+  org_or_group_path: graysurf
+  repo: agent-runtime-kit
+  branch: main
+  archive_commit: a2e8f227000000000000000000000000a2e8f227
+  original_path: docs/plans/2026-05-27-plan-archive-runtime-kit/
+captured_classification:
+  class: personal
+  primary_identity: graysurf
+refs:
+  issue: https://github.com/graysurf/agent-runtime-kit/issues/126
+  pr: https://github.com/graysurf/agent-runtime-kit/pull/127

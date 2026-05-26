@@ -2216,6 +2216,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-plan-archive"
+version = "0.24.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_complete",
+ "indexmap",
+ "nils-common",
+ "nils-term",
+ "nils-test-support",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "nils-plan-issue-cli"
 version = "0.24.0"
 dependencies = [

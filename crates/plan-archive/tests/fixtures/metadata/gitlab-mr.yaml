@@ -1,0 +1,15 @@
+version: 1
+source:
+  host: gitlab.example.com
+  org_or_group_path: acme/platform/backend
+  repo: services
+  branch: main
+  archive_commit: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  original_path: docs/plans/2026-04-10-example-plan/
+captured_classification:
+  class: employer
+  employer: ExampleCorp
+  retention: delete-on-termination
+refs:
+  issue: https://gitlab.example.com/acme/platform/backend/services/-/issues/42
+  mr: https://gitlab.example.com/acme/platform/backend/services/-/merge_requests/99
