@@ -12,13 +12,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 fn binary_path() -> std::path::PathBuf {
-    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop(); // crates/
-    path.pop(); // workspace root
-    path.push("target");
-    path.push("debug");
-    path.push("md-render");
-    path
+    nils_test_support::bin::resolve("md-render")
 }
 
 #[test]
