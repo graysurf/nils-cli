@@ -267,6 +267,17 @@ Returns typed evidence from the provider issue body and comments:
 - Fails when a v2 lifecycle comment carries a malformed typed payload. A
   marker with an invalid payload is not counted as valid evidence.
 
+Label verification is out of scope for `record audit`. The command reads
+issue body and lifecycle comments only; it does not fetch or compare
+provider-issue labels and does not accept a `--label` flag. Callers that
+need to verify expected labels alongside the lifecycle audit must do so
+through the provider directly (for example `gh issue view --json labels`,
+`forge-cli pr view`, or an equivalent provider-native call) and treat that
+check as a separate gate in their workflow. Label mutation remains the
+responsibility of `record open`, `record post`, and `record close` via
+`--label`, `--add-label`, and `--remove-label`; those write paths are
+unaffected.
+
 ### `plan-issue record repair-dashboard`
 
 - Reads the latest audit evidence.
