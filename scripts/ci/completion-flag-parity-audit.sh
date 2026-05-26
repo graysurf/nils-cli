@@ -480,14 +480,20 @@ ensure_binaries() {
     return 0
   fi
 
-  run_command 0 "$repo_root" cargo build --workspace --bins
+  # Use --all-features so feature-gated workspace binaries (e.g.
+  # `md-render` behind `nils-markdown/bin-cli`) are produced under
+  # target/debug/. Without --all-features, `cargo build --workspace
+  # --bins` only builds always-on binaries and the audit reports
+  # spurious "missing binaries after build" failures for opt-in
+  # binaries that are present in the completion matrix.
+  run_command 0 "$repo_root" cargo build --workspace --bins --all-features
   if (( RUN_CODE != 0 )); then
     local details="$RUN_STDERR"
     if [[ -z "${details//[[:space:]]/}" ]]; then
       details="$RUN_STDOUT"
     fi
     details="${details//$'\n'/ }"
-    ENSURE_BIN_ERROR="cargo build --workspace --bins failed: ${details}"
+    ENSURE_BIN_ERROR="cargo build --workspace --bins --all-features failed: ${details}"
     return 1
   fi
 
