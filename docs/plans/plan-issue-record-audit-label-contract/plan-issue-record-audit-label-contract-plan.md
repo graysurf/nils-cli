@@ -55,7 +55,7 @@ not validate labels, and callers must check labels through the provider.
 **Demo/Validation**:
 
 - Commands:
-  - `plan-tooling validate --file docs/plans/plan-issue-record-audit-label-contract/plan-issue-record-audit-label-contract-plan.md --format text --explain`
+  - `plan-tooling validate --file docs/plans/plan-issue-record-audit-label-contract/*-plan.md --format text --explain`
   - `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`
   - `grep -RIn "record audit" docs/ crates/plan-issue-cli/docs/ crates/plan-issue-cli/CHANGELOG.md`
 - Verify: Spec language explicitly names labels as out of scope for audit;
@@ -104,7 +104,7 @@ not validate labels, and callers must check labels through the provider.
     desirable, it is referenced as an open follow-up, not as a planned
     flag on audit.
 - **Validation**:
-  - `plan-tooling validate --file docs/plans/plan-issue-record-audit-label-contract/plan-issue-record-audit-label-contract-plan.md --format text`
+  - `plan-tooling validate --file docs/plans/plan-issue-record-audit-label-contract/*-plan.md --format text`
   - `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`
 
 ### Task 1.3: Add CHANGELOG entry for the contract clarification
