@@ -1,0 +1,16 @@
+# Subagent Task Prompt
+
+- Issue: #{{ issue }}
+- Sprint: S{{ sprint }}
+- Task: {{ task }}
+- Anchor: {{ anchor_task }}
+- Tasks: {{ task_list }}
+- Summary: {{ task_summary }}
+- Owner: {{ owner }}
+- Branch: {{ branch }}
+- Worktree: {{ worktree }}
+- Execution Mode: {{ execution_mode }}
+- Notes: {{ notes }}
+
+## Lane Tasks
+{{ lane_tasks }}

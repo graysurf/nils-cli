@@ -5,8 +5,42 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nils_common::git as common_git;
 use nils_common::markdown as common_markdown;
+use nils_markdown::Engine;
 use plan_tooling::parse::parse_plan_with_display;
+use serde::Serialize;
 use serde_json::{Value, json};
+
+const PLAN_STATUS_COMMENT_TEMPLATE: &str =
+    include_str!("../templates/execute/plan_status_comment.md.tera");
+const PLAN_STATUS_COMMENT_TEMPLATE_NAME: &str = "execute_plan_status_comment";
+
+const SUBAGENT_PROMPT_TEMPLATE: &str = include_str!("../templates/execute/subagent_prompt.md.tera");
+const SUBAGENT_PROMPT_TEMPLATE_NAME: &str = "execute_subagent_prompt";
+
+#[derive(Debug, Serialize)]
+struct PlanStatusCommentView {
+    total: usize,
+    planned: usize,
+    in_progress: usize,
+    blocked: usize,
+    done: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SubagentPromptView<'a> {
+    issue: u64,
+    sprint: i32,
+    task: &'a str,
+    anchor_task: &'a str,
+    task_list: &'a str,
+    task_summary: &'a str,
+    owner: &'a str,
+    branch: &'a str,
+    worktree: &'a str,
+    execution_mode: &'a str,
+    notes: &'a str,
+    lane_tasks: &'a str,
+}
 
 use crate::cli::Cli;
 use crate::commands::build::{BuildPlanTaskSpecArgs, BuildTaskSpecArgs};
@@ -4644,6 +4678,16 @@ fn select_adapter_for_slug(
     Ok(crate::provider::select_adapter(&info, force))
 }
 
+fn render_subagent_prompt(view: &SubagentPromptView<'_>) -> String {
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(SUBAGENT_PROMPT_TEMPLATE_NAME, SUBAGENT_PROMPT_TEMPLATE)
+        .expect("subagent_prompt template registers");
+    engine
+        .render(SUBAGENT_PROMPT_TEMPLATE_NAME, view)
+        .expect("subagent_prompt template renders")
+}
+
 fn render_plan_status_comment(rows: &[TaskRow]) -> String {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for row in rows {
@@ -4651,14 +4695,23 @@ fn render_plan_status_comment(rows: &[TaskRow]) -> String {
         *counts.entry(status).or_insert(0) += 1;
     }
 
-    format!(
-        "## Plan Status Snapshot\n\n- Total tasks: {}\n- planned: {}\n- in-progress: {}\n- blocked: {}\n- done: {}\n",
-        rows.len(),
-        counts.get("planned").copied().unwrap_or(0),
-        counts.get("in-progress").copied().unwrap_or(0),
-        counts.get("blocked").copied().unwrap_or(0),
-        counts.get("done").copied().unwrap_or(0),
-    )
+    let view = PlanStatusCommentView {
+        total: rows.len(),
+        planned: counts.get("planned").copied().unwrap_or(0),
+        in_progress: counts.get("in-progress").copied().unwrap_or(0),
+        blocked: counts.get("blocked").copied().unwrap_or(0),
+        done: counts.get("done").copied().unwrap_or(0),
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(
+            PLAN_STATUS_COMMENT_TEMPLATE_NAME,
+            PLAN_STATUS_COMMENT_TEMPLATE,
+        )
+        .expect("plan_status_comment template registers");
+    engine
+        .render(PLAN_STATUS_COMMENT_TEMPLATE_NAME, &view)
+        .expect("plan_status_comment template renders")
 }
 
 fn should_emit_comment(comment_mode: &crate::commands::CommentModeArgs) -> bool {
@@ -4782,15 +4835,20 @@ fn write_subagent_prompts(
                 row.summary.trim().to_string()
             };
             let path = out_dir.join(format!("{}.md", row.task_id));
-            let body = format!(
-                "# Subagent Task Prompt\n\n- Issue: #{issue}\n- Sprint: S{sprint}\n- Task: {}\n- Anchor: {anchor_task}\n- Tasks: {task_list}\n- Summary: {task_summary}\n- Owner: {}\n- Branch: {}\n- Worktree: {}\n- Execution Mode: {}\n- Notes: {}\n\n## Lane Tasks\n{lane_tasks}\n",
-                row.task_id,
-                lane.owner,
-                lane.branch,
-                lane.worktree,
-                lane.execution_mode,
-                lane.notes
-            );
+            let body = render_subagent_prompt(&SubagentPromptView {
+                issue,
+                sprint,
+                task: &row.task_id,
+                anchor_task: &anchor_task,
+                task_list: &task_list,
+                task_summary: &task_summary,
+                owner: &lane.owner,
+                branch: &lane.branch,
+                worktree: &lane.worktree,
+                execution_mode: &lane.execution_mode,
+                notes: &lane.notes,
+                lane_tasks: &lane_tasks,
+            });
             fs::write(&path, body).map_err(|err| {
                 format!("failed to write subagent prompt {}: {err}", path.display())
             })?;
@@ -6117,5 +6175,77 @@ mod tests {
             "issue/s1-t1"
         );
         assert_eq!(normalize_branch_name(" issue/s1-t2 "), "issue/s1-t2");
+    }
+
+    fn execute_golden_fixture(name: &str) -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("execute")
+            .join(name);
+        if std::env::var_os("BLESS_EXECUTE_GOLDEN").is_some() {
+            return path.to_string_lossy().into_owned();
+        }
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read fixture {}: {err}", path.display()))
+    }
+
+    fn assert_or_bless_execute(name: &str, actual: &str) {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("execute")
+            .join(name);
+        if std::env::var_os("BLESS_EXECUTE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir fixture dir");
+            std::fs::write(&path, actual).expect("write fixture");
+            return;
+        }
+        let expected = execute_golden_fixture(name);
+        assert_eq!(expected, actual, "golden mismatch for {name}");
+    }
+
+    #[test]
+    fn plan_status_comment_matches_golden_empty() {
+        let comment = render_plan_status_comment(&[]);
+        assert_or_bless_execute("plan_status_comment_empty.md", &comment);
+    }
+
+    #[test]
+    fn plan_status_comment_matches_golden_mixed() {
+        let rows = vec![
+            task_row("S1T1", "issue/s1-t1", "wt-1", "#1", "planned", "sprint=S1"),
+            task_row(
+                "S1T2",
+                "issue/s1-t2",
+                "wt-2",
+                "#2",
+                "in-progress",
+                "sprint=S1",
+            ),
+            task_row("S1T3", "issue/s1-t3", "wt-3", "#3", "done", "sprint=S1"),
+        ];
+        let comment = render_plan_status_comment(&rows);
+        assert_or_bless_execute("plan_status_comment_mixed.md", &comment);
+    }
+
+    #[test]
+    fn subagent_prompt_matches_golden() {
+        let view = SubagentPromptView {
+            issue: 541,
+            sprint: 2,
+            task: "2.6",
+            anchor_task: "2.6",
+            task_list: "2.6",
+            task_summary: "Migrate execute.rs Markdown emitters",
+            owner: "subagent-alpha",
+            branch: "issue/2-6",
+            worktree: "issue-2-6",
+            execution_mode: "pr-isolated",
+            notes: "depends on Task 2.5b",
+            lane_tasks: "- 2.6: Migrate execute.rs Markdown emitters",
+        };
+        let body = render_subagent_prompt(&view);
+        assert_or_bless_execute("subagent_prompt.md", &body);
     }
 }
