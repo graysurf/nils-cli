@@ -1,0 +1,22 @@
+- Summary: {{ summary }}
+{%- if highlights %}
+
+### Highlights
+{% for item in highlights %}
+- {{ item }}
+{%- endfor %}
+{%- endif %}
+{%- if links %}
+
+### Links
+{% for link in links %}
+- {{ link.key }}: {{ link.value }}
+{%- endfor %}
+{%- endif %}
+{%- if extras %}
+
+### Session Fields
+{% for extra in extras %}
+- {{ extra.key }}: {{ extra.value }}
+{%- endfor %}
+{%- endif %}

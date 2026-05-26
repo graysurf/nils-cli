@@ -1,0 +1,15 @@
+- Decision: {{ decision }}
+{%- if lenses %}
+- Lenses: {{ lenses }}
+{%- endif %}
+{%- if outcome_comment_url %}
+- Outcome comment: {{ outcome_comment_url }}
+{%- endif %}
+{%- if findings %}
+
+| ID | Severity | Disposition | Summary |
+| --- | --- | --- | --- |
+{%- for finding in findings %}
+| {{ finding.id }} | {{ finding.severity }} | {{ finding.disposition }} | {{ finding.summary }} |
+{%- endfor %}
+{%- endif %}

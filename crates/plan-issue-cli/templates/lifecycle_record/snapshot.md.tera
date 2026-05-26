@@ -1,0 +1,24 @@
+{{ marker }}
+
+## {{ heading }}
+
+- Profile: {{ profile }}
+{%- if path %}
+- Path: `{{ path }}`
+{%- endif %}
+{%- if commit %}
+- Commit: `{{ commit }}`
+{%- endif %}
+{%- if summary %}
+- Summary: {{ summary }}
+{%- endif %}
+- Snapshot mode: local committed Markdown
+
+<details>
+<summary>{{ details_summary }}</summary>
+
+{{ content }}
+
+</details>
+
+{{ envelope_carrier }}

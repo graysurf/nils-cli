@@ -1,0 +1,16 @@
+- Overall: {{ overall }}
+{%- if commands %}
+
+| Command | Status | Evidence |
+| --- | --- | --- |
+{%- for command in commands %}
+| {{ command.command }} | {{ command.status }} | {{ command.evidence }} |
+{%- endfor %}
+{%- endif %}
+{%- if waivers %}
+
+### Waivers
+{% for waiver in waivers %}
+- `{{ waiver.command }}`: {{ waiver.reason }}
+{%- endfor %}
+{%- endif %}
