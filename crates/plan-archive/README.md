@@ -151,6 +151,49 @@ Stable error codes (Sprint 4):
 | `refresh-forge-fetch-failed` | forge-cli fetch failed (per-ref in batch) |
 | `refresh-io-error` | filesystem failure |
 
+## Sprint 5 surface
+
+Sprint 5 (Plan 1) lands `plan-archive query`, the read-only cache
+surface. It never fetches, writes, or commits. Three mutually
+exclusive modes:
+
+```bash
+plan-archive query --ref https://github.com/org/repo/issues/123
+plan-archive query --host github.com [--org <o>] [--repo <r>] [--since 2026-05-01]
+plan-archive query --plan plans/github.com/org/repo/2026-05-27-slug
+plan-archive query --refs-from path/to/metadata.yaml
+  [--archive <path>]
+```
+
+- single-ref (`--ref`): returns the latest snapshot for one
+  issue/PR/MR plus its `fetched_at`. A ref with no snapshots returns
+  a record with `latest_snapshot: null` (exit 0), not an error.
+- aggregate (`--host`/`--org`/`--repo`/`--since`): walks `_index/`
+  across every reachable host in one pass and returns each matching
+  ref's latest snapshot. A no-match query returns an empty array,
+  exit 0.
+- link traversal (`--plan` / `--refs-from`): reads an archived plan's
+  `metadata.yaml` (`--plan` resolves `<archive>/<plan>/metadata.yaml`;
+  `--refs-from` takes the metadata path directly) and resolves each
+  `refs.issue|pr|mr` to its latest snapshot.
+
+`fetched_at` is surfaced by default on every record (decoded from the
+basic-format snapshot filename into extended ISO8601). Latest is the
+lexically-last snapshot filename in the ref folder.
+
+Stable error codes (Sprint 5):
+
+| Code | When |
+| --- | --- |
+| `query-no-selector` | no `--ref`/filter/`--plan`/`--refs-from` supplied |
+| `query-unparseable-ref` | `--ref` is not an issue/PR/MR URL |
+| `query-invalid-since` | `--since` is not `YYYY-MM-DD` |
+| `query-archive-clone-missing` | archive clone path not found |
+| `query-metadata-not-found` | `--plan`/`--refs-from` metadata absent |
+| `query-metadata-read-failed` | metadata unreadable/invalid |
+| `query-metadata-no-refs` | metadata carries no refs to traverse |
+| `query-io-error` | filesystem failure |
+
 ## Output contracts
 
 Both human-readable text (default) and a versioned JSON envelope
@@ -199,6 +242,9 @@ Stable warning codes (Sprint 1):
 - The archive repository is treated as opaque storage; this CLI does
   not enforce repository-level governance beyond what the validators
   check.
+- `query` is strictly read-only: it never fetches, writes, or commits.
+  `refresh` writes and scrubs but holds the commit so any emitted
+  scrub log can be reviewed first.
 
 ## Tests
 

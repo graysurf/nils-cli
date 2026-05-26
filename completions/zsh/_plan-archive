@@ -104,12 +104,14 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (query)
 _arguments "${_arguments_options[@]}" : \
-'--ref=[Reference to look up (single-ref read)]:REF:_default' \
-'--host=[Filter by host FQDN]:HOST:_default' \
-'--org=[Filter by org or GitLab group path]:ORG:_default' \
-'--repo=[Filter by repo slug]:REPO:_default' \
-'--plan=[Filter by plan path inside the archive (link traversal)]:PLAN:_default' \
-'--refs-from=[Read refs from an archived \`metadata.yaml\`]:REFS_FROM:_default' \
+'(--plan --refs-from)--ref=[Reference to look up (single-ref read)]:REF:_default' \
+'(--ref --plan --refs-from)--host=[Filter by host FQDN (aggregate mode)]:HOST:_default' \
+'(--ref --plan --refs-from)--org=[Filter by org or GitLab group path (aggregate mode)]:ORG:_default' \
+'(--ref --plan --refs-from)--repo=[Filter by repo slug (aggregate mode)]:REPO:_default' \
+'(--ref --plan --refs-from)--since=[Only snapshots fetched on or after this \`YYYY-MM-DD\` (aggregate mode)]:SINCE:_default' \
+'(--ref --host --org --repo --since --refs-from)--plan=[Resolve refs from an archived plan path inside the archive (link traversal\: plan → refs)]:PLAN:_default' \
+'(--ref --host --org --repo --since --plan)--refs-from=[Read refs from a \`metadata.yaml\` path (link traversal\: metadata → refs)]:REFS_FROM:_default' \
+'--archive=[Archive clone path. Defaults to the machine-local config'\''s \`archive_clone_path\`]:ARCHIVE:_files' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '(--format)--json[Hidden alias for \`--format json\` kept for symmetry with neighbouring CLIs]' \
@@ -179,7 +181,7 @@ _plan-archive_commands() {
 'migrate:Migrate a closed plan folder into the archive repo. Dry-run by default; use \`--apply\` to write and commit' \
 'refresh:Fetch provider payloads and append scrubbed snapshots to \`_index/\`. Writes and scrubs but does not commit; the scrub log (if any) must be reviewed before committing' \
 'completion:Print a shell completion script for \`plan-archive\`' \
-'query:(Sprint 5) Read or aggregate cached snapshots' \
+'query:Read or aggregate cached \`_index/\` snapshots' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'plan-archive commands' commands "$@"
@@ -198,7 +200,7 @@ _plan-archive__subcmd__help_commands() {
 'migrate:Migrate a closed plan folder into the archive repo. Dry-run by default; use \`--apply\` to write and commit' \
 'refresh:Fetch provider payloads and append scrubbed snapshots to \`_index/\`. Writes and scrubs but does not commit; the scrub log (if any) must be reviewed before committing' \
 'completion:Print a shell completion script for \`plan-archive\`' \
-'query:(Sprint 5) Read or aggregate cached snapshots' \
+'query:Read or aggregate cached \`_index/\` snapshots' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'plan-archive help commands' commands "$@"

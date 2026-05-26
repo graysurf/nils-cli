@@ -279,7 +279,7 @@ _plan-archive() {
             return 0
             ;;
         plan__archive__query)
-            opts="-h --ref --host --org --repo --plan --refs-from --format --json --help"
+            opts="-h --ref --host --org --repo --since --plan --refs-from --archive --format --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -301,11 +301,19 @@ _plan-archive() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --since)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --plan)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --refs-from)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --archive)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
