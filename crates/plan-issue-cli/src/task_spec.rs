@@ -1,3 +1,28 @@
+//! Task-spec builder and TSV writer for the plan-issue-cli runtime.
+//!
+//! This module is intentionally **not** a Markdown emitter: the only
+//! string output below is [`render_tsv`], which produces a
+//! tab-separated `.tsv` file consumed by downstream subagent
+//! lanes. The two
+//! [`nils_common::markdown::canonicalize_table_cell`] calls inside
+//! `build_task_spec` (notes joined for newly-built rows and notes
+//! copied from already-parsed `TaskSpecRow` values) keep
+//! `TaskSpecRow.notes` safe for a single-line TSV cell by collapsing
+//! embedded newlines and replacing `|` with `/`. They are kept here
+//! at struct-construction time, not at TSV emission time, so any
+//! consumer that reads `TaskSpecRow.notes` directly sees the same
+//! pre-canonicalized value.
+//!
+//! The Markdown emitters live in [`crate::render`] and
+//! [`crate::issue_body::render_task_decomposition_block`]; both rely
+//! on the [`nils_common::markdown` v1 contract] idempotency of
+//! `canonicalize_table_cell` so a notes value that has already been
+//! canonicalized here can pass through the template-side `| md_cell`
+//! filter (registered by `nils-markdown`) without double-escaping.
+//! This is the Sprint 2 plan's Task 2.2 audit deliverable: no
+//! Markdown migration is required for this file because no Markdown
+//! is rendered here.
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
