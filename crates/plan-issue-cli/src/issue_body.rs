@@ -1,6 +1,90 @@
 use std::collections::HashMap;
 
 use nils_common::markdown as common_markdown;
+use nils_markdown::{Engine, RenderError};
+use serde::Serialize;
+
+// Task 2.4 will switch `render::render_plan_issue_body` to call
+// `render_task_decomposition_block` instead of stitching the three
+// row helpers manually. Until then the template + view types live
+// here exercised only by the unit tests, so silence dead_code on
+// the new items in the lib target.
+
+/// Template body for the task-decomposition block. Bundled with
+/// `include_str!` per Decision 13 in the source document so the
+/// asset travels with the binary and no runtime filesystem lookup
+/// is required.
+#[allow(dead_code)]
+const TASK_DECOMPOSITION_TEMPLATE: &str = include_str!("../templates/issue_body.md.tera");
+#[allow(dead_code)]
+const TASK_DECOMPOSITION_TEMPLATE_NAME: &str = "issue_body";
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
+struct TaskTableView<'a> {
+    rows: Vec<TaskRowView<'a>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
+struct TaskRowView<'a> {
+    task: &'a str,
+    summary: &'a str,
+    owner: &'a str,
+    branch: &'a str,
+    worktree: &'a str,
+    execution_mode: &'a str,
+    pr: &'a str,
+    status: &'a str,
+    notes: &'a str,
+}
+
+impl<'a> From<&'a TaskRow> for TaskRowView<'a> {
+    fn from(row: &'a TaskRow) -> Self {
+        Self {
+            task: &row.task,
+            summary: &row.summary,
+            owner: &row.owner,
+            branch: &row.branch,
+            worktree: &row.worktree,
+            execution_mode: &row.execution_mode,
+            pr: &row.pr,
+            status: &row.status,
+            notes: &row.notes,
+        }
+    }
+}
+
+/// Render the task-decomposition table block (header row, separator
+/// row, and one row per `rows` entry) through the
+/// [`nils_markdown::Engine`]. Output is byte-equal to the previous
+/// concatenation of [`task_decomposition_header_row`],
+/// [`task_decomposition_separator_row`], and
+/// [`format_task_decomposition_row`] for the same rows.
+///
+/// Sprint 2 Task 2.1 ships this function as the migration entry
+/// point; Task 2.4 will switch `render::render_plan_issue_body` to
+/// call it instead of stitching the three row helpers manually.
+#[allow(dead_code)]
+pub fn render_task_decomposition_block(rows: &[TaskRow]) -> Result<String, RenderError> {
+    let mut engine = Engine::builder().build();
+    engine.register_template(
+        TASK_DECOMPOSITION_TEMPLATE_NAME,
+        TASK_DECOMPOSITION_TEMPLATE,
+    )?;
+    let view = TaskTableView {
+        rows: rows.iter().map(TaskRowView::from).collect(),
+    };
+    let rendered = engine.render(TASK_DECOMPOSITION_TEMPLATE_NAME, &view)?;
+    // Match the `out.join("\n")` contract used by
+    // `render::render_plan_issue_body`: the table block lives as
+    // elements in a `Vec<String>` and is joined with `\n` later, so
+    // it must not carry a trailing newline of its own. The template
+    // file ends with the standard EOF newline per workspace
+    // convention; strip exactly one trailing `\n` to keep the
+    // template human-friendly and the output byte-stable.
+    Ok(rendered.strip_suffix('\n').unwrap_or(&rendered).to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRow {
@@ -479,9 +563,98 @@ fn format_markdown_row(row: &TaskRow) -> String {
 mod tests {
     use super::{
         TaskRow, format_task_decomposition_row, is_placeholder, normalize_pr_display,
-        parse_pr_number, parse_task_table, row_sprint, task_decomposition_header_row,
-        task_decomposition_separator_row, validate_rows,
+        parse_pr_number, parse_task_table, render_task_decomposition_block, row_sprint,
+        task_decomposition_header_row, task_decomposition_separator_row, validate_rows,
     };
+
+    fn sample_task_rows() -> Vec<TaskRow> {
+        vec![
+            TaskRow {
+                task: "S1T1".to_string(),
+                summary: "Add foo".to_string(),
+                owner: "subagent".to_string(),
+                branch: "issue/s1t1".to_string(),
+                worktree: "issue-s1t1".to_string(),
+                execution_mode: "pr-isolated".to_string(),
+                pr: "#101".to_string(),
+                status: "done".to_string(),
+                notes: "-".to_string(),
+                line_index: 0,
+            },
+            TaskRow {
+                task: "S1T2".to_string(),
+                summary: "Pipe|in|summary".to_string(),
+                owner: "main".to_string(),
+                branch: "issue/s1t2".to_string(),
+                worktree: "issue-s1t2".to_string(),
+                execution_mode: "per-sprint".to_string(),
+                pr: "TBD".to_string(),
+                status: "planned".to_string(),
+                notes: "sprint=S1; group=A".to_string(),
+                line_index: 1,
+            },
+            TaskRow {
+                task: "S2T1".to_string(),
+                summary: "Multi\nline\nnotes".to_string(),
+                owner: "subagent".to_string(),
+                branch: "issue/s2t1".to_string(),
+                worktree: "issue-s2t1".to_string(),
+                execution_mode: "pr-shared".to_string(),
+                pr: "#202".to_string(),
+                status: "in-progress".to_string(),
+                notes: "Pipe|here".to_string(),
+                line_index: 2,
+            },
+        ]
+    }
+
+    fn baseline_via_helpers(rows: &[TaskRow]) -> String {
+        let mut out: Vec<String> = vec![
+            task_decomposition_header_row(),
+            task_decomposition_separator_row(),
+        ];
+        for row in rows {
+            out.push(format_task_decomposition_row([
+                &row.task,
+                &row.summary,
+                &row.owner,
+                &row.branch,
+                &row.worktree,
+                &row.execution_mode,
+                &row.pr,
+                &row.status,
+                &row.notes,
+            ]));
+        }
+        out.join("\n")
+    }
+
+    #[test]
+    fn render_task_decomposition_block_matches_helper_composition_for_sample_rows() {
+        let rows = sample_task_rows();
+        let baseline = baseline_via_helpers(&rows);
+        let rendered = render_task_decomposition_block(&rows).expect("render block");
+        pretty_assertions::assert_eq!(baseline, rendered);
+    }
+
+    #[test]
+    fn render_task_decomposition_block_matches_helper_composition_for_empty_rows() {
+        let baseline = baseline_via_helpers(&[]);
+        let rendered = render_task_decomposition_block(&[]).expect("render block");
+        pretty_assertions::assert_eq!(baseline, rendered);
+    }
+
+    #[test]
+    fn render_task_decomposition_block_matches_committed_golden() {
+        let rows = sample_task_rows();
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/golden/issue_body/task_table.golden.md"
+        ))
+        .expect("read golden fixture");
+        let rendered = render_task_decomposition_block(&rows).expect("render block");
+        pretty_assertions::assert_eq!(fixture, rendered);
+    }
 
     #[test]
     fn parse_task_table_extracts_rows() {
