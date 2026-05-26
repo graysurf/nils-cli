@@ -604,23 +604,36 @@ pre-migration output.
 
 - **Location**:
   - crates/agent-workflow-primitives/src/heuristic_inbox.rs
-  - crates/agent-workflow-primitives/templates/heuristic_inbox/open.md.tera (new)
-  - crates/agent-workflow-primitives/templates/heuristic_inbox/promoted.md.tera (new)
-  - crates/agent-workflow-primitives/templates/heuristic_inbox/wontfix.md.tera (new)
+  - crates/agent-workflow-primitives/templates/heuristic_inbox/archive.md.tera (new)
+  - crates/agent-workflow-primitives/templates/heuristic_inbox/next_action.md.tera (new)
   - crates/agent-workflow-primitives/tests/golden/heuristic_inbox/ (new fixture dir)
-- **Description**: 2611-line file, strict section schema. Largest
-  and most schema-strict artifact; migrated last so the layer's
-  helpers and golden harness are battle-tested.
+- **Description**: 2611-line file, strict section schema. The crate
+  exposes two Markdown-emitting helpers that build section bodies
+  for the inbox lifecycle: `render_archive_section`
+  (`## Archive` block with archived date, reason, optional durable
+  link) and the inline section construction inside
+  `replace_next_action` (`## Next Action` block carrying the
+  next-action body plus optional `Lifecycle link`). The remaining
+  84 `format!`/`push_str` sites in the file are JSONL parsing,
+  path manipulation, error/log text, and section detection — not
+  Markdown emission. The placeholder template names from the
+  original plan (`open.md.tera`, `promoted.md.tera`,
+  `wontfix.md.tera`) referred to entry shapes that aren't authored
+  by this crate; the inbox lifecycle authors only mutate Archive
+  and Next Action sections inside an existing Markdown document.
 - **Dependencies**:
   - Task 2.8
 - **Complexity**:
-  - 8
+  - 3
 - **Acceptance criteria**:
-  - Heuristic-system entries render byte-identically to capture for
-    at least three entry shapes (open / promoted / wontfix).
-  - Section ordering matches the existing schema exactly.
+  - `render_archive_section` output byte-identical to capture for
+    both the with-link and without-link inputs.
+  - `replace_next_action`'s emitted `## Next Action` section
+    byte-identical to capture for representative inputs (body +
+    optional lifecycle link).
 - **Validation**:
   - `cargo test -p agent-workflow-primitives heuristic_inbox`
+  - `cargo test -p agent-workflow-primitives --test golden_heuristic_inbox`
 
 ## Sprint 3: md-render binary
 
