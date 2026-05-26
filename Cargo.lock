@@ -2176,6 +2176,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-markdown"
+version = "0.23.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "indexmap",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tera",
+ "thiserror",
+]
+
+[[package]]
 name = "nils-memo-cli"
 version = "0.23.0"
 dependencies = [

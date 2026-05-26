@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/nils-common",
+  "crates/nils-markdown",
   "crates/nils-term",
   "crates/nils-test-support",
   "crates/cli-template",

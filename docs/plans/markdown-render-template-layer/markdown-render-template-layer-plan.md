@@ -121,9 +121,11 @@ output and golden fixtures stay byte-identical.
   `serde` (with `derive`), `serde_json`, `indexmap`, `thiserror`,
   `nils-common` (path dep). Dev-deps add `pretty_assertions`,
   `tempfile`, `nils-test-support`. A `bin-cli` Cargo feature is
-  defined and pulls workspace `clap` and `anyhow`; the binary target
-  is declared but `main.rs` is a stub (`fn main() { unreachable!() }`)
-  in this task and is implemented in Sprint 3. Update
+  defined and pulls workspace `clap` and `anyhow` as optional deps
+  (`dep:clap`, `dep:anyhow`); the `[[bin]]` manifest target itself is
+  not declared in Sprint 1 (the `md-render` binary, its source tree,
+  and the workspace-bins registration land together in Sprint 3 Task
+  3.1 to avoid registering a no-op binary in cargo metadata). Update
   `release/crates-io-publish-order.txt` to list `nils-markdown`
   immediately after `nils-term` and `nils-common`.
 - **Dependencies**:
@@ -133,8 +135,9 @@ output and golden fixtures stay byte-identical.
 - **Acceptance criteria**:
   - `cargo build -p nils-markdown` succeeds.
   - `cargo build -p nils-markdown --features bin-cli` succeeds.
-  - `bash scripts/workspace-bins.sh` does not yet report `md-render`
-    (binary main is gated to Sprint 3).
+  - `bash scripts/workspace-bins.sh` does not list `md-render`
+    (the `[[bin]]` manifest target lands in Sprint 3 Task 3.1; this
+    keeps cargo metadata's bin list free of no-op binaries).
   - `bash scripts/publish-crates.sh --dry-run --crates "nils-common nils-term nils-markdown"`
     succeeds.
 - **Validation**:
