@@ -361,6 +361,8 @@ reflect a real, reachable target.
     `evidence/sprint-3-sweep/` inside the worktree (or use
     `nils-cli agent-out project --topic gitlab-com-test-migration --mkdir`
     if the project-specific output dir is preferred).
+  - Note: the `evidence/sprint-3-sweep/` directory was removed post-closeout;
+    the original captured envelopes are preserved in the PR #521 diff.
 - **Dependencies**:
   - Task 3.1
   - Task 1.6 (so source fixtures point at the new sandbox)
