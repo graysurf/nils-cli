@@ -347,24 +347,38 @@ pre-migration output.
   - `cargo test -p plan-issue-cli issue_body`
   - `cargo test -p plan-issue-cli --test golden`
 
-### Task 2.2: Migrate `plan-issue-cli/src/task_spec.rs`
+### Task 2.2: Confirm `plan-issue-cli/src/task_spec.rs` TSV / Markdown boundary
 
 - **Location**:
   - crates/plan-issue-cli/src/task_spec.rs
-  - crates/plan-issue-cli/templates/task_spec.md.tera (new)
-  - crates/plan-issue-cli/tests/golden/task_spec/ (new fixture dir)
-- **Description**: 28 inline Markdown sites. Exercises the `md_cell`
-  filter on task tables.
+- **Description**: Pre-execution scoping for Sprint 2 found that
+  `task_spec.rs` is a TSV emitter, not a Markdown emitter: its only
+  string output is `render_tsv`, and the two
+  `nils_common::markdown::canonicalize_table_cell` calls inside
+  (lines around `notes.join("; ")` and `notes: ...row.notes`) make
+  the resulting `TaskSpecRow.notes` field TSV-cell-safe (newline
+  collapse, pipe escape). The original plan's "28 inline Markdown
+  sites" count does not match the file. Task 2.2 is now an audit and
+  documentation step: confirm no Markdown emission lives here, add
+  a module-level doc note so future readers do not confuse the
+  pre-canonicalization with Markdown escaping, and rely on
+  `canonicalize_table_cell` idempotency
+  ([`nils-common` markdown helpers contract v1]) so Task 2.4's
+  template-side `| md_cell` filter does not double-escape the same
+  notes downstream in `render::render_plan_issue_body`.
 - **Dependencies**:
   - Task 2.1
 - **Complexity**:
-  - 5
+  - 1
 - **Acceptance criteria**:
-  - Task-spec rendering is byte-identical to pre-migration capture.
-  - Golden coverage includes at least one row whose source contains a
-    literal pipe character to prove `md_cell` is wired correctly.
+  - `task_spec.rs` carries a module-level doc note that calls out
+    the TSV-only contract and the
+    `canonicalize_table_cell` idempotency with `md_cell`.
+  - No production behavior change: `render_tsv` output stays
+    byte-stable for all inputs.
+  - `cargo test -p nils-plan-issue-cli` stays green.
 - **Validation**:
-  - `cargo test -p plan-issue-cli task_spec`
+  - `cargo test -p nils-plan-issue-cli`
 
 ### Task 2.3: Migrate `plan-issue-cli/src/lifecycle_vnext/templates.rs`
 
