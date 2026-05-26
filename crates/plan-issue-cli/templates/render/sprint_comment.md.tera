@@ -1,0 +1,37 @@
+{{ heading }}
+
+- Sprint: {{ sprint }} ({{ sprint_name }})
+- Tasks in sprint: {{ task_count }}
+- Note: {{ lead }}
+{%- if mode == "start" %}
+- Execution Mode comes from current Task Decomposition for each sprint task.
+{%- else %}
+- PR values come from current Task Decomposition; unresolved tasks remain `TBD` until PRs are linked.
+{%- endif %}
+{%- if approval_comment_url %}
+- Approval comment URL: {{ approval_comment_url }}
+{%- endif %}
+
+{% if mode == "start" -%}
+| Task | Summary | Execution Mode |
+| --- | --- | --- |
+{%- for row in task_rows %}
+| {{ row.task }} | {{ row.summary }} | {{ row.third_col }} |
+{%- endfor %}
+{%- if sprint_section %}
+
+{{ sprint_section }}
+{%- endif %}
+{%- else -%}
+| Task | Summary | PR |
+| --- | --- | --- |
+{%- for row in task_rows %}
+| {{ row.task }} | {{ row.summary }} | {{ row.third_col }} |
+{%- endfor %}
+{%- endif %}
+{%- if note_text %}
+
+## Main-Agent Notes
+
+{{ note_text }}
+{%- endif %}

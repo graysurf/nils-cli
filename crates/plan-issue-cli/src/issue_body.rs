@@ -4,28 +4,18 @@ use nils_common::markdown as common_markdown;
 use nils_markdown::{Engine, RenderError};
 use serde::Serialize;
 
-// Task 2.4 will switch `render::render_plan_issue_body` to call
-// `render_task_decomposition_block` instead of stitching the three
-// row helpers manually. Until then the template + view types live
-// here exercised only by the unit tests, so silence dead_code on
-// the new items in the lib target.
-
 /// Template body for the task-decomposition block. Bundled with
 /// `include_str!` per Decision 13 in the source document so the
 /// asset travels with the binary and no runtime filesystem lookup
 /// is required.
-#[allow(dead_code)]
 const TASK_DECOMPOSITION_TEMPLATE: &str = include_str!("../templates/issue_body.md.tera");
-#[allow(dead_code)]
 const TASK_DECOMPOSITION_TEMPLATE_NAME: &str = "issue_body";
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 struct TaskTableView<'a> {
     rows: Vec<TaskRowView<'a>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 struct TaskRowView<'a> {
     task: &'a str,
@@ -61,11 +51,6 @@ impl<'a> From<&'a TaskRow> for TaskRowView<'a> {
 /// concatenation of [`task_decomposition_header_row`],
 /// [`task_decomposition_separator_row`], and
 /// [`format_task_decomposition_row`] for the same rows.
-///
-/// Sprint 2 Task 2.1 ships this function as the migration entry
-/// point; Task 2.4 will switch `render::render_plan_issue_body` to
-/// call it instead of stitching the three row helpers manually.
-#[allow(dead_code)]
 pub fn render_task_decomposition_block(rows: &[TaskRow]) -> Result<String, RenderError> {
     let mut engine = Engine::builder().build();
     engine.register_template(
@@ -225,10 +210,12 @@ pub fn parse_task_table(body: &str) -> Result<TaskTable, String> {
     })
 }
 
+#[cfg(test)]
 pub fn task_decomposition_header_row() -> String {
     format!("| {} |", TASK_DECOMPOSITION_COLUMNS.join(" | "))
 }
 
+#[cfg(test)]
 pub fn task_decomposition_separator_row() -> String {
     let separators = std::iter::repeat_n("---", TASK_DECOMPOSITION_COLUMNS.len())
         .collect::<Vec<_>>()

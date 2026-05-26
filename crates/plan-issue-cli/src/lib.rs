@@ -5,15 +5,15 @@ pub mod dispatch_record;
 mod execute;
 mod forge_cli_adapter;
 mod github;
-mod issue_body;
+pub mod issue_body;
 pub mod lifecycle_record;
 pub mod lifecycle_vnext;
 pub mod output;
 mod provider;
-mod render;
+pub mod render;
 pub mod runtime_layout;
 pub mod state;
-mod task_spec;
+pub mod task_spec;
 pub mod tracking;
 
 use std::ffi::OsString;
