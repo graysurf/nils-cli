@@ -2,14 +2,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use api_testing_core::cli_history::{
-    RequestCallHistoryAuth, RequestCallHistoryFlag, RequestCallHistoryRecord,
-    build_request_call_history_record,
+    RequestCallHistoryAppend, RequestCallHistoryFlag, append_request_call_history_best_effort,
 };
-use api_testing_core::{Result, auth_env, cli_endpoint, cli_util, config, history, jwt};
+use api_testing_core::{Result, auth_env, cli_endpoint, cli_util, config, history};
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
 
 use crate::cli::{CallArgs, OutputFormat};
-use api_testing_core::cli_util::{history_timestamp_now, parse_u64_default, trim_non_empty};
+use api_testing_core::cli_util::{parse_u64_default, trim_non_empty};
 
 const CALL_SCHEMA_VERSION: &str = "cli.api-websocket.call.v1";
 
@@ -107,42 +106,18 @@ pub(crate) fn validate_bearer_token_if_jwt(
     token_name: &str,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    let enabled = cli_util::bool_from_env(
-        std::env::var("WS_JWT_VALIDATE_ENABLED").ok(),
-        "WS_JWT_VALIDATE_ENABLED",
-        true,
-        Some("api-websocket"),
+    auth_env::validate_cli_bearer_jwt(
+        bearer_token,
+        auth_source,
+        token_name,
+        auth_env::CliJwtValidationEnv {
+            enabled_var: "WS_JWT_VALIDATE_ENABLED",
+            strict_var: "WS_JWT_VALIDATE_STRICT",
+            leeway_var: "WS_JWT_VALIDATE_LEEWAY_SECONDS",
+            tool_label: "api-websocket",
+        },
         stderr,
-    );
-    let strict = cli_util::bool_from_env(
-        std::env::var("WS_JWT_VALIDATE_STRICT").ok(),
-        "WS_JWT_VALIDATE_STRICT",
-        false,
-        Some("api-websocket"),
-        stderr,
-    );
-    let leeway_seconds =
-        parse_u64_default(std::env::var("WS_JWT_VALIDATE_LEEWAY_SECONDS").ok(), 0, 0);
-
-    let label = match auth_source {
-        AuthSourceUsed::TokenProfile => format!("token profile '{token_name}'"),
-        AuthSourceUsed::EnvFallback { env_name } => env_name.to_string(),
-        AuthSourceUsed::None => "token".to_string(),
-    };
-
-    let opts = jwt::JwtValidationOptions {
-        enabled,
-        strict,
-        leeway_seconds: i64::try_from(leeway_seconds).unwrap_or(i64::MAX),
-    };
-
-    match jwt::check_bearer_jwt(bearer_token, &label, opts)? {
-        jwt::JwtCheck::Ok => Ok(()),
-        jwt::JwtCheck::Warn(msg) => {
-            let _ = writeln!(stderr, "api-websocket: warning: {msg}");
-            Ok(())
-        }
-    }
+    )
 }
 
 pub(crate) fn cmd_call(
@@ -475,25 +450,6 @@ struct CallHistoryContext {
 }
 
 fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32, stderr: &mut dyn Write) {
-    if !ctx.enabled {
-        return;
-    }
-
-    let history_writer = &ctx.history_writer;
-    let stamp = history_timestamp_now().unwrap_or_default();
-    let auth = match &ctx.auth_source_used {
-        AuthSourceUsed::TokenProfile => RequestCallHistoryAuth::HeaderAndFlag {
-            header_key: "token",
-            header_value: &ctx.token_name_for_log,
-            flag_name: "token",
-            flag_value: &ctx.token_name_for_log,
-        },
-        AuthSourceUsed::EnvFallback { env_name } => RequestCallHistoryAuth::HeaderOnly {
-            key: "auth",
-            value: env_name,
-        },
-        AuthSourceUsed::None => RequestCallHistoryAuth::None,
-    };
     let json_flag = [RequestCallHistoryFlag::raw("format", "json")];
     let extra_flags: &[RequestCallHistoryFlag<'_>] =
         if matches!(ctx.output_format, OutputFormat::Json) {
@@ -502,26 +458,25 @@ fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32, stderr: 
             &[]
         };
 
-    let record = build_request_call_history_record(RequestCallHistoryRecord {
-        stamp: &stamp,
-        exit_code,
-        setup_dir: &ctx.setup_dir,
-        invocation_dir: &ctx.invocation_dir,
-        command_name: "api-websocket",
-        endpoint_label_used: &ctx.endpoint_label_used,
-        endpoint_value_used: &ctx.endpoint_value_used,
-        log_url: ctx.log_url,
-        auth,
-        request_arg: &ctx.request_arg,
-        extra_flags,
-    });
-
-    if let Err(err) = history_writer.append(&record) {
-        let _ = writeln!(
-            stderr,
-            "warning: failed to append api-websocket history: {err}"
-        );
-    }
+    append_request_call_history_best_effort(
+        RequestCallHistoryAppend {
+            enabled: ctx.enabled,
+            history_writer: &ctx.history_writer,
+            exit_code,
+            setup_dir: &ctx.setup_dir,
+            invocation_dir: &ctx.invocation_dir,
+            command_name: "api-websocket",
+            endpoint_label_used: &ctx.endpoint_label_used,
+            endpoint_value_used: &ctx.endpoint_value_used,
+            log_url: ctx.log_url,
+            auth_source: &ctx.auth_source_used,
+            token_name_for_log: &ctx.token_name_for_log,
+            request_arg: &ctx.request_arg,
+            extra_flags,
+            warning_label: "api-websocket",
+        },
+        stderr,
+    );
 }
 
 fn maybe_print_failure_body_to_stderr(

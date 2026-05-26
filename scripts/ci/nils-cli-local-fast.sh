@@ -189,10 +189,13 @@ metadata_raw = subprocess.check_output(
 metadata = json.loads(metadata_raw)
 
 crate_roots = []
+package_has_doctests = {}
 for package in metadata["packages"]:
     manifest = pathlib.Path(package["manifest_path"])
     root = manifest.parent.relative_to(repo).as_posix()
+    has_doctests = any(target.get("doctest") for target in package.get("targets", []))
     crate_roots.append((root, package["name"]))
+    package_has_doctests[package["name"]] = has_doctests
 crate_roots.sort(key=lambda item: len(item[0]), reverse=True)
 
 shared_packages = {"nils-common", "nils-term", "nils-test-support"}
@@ -253,6 +256,9 @@ for path in changed:
     emit("changed", path)
 for package_name in sorted(packages):
     emit("package", package_name)
+for package_name in sorted(packages):
+    if package_has_doctests.get(package_name, False):
+        emit("package_doctest", package_name)
 for reason in sorted(set(workspace_reasons)):
     emit("reason", reason)
 for shell_file in sorted(set(shell_files)):
@@ -263,6 +269,7 @@ mode=""
 docs_checks=0
 changed_count=0
 declare -a packages=()
+declare -a package_doctests=()
 declare -a reasons=()
 declare -a changed_files=()
 declare -a shell_files=()
@@ -273,6 +280,7 @@ while IFS=$'\t' read -r key value; do
     docs_checks) docs_checks="$value" ;;
     changed_count) changed_count="$value" ;;
     package) packages+=("$value") ;;
+    package_doctest) package_doctests+=("$value") ;;
     reason) reasons+=("$value") ;;
     changed) changed_files+=("$value") ;;
     shell) shell_files+=("$value") ;;
@@ -294,6 +302,9 @@ print_plan() {
   done
   for package in "${packages[@]}"; do
     echo "LOCAL_FAST_PACKAGE=$package"
+  done
+  for package in "${package_doctests[@]}"; do
+    echo "LOCAL_FAST_PACKAGE_DOCTEST=$package"
   done
   for reason in "${reasons[@]}"; do
     echo "LOCAL_FAST_REASON=$reason"
@@ -355,6 +366,17 @@ select_test_runner() {
   esac
 }
 
+package_has_doctest() {
+  local package="$1"
+  local candidate
+  for candidate in "${package_doctests[@]}"; do
+    if [[ "$candidate" == "$package" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 case "$mode" in
   none)
     echo "ok: local-fast found no changed files"
@@ -405,7 +427,9 @@ done
 for package in "${packages[@]}"; do
   if [[ "$test_runner" == "nextest" ]]; then
     run cargo nextest run --profile ci -p "$package"
-    run cargo test -p "$package" --doc
+    if package_has_doctest "$package"; then
+      run cargo test -p "$package" --doc
+    fi
   else
     run cargo test -p "$package"
   fi

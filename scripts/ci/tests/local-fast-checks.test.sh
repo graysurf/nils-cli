@@ -35,12 +35,44 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1"
+  local haystack="$2"
+  local needle="$3"
+  if grep -qF "$needle" <<<"$haystack"; then
+    echo "FAIL: $label"
+    echo "unexpected: $needle"
+    echo "$haystack"
+    exit 1
+  fi
+}
+
 assert_package_crate_uses_package_mode() {
   echo "== package crate uses package mode =="
   local output
   output="$(plan_for --changed-file crates/plan-tooling/src/validate.rs)"
   assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=packages"
   assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE=nils-plan-tooling"
+  echo "ok"
+}
+
+assert_bin_only_package_skips_doctests() {
+  echo "== bin-only package skips doctests =="
+  local output
+  output="$(plan_for --changed-file crates/api-grpc/src/commands/call.rs)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=packages"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE=nils-api-grpc"
+  assert_not_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE_DOCTEST=nils-api-grpc"
+  echo "ok"
+}
+
+assert_library_package_keeps_doctests() {
+  echo "== library package keeps doctests =="
+  local output
+  output="$(plan_for --changed-file crates/api-testing-core/src/auth_env.rs)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=packages"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE=nils-api-testing-core"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE_DOCTEST=nils-api-testing-core"
   echo "ok"
 }
 
@@ -118,6 +150,8 @@ assert_shell_script_is_reported() {
 }
 
 assert_package_crate_uses_package_mode
+assert_bin_only_package_skips_doctests
+assert_library_package_keeps_doctests
 assert_shared_crate_escalates_to_workspace
 assert_docs_only_uses_docs_mode
 assert_docs_only_plan_does_not_require_cargo
