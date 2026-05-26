@@ -1,0 +1,7 @@
+## Plan Status Snapshot
+
+- Total tasks: {{ total }}
+- planned: {{ planned }}
+- in-progress: {{ in_progress }}
+- blocked: {{ blocked }}
+- done: {{ done }}

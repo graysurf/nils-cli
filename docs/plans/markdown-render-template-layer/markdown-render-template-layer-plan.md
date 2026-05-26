@@ -510,23 +510,39 @@ pre-migration output.
 
 - **Location**:
   - crates/plan-issue-cli/src/execute.rs
-  - crates/plan-issue-cli/templates/execute/state_update.md.tera (new)
-  - crates/plan-issue-cli/templates/execute/follow_up.md.tera (new)
+  - crates/plan-issue-cli/templates/execute/plan_status_comment.md.tera (new)
+  - crates/plan-issue-cli/templates/execute/subagent_prompt.md.tera (new)
   - crates/plan-issue-cli/tests/golden/execute/ (new fixture dir)
-- **Description**: Longest plan-issue surface (151 inline sites).
-  Migrated last in this crate so earlier patterns are proven. Should
-  start only after Task 2.5b (the rest of the lifecycle_record
-  migration) lands; the formal dependency stays "Task 2.5" because
-  plan-tooling validation only accepts `Task N.M` references.
+- **Description**: execute.rs has 151 `format!`/`push` sites across
+  6121 lines, but most are JSON value construction, file paths,
+  error/log strings, and `KEY=value` dry-run guides — not
+  provider-visible Markdown. Only two sites emit Markdown to
+  providers or to-disk consumers and need template migration:
+  `render_plan_status_comment` (5-line plan-status snapshot used by
+  the local previews) and the inline subagent task-prompt body
+  inside `write_subagent_prompts` (header + metadata bullets +
+  Lane Tasks section, written to disk per subagent lane). The
+  placeholder templates from the original plan
+  (`state_update.md.tera`, `follow_up.md.tera`) referred to
+  emitters that do not exist in this file; the actual checkpoint
+  state/session/validation/review comments are produced by
+  `lifecycle_record::render_record_post_comment_with_display`
+  (already templated in Tasks 2.5 / 2.5b) and are not re-emitted in
+  `execute.rs`. Start only after Task 2.5b lands; the formal
+  dependency stays "Task 2.5" because plan-tooling validation only
+  accepts `Task N.M` references.
 - **Dependencies**:
   - Task 2.5
 - **Complexity**:
-  - 7
+  - 3
 - **Acceptance criteria**:
-  - Execution-state and follow-up comment output is byte-identical
-    to capture for representative inputs.
+  - `render_plan_status_comment` output byte-identical to capture
+    for representative inputs (empty rows, mixed-status rows).
+  - Subagent prompt body output byte-identical to capture for at
+    least one task row.
 - **Validation**:
   - `cargo test -p plan-issue-cli execute`
+  - `cargo test -p plan-issue-cli --test golden_execute`
 
 ### Task 2.7: Migrate `agent-workflow-primitives/src/review_specialists.rs`
 
