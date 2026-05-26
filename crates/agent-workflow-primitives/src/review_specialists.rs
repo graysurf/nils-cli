@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
+use nils_markdown::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -14,6 +15,83 @@ use crate::common::{
     write_json_pretty,
 };
 use crate::completion::{self, CompletionShell};
+
+const TERMINAL_TEMPLATE: &str = include_str!("../templates/review_specialists/terminal.md.tera");
+const TERMINAL_TEMPLATE_NAME: &str = "review_specialists_terminal";
+
+const REPORT_TEMPLATE: &str = include_str!("../templates/review_specialists/report.md.tera");
+const REPORT_TEMPLATE_NAME: &str = "review_specialists_report";
+
+const ISSUE_BODY_TEMPLATE: &str =
+    include_str!("../templates/review_specialists/issue_body.md.tera");
+const ISSUE_BODY_TEMPLATE_NAME: &str = "review_specialists_issue_body";
+
+const PR_COMMENT_TEMPLATE: &str =
+    include_str!("../templates/review_specialists/pr_comment.md.tera");
+const PR_COMMENT_TEMPLATE_NAME: &str = "review_specialists_pr_comment";
+
+#[derive(Debug, Serialize)]
+struct TerminalView {
+    displayed: usize,
+    suppressed: usize,
+    merged: usize,
+    threshold: String,
+    findings: Vec<TerminalFindingRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalFindingRow {
+    severity: String,
+    confidence: String,
+    specialist: String,
+    location: String,
+    summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportView {
+    displayed: usize,
+    suppressed: usize,
+    merged: usize,
+    dispatch_rows: Vec<DispatchRow>,
+    findings: Vec<ReportFindingRow>,
+    red_team_status: &'static str,
+    red_team_reason: String,
+    input_rows: usize,
+    input_files: String,
+    residual_block: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DispatchRow {
+    specialist: String,
+    status: &'static str,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportFindingRow {
+    severity: String,
+    confidence: String,
+    specialist: String,
+    location: String,
+    summary: String,
+    recommendation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct IssueBodyView {
+    displayed: usize,
+    suppressed: usize,
+    findings_block: String,
+    input_rows: usize,
+    input_files: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PrCommentView {
+    findings_block: String,
+}
 
 const FINDINGS_SCHEMA: &str = "review-specialists.findings.v1";
 const MERGED_SCHEMA: &str = "review-specialists.merged.v1";
@@ -783,204 +861,161 @@ fn render_profile(
 }
 
 fn render_terminal(merged: &MergeResult, context: RenderContext) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "review-specialists: displayed={} suppressed={} merged={} threshold={:.2}",
-        merged.counts.displayed,
-        merged.counts.suppressed,
-        merged.counts.merged,
-        merged.display_threshold
-    ));
-    if merged.findings.is_empty() {
-        lines.push("No displayed specialist findings.".to_string());
-    } else {
-        for finding in &merged.findings {
-            lines.push(format!(
-                "- {} {:.2} {} {}: {}",
-                finding.primary.severity,
-                finding.primary.confidence,
-                finding.primary.specialist,
-                format_location(&finding.primary, &context),
-                finding.primary.summary
-            ));
-        }
-    }
-    lines.join("\n") + "\n"
+    let view = TerminalView {
+        displayed: merged.counts.displayed,
+        suppressed: merged.counts.suppressed,
+        merged: merged.counts.merged,
+        threshold: format!("{:.2}", merged.display_threshold),
+        findings: merged
+            .findings
+            .iter()
+            .map(|finding| TerminalFindingRow {
+                severity: finding.primary.severity.to_string(),
+                confidence: format!("{:.2}", finding.primary.confidence),
+                specialist: finding.primary.specialist.clone(),
+                location: format_location(&finding.primary, &context),
+                summary: finding.primary.summary.clone(),
+            })
+            .collect(),
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(TERMINAL_TEMPLATE_NAME, TERMINAL_TEMPLATE)
+        .expect("terminal template registers");
+    engine
+        .render(TERMINAL_TEMPLATE_NAME, &view)
+        .expect("terminal template renders")
 }
 
 fn render_report(merged: &MergeResult, context: RenderContext) -> String {
-    let mut lines = vec![
-        "# Specialist Review Report".to_string(),
-        "".to_string(),
-        "## Scope".to_string(),
-        "".to_string(),
-        "- Base ref: not provided".to_string(),
-        format!(
-            "- Diff summary: {} displayed / {} suppressed / {} merged findings",
-            merged.counts.displayed, merged.counts.suppressed, merged.counts.merged
-        ),
-        "- Changed files: see evidence artifacts or scope output".to_string(),
-        "- Diff lines: see scope output when provided".to_string(),
-        "".to_string(),
-        "## Specialist Dispatch".to_string(),
-        "".to_string(),
-        "| Specialist | Status | Reason |".to_string(),
-        "| --- | --- | --- |".to_string(),
-    ];
-
-    for specialist in INITIAL_SPECIALISTS {
-        let stat = merged.specialist_stats.get(*specialist);
-        let status = if stat.map(|item| item.input).unwrap_or(0) > 0 {
-            "selected"
-        } else {
-            "skipped"
-        };
-        let reason = stat
-            .map(|item| format!("{} merged finding(s)", item.input))
-            .unwrap_or_else(|| "no normalized findings".to_string());
-        lines.push(format!("| {specialist} | {status} | {reason} |"));
-    }
-
-    lines.extend([
-        "".to_string(),
-        "## Findings".to_string(),
-        "".to_string(),
-        "| Severity | Confidence | Specialist | Path | Summary | Recommendation |".to_string(),
-        "| --- | ---: | --- | --- | --- | --- |".to_string(),
-    ]);
-    if merged.findings.is_empty() {
-        lines.push(
-            "| none | 0.00 | none | none | No displayed specialist findings. | none |".to_string(),
-        );
-    } else {
-        for finding in &merged.findings {
-            lines.push(format!(
-                "| {} | {:.2} | {} | {} | {} | {} |",
-                finding.primary.severity,
-                finding.primary.confidence,
-                finding.primary.specialist,
-                markdown_escape(&format_location(&finding.primary, &context)),
-                markdown_escape(&finding.primary.summary),
-                markdown_escape(&finding.primary.recommendation),
-            ));
-        }
-    }
-
-    lines.extend([
-        "".to_string(),
-        "## Red Team".to_string(),
-        "".to_string(),
-        format!(
-            "- Status: {}",
-            if merged.red_team.required {
-                "required"
+    let dispatch_rows: Vec<DispatchRow> = INITIAL_SPECIALISTS
+        .iter()
+        .map(|specialist| {
+            let stat = merged.specialist_stats.get(*specialist);
+            let status = if stat.map(|item| item.input).unwrap_or(0) > 0 {
+                "selected"
             } else {
-                "not required"
+                "skipped"
+            };
+            let reason = stat
+                .map(|item| format!("{} merged finding(s)", item.input))
+                .unwrap_or_else(|| "no normalized findings".to_string());
+            DispatchRow {
+                specialist: (*specialist).to_string(),
+                status,
+                reason,
             }
-        ),
-        format!(
-            "- Activation reason: {}",
-            if merged.red_team.reasons.is_empty() {
-                "none".to_string()
-            } else {
-                merged.red_team.reasons.join(", ")
-            }
-        ),
-        "- Added findings: none generated by this primitive".to_string(),
-        "".to_string(),
-        "## Evidence Reviewed".to_string(),
-        "".to_string(),
-        format!("- Input rows: {}", merged.counts.input_rows),
-        format!("- Input files: {}", merged.input_files.join(", ")),
-        "- Validation commands: caller-provided".to_string(),
-        "- Logs/artifacts: caller-provided".to_string(),
-        "".to_string(),
-        "## Residual Risk".to_string(),
-        "".to_string(),
-    ]);
-    if merged.suppressed_findings.is_empty() {
-        lines.push("- Low-confidence concerns: none suppressed by threshold".to_string());
+        })
+        .collect();
+
+    let findings: Vec<ReportFindingRow> = merged
+        .findings
+        .iter()
+        .map(|finding| ReportFindingRow {
+            severity: finding.primary.severity.to_string(),
+            confidence: format!("{:.2}", finding.primary.confidence),
+            specialist: finding.primary.specialist.clone(),
+            location: markdown_escape(&format_location(&finding.primary, &context)),
+            summary: markdown_escape(&finding.primary.summary),
+            recommendation: markdown_escape(&finding.primary.recommendation),
+        })
+        .collect();
+
+    let red_team_status = if merged.red_team.required {
+        "required"
     } else {
-        for finding in &merged.suppressed_findings {
-            lines.push(format!(
-                "- {} ({:.2}) {}: {}",
-                finding.primary.severity,
-                finding.primary.confidence,
-                format_location(&finding.primary, &context),
-                finding.primary.summary
-            ));
-        }
-    }
-    lines.extend([
-        "- Unverified claims: specialist-authored findings only; no provider mutation performed".to_string(),
-        "- Coverage gaps: validate with repo tests before delivery".to_string(),
-        "".to_string(),
-        "## Recommended Next Step".to_string(),
-        "".to_string(),
-        "- Decision path: caller workflow decides follow-up, merge, or close actions".to_string(),
-        "- Follow-up owner: caller workflow".to_string(),
-        "- Review-evidence record: optional".to_string(),
-        "".to_string(),
-        "Note: this report distinguishes specialist review findings from merge, close, or request-followup decisions. Use `dispatch-pr-review` for those decisions.".to_string(),
-    ]);
-    lines.join("\n") + "\n"
+        "not required"
+    };
+    let red_team_reason = if merged.red_team.reasons.is_empty() {
+        "none".to_string()
+    } else {
+        merged.red_team.reasons.join(", ")
+    };
+
+    let residual_block = if merged.suppressed_findings.is_empty() {
+        "- Low-confidence concerns: none suppressed by threshold".to_string()
+    } else {
+        merged
+            .suppressed_findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "- {} ({:.2}) {}: {}",
+                    finding.primary.severity,
+                    finding.primary.confidence,
+                    format_location(&finding.primary, &context),
+                    finding.primary.summary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let view = ReportView {
+        displayed: merged.counts.displayed,
+        suppressed: merged.counts.suppressed,
+        merged: merged.counts.merged,
+        dispatch_rows,
+        findings,
+        red_team_status,
+        red_team_reason,
+        input_rows: merged.counts.input_rows,
+        input_files: merged.input_files.join(", "),
+        residual_block,
+    };
+
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(REPORT_TEMPLATE_NAME, REPORT_TEMPLATE)
+        .expect("report template registers");
+    engine
+        .render(REPORT_TEMPLATE_NAME, &view)
+        .expect("report template renders")
 }
 
 fn render_issue_body(merged: &MergeResult, context: RenderContext) -> String {
-    let mut lines = vec![
-        "## Current Behavior".to_string(),
-        "".to_string(),
-        format!(
-            "Specialist review produced {} displayed finding(s) and {} low-confidence concern(s).",
-            merged.counts.displayed, merged.counts.suppressed
-        ),
-        "".to_string(),
-        "## Desired Outcome".to_string(),
-        "".to_string(),
-        "Resolve the displayed findings or explicitly document why each is not actionable."
-            .to_string(),
-        "".to_string(),
-        "## Findings".to_string(),
-        "".to_string(),
-    ];
-    if merged.findings.is_empty() {
-        lines.push("No displayed specialist findings.".to_string());
+    let findings_block = if merged.findings.is_empty() {
+        "No displayed specialist findings.".to_string()
     } else {
-        for finding in &merged.findings {
-            lines.push(format!(
-                "- **{}** ({:.2}, {}) {}: {} Recommendation: {}",
-                finding.primary.severity,
-                finding.primary.confidence,
-                finding.primary.specialist,
-                format_location(&finding.primary, &context),
-                finding.primary.summary,
-                finding.primary.recommendation
-            ));
-        }
-    }
-    lines.extend([
-        "".to_string(),
-        "## Checked Evidence".to_string(),
-        "".to_string(),
-        format!("- Input rows: {}", merged.counts.input_rows),
-        format!("- Input files: {}", merged.input_files.join(", ")),
-        "".to_string(),
-        "## Decision".to_string(),
-        "".to_string(),
-        "No provider action was taken by `review-specialists`.".to_string(),
-        "".to_string(),
-        "## Next Action".to_string(),
-        "".to_string(),
-        "Use the owning workflow to repair, defer, or close the findings.".to_string(),
-    ]);
-    lines.join("\n") + "\n"
+        merged
+            .findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "- **{}** ({:.2}, {}) {}: {} Recommendation: {}",
+                    finding.primary.severity,
+                    finding.primary.confidence,
+                    finding.primary.specialist,
+                    format_location(&finding.primary, &context),
+                    finding.primary.summary,
+                    finding.primary.recommendation
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let view = IssueBodyView {
+        displayed: merged.counts.displayed,
+        suppressed: merged.counts.suppressed,
+        findings_block,
+        input_rows: merged.counts.input_rows,
+        input_files: merged.input_files.join(", "),
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(ISSUE_BODY_TEMPLATE_NAME, ISSUE_BODY_TEMPLATE)
+        .expect("issue_body template registers");
+    engine
+        .render(ISSUE_BODY_TEMPLATE_NAME, &view)
+        .expect("issue_body template renders")
 }
 
 fn render_pr_comment(merged: &MergeResult, context: RenderContext) -> String {
-    let mut lines = vec!["## Specialist Review Findings".to_string(), "".to_string()];
-    if merged.findings.is_empty() {
-        lines.push("No displayed specialist findings.".to_string());
+    let findings_block = if merged.findings.is_empty() {
+        "No displayed specialist findings.".to_string()
     } else {
+        let mut lines = Vec::new();
         for finding in &merged.findings {
             lines.push(format!(
                 "- **{}** {}: {} ({:.2}, {})",
@@ -995,13 +1030,16 @@ fn render_pr_comment(merged: &MergeResult, context: RenderContext) -> String {
                 finding.primary.recommendation
             ));
         }
-    }
-    lines.extend([
-        "".to_string(),
-        "This is a deterministic render of specialist findings, not a merge or close decision."
-            .to_string(),
-    ]);
-    lines.join("\n") + "\n"
+        lines.join("\n")
+    };
+    let view = PrCommentView { findings_block };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(PR_COMMENT_TEMPLATE_NAME, PR_COMMENT_TEMPLATE)
+        .expect("pr_comment template registers");
+    engine
+        .render(PR_COMMENT_TEMPLATE_NAME, &view)
+        .expect("pr_comment template renders")
 }
 
 fn render_evidence_json(merged: &MergeResult) -> Result<String, CliError> {
@@ -2027,6 +2065,7 @@ impl ScopeSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn computed_fingerprint_is_stable() {
@@ -2040,5 +2079,217 @@ mod tests {
         assert!(safe_relative_path("src/lib.rs"));
         assert!(!safe_relative_path("../src/lib.rs"));
         assert!(!safe_relative_path("/tmp/src/lib.rs"));
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("review_specialists")
+            .join(name)
+    }
+
+    fn assert_or_bless(name: &str, actual: &str) {
+        let path = fixture_path(name);
+        if std::env::var_os("BLESS_REVIEW_SPECIALISTS_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir fixture dir");
+            std::fs::write(&path, actual).expect("write fixture");
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read fixture {}: {err}", path.display()));
+        pretty_assertions::assert_eq!(expected, actual, "golden mismatch for {name}");
+    }
+
+    fn build_finding(
+        severity: Severity,
+        confidence: f64,
+        specialist: &str,
+        path: &str,
+        line: Option<u64>,
+        summary: &str,
+        recommendation: &str,
+    ) -> MergedFinding {
+        let primary = NormalizedFinding {
+            severity,
+            confidence,
+            path: path.to_string(),
+            line,
+            category: "code".to_string(),
+            summary: summary.to_string(),
+            evidence: format!("evidence for {summary}"),
+            recommendation: recommendation.to_string(),
+            fingerprint: computed_fingerprint(path, line, specialist, summary),
+            specialist: specialist.to_string(),
+            test_suggestion: None,
+            source_file: "fixture.jsonl".to_string(),
+            source_line: 1,
+        };
+        let fingerprint = primary.fingerprint.clone();
+        MergedFinding {
+            fingerprint,
+            primary,
+            confirming_specialists: vec![specialist.to_string()],
+            confirming_count: 1,
+            source_rows: vec![SourceRow {
+                source_file: "fixture.jsonl".to_string(),
+                source_line: 1,
+                specialist: specialist.to_string(),
+                confidence,
+            }],
+        }
+    }
+
+    fn empty_merge_result() -> MergeResult {
+        MergeResult {
+            schema: MERGED_SCHEMA.to_string(),
+            input_files: vec![],
+            display_threshold: DEFAULT_DISPLAY_THRESHOLD,
+            counts: FindingCounts {
+                input_rows: 0,
+                merged: 0,
+                displayed: 0,
+                suppressed: 0,
+            },
+            specialist_stats: BTreeMap::new(),
+            red_team: RedTeamTrigger {
+                required: false,
+                reasons: vec![],
+                diff_lines_gt_200: false,
+                critical_finding: false,
+                forced: false,
+            },
+            findings: vec![],
+            suppressed_findings: vec![],
+        }
+    }
+
+    fn mixed_merge_result() -> MergeResult {
+        let displayed = vec![
+            build_finding(
+                Severity::High,
+                0.85,
+                "testing",
+                "src/lib.rs",
+                Some(42),
+                "Missing test for new branch",
+                "Add a unit test exercising the new branch.",
+            ),
+            build_finding(
+                Severity::Medium,
+                0.72,
+                "maintainability",
+                "src/util.rs",
+                Some(10),
+                "Function is too long",
+                "Split the helper into smaller functions.",
+            ),
+        ];
+        let suppressed = vec![build_finding(
+            Severity::Low,
+            0.45,
+            "performance",
+            "src/main.rs",
+            Some(5),
+            "Allocation inside loop",
+            "Hoist the allocation outside the loop.",
+        )];
+        let mut specialist_stats = BTreeMap::new();
+        specialist_stats.insert(
+            "testing".to_string(),
+            SpecialistStat {
+                input: 1,
+                displayed: 1,
+                suppressed: 0,
+            },
+        );
+        specialist_stats.insert(
+            "maintainability".to_string(),
+            SpecialistStat {
+                input: 1,
+                displayed: 1,
+                suppressed: 0,
+            },
+        );
+        specialist_stats.insert(
+            "performance".to_string(),
+            SpecialistStat {
+                input: 1,
+                displayed: 0,
+                suppressed: 1,
+            },
+        );
+        MergeResult {
+            schema: MERGED_SCHEMA.to_string(),
+            input_files: vec![
+                "findings-a.jsonl".to_string(),
+                "findings-b.jsonl".to_string(),
+            ],
+            display_threshold: DEFAULT_DISPLAY_THRESHOLD,
+            counts: FindingCounts {
+                input_rows: 3,
+                merged: 3,
+                displayed: 2,
+                suppressed: 1,
+            },
+            specialist_stats,
+            red_team: RedTeamTrigger {
+                required: true,
+                reasons: vec!["forced via flag".to_string()],
+                diff_lines_gt_200: false,
+                critical_finding: false,
+                forced: true,
+            },
+            findings: displayed,
+            suppressed_findings: suppressed,
+        }
+    }
+
+    #[test]
+    fn terminal_empty_matches_golden() {
+        let out = render_terminal(&empty_merge_result(), RenderContext::default());
+        assert_or_bless("terminal_empty.md", &out);
+    }
+
+    #[test]
+    fn terminal_mixed_matches_golden() {
+        let out = render_terminal(&mixed_merge_result(), RenderContext::default());
+        assert_or_bless("terminal_mixed.md", &out);
+    }
+
+    #[test]
+    fn report_empty_matches_golden() {
+        let out = render_report(&empty_merge_result(), RenderContext::default());
+        assert_or_bless("report_empty.md", &out);
+    }
+
+    #[test]
+    fn report_mixed_matches_golden() {
+        let out = render_report(&mixed_merge_result(), RenderContext::default());
+        assert_or_bless("report_mixed.md", &out);
+    }
+
+    #[test]
+    fn issue_body_empty_matches_golden() {
+        let out = render_issue_body(&empty_merge_result(), RenderContext::default());
+        assert_or_bless("issue_body_empty.md", &out);
+    }
+
+    #[test]
+    fn issue_body_mixed_matches_golden() {
+        let out = render_issue_body(&mixed_merge_result(), RenderContext::default());
+        assert_or_bless("issue_body_mixed.md", &out);
+    }
+
+    #[test]
+    fn pr_comment_empty_matches_golden() {
+        let out = render_pr_comment(&empty_merge_result(), RenderContext::default());
+        assert_or_bless("pr_comment_empty.md", &out);
+    }
+
+    #[test]
+    fn pr_comment_mixed_matches_golden() {
+        let out = render_pr_comment(&mixed_merge_result(), RenderContext::default());
+        assert_or_bless("pr_comment_mixed.md", &out);
     }
 }

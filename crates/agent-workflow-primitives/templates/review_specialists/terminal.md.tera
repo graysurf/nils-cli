@@ -1,0 +1,8 @@
+review-specialists: displayed={{ displayed }} suppressed={{ suppressed }} merged={{ merged }} threshold={{ threshold }}
+{%- if findings %}
+{%- for finding in findings %}
+- {{ finding.severity }} {{ finding.confidence }} {{ finding.specialist }} {{ finding.location }}: {{ finding.summary }}
+{%- endfor %}
+{%- else %}
+No displayed specialist findings.
+{%- endif %}

@@ -548,19 +548,39 @@ pre-migration output.
 
 - **Location**:
   - crates/agent-workflow-primitives/src/review_specialists.rs
-  - crates/agent-workflow-primitives/templates/review_specialists.md.tera (new)
+  - crates/agent-workflow-primitives/templates/review_specialists/terminal.md.tera (new)
+  - crates/agent-workflow-primitives/templates/review_specialists/report.md.tera (new)
+  - crates/agent-workflow-primitives/templates/review_specialists/issue_body.md.tera (new)
+  - crates/agent-workflow-primitives/templates/review_specialists/pr_comment.md.tera (new)
   - crates/agent-workflow-primitives/Cargo.toml (add `nils-markdown` dep)
   - crates/agent-workflow-primitives/tests/golden/review_specialists/ (new fixture dir)
-- **Description**: First cross-crate consumer; proves the layer is
-  reusable outside `plan-issue-cli`. 59 inline sites.
+- **Description**: First cross-crate consumer of `nils-markdown`;
+  proves the layer is reusable outside `plan-issue-cli`. The file
+  exposes four render profiles dispatched from `render_profile`:
+  `render_terminal` (line-oriented summary for stdout),
+  `render_report` (full Specialist Review Report with multiple
+  Markdown sections, two tables, and conditional risk/recommendation
+  blocks), `render_issue_body` (issue-body shape), and
+  `render_pr_comment` (PR-comment summary). Each profile gets its
+  own template under `templates/review_specialists/`. The fifth
+  profile `Evidence` emits JSON via `render_evidence_json` and stays
+  in Rust — JSON is outside the Tera template layer's scope. The
+  placeholder path `templates/review_specialists.md.tera` in the
+  original plan referred to a single file, but the per-profile split
+  produces cleaner view structs.
 - **Dependencies**:
   - Task 2.6
 - **Complexity**:
   - 5
 - **Acceptance criteria**:
-  - Merged specialist report output byte-identical to capture.
+  - One byte-identical golden fixture per Markdown profile (terminal
+    / report / issue_body / pr_comment) for representative inputs
+    (no findings, mixed-severity findings with suppressed entries).
+  - The four Rust render functions collapse inline `format!`/
+    `push_str` chains into view-struct preparation only.
 - **Validation**:
   - `cargo test -p agent-workflow-primitives review_specialists`
+  - `cargo test -p agent-workflow-primitives --test golden_review_specialists`
 
 ### Task 2.8: Migrate `agent-workflow-primitives/src/repo_retro.rs`
 

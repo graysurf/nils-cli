@@ -1,0 +1,24 @@
+## Current Behavior
+
+Specialist review produced {{ displayed }} displayed finding(s) and {{ suppressed }} low-confidence concern(s).
+
+## Desired Outcome
+
+Resolve the displayed findings or explicitly document why each is not actionable.
+
+## Findings
+
+{{ findings_block }}
+
+## Checked Evidence
+
+- Input rows: {{ input_rows }}
+- Input files: {{ input_files }}
+
+## Decision
+
+No provider action was taken by `review-specialists`.
+
+## Next Action
+
+Use the owning workflow to repair, defer, or close the findings.
