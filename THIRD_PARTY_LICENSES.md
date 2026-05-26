@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `44d5eebd7c33137172f1c6278106bfd816eb8dacfa8793fc246b4b5fa6143e30`
+- Cargo.lock SHA256: `6dc56bc0901ba9c2de4f6799623b373a61d5e3ec99a6ffaa7fef311be81f7313`
 - Third-party crates (`source != null`): 465
 - Workspace crates (`source == null`, excluded below): 31
 
@@ -177,7 +177,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | hermit-abi | 0.5.2 | MIT OR Apache-2.0 | crates.io |
 | hex | 0.4.3 | MIT OR Apache-2.0 | crates.io |
 | hifijson | 0.5.0 | MIT | crates.io |
-| http | 1.4.0 | MIT OR Apache-2.0 | crates.io |
+| http | 1.4.1 | MIT OR Apache-2.0 | crates.io |
 | http-body | 1.0.1 | MIT | crates.io |
 | http-body-util | 0.1.3 | MIT | crates.io |
 | httparse | 1.10.1 | MIT OR Apache-2.0 | crates.io |
