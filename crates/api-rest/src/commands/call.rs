@@ -2,13 +2,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use api_testing_core::cli_history::{
-    RequestCallHistoryAuth, RequestCallHistoryRecord, build_request_call_history_record,
+    RequestCallHistoryAppend, append_request_call_history_best_effort,
 };
 use api_testing_core::{Result, auth_env, cli_endpoint, cli_io, cli_util, config, history, jwt};
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
 
 use crate::cli::CallArgs;
-use api_testing_core::cli_util::{history_timestamp_now, parse_u64_default, trim_non_empty};
+use api_testing_core::cli_util::{parse_u64_default, trim_non_empty};
 
 #[derive(Debug, Clone)]
 pub(crate) struct EndpointSelection {
@@ -344,43 +344,25 @@ struct CallHistoryContext {
 }
 
 fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32, stderr: &mut dyn Write) {
-    if !ctx.enabled {
-        return;
-    }
-
-    let history_writer = &ctx.history_writer;
-    let stamp = history_timestamp_now().unwrap_or_default();
-    let auth = match &ctx.auth_source_used {
-        AuthSourceUsed::TokenProfile => RequestCallHistoryAuth::HeaderAndFlag {
-            header_key: "token",
-            header_value: &ctx.token_name_for_log,
-            flag_name: "token",
-            flag_value: &ctx.token_name_for_log,
+    append_request_call_history_best_effort(
+        RequestCallHistoryAppend {
+            enabled: ctx.enabled,
+            history_writer: &ctx.history_writer,
+            exit_code,
+            setup_dir: &ctx.setup_dir,
+            invocation_dir: &ctx.invocation_dir,
+            command_name: "api-rest",
+            endpoint_label_used: &ctx.endpoint_label_used,
+            endpoint_value_used: &ctx.endpoint_value_used,
+            log_url: ctx.log_url,
+            auth_source: &ctx.auth_source_used,
+            token_name_for_log: &ctx.token_name_for_log,
+            request_arg: &ctx.request_arg,
+            extra_flags: &[],
+            warning_label: "api-rest",
         },
-        AuthSourceUsed::EnvFallback { env_name } => RequestCallHistoryAuth::HeaderOnly {
-            key: "auth",
-            value: env_name,
-        },
-        AuthSourceUsed::None => RequestCallHistoryAuth::None,
-    };
-
-    let record = build_request_call_history_record(RequestCallHistoryRecord {
-        stamp: &stamp,
-        exit_code,
-        setup_dir: &ctx.setup_dir,
-        invocation_dir: &ctx.invocation_dir,
-        command_name: "api-rest",
-        endpoint_label_used: &ctx.endpoint_label_used,
-        endpoint_value_used: &ctx.endpoint_value_used,
-        log_url: ctx.log_url,
-        auth,
-        request_arg: &ctx.request_arg,
-        extra_flags: &[],
-    });
-
-    if let Err(err) = history_writer.append(&record) {
-        let _ = writeln!(stderr, "warning: failed to append api-rest history: {err}");
-    }
+        stderr,
+    );
 }
 
 #[cfg(test)]

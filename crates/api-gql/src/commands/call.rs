@@ -1,13 +1,17 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use api_testing_core::cli_history::{
+    RequestCallHistoryAuth, RequestCallHistoryRecord,
+    build_request_call_history_record_with_extra_args,
+};
 use api_testing_core::{Result, cli_endpoint, config, history};
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
 
 use crate::cli::CallArgs;
 use api_testing_core::cli_util::{
-    bool_from_env, history_timestamp_now, list_available_suffixes, maybe_relpath,
-    parse_u64_default, shell_quote, trim_non_empty,
+    bool_from_env, history_timestamp_now, list_available_suffixes, parse_u64_default,
+    trim_non_empty,
 };
 
 #[derive(Debug, Clone)]
@@ -304,71 +308,43 @@ fn append_history_best_effort(ctx: &CallHistoryContext, exit_code: i32, stderr: 
     let history_writer = &ctx.history_writer;
 
     let stamp = history_timestamp_now().unwrap_or_default();
-    let setup_rel = maybe_relpath(&ctx.setup_dir, &ctx.invocation_dir);
-
-    let mut record = String::new();
-    record.push_str(&format!("# {stamp} exit={exit_code} setup_dir={setup_rel}"));
-
-    if !ctx.endpoint_label_used.is_empty() {
-        if ctx.endpoint_label_used == "url" && !ctx.log_url {
-            record.push_str(" url=<omitted>");
-        } else {
-            record.push_str(&format!(
-                " {}={}",
-                ctx.endpoint_label_used, ctx.endpoint_value_used
-            ));
-        }
-    }
-
-    match &ctx.auth_source_used {
+    let auth = match &ctx.auth_source_used {
         api_testing_core::graphql::auth::GraphqlAuthSourceUsed::JwtProfile { name } => {
-            if !name.is_empty() {
-                record.push_str(&format!(" jwt={name}"));
+            RequestCallHistoryAuth::HeaderAndFlag {
+                header_key: "jwt",
+                header_value: name,
+                flag_name: "jwt",
+                flag_value: name,
             }
         }
         api_testing_core::graphql::auth::GraphqlAuthSourceUsed::EnvFallback { env_name } => {
-            record.push_str(&format!(" token={env_name}"));
+            RequestCallHistoryAuth::HeaderOnly {
+                key: "token",
+                value: env_name,
+            }
         }
-        api_testing_core::graphql::auth::GraphqlAuthSourceUsed::None => {}
-    }
-
-    let op_arg_path = Path::new(&ctx.op_arg);
-    let op_rel = if op_arg_path.is_absolute() {
-        maybe_relpath(op_arg_path, &ctx.invocation_dir)
-    } else {
-        ctx.op_arg.clone()
+        api_testing_core::graphql::auth::GraphqlAuthSourceUsed::None => {
+            RequestCallHistoryAuth::None
+        }
     };
+    let extra_args: Vec<&str> = ctx.vars_arg.as_deref().into_iter().collect();
 
-    record.push_str("\n\napi-gql call \\\n");
-    if !ctx.endpoint_label_used.is_empty() && (ctx.endpoint_label_used != "url" || ctx.log_url) {
-        record.push_str(&format!(
-            "  --{} {} \\\n",
-            ctx.endpoint_label_used,
-            shell_quote(&ctx.endpoint_value_used)
-        ));
-    }
-
-    if let api_testing_core::graphql::auth::GraphqlAuthSourceUsed::JwtProfile { name } =
-        &ctx.auth_source_used
-        && !name.is_empty()
-    {
-        record.push_str(&format!("  --jwt {} \\\n", shell_quote(name)));
-    }
-
-    if let Some(vars_arg) = ctx.vars_arg.as_deref() {
-        let vars_arg_path = Path::new(vars_arg);
-        let vars_rel = if vars_arg_path.is_absolute() {
-            maybe_relpath(vars_arg_path, &ctx.invocation_dir)
-        } else {
-            vars_arg.to_string()
-        };
-        record.push_str(&format!("  {} \\\n", shell_quote(&op_rel)));
-        record.push_str(&format!("  {} \\\n", shell_quote(&vars_rel)));
-        record.push_str("| jq .\n\n");
-    } else {
-        record.push_str(&format!("  {} \\\n", shell_quote(&op_rel)));
-        record.push_str("| jq .\n\n");
-    }
+    let record = build_request_call_history_record_with_extra_args(
+        RequestCallHistoryRecord {
+            stamp: &stamp,
+            exit_code,
+            setup_dir: &ctx.setup_dir,
+            invocation_dir: &ctx.invocation_dir,
+            command_name: "api-gql",
+            endpoint_label_used: &ctx.endpoint_label_used,
+            endpoint_value_used: &ctx.endpoint_value_used,
+            log_url: ctx.log_url,
+            auth,
+            request_arg: &ctx.op_arg,
+            extra_flags: &[],
+        },
+        &extra_args,
+    );
 
     if let Err(err) = history_writer.append(&record) {
         let _ = writeln!(stderr, "warning: failed to append api-gql history: {err}");
