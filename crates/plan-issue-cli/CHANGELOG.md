@@ -60,6 +60,17 @@ versioning.
   `non_required_check_override` in the closeout-comment payload, and the
   comment summary advertises that the override was used.
 
+### Documentation
+
+- `docs/specs/issue-backed-plan-record-contract-v2.md` now states
+  explicitly that `plan-issue record audit` does not validate
+  provider-issue labels and does not accept a `--label` flag. Callers
+  that need to verify expected labels must do so through the provider
+  (e.g. `gh issue view --json labels`, `forge-cli pr view`) as a separate
+  gate. Label mutation remains the responsibility of `record open`,
+  `record post`, and `record close` via `--label`, `--add-label`, and
+  `--remove-label`. (sympoies/nils-cli#535)
+
 ### BREAKING (Plan-Issue Lifecycle v3)
 
 - The `plan-issue record` surface is rewritten around the v3 issue-backed
