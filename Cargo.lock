@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-runtime-cli"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1150,9 +1150,9 @@ checksum = "242402749acf71e6f32f5857598b7002c4058a4e3c3b22b4c7d51cab9aea754e"
 
 [[package]]
 name = "http"
-version = "1.4.0"
+version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3ba2a386d7f85a81f119ad7498ebe444d2e22c2af0b86b069416ace48b3311a"
+checksum = "8be7462df143984c4598a256ef469b251d7d7f9e271135073e78fc535414f3d0"
 dependencies = [
  "bytes",
  "itoa",
@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-docs"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-out"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-scope-lock"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "nils-agent-workflow-primitives"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-gql"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-grpc"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-rest"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-test"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-testing-core"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1960,7 +1960,7 @@ dependencies = [
 
 [[package]]
 name = "nils-api-websocket"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "nils-cli-template"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1992,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "nils-codex-cli"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "nils-common"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "base64",
  "clap",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "nils-forge-cli"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2045,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "nils-fzf-cli"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "nils-gemini-cli"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-cli"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-lock"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-scope"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "nils-git-summary"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "nils-image-processing"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2160,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "nils-macos-agent"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2177,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "nils-memo-cli"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2196,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "nils-plan-issue-cli"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "nils-plan-tooling"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "nils-screen-record"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "block2",
  "chrono",
@@ -2254,7 +2254,7 @@ dependencies = [
 
 [[package]]
 name = "nils-semantic-commit"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "nils-term"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "indicatif",
  "pretty_assertions",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "nils-test-support"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -2288,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "nils-web-evidence"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "clap",
  "clap_complete",
