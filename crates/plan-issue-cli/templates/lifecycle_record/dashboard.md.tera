@@ -1,0 +1,36 @@
+{{ title }}
+
+This issue is the durable tracking surface for an issue-backed plan execution. The full source, plan, and execution logs remain in
+append-only issue comments.
+
+- Status: {{ status }}
+- Profile: {{ profile }}
+- Target scope: {{ target_scope }}
+- Current task: {{ current }}
+- Next action: {{ next_action }}
+- Validation: {{ validation }}
+- Linked PRs: {{ linked_prs }}
+- Blockers: {{ blockers }}
+- Review approval: {{ approval }}
+
+## Durable Record
+
+- Source snapshot: {{ source_link }}
+- Plan snapshot: {{ plan_link }}
+- Execution state: {{ state_link }}
+- Latest session: {{ session_link }}
+- Latest validation: {{ validation_link }}
+{%- if show_review %}
+- Latest review: {{ review_link }}
+{%- endif %}
+- Closeout comment: {{ closeout_link }}
+
+## Guardrails
+
+- The issue body is a mutable dashboard only.
+- Append-only issue comments are the durable source of truth.
+- `plan-tooling` owns plan parsing, validation, batching, and PR split modeling only.
+- Provider create, comment, edit, and close operations remain owned by `forge-cli` or provider atoms.
+{%- if tracker_block %}
+{{ tracker_block }}
+{%- endif %}

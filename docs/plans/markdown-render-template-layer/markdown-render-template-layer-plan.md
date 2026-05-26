@@ -433,31 +433,78 @@ pre-migration output.
   - `cargo test -p plan-issue-cli render`
   - `cargo test -p plan-issue-cli --test golden_render`
 
-### Task 2.5: Migrate `plan-issue-cli/src/lifecycle_record.rs`
+### Task 2.5: Migrate the dashboard renderers in `lifecycle_record.rs`
 
 - **Location**:
   - crates/plan-issue-cli/src/lifecycle_record.rs
-  - crates/plan-issue-cli/templates/lifecycle_record/open.md.tera (new)
+  - crates/plan-issue-cli/templates/lifecycle_record/dashboard.md.tera (new)
+  - crates/plan-issue-cli/tests/golden/lifecycle_record/ (new fixture dir)
+- **Description**: First slice of the largest plan-issue-cli surface
+  (3108 lines, ~200 inline Markdown sites). Migrates the two
+  dashboard emitters that share an identical provider-visible
+  shape: `render_dashboard` (used by `record open` to seed the
+  issue body) and `render_dashboard_from_audit` (used by
+  `record attach`, `record post`, and dashboard repair to rebuild
+  the body from audit evidence). Both feed a single
+  `dashboard.md.tera` through a shared `DashboardView` struct. The
+  remaining renderers in `lifecycle_record.rs` (snapshot comments,
+  post comments, the five kind-specific visible-content helpers)
+  ship in Task 2.5b so each PR stays reviewable. Phase names follow
+  the source document's lifecycle kinds (source / plan / state /
+  session / validation / review / closeout) rather than the
+  placeholder "open / progress / review / delivery / close" wording
+  from the original plan.
+- **Dependencies**:
+  - Task 2.4
+- **Complexity**:
+  - 4
+- **Acceptance criteria**:
+  - Three byte-identical golden fixtures (`dashboard_pending`,
+    `dashboard_full`, `dashboard_complete`) covering the conditional
+    branches (`show_review` and `tracker_block` populated).
+  - `render_dashboard` and `render_dashboard_from_audit` collapse
+    inline `format!`/`out.push` chains into `DashboardView` struct
+    construction only.
+- **Validation**:
+  - `cargo test -p plan-issue-cli lifecycle_record`
+  - `cargo test -p plan-issue-cli --test golden_lifecycle_record`
+
+### Task 2.5b: Migrate the snapshot, post-comment, and kind helpers in `lifecycle_record.rs`
+
+- **Location**:
+  - crates/plan-issue-cli/src/lifecycle_record.rs
+  - crates/plan-issue-cli/templates/lifecycle_record/snapshot.md.tera (new)
+  - crates/plan-issue-cli/templates/lifecycle_record/post_comment.md.tera (new)
   - crates/plan-issue-cli/templates/lifecycle_record/state.md.tera (new)
   - crates/plan-issue-cli/templates/lifecycle_record/session.md.tera (new)
   - crates/plan-issue-cli/templates/lifecycle_record/validation.md.tera (new)
   - crates/plan-issue-cli/templates/lifecycle_record/review.md.tera (new)
   - crates/plan-issue-cli/templates/lifecycle_record/closeout.md.tera (new)
-  - crates/plan-issue-cli/tests/golden/lifecycle_record/ (new fixture dir)
-- **Description**: 111 inline Markdown sites. Each lifecycle phase
-  becomes its own template under
-  `templates/lifecycle_record/<phase>.md.tera`.
+  - crates/plan-issue-cli/tests/golden/lifecycle_record/ (extends Task 2.5 dir)
+- **Description**: Second slice of the lifecycle_record migration.
+  Migrates `render_record_snapshot_comment` (source/plan kinds) to
+  `snapshot.md.tera`, `render_record_post_comment_with_display`
+  (state/session/validation/review/closeout) to
+  `post_comment.md.tera`, and each kind-specific
+  `render_*_payload_visible` helper to its own per-kind template
+  (`state.md.tera`, `session.md.tera`, ...). The Rust helpers
+  collapse into view-struct preparation only after this task.
 - **Dependencies**:
-  - Task 2.4
+  - Task 2.5
 - **Complexity**:
-  - 7
+  - 6
 - **Acceptance criteria**:
-  - One golden fixture per phase (open / progress / review /
-    delivery / close), byte-identical to capture.
-  - The `lifecycle_record.rs` function map collapses inline
-    string-building into view-struct preparation only.
+  - Byte-identical golden fixtures for
+    `render_record_snapshot_comment` (source + plan kinds) and
+    `render_record_post_comment_with_display` (one per kind: state,
+    session, validation, review, closeout), plus at least one
+    populated-and-empty pair for the conditional sections inside
+    each kind helper.
+  - The `render_*_payload_visible` helpers collapse inline string-
+    building into view-struct preparation only.
 - **Validation**:
   - `cargo test -p plan-issue-cli lifecycle_record`
+  - `cargo test -p plan-issue-cli --test golden_lifecycle_record`
 
 ### Task 2.6: Migrate `plan-issue-cli/src/execute.rs`
 
@@ -467,7 +514,10 @@ pre-migration output.
   - crates/plan-issue-cli/templates/execute/follow_up.md.tera (new)
   - crates/plan-issue-cli/tests/golden/execute/ (new fixture dir)
 - **Description**: Longest plan-issue surface (151 inline sites).
-  Migrated last in this crate so earlier patterns are proven.
+  Migrated last in this crate so earlier patterns are proven. Should
+  start only after Task 2.5b (the rest of the lifecycle_record
+  migration) lands; the formal dependency stays "Task 2.5" because
+  plan-tooling validation only accepts `Task N.M` references.
 - **Dependencies**:
   - Task 2.5
 - **Complexity**:
