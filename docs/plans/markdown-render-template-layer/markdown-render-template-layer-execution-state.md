@@ -1,6 +1,6 @@
 # Markdown Render Template Layer Execution State
 
-## Current State
+## Execution State
 
 - Status: open (plan tracker just created; no implementation work
   started)
