@@ -7,6 +7,7 @@ maintenance). Two backends ship together: GitHub (wraps `gh`) and GitLab
 
 ## Read first
 
+- Docs index: [docs/README.md](docs/README.md)
 - Contract: [docs/specs/forge-cli-spec-v1.md](docs/specs/forge-cli-spec-v1.md)
 - Op catalog: [docs/specs/forge-cli-ops-v1.yaml](docs/specs/forge-cli-ops-v1.yaml)
 - Plan: [`/docs/plans/forge-cli/forge-cli-plan.md`](../../docs/plans/forge-cli/forge-cli-plan.md)

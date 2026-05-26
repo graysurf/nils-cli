@@ -24,9 +24,10 @@ Completion obligations for those binaries are tracked in
 | API testing | `api-rest`, `api-gql`, `api-grpc`, `api-websocket`, `api-test` | Run protocol-specific API checks or orchestrate a mixed API test suite. |
 | Git tooling | `git-scope`, `git-cli`, `git-summary`, `git-lock` | Inspect changes, run Git helper flows, summarize commits, or manage repo-local commit locks. |
 | Forge automation | `forge-cli` | Drive PR/MR + Issue lifecycle and repository label catalog maintenance on GitHub (via `gh`) or GitLab (via `glab`) through a single provider-neutral surface; covers create / view / edit / comment / ready / merge / close, label list / audit / ensure, CI wait-checks, and the `pr deliver` macro. |
-| Agent policy and evidence | `agent-docs`, `agent-out`, `agent-scope-lock`, `test-first-evidence`, `web-evidence`, `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `skill-usage` | Resolve agent policy docs, allocate artifact paths, enforce edit scope, inspect repo retrospectives, or persist deterministic workflow evidence. |
+| Agent policy and evidence | `agent-runtime`, `agent-docs`, `agent-out`, `agent-scope-lock`, `agent-run`, `test-first-evidence`, `web-evidence`, `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `review-specialists`, `skill-usage` | Render/install/audit runtime-kit surfaces, resolve agent policy docs, run project commands through explicit env handling, allocate artifact paths, enforce edit scope, inspect repo retrospectives, merge specialist review evidence, or persist deterministic workflow evidence. |
 | Planning and delivery | `plan-tooling`, `plan-issue`, `plan-issue-local`, `semantic-commit` | Validate/split implementation plans, orchestrate issue delivery, rehearse local plan flows, or create semantic commits. |
 | Provider lanes | `codex-cli`, `gemini-cli` | Run provider-specific diagnostics, auth checks, and workflow adapters. |
+| Markdown rendering | `md-render` | Render `.md.tera` templates from JSON view data through the shared `nils-markdown` engine. |
 | Desktop, media, and local utilities | `macos-agent`, `screen-record`, `image-processing`, `fzf-cli`, `memo-cli` | Automate local desktop tasks, capture media, convert images, use interactive shell helpers, or record/search local memos. |
 | Development-only/internal | `cli-template` | Validate packaging and new-crate patterns; excluded from user-facing completion obligations. |
 
@@ -38,6 +39,8 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 
 - [crates/nils-common](crates/nils-common): Shared cross-CLI utilities (including markdown payload validation and markdown-table
   canonicalization helpers).
+- [crates/nils-markdown](crates/nils-markdown): Tera-backed Markdown template engine, shared helpers, golden-test harness, and
+  opt-in `md-render` binary for rendering `.md.tera` templates from JSON view data.
 - [crates/nils-term](crates/nils-term): Terminal UX helpers (TTY detection + progress rendering on stderr).
 - [crates/nils-test-support](crates/nils-test-support): Test-only helpers for deterministic workspace integration tests.
 - [crates/cli-template](crates/cli-template): Minimal example CLI for validating packaging and new-crate patterns.
@@ -76,6 +79,8 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 
 ### Agent policy and evidence tooling
 
+- [crates/agent-runtime-cli](crates/agent-runtime-cli): Runtime-kit tooling binary (`agent-runtime`) for render, install, doctor,
+  audit-drift, runtime state maintenance, skill listing, and PR/MR body rendering.
 - [crates/agent-docs](crates/agent-docs): Deterministic policy-document resolver for Codex/agent workflows (`resolve`, `contexts`, `add`,
   `baseline`).
 - [crates/agent-out](crates/agent-out): Canonical `$AGENT_HOME/out/` path generator and layout auditor for agent workflow artifacts.
@@ -83,8 +88,8 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
   `validate`, `clear`).
 - [crates/web-evidence](crates/web-evidence): Redacted static HTTP evidence capture for agent workflows (`capture`, `completion`).
 - [crates/agent-workflow-primitives](crates/agent-workflow-primitives): Multi-binary local-first agent workflow primitives
-  (`browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`,
-  `skill-usage`, `test-first-evidence`).
+  (`agent-run`, `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`,
+  `review-evidence`, `review-specialists`, `skill-usage`, `test-first-evidence`).
 
 ### Planning, delivery, and provider lanes
 

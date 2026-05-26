@@ -13,3 +13,7 @@ Workspace-level docs that govern this crate (the envelope contract, the
 crate docs placement policy, and the dispatch plan) live under the
 repository root `docs/` tree; consult that tree from the workspace
 root.
+
+## Links
+
+- Back to crate README: [`../README.md`](../README.md)

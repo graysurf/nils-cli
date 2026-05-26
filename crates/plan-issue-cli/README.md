@@ -164,6 +164,10 @@ See [`CLI contract v2`](docs/specs/plan-issue-cli-contract-v2.md)
 [`agent-kit RUNTIME_LAYOUT.md`](https://github.com/sympoies/agent-kit/blob/main/skills/automation/plan-issue-delivery/references/RUNTIME_LAYOUT.md)
 for the upstream contract.
 
+## Docs
+
+- [Docs index](docs/README.md)
+
 ## Specifications
 
 - [CLI contract v2](docs/specs/plan-issue-cli-contract-v2.md)

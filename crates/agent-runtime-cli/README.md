@@ -119,3 +119,8 @@ agent-runtime pr-body render \
 
 The rendered body always uses `## Summary` and `## Test plan` so it satisfies
 the body-section gate enforced by `forge-cli`.
+
+## Docs
+
+- [Docs index](docs/README.md)
+- [Determinism contract](docs/determinism.md)

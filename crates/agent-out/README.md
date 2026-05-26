@@ -111,3 +111,7 @@ Example:
 - `0`: success
 - `1`: runtime failure, or audit violations when `audit --strict` is used
 - `64`: usage/configuration error, including missing `AGENT_HOME`
+
+## Docs
+
+- [Docs index](docs/README.md)

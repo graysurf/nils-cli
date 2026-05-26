@@ -3,8 +3,9 @@
 > Ownership: Maintained by the `agent-runtime-cli` crate maintainers. Keep
 > this index updated when docs are added, moved, or removed.
 
-The Plan 01 stub ships with no crate-local specs / runbooks / reports.
-Authoritative architecture and migration plans live in the consuming repo
+Crate-local docs here cover nils-cli-owned runtime-kit binary behavior.
+Higher-level architecture and migration plans for the rendered runtime surface
+live in the consuming repo
 [`graysurf/agent-runtime-kit`](https://github.com/graysurf/agent-runtime-kit).
 
 ## Specs
@@ -14,6 +15,11 @@ Authoritative architecture and migration plans live in the consuming repo
 ## Runbooks
 
 - None yet. Add documents under `docs/runbooks/` and register them here.
+
+## Contracts
+
+- [Determinism contract](determinism.md) — render determinism rules, sanctioned
+  time source, enforcement checks, and validation commands.
 
 ## Reports
 

@@ -40,3 +40,11 @@ Current runtime ownership:
 - [plan-issue CLI contract v2 (Task Decomposition runtime metadata)](specs/plan-issue-cli-contract-v2.md)
 - [plan-issue state machine v1 (Task Decomposition runtime)](specs/plan-issue-state-machine-v1.md)
 - [plan-issue gate matrix v1](specs/plan-issue-gate-matrix-v1.md)
+
+## Runbooks
+
+- [Provider routing runbook](runbooks/provider-routing-runbook.md)
+
+## Links
+
+- Back to crate README: [`../README.md`](../README.md)

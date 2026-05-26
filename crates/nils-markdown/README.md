@@ -56,3 +56,7 @@ This crate is introduced by
 `docs/plans/markdown-render-template-layer/`. Tier A migration order
 and consumer wiring are tracked in the plan and in tracking issue
 `#541`.
+
+## Docs
+
+- [Docs index](docs/README.md)
