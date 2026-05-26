@@ -114,25 +114,34 @@ bug #2 keeps the symptom misleading for anyone debugging.
    errors and propagate as `(None, None, Vec::new())`.
 3. **Distinguish the three closeout-table labels.** Replace the single
    `Option<CheckStatus>` rendering with a closed set of labels at the
-   render layer only:
+   render layer only. Picked these strings:
    - `Some(CheckStatus::Pass)` with `required_count == Some(0)` →
-     `n/a (no required)` (the "no rule on branch" case)
+     `none required` (the "no rule on branch, or rule with 0 required
+     checks" case; the count is implicit in the word "none" so no
+     `(0)` parenthetical)
    - `Some(CheckStatus::Pass)` with `required_count >= 1` →
      `pass (<n>)`
-   - `Some(CheckStatus::Fail)` → `fail (<n>)` (and the non-required
-     failures column carries the detail as today)
-   - `Some(CheckStatus::None)` → `none`
-   - `None` (probe failed or fixture omitted) → `unknown`
+   - `Some(CheckStatus::Fail)` → `fail (<n>)` (the non-required
+     failures column carries detail as today)
+   - `Some(CheckStatus::None)` → `none` (existing aggregate-rollup
+     "no checks at all" case; PR #554 in #541's closeout is an example)
+   - `None` (probe failed or fixture omitted) → `unknown` (kept as
+     the catch-all so a future regression remains visible rather than
+     silently looking like "none required")
 4. **No wire-format change to `closeout.v1`.** Render-only fix. The
    payload's `required_state` stays `Option<CheckStatus>` and
    `required_count` stays `Option<u32>`. Historical closeouts continue to
    parse; their hex-encoded payloads do not need re-encoding.
-5. **Test the live probe deterministically.** Add a unit test that
-   exercises `pr_required_summary` against an injected `Self::run`
-   replacement (refactor `pr_required_summary` to take a runner closure
-   or move the `gh`-shellout behind a trait) so the no-required-checks
-   path is regression-tested without requiring a live `gh` install or a
-   protected branch.
+5. **Test the live probe deterministically and refactor all
+   `Self::run` callers together.** Introduce a small `GhRunner`
+   abstraction at module scope in `crates/plan-issue-cli/src/github.rs`
+   (function pointer or trait — pick whichever is least invasive when
+   reading the file) and route every existing `Self::run(&args)` call
+   site in the file through it. Tests inject a fake runner that
+   returns canned `(stdout, stderr, exit_status)` triples; production
+   code keeps the current `gh`-shellout behaviour. This is intentional
+   scope expansion past `pr_required_summary`: doing it once now leaves
+   the whole file testable without piecemeal refactors per future fix.
 6. **Update the fixture renderer test set.** Add render-layer unit tests
    covering all five label branches enumerated in decision 3, exercised
    through the existing renderer entry points without going through the
@@ -140,26 +149,32 @@ bug #2 keeps the symptom misleading for anyone debugging.
 7. **Out of scope.** No new branch protection on `sympoies/nils-cli main`
    is requested by this work; the rendering must be correct whether or
    not the repository adopts branch protection later. No GitLab adapter
-   parity — that gap is already tracked under
-   `docs/plans/plan-issue-close-non-required-checks/`. No bump of
-   `closeout.v1` schema; future schema bumps can carry the distinction in
-   the wire format if a reader wants it.
+   parity — `crates/plan-issue-cli/src/forge_cli_adapter.rs:353-354`
+   keeps returning `(None, None)` for now; the GitLab side stays under
+   `docs/plans/plan-issue-close-non-required-checks/` follow-up and is
+   explicitly not folded into this PR even though the
+   `Some(CheckStatus::Pass), Some(0)` change is cheap. Reason: leaves
+   the follow-up plan's scope unambiguous and keeps this PR's diff
+   focused on the live-probe + render fix. No bump of `closeout.v1`
+   schema; future schema bumps can carry the distinction in the wire
+   format if a reader wants it.
 
 ## Scope
 
 - `crates/plan-issue-cli/src/github.rs`: change the `--json` field list
   in `pr_required_summary`, add the "no required checks reported" stderr
-  branch, and refactor enough to inject a test-only runner for the
-  function.
+  branch, introduce a module-scope `GhRunner` abstraction (fn pointer
+  or small trait), and migrate **every** existing `Self::run(&args)`
+  call site in the file onto it so production callers stay untouched
+  while tests can inject a fake runner.
 - `crates/plan-issue-cli/src/lifecycle_record.rs`: change the render
   branch at lines 2062-2074 to emit one of the five labels in decision
   3; add unit tests for each branch.
-- `crates/plan-issue-cli/src/forge_cli_adapter.rs`: no behavior change,
-  but verify the function continues returning `(None, None)` for GitLab
-  and add a comment pointing at the GitLab-adapter follow-up plan so the
-  next reader knows the asymmetry is intentional.
+- `crates/plan-issue-cli/src/forge_cli_adapter.rs`: no behavior change.
+  The `(None, None)` fallback at lines 353-354 stays as-is and is
+  intentionally not touched in this PR (see Decision 7).
 - `crates/plan-issue-cli/tests/`: add an integration test asserting the
-  rendered closeout table contains `n/a (no required)` for a PR seeded
+  rendered closeout table contains `none required` for a PR seeded
   with `required_state=Pass, required_count=0`, `pass (N)` for a PR
   seeded with `required_state=Pass, required_count=N (N>=1)`, and
   `unknown` for a PR seeded with `required_state=None`.
@@ -193,7 +208,7 @@ bug #2 keeps the symptom misleading for anyone debugging.
 ## Requirements
 
 - **R1.** `plan-issue record close --dry-run` against a PR on a branch
-  with no required checks renders that PR's row as `n/a (no required)`
+  with no required checks renders that PR's row as `none required`
   in the `Required` column.
 - **R2.** `plan-issue record close --dry-run` against a PR on a branch
   with N≥1 required checks (all passing) renders that PR's row as
@@ -219,7 +234,7 @@ bug #2 keeps the symptom misleading for anyone debugging.
   injected runner.
 - **AC-4.** Re-running `plan-issue record close --dry-run` against
   sympoies/nils-cli#541's PR set on a freshly built binary renders the
-  `Required` column as `n/a (no required)` for every PR (matching the
+  `Required` column as `none required` for every PR (matching the
   current state of `main`'s branch protection).
 - **AC-5.** The diff does not touch `closeout.v1` payload writing or
   parsing. Existing closeout comments still parse cleanly.
