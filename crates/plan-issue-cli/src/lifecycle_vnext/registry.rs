@@ -261,11 +261,7 @@ mod tests {
     #[test]
     fn state_requires_task_ledger_heading() {
         let state = role(PayloadRole::State);
-        assert!(
-            state
-                .required_visible_sections
-                .contains(&"## Task Ledger")
-        );
+        assert!(state.required_visible_sections.contains(&"## Task Ledger"));
     }
 
     #[test]
