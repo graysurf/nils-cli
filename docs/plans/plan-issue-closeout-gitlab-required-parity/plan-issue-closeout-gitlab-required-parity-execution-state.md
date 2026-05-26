@@ -9,14 +9,14 @@
 - Current task: Task 1.1
 - Next task: Task 1.1
 - Last updated: 2026-05-26 Asia/Taipei
-- Branch/commit/PR/release: TBD on implementation start
+- Branch/commit/PR/release: `fix/plan-issue-557-gitlab-required-none` (init via `tracking run init`; not yet pushed)
 - Source document: docs/plans/plan-issue-closeout-gitlab-required-parity/plan-issue-closeout-gitlab-required-parity-plan.md
 - Discussion source document: docs/plans/plan-issue-closeout-gitlab-required-parity/plan-issue-closeout-gitlab-required-parity-discussion-source.md
 - Source issue: sympoies/nils-cli#557
-- Tracking issue: TBD on `record open`
-- Source snapshot: TBD on `record open`
-- Plan snapshot: TBD on `record open`
-- Initial execution state snapshot: TBD on `record open`
+- Tracking issue: sympoies/nils-cli#565
+- Source snapshot: <https://github.com/sympoies/nils-cli/issues/565#issuecomment-4545391417>
+- Plan snapshot: <https://github.com/sympoies/nils-cli/issues/565#issuecomment-4545391794>
+- Initial execution state snapshot: <https://github.com/sympoies/nils-cli/issues/565#issuecomment-4545392104>
 - Direct source-doc execution waiver: not applicable
 
 ## Task Ledger
@@ -51,3 +51,12 @@
   semantic shift (GitLab pipeline `state=failure` no longer blocks
   close on aggregate `checks=Fail`) as consistent with the #502
   contract.
+- 2026-05-26: Bundle committed direct to `main` at `d7671f1`
+  (`docs(plans): add closeout GitLab required-parity bundle`).
+  `plan-tooling validate` green. Tracking issue opened via
+  `record open --profile tracking`:
+  sympoies/nils-cli#565. `tracking run init` seeded the local
+  run-state for branch `fix/plan-issue-557-gitlab-required-none`.
+  `record audit --expect-visible` returns `overall_pass: true` with
+  all three lifecycle markers (source / plan / state) recognized.
+  Ready to hand off to `deliver-plan-tracking-issue`.
