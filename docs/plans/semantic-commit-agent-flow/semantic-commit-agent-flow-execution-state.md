@@ -3,14 +3,15 @@
 
 ## Execution State
 
-- Status: implemented
+- Status: reviewing
 - Target scope: whole issue
 - Execution window: whole issue
-- Current task: update tracking issue state and prepare delivery
-- Next task: open PR and run provider checks
+- Current task: PR review and provider checks
+- Next task: address review or merge outcome
 - Last updated: 2026-05-27 Asia/Taipei
 - Branch/commit/PR/release: `feat/semantic-commit-agent-flow`;
-  plan-bundle commit `f97cd8d`; PR pending
+  plan-bundle commit `f97cd8d`; implementation commit `ee8f29d`;
+  draft PR <https://github.com/sympoies/nils-cli/pull/576>
 - Source document:
   docs/plans/semantic-commit-agent-flow/semantic-commit-agent-flow-plan.md
 - Discussion source document:
@@ -78,3 +79,5 @@
   completed and released.
 - 2026-05-27: Ran the final local-fast gate. It passed docs-only checks,
   formatting, Clippy with `-D warnings`, nextest package tests, and doctests.
+- 2026-05-27: Opened draft PR
+  <https://github.com/sympoies/nils-cli/pull/576> for provider review.
