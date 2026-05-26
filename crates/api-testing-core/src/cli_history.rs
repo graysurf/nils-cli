@@ -127,24 +127,41 @@ pub fn run_history_command(
         return 3;
     }
 
-    let n = tail.unwrap_or(1).max(1) as usize;
-    let start = records.len().saturating_sub(n);
-    for record in &records[start..] {
-        if command_only && record.starts_with('#') {
-            let trimmed = record
-                .split_once('\n')
-                .map(|(_first, rest)| rest)
-                .unwrap_or_default();
-            let _ = stdout.write_all(trimmed.as_bytes());
-            if trimmed.is_empty() {
-                let _ = stdout.write_all(b"\n\n");
-            }
-        } else {
-            let _ = stdout.write_all(record.as_bytes());
-        }
+    for record in select_history_records(&records, tail, command_only) {
+        let _ = stdout.write_all(record.as_bytes());
     }
 
     0
+}
+
+pub fn select_history_records(
+    records: &[String],
+    tail: Option<u32>,
+    command_only: bool,
+) -> Vec<String> {
+    let n = tail.unwrap_or(1).max(1) as usize;
+    let start = records.len().saturating_sub(n);
+    records[start..]
+        .iter()
+        .map(|record| render_history_record(record, command_only))
+        .collect()
+}
+
+pub fn render_history_record(record: &str, command_only: bool) -> String {
+    if !command_only || !record.starts_with('#') {
+        return record.to_string();
+    }
+
+    let trimmed = record
+        .split_once('\n')
+        .map(|(_first, rest)| rest)
+        .unwrap_or_default();
+
+    if trimmed.is_empty() {
+        "\n\n".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 pub fn append_request_call_history_best_effort(

@@ -2,7 +2,7 @@ use api_testing_core::{
     auth_env::CliAuthSource,
     cli_history::{
         RequestCallHistoryAppend, RequestCallHistoryFlag, append_request_call_history_best_effort,
-        resolve_history_file, run_history_command,
+        render_history_record, resolve_history_file, run_history_command, select_history_records,
     },
     history::{HistoryWriter, RotationPolicy},
 };
@@ -33,6 +33,27 @@ fn cli_history_command_only_and_empty_records() {
     let mut stderr = Vec::new();
     let code = run_history_command(&history_file, Some(1), true, &mut stdout, &mut stderr);
     assert_eq!(code, 3);
+}
+
+#[test]
+fn cli_history_selects_tail_and_strips_metadata_for_command_only() {
+    let records = vec![
+        "# one\napi-rest call \\\n  one.request.json \\\n| jq .\n\n".to_string(),
+        "# two\napi-rest call \\\n  two.request.json \\\n| jq .\n\n".to_string(),
+    ];
+
+    let selected = select_history_records(&records, Some(1), true);
+
+    assert_eq!(selected.len(), 1);
+    assert!(selected[0].contains("two.request.json"));
+    assert!(!selected[0].contains("# two"));
+}
+
+#[test]
+fn cli_history_render_record_preserves_original_when_not_command_only() {
+    let record = "# meta\napi-rest call \\\n  req.request.json \\\n| jq .\n\n";
+
+    assert_eq!(render_history_record(record, false), record);
 }
 
 #[test]

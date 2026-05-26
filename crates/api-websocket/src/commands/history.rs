@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use api_testing_core::cli_history::resolve_history_file;
+use api_testing_core::cli_history::{resolve_history_file, select_history_records};
 use api_testing_core::config;
 
 use crate::cli::{HistoryArgs, OutputFormat};
@@ -87,16 +87,8 @@ pub(crate) fn cmd_history(
         );
     }
 
-    let n = if args.last {
-        1
-    } else {
-        args.tail.unwrap_or(1).max(1) as usize
-    };
-    let start = records.len().saturating_sub(n);
-    let selected: Vec<String> = records[start..]
-        .iter()
-        .map(|record| render_record(record, args.command_only))
-        .collect();
+    let tail = if args.last { Some(1) } else { args.tail };
+    let selected = select_history_records(&records, tail, args.command_only);
 
     if matches!(args.format, OutputFormat::Json) {
         let payload = serde_json::json!({
@@ -118,23 +110,6 @@ pub(crate) fn cmd_history(
     }
 
     0
-}
-
-fn render_record(record: &str, command_only: bool) -> String {
-    if !command_only || !record.starts_with('#') {
-        return record.to_string();
-    }
-
-    let trimmed = record
-        .split_once('\n')
-        .map(|(_first, rest)| rest)
-        .unwrap_or_default();
-
-    if trimmed.is_empty() {
-        "\n\n".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 fn fail_history(
@@ -165,23 +140,4 @@ fn fail_history(
         let _ = writeln!(stderr, "{message}");
     }
     exit_code
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn render_record_returns_original_when_not_command_only() {
-        let input = "# meta\napi-websocket call \\\n  req.ws.json\n\n";
-        assert_eq!(render_record(input, false), input);
-    }
-
-    #[test]
-    fn render_record_strips_metadata_line_in_command_only_mode() {
-        let input = "# meta\napi-websocket call \\\n  req.ws.json\n\n";
-        let rendered = render_record(input, true);
-        assert!(rendered.starts_with("api-websocket call"));
-        assert!(!rendered.starts_with("#"));
-    }
 }
