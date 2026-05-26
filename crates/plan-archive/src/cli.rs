@@ -107,18 +107,28 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// (Sprint 4) Fetch provider payloads and append scrubbed snapshots
-    /// to `_index/`.
+    /// Fetch provider payloads and append scrubbed snapshots to
+    /// `_index/`. Writes and scrubs but does not commit; the scrub
+    /// log (if any) must be reviewed before committing.
     Refresh {
-        /// Reference to refresh (issue/PR/MR URL or shorthand).
+        /// Reference to refresh (issue/PR/MR URL).
         #[arg(long, conflicts_with_all = ["repo", "since"])]
         r#ref: Option<String>,
-        /// Refresh every reference for the given repo.
+        /// Refresh every open reference for the given `host/org/repo`.
         #[arg(long, conflicts_with_all = ["ref", "since"])]
         repo: Option<String>,
-        /// Refresh every reference modified since the given date.
-        #[arg(long, conflicts_with_all = ["ref", "repo"])]
+        /// With `--repo`, only refresh refs updated on or after this
+        /// `YYYY-MM-DD` date.
+        #[arg(long, requires = "repo", conflicts_with = "ref")]
         since: Option<String>,
+        /// Archive clone path. Defaults to the machine-local config's
+        /// `archive_clone_path`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Path to the archive `config/hosts.yaml`. Defaults to
+        /// `<archive>/config/hosts.yaml`.
+        #[arg(long)]
+        hosts: Option<PathBuf>,
     },
     /// Print a shell completion script for `plan-archive`.
     Completion {
@@ -200,7 +210,21 @@ pub fn run() -> i32 {
             apply,
             format,
         }),
-        Command::Refresh { .. } | Command::Query { .. } => unimplemented_subcommand(format),
+        Command::Refresh {
+            r#ref,
+            repo,
+            since,
+            archive,
+            hosts,
+        } => crate::refresh::dispatch(crate::refresh::DispatchArgs {
+            r#ref,
+            repo,
+            since,
+            archive,
+            hosts,
+            format,
+        }),
+        Command::Query { .. } => unimplemented_subcommand(format),
     }
 }
 
