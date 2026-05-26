@@ -1,0 +1,3 @@
+No secrets in this payload. Just regular text content.
+Some words: token, password, secret — but no actual values.
+The end.

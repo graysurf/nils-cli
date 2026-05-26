@@ -30,6 +30,38 @@ validators that later subcommands depend on:
 respond with `subcommand-not-implemented` in Sprint 1; their bodies
 land in Sprints 3–5.
 
+## Sprint 2 surface
+
+Sprint 2 (Plan 1) lands the secret-scrub library that
+`plan-archive refresh` consumes before it writes a snapshot to
+`_index/`. The library is exported from the crate root and has no
+CLI subcommand of its own:
+
+- `plan_archive::scrub_text(input)` — scan `input` against the v1
+  pattern set, return the redacted text plus per-match metadata.
+- `plan_archive::scrub::write_log_if_any(path, matches)` — write the
+  stable `<ISO8601>.scrub.log` sibling when at least one redaction
+  occurred. No file is written for clean payloads.
+- `plan_archive::scrub::pattern_ids()` — read-only view of the
+  configured pattern set, stable across patch versions of the same
+  `PATTERN_SET` major.
+
+v1 pattern set:
+
+| Pattern id | Detects | Capture |
+| --- | --- | --- |
+| `github-token` | GitHub personal/OAuth/app tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`) | entire token |
+| `gitlab-token` | GitLab personal access tokens (`glpat-`) | entire token |
+| `bitbucket-app-password` | Bitbucket app passwords (`ATBB…`) | entire token |
+| `aws-access-key-id` | AWS access key ids (`AKIA`, `ASIA`, …) | entire id |
+| `generic-secret-kv` | `secret/token/password/api_key`-style key-value pairs | value only |
+| `pem-private-key` | `-----BEGIN … PRIVATE KEY-----` blocks | entire block |
+
+Replacement token is `[REDACTED]`. Overlapping matches keep the
+earliest, widest span; the same secret is never reported twice. The
+scrub log itself never contains the secret value — only pattern id,
+byte offset, span length, and replacement length.
+
 ## Output contracts
 
 Both human-readable text (default) and a versioned JSON envelope
@@ -92,6 +124,12 @@ Validator behaviour is covered by:
 - Unit tests inside `src/validate/{hosts,local,metadata}.rs`.
 - Integration tests in `tests/validators.rs` driving the shipped
   fixture set under `tests/fixtures/{hosts,local,metadata}/`.
+
+Scrub behaviour is covered by:
+
+- Unit tests inside `src/scrub/{mod,log}.rs`.
+- Integration tests in `tests/scrub.rs` driving
+  `tests/fixtures/scrub/{all-patterns,clean}.txt`.
 
 ## Related
 

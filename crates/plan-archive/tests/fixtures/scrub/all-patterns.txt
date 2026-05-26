@@ -1,0 +1,10 @@
+GitHub token: ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+GitLab token: glpat-AAAAAAAAAAAAAAAAAAAA
+Bitbucket app password: ATBB1234567890abcdefXYZ
+AWS access key id: AKIAIOSFODNN7EXAMPLE
+Inline secret: api_key="abcd1234efgh5678"
+PEM block follows:
+-----BEGIN RSA PRIVATE KEY-----
+MIIE-not-a-real-key-body
+-----END RSA PRIVATE KEY-----
+End of fixture.

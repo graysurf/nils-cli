@@ -2227,6 +2227,7 @@ dependencies = [
  "nils-term",
  "nils-test-support",
  "pretty_assertions",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml_ng",

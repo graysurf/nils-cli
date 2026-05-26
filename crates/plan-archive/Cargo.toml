@@ -22,6 +22,7 @@ clap_complete = { workspace = true }
 indexmap = { workspace = true }
 nils-common = { version = "0.24.1", path = "../nils-common", package = "nils-common" }
 nils-term = { version = "0.24.1", path = "../nils-term", package = "nils-term" }
+regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
