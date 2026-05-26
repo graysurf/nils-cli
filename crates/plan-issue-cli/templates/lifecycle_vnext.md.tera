@@ -1,0 +1,111 @@
+<!-- plan-issue-record:v2 role={{ marker_role }} profile={{ profile }} -->
+
+{{ heading }}
+
+- Profile: {{ profile }}
+{%- if role == "source" %}
+- Path: `docs/plans/<slug>/<slug>-discussion-source.md`
+- Commit: `<full-sha>`
+- Summary: <one-line source summary>
+- Snapshot mode: local committed Markdown
+
+<details>
+<summary>Source snapshot</summary>
+
+<verbatim source document content>
+
+</details>
+{%- elif role == "plan" %}
+- Path: `docs/plans/<slug>/<slug>-plan.md`
+- Commit: `<full-sha>`
+- Summary: <one-line plan summary>
+- Snapshot mode: local committed Markdown
+
+<details>
+<summary>Plan snapshot</summary>
+
+<verbatim plan content>
+
+</details>
+{%- elif role == "state" %}
+- Status: in-progress
+- Target scope: <issue-backed scope>
+- Current task: <task id or description>
+- Next task: <next action>
+- Last updated: YYYY-MM-DD
+- Branch: <branch>
+- PR: <owner/repo#number or pending>
+- Source document: docs/plans/<slug>/<source-file>
+- Plan document: docs/plans/<slug>/<slug>-plan.md
+
+## Task Ledger
+
+<details>
+<summary>Show task ledger</summary>
+
+| ID | Status | Task | Notes |
+| --- | --- | --- | --- |
+| 1.1 | in-progress | <task title> | <short note> |
+| 1.2 | pending | <task title> |  |
+
+</details>
+
+## Blockers
+
+- <blocker or `None`>
+
+## Validation
+
+| Command | Status | Evidence |
+| --- | --- | --- |
+| `<command>` | pass|fail|skipped | <path or URL> |
+{%- elif role == "session" %}
+- Summary: <one-line summary of work done in this session>
+
+### Highlights
+
+- <meaningful implementation, investigation, or handoff note>
+- <branch, PR, or issue-visible decision>
+
+### Links
+
+- State: <latest state comment URL>
+- PR: <PR URL or pending>
+- Artifacts: <validation or evidence path>
+
+### Session Fields
+
+- branch: <branch>
+- pr: <owner/repo#number or pending>
+- selected_task: <task id>
+{%- elif role == "validation" %}
+- Overall: pass|partial|fail
+
+| Command | Status | Evidence |
+| --- | --- | --- |
+| `<exact command>` | pass|fail|skipped | <artifact path, URL, or short reason> |
+
+### Waivers
+
+- `<command>`: <why it was not run or why failure is accepted>
+{%- elif role == "review" %}
+- Decision: approve|request-changes|comments-only
+- Lenses: testing, maintainability
+- Outcome comment: <provider comment URL or retained evidence path>
+
+| ID | Severity | Disposition | Summary |
+| --- | --- | --- | --- |
+| F1 | major | fixed|residual|follow-up|deferred|no-action | <finding summary> |
+{%- elif role == "closeout" %}
+- Final status: complete
+- Approver: <login or source>
+- Approval: <comment URL or approval text>
+- Final validation: <validation evidence URL>
+- Notes: <optional closeout note>
+
+| PR | Merge SHA | Checks | Required | Non-required failures |
+| --- | --- | --- | --- | --- |
+| <PR URL or ref> | <sha> | pass|fail|none | pass|fail|none (<count>) | none |
+{%- endif %}
+
+<!-- plan-issue-record-payload:hex:<{{ marker_role }}.v1 payload hex bytes> -->

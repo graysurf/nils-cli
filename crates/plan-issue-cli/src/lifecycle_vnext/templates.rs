@@ -11,9 +11,23 @@
 //! line is rendered as a `<!-- ... -->` placeholder so agents see where the
 //! payload would land without producing a record-grade comment.
 
+use nils_markdown::Engine;
+use serde::Serialize;
+
 use crate::commands::record::RecordProfile;
 use crate::lifecycle_record::PayloadRole;
 use crate::lifecycle_vnext::registry::{self, RoleSpec};
+
+const LIFECYCLE_VNEXT_TEMPLATE: &str = include_str!("../../templates/lifecycle_vnext.md.tera");
+const LIFECYCLE_VNEXT_TEMPLATE_NAME: &str = "lifecycle_vnext";
+
+#[derive(Debug, Clone, Serialize)]
+struct LifecycleVnextView<'a> {
+    role: &'a str,
+    marker_role: &'a str,
+    profile: &'a str,
+    heading: &'a str,
+}
 
 /// Output format requested by the template preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,106 +106,19 @@ pub fn render_template(
 }
 
 fn render_markdown(spec: &RoleSpec, profile: RecordProfile) -> String {
-    let marker = format!(
-        "<!-- plan-issue-record:v2 role={role} profile={profile} -->",
-        role = spec.marker_role,
-        profile = profile.as_str()
-    );
-    let payload_placeholder = format!(
-        "<!-- plan-issue-record-payload:hex:<{role}.v1 payload hex bytes> -->",
-        role = spec.marker_role
-    );
-    let body = role_visible_skeleton(spec.role);
-    format!(
-        "{marker}\n\n{heading}\n\n- Profile: {profile}\n{body}\n\n{payload_placeholder}\n",
-        heading = spec.default_heading,
-        profile = profile.as_str(),
-    )
-}
-
-fn role_visible_skeleton(role: PayloadRole) -> &'static str {
-    match role {
-        PayloadRole::Source => {
-            "- Path: `docs/plans/<slug>/<slug>-discussion-source.md`\n\
-             - Commit: `<full-sha>`\n\
-             - Summary: <one-line source summary>\n\
-             - Snapshot mode: local committed Markdown\n\n\
-             <details>\n<summary>Source snapshot</summary>\n\n\
-             <verbatim source document content>\n\n</details>"
-        }
-        PayloadRole::Plan => {
-            "- Path: `docs/plans/<slug>/<slug>-plan.md`\n\
-             - Commit: `<full-sha>`\n\
-             - Summary: <one-line plan summary>\n\
-             - Snapshot mode: local committed Markdown\n\n\
-             <details>\n<summary>Plan snapshot</summary>\n\n\
-             <verbatim plan content>\n\n</details>"
-        }
-        PayloadRole::State => {
-            "- Status: in-progress\n\
-             - Target scope: <issue-backed scope>\n\
-             - Current task: <task id or description>\n\
-             - Next task: <next action>\n\
-             - Last updated: YYYY-MM-DD\n\
-             - Branch: <branch>\n\
-             - PR: <owner/repo#number or pending>\n\
-             - Source document: docs/plans/<slug>/<source-file>\n\
-             - Plan document: docs/plans/<slug>/<slug>-plan.md\n\n\
-             ## Task Ledger\n\n\
-             <details>\n<summary>Show task ledger</summary>\n\n\
-             | ID | Status | Task | Notes |\n\
-             | --- | --- | --- | --- |\n\
-             | 1.1 | in-progress | <task title> | <short note> |\n\
-             | 1.2 | pending | <task title> |  |\n\n\
-             </details>\n\n\
-             ## Blockers\n\n\
-             - <blocker or `None`>\n\n\
-             ## Validation\n\n\
-             | Command | Status | Evidence |\n\
-             | --- | --- | --- |\n\
-             | `<command>` | pass|fail|skipped | <path or URL> |"
-        }
-        PayloadRole::Session => {
-            "- Summary: <one-line summary of work done in this session>\n\n\
-             ### Highlights\n\n\
-             - <meaningful implementation, investigation, or handoff note>\n\
-             - <branch, PR, or issue-visible decision>\n\n\
-             ### Links\n\n\
-             - State: <latest state comment URL>\n\
-             - PR: <PR URL or pending>\n\
-             - Artifacts: <validation or evidence path>\n\n\
-             ### Session Fields\n\n\
-             - branch: <branch>\n\
-             - pr: <owner/repo#number or pending>\n\
-             - selected_task: <task id>"
-        }
-        PayloadRole::Validation => {
-            "- Overall: pass|partial|fail\n\n\
-             | Command | Status | Evidence |\n\
-             | --- | --- | --- |\n\
-             | `<exact command>` | pass|fail|skipped | <artifact path, URL, or short reason> |\n\n\
-             ### Waivers\n\n\
-             - `<command>`: <why it was not run or why failure is accepted>"
-        }
-        PayloadRole::Review => {
-            "- Decision: approve|request-changes|comments-only\n\
-             - Lenses: testing, maintainability\n\
-             - Outcome comment: <provider comment URL or retained evidence path>\n\n\
-             | ID | Severity | Disposition | Summary |\n\
-             | --- | --- | --- | --- |\n\
-             | F1 | major | fixed|residual|follow-up|deferred|no-action | <finding summary> |"
-        }
-        PayloadRole::Closeout => {
-            "- Final status: complete\n\
-             - Approver: <login or source>\n\
-             - Approval: <comment URL or approval text>\n\
-             - Final validation: <validation evidence URL>\n\
-             - Notes: <optional closeout note>\n\n\
-             | PR | Merge SHA | Checks | Required | Non-required failures |\n\
-             | --- | --- | --- | --- | --- |\n\
-             | <PR URL or ref> | <sha> | pass|fail|none | pass|fail|none (<count>) | none |"
-        }
-    }
+    let view = LifecycleVnextView {
+        role: spec.role.as_str(),
+        marker_role: spec.marker_role,
+        profile: profile.as_str(),
+        heading: spec.default_heading,
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(LIFECYCLE_VNEXT_TEMPLATE_NAME, LIFECYCLE_VNEXT_TEMPLATE)
+        .expect("lifecycle_vnext template registers");
+    engine
+        .render(LIFECYCLE_VNEXT_TEMPLATE_NAME, &view)
+        .expect("lifecycle_vnext template renders")
 }
 
 fn render_json_skeleton(spec: &RoleSpec, profile: RecordProfile) -> String {
