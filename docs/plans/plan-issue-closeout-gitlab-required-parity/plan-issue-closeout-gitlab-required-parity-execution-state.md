@@ -3,13 +3,13 @@
 
 ## Execution State
 
-- Status: ready
+- Status: in-progress
 - Target scope: whole plan
 - Execution window: whole plan (single sprint)
-- Current task: Task 1.1
-- Next task: Task 1.1
+- Current task: Task 1.2
+- Next task: open PR for review + delivery
 - Last updated: 2026-05-26 Asia/Taipei
-- Branch/commit/PR/release: `fix/plan-issue-557-gitlab-required-none` (init via `tracking run init`; not yet pushed)
+- Branch/commit/PR/release: `fix/plan-issue-557-gitlab-required-none`; PR pending
 - Source document: docs/plans/plan-issue-closeout-gitlab-required-parity/plan-issue-closeout-gitlab-required-parity-plan.md
 - Discussion source document: docs/plans/plan-issue-closeout-gitlab-required-parity/plan-issue-closeout-gitlab-required-parity-discussion-source.md
 - Source issue: sympoies/nils-cli#557
@@ -21,21 +21,21 @@
 
 ## Task Ledger
 
-| ID       | Status  | Task                                                  | Evidence                          | Notes                                                                                  |
-| -------- | ------- | ----------------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------------------- |
-| Task 1.1 | pending | Swap GitLab adapter return triple and refresh comment | pending implementation            | struct literal swap at `forge_cli_adapter.rs:343-356`; comment refresh references #557 |
-| Task 1.2 | pending | Extend adapter unit test and CHANGELOG entry          | pending after Task 1.1            | extend `pr_merge_summary_composes_view_and_checks`; CHANGELOG `[Unreleased]` entry     |
+| ID       | Status | Task                                                  | Evidence                  | Notes                                                                                                                                                                              |
+| -------- | ------ | ----------------------------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Task 1.1 | done   | Swap GitLab adapter return triple and refresh comment | local commit pending push | struct literal swap at `forge_cli_adapter.rs:343-356`; comment refresh references #557; returns `Some("success".to_string()), Some(0), Vec::new()`                                 |
+| Task 1.2 | done   | Extend adapter unit test and CHANGELOG entry          | local commit pending push | extended `pr_merge_summary_composes_view_and_checks` with `required_state.as_deref()==Some("success")` + `required_count==Some(0)`; CHANGELOG `[Unreleased] ### Fixed` entry added |
 
 ## Validation
 
-| Command                                                                                                                                                       | Status  | Summary                                                          | Artifact |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- | ---------------------------------------------------------------- | -------- |
-| `plan-tooling validate --file docs/plans/plan-issue-closeout-gitlab-required-parity/plan-issue-closeout-gitlab-required-parity-plan.md --format text --explain` | pending | bundle gate (run during `record open`)                           | pending  |
-| `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`                                                                                                   | pending | docs hygiene, placement, rumdl, plan-bundle, cli-output-contract | pending  |
-| `cargo test -p nils-plan-issue-cli`                                                                                                                           | pending | per-crate gate                                                   | pending  |
-| `cargo clippy -p nils-plan-issue-cli --all-targets --all-features -- -D warnings`                                                                             | pending | per-crate clippy                                                 | pending  |
-| `cargo build -p nils-plan-issue-cli --locked`                                                                                                                 | pending | Cargo.lock locked-build CI lane                                  | pending  |
-| `cargo nextest run --workspace`                                                                                                                               | pending | workspace gate                                                   | pending  |
+| Command                                                                                                                                                         | Status | Summary                                                          | Artifact |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------- | -------- |
+| `plan-tooling validate --file docs/plans/plan-issue-closeout-gitlab-required-parity/plan-issue-closeout-gitlab-required-parity-plan.md --format text --explain` | pass   | bundle gate                                                      | exit 0   |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`                                                                                                     | pass   | docs hygiene, placement, rumdl, plan-bundle, cli-output-contract | green    |
+| `cargo test -p nils-plan-issue-cli`                                                                                                                             | pass   | per-crate gate (127+11+7+6+232 = 383 tests pass)                 | green    |
+| `cargo clippy -p nils-plan-issue-cli --all-targets --all-features -- -D warnings`                                                                               | pass   | per-crate clippy                                                 | green    |
+| `cargo build -p nils-plan-issue-cli --locked`                                                                                                                   | pass   | Cargo.lock locked-build CI lane                                  | green    |
+| `cargo nextest run --workspace`                                                                                                                                 | pass   | workspace gate (4041/4041 pass in 11.3s)                         | green    |
 
 ## Blockers
 
@@ -60,3 +60,15 @@
   `record audit --expect-visible` returns `overall_pass: true` with
   all three lifecycle markers (source / plan / state) recognized.
   Ready to hand off to `deliver-plan-tracking-issue`.
+- 2026-05-26: Implementation landed locally on branch
+  `fix/plan-issue-557-gitlab-required-none`. `forge_cli_adapter.rs`
+  GitLab branch of `pr_merge_summary` returns `Some("success"),
+  Some(0), []` and the inline comment now references #557 / #502.
+  `pr_merge_summary_composes_view_and_checks` extended to assert the
+  full new triple. CHANGELOG `[Unreleased] ### Fixed` entry added.
+  Source / plan docs corrected to spell the adapter-layer type
+  (`Option<String>` with the `"success"` literal) explicitly instead
+  of the renderer-layer `CheckStatus::Pass`. Full validation matrix
+  passes locally: `plan-tooling validate`, docs-only CI gate, per-crate
+  `cargo test` / `clippy` / locked-build, and workspace `cargo nextest`
+  (4041/4041). PR pending.

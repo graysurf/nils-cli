@@ -342,16 +342,22 @@ impl ProviderAdapter for ForgeCliAdapter {
         };
         // GitLab has no first-class required-check concept: pipeline
         // jobs are either reported by `glab` as a single rolled-up
-        // status, or not at all. We leave the required fields at
-        // `None`/empty so the close gate falls back to the aggregate
-        // `checks` value (matching pre-#502 GitLab behavior).
+        // status, or not at all. Report zero required checks — the
+        // same shape `pr_required_summary` returns for a GitHub branch
+        // without a required-check rule — so the closeout-comment
+        // `Required` column renders `none required` (via
+        // `required_check_label` at
+        // `lifecycle_record.rs:2154-2160`) instead of `unknown`, and
+        // the close gate in `lifecycle_record.rs:2446-2469` treats it
+        // as a clean resolve per the #502 "non-required failures
+        // never block close" contract. Tracked at sympoies/nils-cli#557.
         Ok(PrMergeSummary {
             state,
             merged,
             merge_sha,
             checks,
-            required_state: None,
-            required_count: None,
+            required_state: Some("success".to_string()),
+            required_count: Some(0),
             non_required_failures: Vec::new(),
         })
     }
@@ -755,6 +761,12 @@ mod tests {
         assert!(summary.merged);
         assert_eq!(summary.merge_sha.as_deref(), Some("deadbeef"));
         assert_eq!(summary.checks.as_deref(), Some("success"));
+        // GitLab parity (sympoies/nils-cli#557): the adapter reports
+        // zero required checks so closeout rendering lands on the
+        // `none required` label instead of `unknown`.
+        assert_eq!(summary.required_state.as_deref(), Some("success"));
+        assert_eq!(summary.required_count, Some(0));
+        assert!(summary.non_required_failures.is_empty());
         let calls = handle.calls();
         assert_eq!(calls.len(), 2);
         assert!(calls[0].windows(2).any(|w| w[0] == "pr" && w[1] == "view"));
