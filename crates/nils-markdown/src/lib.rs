@@ -14,3 +14,13 @@
 //! into, and a byte-equality `assert_render` test harness. Sprint 3
 //! lands the `md-render` binary that drives the same engine over JSON
 //! input under the `bin-cli` Cargo feature.
+
+mod engine;
+mod error;
+mod filters;
+#[cfg(feature = "test-support")]
+pub mod golden;
+pub mod helpers;
+
+pub use engine::{Engine, EngineBuilder};
+pub use error::RenderError;

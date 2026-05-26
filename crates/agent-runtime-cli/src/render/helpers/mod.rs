@@ -16,9 +16,9 @@
 
 use crate::render::manifest::{ManifestSet, StateOutMode};
 use indexmap::IndexMap;
+use nils_markdown::Engine;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tera::Tera;
 
 pub mod cli_ref;
 pub mod script;
@@ -37,12 +37,18 @@ pub struct HelperContext {
     pub current_skill_state_out_mode: StateOutMode,
 }
 
-/// Register every renderer helper on `tera` with the shared `ctx`.
-pub fn register_all(tera: &mut Tera, ctx: Arc<HelperContext>) {
-    tera.register_function("script", script::make(ctx.clone()));
-    tera.register_function("skill_ref", skill_ref::make(ctx.clone()));
-    tera.register_function("state_out", state_out::make(ctx.clone()));
-    tera.register_function("cli_ref", cli_ref::make(ctx));
+/// Register every renderer helper on `engine` with the shared `ctx`.
+///
+/// `agent-runtime-cli` keeps the four helper bodies in this crate
+/// because they bind to its manifest domain (`ManifestSet`,
+/// `StateOutMode`, `CliToolsManifest`); `nils-markdown` exposes a
+/// generic [`Engine::register_helper`] extension point that this
+/// function plugs into.
+pub fn register_all(engine: &mut Engine, ctx: Arc<HelperContext>) {
+    engine.register_helper("script", script::make(ctx.clone()));
+    engine.register_helper("skill_ref", skill_ref::make(ctx.clone()));
+    engine.register_helper("state_out", state_out::make(ctx.clone()));
+    engine.register_helper("cli_ref", cli_ref::make(ctx));
 }
 
 #[cfg(test)]
@@ -181,9 +187,14 @@ mod test_support {
     }
 
     pub fn render(template: &str, ctx: HelperContext) -> tera::Result<String> {
-        let mut tera = Tera::default();
-        register_all(&mut tera, Arc::new(ctx));
-        tera.render_str(template, &tera::Context::new())
+        let mut engine = Engine::builder().build();
+        register_all(&mut engine, Arc::new(ctx));
+        engine
+            .render_str(template, &serde_json::Value::Null)
+            .map_err(|err| match err {
+                nils_markdown::RenderError::Render { source, .. } => source,
+                other => tera::Error::msg(format!("{other}")),
+            })
     }
 
     /// Flatten a Tera error and its source chain into a single string so
