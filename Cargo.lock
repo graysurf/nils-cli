@@ -1862,6 +1862,7 @@ dependencies = [
  "clap_complete",
  "nils-agent-out",
  "nils-common",
+ "nils-markdown",
  "nils-term",
  "nils-test-support",
  "pretty_assertions",
