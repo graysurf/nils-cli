@@ -3,15 +3,16 @@
 
 ## Execution State
 
-- Status: in-progress
+- Status: complete
 - Target scope: whole issue
 - Execution window: whole issue
-- Current task: Task 1.4
-- Next task: open the docs PR via `deliver-plan-tracking-issue`, then close sympoies/nils-cli#535
+- Current task: done
+- Next task: closeout via `plan-tracking-issue-closeout` (then close sympoies/nils-cli#535)
 - Last updated: 2026-05-26 Asia/Taipei
 - Branch/commit/PR/release:
-  `feat/plan-issue-audit-label-contract-sprint-1`; bundle PR
-  `sympoies/nils-cli#556` (merged → `f1aaa36`); Sprint 1 PR pending
+  `feat/plan-issue-audit-label-contract-sprint-1` (deleted post-merge);
+  bundle PR `sympoies/nils-cli#556` (merged → `f1aaa36`);
+  Sprint 1 PR `sympoies/nils-cli#559` (merged squash → `47673e0`)
 - Source document: docs/plans/plan-issue-record-audit-label-contract/plan-issue-record-audit-label-contract-plan.md
 - Discussion source document: docs/plans/plan-issue-record-audit-label-contract/plan-issue-record-audit-label-contract-discussion-source.md
 - Source issue: sympoies/nils-cli#535
@@ -28,7 +29,7 @@
 | Task 1.1 | done | Inventory existing doc claims about `record audit` | session log 2026-05-26 (T1.1) | v2 spec is the only contract surface; README / CHANGELOG / runbook / tests / src have no label claim |
 | Task 1.2 | done | Amend v2 spec audit section with explicit label boundary | `crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md` | added "Label verification is out of scope" paragraph below the audit bullets |
 | Task 1.3 | done | Add CHANGELOG entry for the contract clarification | `crates/plan-issue-cli/CHANGELOG.md` (Unreleased › Documentation) | references sympoies/nils-cli#535 |
-| Task 1.4 | pending | Open and merge the docs PR, then close #535 | — | handed off to `deliver-plan-tracking-issue` |
+| Task 1.4 | done | Open and merge the docs PR, then close #535 | sympoies/nils-cli#559 (merged squash → `47673e0`) | PR merged with `mergeStateStatus=UNSTABLE` due to GitHub Actions `dtolnay/rust-toolchain@stable` codeload infra outage; user-authorized merge because main is unprotected and all checks are `isRequired=null`. Source issue close handed to `plan-tracking-issue-closeout` |
 
 ## Validation
 
