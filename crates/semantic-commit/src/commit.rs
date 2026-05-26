@@ -13,6 +13,11 @@ const EXIT_MESSAGE_REQUIRED: i32 = 3;
 const EXIT_VALIDATION_FAILED: i32 = 4;
 const EXIT_DEPENDENCY_ERROR: i32 = 5;
 const CAT_PAGER_ENV: [(&str, &str); 2] = [("GIT_PAGER", "cat"), ("PAGER", "cat")];
+const NONINTERACTIVE_COMMIT_ENV: [(&str, &str); 3] = [
+    ("GIT_PAGER", "cat"),
+    ("PAGER", "cat"),
+    ("GIT_EDITOR", "true"),
+];
 const COMMIT_RESULT_SCHEMA_VERSION: &str = "cli.semantic-commit.commit.v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1177,7 +1182,11 @@ fn git_cleanup_commit(
     }
     args.push(format!("{}={target_sha}", operation.git_flag()));
 
-    let output = run_git_output_with_pager_owned(options.repo.as_deref(), &args)?;
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = match options.repo.as_deref() {
+        Some(repo) => common_git::run_output_in_with_env(repo, &refs, &NONINTERACTIVE_COMMIT_ENV),
+        None => common_git::run_output_with_env(&refs, &NONINTERACTIVE_COMMIT_ENV),
+    }?;
 
     if !output.stderr.is_empty() {
         std::io::stderr().write_all(&output.stderr)?;

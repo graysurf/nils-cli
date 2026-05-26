@@ -1214,6 +1214,47 @@ fn squash_json_dry_run_reports_target_without_committing() {
 }
 
 #[test]
+fn squash_creates_squash_commit_without_opening_editor() {
+    let repo = common::init_repo();
+    stage_file(repo.path(), "base.txt", "base\n");
+    let base = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "commit",
+            "--message",
+            "feat(core): base change",
+            "--no-summary",
+        ],
+        &[],
+        None,
+    );
+    assert_eq!(base.status.code(), Some(0));
+
+    common::write_executable(repo.path(), "fail-editor.sh", "#!/bin/sh\nexit 42\n");
+    let editor = repo.path().join("fail-editor.sh");
+    stage_file(repo.path(), "squash.txt", "squash\n");
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &["squash", "--target", "HEAD", "--json", "--no-summary"],
+        &[("GIT_EDITOR", editor.to_str().expect("editor path"))],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).expect("squash json");
+    assert_eq!(json["operation"], "squash");
+    assert_eq!(
+        git_trim(repo.path(), &["show", "-s", "--format=%s", "HEAD"]),
+        "squash! feat(core): base change"
+    );
+}
+
+#[test]
 fn fixup_invalid_target_fails_without_commit() {
     let repo = common::init_repo();
     stage_file(repo.path(), "base.txt", "base\n");
