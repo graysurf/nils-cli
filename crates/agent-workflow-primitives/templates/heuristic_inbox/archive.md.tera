@@ -1,0 +1,7 @@
+## Archive
+
+- Archived: {{ archive_date }}
+- Reason: {{ reason }}
+{%- if link %}
+- Durable link: `{{ link }}`
+{%- endif %}

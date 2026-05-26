@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
+use nils_markdown::Engine;
 use nils_term::prompt::{self, PromptError, PromptOptions};
 use regex::Regex;
 use serde::Serialize;
@@ -21,6 +22,24 @@ use serde_json::{Map, Value, json};
 
 use crate::common::{CliError, OutputFormat, display_path, render_error, render_success};
 use crate::completion::{self, CompletionShell};
+
+const ARCHIVE_TEMPLATE: &str = include_str!("../templates/heuristic_inbox/archive.md.tera");
+const ARCHIVE_TEMPLATE_NAME: &str = "heuristic_inbox_archive";
+
+const NEXT_ACTION_TEMPLATE: &str = include_str!("../templates/heuristic_inbox/next_action.md.tera");
+const NEXT_ACTION_TEMPLATE_NAME: &str = "heuristic_inbox_next_action";
+
+#[derive(Debug, Serialize)]
+struct ArchiveSectionView<'a> {
+    archive_date: &'a str,
+    reason: &'a str,
+    link: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct NextActionSectionView<'a> {
+    body: &'a str,
+}
 
 const LIST_SCHEMA_VERSION: &str = "cli.heuristic-inbox.list.v1";
 const VERIFY_SCHEMA_VERSION: &str = "cli.heuristic-inbox.verify.v1";
@@ -1133,18 +1152,29 @@ fn archive_destination(folder: &Path, archive_root: &Path, archive_date: &str) -
 }
 
 fn render_archive_section(archive_date: &str, reason: &str, link: &str) -> String {
-    let mut lines = vec![
-        "## Archive".to_string(),
-        String::new(),
-        format!("- Archived: {archive_date}"),
-        format!("- Reason: {reason}"),
-    ];
-    if !link.is_empty() {
-        lines.push(format!("- Durable link: `{link}`"));
-    }
-    let mut joined = lines.join("\n");
-    joined.push('\n');
-    joined
+    let view = ArchiveSectionView {
+        archive_date,
+        reason,
+        link: Some(link).filter(|value| !value.is_empty()),
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(ARCHIVE_TEMPLATE_NAME, ARCHIVE_TEMPLATE)
+        .expect("archive template registers");
+    engine
+        .render(ARCHIVE_TEMPLATE_NAME, &view)
+        .expect("archive template renders")
+}
+
+fn render_next_action_section(body: &str) -> String {
+    let view = NextActionSectionView { body };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(NEXT_ACTION_TEMPLATE_NAME, NEXT_ACTION_TEMPLATE)
+        .expect("next_action template registers");
+    engine
+        .render(NEXT_ACTION_TEMPLATE_NAME, &view)
+        .expect("next_action template renders")
 }
 
 /// Find a section in `text` by its header line (e.g. "## Archive").
@@ -1468,12 +1498,16 @@ fn replace_next_action(text: &str, link: &str, next_action: &str) -> String {
     let Some((start, end)) = find_section_span(text, "## Next Action") else {
         if !next_action.is_empty() {
             let mut s = text.trim_end().to_string();
-            s.push_str(&format!("\n\n## Next Action\n\n{next_action}\n"));
+            s.push_str("\n\n");
+            s.push_str(&render_next_action_section(next_action));
             return s;
         }
         if !link.is_empty() {
             let mut s = text.trim_end().to_string();
-            s.push_str(&format!("\n\n## Next Action\n\nLifecycle link: `{link}`\n"));
+            s.push_str("\n\n");
+            s.push_str(&render_next_action_section(&format!(
+                "Lifecycle link: `{link}`"
+            )));
             return s;
         }
         return text.to_string();
@@ -1495,7 +1529,7 @@ fn replace_next_action(text: &str, link: &str, next_action: &str) -> String {
         }
         body.push_str(&format!("Lifecycle link: `{link}`"));
     }
-    let replacement = format!("## Next Action\n\n{}\n", body.trim());
+    let replacement = render_next_action_section(body.trim());
     let mut out = String::with_capacity(text.len());
     out.push_str(&text[..start]);
     out.push_str(&replacement);
@@ -2607,5 +2641,55 @@ mod tests {
         let rewritten = normalize_home_paths(text);
         assert!(rewritten.contains("<workspace>/project"));
         assert!(rewritten.contains("<workspace>/build.log"));
+    }
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("heuristic_inbox")
+            .join(name)
+    }
+
+    fn assert_or_bless(name: &str, actual: &str) {
+        let path = fixture_path(name);
+        if std::env::var_os("BLESS_HEURISTIC_INBOX_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir fixture dir");
+            std::fs::write(&path, actual).expect("write fixture");
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read fixture {}: {err}", path.display()));
+        pretty_assertions::assert_eq!(expected, actual, "golden mismatch for {name}");
+    }
+
+    #[test]
+    fn archive_section_without_link_matches_golden() {
+        let out = render_archive_section("2026-05-26", "promoted to plan #541", "");
+        assert_or_bless("archive_without_link.md", &out);
+    }
+
+    #[test]
+    fn archive_section_with_link_matches_golden() {
+        let out = render_archive_section(
+            "2026-05-26",
+            "promoted to plan #541",
+            "docs/plans/markdown-render-template-layer/",
+        );
+        assert_or_bless("archive_with_link.md", &out);
+    }
+
+    #[test]
+    fn next_action_section_matches_golden() {
+        let out = render_next_action_section("Create a follow-up plan.");
+        assert_or_bless("next_action_body.md", &out);
+    }
+
+    #[test]
+    fn next_action_section_with_lifecycle_link_matches_golden() {
+        let out = render_next_action_section(
+            "Resolve via plan #541.\n\nLifecycle link: `docs/plans/markdown-render-template-layer/`",
+        );
+        assert_or_bless("next_action_with_link.md", &out);
     }
 }
