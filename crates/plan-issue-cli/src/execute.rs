@@ -1634,20 +1634,20 @@ fn derive_lint_hints(
     match role {
         PayloadRole::State => {
             // Final state when the structured payload reports `complete`.
-            if let Some(payload) = payload {
-                if let Ok(state) = payload.parse_state() {
-                    hints.state_is_final = matches!(
-                        state.status,
-                        Some(crate::lifecycle_record::StateStatus::Complete)
-                    );
-                }
+            if let Some(payload) = payload
+                && let Ok(state) = payload.parse_state()
+            {
+                hints.state_is_final = matches!(
+                    state.status,
+                    Some(crate::lifecycle_record::StateStatus::Complete)
+                );
             }
         }
         PayloadRole::Review => {
-            if let Some(payload) = payload {
-                if let Ok(review) = payload.parse_review() {
-                    hints.review_has_findings = !review.findings.is_empty();
-                }
+            if let Some(payload) = payload
+                && let Ok(review) = payload.parse_review()
+            {
+                hints.review_has_findings = !review.findings.is_empty();
             }
         }
         _ => {}
@@ -2280,21 +2280,19 @@ fn run_tracking_close_ready(
     let mut blockers: Vec<Value> = Vec::new();
     let mut linked_prs: Vec<String> = args.linked_pr.clone();
 
-    if let Some(audit) = audit.as_ref() {
-        if let Some(state_evidence) = audit.evidence.get("state") {
-            if let Some(payload) = state_evidence.payload.as_ref() {
-                if let Ok(state) = payload.parse_state() {
-                    for pr in state.prs {
-                        linked_prs.push(pr.pr_ref);
-                    }
-                }
-            }
+    if let Some(audit) = audit.as_ref()
+        && let Some(state_evidence) = audit.evidence.get("state")
+        && let Some(payload) = state_evidence.payload.as_ref()
+        && let Ok(state) = payload.parse_state()
+    {
+        for pr in state.prs {
+            linked_prs.push(pr.pr_ref);
         }
     }
-    if let Some(run) = run.as_ref() {
-        if let Some(pr) = run.pr.as_ref() {
-            linked_prs.push(pr.r#ref.clone());
-        }
+    if let Some(run) = run.as_ref()
+        && let Some(pr) = run.pr.as_ref()
+    {
+        linked_prs.push(pr.r#ref.clone());
     }
     linked_prs.sort();
     linked_prs.dedup();
@@ -2317,22 +2315,22 @@ fn run_tracking_close_ready(
 
     // Visible completeness check (Task 6.2 deep gate).
     let mut visible_summary = json!({"checked": false});
-    if args.expect_visible {
-        if let (Some(audit), Some(comments)) = (audit.as_ref(), comments_json.as_deref()) {
-            let visible = run_record_audit_visible(audit, comments, Some(args.profile))?;
-            let overall_pass = visible["overall_pass"].as_bool().unwrap_or(false);
-            visible_summary = json!({
-                "checked": true,
-                "pass": overall_pass,
-                "report": visible,
-            });
-            if !overall_pass {
-                blockers.push(json!({
-                    "code": "visible-completeness-failed",
-                    "message": "visible-completeness lint reported missing sections",
-                    "suggested_unblock": "fix the rendered lifecycle comments before close",
-                }));
-            }
+    if args.expect_visible
+        && let (Some(audit), Some(comments)) = (audit.as_ref(), comments_json.as_deref())
+    {
+        let visible = run_record_audit_visible(audit, comments, Some(args.profile))?;
+        let overall_pass = visible["overall_pass"].as_bool().unwrap_or(false);
+        visible_summary = json!({
+            "checked": true,
+            "pass": overall_pass,
+            "report": visible,
+        });
+        if !overall_pass {
+            blockers.push(json!({
+                "code": "visible-completeness-failed",
+                "message": "visible-completeness lint reported missing sections",
+                "suggested_unblock": "fix the rendered lifecycle comments before close",
+            }));
         }
     }
 
@@ -2459,11 +2457,11 @@ fn run_tracking_status(
         "run_state": tracking_status_run_state_summary(run_state_value.as_ref()),
     });
 
-    if args.expect_visible {
-        if let (Some(audit), Some(comments)) = (audit.as_ref(), comments_json.as_deref()) {
-            let visible = run_record_audit_visible(audit, comments, Some(args.profile))?;
-            payload["visible"] = visible;
-        }
+    if args.expect_visible
+        && let (Some(audit), Some(comments)) = (audit.as_ref(), comments_json.as_deref())
+    {
+        let visible = run_record_audit_visible(audit, comments, Some(args.profile))?;
+        payload["visible"] = visible;
     }
 
     Ok(payload)

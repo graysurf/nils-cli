@@ -198,7 +198,7 @@ fn tracking_status_reports_stale_run_state_when_issue_closed() {
         .map(|w| w["code"].as_str().unwrap())
         .collect();
     assert!(
-        warnings.iter().any(|c| *c == "run-state-stale"),
+        warnings.contains(&"run-state-stale"),
         "warnings: {warnings:?}"
     );
 }

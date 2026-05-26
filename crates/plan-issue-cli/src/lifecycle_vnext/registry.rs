@@ -264,8 +264,7 @@ mod tests {
         assert!(
             state
                 .required_visible_sections
-                .iter()
-                .any(|h| *h == "## Task Ledger")
+                .contains(&"## Task Ledger")
         );
     }
 

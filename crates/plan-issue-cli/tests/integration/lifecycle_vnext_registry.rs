@@ -59,8 +59,7 @@ fn lifecycle_vnext_registry_state_requires_task_ledger() {
     assert!(
         state
             .required_visible_sections
-            .iter()
-            .any(|h| *h == "## Task Ledger"),
+            .contains(&"## Task Ledger"),
         "state visible sections missing ## Task Ledger: {:?}",
         state.required_visible_sections
     );

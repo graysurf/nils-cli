@@ -131,8 +131,8 @@ fn tracking_checkpoint_refusals_block_when_run_state_stale_vs_issue_closed() {
         "blocked codes: {codes:?}"
     );
     assert!(
-        result["roles_planned"].as_array().unwrap().is_empty() == false
-            || result["blocked"].as_array().unwrap().is_empty() == false
+        !result["roles_planned"].as_array().unwrap().is_empty()
+            || !result["blocked"].as_array().unwrap().is_empty()
     );
 }
 
