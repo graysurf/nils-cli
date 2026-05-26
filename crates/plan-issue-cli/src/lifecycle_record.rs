@@ -9,6 +9,142 @@ use crate::commands::record::{LifecycleCommentKind, RecordProfile, TaskLedgerDis
 const DASHBOARD_TEMPLATE: &str = include_str!("../templates/lifecycle_record/dashboard.md.tera");
 const DASHBOARD_TEMPLATE_NAME: &str = "lifecycle_record_dashboard";
 
+const SNAPSHOT_TEMPLATE: &str = include_str!("../templates/lifecycle_record/snapshot.md.tera");
+const SNAPSHOT_TEMPLATE_NAME: &str = "lifecycle_record_snapshot";
+
+const POST_COMMENT_TEMPLATE: &str =
+    include_str!("../templates/lifecycle_record/post_comment.md.tera");
+const POST_COMMENT_TEMPLATE_NAME: &str = "lifecycle_record_post_comment";
+
+const STATE_VISIBLE_TEMPLATE: &str = include_str!("../templates/lifecycle_record/state.md.tera");
+const STATE_VISIBLE_TEMPLATE_NAME: &str = "lifecycle_record_state";
+
+const SESSION_VISIBLE_TEMPLATE: &str =
+    include_str!("../templates/lifecycle_record/session.md.tera");
+const SESSION_VISIBLE_TEMPLATE_NAME: &str = "lifecycle_record_session";
+
+const VALIDATION_VISIBLE_TEMPLATE: &str =
+    include_str!("../templates/lifecycle_record/validation.md.tera");
+const VALIDATION_VISIBLE_TEMPLATE_NAME: &str = "lifecycle_record_validation";
+
+const REVIEW_VISIBLE_TEMPLATE: &str = include_str!("../templates/lifecycle_record/review.md.tera");
+const REVIEW_VISIBLE_TEMPLATE_NAME: &str = "lifecycle_record_review";
+
+const CLOSEOUT_VISIBLE_TEMPLATE: &str =
+    include_str!("../templates/lifecycle_record/closeout.md.tera");
+const CLOSEOUT_VISIBLE_TEMPLATE_NAME: &str = "lifecycle_record_closeout";
+
+#[derive(Debug, Serialize)]
+struct PostCommentView<'a> {
+    marker: String,
+    heading: &'static str,
+    profile: &'a str,
+    visible_content: String,
+    envelope_carrier: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StateVisibleView<'a> {
+    status: Option<&'static str>,
+    target_scope: Option<&'a str>,
+    current: Option<&'a str>,
+    next_action: Option<&'a str>,
+    tasks: Vec<StateTaskRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct StateTaskRow {
+    id: String,
+    status: &'static str,
+    title: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionVisibleView<'a> {
+    summary: &'a str,
+    highlights: Vec<String>,
+    links: Vec<KeyValuePair>,
+    extras: Vec<KeyValuePair>,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyValuePair {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidationVisibleView<'a> {
+    overall: &'static str,
+    commands: Vec<ValidationCommandRow<'a>>,
+    waivers: Vec<ValidationWaiverRow<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidationCommandRow<'a> {
+    command: String,
+    status: &'static str,
+    evidence: String,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidationWaiverRow<'a> {
+    command: &'a str,
+    reason: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct ReviewVisibleView<'a> {
+    decision: &'static str,
+    lenses: Option<String>,
+    outcome_comment_url: Option<&'a str>,
+    findings: Vec<ReviewFindingRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReviewFindingRow {
+    id: String,
+    severity: &'static str,
+    disposition: &'static str,
+    summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CloseoutVisibleView<'a> {
+    final_status: &'a str,
+    approver: Option<&'a str>,
+    approval_url: Option<&'a str>,
+    final_validation_url: Option<&'a str>,
+    notes: Option<&'a str>,
+    has_override: bool,
+    override_reason: Option<String>,
+    override_failures: Option<String>,
+    linked_prs: Vec<CloseoutPrRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct CloseoutPrRow {
+    label: String,
+    merge_sha: String,
+    checks: &'static str,
+    required: String,
+    non_required_failures: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SnapshotView<'a> {
+    marker: String,
+    heading: &'static str,
+    profile: &'a str,
+    path: Option<&'a str>,
+    commit: Option<&'a str>,
+    summary: Option<&'a str>,
+    details_summary: &'static str,
+    content: &'a str,
+    envelope_carrier: String,
+}
+
 #[derive(Debug, Serialize)]
 struct DashboardView<'a> {
     title: &'static str,
@@ -1452,41 +1588,33 @@ pub fn render_record_snapshot_comment(
     };
     let envelope_carrier = render_payload_carrier(&envelope)?;
 
-    let marker = marker_for(profile, kind);
-    let heading = default_heading(profile, kind);
-    let details_summary = default_details_summary(kind);
-
-    let mut out = Vec::new();
-    out.push(marker);
-    out.push(String::new());
-    out.push(format!("## {heading}"));
-    out.push(String::new());
-    out.push(format!("- Profile: {}", profile.as_str()));
-    if !snapshot.path.trim().is_empty() {
-        out.push(format!("- Path: `{}`", snapshot.path.trim()));
-    }
-    if !snapshot.commit.trim().is_empty() {
-        out.push(format!("- Commit: `{}`", snapshot.commit.trim()));
-    }
-    if let Some(summary) = snapshot
+    let path = Some(snapshot.path.trim()).filter(|value| !value.is_empty());
+    let commit = Some(snapshot.commit.trim()).filter(|value| !value.is_empty());
+    let summary = snapshot
         .summary
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        out.push(format!("- Summary: {summary}"));
-    }
-    out.push("- Snapshot mode: local committed Markdown".to_string());
-    out.push(String::new());
-    out.push("<details>".to_string());
-    out.push(format!("<summary>{details_summary}</summary>"));
-    out.push(String::new());
-    out.push(content.to_string());
-    out.push(String::new());
-    out.push("</details>".to_string());
-    out.push(String::new());
-    out.push(envelope_carrier);
-    Ok(finalize_markdown(out))
+        .filter(|value| !value.is_empty());
+
+    let view = SnapshotView {
+        marker: marker_for(profile, kind),
+        heading: default_heading(profile, kind),
+        profile: profile.as_str(),
+        path,
+        commit,
+        summary,
+        details_summary: default_details_summary(kind),
+        content,
+        envelope_carrier,
+    };
+
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(SNAPSHOT_TEMPLATE_NAME, SNAPSHOT_TEMPLATE)
+        .map_err(|err| format!("snapshot template register failed: {err}"))?;
+    engine
+        .render(SNAPSHOT_TEMPLATE_NAME, &view)
+        .map_err(|err| format!("snapshot template render failed: {err}"))
 }
 
 /// Render the canonical v2 lifecycle comment used by `record post` for
@@ -1538,19 +1666,21 @@ pub fn render_record_post_comment_with_display(
     };
     let envelope_carrier = render_payload_carrier(&envelope)?;
 
-    let marker = marker_for(profile, kind);
-    let heading = default_heading(profile, kind);
+    let view = PostCommentView {
+        marker: marker_for(profile, kind),
+        heading: default_heading(profile, kind),
+        profile: profile.as_str(),
+        visible_content,
+        envelope_carrier,
+    };
 
-    let mut out = Vec::new();
-    out.push(marker);
-    out.push(String::new());
-    out.push(format!("## {heading}"));
-    out.push(String::new());
-    out.push(format!("- Profile: {}", profile.as_str()));
-    out.push(visible_content);
-    out.push(String::new());
-    out.push(envelope_carrier);
-    Ok(finalize_markdown(out))
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(POST_COMMENT_TEMPLATE_NAME, POST_COMMENT_TEMPLATE)
+        .map_err(|err| format!("post_comment template register failed: {err}"))?;
+    engine
+        .render(POST_COMMENT_TEMPLATE_NAME, &view)
+        .map_err(|err| format!("post_comment template render failed: {err}"))
 }
 
 fn render_visible_post_content(
@@ -1724,238 +1854,240 @@ fn is_terminal_state(state: &StateData) -> bool {
 }
 
 fn render_state_payload_visible(state: &StateData) -> String {
-    let mut out = Vec::new();
-    if let Some(status) = state.status {
-        out.push(format!("- Status: {}", status_state_label(status)));
-    }
-    if let Some(value) = state
-        .target_scope
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        out.push(format!("- Target scope: {value}"));
-    }
-    if let Some(value) = state.current.as_deref().filter(|value| !value.is_empty()) {
-        out.push(format!("- Current task: {value}"));
-    }
-    if let Some(value) = state
-        .next_action
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        out.push(format!("- Next task: {value}"));
-    }
-    if !state.tasks.is_empty() {
-        out.push(String::new());
-        out.push("## Task Ledger".to_string());
-        out.push(String::new());
-        out.push("| ID | Status | Task |".to_string());
-        out.push("| --- | --- | --- |".to_string());
-        for task in &state.tasks {
-            out.push(format!(
-                "| {} | {} | {} |",
-                table_cell(&task.id),
-                table_cell(task_row_status_label(task.status)),
-                table_cell(task.title.as_deref().unwrap_or(""))
-            ));
-        }
-    }
-    finalize_markdown(out).trim().to_string()
+    let view = StateVisibleView {
+        status: state.status.map(status_state_label),
+        target_scope: state
+            .target_scope
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+        current: state.current.as_deref().filter(|value| !value.is_empty()),
+        next_action: state
+            .next_action
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+        tasks: state
+            .tasks
+            .iter()
+            .map(|task| StateTaskRow {
+                id: table_cell(&task.id),
+                status: task_row_status_label(task.status),
+                title: table_cell(task.title.as_deref().unwrap_or("")),
+            })
+            .collect(),
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(STATE_VISIBLE_TEMPLATE_NAME, STATE_VISIBLE_TEMPLATE)
+        .expect("state template registers");
+    let rendered = engine
+        .render(STATE_VISIBLE_TEMPLATE_NAME, &view)
+        .expect("state template renders");
+    rendered.trim().to_string()
 }
 
 fn render_session_payload_visible(session: &SessionData, raw: &Value) -> String {
-    let mut out = vec![format!("- Summary: {}", session.summary.trim())];
-    if !session.highlights.is_empty() {
-        out.push(String::new());
-        out.push("### Highlights".to_string());
-        out.push(String::new());
-        for item in &session.highlights {
-            out.push(format!("- {}", item.trim()));
-        }
-    }
-    if !session.links.is_empty() {
-        out.push(String::new());
-        out.push("### Links".to_string());
-        out.push(String::new());
-        for (key, value) in &session.links {
-            out.push(format!("- {}: {}", key.trim(), value.trim()));
-        }
-    }
-    if let Some(object) = raw.as_object() {
-        let extras = object
+    let extras: Vec<KeyValuePair> = raw
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .filter(|(key, value)| {
+                    !matches!(key.as_str(), "summary" | "highlights" | "links") && !value.is_null()
+                })
+                .map(|(key, value)| KeyValuePair {
+                    key: key.trim().to_string(),
+                    value: visible_value(value),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let view = SessionVisibleView {
+        summary: session.summary.trim(),
+        highlights: session
+            .highlights
             .iter()
-            .filter(|(key, value)| {
-                !matches!(key.as_str(), "summary" | "highlights" | "links") && !value.is_null()
+            .map(|item| item.trim().to_string())
+            .collect(),
+        links: session
+            .links
+            .iter()
+            .map(|(key, value)| KeyValuePair {
+                key: key.trim().to_string(),
+                value: value.trim().to_string(),
             })
-            .collect::<Vec<_>>();
-        if !extras.is_empty() {
-            out.push(String::new());
-            out.push("### Session Fields".to_string());
-            out.push(String::new());
-            for (key, value) in extras {
-                out.push(format!("- {}: {}", key.trim(), visible_value(value)));
-            }
-        }
-    }
-    finalize_markdown(out).trim().to_string()
+            .collect(),
+        extras,
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(SESSION_VISIBLE_TEMPLATE_NAME, SESSION_VISIBLE_TEMPLATE)
+        .expect("session template registers");
+    let rendered = engine
+        .render(SESSION_VISIBLE_TEMPLATE_NAME, &view)
+        .expect("session template renders");
+    rendered.trim().to_string()
 }
 
 fn render_validation_payload_visible(validation: &ValidationData) -> String {
-    let mut out = vec![format!(
-        "- Overall: {}",
-        validation_overall_label(validation.overall)
-    )];
-    if !validation.commands.is_empty() {
-        out.push(String::new());
-        out.push("| Command | Status | Evidence |".to_string());
-        out.push("| --- | --- | --- |".to_string());
-        for command in &validation.commands {
-            out.push(format!(
-                "| {} | {} | {} |",
-                table_cell(&command.command),
-                table_cell(validation_command_status_label(command.status)),
-                table_cell(command.evidence.as_deref().unwrap_or(""))
-            ));
-        }
-    }
-    if !validation.waivers.is_empty() {
-        out.push(String::new());
-        out.push("### Waivers".to_string());
-        out.push(String::new());
-        for waiver in &validation.waivers {
-            out.push(format!(
-                "- `{}`: {}",
-                waiver.command.trim(),
-                waiver.reason.trim()
-            ));
-        }
-    }
-    finalize_markdown(out).trim().to_string()
+    let view = ValidationVisibleView {
+        overall: validation_overall_label(validation.overall),
+        commands: validation
+            .commands
+            .iter()
+            .map(|command| ValidationCommandRow {
+                command: table_cell(&command.command),
+                status: validation_command_status_label(command.status),
+                evidence: table_cell(command.evidence.as_deref().unwrap_or("")),
+                _phantom: std::marker::PhantomData,
+            })
+            .collect(),
+        waivers: validation
+            .waivers
+            .iter()
+            .map(|waiver| ValidationWaiverRow {
+                command: waiver.command.trim(),
+                reason: waiver.reason.trim(),
+            })
+            .collect(),
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(
+            VALIDATION_VISIBLE_TEMPLATE_NAME,
+            VALIDATION_VISIBLE_TEMPLATE,
+        )
+        .expect("validation template registers");
+    let rendered = engine
+        .render(VALIDATION_VISIBLE_TEMPLATE_NAME, &view)
+        .expect("validation template renders");
+    rendered.trim().to_string()
 }
 
 fn render_review_payload_visible(review: &ReviewData) -> String {
-    let mut out = vec![format!(
-        "- Decision: {}",
-        review_decision_label(review.decision)
-    )];
-    if !review.lenses.is_empty() {
-        out.push(format!("- Lenses: {}", review.lenses.join(", ")));
-    }
-    if let Some(url) = review
-        .outcome_comment_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        out.push(format!("- Outcome comment: {}", url.trim()));
-    }
-    if !review.findings.is_empty() {
-        out.push(String::new());
-        out.push("| ID | Severity | Disposition | Summary |".to_string());
-        out.push("| --- | --- | --- | --- |".to_string());
-        for finding in &review.findings {
-            out.push(format!(
-                "| {} | {} | {} | {} |",
-                table_cell(&finding.id),
-                table_cell(finding_severity_label(finding.severity)),
-                table_cell(finding_disposition_label(finding.disposition)),
-                table_cell(&finding.summary)
-            ));
-        }
-    }
-    finalize_markdown(out).trim().to_string()
+    let view = ReviewVisibleView {
+        decision: review_decision_label(review.decision),
+        lenses: if review.lenses.is_empty() {
+            None
+        } else {
+            Some(review.lenses.join(", "))
+        },
+        outcome_comment_url: review
+            .outcome_comment_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        findings: review
+            .findings
+            .iter()
+            .map(|finding| ReviewFindingRow {
+                id: table_cell(&finding.id),
+                severity: finding_severity_label(finding.severity),
+                disposition: finding_disposition_label(finding.disposition),
+                summary: table_cell(&finding.summary),
+            })
+            .collect(),
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(REVIEW_VISIBLE_TEMPLATE_NAME, REVIEW_VISIBLE_TEMPLATE)
+        .expect("review template registers");
+    let rendered = engine
+        .render(REVIEW_VISIBLE_TEMPLATE_NAME, &view)
+        .expect("review template renders");
+    rendered.trim().to_string()
 }
 
 fn render_closeout_payload_visible(closeout: &CloseoutData) -> String {
-    let mut out = vec![format!("- Final status: {}", closeout.final_status.trim())];
-    if let Some(approver) = closeout
-        .approval
-        .approver
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        out.push(format!("- Approver: {}", approver.trim()));
-    }
-    if let Some(url) = closeout
-        .approval
-        .comment_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        out.push(format!("- Approval: {}", url.trim()));
-    }
-    if let Some(url) = closeout
-        .final_validation_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        out.push(format!("- Final validation: {}", url.trim()));
-    }
-    if let Some(notes) = closeout
-        .notes
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        out.push(format!("- Notes: {}", notes.trim()));
-    }
-    if let Some(override_block) = closeout
+    let override_block = closeout
         .non_required_check_override
         .as_ref()
-        .filter(|value| !value.is_null())
-    {
-        out.push(String::new());
-        out.push("### Non-required Check Override".to_string());
-        out.push(String::new());
-        if let Some(reason) = override_block
+        .filter(|value| !value.is_null());
+    let override_reason = override_block.and_then(|block| {
+        block
             .get("reason")
             .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            out.push(format!("- Reason: {}", reason.trim()));
-        }
-        if let Some(failures) = override_block
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
+    let override_failures = override_block.and_then(|block| {
+        let items = block
             .get("observed_non_required_failures")
             .and_then(Value::as_array)
-            .filter(|items| !items.is_empty())
-        {
-            out.push(format!(
-                "- Observed failures: {}",
-                failures
-                    .iter()
-                    .map(visible_value)
-                    .filter(|value| !value.trim().is_empty())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
-    out.push(String::new());
-    if closeout.linked_prs.is_empty() {
-        out.push("- Linked PRs: none".to_string());
-    } else {
-        out.push("| PR | Merge SHA | Checks | Required | Non-required failures |".to_string());
-        out.push("| --- | --- | --- | --- | --- |".to_string());
-        for pr in &closeout.linked_prs {
-            let pr_label = pr.url.as_deref().unwrap_or(&pr.pr_ref);
-            let required = pr
-                .required_state
-                .map(check_status_label)
-                .unwrap_or("unknown");
-            let required_count = pr
-                .required_count
-                .map(|count| format!(" ({count})"))
-                .unwrap_or_default();
-            out.push(format!(
-                "| {} | {} | {} | {}{} | {} |",
-                table_cell(pr_label),
-                table_cell(pr.merge_sha.as_deref().unwrap_or("")),
-                table_cell(check_status_label(pr.checks)),
-                table_cell(required),
-                required_count,
-                table_cell(&non_empty_join(&pr.non_required_failures, "none"))
-            ));
-        }
-    }
-    finalize_markdown(out).trim().to_string()
+            .filter(|items| !items.is_empty())?;
+        Some(
+            items
+                .iter()
+                .map(visible_value)
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    });
+    let has_override = override_block.is_some();
+
+    let view = CloseoutVisibleView {
+        final_status: closeout.final_status.trim(),
+        approver: closeout
+            .approval
+            .approver
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        approval_url: closeout
+            .approval
+            .comment_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        final_validation_url: closeout
+            .final_validation_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        notes: closeout
+            .notes
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        has_override,
+        override_reason,
+        override_failures,
+        linked_prs: closeout
+            .linked_prs
+            .iter()
+            .map(|pr| {
+                let pr_label = pr.url.as_deref().unwrap_or(&pr.pr_ref);
+                let required = pr
+                    .required_state
+                    .map(check_status_label)
+                    .unwrap_or("unknown");
+                let required_count = pr
+                    .required_count
+                    .map(|count| format!(" ({count})"))
+                    .unwrap_or_default();
+                CloseoutPrRow {
+                    label: table_cell(pr_label),
+                    merge_sha: table_cell(pr.merge_sha.as_deref().unwrap_or("")),
+                    checks: check_status_label(pr.checks),
+                    required: format!("{}{}", table_cell(required), required_count),
+                    non_required_failures: table_cell(&non_empty_join(
+                        &pr.non_required_failures,
+                        "none",
+                    )),
+                }
+            })
+            .collect(),
+    };
+    let mut engine = Engine::builder().build();
+    engine
+        .register_template(CLOSEOUT_VISIBLE_TEMPLATE_NAME, CLOSEOUT_VISIBLE_TEMPLATE)
+        .expect("closeout template registers");
+    let rendered = engine
+        .render(CLOSEOUT_VISIBLE_TEMPLATE_NAME, &view)
+        .expect("closeout template renders");
+    rendered.trim().to_string()
 }
 
 fn task_row_status_label(status: TaskRowStatus) -> &'static str {

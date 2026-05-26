@@ -1,0 +1,16 @@
+<!-- plan-issue-record:v2 role=plan profile=tracking -->
+
+## Plan Snapshot
+
+- Profile: tracking
+- Snapshot mode: local committed Markdown
+
+<details>
+<summary>Plan snapshot</summary>
+
+plan body
+
+
+</details>
+
+<!-- plan-issue-record-payload:hex:7b22736368656d61223a22706c616e2d69737375652d7265636f72642e7061796c6f61642e7632222c22726f6c65223a22706c616e222c2270726f66696c65223a22747261636b696e67222c22757064617465645f6174223a6e756c6c2c2264617461223a7b2270617468223a22222c22636f6d6d6974223a22222c227469746c65223a6e756c6c2c2273756d6d617279223a6e756c6c7d7d -->

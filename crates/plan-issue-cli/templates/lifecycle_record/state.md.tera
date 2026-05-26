@@ -1,0 +1,22 @@
+{%- if status %}
+- Status: {{ status }}
+{%- endif %}
+{%- if target_scope %}
+- Target scope: {{ target_scope }}
+{%- endif %}
+{%- if current %}
+- Current task: {{ current }}
+{%- endif %}
+{%- if next_action %}
+- Next task: {{ next_action }}
+{%- endif %}
+{%- if tasks %}
+
+## Task Ledger
+
+| ID | Status | Task |
+| --- | --- | --- |
+{%- for task in tasks %}
+| {{ task.id }} | {{ task.status }} | {{ task.title }} |
+{%- endfor %}
+{%- endif %}

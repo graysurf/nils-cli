@@ -1,0 +1,34 @@
+- Final status: {{ final_status }}
+{%- if approver %}
+- Approver: {{ approver }}
+{%- endif %}
+{%- if approval_url %}
+- Approval: {{ approval_url }}
+{%- endif %}
+{%- if final_validation_url %}
+- Final validation: {{ final_validation_url }}
+{%- endif %}
+{%- if notes %}
+- Notes: {{ notes }}
+{%- endif %}
+{%- if has_override %}
+
+### Non-required Check Override
+
+{%- if override_reason %}
+- Reason: {{ override_reason }}
+{%- endif %}
+{%- if override_failures %}
+- Observed failures: {{ override_failures }}
+{%- endif %}
+{%- endif %}
+
+{% if linked_prs -%}
+| PR | Merge SHA | Checks | Required | Non-required failures |
+| --- | --- | --- | --- | --- |
+{%- for pr in linked_prs %}
+| {{ pr.label }} | {{ pr.merge_sha }} | {{ pr.checks }} | {{ pr.required }} | {{ pr.non_required_failures }} |
+{%- endfor %}
+{%- else -%}
+- Linked PRs: none
+{%- endif %}
