@@ -2059,19 +2059,12 @@ fn render_closeout_payload_visible(closeout: &CloseoutData) -> String {
             .iter()
             .map(|pr| {
                 let pr_label = pr.url.as_deref().unwrap_or(&pr.pr_ref);
-                let required = pr
-                    .required_state
-                    .map(check_status_label)
-                    .unwrap_or("unknown");
-                let required_count = pr
-                    .required_count
-                    .map(|count| format!(" ({count})"))
-                    .unwrap_or_default();
+                let required_label = required_check_label(pr.required_state, pr.required_count);
                 CloseoutPrRow {
                     label: table_cell(pr_label),
                     merge_sha: table_cell(pr.merge_sha.as_deref().unwrap_or("")),
                     checks: check_status_label(pr.checks),
-                    required: format!("{}{}", table_cell(required), required_count),
+                    required: table_cell(&required_label),
                     non_required_failures: table_cell(&non_empty_join(
                         &pr.non_required_failures,
                         "none",
@@ -2131,6 +2124,42 @@ fn check_status_label(status: CheckStatus) -> &'static str {
         CheckStatus::Pass => "pass",
         CheckStatus::Fail => "fail",
         CheckStatus::None => "none",
+    }
+}
+
+/// Render the closeout-comment `Required` column from the
+/// `(required_state, required_count)` pair on a [`LinkedPrEvidence`].
+///
+/// Five label branches:
+///
+/// - `Some(Pass) + Some(0)` → `"none required"` — no required-check
+///   rule exists for the branch (or rule explicitly declares zero
+///   required checks). The earlier rendering collapsed this into
+///   `"unknown"` even on healthy PRs (sympoies/nils-cli#541 closeout).
+/// - `Some(Pass) + Some(N>=1)` → `"pass (N)"` — required checks
+///   enforced and green.
+/// - `Some(Pass) + None` → `"pass"` — required-state known but count
+///   not surfaced by the provider; defensive case kept for future
+///   adapters.
+/// - `Some(Fail) + …` → `"fail (N)"` or `"fail"` — required checks
+///   enforced and at least one is red. Non-required failures are
+///   carried in the adjacent column.
+/// - `Some(None) + …` → `"none"` — provider reported no aggregate
+///   rollup at all (e.g. PR #554 on #541's closeout, where GHA never
+///   registered any check suite).
+/// - `None + …` → `"unknown"` — adapter probe failed (e.g. `gh` spawn
+///   error, `gh pr checks --required` non-zero with unrecognised
+///   stderr, fixture omits the field). Kept as the catch-all so a
+///   future probe regression remains visible.
+fn required_check_label(state: Option<CheckStatus>, count: Option<u32>) -> String {
+    match (state, count) {
+        (Some(CheckStatus::Pass), Some(0)) => "none required".to_string(),
+        (Some(CheckStatus::Pass), Some(n)) => format!("pass ({n})"),
+        (Some(CheckStatus::Pass), None) => "pass".to_string(),
+        (Some(CheckStatus::Fail), Some(n)) => format!("fail ({n})"),
+        (Some(CheckStatus::Fail), None) => "fail".to_string(),
+        (Some(CheckStatus::None), _) => "none".to_string(),
+        (None, _) => "unknown".to_string(),
     }
 }
 
@@ -3188,5 +3217,45 @@ mod sprint3_tests {
 
         let payload = extract_payload(&body).expect("payload");
         assert_eq!(payload.role, PayloadRole::Source);
+    }
+
+    #[test]
+    fn required_check_label_emits_five_distinct_branches() {
+        // `Some(Pass) + Some(0)` is the "no required-check rule" case
+        // observed on sympoies/nils-cli#541's closeout — was previously
+        // collapsed into "unknown".
+        assert_eq!(
+            required_check_label(Some(CheckStatus::Pass), Some(0)),
+            "none required"
+        );
+
+        // `Some(Pass) + Some(N>=1)` keeps the existing "pass (N)" shape.
+        assert_eq!(
+            required_check_label(Some(CheckStatus::Pass), Some(3)),
+            "pass (3)"
+        );
+
+        // `Some(Pass) + None` is the defensive case for adapters that
+        // know the state but not the count.
+        assert_eq!(required_check_label(Some(CheckStatus::Pass), None), "pass");
+
+        // `Some(Fail) + Some(N)` keeps the existing "fail (N)" shape.
+        assert_eq!(
+            required_check_label(Some(CheckStatus::Fail), Some(2)),
+            "fail (2)"
+        );
+        assert_eq!(required_check_label(Some(CheckStatus::Fail), None), "fail");
+
+        // `Some(None)` is the aggregate-rollup-absent case (PR #554 on
+        // #541's closeout — GHA never registered any check suite).
+        assert_eq!(
+            required_check_label(Some(CheckStatus::None), Some(0)),
+            "none"
+        );
+        assert_eq!(required_check_label(Some(CheckStatus::None), None), "none");
+
+        // `None` is the catch-all for probe failures / fixture omissions.
+        assert_eq!(required_check_label(None, None), "unknown");
+        assert_eq!(required_check_label(None, Some(0)), "unknown");
     }
 }

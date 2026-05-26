@@ -84,30 +84,95 @@ pub struct PrMergeSummary {
     pub non_required_failures: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+/// Output captured from a single `gh` invocation. Exposes stdout, stderr,
+/// and exit status so callers that need to branch on stderr text (e.g.
+/// `pr_required_summary`'s "no required checks reported" recognition) can
+/// inspect every channel without re-shelling out.
+#[derive(Debug, Clone)]
+pub struct GhRunOutput {
+    pub success: bool,
+    /// Raw exit code surfaced from the runner. Production paths only
+    /// branch on `success`; the field is kept for tests that need to
+    /// assert a specific non-zero code, and for future probes.
+    #[allow(dead_code)]
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Test-friendly indirection over the `gh` shellout. Production code uses
+/// [`default_gh_runner`]; tests inject a fake that returns canned outputs
+/// via [`GhCliAdapter::with_runner`].
+pub type GhRunner = fn(&[&str]) -> Result<GhRunOutput, String>;
+
+/// Default runner backing [`GhCliAdapter`]. Spawns the real `gh` binary
+/// and forwards stdout / stderr / exit status into [`GhRunOutput`].
+pub fn default_gh_runner(args: &[&str]) -> Result<GhRunOutput, String> {
+    let output = common_process::run_output("gh", args)
+        .map(|output| output.into_std_output())
+        .map_err(|err| format!("failed to execute gh: {err}"))?;
+    Ok(GhRunOutput {
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct GhCliAdapter {
     force: bool,
+    runner: GhRunner,
+}
+
+impl Default for GhCliAdapter {
+    fn default() -> Self {
+        Self {
+            force: false,
+            runner: default_gh_runner,
+        }
+    }
 }
 
 impl GhCliAdapter {
     pub const fn new(force: bool) -> Self {
-        Self { force }
+        Self {
+            force,
+            runner: default_gh_runner,
+        }
     }
 
-    fn run(args: &[String]) -> Result<String, String> {
-        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = common_process::run_output("gh", &arg_refs)
-            .map(|output| output.into_std_output())
-            .map_err(|err| format!("failed to execute gh: {err}"))?;
+    /// Build an adapter with a custom runner. Used by unit tests to drive
+    /// `gh` call sites deterministically; production callers should keep
+    /// using [`GhCliAdapter::new`].
+    #[cfg(test)]
+    pub const fn with_runner(force: bool, runner: GhRunner) -> Self {
+        Self { force, runner }
+    }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let detail = if stderr.is_empty() { stdout } else { stderr };
+    fn run(&self, args: &[String]) -> Result<String, String> {
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = (self.runner)(&arg_refs)?;
+        if !output.success {
+            let stderr_trim = output.stderr.trim();
+            let stdout_trim = output.stdout.trim();
+            let detail = if stderr_trim.is_empty() {
+                stdout_trim
+            } else {
+                stderr_trim
+            };
             return Err(format!("gh {} failed: {detail}", args.join(" ")));
         }
+        Ok(output.stdout)
+    }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    /// Like [`Self::run`] but surfaces the full [`GhRunOutput`] regardless
+    /// of exit status. Used by `pr_required_summary` so the "no required
+    /// checks reported" stderr branch can be recognised without losing
+    /// other failure paths.
+    fn run_full(&self, args: &[String]) -> Result<GhRunOutput, String> {
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        (self.runner)(&arg_refs)
     }
 
     fn parse_json(stdout: &str, context: &str) -> Result<Value, String> {
@@ -136,6 +201,7 @@ impl GhCliAdapter {
     /// `gh pr view` and is used to compute the non-required failure
     /// list (rollup names not in the required set).
     fn pr_required_summary(
+        &self,
         repo: &str,
         pr: u64,
         rollup_value: Option<&Value>,
@@ -148,33 +214,60 @@ impl GhCliAdapter {
             repo.to_string(),
             "--required".to_string(),
             "--json".to_string(),
-            "bucket,state,conclusion,name".to_string(),
+            // Only fields this function actually reads. `conclusion` was
+            // listed historically but the function never indexes
+            // `required_array[].conclusion`; current `gh` (cli >=2.x)
+            // also rejects `conclusion` outright with
+            // `Unknown JSON field: "conclusion"` (exit 5), which would
+            // otherwise force every callsite into the catch-all `unknown`
+            // render branch.
+            "name,state".to_string(),
         ];
-        let raw = match Self::run(&args) {
+        let output = match self.run_full(&args) {
             Ok(out) => out,
+            // Spawn failures (network / `gh` not installed) — fall back
+            // to the catch-all `unknown` render branch.
             Err(_) => return (None, None, Vec::new()),
         };
+        if !output.success {
+            // upstream contract: `gh pr checks --required` exits non-zero
+            // and writes `no required checks reported on the '<branch>'
+            // branch` to stderr when the target branch has no
+            // branch-protection rule. Treat that case as the canonical
+            // zero-required success rollup so non-required failures do
+            // not block the close gate and the renderer can show
+            // `none required` rather than `unknown`. Other non-zero
+            // exits remain failures and propagate as `(None, None, [])`.
+            if output.stderr.contains("no required checks reported") {
+                return (Some("success".to_string()), Some(0), Vec::new());
+            }
+            return (None, None, Vec::new());
+        }
+        let raw = output.stdout;
         let required_array: Vec<Value> = match serde_json::from_str(raw.trim()) {
             Ok(Value::Array(items)) => items,
             Ok(_) => return (None, None, Vec::new()),
-            // `gh pr checks --required` prints nothing when the PR has
-            // no required checks; treat empty output as a zero-required
-            // success rollup so a non-required failure does not block
-            // the gate.
+            // Defensive secondary: if a future `gh` version starts
+            // exiting 0 with empty stdout for the same condition (e.g.
+            // `--json` mode flips to "empty array"), still treat it as
+            // zero-required success.
             Err(_) if raw.trim().is_empty() => {
                 return (Some("success".to_string()), Some(0), Vec::new());
             }
             Err(_) => return (None, None, Vec::new()),
         };
         let required_count = u32::try_from(required_array.len()).unwrap_or(u32::MAX);
-        let required_state =
-            rollup_status(&Value::Array(required_array.clone())).unwrap_or_else(|| {
-                if required_array.is_empty() {
-                    "success".to_string()
-                } else {
-                    "unknown".to_string()
-                }
-            });
+        // Empty array means "no required checks defined" — same logical
+        // state as the stderr-recognition branch above and the
+        // defensive empty-stdout branch. Map directly to "success" so
+        // the renderer can pick the `none required` label rather than
+        // bouncing through `rollup_status`, which would return "none"
+        // for an empty array and downgrade to `CheckStatus::None`.
+        if required_array.is_empty() {
+            return (Some("success".to_string()), Some(0), Vec::new());
+        }
+        let required_state = rollup_status(&Value::Array(required_array.clone()))
+            .unwrap_or_else(|| "unknown".to_string());
 
         let required_names: std::collections::HashSet<String> = required_array
             .iter()
@@ -251,7 +344,7 @@ impl ProviderAdapter for GhCliAdapter {
             "--json".to_string(),
             "body".to_string(),
         ];
-        let stdout = Self::run(&args)?;
+        let stdout = self.run(&args)?;
         let json = Self::parse_json(&stdout, "issue view")?;
         let body = json
             .get("body")
@@ -270,7 +363,7 @@ impl ProviderAdapter for GhCliAdapter {
             "--json".to_string(),
             "body,comments".to_string(),
         ];
-        let stdout = Self::run(&args)?;
+        let stdout = self.run(&args)?;
         let json = Self::parse_json(&stdout, "issue view (body+comments)")?;
         let body = json
             .get("body")
@@ -315,7 +408,7 @@ impl ProviderAdapter for GhCliAdapter {
             }
         }
 
-        let stdout = Self::run(&args)?;
+        let stdout = self.run(&args)?;
         let url = stdout.trim().to_string();
         let issue_number = issue_number_from_url(&url)
             .ok_or_else(|| format!("unable to parse issue number from gh output: {url}"))?;
@@ -334,7 +427,7 @@ impl ProviderAdapter for GhCliAdapter {
             "--body-file".to_string(),
             body_file.to_string_lossy().to_string(),
         ];
-        Self::run(&args).map(|_| ())
+        self.run(&args).map(|_| ())
     }
 
     fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<String, String> {
@@ -349,7 +442,7 @@ impl ProviderAdapter for GhCliAdapter {
             "--body-file".to_string(),
             body_file.to_string_lossy().to_string(),
         ];
-        let stdout = Self::run(&args)?;
+        let stdout = self.run(&args)?;
         extract_issue_comment_url(&stdout).ok_or_else(|| {
             format!(
                 "gh issue comment did not print a recognisable comment URL; got: {:?}",
@@ -399,7 +492,7 @@ impl ProviderAdapter for GhCliAdapter {
             return Ok(());
         }
 
-        Self::run(&args).map(|_| ())
+        self.run(&args).map(|_| ())
     }
 
     fn close_issue(
@@ -432,7 +525,7 @@ impl ProviderAdapter for GhCliAdapter {
             }
         }
 
-        Self::run(&args).map(|_| ())
+        self.run(&args).map(|_| ())
     }
 
     fn pr_is_merged(&self, repo: &str, pr: u64) -> Result<bool, String> {
@@ -445,7 +538,7 @@ impl ProviderAdapter for GhCliAdapter {
             "--json".to_string(),
             "state,mergedAt".to_string(),
         ];
-        let stdout = Self::run(&args)?;
+        let stdout = self.run(&args)?;
         let json = Self::parse_json(&stdout, "pr view")?;
 
         let merged_at_present = !json.get("mergedAt").is_some_and(Value::is_null);
@@ -467,7 +560,7 @@ impl ProviderAdapter for GhCliAdapter {
             "--json".to_string(),
             "state,mergeCommit,statusCheckRollup".to_string(),
         ];
-        let stdout = Self::run(&args)?;
+        let stdout = self.run(&args)?;
         let json = Self::parse_json(&stdout, "pr view (merge summary)")?;
 
         let state = json
@@ -487,7 +580,7 @@ impl ProviderAdapter for GhCliAdapter {
             .and_then(rollup_status)
             .filter(|status| !status.is_empty());
         let (required_state, required_count, non_required_failures) =
-            Self::pr_required_summary(repo, pr, rollup_value);
+            self.pr_required_summary(repo, pr, rollup_value);
         Ok(PrMergeSummary {
             state,
             merged,
@@ -505,7 +598,7 @@ impl ProviderAdapter for GhCliAdapter {
         // which is the issue-style stream used for review-evidence comments.
         let endpoint = format!("repos/{repo}/issues/{pr}/comments");
         let args = vec!["api".to_string(), "--paginate".to_string(), endpoint];
-        let stdout = Self::run(&args)?;
+        let stdout = self.run(&args)?;
 
         // `gh api --paginate` concatenates JSON arrays back-to-back without
         // a wrapping comma, so we parse each top-level array on its own
@@ -975,5 +1068,133 @@ esac
             "empty oid should be filtered out"
         );
         assert_eq!(summary_empty.checks.as_deref(), Some("none"));
+    }
+
+    // Sprint 1 of the closeout required-check rendering plan
+    // (sympoies/nils-cli#561): exercise pr_required_summary's
+    // "no required checks reported" stderr recognition deterministically
+    // through an injected `GhRunner`, plus the success + failure paths.
+
+    use super::{GhRunOutput, default_gh_runner};
+
+    fn ok_runner(stdout: &str) -> super::GhRunner {
+        // Each branch returns a fresh static fn so we can use them as
+        // `GhRunner` (fn pointer) values without capturing locals.
+        // The injected runner is keyed by the `--required` flag; a smarter
+        // dispatcher per-test would be overkill for unit coverage.
+        match stdout {
+            "empty_array" => |_| {
+                Ok(GhRunOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: "[]".to_string(),
+                    stderr: String::new(),
+                })
+            },
+            "one_required_pass" => |_| {
+                Ok(GhRunOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: r#"[{"name":"ci","state":"SUCCESS"}]"#.to_string(),
+                    stderr: String::new(),
+                })
+            },
+            _ => |_| {
+                Ok(GhRunOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            },
+        }
+    }
+
+    fn stderr_runner(message: &'static str) -> super::GhRunner {
+        // Map the canonical stderr strings to static-only branches the
+        // `GhRunner` (fn pointer) type permits.
+        match message {
+            "no_required" => |_| {
+                Ok(GhRunOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "no required checks reported on the 'feature/x' branch\n".to_string(),
+                })
+            },
+            "auth" => |_| {
+                Ok(GhRunOutput {
+                    success: false,
+                    exit_code: Some(4),
+                    stdout: String::new(),
+                    stderr: "gh: GraphQL error: Could not resolve to a PR\n".to_string(),
+                })
+            },
+            _ => |_| Err("simulated spawn failure".to_string()),
+        }
+    }
+
+    #[test]
+    fn pr_required_summary_recognises_no_required_checks_reported_stderr() {
+        // The canonical exit-1 + "no required checks reported on the
+        // '<branch>' branch" stderr message must be classified as the
+        // zero-required success case, not as the catch-all `(None, None, [])`.
+        let adapter = GhCliAdapter::with_runner(false, stderr_runner("no_required"));
+        let (state, count, non_required) =
+            adapter.pr_required_summary("sympoies/nils-cli", 553, None);
+        assert_eq!(state.as_deref(), Some("success"));
+        assert_eq!(count, Some(0));
+        assert!(non_required.is_empty());
+    }
+
+    #[test]
+    fn pr_required_summary_returns_zero_required_on_empty_array_stdout() {
+        let adapter = GhCliAdapter::with_runner(false, ok_runner("empty_array"));
+        let (state, count, non_required) =
+            adapter.pr_required_summary("sympoies/nils-cli", 553, None);
+        assert_eq!(state.as_deref(), Some("success"));
+        assert_eq!(count, Some(0));
+        assert!(non_required.is_empty());
+    }
+
+    #[test]
+    fn pr_required_summary_returns_pass_with_count_for_one_required_check() {
+        let adapter = GhCliAdapter::with_runner(false, ok_runner("one_required_pass"));
+        let (state, count, non_required) =
+            adapter.pr_required_summary("sympoies/nils-cli", 553, None);
+        assert_eq!(state.as_deref(), Some("success"));
+        assert_eq!(count, Some(1));
+        assert!(non_required.is_empty());
+    }
+
+    #[test]
+    fn pr_required_summary_returns_none_on_unrecognised_failure_stderr() {
+        // Any non-zero exit whose stderr does NOT include
+        // "no required checks reported" stays in the catch-all
+        // `(None, None, [])` branch so the renderer can emit `unknown`
+        // and a future regression remains visible.
+        let adapter = GhCliAdapter::with_runner(false, stderr_runner("auth"));
+        let (state, count, non_required) =
+            adapter.pr_required_summary("sympoies/nils-cli", 553, None);
+        assert!(state.is_none());
+        assert!(count.is_none());
+        assert!(non_required.is_empty());
+    }
+
+    #[test]
+    fn pr_required_summary_returns_none_on_runner_spawn_failure() {
+        let adapter = GhCliAdapter::with_runner(false, stderr_runner("spawn"));
+        let (state, count, non_required) =
+            adapter.pr_required_summary("sympoies/nils-cli", 553, None);
+        assert!(state.is_none());
+        assert!(count.is_none());
+        assert!(non_required.is_empty());
+    }
+
+    #[test]
+    fn default_gh_runner_is_callable_via_function_pointer() {
+        // Smoke that the production runner satisfies the `GhRunner` type
+        // (fn pointer) bound without indirection at the call site.
+        let _: super::GhRunner = default_gh_runner;
     }
 }

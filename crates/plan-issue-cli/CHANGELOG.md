@@ -39,6 +39,21 @@ versioning.
 
 ### Fixed
 
+- `plan-issue record close` closeout-comment table renders the
+  `Required` column as `none required` (zero required checks defined),
+  `pass (N)`, `fail (N)`, `none`, or `unknown` instead of collapsing
+  every `required_state == None` cause into the single misleading
+  `unknown` label. Two underlying repairs feed the new rendering: the
+  GitHub adapter's `pr_required_summary` now drops the unsupported
+  `conclusion` field from the `gh pr checks --required --json …` call
+  list (the call was exiting 5 with `Unknown JSON field: "conclusion"`
+  on current `gh`) and recognises `gh`'s `no required checks reported
+  on the '<branch>' branch` stderr message as the canonical
+  zero-required success rollup, mapping it to
+  `(Some("success"), Some(0), [])` so the renderer can pick the new
+  `none required` label. The `closeout.v1` payload wire format is
+  unchanged; historical closeout records remain immutable.
+  (sympoies/nils-cli#561, observation source #541)
 - `plan-issue record close` no longer collapses non-required GitHub
   `statusCheckRollup` failures into `linked-pr-not-merged`. The strict
   closeout gate now consults a separate required-check rollup (via

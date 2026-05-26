@@ -1233,6 +1233,21 @@ fn record_close_fixture_passes_with_non_required_failure_when_zero_required() {
     assert_eq!(linked["required_count"], 0);
     assert_eq!(linked["required_state"], "pass");
     assert_eq!(linked["non_required_failures"][0], "scripts/ci/all.sh");
+
+    // sympoies/nils-cli#561 follow-up: rendered closeout-comment table
+    // must label the zero-required case `none required`, not `unknown`
+    // and not `pass (0)`.
+    let body = preview["closeout_comment_body"]
+        .as_str()
+        .expect("closeout body");
+    assert!(
+        body.contains("| none required |"),
+        "expected `none required` in closeout body, got: {body}"
+    );
+    assert!(
+        !body.contains("| unknown |"),
+        "expected no `unknown` cell in closeout body, got: {body}"
+    );
 }
 
 #[test]
