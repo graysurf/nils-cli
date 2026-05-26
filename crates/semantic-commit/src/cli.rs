@@ -24,6 +24,10 @@ enum Command {
     StagedContext(RawArgs),
     #[command(about = "Commit staged changes with a prepared commit message")]
     Commit(RawArgs),
+    #[command(about = "Create a fixup! commit for staged changes")]
+    Fixup(RawArgs),
+    #[command(about = "Create a squash! commit for staged changes")]
+    Squash(RawArgs),
     #[command(about = "Export shell completion script")]
     Completion(RawArgs),
     #[command(about = "Display help message")]
@@ -54,6 +58,8 @@ where
     match cli.command {
         Some(Command::StagedContext(raw)) => staged_context::run(&raw.args),
         Some(Command::Commit(raw)) => commit::run(&raw.args),
+        Some(Command::Fixup(raw)) => commit::run_fixup(&raw.args),
+        Some(Command::Squash(raw)) => commit::run_squash(&raw.args),
         Some(Command::Completion(raw)) => completion::run(&raw.args),
         Some(Command::Help) | None => print_help_stdout(),
     }
@@ -122,6 +128,23 @@ mod tests {
         assert_eq!(
             raw.args,
             ["--message", "feat: test", "--validate-only"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn clap_dispatches_fixup_subcommand_raw_args() {
+        let cli = Cli::try_parse_from(["semantic-commit", "fixup", "--target", "HEAD"])
+            .expect("parse fixup command");
+
+        let Some(Command::Fixup(raw)) = cli.command else {
+            panic!("expected fixup command");
+        };
+        assert_eq!(
+            raw.args,
+            ["--target", "HEAD"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()

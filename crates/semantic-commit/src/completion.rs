@@ -113,6 +113,19 @@ fn build_completion_command() -> Command {
                         .action(ArgAction::SetTrue),
                 )
                 .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .help("Output format")
+                        .value_name("text|json")
+                        .value_parser(["text", "json"]),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .help("Alias for --format json")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
                     Arg::new("repo")
                         .long("repo")
                         .help("Repository path override")
@@ -156,6 +169,87 @@ fn build_completion_command() -> Command {
                         .action(ArgAction::SetTrue),
                 )
                 .arg(
+                    Arg::new("amend")
+                        .long("amend")
+                        .help("Amend HEAD instead of creating a new commit")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no-edit")
+                        .long("no-edit")
+                        .help("Reuse the HEAD message with --amend")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("message-only")
+                        .long("message-only")
+                        .help("Amend only the HEAD message and require no staged changes")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("allow-empty")
+                        .long("allow-empty")
+                        .help("Allow commit operation without staged changes")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("require-clean")
+                        .long("require-clean")
+                        .help("Require no unstaged or untracked changes")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no-unstaged")
+                        .long("no-unstaged")
+                        .help("Alias for --require-clean")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("expect-head")
+                        .long("expect-head")
+                        .help("Require HEAD to match revision before committing")
+                        .value_name("rev"),
+                )
+                .arg(
+                    Arg::new("signoff")
+                        .long("signoff")
+                        .help("Pass --signoff to git commit")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("trailer")
+                        .long("trailer")
+                        .help("Add a git trailer")
+                        .value_name("token: value")
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("type")
+                        .long("type")
+                        .help("Structured message type")
+                        .value_name("type"),
+                )
+                .arg(
+                    Arg::new("scope")
+                        .long("scope")
+                        .help("Structured message scope")
+                        .value_name("scope"),
+                )
+                .arg(
+                    Arg::new("subject")
+                        .long("subject")
+                        .help("Structured message subject")
+                        .value_name("subject"),
+                )
+                .arg(
+                    Arg::new("body-bullet")
+                        .long("body-bullet")
+                        .alias("bullet")
+                        .help("Structured message body bullet")
+                        .value_name("text")
+                        .action(ArgAction::Append),
+                )
+                .arg(
                     Arg::new("no-progress")
                         .long("no-progress")
                         .help("Disable progress UI")
@@ -168,6 +262,14 @@ fn build_completion_command() -> Command {
                         .action(ArgAction::SetTrue),
                 ),
         )
+        .subcommand(cleanup_completion_command(
+            "fixup",
+            "Create a fixup! commit for staged changes",
+        ))
+        .subcommand(cleanup_completion_command(
+            "squash",
+            "Create a squash! commit for staged changes",
+        ))
         .subcommand(
             Command::new("completion")
                 .about("Export shell completion script")
@@ -179,4 +281,90 @@ fn build_completion_command() -> Command {
                 ),
         )
         .subcommand(Command::new("help").about("Display help message"))
+}
+
+fn cleanup_completion_command(name: &'static str, about: &'static str) -> Command {
+    Command::new(name)
+        .about(about)
+        .arg(
+            Arg::new("target")
+                .long("target")
+                .help("Target commit revision")
+                .value_name("rev"),
+        )
+        .arg(
+            Arg::new("summary")
+                .long("summary")
+                .help("Summary provider")
+                .value_name("git-scope|git-show|none")
+                .value_parser(["git-scope", "git-show", "none"]),
+        )
+        .arg(
+            Arg::new("no-summary")
+                .long("no-summary")
+                .help("Disable summary section")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .help("Output format")
+                .value_name("text|json")
+                .value_parser(["text", "json"]),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .help("Alias for --format json")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .help("Validate target and staged checks without committing")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("allow-empty")
+                .long("allow-empty")
+                .help("Allow cleanup commit without staged changes")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("require-clean")
+                .long("require-clean")
+                .help("Require no unstaged or untracked changes")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("no-unstaged")
+                .long("no-unstaged")
+                .help("Alias for --require-clean")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("expect-head")
+                .long("expect-head")
+                .help("Require HEAD to match revision before committing")
+                .value_name("rev"),
+        )
+        .arg(
+            Arg::new("repo")
+                .long("repo")
+                .help("Repository path override")
+                .value_name("path")
+                .value_hint(ValueHint::DirPath),
+        )
+        .arg(
+            Arg::new("no-progress")
+                .long("no-progress")
+                .help("Disable progress UI")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("quiet")
+                .long("quiet")
+                .help("Reduce non-error output")
+                .action(ArgAction::SetTrue),
+        )
 }

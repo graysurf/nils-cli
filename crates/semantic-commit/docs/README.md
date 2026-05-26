@@ -1,19 +1,22 @@
 # semantic-commit Docs Index
 
-> Ownership: Maintained by the `semantic-commit` crate maintainers. Keep this index updated when docs are added, moved, or removed.
+> Ownership: Maintained by the `semantic-commit` crate maintainers. Keep this
+> index updated when docs are added, moved, or removed.
+
+## Primary Documentation
+
+- [Crate README](../README.md) - command behavior, examples, JSON output,
+  validation rules, and non-goals.
 
 ## Specs
 
-- None yet. Add documents under `docs/specs/` and register them here.
+- None yet. The current JSON result contract is documented in the crate
+  README until a dedicated versioned spec is needed.
 
 ## Runbooks
 
-- None yet. Add documents under `docs/runbooks/` and register them here.
+- None yet.
 
 ## Reports
 
-- None yet. Add documents under `docs/reports/` and register them here.
-
-## Links
-
-- Back to crate README: [`../README.md`](../README.md)
+- None yet.
