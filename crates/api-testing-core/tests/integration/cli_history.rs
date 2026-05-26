@@ -2,7 +2,7 @@ use api_testing_core::{
     auth_env::CliAuthSource,
     cli_history::{
         RequestCallHistoryAppend, RequestCallHistoryFlag, append_request_call_history_best_effort,
-        resolve_history_file, run_history_command, select_history_records,
+        render_history_record, resolve_history_file, run_history_command, select_history_records,
     },
     history::{HistoryWriter, RotationPolicy},
 };
@@ -47,6 +47,13 @@ fn cli_history_selects_tail_and_strips_metadata_for_command_only() {
     assert_eq!(selected.len(), 1);
     assert!(selected[0].contains("two.request.json"));
     assert!(!selected[0].contains("# two"));
+}
+
+#[test]
+fn cli_history_render_record_preserves_original_when_not_command_only() {
+    let record = "# meta\napi-rest call \\\n  req.request.json \\\n| jq .\n\n";
+
+    assert_eq!(render_history_record(record, false), record);
 }
 
 #[test]
