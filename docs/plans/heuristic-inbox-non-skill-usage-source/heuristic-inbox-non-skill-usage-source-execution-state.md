@@ -21,20 +21,20 @@
 
 ## Task Ledger
 
-| ID       | Status   | Task                                                              | Evidence       | Notes                                                            |
-| -------- | -------- | ---------------------------------------------------------------- | -------------- | --------------------------------------------------------------- |
-| Task 1.1 | complete | Add `--from-evidence` / `--manual` sources and exclusivity gate  | commit 34cd315 | `new_source` ArgGroup; `from_skill_usage` now `Option<PathBuf>` |
-| Task 1.2 | complete | Resolve each source and compose the entry                        | commit 34cd315 | per-source resolvers + shared `compose_entry`; reuses redaction |
-| Task 1.3 | complete | Help, completions, and tests                                     | commit 34cd315 | regenerated zsh/bash assets; 3 new integration tests            |
+| ID       | Status   | Task                                                            | Evidence       | Notes                                                           |
+| -------- | -------- | --------------------------------------------------------------- | -------------- | --------------------------------------------------------------- |
+| Task 1.1 | complete | Add `--from-evidence` / `--manual` sources and exclusivity gate | commit 34cd315 | `new_source` ArgGroup; `from_skill_usage` now `Option<PathBuf>` |
+| Task 1.2 | complete | Resolve each source and compose the entry                       | commit 34cd315 | per-source resolvers + shared `compose_entry`; reuses redaction |
+| Task 1.3 | complete | Help, completions, and tests                                    | commit 34cd315 | regenerated zsh/bash assets; 3 new integration tests            |
 
 ## Validation
 
-| Command                                                                | Status | Summary                                            | Artifact                |
-| ---------------------------------------------------------------------- | ------ | -------------------------------------------------- | ----------------------- |
-| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`           | pass   | fmt + clippy -D warnings + 4189 nextest tests pass | 585-validation/local-fast.log |
-| `cargo test -p nils-agent-workflow-primitives --test integration`      | pass   | heuristic_inbox suite incl. 3 new tests green      | 585-validation/local-fast.log |
-| `bash scripts/ci/completion-flag-parity-audit.sh --strict`             | pass   | 38 required binaries, 0 failures with new flags    | —                       |
-| `bash scripts/ci/completion-asset-audit.sh --strict`                   | pass   | asset matrix coverage intact                       | —                       |
+| Command                                                           | Status | Summary                                            | Artifact                      |
+| ----------------------------------------------------------------- | ------ | -------------------------------------------------- | ----------------------------- |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`      | pass   | fmt + clippy -D warnings + 4189 nextest tests pass | 585-validation/local-fast.log |
+| `cargo test -p nils-agent-workflow-primitives --test integration` | pass   | heuristic_inbox suite incl. 3 new tests green      | 585-validation/local-fast.log |
+| `bash scripts/ci/completion-flag-parity-audit.sh --strict`        | pass   | 38 required binaries, 0 failures with new flags    | —                             |
+| `bash scripts/ci/completion-asset-audit.sh --strict`              | pass   | asset matrix coverage intact                       | —                             |
 
 ## Blockers
 
