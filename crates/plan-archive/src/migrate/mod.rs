@@ -526,9 +526,15 @@ fn apply(args: DispatchArgs, report: DryRunReport) -> Result<ApplyReport, Migrat
         .map_err(|e| MigrateError::Io(format!("metadata serialize: {e}")))?;
     let metadata_path = archive_abs_target.join("metadata.yaml");
     fs::write(&metadata_path, metadata_yaml).map_err(|e| MigrateError::Io(e.to_string()))?;
+    crate::catalog::write_catalog(&archive).map_err(|e| MigrateError::Io(e.to_string()))?;
 
     // Stage and commit in the archive repo.
-    let stage_args = ["add", "--", &report.archive_target.relative_path];
+    let stage_args = [
+        "add",
+        "--",
+        &report.archive_target.relative_path,
+        "catalog.json",
+    ];
     let stage_out = nils_common::git::run_output_in(&archive, &stage_args)
         .map_err(|e| MigrateError::Io(e.to_string()))?;
     if !stage_out.status.success() {

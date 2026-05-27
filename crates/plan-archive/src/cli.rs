@@ -167,6 +167,25 @@ enum Command {
         #[arg(long)]
         archive: Option<PathBuf>,
     },
+    /// Generate, write, or filter the derived archive catalog.
+    Catalog {
+        /// Write deterministic `<archive>/catalog.json`.
+        #[arg(long)]
+        write: bool,
+        /// Filter records by case-insensitive substring.
+        #[arg(long)]
+        grep: Option<String>,
+        /// Filter records by area tag.
+        #[arg(long)]
+        area: Option<String>,
+        /// Return plans that reference this issue/PR/MR URL.
+        #[arg(long = "refs-to")]
+        refs_to: Option<String>,
+        /// Archive clone path. Defaults to the machine-local config's
+        /// `archive_clone_path`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+    },
 }
 
 pub fn run() -> i32 {
@@ -251,6 +270,20 @@ pub fn run() -> i32 {
             since,
             plan,
             refs_from,
+            archive,
+            format,
+        }),
+        Command::Catalog {
+            write,
+            grep,
+            area,
+            refs_to,
+            archive,
+        } => crate::catalog::dispatch(crate::catalog::DispatchArgs {
+            write,
+            grep,
+            area,
+            refs_to,
             archive,
             format,
         }),
