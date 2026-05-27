@@ -343,6 +343,135 @@ fn commit_validate_only_invalid_message_returns_4() {
     assert_eq!(output.status.code(), Some(4));
 }
 
+#[test]
+fn commit_validate_only_rejects_claude_coauthor_trailer_in_message() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = as_str(&output.stderr);
+    assert!(
+        stderr.contains("blocked by rule `claude-coauthor-trailer`"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("matched: Co-Authored-By: Claude"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn commit_validate_only_rejects_claude_coauthor_trailer_flag() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing",
+            "--trailer",
+            "Co-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = as_str(&output.stderr);
+    assert!(
+        stderr.contains("source: --trailer #1"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("blocked by rule `claude-coauthor-trailer`"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn commit_validate_only_rejects_claude_coauthor_equals_trailer_flag() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing",
+            "--trailer",
+            "Co-Authored-By=Claude Haiku <noreply@anthropic.com>",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = as_str(&output.stderr);
+    assert!(
+        stderr.contains("matched: Co-Authored-By: Claude ..."),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn commit_validate_only_allows_non_claude_coauthor_trailers() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing\n\nCo-Authored-By: Jane Dev <jane@example.com>",
+            "--trailer",
+            "Co-Authored-By: Build Bot <bot@example.com>",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_validate_only_allows_claude_as_part_of_longer_word() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing\n\nCo-Authored-By: Claudette Dev <dev@example.com>",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
 fn header_with_total_len(total_len: usize) -> String {
     let prefix = "feat: ";
     assert!(total_len > prefix.len());

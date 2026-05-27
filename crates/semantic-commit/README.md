@@ -224,6 +224,9 @@ Semantic Commit validation applies to `semantic-commit commit` message input:
 - Body and trailer lines must be at most `100` characters.
 - Git trailers may appear after the header or after a blank separator
   following bullet body lines.
+- Blocked message rules reject known unwanted agent attribution text, including
+  `Co-Authored-By: Claude ...` trailers from either message input or
+  `--trailer`.
 
 `fixup` and `squash` do not use this header validation because git generates
 subjects prefixed with `fixup!` or `squash!`.
