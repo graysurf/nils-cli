@@ -59,6 +59,7 @@ pub struct RefreshReport {
     pub snapshots: Vec<SnapshotResult>,
     pub failed: Vec<FailedRef>,
     pub requires_review: bool,
+    pub catalog_path: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,11 +166,16 @@ pub fn run<F: ForgeFetcher, C: Clock>(
         }
     }
 
+    let catalog_path = crate::catalog::write_catalog(&archive)
+        .map_err(|e| RefreshError::Io(e.to_string()))?
+        .display()
+        .to_string();
     let requires_review = snapshots.iter().any(|s| s.requires_review);
     Ok(RefreshReport {
         snapshots,
         failed,
         requires_review,
+        catalog_path: Some(catalog_path),
     })
 }
 
@@ -346,6 +352,9 @@ fn emit(format: OutputFormat, report: RefreshReport) -> i32 {
                 println!(
                     "review required: at least one snapshot emitted a scrub log; commit only after acknowledging it"
                 );
+            }
+            if let Some(path) = &report.catalog_path {
+                println!("catalog regenerated: {path}");
             }
             exit::SUCCESS
         }

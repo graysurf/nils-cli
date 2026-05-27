@@ -6,6 +6,7 @@
 //! (`plan-archive-nils-cli`) lands the three schema validators that the
 //! later `migrate`, `refresh`, and `query` subcommands build on.
 
+pub mod catalog;
 pub mod cli;
 pub mod completion;
 pub mod migrate;
