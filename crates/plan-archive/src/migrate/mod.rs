@@ -538,10 +538,7 @@ fn apply(args: DispatchArgs, report: DryRunReport) -> Result<ApplyReport, Migrat
         ));
     }
 
-    let archive_msg = format!(
-        "archive(plan): {}/{}/{} {}",
-        report.source.host, report.source.org_or_group_path, report.source.repo, report.plan_folder
-    );
+    let archive_msg = archive_commit_message(&report.source.repo, &report.plan_folder);
     run_semantic_commit(&archive, &archive_msg)?;
     let archive_commit = head_sha(&archive)?;
     push_archive(&archive)?;
@@ -586,6 +583,14 @@ fn pathdiff(file_rel_to_repo: &str, plan_path: &Path) -> PathBuf {
             .strip_prefix(&prefix)
             .unwrap_or(file_rel_to_repo),
     )
+}
+
+/// Build the archive commit header. Keeps only `<repo>/<folder>` so the
+/// header stays within semantic-commit's 100-char limit even for long
+/// date-prefixed plan folder names; the full host/org/repo path is already
+/// recorded in the archive path and `metadata.yaml`.
+fn archive_commit_message(repo: &str, plan_folder: &str) -> String {
+    format!("archive(plan): {repo}/{plan_folder}")
 }
 
 fn has_dirty_plan_folder(repo: &Path, plan_path: &Path) -> Result<bool, MigrateError> {
@@ -648,4 +653,32 @@ fn push_archive(repo: &Path) -> Result<(), MigrateError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::archive_commit_message;
+
+    #[test]
+    fn archive_commit_message_format() {
+        assert_eq!(
+            archive_commit_message("agent-runtime-kit", "2026-05-27-plan-archive-nils-cli"),
+            "archive(plan): agent-runtime-kit/2026-05-27-plan-archive-nils-cli"
+        );
+    }
+
+    #[test]
+    fn archive_commit_header_within_semantic_commit_limit() {
+        // The longest dated plan folder migrated to date; the header must stay
+        // within semantic-commit's 100-char header limit.
+        let msg = archive_commit_message(
+            "agent-runtime-kit",
+            "2026-05-26-plan-issue-lifecycle-ordering-regression",
+        );
+        assert!(
+            msg.len() <= 100,
+            "archive commit header is {} chars: {msg}",
+            msg.len()
+        );
+    }
 }
