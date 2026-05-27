@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `7c954c5e0ea86e7561fb9964d2272e241dab8e2a76cda8e05a8092ad37c30e4b`
+- Cargo.lock SHA256: `191fd979a6f83a1786cac895b3158afb0296ba9a49eb418d95b34edf5ae671b8`
 - Third-party crates (`source != null`): 465
 
 ## Notice Extraction Policy
@@ -1166,7 +1166,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### hyper 1.9.0
+### hyper 1.10.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -1526,7 +1526,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE.txt`
 
-### libredox 0.1.16
+### libredox 0.1.17
 
 - License: `MIT`
 - Source: `crates.io`
@@ -2993,7 +2993,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### toml_edit 0.25.11+spec-1.1.0
+### toml_edit 0.25.12+spec-1.1.0
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -3925,7 +3925,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### zerocopy 0.8.48
+### zerocopy 0.8.49
 
 - License: `BSD-2-Clause OR Apache-2.0 OR MIT`
 - Source: `crates.io`
@@ -3935,7 +3935,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
   - `LICENSE-BSD`
 
-### zerocopy-derive 0.8.48
+### zerocopy-derive 0.8.49
 
 - License: `BSD-2-Clause OR Apache-2.0 OR MIT`
 - Source: `crates.io`
