@@ -22,6 +22,9 @@ _plan-archive() {
             plan__archive,completion)
                 cmd="plan__archive__completion"
                 ;;
+            plan__archive,discover)
+                cmd="plan__archive__discover"
+                ;;
             plan__archive,help)
                 cmd="plan__archive__help"
                 ;;
@@ -48,6 +51,9 @@ _plan-archive() {
                 ;;
             plan__archive__help,completion)
                 cmd="plan__archive__help__completion"
+                ;;
+            plan__archive__help,discover)
+                cmd="plan__archive__help__discover"
                 ;;
             plan__archive__help,help)
                 cmd="plan__archive__help__help"
@@ -77,7 +83,7 @@ _plan-archive() {
 
     case "${cmd}" in
         plan__archive)
-            opts="-h -V --format --json --help --version validate-hosts validate-local validate-metadata migrate refresh completion query catalog help"
+            opts="-h -V --format --json --help --version validate-hosts validate-local validate-metadata migrate discover refresh completion query catalog help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -146,8 +152,42 @@ _plan-archive() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        plan__archive__discover)
+            opts="-h --source-repo --plans-root --archive --hosts --include-unknown --format --json --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --source-repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --plans-root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --archive)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --hosts)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         plan__archive__help)
-            opts="validate-hosts validate-local validate-metadata migrate refresh completion query catalog help"
+            opts="validate-hosts validate-local validate-metadata migrate discover refresh completion query catalog help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -175,6 +215,20 @@ _plan-archive() {
             return 0
             ;;
         plan__archive__help__completion)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        plan__archive__help__discover)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

@@ -9,10 +9,12 @@
 pub mod catalog;
 pub mod cli;
 pub mod completion;
+pub mod discover;
 pub mod migrate;
 pub mod query;
 pub mod refresh;
 pub mod scrub;
+pub mod source;
 pub mod validate;
 
 pub use scrub::{Match, PATTERN_SET, REDACTION_TOKEN, ScrubResult, pattern_ids, scrub_text};

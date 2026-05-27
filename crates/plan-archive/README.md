@@ -66,7 +66,9 @@ byte offset, span length, and replacement length.
 
 Sprint 3 (Plan 1) lands `plan-archive migrate`, which moves a closed
 plan folder out of a working repo into the archive repo. Dry-run is
-the default; `--apply` performs the writes and commits.
+the default; `--apply` performs the writes and commits. To enumerate
+which folders look ready before migrating one, use the read-only
+[`discover`](#discover-surface) preselection scan described below.
 
 ```bash
 plan-archive migrate \
@@ -107,6 +109,157 @@ Stable error codes (Sprint 3):
 | `migrate-source-repo-dirty` | uncommitted changes in the plan folder (apply) |
 | `migrate-subprocess-failed` | a git or semantic-commit subprocess failed |
 | `migrate-io-error` | filesystem failure |
+
+## Discover surface
+
+`plan-archive discover` is a **read-only** scanner that enumerates plan
+folders under a working repo and classifies each as an archive
+candidate. It never copies, deletes, writes, commits, pushes, or
+refreshes provider state — it only reads local files and previews where
+each folder *would* land in the archive. It reuses the same source
+identity, host classification, and archive-target derivation as
+`migrate` (`plans/<host>/<org>/<repo>/<folder>/`), so the two commands
+cannot drift.
+
+```bash
+plan-archive discover \
+  [--source-repo <path>] [--plans-root docs/plans] \
+  [--archive <path>] [--hosts <path>] \
+  [--include-unknown] [--format json|text]
+```
+
+- `--source-repo` defaults to the current git repo root; `--plans-root`
+  is repo-relative and defaults to `docs/plans`; `--archive` and
+  `--hosts` resolve exactly as for `migrate`.
+- `--include-unknown` adds `unknown` candidates to the listing (they are
+  omitted by default). The summary always reports `scanned`, `eligible`,
+  `blocked`, and `unknown` counts, so nothing is silently hidden.
+
+### Status classes
+
+| Status | Meaning |
+| --- | --- |
+| `eligible` | ≥1 inferred provider ref, a free archive target, a clean plan folder, a known host, and confident closeout evidence. Carries a ready-to-review `suggested_migrate_command`. |
+| `blocked` | Has at least one actionable blocker: `archive-target-exists`, `source-plan-folder-dirty`, `unknown-host`, or `no-provider-refs`. |
+| `unknown` | Otherwise migrate-able, but closeout evidence could not be confidently inferred from local files (`closeout-evidence-uncertain`). |
+
+Provider refs are inferred by parsing issue/PR/MR URLs out of the
+folder's top-level Markdown; each ref records whether it points at the
+source repo or is cross-repo. Discovery never calls a provider.
+
+### Closeout evidence
+
+A folder counts as closed (and so `eligible`, given no blockers) when a
+top-level Markdown file carries either:
+
+- a Markdown **Closeout** heading (`## Closeout`, `# Close-out`, …), or
+- a `Status:` line whose value contains a terminal keyword
+  (`complete`, `completed`, `closed`, `done`, `delivered`, `merged`,
+  `archived`, `shipped`, `ready for close`) **and** no in-flight keyword
+  (`active`, `in progress`, `not started`, `pending`, `wip`, `todo`,
+  `blocked`, `ongoing`, `draft`, `ready to implement`).
+
+The in-flight veto keeps sprint-level notes such as
+`Status: Sprint 2 complete; Sprint 3 active` out of `eligible`. When the
+signal is absent or ambiguous the folder stays `unknown` rather than
+being promoted — discover never invents closeout evidence.
+
+### Example (`--format json`)
+
+```json
+{
+  "schema_version": "cli.plan-archive.discover.v1",
+  "data": {
+    "source": {
+      "host": "github.com",
+      "org_or_group_path": "graysurf",
+      "repo": "agent-runtime-kit",
+      "branch": "main",
+      "commit": "…"
+    },
+    "plans_root": "docs/plans",
+    "archive": "/abs/agent-plan-archive",
+    "host_known": true,
+    "summary": {
+      "scanned": 2,
+      "eligible": 1,
+      "blocked": 1,
+      "unknown": 0,
+      "included_unknown": false
+    },
+    "candidates": [
+      {
+        "plan_folder": "2026-05-01-ready-plan",
+        "source_path": "docs/plans/2026-05-01-ready-plan/",
+        "status": "eligible",
+        "reasons": [],
+        "refs": [
+          {
+            "url": "https://github.com/graysurf/agent-runtime-kit/issues/10",
+            "kind": "issue",
+            "source_file": "docs/plans/2026-05-01-ready-plan/plan.md",
+            "matches_source_repo": true
+          }
+        ],
+        "archive_target": {
+          "relative_path": "plans/github.com/graysurf/agent-runtime-kit/2026-05-01-ready-plan",
+          "absolute_path": "/abs/agent-plan-archive/plans/github.com/graysurf/agent-runtime-kit/2026-05-01-ready-plan",
+          "exists": false
+        },
+        "closeout_evidence": {
+          "marker": "complete; all sprints delivered",
+          "source_file": "docs/plans/2026-05-01-ready-plan/execution-state.md"
+        },
+        "dirty": false,
+        "suggested_migrate_command": "plan-archive migrate --plan docs/plans/2026-05-01-ready-plan --issue https://github.com/graysurf/agent-runtime-kit/issues/10 --format json"
+      },
+      {
+        "plan_folder": "2026-05-02-stuck-plan",
+        "source_path": "docs/plans/2026-05-02-stuck-plan/",
+        "status": "blocked",
+        "reasons": [
+          {
+            "code": "archive-target-exists",
+            "detail": "archive target already exists; resolve the collision before migrating"
+          }
+        ],
+        "refs": [
+          {
+            "url": "https://github.com/graysurf/agent-runtime-kit/issues/11",
+            "kind": "issue",
+            "source_file": "docs/plans/2026-05-02-stuck-plan/plan.md",
+            "matches_source_repo": true
+          }
+        ],
+        "archive_target": {
+          "relative_path": "plans/github.com/graysurf/agent-runtime-kit/2026-05-02-stuck-plan",
+          "absolute_path": "/abs/agent-plan-archive/plans/github.com/graysurf/agent-runtime-kit/2026-05-02-stuck-plan",
+          "exists": true
+        },
+        "dirty": false
+      }
+    ]
+  }
+}
+```
+
+`discover` is a **preselection helper only**. It suggests a
+`plan-archive migrate …` command for each eligible folder, but applying a
+migration stays with `migrate`, which is dry-run-first and gated on
+explicit confirmation. Review each folder's migrate dry-run before
+`--apply`; there is no bulk-apply path and discovery never refreshes
+provider state.
+
+Stable error codes (discover):
+
+| Code | When |
+| --- | --- |
+| `discover-source-repo-not-found` | `--source-repo` is not a git repo |
+| `discover-archive-clone-missing` | archive clone path not found |
+| `discover-hosts-load-failed` / `discover-hosts-parse-failed` | hosts config unreadable/invalid |
+| `discover-identity-failed` | could not read source remote/branch/HEAD |
+| `discover-plans-root-outside-repo` | `--plans-root` resolves outside the source repo |
+| `discover-io-error` | filesystem failure |
 
 ## Sprint 4 surface
 

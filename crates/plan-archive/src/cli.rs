@@ -107,6 +107,31 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Read-only scan of plan folders for archive candidates.
+    /// Classifies each folder as eligible, blocked, or unknown and
+    /// suggests a `plan-archive migrate` command for eligible folders.
+    /// Never mutates the source or archive repos.
+    Discover {
+        /// Source working repo. Defaults to the current git repo root.
+        #[arg(long)]
+        source_repo: Option<PathBuf>,
+        /// Plan-folder root, relative to the source repo. Defaults to
+        /// `docs/plans`.
+        #[arg(long)]
+        plans_root: Option<PathBuf>,
+        /// Archive clone path. Defaults to the machine-local config's
+        /// `archive_clone_path`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Path to the archive `config/hosts.yaml`. Defaults to
+        /// `<archive>/config/hosts.yaml`.
+        #[arg(long)]
+        hosts: Option<PathBuf>,
+        /// Include `unknown` candidates in the output (default:
+        /// eligible + blocked only). Counts always report all three.
+        #[arg(long)]
+        include_unknown: bool,
+    },
     /// Fetch provider payloads and append scrubbed snapshots to
     /// `_index/`. Writes and scrubs but does not commit; the scrub
     /// log (if any) must be reviewed before committing.
@@ -237,6 +262,20 @@ pub fn run() -> i32 {
             pr,
             mr,
             apply,
+            format,
+        }),
+        Command::Discover {
+            source_repo,
+            plans_root,
+            archive,
+            hosts,
+            include_unknown,
+        } => crate::discover::dispatch(crate::discover::DispatchArgs {
+            source_repo,
+            plans_root,
+            archive,
+            hosts,
+            include_unknown,
             format,
         }),
         Command::Refresh {
