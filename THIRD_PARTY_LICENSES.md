@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `7c954c5e0ea86e7561fb9964d2272e241dab8e2a76cda8e05a8092ad37c30e4b`
+- Cargo.lock SHA256: `191fd979a6f83a1786cac895b3158afb0296ba9a49eb418d95b34edf5ae671b8`
 - Third-party crates (`source != null`): 465
 - Workspace crates (`source == null`, excluded below): 33
 
@@ -183,7 +183,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | httparse | 1.10.1 | MIT OR Apache-2.0 | crates.io |
 | humansize | 2.1.3 | MIT/Apache-2.0 | crates.io |
 | hybrid-array | 0.4.12 | MIT OR Apache-2.0 | crates.io |
-| hyper | 1.9.0 | MIT | crates.io |
+| hyper | 1.10.0 | MIT | crates.io |
 | hyper-rustls | 0.27.9 | Apache-2.0 OR ISC OR MIT | crates.io |
 | hyper-util | 0.1.20 | MIT | crates.io |
 | iana-time-zone | 0.1.65 | MIT OR Apache-2.0 | crates.io |
@@ -225,7 +225,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | leb128fmt | 0.1.0 | MIT OR Apache-2.0 | crates.io |
 | libc | 0.2.186 | MIT OR Apache-2.0 | crates.io |
 | libm | 0.2.16 | MIT | crates.io |
-| libredox | 0.1.16 | MIT | crates.io |
+| libredox | 0.1.17 | MIT | crates.io |
 | libsqlite3-sys | 0.37.0 | MIT | crates.io |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | litemap | 0.8.2 | Unicode-3.0 | crates.io |
@@ -396,7 +396,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 | crates.io |
 | toml | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
-| toml_edit | 0.25.11+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
+| toml_edit | 0.25.12+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_parser | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_writer | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | tower | 0.5.3 | MIT | crates.io |
@@ -503,8 +503,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | zbus | 5.15.0 | MIT | crates.io |
 | zbus_macros | 5.15.0 | MIT | crates.io |
 | zbus_names | 4.3.2 | MIT | crates.io |
-| zerocopy | 0.8.48 | BSD-2-Clause OR Apache-2.0 OR MIT | crates.io |
-| zerocopy-derive | 0.8.48 | BSD-2-Clause OR Apache-2.0 OR MIT | crates.io |
+| zerocopy | 0.8.49 | BSD-2-Clause OR Apache-2.0 OR MIT | crates.io |
+| zerocopy-derive | 0.8.49 | BSD-2-Clause OR Apache-2.0 OR MIT | crates.io |
 | zerofrom | 0.1.8 | Unicode-3.0 | crates.io |
 | zerofrom-derive | 0.1.7 | Unicode-3.0 | crates.io |
 | zeroize | 1.8.2 | Apache-2.0 OR MIT | crates.io |
