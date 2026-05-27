@@ -125,7 +125,7 @@ moving the `\n` into the Rust-side pre-rendered block, not chasing
 
 ## Reference plan + tracking issue
 
-- Plan: `docs/plans/markdown-render-template-layer/markdown-render-template-layer-plan.md`
+- Plan: archived at `agent-plan-archive:plans/github.com/sympoies/nils-cli/2026-05-26-markdown-render-template-layer/`
 - Tracking issue: `sympoies/nils-cli#541`
 - Implementation PRs: `#542` (Sprint 1), `#543`–`#552` (Sprint 2
   Tier-A), Sprint 3 (this runbook + the `md-render` binary).

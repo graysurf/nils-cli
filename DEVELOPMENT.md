@@ -68,8 +68,8 @@ For optional runtime tools used by individual CLIs, see `BINARY_DEPENDENCIES.md`
 install-map shape only. A passing shape check is not Codex Desktop acceptance;
 live acceptance still requires `codex debug prompt-input` in a fresh Codex
 Desktop session with `$HOME/.agents` absent and legacy skill environment
-variables unset. Rationale:
-`docs/plans/codex-skill-surface-primitives/codex-skill-surface-primitives-discussion-source.md`.
+variables unset. Rationale: see the archived plan bundle
+`agent-plan-archive:plans/github.com/sympoies/nils-cli/2026-05-23-codex-skill-surface-primitives/`.
 
 ## 3. Canonical validation flows
 

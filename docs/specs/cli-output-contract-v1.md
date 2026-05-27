@@ -23,8 +23,7 @@ Apply this contract to every user-facing binary in the workspace:
 
 - New binaries MUST adopt the contract before they ship.
 - Existing binaries SHOULD migrate within one minor release cycle. The
-  rollout plan lives in
-  `docs/plans/cli-output-contract-unification/cli-output-contract-unification-plan.md`.
+  rollout plan has been retired after rollout (see repository history).
 - Binaries that already publish a `schema_version` (notably
   `agent-workflow-primitives`) keep their string literals byte-stable;
   only the surrounding envelope changes when they migrate.
@@ -188,8 +187,8 @@ previously shipped `--json`:
 
 `agent-workflow-primitives` and `staged-context` carry their own
 schema-version aliases; their deprecation timelines are documented in
-their respective migration tasks. See
-`docs/plans/cli-output-contract-unification/cli-output-contract-unification-plan.md`.
+their respective migration tasks (rollout plan retired; see repository
+history).
 
 ## Testing requirements
 
@@ -215,8 +214,7 @@ Per workspace (covered by the migration plan's Sprint 3 lint script):
   [`crates/nils-common/src/cli_contract.rs`](../../crates/nils-common/src/cli_contract.rs).
 - Reference binary:
   [`crates/cli-template`](../../crates/cli-template).
-- Migration plan:
-  [`docs/plans/cli-output-contract-unification/cli-output-contract-unification-plan.md`](../plans/cli-output-contract-unification/cli-output-contract-unification-plan.md).
+- Migration plan: retired after rollout (see repository history).
 - Shared-crate boundary rules:
   [`docs/specs/workspace-shared-crate-boundary-v1.md`](workspace-shared-crate-boundary-v1.md).
 - Predecessor guideline (retry / partial-failure / sensitive-data

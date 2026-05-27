@@ -187,7 +187,7 @@ versioning.
   `$AGENT_HOME/out/plan-issue-delivery/<repo-slug>/issue-<n>/...`
   defined by
   [`agent-kit RUNTIME_LAYOUT.md`](https://github.com/sympoies/agent-kit/blob/main/skills/automation/plan-issue-delivery/references/RUNTIME_LAYOUT.md)
-  and [`docs/plans/plan-issue-cli-canonical-runtime-artifacts-plan.md`](../../docs/plans/plan-issue-cli-canonical-runtime-artifacts-plan.md).
+  and the `plan-issue-cli-canonical-runtime-artifacts` plan (retired; see repository history).
   Retired filenames:
   - `<plan-slug>-plan-tasks.tsv`
   - `<plan-slug>-plan-issue-body.md`

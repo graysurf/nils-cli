@@ -7,8 +7,9 @@
 //! and let the template own layout; templates never reach into the
 //! consumer's domain.
 //!
-//! Sprint 1 of `docs/plans/markdown-render-template-layer/` populates
-//! this crate with the engine builder, the `md_cell` Tera filter, the
+//! Sprint 1 of the archived `markdown-render-template-layer` plan
+//! (agent-plan-archive: nils-cli/2026-05-26-markdown-render-template-layer)
+//! populates this crate with the engine builder, the `md_cell` Tera filter, the
 //! `nils_common::markdown` re-export bridge, the `register_helper`
 //! extension point that consumer crates plug their own domain helpers
 //! into, and a byte-equality `assert_render` test harness. Sprint 3

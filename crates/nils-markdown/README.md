@@ -52,10 +52,10 @@ template's view.
 
 ## Rollout
 
-This crate is introduced by
-`docs/plans/markdown-render-template-layer/`. Tier A migration order
-and consumer wiring are tracked in the plan and in tracking issue
-`#541`.
+This crate is introduced by the archived plan bundle
+`agent-plan-archive:plans/github.com/sympoies/nils-cli/2026-05-26-markdown-render-template-layer/`.
+Tier A migration order and consumer wiring are tracked in the plan and
+in tracking issue `#541`.
 
 ## Docs
 

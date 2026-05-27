@@ -3,9 +3,11 @@
 This is the long-term runbook for the `plan-issue-cli` provider routing layer.
 It was promoted from the Sprint 1 design note after the multi-provider routing
 work (Sprints 1–4) shipped through sympoies/nils-cli#498, #499, #503, and #505.
-For the historical sprint deliberation, see the original design note under
-`docs/plans/plan-issue-cli-provider-abstraction/`; this runbook is the durable
-reference for contributors who maintain or extend the routing layer.
+For the historical sprint deliberation, see the original design note in the
+archived bundle
+`agent-plan-archive:plans/github.com/sympoies/nils-cli/2026-05-25-plan-issue-cli-provider-abstraction/`;
+this runbook is the durable reference for contributors who maintain or extend
+the routing layer.
 
 ## 1. Routing strategy
 

@@ -164,5 +164,5 @@ retired filenames and the migration note are catalogued in the crate
 Downstream consumers must read artifacts from the canonical
 `$ISSUE_ROOT` / `$SPRINT_ROOT` paths above.
 
-Migration delivered by
-[`docs/plans/plan-issue-cli-canonical-runtime-artifacts-plan.md`](../../../../docs/plans/plan-issue-cli-canonical-runtime-artifacts-plan.md).
+Migration delivered by the `plan-issue-cli-canonical-runtime-artifacts`
+plan (retired; see repository history).
