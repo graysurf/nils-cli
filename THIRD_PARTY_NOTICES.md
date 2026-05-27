@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `abaa3342bbbadfe66d4eb76b575c05bcb1633eb99850da12662b938eceae2905`
+- Cargo.lock SHA256: `b2d194c1597e7d915649b9ee4b4cb8fc1e6e5a26fe1ffb5207d4c3b4573b1023`
 - Third-party crates (`source != null`): 465
 
 ## Notice Extraction Policy
@@ -1587,7 +1587,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### memchr 2.8.0
+### memchr 2.8.1
 
 - License: `Unlicense OR MIT`
 - Source: `crates.io`
