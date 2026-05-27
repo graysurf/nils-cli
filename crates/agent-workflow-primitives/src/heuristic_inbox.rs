@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum, ValueHint};
 use nils_markdown::Engine;
 use nils_term::prompt::{self, PromptError, PromptOptions};
 use regex::Regex;
@@ -1427,13 +1427,81 @@ fn run_new(args: &NewArgs) -> Result<NewResult, CliError> {
         ));
     }
 
-    let (record_file, record) = load_skill_usage_record(&args.from_skill_usage)?;
+    // Exactly one source is guaranteed by the `new_source` ArgGroup.
+    let resolved = if let Some(path) = &args.from_skill_usage {
+        resolve_skill_usage_source(path)?
+    } else if let Some(path) = &args.from_evidence {
+        resolve_evidence_source(path)?
+    } else {
+        resolve_manual_source()
+    };
 
     let title = if args.title.is_empty() {
         title_from_slug(slug)
     } else {
         args.title.clone()
     };
+    let area = if !args.area.is_empty() {
+        args.area.clone()
+    } else {
+        resolved.area_default
+    };
+    let next_action = if args.next_action.is_empty() {
+        "Triage this gap and route any implementation work to a focused plan or domain workflow."
+            .to_string()
+    } else {
+        args.next_action.clone()
+    };
+
+    let text = compose_entry(EntryParts {
+        title: &title,
+        status: args.status.as_str(),
+        first_observed: &resolved.first_observed,
+        area: &area,
+        severity: args.severity.as_str(),
+        signal: &resolved.signal,
+        raw_record_display: &resolved.raw_record_display,
+        evidence_summary: &resolved.evidence_summary,
+        next_action: &next_action,
+    });
+
+    write_text(&target, &text)?;
+    fs::create_dir_all(&evidence_dir).map_err(|err| {
+        CliError::runtime(
+            "create-dir-failed",
+            format!("failed to create {}: {err}", evidence_dir.display()),
+            Some(json!({ "path": display_path(&evidence_dir) })),
+        )
+    })?;
+    for (filename, body) in &resolved.evidence_files {
+        write_text(&evidence_dir.join(filename), body)?;
+    }
+    Ok(NewResult {
+        ok: true,
+        path: display_path(&target),
+        folder: display_path(&case_folder),
+        status: args.status.as_str().to_string(),
+        severity: args.severity.as_str().to_string(),
+    })
+}
+
+/// Resolved per-source content used to compose an inbox `ENTRY.md`.
+struct ResolvedSource {
+    /// Fallback `Area` value when `--area` is not supplied.
+    area_default: String,
+    first_observed: String,
+    /// Body of the `## Signal` section.
+    signal: String,
+    /// Rendered value after `- Raw record: ` (already escaped/quoted as needed).
+    raw_record_display: String,
+    /// Trailing summary line under `## Evidence`.
+    evidence_summary: String,
+    /// Files to write under the case `evidence/` directory: `(filename, body)`.
+    evidence_files: Vec<(String, String)>,
+}
+
+fn resolve_skill_usage_source(path: &Path) -> Result<ResolvedSource, CliError> {
+    let (record_file, record) = load_skill_usage_record(path)?;
     let skill = record
         .get("skill")
         .and_then(Value::as_str)
@@ -1449,49 +1517,93 @@ fn run_new(args: &NewArgs) -> Result<NewResult, CliError> {
         .and_then(Value::as_str)
         .unwrap_or("See linked skill usage record.");
     let outcome_summary = redact_summary(outcome_summary_raw);
-    let area = if args.area.is_empty() {
-        skill.clone()
-    } else {
-        args.area.clone()
-    };
-    let first_observed = today_from_record(&record);
-    let next_action = if args.next_action.is_empty() {
-        "Triage this gap and route any implementation work to a focused plan or domain workflow."
-            .to_string()
-    } else {
-        args.next_action.clone()
-    };
     let raw_record_pointer = normalize_home_paths(&display_path(&record_file));
-
-    let text = format!(
-        "# {title}\n\n## Status\n\n- Status: {status}\n- First observed: {first_observed}\n- Area: {area}\n- Severity: {severity}\n\n## Signal\n\nSkill `{skill}` ended with `{outcome_status}`. Summary: {outcome_summary}\n\n## Evidence\n\n- Raw record: `{raw_record_pointer}`\n- Summary: linked `skill-usage.record.v1` envelope; raw runtime details remain in the evidence location.\n\n## Impact\n\nFuture agents may repeat this workflow gap unless the retained entry is triaged,\nrouted, and later promoted into a durable fix, runbook, test, script, or skill\npolicy.\n\n## Current Workaround\n\nUse the linked raw record for details, apply the safest manual workaround for\nthe affected workflow, and avoid copying raw logs or secrets into this entry.\n\n## Promotion Criteria\n\nPromote after the durable fix or accepted-risk decision is implemented,\nvalidated, and linked from this entry.\n\n## Next Action\n\n{next_action}\n",
-        title = title,
-        status = args.status.as_str(),
-        first_observed = first_observed,
-        area = area,
-        severity = args.severity.as_str(),
-        skill = skill,
-        outcome_status = outcome_status,
-        outcome_summary = outcome_summary,
-        raw_record_pointer = raw_record_pointer,
-        next_action = next_action,
-    );
-
-    write_text(&target, &text)?;
-    fs::create_dir_all(&evidence_dir).map_err(|err| {
-        CliError::runtime(
-            "create-dir-failed",
-            format!("failed to create {}: {err}", evidence_dir.display()),
-            Some(json!({ "path": display_path(&evidence_dir) })),
-        )
-    })?;
-    Ok(NewResult {
-        ok: true,
-        path: display_path(&target),
-        folder: display_path(&case_folder),
-        status: args.status.as_str().to_string(),
-        severity: args.severity.as_str().to_string(),
+    Ok(ResolvedSource {
+        area_default: skill.clone(),
+        first_observed: today_from_record(&record),
+        signal: format!("Skill `{skill}` ended with `{outcome_status}`. Summary: {outcome_summary}"),
+        raw_record_display: format!("`{raw_record_pointer}`"),
+        evidence_summary:
+            "linked `skill-usage.record.v1` envelope; raw runtime details remain in the evidence location."
+                .to_string(),
+        evidence_files: Vec::new(),
     })
+}
+
+fn resolve_evidence_source(path: &Path) -> Result<ResolvedSource, CliError> {
+    let (redacted, violations) = redact_ingest_source(path, DEFAULT_EVIDENCE_MAX_BYTES)?;
+    if !violations.is_empty() {
+        let messages: Vec<String> = violations.iter().map(|v| v.message.clone()).collect();
+        return Err(CliError::usage(
+            "evidence-not-redactable",
+            format!(
+                "evidence source cannot be ingested safely: {}",
+                messages.join("; ")
+            ),
+            Some(json!({ "violations": violations })),
+        ));
+    }
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("evidence.md")
+        .to_string();
+    Ok(ResolvedSource {
+        area_default: "uncategorized".to_string(),
+        first_observed: today_utc(),
+        signal:
+            "Workflow gap captured from an ingested evidence file. See the Evidence section for the redacted source."
+                .to_string(),
+        raw_record_display: format!("`evidence/{filename}`"),
+        evidence_summary:
+            "redacted evidence ingested at creation time; raw logs and secrets were stripped before commit."
+                .to_string(),
+        evidence_files: vec![(filename, redacted)],
+    })
+}
+
+fn resolve_manual_source() -> ResolvedSource {
+    let today = today_utc();
+    ResolvedSource {
+        area_default: "uncategorized".to_string(),
+        first_observed: today.clone(),
+        signal:
+            "Workflow gap diagnosed manually during a live session; no skill-usage record was captured. See Next Action for the triage and routing plan."
+                .to_string(),
+        raw_record_display: format!("not captured (manual diagnosis, {today})"),
+        evidence_summary:
+            "manual diagnosis with no captured raw record; attach redacted evidence later via `heuristic-inbox ingest-evidence`."
+                .to_string(),
+        evidence_files: Vec::new(),
+    }
+}
+
+/// Named arguments for [`compose_entry`].
+struct EntryParts<'a> {
+    title: &'a str,
+    status: &'a str,
+    first_observed: &'a str,
+    area: &'a str,
+    severity: &'a str,
+    signal: &'a str,
+    raw_record_display: &'a str,
+    evidence_summary: &'a str,
+    next_action: &'a str,
+}
+
+fn compose_entry(parts: EntryParts<'_>) -> String {
+    format!(
+        "# {title}\n\n## Status\n\n- Status: {status}\n- First observed: {first_observed}\n- Area: {area}\n- Severity: {severity}\n\n## Signal\n\n{signal}\n\n## Evidence\n\n- Raw record: {raw_record_display}\n- Summary: {evidence_summary}\n\n## Impact\n\nFuture agents may repeat this workflow gap unless the retained entry is triaged,\nrouted, and later promoted into a durable fix, runbook, test, script, or skill\npolicy.\n\n## Current Workaround\n\nApply the safest manual workaround for the affected workflow until the durable\nfix lands, and avoid copying raw logs or secrets into this entry.\n\n## Promotion Criteria\n\nPromote after the durable fix or accepted-risk decision is implemented,\nvalidated, and linked from this entry.\n\n## Next Action\n\n{next_action}\n",
+        title = parts.title,
+        status = parts.status,
+        first_observed = parts.first_observed,
+        area = parts.area,
+        severity = parts.severity,
+        signal = parts.signal,
+        raw_record_display = parts.raw_record_display,
+        evidence_summary = parts.evidence_summary,
+        next_action = parts.next_action,
+    )
 }
 
 fn replace_next_action(text: &str, link: &str, next_action: &str) -> String {
@@ -2320,7 +2432,7 @@ fn dispatch_ingest(args: IngestArgs, argv: &[String], started_at: &str) -> i32 {
     about = "Manage curated HEURISTIC_SYSTEM error-inbox and operation-record case folders.",
     long_about = "Manage curated heuristic-system inbox cases, operation records, evidence ingestion, and archival transitions.",
     disable_help_subcommand = true,
-    after_help = "EXAMPLES:\n  heuristic-inbox list --format json\n  heuristic-inbox verify heuristic-system/error-inbox/<slug>/ --format json\n  heuristic-inbox new --from-skill-usage out/.../skill-usage.record.json --slug pipeline-gap\n  heuristic-inbox set-status heuristic-system/error-inbox/<slug>/ --status promoted --link docs/plans/foo.md\n  heuristic-inbox archive heuristic-system/error-inbox/<slug>/ --date 2026-05-18\n  heuristic-inbox ingest-evidence heuristic-system/error-inbox/<slug>/ --from validation.md\n  heuristic-inbox completion zsh\n\nENVIRONMENT:\n  HOME  Fallback base path when expanding home-relative paths.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
+    after_help = "EXAMPLES:\n  heuristic-inbox list --format json\n  heuristic-inbox verify heuristic-system/error-inbox/<slug>/ --format json\n  heuristic-inbox new --from-skill-usage out/.../skill-usage.record.json --slug pipeline-gap\n  heuristic-inbox new --from-evidence out/.../diagnosis.md --slug worktree-signing-gap\n  heuristic-inbox new --manual --slug live-diagnosis-gap --area cli --severity high\n  heuristic-inbox set-status heuristic-system/error-inbox/<slug>/ --status promoted --link docs/plans/foo.md\n  heuristic-inbox archive heuristic-system/error-inbox/<slug>/ --date 2026-05-18\n  heuristic-inbox ingest-evidence heuristic-system/error-inbox/<slug>/ --from validation.md\n  heuristic-inbox completion zsh\n\nENVIRONMENT:\n  HOME  Fallback base path when expanding home-relative paths.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -2334,7 +2446,7 @@ enum Command {
     List(ListArgs),
     /// Verify one inbox or operation-record case folder.
     Verify(VerifyArgs),
-    /// Create a curated entry from a skill usage record.
+    /// Create a curated entry from a skill-usage record, redacted evidence, or manual diagnosis.
     New(NewArgs),
     /// Update an inbox entry lifecycle status.
     SetStatus(SetStatusArgs),
@@ -2385,10 +2497,23 @@ struct VerifyArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("new_source")
+        .required(true)
+        .args(["from_skill_usage", "from_evidence", "manual"]),
+))]
 struct NewArgs {
-    /// Path to a skill-usage record file or its containing directory.
+    /// Scaffold from a `skill-usage.record.v1` envelope (file or its directory).
     #[arg(long = "from-skill-usage", value_name = "PATH", value_hint = ValueHint::AnyPath)]
-    from_skill_usage: PathBuf,
+    from_skill_usage: Option<PathBuf>,
+
+    /// Scaffold from an already-redacted evidence file (reuses ingest-evidence redaction).
+    #[arg(long = "from-evidence", value_name = "PATH", value_hint = ValueHint::AnyPath)]
+    from_evidence: Option<PathBuf>,
+
+    /// Scaffold a manual-diagnosis skeleton with no captured raw evidence.
+    #[arg(long = "manual")]
+    manual: bool,
 
     /// Slug for the new inbox case.
     #[arg(long)]
