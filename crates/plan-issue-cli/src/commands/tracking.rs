@@ -98,6 +98,8 @@ pub struct TrackingRunInitArgs {
     pub run_id: Option<String>,
 
     /// Override the recorded timestamp (`created_at` / `updated_at`).
+    /// Defaults to the current UTC time; pass an explicit value for
+    /// deterministic tests/fixtures.
     #[arg(long = "now", value_name = "rfc3339")]
     pub now: Option<String>,
 
@@ -153,6 +155,8 @@ pub struct TrackingRunUpdateArgs {
     pub note: Option<String>,
 
     /// Override the recorded `updated_at` timestamp.
+    /// Defaults to the current UTC time; pass an explicit value for
+    /// deterministic tests/fixtures.
     #[arg(long = "now", value_name = "rfc3339")]
     pub now: Option<String>,
 }

@@ -2239,6 +2239,7 @@ dependencies = [
 name = "nils-plan-issue-cli"
 version = "0.25.2"
 dependencies = [
+ "chrono",
  "clap",
  "clap_complete",
  "nils-common",
