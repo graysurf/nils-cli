@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `b2d194c1597e7d915649b9ee4b4cb8fc1e6e5a26fe1ffb5207d4c3b4573b1023`
+- Cargo.lock SHA256: `7c954c5e0ea86e7561fb9964d2272e241dab8e2a76cda8e05a8092ad37c30e4b`
 - Third-party crates (`source != null`): 465
 - Workspace crates (`source == null`, excluded below): 33
 
@@ -129,7 +129,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | directories | 6.0.0 | MIT OR Apache-2.0 | crates.io |
 | dirs-sys | 0.5.0 | MIT OR Apache-2.0 | crates.io |
 | dispatch2 | 0.3.1 | Zlib OR Apache-2.0 OR MIT | crates.io |
-| displaydoc | 0.2.5 | MIT OR Apache-2.0 | crates.io |
+| displaydoc | 0.2.6 | MIT OR Apache-2.0 | crates.io |
 | dunce | 1.0.5 | CC0-1.0 OR MIT-0 OR Apache-2.0 | crates.io |
 | dyn-clone | 1.0.20 | MIT OR Apache-2.0 | crates.io |
 | encode_unicode | 1.0.0 | Apache-2.0 OR MIT | crates.io |
