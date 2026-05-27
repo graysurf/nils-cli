@@ -73,7 +73,16 @@ impl ForgeFetcher for RealForge {
         let provider = Self::provider_for(&target.host);
         let repo_slug = format!("{}/{}", target.org_or_group_path, target.repo);
         let number = target.number.to_string();
-        let base = || vec!["--provider", provider, "--repo", &repo_slug, "--format", "json"];
+        let base = || {
+            vec![
+                "--provider",
+                provider,
+                "--repo",
+                &repo_slug,
+                "--format",
+                "json",
+            ]
+        };
         match target.kind {
             RefKind::Issue => {
                 let mut args = base();
