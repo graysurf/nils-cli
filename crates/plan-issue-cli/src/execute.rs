@@ -5562,10 +5562,10 @@ mod tests {
             "https://gitlab.com/group/project/-/issues/12#note_789"
         ));
         assert!(approval_comment_url_looks_valid(
-            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/merge_requests/7#note_321"
+            "https://gitlab.com/terrylin/agent-runtime-testing/-/merge_requests/7#note_321"
         ));
         assert!(approval_comment_url_looks_valid(
-            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/work_items/13#note_654"
+            "https://gitlab.com/terrylin/agent-runtime-testing/-/work_items/13#note_654"
         ));
         assert!(!approval_comment_url_looks_valid(
             "https://example.com/issues/217#issuecomment-123"
@@ -5574,10 +5574,10 @@ mod tests {
             "https://github.com/sympoies/nils-cli/issues/217#comment-123"
         ));
         assert!(!approval_comment_url_looks_valid(
-            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/merge_requests/7#note_abc"
+            "https://gitlab.com/terrylin/agent-runtime-testing/-/merge_requests/7#note_abc"
         ));
         assert!(!approval_comment_url_looks_valid(
-            "https://gitlab.gamania.com/terrylin/agent-runtime-testing/-/merge_requests/7"
+            "https://gitlab.com/terrylin/agent-runtime-testing/-/merge_requests/7"
         ));
 
         assert!(should_emit_comment(&CommentModeArgs {

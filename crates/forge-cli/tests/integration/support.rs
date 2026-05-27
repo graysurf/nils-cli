@@ -11,6 +11,20 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
+const SCRUBBED_ENV: &[&str] = &[
+    "FORGE_CLI_INBOX_GITLAB_HOST",
+    "FORGE_CLI_INBOX_GITLAB_VPN",
+    "FORGE_CLI_INBOX_GITLAB_VPN_CHECK",
+    "FORGE_CLI_INBOX_GITLAB_VPN_CHECK_TIMEOUT",
+    "FORGE_CLI_INBOX_GITLAB_OPENVPN_PROFILE",
+    "FORGE_CLI_INBOX_PROVIDER_TIMEOUT",
+    "FORGE_CLI_INBOX_STRICT_PROVIDERS",
+    "FORGE_CLI_INBOX_CACHE_FALLBACK",
+    "FORGE_CLI_INBOX_CACHE_MAX_AGE",
+    "FORGE_CLI_INBOX_NO_CACHE",
+    "FORGE_CLI_INBOX_CACHE_DIR",
+];
+
 /// Resolve the compiled `forge-cli` binary. Uses the shared
 /// `nils_test_support::bin::resolve` helper which handles both the hyphen and
 /// underscore env-var variants Cargo exposes plus the `target/<profile>/`
@@ -82,6 +96,9 @@ pub fn run_forge_cli(stub: &StubEnv, args: &[&str]) -> CmdOutput {
 pub fn run_forge_cli_in(stub: &StubEnv, args: &[&str], cwd: Option<&Path>) -> CmdOutput {
     let mut cmd = Command::new(forge_cli_bin());
     cmd.args(args);
+    for key in SCRUBBED_ENV {
+        cmd.env_remove(key);
+    }
     for (k, v) in &stub.envs {
         cmd.env(k, v);
     }

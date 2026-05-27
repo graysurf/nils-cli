@@ -2369,11 +2369,11 @@ mod tests {
             repo: None,
             dry_run: false,
         };
-        let targets = resolve_targets(&global, Some("gitlab.example.com"));
+        let targets = resolve_targets(&global, Some("gitlab.com"));
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].provider, Provider::GitHub);
         assert_eq!(targets[1].provider, Provider::GitLab);
-        assert_eq!(targets[1].host, "gitlab.example.com");
+        assert_eq!(targets[1].host, "gitlab.com");
     }
 
     #[test]
@@ -2425,16 +2425,11 @@ mod tests {
             VpnCheck::Cmd { program } if program == "check-vpn"
         ));
         assert!(matches!(
-            parse_vpn_check("tcp:gitlab.example.com:443").unwrap(),
-            VpnCheck::Tcp { host, port } if host == "gitlab.example.com" && port == 443
+            parse_vpn_check("tcp:gitlab.com:443").unwrap(),
+            VpnCheck::Tcp { host, port } if host == "gitlab.com" && port == 443
         ));
 
-        for raw in [
-            "cmd:",
-            "tcp:gitlab.example.com:not-a-port",
-            "tcp::443",
-            "bogus",
-        ] {
+        for raw in ["cmd:", "tcp:gitlab.com:not-a-port", "tcp::443", "bogus"] {
             assert_eq!(
                 parse_vpn_check(raw).unwrap_err().kind(),
                 "vpn_check_invalid"
@@ -2454,11 +2449,11 @@ mod tests {
 
         let gitlab = ProviderTarget {
             provider: Provider::GitLab,
-            host: "gitlab.example.com".into(),
+            host: "gitlab.com".into(),
         };
         assert!(matches!(
             gitlab_vpn_check_for_target(&gitlab, &runtime),
-            Some(VpnCheck::Tcp { host, port }) if host == "gitlab.example.com" && port == 443
+            Some(VpnCheck::Tcp { host, port }) if host == "gitlab.com" && port == 443
         ));
 
         let github = ProviderTarget {
@@ -2509,7 +2504,7 @@ mod tests {
         runtime.gitlab_openvpn_profile = Some(profile.clone());
         let target = ProviderTarget {
             provider: Provider::GitLab,
-            host: "gitlab.example.com".into(),
+            host: "gitlab.com".into(),
         };
 
         let err = run_cmd_vpn_check(script.to_str().expect("script path"), &target, &runtime)
@@ -2550,7 +2545,7 @@ mod tests {
 
         let target = ProviderTarget {
             provider: Provider::GitLab,
-            host: "gitlab.example.com:8443".into(),
+            host: "gitlab.com:8443".into(),
         };
         let config = QueryConfig::new(vec![InboxKindFlag::Assigned], InboxItemTypeFlag::All, 5);
         let items = vec![InboxItem {
@@ -2561,7 +2556,7 @@ mod tests {
             repo: "team/widgets".into(),
             number: 42,
             title: "Review timeout handling".into(),
-            url: "https://gitlab.example.com/team/widgets/-/merge_requests/42".into(),
+            url: "https://gitlab.com/team/widgets/-/merge_requests/42".into(),
             updated_at: "2026-05-24T00:00:00Z".into(),
             author: Some("alice".into()),
             source: "gitlab_merge_requests".to_string(),
@@ -2673,7 +2668,7 @@ mod tests {
             },
             ProviderTarget {
                 provider: Provider::GitLab,
-                host: "gitlab.example.com".into(),
+                host: "gitlab.com".into(),
             },
         ];
         let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
@@ -2728,7 +2723,7 @@ mod tests {
             },
             ProviderTarget {
                 provider: Provider::GitLab,
-                host: "gitlab.example.com".into(),
+                host: "gitlab.com".into(),
             },
         ];
         let config = QueryConfig::new(Vec::new(), InboxItemTypeFlag::All, 30);
@@ -2754,7 +2749,7 @@ mod tests {
     /// both plans must be identical.
     #[test]
     fn gitlab_identity_predicate_matches_query_plan() {
-        let host = "gitlab.example.com";
+        let host = "gitlab.com";
         let id = GitlabIdentity {
             id: "1".into(),
             username: "u".into(),
@@ -2819,11 +2814,11 @@ mod tests {
     #[test]
     fn classify_gitlab_todo_accepts_canonical_gitlab_paths() {
         let issue = serde_json::json!({
-            "target": {"web_url": "https://gitlab.example.com/team/api/-/issues/32"},
+            "target": {"web_url": "https://gitlab.com/team/api/-/issues/32"},
         });
         assert_eq!(classify_gitlab_todo(&issue), TodoTarget::Issue);
         let mr = serde_json::json!({
-            "target_url": "https://gitlab.example.com/team/api/-/merge_requests/77",
+            "target_url": "https://gitlab.com/team/api/-/merge_requests/77",
         });
         assert_eq!(classify_gitlab_todo(&mr), TodoTarget::MergeRequest);
     }
@@ -2834,7 +2829,7 @@ mod tests {
         // must short-circuit to Unknown without falling back to URL guessing.
         let raw = serde_json::json!({
             "target_type": "DesignManagement::Design",
-            "target_url": "https://gitlab.example.com/team/api/-/issues/9",
+            "target_url": "https://gitlab.com/team/api/-/issues/9",
         });
         assert_eq!(classify_gitlab_todo(&raw), TodoTarget::Unknown);
     }
@@ -2860,7 +2855,7 @@ mod tests {
         }
         let target = ProviderTarget {
             provider: Provider::GitLab,
-            host: "gitlab.example.com".into(),
+            host: "gitlab.com".into(),
         };
         let config = QueryConfig::new(vec![InboxKindFlag::Review], InboxItemTypeFlag::Issue, 30);
         let result = execute_gitlab(&AssertNoIdentityRunner, &target, &config, &test_runtime())

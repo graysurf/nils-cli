@@ -60,7 +60,7 @@ exit 7
 const GLAB_INBOX_STUB: &str = r#"#!/bin/sh
 set -e
 case "$*" in
-  *"--hostname gitlab.example.com"*|*"--hostname gitlab.env.example"*) ;;
+  *"--hostname gitlab.com"*) ;;
   *)
     echo "missing hostname: $*" >&2
     exit 98
@@ -68,19 +68,19 @@ case "$*" in
 esac
 
 case "$*" in
-  "api user --hostname gitlab.example.com"|"api user --hostname gitlab.env.example")
+  "api user --hostname gitlab.com")
     cat <<'EOF'
 {"id":1435,"username":"terrylin"}
 EOF
     ;;
   *"merge_requests"*"scope=assigned_to_me"*)
     cat <<'EOF'
-[{"iid":21,"web_url":"https://gitlab.example.com/team/api/-/merge_requests/21","title":"Assigned MR","updated_at":"2026-05-22T08:00:00Z","author":{"username":"carol"},"references":{"full":"team/api!21"}}]
+[{"iid":21,"web_url":"https://gitlab.com/team/api/-/merge_requests/21","title":"Assigned MR","updated_at":"2026-05-22T08:00:00Z","author":{"username":"carol"},"references":{"full":"team/api!21"}}]
 EOF
     ;;
   *"merge_requests"*"reviewer_username=terrylin"*)
     cat <<'EOF'
-[{"iid":22,"web_url":"https://gitlab.example.com/team/api/-/merge_requests/22","title":"Review MR","updated_at":"2026-05-22T11:00:00Z","author":{"username":"dave"},"references":{"full":"team/api!22"}}]
+[{"iid":22,"web_url":"https://gitlab.com/team/api/-/merge_requests/22","title":"Review MR","updated_at":"2026-05-22T11:00:00Z","author":{"username":"dave"},"references":{"full":"team/api!22"}}]
 EOF
     ;;
   *"merge_requests"*"author_id=1435"*)
@@ -88,7 +88,7 @@ EOF
     ;;
   *"issues"*"scope=assigned_to_me"*)
     cat <<'EOF'
-[{"iid":31,"web_url":"https://gitlab.example.com/team/api/-/issues/31","title":"Assigned issue","updated_at":"2026-05-22T07:00:00Z","author":{"username":"erin"},"references":{"full":"team/api#31"}}]
+[{"iid":31,"web_url":"https://gitlab.com/team/api/-/issues/31","title":"Assigned issue","updated_at":"2026-05-22T07:00:00Z","author":{"username":"erin"},"references":{"full":"team/api#31"}}]
 EOF
     ;;
   *"issues"*"author_id=1435"*)
@@ -96,7 +96,7 @@ EOF
     ;;
   *"todos"*"state=pending"*)
     cat <<'EOF'
-[{"id":55,"body":"todo body","created_at":"2026-05-22T06:00:00Z","target_url":"https://gitlab.example.com/team/api/-/issues/32","target":{"iid":32,"title":"Todo issue","web_url":"https://gitlab.example.com/team/api/-/issues/32","updated_at":"2026-05-22T06:30:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"},"author":{"username":"notifier"}}]
+[{"id":55,"body":"todo body","created_at":"2026-05-22T06:00:00Z","target_url":"https://gitlab.com/team/api/-/issues/32","target":{"iid":32,"title":"Todo issue","web_url":"https://gitlab.com/team/api/-/issues/32","updated_at":"2026-05-22T06:30:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"},"author":{"username":"notifier"}}]
 EOF
     ;;
   *)
@@ -148,7 +148,7 @@ fn inbox_github_dedupes_reasons_and_normalizes_items() {
 #[test]
 fn inbox_gitlab_passes_hostname_and_normalizes_api_rows() {
     let stub = StubEnv::new()
-        .env("FORGE_CLI_INBOX_GITLAB_HOST", "gitlab.env.example")
+        .env("FORGE_CLI_INBOX_GITLAB_HOST", "gitlab.com")
         .glab_stub(GLAB_INBOX_STUB);
     let out = run_forge_cli(
         &stub,
@@ -160,14 +160,14 @@ fn inbox_gitlab_passes_hostname_and_normalizes_api_rows() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--limit",
             "7",
         ],
     );
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
-    assert_eq!(env["data"]["providers"][0]["host"], "gitlab.example.com");
+    assert_eq!(env["data"]["providers"][0]["host"], "gitlab.com");
     assert_eq!(env["data"]["providers"][0]["item_count"], 4);
     assert_eq!(env["data"]["items"][0]["kind"], "review");
     assert_eq!(env["data"]["items"][0]["repo"], "team/api");
@@ -183,7 +183,7 @@ fn inbox_gitlab_passes_hostname_and_normalizes_api_rows() {
 #[test]
 fn inbox_gitlab_host_can_default_from_env() {
     let stub = StubEnv::new()
-        .env("FORGE_CLI_INBOX_GITLAB_HOST", "gitlab.env.example")
+        .env("FORGE_CLI_INBOX_GITLAB_HOST", "gitlab.com")
         .glab_stub(GLAB_INBOX_STUB);
     let out = run_forge_cli(
         &stub,
@@ -200,7 +200,7 @@ fn inbox_gitlab_host_can_default_from_env() {
     );
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
-    assert_eq!(env["data"]["providers"][0]["host"], "gitlab.env.example");
+    assert_eq!(env["data"]["providers"][0]["host"], "gitlab.com");
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn inbox_list_partial_success_keeps_successful_provider() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
         ],
     );
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
@@ -232,7 +232,7 @@ fn inbox_list_partial_success_keeps_successful_provider() {
         env["warnings"][0]
             .as_str()
             .unwrap()
-            .contains("provider_failed: gitlab gitlab.example.com")
+            .contains("provider_failed: gitlab gitlab.com")
     );
 }
 
@@ -249,7 +249,7 @@ fn inbox_provider_timeout_is_provider_local_partial_failure() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--provider-timeout",
             "1s",
         ],
@@ -278,7 +278,7 @@ fn inbox_gitlab_only_timeout_is_nonzero() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--provider-timeout",
             "1s",
         ],
@@ -306,7 +306,7 @@ fn inbox_strict_providers_fails_partial_failure_with_provider_details() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--strict-providers",
         ],
     );
@@ -340,7 +340,7 @@ exit 99
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--gitlab-vpn",
             "required",
             "--gitlab-vpn-check",
@@ -379,7 +379,7 @@ exit 99
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--gitlab-vpn",
             "required",
             "--gitlab-vpn-check",
@@ -414,7 +414,7 @@ fn inbox_dry_run_redacts_openvpn_profile_path() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--gitlab-vpn",
             "required",
             "--gitlab-vpn-check",
@@ -456,7 +456,7 @@ fn inbox_cache_fallback_marks_cached_items_stale_while_provider_failed() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
         ],
     );
     assert_eq!(seed_out.code, 0, "stderr={}", seed_out.stderr);
@@ -476,7 +476,7 @@ fn inbox_cache_fallback_marks_cached_items_stale_while_provider_failed() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--provider-timeout",
             "250ms",
             "--cache-fallback",
@@ -508,7 +508,7 @@ fn inbox_contract_all_selected_providers_failed_is_nonzero() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
         ],
     );
     assert_eq!(out.code, 1, "stderr={}", out.stderr);
@@ -673,7 +673,7 @@ fn inbox_item_type_gitlab_default_plans_identity_and_default_families() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
         ],
     );
     assert_eq!(out.code, 0, "stderr={}", out.stderr);
@@ -682,7 +682,7 @@ fn inbox_item_type_gitlab_default_plans_identity_and_default_families() {
     assert!(
         plans
             .iter()
-            .any(|p| p.contains("api user --hostname gitlab.example.com"))
+            .any(|p| p.contains("api user --hostname gitlab.com"))
     );
     assert!(
         plans
@@ -725,7 +725,7 @@ fn inbox_item_type_gitlab_pr_only_skips_issue_calls() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--item-type",
             "pr",
         ],
@@ -738,7 +738,7 @@ fn inbox_item_type_gitlab_pr_only_skips_issue_calls() {
     assert!(
         plans
             .iter()
-            .any(|p| p.contains("api user --hostname gitlab.example.com"))
+            .any(|p| p.contains("api user --hostname gitlab.com"))
     );
     assert!(
         plans
@@ -775,7 +775,7 @@ fn inbox_item_type_gitlab_issue_only_skips_mr_calls() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--item-type",
             "issue",
         ],
@@ -788,7 +788,7 @@ fn inbox_item_type_gitlab_issue_only_skips_mr_calls() {
     assert!(
         plans
             .iter()
-            .any(|p| p.contains("api user --hostname gitlab.example.com"))
+            .any(|p| p.contains("api user --hostname gitlab.com"))
     );
     assert!(
         plans
@@ -820,7 +820,7 @@ fn inbox_item_type_gitlab_skips_identity_when_no_query_needs_it() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--kind",
             "assigned",
             "--kind",
@@ -860,8 +860,8 @@ EOF
     ;;
   *"todos"*"state=pending"*)
     cat <<'EOF'
-[{"id":55,"target_type":"Issue","target_url":"https://gitlab.example.com/team/api/-/issues/32","target":{"iid":32,"title":"Todo issue","web_url":"https://gitlab.example.com/team/api/-/issues/32","updated_at":"2026-05-22T06:30:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"}},
- {"id":56,"target_type":"MergeRequest","target_url":"https://gitlab.example.com/team/api/-/merge_requests/77","target":{"iid":77,"title":"Todo MR","web_url":"https://gitlab.example.com/team/api/-/merge_requests/77","updated_at":"2026-05-22T06:45:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"}}]
+[{"id":55,"target_type":"Issue","target_url":"https://gitlab.com/team/api/-/issues/32","target":{"iid":32,"title":"Todo issue","web_url":"https://gitlab.com/team/api/-/issues/32","updated_at":"2026-05-22T06:30:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"}},
+ {"id":56,"target_type":"MergeRequest","target_url":"https://gitlab.com/team/api/-/merge_requests/77","target":{"iid":77,"title":"Todo MR","web_url":"https://gitlab.com/team/api/-/merge_requests/77","updated_at":"2026-05-22T06:45:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/api"}}]
 EOF
     ;;
   *)
@@ -883,7 +883,7 @@ fn inbox_item_type_gitlab_todo_pr_only_keeps_mr_targets() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--kind",
             "todo",
             "--item-type",
@@ -910,7 +910,7 @@ fn inbox_item_type_gitlab_todo_issue_only_keeps_issue_targets() {
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--kind",
             "todo",
             "--item-type",
@@ -933,7 +933,7 @@ set -e
 case "$*" in
   *"todos"*"state=pending"*)
     cat <<'EOF'
-[{"id":99,"target_url":"https://gitlab.example.com/team/snippets/-/snippets/5","target":{"iid":5,"title":"Mystery todo","web_url":"https://gitlab.example.com/team/snippets/-/snippets/5","updated_at":"2026-05-22T07:00:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/snippets"}}]
+[{"id":99,"target_url":"https://gitlab.com/team/snippets/-/snippets/5","target":{"iid":5,"title":"Mystery todo","web_url":"https://gitlab.com/team/snippets/-/snippets/5","updated_at":"2026-05-22T07:00:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/snippets"}}]
 EOF
     ;;
   *)
@@ -952,7 +952,7 @@ esac
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--kind",
             "todo",
         ],
@@ -970,7 +970,7 @@ set -e
 case "$*" in
   *"todos"*"state=pending"*)
     cat <<'EOF'
-[{"id":99,"target_url":"https://gitlab.example.com/team/snippets/-/snippets/5","target":{"iid":5,"title":"Mystery todo","web_url":"https://gitlab.example.com/team/snippets/-/snippets/5","updated_at":"2026-05-22T07:00:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/snippets"}}]
+[{"id":99,"target_url":"https://gitlab.com/team/snippets/-/snippets/5","target":{"iid":5,"title":"Mystery todo","web_url":"https://gitlab.com/team/snippets/-/snippets/5","updated_at":"2026-05-22T07:00:00Z","author":{"username":"frank"}},"project":{"path_with_namespace":"team/snippets"}}]
 EOF
     ;;
   *)
@@ -989,7 +989,7 @@ esac
             "inbox",
             "list",
             "--gitlab-host",
-            "gitlab.example.com",
+            "gitlab.com",
             "--kind",
             "todo",
             "--item-type",
