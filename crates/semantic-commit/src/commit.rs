@@ -268,6 +268,10 @@ pub fn run(args: &[String]) -> i32 {
         return EXIT_ERROR;
     }
 
+    if let Err(code) = validate_blocked_message_rules(&message_contents, &options.trailers) {
+        return code;
+    }
+
     let tmpfile = match tempfile::NamedTempFile::new() {
         Ok(file) => file,
         Err(_) => {
@@ -1583,6 +1587,131 @@ fn validate_commit_message_with_width(path: &Path, max_header_width: usize) -> R
 fn fail_validation(message: &str) -> Result<(), i32> {
     eprintln!("error: {message}");
     Err(EXIT_VALIDATION_FAILED)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlockedMessageRule {
+    id: &'static str,
+    reason: &'static str,
+    matched_hint: &'static str,
+    fix: &'static str,
+    patterns: &'static [BlockedMessagePattern],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockedMessagePattern {
+    TrailerValueStartsWith {
+        token: &'static str,
+        value_prefix: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockedMessageSource {
+    MessageLine(usize),
+    TrailerFlag(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BlockedMessageMatch {
+    source: BlockedMessageSource,
+}
+
+const CLAUDE_COAUTHOR_PATTERNS: &[BlockedMessagePattern] =
+    &[BlockedMessagePattern::TrailerValueStartsWith {
+        token: "Co-Authored-By",
+        value_prefix: "Claude",
+    }];
+
+const BLOCKED_MESSAGE_RULES: &[BlockedMessageRule] = &[BlockedMessageRule {
+    id: "claude-coauthor-trailer",
+    reason: "do not attribute commits to any Claude model",
+    matched_hint: "Co-Authored-By: Claude ...",
+    fix: "remove the `Co-Authored-By: Claude ...` trailer",
+    patterns: CLAUDE_COAUTHOR_PATTERNS,
+}];
+
+fn validate_blocked_message_rules(message: &str, trailers: &[String]) -> Result<(), i32> {
+    for rule in BLOCKED_MESSAGE_RULES {
+        if let Some(blocked) = find_blocked_message_match(rule, message, trailers) {
+            return fail_validation(&format!(
+                "commit message is blocked by rule `{}`\n  source: {}\n  matched: {}\n  rule: {}\n  fix: {}",
+                rule.id,
+                blocked_message_source_label(blocked.source),
+                rule.matched_hint,
+                rule.reason,
+                rule.fix
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn find_blocked_message_match<'a>(
+    rule: &BlockedMessageRule,
+    message: &'a str,
+    trailers: &'a [String],
+) -> Option<BlockedMessageMatch> {
+    for (idx, line) in message.lines().enumerate() {
+        if rule.patterns.iter().any(|pattern| pattern.matches(line)) {
+            return Some(BlockedMessageMatch {
+                source: BlockedMessageSource::MessageLine(idx + 1),
+            });
+        }
+    }
+
+    for (idx, trailer) in trailers.iter().enumerate() {
+        if rule.patterns.iter().any(|pattern| pattern.matches(trailer)) {
+            return Some(BlockedMessageMatch {
+                source: BlockedMessageSource::TrailerFlag(idx + 1),
+            });
+        }
+    }
+
+    None
+}
+
+fn blocked_message_source_label(source: BlockedMessageSource) -> String {
+    match source {
+        BlockedMessageSource::MessageLine(line) => format!("message line {line}"),
+        BlockedMessageSource::TrailerFlag(idx) => format!("--trailer #{idx}"),
+    }
+}
+
+impl BlockedMessagePattern {
+    fn matches(self, line: &str) -> bool {
+        match self {
+            Self::TrailerValueStartsWith {
+                token,
+                value_prefix,
+            } => trailer_value_starts_with(line, token, value_prefix),
+        }
+    }
+}
+
+fn trailer_value_starts_with(line: &str, expected_token: &str, value_prefix: &str) -> bool {
+    let Some((token, value)) = split_trailer(line.trim()) else {
+        return false;
+    };
+    token.eq_ignore_ascii_case(expected_token)
+        && starts_with_ascii_word_ignore_case(value, value_prefix)
+}
+
+fn starts_with_ascii_word_ignore_case(value: &str, expected_word: &str) -> bool {
+    if expected_word.is_empty() {
+        return false;
+    }
+    let value = value.trim_start();
+    let Some(prefix) = value.get(..expected_word.len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(expected_word) {
+        return false;
+    }
+    value[expected_word.len()..]
+        .chars()
+        .next()
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
 }
 
 fn is_valid_header(header: &str) -> bool {
