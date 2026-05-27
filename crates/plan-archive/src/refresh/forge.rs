@@ -49,29 +49,10 @@ impl RealForge {
             "gitlab"
         }
     }
-}
 
-impl ForgeFetcher for RealForge {
-    fn fetch_payload(&self, target: &RefTarget) -> Result<String, String> {
-        let provider = Self::provider_for(&target.host);
-        let repo_slug = format!("{}/{}", target.org_or_group_path, target.repo);
-        let number = target.number.to_string();
-        let subcommand = match target.kind {
-            RefKind::Issue => "issue",
-            RefKind::Pull | RefKind::MergeRequest => "pr",
-        };
-        let args = [
-            "--provider",
-            provider,
-            "--repo",
-            &repo_slug,
-            "--format",
-            "json",
-            subcommand,
-            "view",
-            &number,
-            "--with-comments",
-        ];
+    /// Run one `forge-cli` invocation and return stdout, mapping a
+    /// spawn failure or non-zero exit into an error string.
+    fn run(&self, args: &[&str]) -> Result<String, String> {
         let out = Command::new(&self.binary)
             .args(args)
             .output()
@@ -84,6 +65,45 @@ impl ForgeFetcher for RealForge {
             ));
         }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+}
+
+impl ForgeFetcher for RealForge {
+    fn fetch_payload(&self, target: &RefTarget) -> Result<String, String> {
+        let provider = Self::provider_for(&target.host);
+        let repo_slug = format!("{}/{}", target.org_or_group_path, target.repo);
+        let number = target.number.to_string();
+        let base = || {
+            vec![
+                "--provider",
+                provider,
+                "--repo",
+                &repo_slug,
+                "--format",
+                "json",
+            ]
+        };
+        match target.kind {
+            RefKind::Issue => {
+                let mut args = base();
+                args.extend(["issue", "view", number.as_str(), "--with-comments"]);
+                self.run(&args)
+            }
+            // `forge-cli pr view` has no `--with-comments` flag (unlike
+            // `issue view`); the PR/MR comment stream is a separate `pr
+            // comments` call. Fetch both and merge the comments into the
+            // view payload so PR/MR snapshots carry the same `data.comments`
+            // shape that issue snapshots do.
+            RefKind::Pull | RefKind::MergeRequest => {
+                let mut view_args = base();
+                view_args.extend(["pr", "view", number.as_str()]);
+                let view = self.run(&view_args)?;
+                let mut comment_args = base();
+                comment_args.extend(["pr", "comments", number.as_str()]);
+                let comments = self.run(&comment_args)?;
+                merge_pr_comments(&view, &comments)
+            }
+        }
     }
 
     fn list_open_refs(
@@ -129,6 +149,27 @@ impl ForgeFetcher for RealForge {
         }
         Ok(targets)
     }
+}
+
+/// Merge a `forge-cli pr comments` payload's `data.comments` array into a
+/// `forge-cli pr view` payload under `data.comments`, returning the combined
+/// JSON string. This mirrors the embedded `comments` field that `issue view
+/// --with-comments` produces, so PR/MR snapshots share the issue shape. A
+/// missing comment stream becomes an empty array.
+fn merge_pr_comments(view_json: &str, comments_json: &str) -> Result<String, String> {
+    let mut view: serde_json::Value =
+        serde_json::from_str(view_json).map_err(|e| format!("parse pr view: {e}"))?;
+    let comments: serde_json::Value =
+        serde_json::from_str(comments_json).map_err(|e| format!("parse pr comments: {e}"))?;
+    let stream = comments
+        .get("data")
+        .and_then(|d| d.get("comments"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    if let Some(data) = view.get_mut("data").and_then(|d| d.as_object_mut()) {
+        data.insert("comments".to_string(), stream);
+    }
+    serde_json::to_string(&view).map_err(|e| format!("serialize merged pr payload: {e}"))
 }
 
 /// Parse a `forge-cli … list` JSON envelope into ref targets. The
@@ -221,5 +262,30 @@ mod tests {
     #[test]
     fn listing_empty_on_garbage() {
         assert!(parse_listing("not json", "github.com", "o", "r", "issue").is_empty());
+    }
+
+    #[test]
+    fn merge_pr_comments_embeds_stream() {
+        let view = r#"{"schema_version":"v1","ok":true,"data":{"number":542,"title":"x"}}"#;
+        let comments =
+            r#"{"ok":true,"data":{"number":542,"comments":[{"author":"a","body":"hi"}]}}"#;
+        let merged = merge_pr_comments(view, comments).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["data"]["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(v["data"]["title"], "x");
+    }
+
+    #[test]
+    fn merge_pr_comments_defaults_empty_when_absent() {
+        let view = r#"{"data":{"number":1}}"#;
+        let comments = r#"{"data":{"number":1}}"#;
+        let merged = merge_pr_comments(view, comments).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert!(v["data"]["comments"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_pr_comments_errors_on_garbage() {
+        assert!(merge_pr_comments("not json", "{}").is_err());
     }
 }
