@@ -574,3 +574,74 @@ fn render_clap_message(err: &clap::Error) -> String {
         })
         .unwrap_or_else(|| "command-line parse failed".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_surface_is_valid() {
+        // Validates the whole derived command tree, including the
+        // `discover` subcommand and its arguments.
+        Cli::command().debug_assert();
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "discover"),
+            "discover wired: {names:?}"
+        );
+    }
+
+    #[test]
+    fn discover_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "plan-archive",
+            "discover",
+            "--source-repo",
+            "/repo",
+            "--plans-root",
+            "docs/plans",
+            "--archive",
+            "/arch",
+            "--hosts",
+            "/arch/config/hosts.yaml",
+            "--include-unknown",
+            "--format",
+            "json",
+        ])
+        .expect("discover parses");
+        assert!(matches!(cli.output_format(), OutputFormat::Json));
+        match cli.command {
+            Command::Discover {
+                source_repo,
+                plans_root,
+                archive,
+                hosts,
+                include_unknown,
+            } => {
+                assert_eq!(source_repo, Some(PathBuf::from("/repo")));
+                assert_eq!(plans_root, Some(PathBuf::from("docs/plans")));
+                assert_eq!(archive, Some(PathBuf::from("/arch")));
+                assert_eq!(hosts, Some(PathBuf::from("/arch/config/hosts.yaml")));
+                assert!(include_unknown);
+            }
+            _ => panic!("expected the Discover subcommand"),
+        }
+    }
+
+    #[test]
+    fn discover_defaults_are_optional() {
+        let cli = Cli::try_parse_from(["plan-archive", "discover"]).expect("parses with defaults");
+        assert!(matches!(
+            cli.command,
+            Command::Discover {
+                include_unknown: false,
+                source_repo: None,
+                plans_root: None,
+                ..
+            }
+        ));
+    }
+}

@@ -455,3 +455,101 @@ fn duplicate_refs_are_deduplicated_across_files() {
     assert_eq!(c.refs.len(), 1, "same URL inferred once");
     assert_eq!(c.status, DiscoverStatus::Eligible);
 }
+
+/// Dispatch args with an explicit format and `--hosts` left to default
+/// to `<archive>/config/hosts.yaml`.
+fn dispatch_args(s: &Scenario, include_unknown: bool, format: OutputFormat) -> DispatchArgs {
+    DispatchArgs {
+        source_repo: Some(s.source_repo.clone()),
+        plans_root: None,
+        archive: Some(s.archive.clone()),
+        hosts: None,
+        include_unknown,
+        format,
+    }
+}
+
+#[test]
+fn dispatch_text_and_json_emit_successfully() {
+    let s = build_matrix();
+    // Text path drives the full renderer across all three status groups,
+    // refs, cross-repo labels, closeout markers, and reason codes.
+    assert_eq!(
+        discover::dispatch(dispatch_args(&s, true, OutputFormat::Text)),
+        0
+    );
+    // JSON path drives the envelope emitter.
+    assert_eq!(
+        discover::dispatch(dispatch_args(&s, false, OutputFormat::Json)),
+        0
+    );
+
+    // host-not-known prints the dedicated warning line.
+    let g = build_with_host("gitlab.com");
+    write_plan(
+        &g,
+        "2026-05-01-x",
+        &[
+            ("plan.md", &format!("Tracking: {ISSUE_URL}\n")),
+            ("state.md", "- Status: done\n"),
+        ],
+    );
+    commit_all(&g, "seed");
+    assert_eq!(
+        discover::dispatch(dispatch_args(&g, true, OutputFormat::Text)),
+        0
+    );
+}
+
+#[test]
+fn error_paths_cover_codes_and_emitters() {
+    let s = build_base();
+    let missing_archive = s.source_repo.join("no-such-archive");
+
+    // archive clone missing — typed code + both emitter arms.
+    let mut a = args(&s, true);
+    a.archive = Some(missing_archive.clone());
+    assert_eq!(
+        discover::scan(&a).unwrap_err().code(),
+        "discover-archive-clone-missing"
+    );
+    let mut json = args(&s, true);
+    json.archive = Some(missing_archive.clone());
+    assert_ne!(discover::dispatch(json), 0);
+    let mut text = dispatch_args(&s, true, OutputFormat::Text);
+    text.archive = Some(missing_archive);
+    assert_ne!(discover::dispatch(text), 0);
+
+    // hosts file missing → load-failed.
+    let mut hl = args(&s, true);
+    hl.hosts = Some(s.source_repo.join("no-hosts.yaml"));
+    assert_eq!(
+        discover::scan(&hl).unwrap_err().code(),
+        "discover-hosts-load-failed"
+    );
+
+    // malformed hosts file (unknown class) → parse-failed.
+    let bad = s.source_repo.join("bad-hosts.yaml");
+    fs::write(
+        &bad,
+        "version: 1\nhosts:\n  github.com:\n    class: bogus\n",
+    )
+    .unwrap();
+    let mut hp = args(&s, true);
+    hp.hosts = Some(bad);
+    assert_eq!(
+        discover::scan(&hp).unwrap_err().code(),
+        "discover-hosts-parse-failed"
+    );
+
+    // source repo that is not a git repo → not-found.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let mut sr = args(&s, true);
+    sr.source_repo = Some(plain);
+    assert_eq!(
+        discover::scan(&sr).unwrap_err().code(),
+        "discover-source-repo-not-found"
+    );
+}
