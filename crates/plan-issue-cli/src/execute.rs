@@ -1713,11 +1713,11 @@ fn run_tracking_run_init(
     use crate::tracking::events::{self, ExecutionEvent, ExecutionEventKind};
     use crate::tracking::run_state::{ExecutionRun, RunPhase, RunRoot, SelectedScope};
 
+    let now = args.now.clone().unwrap_or_else(default_now);
     let run_id = args
         .run_id
         .clone()
-        .unwrap_or_else(|| default_run_id(args.issue, args.now.as_deref()));
-    let now = args.now.clone().unwrap_or_else(default_now);
+        .unwrap_or_else(|| default_run_id(args.issue, &now));
     let mut run = ExecutionRun::new(
         run_id.clone(),
         args.provider_repo.clone(),
@@ -2425,22 +2425,20 @@ fn resolve_close_ready_inputs(
     Ok((body, comments))
 }
 
-fn default_run_id(issue: u64, now: Option<&str>) -> String {
+fn default_run_id(issue: u64, now: &str) -> String {
     let mut id = String::new();
-    let timestamp = now.unwrap_or("00000000-000000");
-    let clean: String = timestamp
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
+    let clean: String = now.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     id.push_str(&clean);
     id.push_str(&format!("-issue-{issue}"));
     id
 }
 
 fn default_now() -> String {
-    // Deterministic placeholder when no `--now` is supplied. Tests can pass
-    // `--now` for stable values.
-    "1970-01-01T00:00:00Z".to_string()
+    // Safe default when no `--now` is supplied: real wall-clock UTC time, so a
+    // live `tracking run init`/`update` never records the 1970 epoch placeholder
+    // into run-state (issue #588). Tests and deterministic fixtures pass an
+    // explicit `--now` to override this.
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 fn run_tracking_status(

@@ -21,6 +21,7 @@ name = "plan-issue-local"
 path = "src/bin/plan-issue-local.rs"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 serde = { workspace = true }

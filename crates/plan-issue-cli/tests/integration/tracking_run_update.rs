@@ -61,6 +61,53 @@ fn tracking_run_update_init_writes_run_state_and_events() {
 }
 
 #[test]
+fn tracking_run_init_defaults_now_to_wallclock_when_now_omitted() {
+    // Regression (issue #588): omitting `--now` must not write the 1970 epoch
+    // placeholder into live run-state. The safe default is the current UTC time,
+    // and `run_id` is derived from it rather than the `00000000…` placeholder.
+    let tmp = TempDir::new().expect("tmp");
+    let run_state_path = tmp.path().join("run-state.json");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "run",
+        "init",
+        "--provider-repo",
+        "owner/repo",
+        "--issue",
+        "123",
+        "--out",
+        run_state_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let run = run_state::read_run_state(&run_state_path).expect("read");
+    assert_ne!(
+        run.created_at, "1970-01-01T00:00:00Z",
+        "init without --now must not record the 1970 placeholder"
+    );
+    assert_eq!(run.created_at, run.updated_at, "init seeds both timestamps");
+    // RFC3339 UTC form with `Z` suffix, matching the workspace convention.
+    assert!(
+        run.created_at.contains('T') && run.created_at.ends_with('Z'),
+        "created_at should be RFC3339 UTC: {}",
+        run.created_at
+    );
+
+    let envelope = json_stdout(&out);
+    let run_id = envelope["payload"]["result"]["run_id"]
+        .as_str()
+        .expect("run_id");
+    assert!(
+        !run_id.starts_with("00000000000000"),
+        "run_id should derive from a real timestamp, not the placeholder: {run_id}"
+    );
+    assert!(run_id.ends_with("-issue-123"), "run_id: {run_id}");
+}
+
+#[test]
 fn tracking_run_update_changes_phase_and_appends_event() {
     let tmp = TempDir::new().expect("tmp");
     let run_state_path = tmp.path().join("run-state.json");
