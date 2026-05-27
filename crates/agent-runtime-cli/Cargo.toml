@@ -1,6 +1,6 @@
 [package]
 name = "agent-runtime-cli"
-version = "0.25.3"
+version = "0.25.4"
 edition.workspace = true
 license.workspace = true
 
@@ -19,7 +19,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 indexmap = { workspace = true }
-nils-markdown = { version = "0.25.3", path = "../nils-markdown", package = "nils-markdown" }
+nils-markdown = { version = "0.25.4", path = "../nils-markdown", package = "nils-markdown" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
@@ -29,5 +29,5 @@ tera = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "0.25.3", path = "../nils-test-support" }
+nils-test-support = { version = "0.25.4", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
