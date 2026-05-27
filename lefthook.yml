@@ -1,0 +1,4 @@
+pre-push:
+  commands:
+    signed-commits:
+      run: bash scripts/ci/verify-signed-commits.sh
