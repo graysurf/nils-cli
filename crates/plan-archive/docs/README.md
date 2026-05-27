@@ -20,7 +20,7 @@
 ## Links
 
 - Back to crate README: [`../README.md`](../README.md)
-- Master design: [agent-runtime-kit `docs/plans/plan-archive-system/`][master]
+- Master design: [agent-runtime-kit `docs/plans/2026-05-26-plan-archive-system/`][master]
 - Plan 1 tracker: <https://github.com/sympoies/nils-cli/issues/571>
 
-[master]: https://github.com/graysurf/agent-runtime-kit/blob/main/docs/plans/plan-archive-system/plan-archive-system-discussion-source.md
+[master]: https://github.com/graysurf/agent-runtime-kit/blob/main/docs/plans/2026-05-26-plan-archive-system/plan-archive-system-discussion-source.md

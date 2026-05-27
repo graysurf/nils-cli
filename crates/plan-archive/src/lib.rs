@@ -1,7 +1,7 @@
 //! Deterministic plan-archive CLI shipped as part of the `nils-cli` workspace.
 //!
 //! See the master design at
-//! `agent-runtime-kit:docs/plans/plan-archive-system/plan-archive-system-discussion-source.md`
+//! `agent-runtime-kit:docs/plans/2026-05-26-plan-archive-system/plan-archive-system-discussion-source.md`
 //! for the surrounding contract. Sprint 1 of the Plan 1 plan
 //! (`plan-archive-nils-cli`) lands the three schema validators that the
 //! later `migrate`, `refresh`, and `query` subcommands build on.

@@ -5,7 +5,7 @@
 - Inventory source of truth: `bash scripts/workspace-bins.sh`.
 - Obligation rule for this matrix: all workspace binaries are `required` unless explicitly `excluded` as internal/example binaries.
 - Explicit exclusion: `cli-template` is `excluded` because it is an example/template CLI and is out of scope for user-facing release
-  contract migration (`docs/plans/repo-completion-standard-rollout-plan.md`).
+  contract migration (rollout plan retired; see repository history).
 - Explicit exclusion: `agent-runtime` is `excluded` because the binary has no `completion <bash|zsh>` export or generated shell assets
   yet. Its runtime-kit render / install / doctor / audit command surface is implemented; this row flips to `required` when the crate adds
   a clap-first completion subcommand and checked-in completion assets.

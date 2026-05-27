@@ -2,7 +2,7 @@
 
 `plan-archive` is the deterministic CLI surface for the plan-archive
 workflow described in
-[`agent-runtime-kit:docs/plans/plan-archive-system/`][master-design].
+[`agent-runtime-kit:docs/plans/2026-05-26-plan-archive-system/`][master-design].
 Skills in `agent-runtime-kit` (`meta:plan-archive-migrate` and
 `meta:plan-archive-query`) wrap this binary; this crate does not talk
 to provider APIs directly.
@@ -268,9 +268,9 @@ Scrub behaviour is covered by:
 
 ## Related
 
-- Master design: `agent-runtime-kit:docs/plans/plan-archive-system/plan-archive-system-discussion-source.md`
-- Plan 1: `agent-runtime-kit:docs/plans/plan-archive-nils-cli/plan-archive-nils-cli-plan.md`
-- Plan 3 (skill bodies): `agent-runtime-kit:docs/plans/plan-archive-runtime-kit/plan-archive-runtime-kit-plan.md`
+- Master design: `agent-runtime-kit:docs/plans/2026-05-26-plan-archive-system/plan-archive-system-discussion-source.md`
+- Plan 1: `agent-plan-archive:plans/github.com/graysurf/agent-runtime-kit/2026-05-27-plan-archive-nils-cli/plan-archive-nils-cli-plan.md`
+- Plan 3 (skill bodies): `agent-plan-archive:plans/github.com/graysurf/agent-runtime-kit/2026-05-27-plan-archive-runtime-kit/plan-archive-runtime-kit-plan.md`
 - Tracker: <https://github.com/sympoies/nils-cli/issues/571>
 
-[master-design]: https://github.com/graysurf/agent-runtime-kit/blob/main/docs/plans/plan-archive-system/plan-archive-system-discussion-source.md
+[master-design]: https://github.com/graysurf/agent-runtime-kit/blob/main/docs/plans/2026-05-26-plan-archive-system/plan-archive-system-discussion-source.md
