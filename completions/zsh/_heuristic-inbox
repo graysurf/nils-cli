@@ -15,8 +15,8 @@ _heuristic-inbox() {
 
     local context curcontext="$curcontext" state line
     _arguments "${_arguments_options[@]}" : \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
 '--version[Print version]' \
 ":: :_heuristic-inbox_commands" \
@@ -32,25 +32,28 @@ _heuristic-inbox() {
 _arguments "${_arguments_options[@]}" : \
 '--inbox-dir=[Inbox directory]:DIR:_files -/' \
 '--status=[Comma-separated lifecycle status filter]:STATUS:_default' \
-'--format=[Output format]:FORMAT:(text json)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
 '--include-archived[Include archived entries]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (verify)
 _arguments "${_arguments_options[@]}" : \
 '--inbox-dir=[Inbox directory used for duplicate detection]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
 '--strict[Escalate ENTRY.md/RECORD.md body redaction findings to ok=false]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 ':entry -- Case folder or ENTRY.md/RECORD.md path:_files' \
 && ret=0
 ;;
 (new)
 _arguments "${_arguments_options[@]}" : \
-'--from-skill-usage=[Path to a skill-usage record file or its containing directory]:PATH:_files' \
+'--from-skill-usage=[Scaffold from a \`skill-usage.record.v1\` envelope (file or its directory)]:PATH:_files' \
+'--from-evidence=[Scaffold from an already-redacted evidence file (reuses ingest-evidence redaction)]:PATH:_files' \
 '--slug=[Slug for the new inbox case]:SLUG:_default' \
 '--out-dir=[Output inbox directory (defaults to heuristic-system/error-inbox)]:DIR:_files -/' \
 '--title=[Optional title override]:TITLE:_default' \
@@ -59,9 +62,11 @@ _arguments "${_arguments_options[@]}" : \
 '--severity=[Severity for the new entry]:SEVERITY:(low medium high)' \
 '--next-action=[Optional Next Action override]:NEXT_ACTION:_default' \
 '--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
-'-h[Print help]' \
-'--help[Print help]' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--manual[Scaffold a manual-diagnosis skeleton with no captured raw evidence]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (set-status)
@@ -70,9 +75,10 @@ _arguments "${_arguments_options[@]}" : \
 '--link=[Optional durable link to append to Next Action]:LINK:_default' \
 '--next-action=[Optional Next Action override]:NEXT_ACTION:_default' \
 '--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
-'-h[Print help]' \
-'--help[Print help]' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 ':entry -- Case folder or ENTRY.md path:_files' \
 && ret=0
 ;;
@@ -84,12 +90,13 @@ _arguments "${_arguments_options[@]}" : \
 '--link=[Optional durable outcome link]:LINK:_default' \
 '--reason=[Optional archive reason]:REASON:_default' \
 '--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
 '-y[Archive without prompting]' \
 '--yes[Archive without prompting]' \
 '--dry-run[Report destination without moving the case folder]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 ':entry -- Case folder or ENTRY.md path:_files' \
 && ret=0
 ;;
@@ -100,10 +107,11 @@ _arguments "${_arguments_options[@]}" : \
 '--suffix=[Evidence file suffix (default\: .md)]:SUFFIX:_default' \
 '--max-bytes=[Reject sources larger than this many bytes]:MAX_BYTES:_default' \
 '--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
 '--force[Overwrite existing evidence with same label]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 ':case -- Case folder or ENTRY.md/RECORD.md path:_files' \
 && ret=0
 ;;
@@ -124,7 +132,7 @@ _heuristic-inbox_commands() {
     local commands; commands=(
 'list:List inbox entries' \
 'verify:Verify one inbox or operation-record case folder' \
-'new:Create a curated entry from a skill usage record' \
+'new:Create a curated entry from a skill-usage record, redacted evidence, or manual diagnosis' \
 'set-status:Update an inbox entry lifecycle status' \
 'archive:Move a completed inbox case folder out of the active inbox' \
 'ingest-evidence:Redact and write an evidence file inside a case folder' \

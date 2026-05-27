@@ -1459,6 +1459,143 @@ Promote after a durable fix and validation are linked.\n\n\
     }
 
     #[test]
+    fn new_from_evidence_redacts_and_passes_verify() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let evidence = tmp.path().join("diagnosis.md");
+        fs::write(
+            &evidence,
+            "# Worktree signing diagnosis\n\nRan validation under /Users/example/Project/x; signing failed.\n",
+        )
+        .expect("write evidence");
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "new",
+                "--from-evidence",
+                evidence.to_str().unwrap(),
+                "--slug",
+                "worktree-signing-gap",
+                "--out-dir",
+                inbox.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let entry = PathBuf::from(payload["data"]["path"].as_str().unwrap());
+        let folder = entry.parent().unwrap();
+        let entry_text = fs::read_to_string(&entry).unwrap();
+        assert!(entry_text.contains("- Raw record: `evidence/diagnosis.md`"));
+        let evidence_copy =
+            fs::read_to_string(folder.join("evidence").join("diagnosis.md")).unwrap();
+        assert!(
+            evidence_copy.contains("<workspace>/Project/x"),
+            "absolute home path not redacted: {evidence_copy}"
+        );
+
+        let verify = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                folder.to_str().unwrap(),
+                "--strict",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+        assert_eq!(json_stdout(&verify)["data"]["ok"], true);
+    }
+
+    #[test]
+    fn new_manual_passes_verify_with_uncaptured_pointer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "new",
+                "--manual",
+                "--slug",
+                "live-diagnosis-gap",
+                "--out-dir",
+                inbox.to_str().unwrap(),
+                "--area",
+                "cli",
+                "--severity",
+                "high",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let entry = PathBuf::from(payload["data"]["path"].as_str().unwrap());
+        let folder = entry.parent().unwrap();
+        let entry_text = fs::read_to_string(&entry).unwrap();
+        assert!(entry_text.contains("- Area: cli"));
+        assert!(entry_text.contains("- Raw record: not captured (manual diagnosis,"));
+
+        let verify = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                folder.to_str().unwrap(),
+                "--strict",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+        assert_eq!(json_stdout(&verify)["data"]["ok"], true);
+    }
+
+    #[test]
+    fn new_requires_exactly_one_source() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+
+        // No source provided.
+        let none = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "new",
+                "--slug",
+                "no-source",
+                "--out-dir",
+                inbox.to_str().unwrap(),
+            ],
+        );
+        assert_ne!(none.code, 0, "missing source should fail");
+
+        // Two sources provided.
+        let record_dir = tmp.path().join("out").join("skill-usage");
+        write_skill_usage_record(&record_dir);
+        let both = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "new",
+                "--manual",
+                "--from-skill-usage",
+                record_dir.to_str().unwrap(),
+                "--slug",
+                "two-sources",
+                "--out-dir",
+                inbox.to_str().unwrap(),
+            ],
+        );
+        assert_ne!(both.code, 0, "conflicting sources should fail");
+    }
+
+    #[test]
     fn set_status_updates_status_and_link() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let inbox = inbox_root(tmp.path());
