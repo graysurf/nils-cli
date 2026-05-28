@@ -13,6 +13,10 @@ pub mod common;
 mod completion_outside_repo;
 #[path = "integration/exit_codes.rs"]
 mod exit_codes;
+#[path = "integration/ledger_sync.rs"]
+mod ledger_sync;
+#[path = "integration/ledger_update.rs"]
+mod ledger_update;
 #[path = "integration/scaffold.rs"]
 mod scaffold;
 #[path = "integration/spec.rs"]

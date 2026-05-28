@@ -2554,6 +2554,40 @@ fn run_tracking_close_ready(
         }));
     }
 
+    // Ledger-rows-pending blocker (Task 1.3): when phase indicates the lane
+    // is ready for close or already closed, every Task Ledger row in the
+    // bundle must be done/blocked/waived. Silent-skip when bundle is absent
+    // or the file cannot be read so older run-states without a bundle field
+    // keep working.
+    if let Some(run) = run.as_ref() {
+        let phase_gates_ledger = matches!(
+            run.phase,
+            crate::tracking::run_state::RunPhase::ReadyForClose
+                | crate::tracking::run_state::RunPhase::Closed
+        );
+        if phase_gates_ledger
+            && let Some(bundle) = run.bundle.as_ref()
+            && let Some(ledger_path) = find_execution_state(bundle)
+            && let Ok(raw) = std::fs::read_to_string(&ledger_path)
+            && let Ok(rows) = plan_tooling::ledger::read_rows(&raw, &ledger_path)
+        {
+            for row in &rows {
+                if row.status == "pending" || row.status == "in-progress" {
+                    blockers.push(json!({
+                        "code": "ledger-rows-pending",
+                        "task_id": row.id,
+                        "status": row.status,
+                        "message": "ledger row still pending at phase=ready_for_close",
+                        "suggested_unblock": format!(
+                            "plan-tooling ledger-update --task '{}' --status done --evidence <evidence>",
+                            row.id
+                        ),
+                    }));
+                }
+            }
+        }
+    }
+
     // Visible completeness check (Task 6.2 deep gate).
     let mut visible_summary = json!({"checked": false});
     if args.expect_visible
@@ -2589,6 +2623,19 @@ fn run_tracking_close_ready(
         "linked_prs": linked_prs,
         "visible_completeness": visible_summary,
     }))
+}
+
+fn find_execution_state(bundle: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(bundle).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.ends_with("-execution-state.md")
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn resolve_close_ready_inputs(

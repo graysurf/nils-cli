@@ -2237,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "nils-plan-issue-cli"
-version = "0.25.6"
+version = "0.25.7"
 dependencies = [
  "chrono",
  "clap",
@@ -2254,7 +2254,7 @@ dependencies = [
 
 [[package]]
 name = "nils-plan-tooling"
-version = "0.25.6"
+version = "0.25.7"
 dependencies = [
  "anyhow",
  "clap",

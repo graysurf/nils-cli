@@ -85,6 +85,31 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(ledger-update)
+_arguments "${_arguments_options[@]}" : \
+'--execution-state=[Path to the \`<slug>-execution-state.md\` file]:path:_default' \
+'--task=[Ledger row ID to patch (exact match)]:id:_default' \
+'--status=[New row status]:status:(pending in-progress done blocked waived)' \
+'--evidence=[Evidence text to merge into the Evidence cell]:text:_default' \
+'--notes=[Optional notes value; omit to leave Notes untouched]:text:_default' \
+'--format=[Output format]:fmt:(text json)' \
+'--dry-run[Compute the patch but do not write the file]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(ledger-sync)
+_arguments "${_arguments_options[@]}" : \
+'--bundle=[Plan bundle directory containing \`*-execution-state.md\`]:dir:_default' \
+'--body-file=[Issue body markdown file]:path:_default' \
+'--comments-json=[Issue comments JSON file (\`gh issue view --json comments\`)]:path:_default' \
+'--fixture=[Fixture directory containing \`body.md\` + \`comments.json\`]:dir:_default' \
+'--format=[Output format]:fmt:(text json)' \
+'--write[Patch the ledger file (empty-cell preference rule)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (scaffold)
 _arguments "${_arguments_options[@]}" : \
 '--slug=[Plan slug used for output naming]:slug:_default' \
@@ -128,6 +153,8 @@ _plan-tooling_commands() {
 'batches:Compute dependency layers (parallel batches) for a sprint' \
 'artifact-audit:Classify durable coordination artifacts without side effects' \
 'split-prs:Build task-to-PR split records (deterministic/auto)' \
+'ledger-update:Patch one row in an execution-state \`## Task Ledger\` table' \
+'ledger-sync:Reconcile a ledger Evidence column against tracking-issue evidence' \
 'scaffold:Create a new plan from template' \
 'spec:Dump the validate catalog (class, pattern, rule, example)' \
 'completion:Export shell completion script' \
@@ -154,6 +181,16 @@ _plan-tooling__subcmd__completion_commands() {
 _plan-tooling__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling help commands' commands "$@"
+}
+(( $+functions[_plan-tooling__subcmd__ledger-sync_commands] )) ||
+_plan-tooling__subcmd__ledger-sync_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-tooling ledger-sync commands' commands "$@"
+}
+(( $+functions[_plan-tooling__subcmd__ledger-update_commands] )) ||
+_plan-tooling__subcmd__ledger-update_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-tooling ledger-update commands' commands "$@"
 }
 (( $+functions[_plan-tooling__subcmd__scaffold_commands] )) ||
 _plan-tooling__subcmd__scaffold_commands() {
