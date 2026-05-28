@@ -1,6 +1,6 @@
 [package]
 name = "nils-git-scope"
-version = "0.25.9"
+version = "0.25.10"
 edition.workspace = true
 license.workspace = true
 
@@ -14,9 +14,9 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-term = { version = "0.25.9", path = "../nils-term", package = "nils-term" }
-nils-common = { version = "0.25.9", path = "../nils-common", package = "nils-common" }
+nils-term = { version = "0.25.10", path = "../nils-term", package = "nils-term" }
+nils-common = { version = "0.25.10", path = "../nils-common", package = "nils-common" }
 tempfile = "3"
 
 [dev-dependencies]
-nils-test-support = { version = "0.25.9", path = "../nils-test-support" }
+nils-test-support = { version = "0.25.10", path = "../nils-test-support" }
