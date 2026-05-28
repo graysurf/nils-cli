@@ -127,7 +127,7 @@ with unit tests for the formatting and fallback.
 - **Dependencies**: Task 1.1
 - **Complexity**: 1
 - **Acceptance criteria**:
-  - `long_version("9.9.9")` starts with `9.9.9 (` and contains `rustc `.
+  - `long_version("9.9.9")` starts with `9.9.9 (` and contains `rustc`.
   - The consts are non-empty in a normal build.
 - **Validation**:
   - `cargo test -p nils-build-info`

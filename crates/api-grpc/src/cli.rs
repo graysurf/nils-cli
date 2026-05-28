@@ -24,6 +24,7 @@ EXIT CODES:
 #[command(
     name = "api-grpc",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "GRPC API runner (call/history/report)",
     long_about = "Run GRPC request files, inspect history, and generate Markdown reports. A bare request file is treated as the `call` subcommand.",
     after_help = ROOT_AFTER_HELP,

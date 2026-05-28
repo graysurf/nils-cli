@@ -19,6 +19,7 @@ anyhow = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+nils-build-info = { version = "0.26.1", path = "../nils-build-info" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

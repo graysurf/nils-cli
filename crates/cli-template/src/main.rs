@@ -13,6 +13,7 @@ const BINARY: &str = "cli-template";
 #[command(
     name = "cli-template",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Template CLI for nils-cli workspace"
 )]
 struct Cli {

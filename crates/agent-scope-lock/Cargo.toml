@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
+nils-build-info = { version = "0.26.1", path = "../nils-build-info" }
 nils-common = { version = "0.26.1", path = "../nils-common", package = "nils-common" }
 serde = { workspace = true }
 serde_json = { workspace = true }

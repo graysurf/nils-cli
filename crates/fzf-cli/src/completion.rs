@@ -67,6 +67,7 @@ fn query_arg() -> Arg {
 pub(crate) fn build_completion_command() -> Command {
     Command::new("fzf-cli")
         .version(env!("CARGO_PKG_VERSION"))
+        .long_version(nils_build_info::long_version(env!("CARGO_PKG_VERSION")))
         .about("Fuzzy workflow helper CLI")
         .disable_help_subcommand(true)
         .subcommand(

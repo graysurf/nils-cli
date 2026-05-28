@@ -410,6 +410,7 @@ fn display_os(value: &OsStr) -> String {
 #[command(
     name = "agent-run",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Run agent commands through a normalized project environment.",
     long_about = "Run project build, test, and validation commands through a normalized project environment, including direnv when a project env file applies.",
     disable_help_subcommand = true,

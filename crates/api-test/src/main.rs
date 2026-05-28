@@ -40,6 +40,7 @@ EXIT CODES:
 #[command(
     name = "api-test",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "API suite runner (run + summary)",
     long_about = "Run API suite manifests, write structured results, and render Markdown summaries. Bare run flags are treated as the `run` subcommand.",
     after_help = ROOT_AFTER_HELP,

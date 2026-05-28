@@ -18,7 +18,7 @@ pub mod tracking;
 
 use std::ffi::OsString;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use nils_common::cli_contract::exit;
 use serde_json::json;
 
@@ -100,8 +100,9 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
-        Ok(cli) => cli,
+    let command = Cli::command().name(binary.binary_name());
+    let matches = match command.try_get_matches_from(args) {
+        Ok(matches) => matches,
         Err(err) => {
             let code = if err.use_stderr() {
                 EXIT_USAGE
@@ -110,6 +111,13 @@ where
             };
             let _ = err.print();
             return code;
+        }
+    };
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let _ = err.print();
+            return EXIT_USAGE;
         }
     };
 

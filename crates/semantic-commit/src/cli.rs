@@ -7,6 +7,7 @@ use nils_common::cli_contract::exit;
 #[command(
     name = "semantic-commit",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Commit workflow helper with semantic commit validation",
     disable_help_subcommand = true
 )]

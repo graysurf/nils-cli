@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+nils-build-info = { version = "0.26.1", path = "../nils-build-info" }
 nils-common = { version = "0.26.1", path = "../nils-common", package = "nils-common" }
 nils-term = { version = "0.26.1", path = "../nils-term", package = "nils-term" }
 serde = { workspace = true }

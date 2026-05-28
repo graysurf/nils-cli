@@ -22,6 +22,7 @@ mod unlock;
 #[command(
     name = "git-lock",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Save and restore named Git commit locks.",
     long_about = "Save, list, copy, diff, tag, and restore named Git commit locks using a repository-local cache.",
     disable_help_subcommand = true,

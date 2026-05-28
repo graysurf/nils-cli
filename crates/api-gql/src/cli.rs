@@ -27,6 +27,7 @@ EXIT CODES:
 #[command(
     name = "api-gql",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "GraphQL runner (default subcommand: call)",
     long_about = "Run GraphQL operation files, inspect history, generate Markdown reports, and resolve schemas. A bare operation file is treated as the `call` subcommand.",
     after_help = ROOT_AFTER_HELP,

@@ -14,6 +14,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+nils-build-info = { version = "0.26.1", path = "../nils-build-info" }
 chrono = { version = "0.4", features = ["clock"] }
 nils-term = { version = "0.26.1", path = "../nils-term", package = "nils-term" }
 nils-common = { version = "0.26.1", path = "../nils-common", package = "nils-common" }

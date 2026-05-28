@@ -45,6 +45,7 @@ fn normalize_bash_completion(script: String) -> String {
 fn build_command_model() -> Command {
     Command::new("git-cli")
         .version(env!("CARGO_PKG_VERSION"))
+        .long_version(nils_build_info::long_version(env!("CARGO_PKG_VERSION")))
         .about("Git helper CLI")
         .disable_help_subcommand(true)
         .subcommand(build_utils_group())

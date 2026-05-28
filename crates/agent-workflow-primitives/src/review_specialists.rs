@@ -1422,6 +1422,7 @@ fn is_test_path(path: &str) -> bool {
 #[command(
     name = "review-specialists",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Validate, merge, render, bundle, and scope specialist review findings.",
     long_about = "Deterministic primitive for the non-judgment parts of code-review-specialists workflows. It never runs reviewers, posts provider comments, opens issues, merges PRs, or closes issues.",
     disable_help_subcommand = true,

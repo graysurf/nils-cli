@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 #[command(
     name = "web-evidence",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Capture redacted static HTTP evidence for agent workflows.",
     long_about = "Capture redacted HTTP metadata, previews, and manifests into deterministic artifact directories for workflow evidence.",
     disable_help_subcommand = true,

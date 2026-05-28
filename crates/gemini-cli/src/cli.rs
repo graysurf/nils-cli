@@ -32,6 +32,7 @@ EXIT CODES:
 #[command(
     name = "gemini-cli",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Gemini CLI for nils-cli workspace",
     long_about = "Run Gemini-oriented agent helpers, authentication helpers, diagnostics, configuration, and prompt-segment utilities.",
     after_help = ROOT_AFTER_HELP

@@ -27,7 +27,12 @@ use crate::validate::{
 const BINARY: &str = "plan-archive";
 
 #[derive(Parser)]
-#[command(name = BINARY, version, about = "Plan archive CLI for nils-cli workspace")]
+#[command(
+    name = BINARY,
+    version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
+    about = "Plan archive CLI for nils-cli workspace"
+)]
 struct Cli {
     /// Output format (defaults to text).
     #[arg(long, global = true, value_enum)]

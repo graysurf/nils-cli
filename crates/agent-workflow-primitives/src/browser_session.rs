@@ -190,6 +190,7 @@ fn missing_fields(record: &BrowserRecord) -> Vec<String> {
 #[command(
     name = "browser-session",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Record browser-session evidence for agent workflows.",
     long_about = "Record browser QA goals, steps, artifacts, and verification status in a deterministic evidence file.",
     disable_help_subcommand = true,
