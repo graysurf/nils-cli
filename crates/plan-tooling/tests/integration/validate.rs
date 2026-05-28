@@ -455,6 +455,13 @@ fn validate_explain_on_success_prints_full_catalog() {
     assert!(out.stdout.is_empty());
     // Successful validate prints zero errors but still emits the explainer.
     assert!(!out.stderr.contains("error:"));
+    // It must lead with a clear pass verdict so the catalog is not mistaken
+    // for a wall of errors (finding #21 from the plan-tracking testbed).
+    assert!(
+        out.stderr.contains("ok:") && out.stderr.contains("valid"),
+        "stderr should lead with an ok verdict, got: {}",
+        out.stderr
+    );
     assert!(out.stderr.contains("Examples:"));
     // Catalog should expose every known class on success.
     for class in [
