@@ -943,6 +943,9 @@ fn finalize_markdown(lines: Vec<String>) -> String {
 // -----------------------------------------------------------------------------
 
 /// On-wire schema identity for v2 lifecycle payloads.
+///
+/// This is the active schema identity for today's lifecycle comments, not a
+/// promise that future state payload replacements keep v2 readable forever.
 pub const PAYLOAD_SCHEMA_V2: &str = "plan-issue-record.payload.v2";
 
 /// Older fenced-code-block info-string used to mark a lifecycle payload.
@@ -1277,7 +1280,8 @@ impl std::error::Error for PayloadError {}
 ///
 /// - Returns `Ok(payload)` on a single well-formed hidden carrier or older
 ///   `plan-issue-record-payload` fence whose envelope `schema` matches
-///   [`PAYLOAD_SCHEMA_V2`].
+///   [`PAYLOAD_SCHEMA_V2`]. The older fence support is carrier-level support
+///   for current v2 records; it is not a future old-schema reader contract.
 /// - Returns `Err(NoFence)` when the comment does not contain either payload
 ///   carrier.
 /// - Returns `Err(MultipleFences)` when multiple payload carriers are present;

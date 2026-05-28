@@ -13,6 +13,12 @@ performs strict provider-verified closeout. See
 and [plan-issue state machine v2](specs/plan-issue-state-machine-v2.md)
 for the normative spec.
 
+For the next state payload replacement, the active contract is new-format-only:
+the new accumulative state task-ledger payload replaces the old v2/current-only
+state semantics. `record audit`, `record repair-dashboard`, `tracking status`,
+and `tracking close-ready` do not promise a long-term old-payload reader or
+mixed old/new reconciliation path.
+
 The prior `start-plan` / `start-sprint` Task Decomposition runtime is
 retained for existing dispatch flows that have not migrated yet. Its
 state machine, gate invariants, and runtime-truth row model live in the

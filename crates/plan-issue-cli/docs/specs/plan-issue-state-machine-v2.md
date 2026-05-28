@@ -32,6 +32,11 @@
   `plan-issue-record:v2` marker family.
 - Lifecycle role evidence: parsed structured payloads, indexed by role with
   the latest comment timestamp winning.
+- Active payload contract: the state machine consumes the current lifecycle
+  payload schema only. The next state payload replacement is allowed to replace
+  old v2/current-only state semantics without a permanent v2 reader or mixed
+  old/new reconciliation rule. Existing issues that need preservation should
+  use one-off migration/repair or a new tracking issue before closeout.
 
 ## Plan Record States
 

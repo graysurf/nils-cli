@@ -10,7 +10,9 @@ model; `plan-issue-cli` materializes runtime `Owner/Branch/Worktree/Notes` metad
 
 For issue-backed tracking and dispatch workflows whose provider issue body is a mutable dashboard, use `plan-issue record ...`. The record
 surface opens provider issues, posts append-only lifecycle comments, audits lifecycle markers, repairs dashboards, and closes records through
-the strict lifecycle gate.
+the strict lifecycle gate. Future state payload replacements are new-format-only: the active audit, dashboard repair, tracking status, and
+close-ready paths target the current payload contract, with old provider issues handled by one-off migration/repair rather than permanent
+old-format readers.
 
 The crate ships two binaries with the same command surface:
 
