@@ -1,4 +1,5 @@
 nils-test-support
+nils-build-info
 nils-common
 nils-agent-docs
 nils-agent-out
@@ -8,6 +9,7 @@ nils-markdown
 nils-web-evidence
 nils-agent-workflow-primitives
 nils-git-cli
+nils-forge-cli
 nils-memo-cli
 nils-screen-record
 nils-api-testing-core
