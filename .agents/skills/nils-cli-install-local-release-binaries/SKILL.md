@@ -22,7 +22,9 @@ Inputs:
 
 Outputs:
 
-- Builds the workspace in release mode (unless `--skip-build`).
+- Builds the selected binaries in release mode (unless `--skip-build`) using
+  explicit `cargo build --release --bin <name>` arguments for the same bin list
+  that will be installed.
 - Installs selected binaries into the destination directory.
   - Default binaries: all workspace `bin` targets (auto-discovered via `scripts/workspace-bins.sh`)
 

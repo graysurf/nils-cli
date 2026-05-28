@@ -6,13 +6,15 @@ usage() {
 Usage:
   install-local-release-binaries.sh [--help] [--prefix PATH] [--bin NAME]... [--skip-build]
 
-Builds the Rust workspace in release mode and installs the binaries into a local
-directory (default: ~/.local/nils-cli/bin).
+Builds selected Rust binaries in release mode and installs them into a local
+directory (default: ~/.local/nils-cli/bin). The build command uses the same
+binary list that will be installed, so stale target/release binaries are not
+copied from prior builds.
 
 Options:
   --prefix PATH   Destination directory (default: ~/.local/nils-cli/bin)
   --bin NAME      Install only a specific binary (repeatable)
-  --skip-build    Skip `cargo build --release --workspace` and only install from target/
+  --skip-build    Skip `cargo build --release --bin <name> ...` and only install from target/
   -h, --help      Show help
 
 Default binaries:
@@ -115,7 +117,11 @@ run() {
 }
 
 if [[ "$skip_build" -eq 0 ]]; then
-  run cargo build --release --workspace
+  build_cmd=(cargo build --release)
+  for bin in "${bins[@]}"; do
+    build_cmd+=(--bin "$bin")
+  done
+  run "${build_cmd[@]}"
 fi
 
 run mkdir -p "$prefix"
@@ -124,7 +130,7 @@ for bin in "${bins[@]}"; do
   src="$repo_root/target/release/$bin"
   if [[ ! -x "$src" ]]; then
     echo "error: release binary not found or not executable: $src" >&2
-    echo "hint: run: cargo build --release --workspace" >&2
+    echo "hint: run: cargo build --release --bin $bin" >&2
     exit 1
   fi
   run install -m 0755 "$src" "$prefix/"
