@@ -406,6 +406,55 @@ PY
   die "timed out after ${max_seconds}s waiting for ${workflow} on ${repo} for ${head_ref}"
 }
 
+assert_release_assets_available() {
+  local repo="$1"
+  local version="$2"
+  local tag="v${version}"
+
+  command -v gh >/dev/null 2>&1 || die "gh is required to inspect release assets"
+
+  local release_json
+  release_json="$(gh -R "$repo" release view "$tag" --json assets,url 2>/dev/null)" \
+    || die "GitHub Release ${repo} ${tag} is not available"
+
+  local release_url
+  release_url="$(
+    python3 - "$version" "$release_json" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+version = sys.argv[1]
+release = json.loads(sys.argv[2])
+asset_names = {asset.get("name") for asset in release.get("assets", [])}
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
+required = {
+    f"nils-cli-v{version}-{target}.tar.gz"
+    for target in targets
+} | {
+    f"nils-cli-v{version}-{target}.tar.gz.sha256"
+    for target in targets
+}
+missing = sorted(required - asset_names)
+if missing:
+    print("error:missing release assets: " + ", ".join(missing))
+    raise SystemExit(2)
+print("ok:" + (release.get("url") or ""))
+PY
+  )" || die "${release_url#error:}"
+
+  if [[ "$release_url" != ok:* ]]; then
+    die "unexpected release asset inspection result"
+  fi
+  note "GitHub Release assets are available: ${release_url#ok:}"
+}
+
 resolve_tap_repo_slug() {
   local explicit="$1"
   local repo="${explicit:-${NILS_CLI_HOMEBREW_TAP_REPO:-sympoies/homebrew-tap}}"
@@ -669,8 +718,8 @@ run_tap_stage() {
     || die "tap main is not fast-forward to origin/main; resolve manually"
 
   # 1) Wait for source release.yml so artifacts are guaranteed available.
-  note "waiting for ${source_repo_slug} release.yml on tag ${tag}"
-  wait_for_release_run "$source_repo_slug" "release.yml" "$tag" "${NILS_CLI_RELEASE_WAIT_SECONDS:-1200}"
+  note "checking ${source_repo_slug} GitHub Release assets for ${tag}"
+  assert_release_assets_available "$source_repo_slug" "$version"
 
   # 2) Parse artifact origin from existing formula (no hardcoded owner/repo).
   local artifact_origin
@@ -1021,8 +1070,8 @@ if [[ "$from_tap" -eq 1 ]]; then
     die "--from-tap could not determine source repo slug from origin remote"
   fi
 
-  note "waiting for ${source_repo_slug} release.yml on tag ${tag}"
-  wait_for_release_run "$source_repo_slug" "release.yml" "$tag" "${NILS_CLI_RELEASE_WAIT_SECONDS:-1200}"
+  note "checking ${source_repo_slug} GitHub Release assets for ${tag}"
+  assert_release_assets_available "$source_repo_slug" "$version"
 
   tap_repo_slug="$(resolve_tap_repo_slug "$tap_repo_arg")"
   if [[ "$skip_tap_wait" -eq 0 ]]; then

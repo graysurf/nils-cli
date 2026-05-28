@@ -64,8 +64,8 @@ Inputs:
   - `--skip-tap` (skip the tap stage entirely)
   - `--skip-tap-wait` (do not wait for the tap formula-update workflow)
   - `--skip-tap-tag` (legacy local-tap option; not used by the dispatch-based default path)
-  - `--from-tap` (resume mode: skip nils-cli stages 1-8 and wait for the tap stage; requires
-    an existing local `v<version>` tag in the nils-cli work tree)
+  - `--from-tap` (resume mode: skip nils-cli stages 1-8, verify release assets already exist,
+    and wait for the tap stage; requires an existing local `v<version>` tag in the nils-cli work tree)
   - `--tap-formula <name>` (formula basename, default `nils-cli`; reserved for AWL et al.)
   - `--skip-dev-clean` (do not clear `~/.local/nils-cli/bin` after a successful release)
   - `--skip-local-brew-upgrade` (do not run `brew update` + `brew upgrade/install <formula>` after a successful tap update)
@@ -192,7 +192,8 @@ Failure modes:
 - Validate inputs and environment.
 - Probe `RUSTC_WRAPPER` and disable it when it is incompatible with the active `rustc`.
 - Resolve delivery mode (PR by default; `--direct-push` or `--skip-push` switches to legacy).
-- `--from-tap` shortcut: skip nils-cli bump+tag and wait for the tap stage for an existing tag.
+- `--from-tap` shortcut: skip nils-cli bump+tag, verify the GitHub Release assets exist,
+  and wait for the tap stage for an existing tag.
 - nils-cli stage:
   - Optional pre-bump strict gate: `--ci-gate-main` requires the prior `origin/main` commit's `ci.yml` to be green (otherwise dies).
   - PR mode: switch from `main` to a freshly created `chore/release-X-Y-Z` branch
