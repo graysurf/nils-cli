@@ -59,6 +59,8 @@ mod tracking_checkpoint_live;
 mod tracking_checkpoint_refusals;
 #[path = "integration/tracking_close_ready.rs"]
 mod tracking_close_ready;
+#[path = "integration/tracking_close_ready_ledger_blocker.rs"]
+mod tracking_close_ready_ledger_blocker;
 #[path = "integration/tracking_events.rs"]
 mod tracking_events;
 #[path = "integration/tracking_fsm.rs"]
