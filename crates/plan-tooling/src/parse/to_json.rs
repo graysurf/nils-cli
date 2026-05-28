@@ -77,7 +77,7 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     };
 
-    let repo_root = crate::repo_root::detect();
+    let repo_root = crate::repo_root::detect_from(Path::new(&file_arg));
     let display_path = file_arg.clone();
     let read_path = resolve_repo_relative(&repo_root, Path::new(&file_arg));
 

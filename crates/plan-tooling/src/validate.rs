@@ -119,7 +119,12 @@ pub fn run(args: &[String]) -> i32 {
         return die(&format!("invalid --format (expected text|json): {format}"));
     }
 
-    let repo_root = crate::repo_root::detect();
+    let repo_root = files
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_absolute())
+        .map(crate::repo_root::detect_from)
+        .unwrap_or_else(crate::repo_root::detect);
 
     let discovered = if files.is_empty() {
         discover_default_plan_files(&repo_root)
