@@ -149,6 +149,10 @@ pub fn run(args: &[String]) -> i32 {
             return print_json_output(output, 0);
         }
         if explain {
+            eprintln!(
+                "ok: no plan files discovered; nothing to validate. Showing \
+                 the full accepted-shape catalog for reference."
+            );
             print_explanations_text(&ExplainResult {
                 matched: all_explanations(),
                 uncatalogued: Vec::new(),
@@ -221,6 +225,11 @@ pub fn run(args: &[String]) -> i32 {
 
     if errors.is_empty() {
         if explain {
+            let n = discovered_for_output.len();
+            eprintln!(
+                "ok: {n} plan file(s) valid; 0 errors. No triggered classes to \
+                 explain — showing the full accepted-shape catalog for reference."
+            );
             print_explanations_text(&ExplainResult {
                 matched: all_explanations(),
                 uncatalogued: Vec::new(),

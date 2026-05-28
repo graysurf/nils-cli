@@ -2010,6 +2010,21 @@ fn run_tracking_checkpoint(
                     "role": spec.marker_role,
                     "reason": reason,
                 }));
+                // A `review` role explicitly named in --post but with no
+                // decision in run state is a caller error: a review checkpoint
+                // with no decision carries no delivery evidence. Surface it as a
+                // blocker (code matches the visible-completeness lint) instead
+                // of a silent skip, so `--post state,review` does not report a
+                // misleading state-only partial success. session/validation can
+                // legitimately be empty and keep the skip-empty behavior.
+                if matches!(*role, crate::lifecycle_record::PayloadRole::Review) {
+                    blocked.push(json!({
+                        "code": "review-missing-decision",
+                        "role": spec.marker_role,
+                        "message": "review role requested but run state has no review decision",
+                        "suggested_unblock": "record a decision with `plan-issue tracking run update --review-decision <approve|request-changes|...>` before this checkpoint",
+                    }));
+                }
             }
             CheckpointRoleResult::Rendered(body) => {
                 let hints = checkpoint_lint_hints(*role, &run);
