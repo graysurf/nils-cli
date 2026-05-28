@@ -226,8 +226,15 @@ pub struct TrackingCheckpointArgs {
 
     /// Opt into live mutation. Without this flag, `tracking checkpoint`
     /// renders the planned comments but never mutates the provider issue.
-    /// Live posting lands in Task 6.1; until then the controller returns a
-    /// `tracking-checkpoint-live-not-implemented` blocked code.
+    /// With `--live`, the controller posts one lifecycle comment per role
+    /// listed in `--post` (one comment per role, mirroring `record post`
+    /// semantics), preserving declaration order. On the first per-role
+    /// failure it stops and returns the already-posted URLs alongside a
+    /// `tracking-checkpoint-live-post-failed` blocker so the caller can
+    /// decide whether to retry. Combine with `--repair-dashboard` to
+    /// refresh the issue body after all roles post successfully (skipped
+    /// on partial failure). Combine with `--fixture <dir>` to exercise
+    /// the post path deterministically without provider mutation.
     #[arg(long = "live", default_value_t = false)]
     pub live: bool,
 

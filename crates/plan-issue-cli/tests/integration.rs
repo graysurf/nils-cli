@@ -53,6 +53,8 @@ mod start_sprint_canonical;
 mod task_spec_flow;
 #[path = "integration/tracking_checkpoint_dry_run.rs"]
 mod tracking_checkpoint_dry_run;
+#[path = "integration/tracking_checkpoint_live.rs"]
+mod tracking_checkpoint_live;
 #[path = "integration/tracking_checkpoint_refusals.rs"]
 mod tracking_checkpoint_refusals;
 #[path = "integration/tracking_close_ready.rs"]
