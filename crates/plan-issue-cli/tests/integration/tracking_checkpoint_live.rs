@@ -137,7 +137,7 @@ fn tracking_checkpoint_live_fixture_returns_posted_state_role_with_synthesized_u
 
     let result = json_stdout(&out)["payload"]["result"].clone();
     assert_eq!(result["mode"], "fixture");
-    // The deprecated refusal code must not surface on the live path.
+    // The retired refusal code must not surface on the live path.
     let blocked_codes: Vec<&str> = result["blocked"]
         .as_array()
         .unwrap()
