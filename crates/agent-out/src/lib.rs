@@ -382,16 +382,8 @@ fn git_origin_url(repo: &Path) -> Option<String> {
 }
 
 pub fn project_slug_from_remote_url(remote: &str) -> Option<String> {
-    let trimmed = remote.trim().trim_end_matches(".git");
-    let path = if let Some((_, after_scheme)) = trimmed.split_once("://") {
-        after_scheme.split_once('/').map(|(_, rest)| rest)?
-    } else if let Some((_, scp_path)) = trimmed.split_once(':') {
-        scp_path
-    } else {
-        trimmed
-    };
-
-    project_slug_from_owner_repo(path)
+    let parsed = nils_common::git::parse_git_remote_url(remote)?;
+    project_slug_from_owner_repo(&parsed.path)
 }
 
 pub fn project_slug_from_owner_repo(value: &str) -> Option<String> {

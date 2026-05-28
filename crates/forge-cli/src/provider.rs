@@ -149,50 +149,12 @@ pub fn classify_host(host: &str) -> Option<Provider> {
     None
 }
 
-/// Parse the host out of a remote URL. Supports:
-/// - `https://[userinfo@]<host>/<owner>/<repo>(.git)?`
-/// - `ssh://[user@]<host>(:port)?/<owner>/<repo>(.git)?`
-/// - `git@<host>:<owner>/<repo>(.git)?`
+/// Parse the host out of a remote URL. Delegates to
+/// [`nils_common::git::parse_git_remote_url`] so the supported shapes match the
+/// rest of the workspace (https/http with optional userinfo+port, ssh with
+/// optional userinfo+port, SCP-style `user@host:path`).
 pub fn parse_host(url: &str) -> Option<String> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(rest) = trimmed.strip_prefix("https://") {
-        return host_before_path(rest)
-            .map(|host| nils_common::git::strip_userinfo(&host).to_string())
-            .filter(|host| !host.is_empty());
-    }
-    if let Some(rest) = trimmed.strip_prefix("ssh://") {
-        // ssh://[user@]host[:port]/owner/repo
-        let after_user = nils_common::git::strip_userinfo(rest);
-        return host_before_path(after_user)
-            .map(strip_port)
-            .filter(|host| !host.is_empty());
-    }
-    if let Some((user_host, _)) = trimmed.split_once(':')
-        && let Some((_, host)) = user_host.rsplit_once('@')
-        && !host.is_empty()
-    {
-        return Some(host.to_string());
-    }
-    None
-}
-
-fn host_before_path(s: &str) -> Option<String> {
-    let host = s.split('/').next()?.trim();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
-}
-
-fn strip_port(host: String) -> String {
-    match host.split_once(':') {
-        Some((h, _)) => h.to_string(),
-        None => host,
-    }
+    nils_common::git::parse_git_remote_url(url).map(|remote| remote.host)
 }
 
 /// Default `git remote get-url` lookup used in production. Returns `None`
