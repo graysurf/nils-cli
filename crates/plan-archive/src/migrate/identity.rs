@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use nils_common::git as gitio;
+use nils_common::git::{self as gitio, strip_userinfo};
 
 /// Source-repo identity captured at migration time.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -91,21 +91,19 @@ pub fn parse_remote_url(url: &str) -> Option<(String, String, String)> {
         let (host, path) = rest.split_once(':')?;
         (host.to_string(), path.to_string())
     } else if let Some(rest) = url.strip_prefix("ssh://") {
-        let rest = rest.strip_prefix("git@").unwrap_or(rest);
         let (host_port, path) = rest.split_once('/')?;
+        let host_port = strip_userinfo(host_port);
         let host = host_port
             .split_once(':')
             .map(|(h, _)| h)
             .unwrap_or(host_port);
         (host.to_string(), path.to_string())
     } else if let Some(rest) = url.strip_prefix("https://") {
-        let rest = strip_credentials_prefix(rest);
         let (host, path) = rest.split_once('/')?;
-        (host.to_string(), path.to_string())
+        (strip_userinfo(host).to_string(), path.to_string())
     } else if let Some(rest) = url.strip_prefix("http://") {
-        let rest = strip_credentials_prefix(rest);
         let (host, path) = rest.split_once('/')?;
-        (host.to_string(), path.to_string())
+        (strip_userinfo(host).to_string(), path.to_string())
     } else {
         return None;
     };
@@ -124,16 +122,6 @@ pub fn parse_remote_url(url: &str) -> Option<(String, String, String)> {
         return None;
     }
     Some((host, org_or_group_path, repo))
-}
-
-fn strip_credentials_prefix(s: &str) -> &str {
-    if let Some(idx) = s.find('@')
-        && let Some(slash_idx) = s.find('/')
-        && idx < slash_idx
-    {
-        return &s[idx + 1..];
-    }
-    s
 }
 
 #[cfg(test)]
@@ -208,5 +196,23 @@ mod tests {
     fn parses_https_with_basic_auth_credentials() {
         let r = parse_remote_url("https://user:pass@github.com/org/repo.git").unwrap();
         assert_eq!(r, ("github.com".into(), "org".into(), "repo".into()));
+    }
+
+    #[test]
+    fn parses_ssh_with_non_git_user() {
+        let r = parse_remote_url("ssh://deploy@gitlab.example.com/group/proj.git").unwrap();
+        assert_eq!(
+            r,
+            ("gitlab.example.com".into(), "group".into(), "proj".into())
+        );
+    }
+
+    #[test]
+    fn parses_ssh_with_userinfo_and_port() {
+        let r = parse_remote_url("ssh://deploy@gitlab.example.com:2222/group/proj.git").unwrap();
+        assert_eq!(
+            r,
+            ("gitlab.example.com".into(), "group".into(), "proj".into())
+        );
     }
 }
