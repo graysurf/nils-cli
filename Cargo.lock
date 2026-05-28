@@ -2015,6 +2015,7 @@ dependencies = [
 name = "nils-common"
 version = "0.26.0"
 dependencies = [
+ "anyhow",
  "base64",
  "clap",
  "nils-test-support",
