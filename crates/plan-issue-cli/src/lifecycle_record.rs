@@ -3258,4 +3258,127 @@ mod sprint3_tests {
         assert_eq!(required_check_label(None, None), "unknown");
         assert_eq!(required_check_label(None, Some(0)), "unknown");
     }
+
+    // Snapshot tests below lock the full byte-for-byte wire shape of
+    // `render_record_post_comment` for each lifecycle kind. The existing
+    // `contains` assertions cover individual fields; these goldens guard
+    // against silent template/serializer drift that re-orders lines, drops
+    // sections, or grows a new field downstream consumers don't expect.
+
+    fn golden_dump(label: &str, body: &str) {
+        if std::env::var("LIFECYCLE_RECORD_GOLDEN_DUMP").is_ok() {
+            eprintln!("--- BEGIN {label} ---\n{body}\n--- END {label} ---");
+        }
+    }
+
+    #[test]
+    fn golden_state_post_comment_locks_full_wire_shape() {
+        let body = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::State,
+            json!({
+                "status": "complete",
+                "target_scope": "PR #599 follow-ups",
+                "current": "delivering snapshot tests",
+                "next_action": "open closeout comment",
+                "tasks": [
+                    {"id": "1.1", "status": "done", "title": "ship URL parser"},
+                    {"id": "1.2", "status": "in-progress", "title": "ship snapshots"},
+                ],
+                "prs": [{"ref": "owner/repo#1", "url": "https://example.test/pr/1", "status": "merged"}],
+                "blockers": [],
+                "links": {},
+            }),
+            None,
+            Some("2026-05-23T08:42:11Z"),
+        )
+        .expect("state render");
+        golden_dump("state", &body);
+        assert_eq!(
+            body,
+            include_str!("snapshots/state_post_comment.md"),
+            "state post-comment shape drifted; run with LIFECYCLE_RECORD_GOLDEN_DUMP=1 to dump"
+        );
+    }
+
+    #[test]
+    fn golden_validation_post_comment_locks_full_wire_shape() {
+        let body = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Validation,
+            json!({
+                "overall": "pass",
+                "commands": [
+                    {"command": "cargo test --workspace", "status": "pass", "evidence": "all green"},
+                    {"command": "scripts/ci/local-fast.sh", "status": "pass", "evidence": "ok"},
+                ],
+                "waivers": [],
+            }),
+            None,
+            Some("2026-05-23T08:42:11Z"),
+        )
+        .expect("validation render");
+        golden_dump("validation", &body);
+        assert_eq!(
+            body,
+            include_str!("snapshots/validation_post_comment.md"),
+            "validation post-comment shape drifted"
+        );
+    }
+
+    #[test]
+    fn golden_review_post_comment_locks_full_wire_shape() {
+        let body = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Review,
+            json!({
+                "decision": "approve",
+                "lenses": ["testing", "maintainability"],
+                "findings": [
+                    {"id": "F1", "severity": "minor", "disposition": "fixed", "summary": "covered"},
+                ],
+                "outcome_comment_url": "https://example.test/review",
+            }),
+            None,
+            Some("2026-05-23T08:42:11Z"),
+        )
+        .expect("review render");
+        golden_dump("review", &body);
+        assert_eq!(
+            body,
+            include_str!("snapshots/review_post_comment.md"),
+            "review post-comment shape drifted"
+        );
+    }
+
+    #[test]
+    fn golden_closeout_post_comment_locks_full_wire_shape() {
+        let body = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Closeout,
+            json!({
+                "final_status": "complete",
+                "approval": {"comment_url": "https://example.test/approval"},
+                "linked_prs": [{
+                    "ref": "owner/repo#1",
+                    "url": "https://example.test/pr/1",
+                    "merge_sha": "abc1234",
+                    "checks": "pass",
+                    "required_state": "pass",
+                    "required_count": 2,
+                    "non_required_failures": []
+                }],
+                "notes": "shipped"
+            }),
+            Some("Closeout summary."),
+            Some("2026-05-23T08:42:11Z"),
+        )
+        .expect("closeout render");
+        golden_dump("closeout", &body);
+        assert_eq!(
+            body,
+            include_str!("snapshots/closeout_post_comment.md"),
+            "closeout post-comment shape drifted"
+        );
+    }
 }
