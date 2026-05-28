@@ -20,7 +20,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 nils-build-info = { version = "0.27.0", path = "../nils-build-info" }
-serde = { workspace = true }
 serde_json = { workspace = true }
 nils-common = { version = "0.27.0", path = "../nils-common", package = "nils-common" }
 

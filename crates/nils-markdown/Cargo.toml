@@ -25,7 +25,6 @@ test-support = ["dep:pretty_assertions"]
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 clap_complete = { workspace = true, optional = true }
-indexmap = { workspace = true }
 nils-build-info = { version = "0.27.0", path = "../nils-build-info", optional = true }
 nils-common = { version = "0.27.0", path = "../nils-common", package = "nils-common" }
 pretty_assertions = { workspace = true, optional = true }

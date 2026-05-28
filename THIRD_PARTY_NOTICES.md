@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `f2ff71744a9211047cb477a816ae7f69e22e4d240019dd36124d494035756c77`
-- Third-party crates (`source != null`): 465
+- Cargo.lock SHA256: `a543ccac75c0e6ccb305a82273546495b5cfc18a8ce6d03ceae6b0ec37794c78`
+- Third-party crates (`source != null`): 460
 
 ## Notice Extraction Policy
 
@@ -660,24 +660,6 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
 
 ### digest 0.11.3
-
-- License: `MIT OR Apache-2.0`
-- Source: `crates.io`
-- Notice files: No explicit NOTICE file discovered.
-- License file references:
-  - `LICENSE-APACHE`
-  - `LICENSE-MIT`
-
-### directories 6.0.0
-
-- License: `MIT OR Apache-2.0`
-- Source: `crates.io`
-- Notice files: No explicit NOTICE file discovered.
-- License file references:
-  - `LICENSE-APACHE`
-  - `LICENSE-MIT`
-
-### dirs-sys 0.5.0
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -1526,14 +1508,6 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE.txt`
 
-### libredox 0.1.17
-
-- License: `MIT`
-- Source: `crates.io`
-- Notice files: No explicit NOTICE file discovered.
-- License file references:
-  - `LICENSE`
-
 ### libsqlite3-sys 0.38.0
 
 - License: `MIT`
@@ -1879,16 +1853,6 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
-
-### option-ext 0.2.0
-
-- License: `MPL-2.0`
-- Source: `crates.io`
-- Source URL: <https://crates.io/crates/option-ext/0.2.0>
-- License text (MPL-2.0): <https://mozilla.org/MPL/2.0/>
-- Notice files: No explicit NOTICE file discovered.
-- License file references:
-  - `LICENSE.txt`
 
 ### ordered-stream 0.2.0
 
@@ -2273,14 +2237,6 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
-
-### redox_users 0.5.2
-
-- License: `MIT`
-- Source: `crates.io`
-- Notice files: No explicit NOTICE file discovered.
-- License file references:
-  - `LICENSE`
 
 ### regex 1.12.3
 

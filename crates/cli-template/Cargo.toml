@@ -11,7 +11,6 @@ repository = "https://github.com/sympoies/nils-cli"
 name = "cli-template"
 path = "src/main.rs"
 [dependencies]
-anyhow = { workspace = true }
 clap = { workspace = true }
 nils-build-info = { version = "0.27.0", path = "../nils-build-info" }
 nils-common = { version = "0.27.0", path = "../nils-common", package = "nils-common" }
