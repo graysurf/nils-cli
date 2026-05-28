@@ -2557,7 +2557,8 @@ fn run_tracking_close_ready(
     // Ledger-rows-pending blocker (Task 1.3): when phase indicates the lane
     // is ready for close or already closed, every Task Ledger row in the
     // bundle must be done/blocked/waived. Silent-skip when bundle is absent
-    // or the file cannot be read so legacy run-states keep working.
+    // or the file cannot be read so older run-states without a bundle field
+    // keep working.
     if let Some(run) = run.as_ref() {
         let phase_gates_ledger = matches!(
             run.phase,

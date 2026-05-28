@@ -252,6 +252,100 @@ fn build_completion_command() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("ledger-update")
+                .about("Patch one row in an execution-state `## Task Ledger` table")
+                .arg(
+                    Arg::new("execution-state")
+                        .long("execution-state")
+                        .help("Path to the `<slug>-execution-state.md` file")
+                        .value_name("path")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("task")
+                        .long("task")
+                        .help("Ledger row ID to patch (exact match)")
+                        .value_name("id")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("status")
+                        .long("status")
+                        .help("New row status")
+                        .value_name("status")
+                        .value_parser(["pending", "in-progress", "done", "blocked", "waived"])
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("evidence")
+                        .long("evidence")
+                        .help("Evidence text to merge into the Evidence cell")
+                        .value_name("text")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("notes")
+                        .long("notes")
+                        .help("Optional notes value; omit to leave Notes untouched")
+                        .value_name("text"),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .help("Compute the patch but do not write the file")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .help("Output format")
+                        .value_name("fmt")
+                        .value_parser(["text", "json"]),
+                ),
+        )
+        .subcommand(
+            Command::new("ledger-sync")
+                .about("Reconcile a ledger Evidence column against tracking-issue evidence")
+                .arg(
+                    Arg::new("bundle")
+                        .long("bundle")
+                        .help("Plan bundle directory containing `*-execution-state.md`")
+                        .value_name("dir")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("body-file")
+                        .long("body-file")
+                        .help("Issue body markdown file")
+                        .value_name("path"),
+                )
+                .arg(
+                    Arg::new("comments-json")
+                        .long("comments-json")
+                        .help("Issue comments JSON file (`gh issue view --json comments`)")
+                        .value_name("path"),
+                )
+                .arg(
+                    Arg::new("fixture")
+                        .long("fixture")
+                        .help("Fixture directory containing `body.md` + `comments.json`")
+                        .value_name("dir"),
+                )
+                .arg(
+                    Arg::new("write")
+                        .long("write")
+                        .help("Patch the ledger file (empty-cell preference rule)")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .help("Output format")
+                        .value_name("fmt")
+                        .value_parser(["text", "json"]),
+                ),
+        )
+        .subcommand(
             Command::new("scaffold")
                 .about("Create a new plan from template")
                 .arg(
