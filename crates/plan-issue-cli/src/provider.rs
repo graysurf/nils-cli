@@ -159,16 +159,18 @@ fn parse_repo_with_host(raw: &str) -> Option<Repo> {
         return finalize_with_host(host, path);
     }
 
-    // Strip URL scheme + optional `git@` prefix from `ssh://` form, leaving
-    // `<host>/<path>`.
+    // Strip URL scheme from `https://` / `http://` / `ssh://` form, leaving
+    // `[userinfo@]<host>/<path>`. Any userinfo is dropped below via
+    // `strip_userinfo`.
     let host_and_path = trimmed
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
-        .or_else(|| trimmed.strip_prefix("ssh://git@"))
+        .or_else(|| trimmed.strip_prefix("ssh://"))
         .map(|rest| rest.trim_start_matches('/'))
         .unwrap_or(trimmed);
 
     let (host, path) = host_and_path.split_once('/')?;
+    let host = common_git::strip_userinfo(host);
     if !host.contains('.') {
         // Bare `owner/repo` without a host segment.
         return None;
@@ -275,10 +277,11 @@ fn parse_remote_url(remote: &str) -> Option<(String, String, Provider)> {
         return finalize_remote(host, path);
     }
 
-    // ssh://git@host/owner/repo(.git)
-    if let Some(rest) = trimmed.strip_prefix("ssh://git@")
+    // ssh://[userinfo@]host/owner/repo(.git)
+    if let Some(rest) = trimmed.strip_prefix("ssh://")
         && let Some((host, path)) = rest.split_once('/')
     {
+        let host = common_git::strip_userinfo(host);
         return finalize_remote(host, path);
     }
 
@@ -287,6 +290,7 @@ fn parse_remote_url(remote: &str) -> Option<(String, String, Provider)> {
         if let Some(rest) = trimmed.strip_prefix(prefix)
             && let Some((host, path)) = rest.split_once('/')
         {
+            let host = common_git::strip_userinfo(host);
             return finalize_remote(host, path);
         }
     }
@@ -375,6 +379,57 @@ mod tests {
             assert_eq!(h, host);
             assert_eq!(p, provider);
         }
+    }
+
+    #[test]
+    fn parse_remote_url_strips_basic_auth_userinfo() {
+        let cases = [
+            (
+                "https://user:pass@github.com/sympoies/nils-cli.git",
+                "sympoies/nils-cli",
+                "github.com",
+                Provider::GitHub,
+            ),
+            (
+                "https://x-access-token:TOKEN@gitlab.com/group/proj.git",
+                "group/proj",
+                "gitlab.com",
+                Provider::GitLab,
+            ),
+        ];
+        for (remote, slug, host, provider) in cases {
+            let (s, h, p) = parse_remote_url(remote).unwrap_or_else(|| panic!("parse {remote}"));
+            assert_eq!(s, slug);
+            assert_eq!(h, host);
+            assert_eq!(p, provider);
+        }
+    }
+
+    #[test]
+    fn parse_repo_with_host_strips_basic_auth_userinfo() {
+        let repo =
+            parse_repo_with_host("https://user:pass@github.com/sympoies/nils-cli").expect("parse");
+        assert_eq!(repo.provider, Provider::GitHub);
+        assert_eq!(repo.slug, "sympoies/nils-cli");
+        assert_eq!(repo.host.as_deref(), Some("github.com"));
+    }
+
+    #[test]
+    fn parse_remote_url_strips_userinfo_from_ssh_scheme() {
+        let (slug, host, provider) =
+            parse_remote_url("ssh://deploy@gitlab.example.com/group/proj.git").expect("parse");
+        assert_eq!(slug, "group/proj");
+        assert_eq!(host, "gitlab.example.com");
+        assert_eq!(provider, Provider::GitLab);
+    }
+
+    #[test]
+    fn parse_repo_with_host_strips_userinfo_from_ssh_scheme() {
+        let repo =
+            parse_repo_with_host("ssh://deploy@gitlab.example.com/group/proj").expect("parse");
+        assert_eq!(repo.provider, Provider::GitLab);
+        assert_eq!(repo.slug, "group/proj");
+        assert_eq!(repo.host.as_deref(), Some("gitlab.example.com"));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use nils_common::git::strip_userinfo;
 use nils_common::process;
 use std::io::{self, Write};
 use std::process::Output;
@@ -903,10 +904,6 @@ fn host_from_url(url: &str) -> String {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase()
-}
-
-fn strip_userinfo(host: &str) -> &str {
-    host.rsplit_once('@').map(|(_, tail)| tail).unwrap_or(host)
 }
 
 fn percent_encode(value: &str, keep_slash: bool) -> String {
