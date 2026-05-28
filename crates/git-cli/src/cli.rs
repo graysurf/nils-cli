@@ -9,6 +9,7 @@ use crate::{branch, ci, commit, completion, open, reset, utils};
 #[command(
     name = "git-cli",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Git helper CLI",
     disable_help_subcommand = true,
     override_usage = "git-cli <group> <command> [args]"

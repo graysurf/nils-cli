@@ -61,6 +61,7 @@ fn normalize_bash_completion(script: String) -> String {
 fn build_completion_command() -> Command {
     Command::new("git-summary")
         .version(env!("CARGO_PKG_VERSION"))
+        .long_version(nils_build_info::long_version(env!("CARGO_PKG_VERSION")))
         .about("Git history summary CLI")
         .disable_help_subcommand(true)
         .arg(

@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 #[command(
     name = "agent-scope-lock",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Create and validate deterministic agent edit-scope locks.",
     long_about = "Create, read, validate, and clear repository edit-scope locks so agent changes stay within declared path prefixes.",
     disable_help_subcommand = true,

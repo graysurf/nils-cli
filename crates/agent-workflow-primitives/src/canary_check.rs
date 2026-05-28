@@ -158,6 +158,7 @@ fn read_record(out_dir: &Path) -> Result<CanaryRecord, CliError> {
 #[command(
     name = "canary-check",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Run and verify local canary checks for agent workflows.",
     long_about = "Run a local command as a canary, persist redacted evidence, and verify the latest run status.",
     disable_help_subcommand = true,

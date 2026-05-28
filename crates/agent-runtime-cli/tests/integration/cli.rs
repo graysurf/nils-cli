@@ -1,5 +1,6 @@
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
+use pretty_assertions::{assert_eq, assert_ne};
 use std::path::PathBuf;
 
 fn agent_runtime_bin() -> PathBuf {
@@ -39,6 +40,36 @@ fn version_prints_workspace_version() {
     assert!(
         stdout.contains(expected),
         "version output should include {expected}: {stdout}"
+    );
+}
+
+#[test]
+fn short_version_prints_clean_workspace_version() {
+    let output = run(&["-V"]);
+    assert_eq!(output.code, 0);
+
+    let expected = format!("agent-runtime {}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(output.stdout_text(), expected);
+}
+
+#[test]
+fn long_version_prints_build_metadata() {
+    let output = run(&["--version"]);
+    assert_eq!(output.code, 0);
+
+    let stdout = output.stdout_text();
+    assert!(
+        stdout.starts_with(&format!("agent-runtime {} (", env!("CARGO_PKG_VERSION"))),
+        "long version should start with semver and metadata paren: {stdout}"
+    );
+    assert!(
+        stdout.contains(nils_build_info::GIT_DESCRIBE),
+        "long version should include git describe token {}: {stdout}",
+        nils_build_info::GIT_DESCRIBE
+    );
+    assert!(
+        stdout.contains("rustc "),
+        "long version should include rustc version: {stdout}"
     );
 }
 

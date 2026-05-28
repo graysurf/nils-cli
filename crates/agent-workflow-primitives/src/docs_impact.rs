@@ -190,6 +190,7 @@ fn is_docs_path(path: &str) -> bool {
 #[command(
     name = "docs-impact",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Scan Git changes for documentation impact.",
     long_about = "Scan Git changes and classify whether implementation work requires documentation updates.",
     disable_help_subcommand = true,

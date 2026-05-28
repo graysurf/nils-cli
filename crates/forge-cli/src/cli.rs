@@ -26,6 +26,7 @@ pub const BINARY: &str = "forge-cli";
 #[command(
     name = "forge-cli",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Provider-neutral CLI for remote forge operations (gh / glab wrapper)."
 )]
 pub struct Cli {

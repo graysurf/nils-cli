@@ -14,6 +14,7 @@ use crate::summary::summary;
 #[command(
     name = "git-summary",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Git history summary CLI",
     disable_help_subcommand = true,
     override_usage = "git-summary <command> [args]",

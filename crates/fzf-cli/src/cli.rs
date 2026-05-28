@@ -12,6 +12,7 @@ use crate::{
 #[command(
     name = "fzf-cli",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Fuzzy workflow helper CLI",
     disable_help_subcommand = true,
     override_usage = "fzf-cli <command> [args]"

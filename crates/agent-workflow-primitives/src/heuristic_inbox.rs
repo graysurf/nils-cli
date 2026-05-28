@@ -2429,6 +2429,7 @@ fn dispatch_ingest(args: IngestArgs, argv: &[String], started_at: &str) -> i32 {
 #[command(
     name = "heuristic-inbox",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Manage curated HEURISTIC_SYSTEM error-inbox and operation-record case folders.",
     long_about = "Manage curated heuristic-system inbox cases, operation records, evidence ingestion, and archival transitions.",
     disable_help_subcommand = true,

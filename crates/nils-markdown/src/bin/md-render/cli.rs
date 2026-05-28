@@ -8,7 +8,13 @@ use nils_common::cli_contract::OutputFormat;
 /// autoescape, no `now()`, registered template name = template file
 /// stem) matches the workspace's Tier-A migration golden harness.
 #[derive(Debug, Parser)]
-#[command(name = "md-render", version, about, long_about = None)]
+#[command(
+    name = "md-render",
+    version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
+    about,
+    long_about = None
+)]
 pub struct Cli {
     /// Output format envelope. `text` writes rendered Markdown to
     /// stdout; `json` wraps the rendered body in the

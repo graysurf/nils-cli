@@ -19,6 +19,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+nils-build-info = { version = "0.26.1", path = "../nils-build-info" }
 indexmap = { workspace = true }
 nils-common = { version = "0.26.1", path = "../nils-common", package = "nils-common" }
 nils-term = { version = "0.26.1", path = "../nils-term", package = "nils-term" }

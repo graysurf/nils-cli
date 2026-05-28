@@ -37,6 +37,7 @@ pub mod uninstall;
 #[command(
     name = "agent-runtime",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Render / install / doctor / audit-drift for graysurf/agent-runtime-kit."
 )]
 pub struct Cli {

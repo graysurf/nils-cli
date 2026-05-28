@@ -9,6 +9,7 @@ use nils_common::cli_contract::exit;
 #[command(
     name = "plan-tooling",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Plan tooling CLI",
     disable_help_subcommand = true
 )]

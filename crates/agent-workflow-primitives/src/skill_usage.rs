@@ -724,6 +724,7 @@ fn scan_secret_like_values(violations: &mut Vec<Violation>, value: &Value, path:
 #[command(
     name = "skill-usage",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Record and verify skill-usage evidence for agent workflows.",
     long_about = "Record skill invocation intent, linked evidence, validation, failures, outcome, and verification status.",
     disable_help_subcommand = true,

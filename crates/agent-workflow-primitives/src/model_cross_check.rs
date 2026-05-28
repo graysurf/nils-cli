@@ -209,6 +209,7 @@ fn missing_fields(record: &CrossCheckRecord) -> Vec<String> {
 #[command(
     name = "model-cross-check",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Record cross-model review evidence without owning provider calls.",
     long_about = "Persist primary and checker model observations, linked artifacts, and verification status without invoking model providers.",
     disable_help_subcommand = true,

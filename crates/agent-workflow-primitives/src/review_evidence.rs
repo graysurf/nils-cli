@@ -223,6 +223,7 @@ fn missing_fields(record: &ReviewRecord) -> Vec<String> {
 #[command(
     name = "review-evidence",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Record review findings and validation evidence.",
     long_about = "Persist review findings, validation commands, artifacts, and verification status for agent workflows.",
     disable_help_subcommand = true,

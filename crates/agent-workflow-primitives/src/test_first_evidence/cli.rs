@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 #[command(
     name = "test-first-evidence",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Record test-first evidence and waivers for agent workflows.",
     long_about = "Create and verify test-first evidence records that capture failing tests, waivers, and final validation.",
     disable_help_subcommand = true,

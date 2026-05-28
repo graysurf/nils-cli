@@ -57,6 +57,7 @@ pub enum FetchState {
 #[command(
     name = "memo-cli",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Capture-first memo CLI with agent enrichment",
     long_about = "Capture, search, report, fetch, and apply memo records through a local SQLite database with text or JSON output.",
     after_help = MEMO_AFTER_HELP

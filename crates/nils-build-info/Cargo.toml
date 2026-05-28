@@ -1,0 +1,12 @@
+[package]
+name = "nils-build-info"
+version = "0.26.1"
+edition.workspace = true
+license.workspace = true
+
+description = "Build metadata helper for nils-cli workspace binaries."
+repository = "https://github.com/sympoies/nils-cli"
+
+[lib]
+name = "nils_build_info"
+path = "src/lib.rs"

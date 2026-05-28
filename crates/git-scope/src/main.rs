@@ -18,6 +18,7 @@ mod tree;
 #[command(
     name = "git-scope",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Inspect Git-tracked file scopes and selected content.",
     long_about = "Inspect tracked, staged, unstaged, untracked, and commit-scoped paths with optional file-content printing.",
     disable_help_subcommand = true,

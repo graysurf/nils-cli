@@ -58,6 +58,7 @@ path = "src/bin/test-first-evidence.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
+nils-build-info = { version = "0.26.1", path = "../nils-build-info" }
 nils-agent-out = { version = "0.26.1", path = "../agent-out" }
 nils-common = { version = "0.26.1", path = "../nils-common", package = "nils-common" }
 nils-markdown = { version = "0.26.1", path = "../nils-markdown", package = "nils-markdown" }

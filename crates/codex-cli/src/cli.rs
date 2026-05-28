@@ -30,6 +30,7 @@ EXIT CODES:
 #[command(
     name = "codex-cli",
     version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Codex CLI for nils-cli workspace",
     long_about = "Run Codex-oriented agent helpers, authentication helpers, diagnostics, configuration, and prompt-segment utilities.",
     after_help = ROOT_AFTER_HELP
