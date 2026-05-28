@@ -7,10 +7,10 @@ Usage:
   install-local-release-binaries.sh [--help] [--prefix PATH] [--bin NAME]... [--skip-build]
 
 Builds the Rust workspace in release mode and installs the binaries into a local
-directory (default: ~/.local/nils-cli).
+directory (default: ~/.local/nils-cli/bin).
 
 Options:
-  --prefix PATH   Destination directory (default: ~/.local/nils-cli)
+  --prefix PATH   Destination directory (default: ~/.local/nils-cli/bin)
   --bin NAME      Install only a specific binary (repeatable)
   --skip-build    Skip `cargo build --release --workspace` and only install from target/
   -h, --help      Show help
@@ -22,11 +22,11 @@ Default binaries:
 Example:
   ./scripts/install-local-release-binaries.sh
   ./scripts/install-local-release-binaries.sh --bin git-scope
-  ./scripts/install-local-release-binaries.sh --prefix ~/.local/nils-cli
+  ./scripts/install-local-release-binaries.sh --prefix ~/.local/nils-cli/bin
 USAGE
 }
 
-prefix="${HOME}/.local/nils-cli"
+prefix="${HOME}/.local/nils-cli/bin"
 skip_build=0
 bins=()
 

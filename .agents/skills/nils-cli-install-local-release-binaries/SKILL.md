@@ -1,6 +1,6 @@
 ---
 name: nils-cli-install-local-release-binaries
-description: Build release binaries and install them into ~/.local/nils-cli.
+description: Build release binaries and install them into ~/.local/nils-cli/bin.
 ---
 
 # Nils CLI Install Local Release Binaries
@@ -16,7 +16,7 @@ Prereqs:
 Inputs:
 
 - Optional flags:
-  - `--prefix PATH` (default: `~/.local/nils-cli`)
+  - `--prefix PATH` (default: `~/.local/nils-cli/bin`)
   - `--bin NAME` (repeatable)
   - `--skip-build`
 
