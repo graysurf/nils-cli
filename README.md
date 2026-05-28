@@ -182,10 +182,10 @@ This repo can publish prebuilt tarballs via GitHub Releases for both:
 - x86_64 (amd64)
 - aarch64 (arm64)
 
-To trigger a release build, push a tag like `v0.25.6`:
+To trigger a release build, push a tag like `v0.25.8`:
 
-- `git tag -a v0.25.6 -m "v0.25.6"`
-- `git push origin v0.25.6`
+- `git tag -a v0.25.8 -m "v0.25.8"`
+- `git push origin v0.25.8`
 
 Then download the matching `nils-cli-<tag>-<target>.tar.gz` asset, extract it, and add `<extract_dir>/bin` to your `PATH`.
 

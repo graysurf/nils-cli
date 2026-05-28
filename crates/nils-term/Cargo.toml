@@ -1,6 +1,6 @@
 [package]
 name = "nils-term"
-version = "0.25.6"
+version = "0.25.8"
 edition.workspace = true
 license.workspace = true
 description = "Library crate for nils-term in the nils-cli workspace."
