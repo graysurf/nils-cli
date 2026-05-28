@@ -1,6 +1,6 @@
 [package]
 name = "nils-plan-archive"
-version = "0.25.6"
+version = "0.25.8"
 edition.workspace = true
 license.workspace = true
 
@@ -20,8 +20,8 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 indexmap = { workspace = true }
-nils-common = { version = "0.25.6", path = "../nils-common", package = "nils-common" }
-nils-term = { version = "0.25.6", path = "../nils-term", package = "nils-term" }
+nils-common = { version = "0.25.8", path = "../nils-common", package = "nils-common" }
+nils-term = { version = "0.25.8", path = "../nils-term", package = "nils-term" }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,6 +29,6 @@ serde_yaml_ng = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "0.25.6", path = "../nils-test-support" }
+nils-test-support = { version = "0.25.8", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
