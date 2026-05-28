@@ -16,6 +16,7 @@ Runs the full CI/parity checks from DEVELOPMENT.md:
   - bash scripts/ci/tests/local-fast-checks.test.sh
   - bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
   - bash scripts/ci/test-stale-audit.sh --strict
+  - bash scripts/ci/workspace-version-lockstep.sh --strict
   - bash scripts/ci/third-party-artifacts-audit.sh --strict
   - bash scripts/ci/completion-asset-audit.sh --strict
   - bash scripts/ci/completion-flag-parity-audit.sh --strict
@@ -131,6 +132,7 @@ fi
 run bash scripts/ci/tests/local-fast-checks.test.sh
 run bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
 run bash scripts/ci/test-stale-audit.sh --strict
+run bash scripts/ci/workspace-version-lockstep.sh --strict
 run bash scripts/ci/third-party-artifacts-audit.sh --strict
 run bash scripts/ci/completion-asset-audit.sh --strict
 run bash scripts/ci/completion-flag-parity-audit.sh --strict

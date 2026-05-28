@@ -207,6 +207,7 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/tests/local-fast-checks.test.sh`
 - `bash scripts/ci/tests/shared-helper-adoption-audit.test.sh`
 - `bash scripts/ci/test-stale-audit.sh --strict`
+- `bash scripts/ci/workspace-version-lockstep.sh --strict`
 - `bash scripts/ci/third-party-artifacts-audit.sh --strict`
 - `bash scripts/ci/completion-asset-audit.sh --strict`
 - `bash scripts/ci/completion-flag-parity-audit.sh --strict`
