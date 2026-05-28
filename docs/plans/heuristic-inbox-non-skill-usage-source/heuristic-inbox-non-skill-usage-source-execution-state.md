@@ -3,13 +3,13 @@
 
 ## Execution State
 
-- Status: in-progress
+- Status: complete
 - Target scope: whole plan
 - Execution window: whole plan (single sprint)
-- Current task: Sprint 1 delivery (PR + merge)
-- Next task: Open and deliver the implementation PR closing #585
+- Current task: complete — PR #595 merged
+- Next task: close-ready handoff to `plan-tracking-issue-closeout`
 - Last updated: 2026-05-28 Asia/Taipei
-- Branch/commit/PR/release: `feat/585-heuristic-inbox-non-skill-usage-source`; commit `34cd315`; PR pending
+- Branch/commit/PR/release: `feat/585-heuristic-inbox-non-skill-usage-source`; PR sympoies/nils-cli#595 squash-merged as `0669ad2`
 - Source document: docs/plans/heuristic-inbox-non-skill-usage-source/heuristic-inbox-non-skill-usage-source-plan.md
 - Discussion source document: docs/plans/heuristic-inbox-non-skill-usage-source/heuristic-inbox-non-skill-usage-source-discussion-source.md
 - Source issue: sympoies/nils-cli#585
