@@ -19,8 +19,12 @@ pub struct TrackingArgs {
 
 #[derive(Debug, Clone, Subcommand, Serialize)]
 pub enum TrackingCommand {
-    /// Read issue lifecycle evidence + local run state and return the
-    /// reconciled FSM state without provider mutation.
+    /// Read active payload evidence + local run state and return the
+    /// reconciled FSM state without provider mutation. Old state payload
+    /// formats require one-off migration/repair.
+    #[command(
+        after_help = "State payload replacement policy: this command targets the active payload contract only. Old state payload formats require one-off migration/repair outside the main CLI; no long-term v2 reader or mixed old/new stream reconciliation is provided."
+    )]
     Status(Box<TrackingStatusArgs>),
 
     /// Manage a typed local run state (`run init`, `run update`).
@@ -29,8 +33,12 @@ pub enum TrackingCommand {
     /// Render or post checkpoint lifecycle comments derived from run state.
     Checkpoint(Box<TrackingCheckpointArgs>),
 
-    /// Non-mutating close-readiness probe.
+    /// Non-mutating close-readiness probe over the active payload contract.
+    /// Old state payload formats require one-off migration/repair.
     #[command(name = "close-ready")]
+    #[command(
+        after_help = "State payload replacement policy: this command targets the active payload contract only. Old state payload formats require one-off migration/repair outside the main CLI; no long-term v2 reader or mixed old/new stream reconciliation is provided."
+    )]
     CloseReady(Box<TrackingCloseReadyArgs>),
 }
 

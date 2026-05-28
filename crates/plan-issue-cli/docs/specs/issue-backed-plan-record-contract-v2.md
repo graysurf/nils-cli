@@ -95,7 +95,9 @@ text starts with `plan-issue-record-payload:hex:` and hex-decoding the
 following JSON envelope. For backward compatibility, audit still accepts the
 older visible fenced JSON block whose info-string is the literal token
 `plan-issue-record-payload`, but new provider-backed comments must not render
-that visible fence by default.
+that visible fence by default. This is carrier compatibility for the current
+v2 contract only; it is not a commitment to keep old state payload schemas
+readable after the next state payload replacement.
 
 The envelope shape is:
 
@@ -197,6 +199,25 @@ Per-role `data` shapes:
 The schema field name `plan-issue-record.payload.v2` is the on-wire schema
 identity. Audit logic must reject unknown schema names rather than guess.
 
+## State Payload Replacement Policy
+
+The next state payload contract replaces the current v2 state payload semantics
+instead of preserving them as a supported old format. In that replacement:
+
+- `state.tasks[]` becomes the complete accumulative task-ledger payload for the
+  state post, not a v2/current-only compatibility stream.
+- `record audit`, `record repair-dashboard`, `tracking status`, and
+  `tracking close-ready` target the active payload contract only. They do not
+  carry a long-term v2 reader or mixed old/new stream reconciliation rule.
+- Old provider issues with previous lifecycle comments are not guaranteed to
+  stay auditable, dashboard-repairable, or closeout-capable through the main
+  CLI after the replacement lands.
+- Preservation for a past issue is a one-off migration/repair task or a new
+  tracking issue, not permanent compatibility in the primary reader.
+- Tests and fixtures for the replacement should be rewritten around the new
+  payload shape. Do not add side-by-side v2/new parity tests unless a later
+  product decision explicitly reintroduces a migration contract.
+
 ## Command Boundary
 
 - `plan-tooling`: plan parsing, validation, sprint and task split modeling.
@@ -266,6 +287,9 @@ Returns typed evidence from the provider issue body and comments:
 - Reports `missing_required` codes for each lifecycle role not satisfied.
 - Fails when a v2 lifecycle comment carries a malformed typed payload. A
   marker with an invalid payload is not counted as valid evidence.
+- For future state payload replacements, audits the active payload contract
+  only. Older state payload formats must be handled through one-off migration
+  or repair outside the main reader.
 
 Label verification is out of scope for `record audit`. The command reads
 issue body and lifecycle comments only; it does not fetch or compare
@@ -289,6 +313,8 @@ unaffected.
   Dashboard`.
 - Fails through audit when the latest lifecycle payload cannot be parsed,
   rather than silently rendering summary fields as `pending`.
+- Follows the same active-payload-only policy as `record audit`; dashboard
+  repair does not reconcile mixed old/new state payload streams.
 
 ### `plan-issue record close`
 
@@ -386,7 +412,9 @@ Examples of `payload`:
 
 There is none. Consumers must migrate from v1 markers and v1 command flags
 in a coordinated release of the consumer (agent-runtime-kit) after the
-`plan-issue` v3 release ships.
+`plan-issue` v3 release ships. The same rule applies to the next state payload
+replacement: old state payload formats are not a supported compatibility layer
+for the primary audit, dashboard repair, tracking status, or close-ready paths.
 
 ## Consumer Migration
 

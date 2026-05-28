@@ -23,13 +23,21 @@ pub enum RecordCommand {
     /// review, or closeout) to an existing plan record issue.
     Post(Box<RecordPostArgs>),
 
-    /// Recompute and edit the dashboard issue body from audit evidence.
+    /// Recompute and edit the dashboard issue body from active payload
+    /// evidence. Old state payload formats require one-off migration/repair.
+    #[command(
+        after_help = "State payload replacement policy: this command targets the active payload contract only. Old state payload formats require one-off migration/repair outside the main CLI; no long-term v2 reader or mixed old/new stream reconciliation is provided."
+    )]
     RepairDashboard(Box<RecordRepairDashboardArgs>),
 
     /// Close a plan record issue after the strict lifecycle gate passes.
     Close(Box<RecordCloseArgs>),
 
-    /// Audit issue body and comments for lifecycle markers.
+    /// Audit issue body and comments for the active payload contract. Old
+    /// state payload formats require one-off migration/repair.
+    #[command(
+        after_help = "State payload replacement policy: this command targets the active payload contract only. Old state payload formats require one-off migration/repair outside the main CLI; no long-term v2 reader or mixed old/new stream reconciliation is provided."
+    )]
     Audit(Box<RecordAuditArgs>),
 
     /// Preview the visible Markdown or JSON payload skeleton for a lifecycle

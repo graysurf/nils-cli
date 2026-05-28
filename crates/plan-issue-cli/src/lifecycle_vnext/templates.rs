@@ -2,7 +2,7 @@
 //!
 //! Backs the `plan-issue record template` command. Source of truth for the
 //! visible Markdown skeletons is
-//! `docs/source/plan-issue-redesign/plan-tracking-issue-comment-taxonomy-v1.md`;
+//! `crates/plan-issue-cli/docs/specs/issue-backed-plan-record-contract-v2.md`;
 //! payload JSON skeletons match the structured payload schemas declared in
 //! the same document.
 //!
@@ -122,6 +122,9 @@ fn render_markdown(spec: &RoleSpec, profile: RecordProfile) -> String {
 }
 
 fn render_json_skeleton(spec: &RoleSpec, profile: RecordProfile) -> String {
+    // This preview reflects the active payload contract only. When the state
+    // payload is replaced, update the skeleton instead of preserving a v2
+    // compatibility preview.
     let data = role_payload_skeleton(spec.role);
     let envelope = serde_json::json!({
         "schema": "plan-issue-record.payload.v2",

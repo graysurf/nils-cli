@@ -37,6 +37,14 @@ versioning.
   `record` subcommand surface, envelope, error shape, and tracking
   schema constants before runtime-kit migrates.
 
+### Changed
+
+- Documented the next state payload replacement as a new-format-only contract:
+  `record audit`, `record repair-dashboard`, `tracking status`, and
+  `tracking close-ready` target the active payload contract, while old
+  provider issues require one-off migration/repair instead of long-term v2
+  readers. (sympoies/nils-cli#628)
+
 ### Fixed
 
 - `plan-issue record close` closeout-comment table renders the

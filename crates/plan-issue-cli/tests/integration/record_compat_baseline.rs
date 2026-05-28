@@ -1,8 +1,8 @@
 //! Plan Issue vNext compatibility baseline (Task 1.2).
 //!
-//! Locks the released `record` command surface, envelope, and error shape
-//! before the vNext rewrite begins so an accidental regression during
-//! Sprint 2–6 fails CI here instead of breaking runtime-kit downstream.
+//! Locks the released `record` command surface, envelope, and error shape.
+//! The baseline guards the current active contract; it must not grow into a
+//! permanent old-state-payload compatibility suite.
 //!
 //! Source: `docs/plans/plan-issue-vnext-implementation/plan-issue-vnext-implementation-plan.md`
 //! Task 1.2; design constraints from
@@ -60,6 +60,41 @@ fn record_subcommand_help_keeps_released_command_surface() {
         assert!(
             out.stdout.contains(sub),
             "record {sub} --help stdout missing subcommand name: {}",
+            out.stdout
+        );
+    }
+}
+
+#[test]
+fn lifecycle_reader_help_declares_no_old_state_payload_contract() {
+    for args in [
+        &["record", "audit", "--help"][..],
+        &["record", "repair-dashboard", "--help"][..],
+        &["tracking", "status", "--help"][..],
+        &["tracking", "close-ready", "--help"][..],
+    ] {
+        let out = common::run_plan_issue(args);
+        assert_eq!(
+            out.code, 0,
+            "help should exit success for {:?}; stderr: {}",
+            args, out.stderr
+        );
+        assert!(
+            out.stdout.contains("active payload contract"),
+            "help should name the active payload contract for {:?}: {}",
+            args,
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("one-off migration/repair"),
+            "help should route old state payloads to one-off migration/repair for {:?}: {}",
+            args,
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("no long-term v2 reader"),
+            "help should reject long-term v2 reader scope for {:?}: {}",
+            args,
             out.stdout
         );
     }
