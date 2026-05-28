@@ -405,7 +405,7 @@ fn patch_text(
     let new_evidence_value = canonicalize_table_cell(evidence).trim().to_string();
     let new_evidence = if new_evidence_value.is_empty() {
         previous_evidence.clone()
-    } else if previous_evidence.is_empty() {
+    } else if previous_evidence.is_empty() || is_evidence_placeholder(&previous_evidence) {
         new_evidence_value
     } else {
         format!("{previous_evidence}; {new_evidence_value}")
@@ -454,6 +454,18 @@ fn patch_text(
         notes_changed,
         new_text,
     })
+}
+
+/// Treat the conventional Task Ledger placeholders as semantically empty so
+/// `ledger-update` replaces them with the first real evidence URL instead of
+/// joining them with `; ` (which would render `—; https://…`).
+fn is_evidence_placeholder(value: &str) -> bool {
+    let token = value.trim();
+    matches!(token, "—" | "-" | "--" | "–")
+        || matches!(
+            token.to_ascii_lowercase().as_str(),
+            "" | "n/a" | "na" | "none" | "tbd"
+        )
 }
 
 fn split_row(line: &str) -> Option<Vec<String>> {
@@ -642,5 +654,53 @@ mod tests {
         let outcome =
             patch_text(SAMPLE, Path::new("demo.md"), "1.1", "done", "a|b", None).expect("patch");
         assert_eq!(outcome.new_evidence, "a/b");
+    }
+
+    #[test]
+    fn em_dash_evidence_placeholder_is_replaced_not_appended() {
+        // The bundle template ships rows with `—` (em-dash) in the
+        // Evidence column to mean "empty". The first real evidence URL
+        // must replace that placeholder, not produce `—; <url>`.
+        let prefilled = SAMPLE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            "| 1.1 | pending | Implement `ledger-update` | — | first row |",
+        );
+        let outcome = patch_text(
+            &prefilled,
+            Path::new("demo.md"),
+            "1.1",
+            "done",
+            "https://example/c/1",
+            None,
+        )
+        .expect("patch");
+        assert_eq!(outcome.previous_evidence, "—");
+        assert_eq!(outcome.new_evidence, "https://example/c/1");
+        assert!(
+            !outcome.new_text.contains("—; https://example/c/1"),
+            "evidence column still concatenated em-dash: {}",
+            outcome.new_text
+        );
+        assert!(outcome.new_text.contains(
+            "| 1.1 | done | Implement `ledger-update` | https://example/c/1 | first row |"
+        ));
+    }
+
+    #[test]
+    fn evidence_placeholder_variants_all_replace() {
+        for placeholder in ["-", "--", "–", "n/a", "N/A", "none", "tbd", "TBD"] {
+            let prefilled = SAMPLE.replace(
+                "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+                &format!(
+                    "| 1.1 | pending | Implement `ledger-update` | {placeholder} | first row |"
+                ),
+            );
+            let outcome = patch_text(&prefilled, Path::new("demo.md"), "1.1", "done", "url", None)
+                .expect("patch");
+            assert_eq!(
+                outcome.new_evidence, "url",
+                "placeholder {placeholder:?} not replaced"
+            );
+        }
     }
 }

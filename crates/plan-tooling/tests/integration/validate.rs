@@ -82,6 +82,30 @@ fn validate_accepts_existing_read_first_source_path() {
 }
 
 #[test]
+fn validate_resolves_repo_from_absolute_file_argument() {
+    // Regression for the plan-tooling half of finding #1 in the
+    // plan-tracking testbed: when --file is an absolute path that
+    // points into a *different* git repo than the caller's cwd,
+    // `Primary source path not found` should still resolve against
+    // the *target* repo, not the caller's.
+    let caller = init_repo();
+    let target = init_repo();
+    write_file(&target.path().join("docs/source/spec.md"), "# Spec\n");
+    write_file(&target.path().join("source-backed.md"), SOURCE_BACKED_PLAN);
+
+    let target_plan = target.path().join("source-backed.md");
+    let target_plan_str = target_plan.to_str().expect("utf8 plan path");
+
+    let out = run_plan_tooling(caller.path(), &["validate", "--file", target_plan_str]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    assert!(out.stderr.is_empty(), "stderr: {}", out.stderr);
+}
+
+#[test]
 fn validate_fails_when_complexity_field_is_present_without_integer() {
     let repo = init_repo();
     write_file(
