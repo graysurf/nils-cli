@@ -224,7 +224,8 @@ fn is_group_project_path(value: &str) -> bool {
 }
 
 fn classify_host(host: &str) -> Option<Provider> {
-    if host == "github.com" || host.ends_with(".github.com") {
+    let host = host.trim().to_ascii_lowercase();
+    if host == "github.com" || host.ends_with(".github.com") || host.ends_with(".ghe.com") {
         Some(Provider::GitHub)
     } else if host == "gitlab.com" || host.starts_with("gitlab.") || host.contains(".gitlab.") {
         Some(Provider::GitLab)
@@ -319,6 +320,18 @@ mod tests {
         assert_eq!(classify_host("github.com"), Some(Provider::GitHub));
         assert_eq!(classify_host("gitlab.com"), Some(Provider::GitLab));
         assert_eq!(classify_host("bitbucket.org"), None);
+    }
+
+    #[test]
+    fn classify_host_is_case_insensitive_and_trims() {
+        assert_eq!(classify_host("GitHub.com"), Some(Provider::GitHub));
+        assert_eq!(classify_host("  GitLab.com  "), Some(Provider::GitLab));
+    }
+
+    #[test]
+    fn classify_host_recognises_github_enterprise_hosts() {
+        assert_eq!(classify_host("internal.ghe.com"), Some(Provider::GitHub));
+        assert_eq!(classify_host("corp.ghe.com"), Some(Provider::GitHub));
     }
 
     #[test]
