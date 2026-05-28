@@ -6,8 +6,79 @@ on:
       - "v*"
 
 jobs:
+  verify_ci:
+    name: Verify CI gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - name: Require green CI on tagged commit
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const requiredChecks = ["test", "test_macos", "coverage"];
+            const attempts = 60;
+            const intervalMs = 30_000;
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const timestamp = (run) =>
+              Date.parse(run.completed_at || run.started_at || run.check_suite?.created_at || "") || 0;
+
+            for (let attempt = 1; attempt <= attempts; attempt++) {
+              const runs = await github.paginate(github.rest.checks.listForRef, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.sha,
+                per_page: 100,
+              });
+
+              const latest = new Map();
+              for (const run of runs) {
+                if (!requiredChecks.includes(run.name)) {
+                  continue;
+                }
+                const previous = latest.get(run.name);
+                if (!previous || timestamp(run) > timestamp(previous)) {
+                  latest.set(run.name, run);
+                }
+              }
+
+              const pending = [];
+              const failing = [];
+              for (const name of requiredChecks) {
+                const run = latest.get(name);
+                if (!run) {
+                  pending.push(`${name}: missing`);
+                } else if (run.status !== "completed") {
+                  pending.push(`${name}: ${run.status}`);
+                } else if (run.conclusion !== "success") {
+                  failing.push(`${name}: ${run.conclusion} (${run.html_url})`);
+                }
+              }
+
+              if (pending.length === 0 && failing.length === 0) {
+                core.info(`Tagged commit ${context.sha} has green CI checks: ${requiredChecks.join(", ")}`);
+                return;
+              }
+
+              if (failing.length > 0) {
+                core.setFailed(`Tagged commit ${context.sha} has failed CI checks: ${failing.join("; ")}`);
+                return;
+              }
+
+              if (attempt === attempts) {
+                core.setFailed(`Timed out waiting for CI checks on ${context.sha}: ${pending.join("; ")}`);
+                return;
+              }
+
+              core.info(`Waiting for CI checks on ${context.sha} (${attempt}/${attempts}): ${pending.join("; ")}`);
+              await sleep(intervalMs);
+            }
+
   build:
     name: Build (${{ matrix.target }})
+    needs: verify_ci
     runs-on: ${{ matrix.runs_on }}
     permissions:
       contents: read
