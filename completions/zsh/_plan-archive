@@ -78,6 +78,20 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(discover)
+_arguments "${_arguments_options[@]}" : \
+'--source-repo=[Source working repo. Defaults to the current git repo root]:SOURCE_REPO:_files' \
+'--plans-root=[Plan-folder root, relative to the source repo. Defaults to \`docs/plans\`]:PLANS_ROOT:_files' \
+'--archive=[Archive clone path. Defaults to the machine-local config'\''s \`archive_clone_path\`]:ARCHIVE:_files' \
+'--hosts=[Path to the archive \`config/hosts.yaml\`. Defaults to \`<archive>/config/hosts.yaml\`]:HOSTS:_files' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--include-unknown[Include \`unknown\` candidates in the output (default\: eligible + blocked only). Counts always report all three]' \
+'(--format)--json[Hidden alias for \`--format json\` kept for symmetry with neighbouring CLIs]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (refresh)
 _arguments "${_arguments_options[@]}" : \
 '(--repo --since)--ref=[Reference to refresh (issue/PR/MR URL)]:REF:_default' \
@@ -161,6 +175,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(discover)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (refresh)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -197,6 +215,7 @@ _plan-archive_commands() {
 'validate-local:Validate a machine-local \`agent-plan-archive/config.yaml\` document. Missing files return documented defaults with exit code 0' \
 'validate-metadata:Validate an archived plan'\''s \`metadata.yaml\` document' \
 'migrate:Migrate a closed plan folder into the archive repo. Dry-run by default; use \`--apply\` to write and commit' \
+'discover:Read-only scan of plan folders for archive candidates. Classifies each folder as eligible, blocked, or unknown and suggests a \`plan-archive migrate\` command for eligible folders. Never mutates the source or archive repos' \
 'refresh:Fetch provider payloads and append scrubbed snapshots to \`_index/\`. Writes and scrubs but does not commit; the scrub log (if any) must be reviewed before committing' \
 'completion:Print a shell completion script for \`plan-archive\`' \
 'query:Read or aggregate cached \`_index/\` snapshots' \
@@ -215,6 +234,11 @@ _plan-archive__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'plan-archive completion commands' commands "$@"
 }
+(( $+functions[_plan-archive__subcmd__discover_commands] )) ||
+_plan-archive__subcmd__discover_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-archive discover commands' commands "$@"
+}
 (( $+functions[_plan-archive__subcmd__help_commands] )) ||
 _plan-archive__subcmd__help_commands() {
     local commands; commands=(
@@ -222,6 +246,7 @@ _plan-archive__subcmd__help_commands() {
 'validate-local:Validate a machine-local \`agent-plan-archive/config.yaml\` document. Missing files return documented defaults with exit code 0' \
 'validate-metadata:Validate an archived plan'\''s \`metadata.yaml\` document' \
 'migrate:Migrate a closed plan folder into the archive repo. Dry-run by default; use \`--apply\` to write and commit' \
+'discover:Read-only scan of plan folders for archive candidates. Classifies each folder as eligible, blocked, or unknown and suggests a \`plan-archive migrate\` command for eligible folders. Never mutates the source or archive repos' \
 'refresh:Fetch provider payloads and append scrubbed snapshots to \`_index/\`. Writes and scrubs but does not commit; the scrub log (if any) must be reviewed before committing' \
 'completion:Print a shell completion script for \`plan-archive\`' \
 'query:Read or aggregate cached \`_index/\` snapshots' \
@@ -239,6 +264,11 @@ _plan-archive__subcmd__help__subcmd__catalog_commands() {
 _plan-archive__subcmd__help__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'plan-archive help completion commands' commands "$@"
+}
+(( $+functions[_plan-archive__subcmd__help__subcmd__discover_commands] )) ||
+_plan-archive__subcmd__help__subcmd__discover_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-archive help discover commands' commands "$@"
 }
 (( $+functions[_plan-archive__subcmd__help__subcmd__help_commands] )) ||
 _plan-archive__subcmd__help__subcmd__help_commands() {

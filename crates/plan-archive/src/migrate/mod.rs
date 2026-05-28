@@ -13,8 +13,8 @@ use std::process::Command as ProcCommand;
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
 use serde::Serialize;
 
-use crate::validate;
-use crate::validate::hosts::{HostClass, HostEntry, HostsConfig, validate_hosts_yaml};
+use crate::source::{self, SourceError};
+use crate::validate::hosts::{HostClass, HostEntry};
 
 pub mod identity;
 pub mod path;
@@ -180,6 +180,18 @@ impl MigrateError {
     }
 }
 
+impl From<SourceError> for MigrateError {
+    fn from(err: SourceError) -> Self {
+        match err {
+            SourceError::SourceRepoNotFound(p) => MigrateError::SourceRepoNotFound(p),
+            SourceError::ArchiveCloneMissing(p) => MigrateError::ArchiveCloneMissing(p),
+            SourceError::HostsLoadFailed(s) => MigrateError::HostsLoadFailed(s),
+            SourceError::HostsParseFailed(s) => MigrateError::HostsParseFailed(s),
+            SourceError::Io(s) => MigrateError::Io(s),
+        }
+    }
+}
+
 /// Entry point called from `cli::run`.
 pub fn dispatch(args: DispatchArgs) -> i32 {
     let format = args.format;
@@ -202,8 +214,8 @@ pub fn dispatch(args: DispatchArgs) -> i32 {
 /// classification, enumerates files, and assembles the metadata
 /// payload. Performs no writes.
 pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
-    let source_repo = resolve_source_repo(args.source_repo.as_deref())?;
-    let archive = resolve_archive(args.archive.as_deref())?;
+    let source_repo = source::resolve_source_repo(args.source_repo.as_deref())?;
+    let archive = source::resolve_archive(args.archive.as_deref())?;
     let plan_path_in_repo = normalise_plan_arg(&args.plan);
 
     let absolute_plan = source_repo.join(&plan_path_in_repo);
@@ -216,11 +228,8 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
     let identity = derive_source_identity(&source_repo)
         .map_err(|e| MigrateError::IdentityFailed(e.to_string()))?;
 
-    let hosts_path = args
-        .hosts
-        .clone()
-        .unwrap_or_else(|| archive.join("config").join("hosts.yaml"));
-    let hosts_config = load_hosts(&hosts_path)?;
+    let hosts_path = source::hosts_path_for(&archive, args.hosts.as_deref());
+    let hosts_config = source::load_hosts(&hosts_path)?;
 
     let host_entry = hosts_config
         .hosts
@@ -291,64 +300,9 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
     })
 }
 
-fn resolve_source_repo(arg: Option<&Path>) -> Result<PathBuf, MigrateError> {
-    let candidate = match arg {
-        Some(p) => p.to_path_buf(),
-        None => std::env::current_dir().map_err(|e| MigrateError::Io(e.to_string()))?,
-    };
-    let root = nils_common::git::repo_root_in(&candidate)
-        .map_err(|e| MigrateError::Io(e.to_string()))?
-        .ok_or_else(|| MigrateError::SourceRepoNotFound(candidate.clone()))?;
-    if !root.is_dir() {
-        return Err(MigrateError::SourceRepoNotFound(root));
-    }
-    Ok(root)
-}
-
-fn resolve_archive(arg: Option<&Path>) -> Result<PathBuf, MigrateError> {
-    let candidate = match arg {
-        Some(p) => p.to_path_buf(),
-        None => default_archive_clone_path()?,
-    };
-    if !candidate.is_dir() {
-        return Err(MigrateError::ArchiveCloneMissing(candidate));
-    }
-    Ok(candidate)
-}
-
-fn default_archive_clone_path() -> Result<PathBuf, MigrateError> {
-    let local = validate::local::validate_local_path(&local_config_path())
-        .map_err(|e| MigrateError::Io(e.to_string()))?;
-    Ok(local.data.config.archive_clone_path)
-}
-
-fn local_config_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("PLAN_ARCHIVE_LOCAL_CONFIG") {
-        return PathBuf::from(p);
-    }
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(xdg)
-            .join("agent-plan-archive")
-            .join("config.yaml");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("agent-plan-archive")
-            .join("config.yaml");
-    }
-    PathBuf::from("/nonexistent/agent-plan-archive/config.yaml")
-}
-
 fn normalise_plan_arg(arg: &Path) -> PathBuf {
     let s = arg.to_string_lossy().trim_end_matches('/').to_string();
     PathBuf::from(s)
-}
-
-fn load_hosts(path: &Path) -> Result<HostsConfig, MigrateError> {
-    let raw = fs::read_to_string(path).map_err(|e| MigrateError::HostsLoadFailed(e.to_string()))?;
-    let v = validate_hosts_yaml(&raw).map_err(|e| MigrateError::HostsParseFailed(e.to_string()))?;
-    Ok(v.data.config)
 }
 
 fn enumerate_plan_files(
@@ -491,8 +445,8 @@ fn emit_error(format: OutputFormat, code: &str, message: &str) -> i32 {
 /// Apply path. Copies files, writes metadata, commits archive,
 /// pushes archive, and on success commits the source-repo deletion.
 fn apply(args: DispatchArgs, report: DryRunReport) -> Result<ApplyReport, MigrateError> {
-    let source_repo = resolve_source_repo(args.source_repo.as_deref())?;
-    let archive = resolve_archive(args.archive.as_deref())?;
+    let source_repo = source::resolve_source_repo(args.source_repo.as_deref())?;
+    let archive = source::resolve_archive(args.archive.as_deref())?;
     let plan_path_in_repo = normalise_plan_arg(&args.plan);
 
     if report.archive_target.exists {
@@ -501,7 +455,7 @@ fn apply(args: DispatchArgs, report: DryRunReport) -> Result<ApplyReport, Migrat
         ));
     }
 
-    if has_dirty_plan_folder(&source_repo, &plan_path_in_repo)? {
+    if source::has_dirty_path(&source_repo, &plan_path_in_repo)? {
         return Err(MigrateError::SourceRepoDirty(
             plan_path_in_repo.display().to_string(),
         ));
@@ -597,21 +551,6 @@ fn pathdiff(file_rel_to_repo: &str, plan_path: &Path) -> PathBuf {
 /// recorded in the archive path and `metadata.yaml`.
 fn archive_commit_message(repo: &str, plan_folder: &str) -> String {
     format!("archive(plan): {repo}/{plan_folder}")
-}
-
-fn has_dirty_plan_folder(repo: &Path, plan_path: &Path) -> Result<bool, MigrateError> {
-    let out = nils_common::git::run_output_in(
-        repo,
-        &["status", "--porcelain", "--", &plan_path.to_string_lossy()],
-    )
-    .map_err(|e| MigrateError::Io(e.to_string()))?;
-    if !out.status.success() {
-        return Err(MigrateError::Subprocess(
-            "git status".to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        ));
-    }
-    Ok(!out.stdout.is_empty())
 }
 
 fn run_semantic_commit(repo: &Path, message: &str) -> Result<(), MigrateError> {

@@ -107,6 +107,31 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Read-only scan of plan folders for archive candidates.
+    /// Classifies each folder as eligible, blocked, or unknown and
+    /// suggests a `plan-archive migrate` command for eligible folders.
+    /// Never mutates the source or archive repos.
+    Discover {
+        /// Source working repo. Defaults to the current git repo root.
+        #[arg(long)]
+        source_repo: Option<PathBuf>,
+        /// Plan-folder root, relative to the source repo. Defaults to
+        /// `docs/plans`.
+        #[arg(long)]
+        plans_root: Option<PathBuf>,
+        /// Archive clone path. Defaults to the machine-local config's
+        /// `archive_clone_path`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Path to the archive `config/hosts.yaml`. Defaults to
+        /// `<archive>/config/hosts.yaml`.
+        #[arg(long)]
+        hosts: Option<PathBuf>,
+        /// Include `unknown` candidates in the output (default:
+        /// eligible + blocked only). Counts always report all three.
+        #[arg(long)]
+        include_unknown: bool,
+    },
     /// Fetch provider payloads and append scrubbed snapshots to
     /// `_index/`. Writes and scrubs but does not commit; the scrub
     /// log (if any) must be reviewed before committing.
@@ -237,6 +262,20 @@ pub fn run() -> i32 {
             pr,
             mr,
             apply,
+            format,
+        }),
+        Command::Discover {
+            source_repo,
+            plans_root,
+            archive,
+            hosts,
+            include_unknown,
+        } => crate::discover::dispatch(crate::discover::DispatchArgs {
+            source_repo,
+            plans_root,
+            archive,
+            hosts,
+            include_unknown,
             format,
         }),
         Command::Refresh {
@@ -534,4 +573,75 @@ fn render_clap_message(err: &clap::Error) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| "command-line parse failed".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_surface_is_valid() {
+        // Validates the whole derived command tree, including the
+        // `discover` subcommand and its arguments.
+        Cli::command().debug_assert();
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "discover"),
+            "discover wired: {names:?}"
+        );
+    }
+
+    #[test]
+    fn discover_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "plan-archive",
+            "discover",
+            "--source-repo",
+            "/repo",
+            "--plans-root",
+            "docs/plans",
+            "--archive",
+            "/arch",
+            "--hosts",
+            "/arch/config/hosts.yaml",
+            "--include-unknown",
+            "--format",
+            "json",
+        ])
+        .expect("discover parses");
+        assert!(matches!(cli.output_format(), OutputFormat::Json));
+        match cli.command {
+            Command::Discover {
+                source_repo,
+                plans_root,
+                archive,
+                hosts,
+                include_unknown,
+            } => {
+                assert_eq!(source_repo, Some(PathBuf::from("/repo")));
+                assert_eq!(plans_root, Some(PathBuf::from("docs/plans")));
+                assert_eq!(archive, Some(PathBuf::from("/arch")));
+                assert_eq!(hosts, Some(PathBuf::from("/arch/config/hosts.yaml")));
+                assert!(include_unknown);
+            }
+            _ => panic!("expected the Discover subcommand"),
+        }
+    }
+
+    #[test]
+    fn discover_defaults_are_optional() {
+        let cli = Cli::try_parse_from(["plan-archive", "discover"]).expect("parses with defaults");
+        assert!(matches!(
+            cli.command,
+            Command::Discover {
+                include_unknown: false,
+                source_repo: None,
+                plans_root: None,
+                ..
+            }
+        ));
+    }
 }
