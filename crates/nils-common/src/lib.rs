@@ -24,6 +24,7 @@
 
 pub mod cli_contract;
 pub mod clipboard;
+pub mod diag_output;
 pub mod env;
 pub mod fs;
 pub mod git;
