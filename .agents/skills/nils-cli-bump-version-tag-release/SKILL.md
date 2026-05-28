@@ -141,7 +141,9 @@ Outputs (tap stage):
 
 - Waits for the source repo's `release.yml` run on tag `vX.Y.Z` to complete `success`.
 - The source release workflow dispatches `sympoies/homebrew-tap` after the GitHub Release and assets exist.
-- Unless `--skip-tap-wait`, waits for `update-nils-cli-formula.yml` in the tap repo to finish `success`.
+- Unless `--skip-tap-wait`, waits for the latest matching
+  `update-nils-cli-formula.yml` run in the tap repo to finish `success`; retrying
+  the same release version is supported after a failed tap run.
 - The tap workflow fetches `.tar.gz.sha256` sidecars for all four platforms, rewrites
   `Formula/nils-cli.rb`, validates and brew-tests it on Linux/macOS, commits to tap `main`,
   and creates the tap release record for `nils-cli-vX.Y.Z`.
