@@ -26,11 +26,16 @@ Options:
                           before the tap stage. Ignored in PR mode (PR delivery already gates CI).
   --allow-dirty           Allow dirty release-managed files only.
   --force-tag             Delete existing local/remote tag before re-tagging.
-  --tap-dir <path>        Path to homebrew-tap work tree (overrides env + convention).
+  --tap-repo <owner/repo> Homebrew tap repository to wait on after source release
+                          dispatch (default: sympoies/homebrew-tap; env:
+                          NILS_CLI_HOMEBREW_TAP_REPO).
+  --tap-dir <path>        Optional local homebrew-tap work tree to fast-forward before
+                          the local Homebrew install check (overrides env + convention).
   --skip-tap              Skip the homebrew-tap stage entirely.
-  --skip-tap-wait         Do not wait for tap release.yml after pushing the prefix tag.
+  --skip-tap-wait         Do not wait for the tap formula-update workflow.
   --skip-tap-tag          Commit + push tap formula bump but skip the prefix tag.
-  --from-tap              Resume mode: skip nils-cli stages 1-8 and run only the tap stage.
+                          Legacy local-tap mode only.
+  --from-tap              Resume mode: skip nils-cli stages 1-8 and wait for the tap stage.
                           Requires --version and an existing v<version> tag in this repo.
   --tap-formula <name>    Formula basename to bump (default: nils-cli). Reserved for AWL et al.
   --skip-dev-clean        Do not clear ~/.local/nils-cli/bin after a successful release.
@@ -54,11 +59,13 @@ Default behavior:
   to run the full audit locally (slow); use --skip-ci-wait (direct-push only) to
   fire-and-forget without gating on the bump commit's ci.yml run.
 
-  After tagging the nils-cli release, the tap stage is run automatically when:
+  After tagging the nils-cli release, the source release workflow dispatches
+  sympoies/homebrew-tap to update Formula/nils-cli.rb from published release
+  artifacts. This script waits for that tap workflow, then clears the local dev
+  install and installs/upgrades the local Homebrew formula when brew is available.
+  The tap stage runs automatically when:
     - --skip-push is NOT set, AND
-    - --skip-tap is NOT set, AND
-    - a tap work tree resolves via (--tap-dir | $NILS_CLI_HOMEBREW_TAP_DIR | <repo parent>/homebrew-tap).
-  Otherwise the tap stage is skipped with a note.
+    - --skip-tap is NOT set.
 USAGE
 }
 
@@ -399,6 +406,122 @@ PY
   die "timed out after ${max_seconds}s waiting for ${workflow} on ${repo} for ${head_ref}"
 }
 
+resolve_tap_repo_slug() {
+  local explicit="$1"
+  local repo="${explicit:-${NILS_CLI_HOMEBREW_TAP_REPO:-sympoies/homebrew-tap}}"
+  if ! [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    die "invalid Homebrew tap repo slug: ${repo}"
+  fi
+  echo "$repo"
+}
+
+tap_name_from_repo_slug() {
+  local repo="$1"
+  local owner="${repo%%/*}"
+  local name="${repo#*/}"
+  if [[ "$name" == homebrew-* ]]; then
+    name="${name#homebrew-}"
+  fi
+  echo "${owner}/${name}"
+}
+
+wait_for_homebrew_tap_update() {
+  local tap_repo="$1"
+  local version="$2"
+  local tag="v${version}"
+  local max_seconds="${3:-1200}"
+  local workflow="${NILS_CLI_TAP_UPDATE_WORKFLOW:-update-nils-cli-formula.yml}"
+
+  command -v gh >/dev/null 2>&1 || die "gh is required to wait for ${tap_repo} formula update"
+
+  local deadline=$((SECONDS + max_seconds))
+  local run_id="" status="" conclusion="" url="" title=""
+
+  while (( SECONDS < deadline )); do
+    local runs_json
+    runs_json="$(gh -R "$tap_repo" run list --workflow "$workflow" --limit 30 \
+      --json databaseId,status,conclusion,url,displayTitle,event 2>/dev/null)" \
+      || { sleep 10; continue; }
+
+    local match
+    match="$(
+      python3 - "$tag" "$runs_json" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+tag = sys.argv[1]
+runs = json.loads(sys.argv[2])
+for run in runs:
+    title = run.get("displayTitle") or ""
+    if tag in title:
+        print(json.dumps({
+            "id": run.get("databaseId"),
+            "status": run.get("status"),
+            "conclusion": run.get("conclusion"),
+            "url": run.get("url"),
+            "title": title,
+        }))
+        break
+PY
+    )"
+
+    if [[ -z "$match" ]]; then
+      note "waiting for ${tap_repo} ${workflow} run for ${tag}"
+      sleep 15
+      continue
+    fi
+
+    run_id="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['id'])" "$match")"
+    status="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['status'] or '')" "$match")"
+    conclusion="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['conclusion'] or '')" "$match")"
+    url="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['url'] or '')" "$match")"
+    title="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['title'] or '')" "$match")"
+
+    if [[ "$status" == "completed" ]]; then
+      if [[ "$conclusion" == "success" ]]; then
+        note "${tap_repo} ${workflow} run ${run_id} completed: ${url}"
+        return 0
+      fi
+      die "${tap_repo} ${workflow} run ${run_id} ended with conclusion='${conclusion}': ${url}"
+    fi
+
+    note "waiting for ${tap_repo} ${workflow} run ${run_id} (${status:-pending}, ${title}): ${url}"
+    sleep 20
+  done
+
+  die "timed out after ${max_seconds}s waiting for ${workflow} on ${tap_repo} for ${tag}"
+}
+
+refresh_local_tap_dir_if_present() {
+  local tap_dir="$1"
+  if [[ -z "$tap_dir" ]]; then
+    return 0
+  fi
+
+  local tap_branch
+  tap_branch="$(git -C "$tap_dir" branch --show-current 2>/dev/null || true)"
+  if [[ "$tap_branch" != "main" ]]; then
+    warn "local tap work tree is on '${tap_branch:-detached}', not main; skipping local fast-forward"
+    return 0
+  fi
+  if [[ -n "$(git -C "$tap_dir" status --porcelain)" ]]; then
+    warn "local tap work tree is dirty; skipping local fast-forward: ${tap_dir}"
+    return 0
+  fi
+
+  note "fast-forwarding local tap work tree at ${tap_dir}"
+  git -C "$tap_dir" fetch --no-tags origin main --quiet || {
+    warn "failed to fetch local tap origin/main; continuing"
+    return 0
+  }
+  git -C "$tap_dir" merge --ff-only origin/main >/dev/null || {
+    warn "failed to fast-forward local tap work tree; continuing"
+    return 0
+  }
+}
+
 # Fetch sha256 hex for the published artifact tarball; echoes the hex.
 # Args: artifact_origin (owner/repo), version, arch
 fetch_artifact_sha256() {
@@ -666,6 +789,7 @@ upgrade_local_brew_install() {
   local skip="$1"
   local formula="$2"
   local target_version="$3"
+  local tap_repo="${4:-sympoies/homebrew-tap}"
 
   if [[ "$skip" -eq 1 ]]; then
     note "--skip-local-brew-upgrade set; leaving local Homebrew install untouched"
@@ -677,16 +801,29 @@ upgrade_local_brew_install() {
     return 0
   fi
 
-  if ! brew list --formula "$formula" >/dev/null 2>&1; then
-    note "Homebrew formula ${formula} is not installed locally; skipping local upgrade"
-    return 0
+  local tap_name
+  tap_name="$(tap_name_from_repo_slug "$tap_repo")"
+  if ! brew tap | grep -qx "$tap_name"; then
+    note "tapping ${tap_name} from https://github.com/${tap_repo}"
+    brew tap "$tap_name" "https://github.com/${tap_repo}.git"
   fi
 
   note "updating Homebrew taps before local ${formula} upgrade"
   brew update
 
-  note "upgrading local Homebrew formula ${formula} to v${target_version}"
-  brew upgrade "$formula"
+  if brew list --formula "$formula" >/dev/null 2>&1; then
+    note "upgrading local Homebrew formula ${formula} to v${target_version}"
+    if ! brew upgrade "$formula"; then
+      local current_version
+      current_version="$(brew list --versions "$formula" 2>/dev/null | awk '{print $2; exit}')"
+      if [[ "$current_version" != "$target_version" ]]; then
+        die "brew upgrade ${formula} failed and installed version is ${current_version:-unknown}"
+      fi
+    fi
+  else
+    note "installing local Homebrew formula ${tap_name}/${formula} v${target_version}"
+    brew install "${tap_name}/${formula}"
+  fi
 
   local installed_version=""
   installed_version="$(brew list --versions "$formula" 2>/dev/null | awk '{print $2; exit}')"
@@ -710,6 +847,7 @@ skip_ci_wait=0
 allow_dirty=0
 force_tag=0
 tap_dir_arg=""
+tap_repo_arg=""
 skip_tap=0
 skip_tap_wait=0
 skip_tap_tag=0
@@ -775,6 +913,13 @@ while [[ $# -gt 0 ]]; do
         die "--tap-dir requires a value"
       fi
       tap_dir_arg="${2:-}"
+      shift 2
+      ;;
+    --tap-repo)
+      if [[ $# -lt 2 ]]; then
+        die "--tap-repo requires a value"
+      fi
+      tap_repo_arg="${2:-}"
       shift 2
       ;;
     --skip-tap)
@@ -876,18 +1021,22 @@ if [[ "$from_tap" -eq 1 ]]; then
     die "--from-tap could not determine source repo slug from origin remote"
   fi
 
-  tap_dir="$(resolve_tap_dir "$tap_dir_arg" "$repo_parent")" \
-    || die "tap directory could not be resolved (use --tap-dir or NILS_CLI_HOMEBREW_TAP_DIR)"
+  note "waiting for ${source_repo_slug} release.yml on tag ${tag}"
+  wait_for_release_run "$source_repo_slug" "release.yml" "$tag" "${NILS_CLI_RELEASE_WAIT_SECONDS:-1200}"
 
-  run_tap_stage \
-    "$tap_dir" \
-    "$source_repo_slug" \
-    "$version" \
-    "$tap_formula" \
-    "$skip_tap_tag" \
-    "$skip_tap_wait"
+  tap_repo_slug="$(resolve_tap_repo_slug "$tap_repo_arg")"
+  if [[ "$skip_tap_wait" -eq 0 ]]; then
+    wait_for_homebrew_tap_update "$tap_repo_slug" "$version" "${NILS_CLI_TAP_WAIT_SECONDS:-1200}"
+  else
+    note "--skip-tap-wait set; not waiting for ${tap_repo_slug} formula update"
+  fi
+
+  tap_dir=""
+  if tap_dir="$(resolve_tap_dir "$tap_dir_arg" "$repo_parent" 2>/dev/null)"; then
+    refresh_local_tap_dir_if_present "$tap_dir"
+  fi
   clean_dev_install "$skip_dev_clean"
-  upgrade_local_brew_install "$skip_local_brew_upgrade" "$tap_formula" "$version"
+  upgrade_local_brew_install "$skip_local_brew_upgrade" "$tap_formula" "$version" "$tap_repo_slug"
   exit 0
 fi
 
@@ -1254,27 +1403,26 @@ if [[ "$skip_tap" -eq 1 ]]; then
   exit 0
 fi
 
-tap_dir=""
-if ! tap_dir="$(resolve_tap_dir "$tap_dir_arg" "$repo_parent" 2>&1)"; then
-  resolve_err="$tap_dir"
-  if [[ -n "$tap_dir_arg" || -n "${NILS_CLI_HOMEBREW_TAP_DIR:-}" ]]; then
-    die "tap stage requested but tap directory invalid: ${resolve_err}"
-  fi
-  note "tap stage skipped (no tap configured; set NILS_CLI_HOMEBREW_TAP_DIR or pass --tap-dir to enable)"
-  exit 0
-fi
-
 if [[ -z "$source_repo_slug" || "$source_repo_slug" == *"/"*"/"* ]]; then
   die "tap stage cannot determine source repo slug from origin remote"
 fi
 
-run_tap_stage \
-  "$tap_dir" \
-  "$source_repo_slug" \
-  "$version" \
-  "$tap_formula" \
-  "$skip_tap_tag" \
-  "$skip_tap_wait"
+note "waiting for ${source_repo_slug} release.yml on tag ${tag}"
+wait_for_release_run "$source_repo_slug" "release.yml" "$tag" "${NILS_CLI_RELEASE_WAIT_SECONDS:-1200}"
+
+tap_repo_slug="$(resolve_tap_repo_slug "$tap_repo_arg")"
+if [[ "$skip_tap_wait" -eq 0 ]]; then
+  wait_for_homebrew_tap_update "$tap_repo_slug" "$version" "${NILS_CLI_TAP_WAIT_SECONDS:-1200}"
+else
+  note "--skip-tap-wait set; not waiting for ${tap_repo_slug} formula update"
+fi
+
+tap_dir=""
+if tap_dir="$(resolve_tap_dir "$tap_dir_arg" "$repo_parent" 2>/dev/null)"; then
+  refresh_local_tap_dir_if_present "$tap_dir"
+elif [[ -n "$tap_dir_arg" || -n "${NILS_CLI_HOMEBREW_TAP_DIR:-}" ]]; then
+  warn "tap directory could not be resolved; skipping local tap fast-forward"
+fi
 
 clean_dev_install "$skip_dev_clean"
-upgrade_local_brew_install "$skip_local_brew_upgrade" "$tap_formula" "$version"
+upgrade_local_brew_install "$skip_local_brew_upgrade" "$tap_formula" "$version" "$tap_repo_slug"
