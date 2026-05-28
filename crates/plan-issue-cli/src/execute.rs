@@ -106,7 +106,7 @@ pub fn execute(binary: BinaryFlavor, cli: &Cli) -> Result<Value, CommandError> {
         CliCommand::Record(args) => {
             run_record(binary, cli.dry_run, cli.force, cli.repo.as_deref(), args)
         }
-        CliCommand::Tracking(args) => run_tracking(cli.repo.as_deref(), args),
+        CliCommand::Tracking(args) => run_tracking(binary, cli.force, cli.repo.as_deref(), args),
         CliCommand::Completion(_) => Err(CommandError::usage(
             "completion-direct-output-only",
             "completion output is emitted directly; run `<binary> completion <bash|zsh>`",
@@ -1690,6 +1690,8 @@ fn derive_lint_hints(
 }
 
 fn run_tracking(
+    binary: BinaryFlavor,
+    force: bool,
     repo_override: Option<&str>,
     args: &crate::commands::tracking::TrackingArgs,
 ) -> Result<Value, CommandError> {
@@ -1700,7 +1702,9 @@ fn run_tracking(
             TrackingRunCommand::Init(args) => run_tracking_run_init(repo_override, args),
             TrackingRunCommand::Update(args) => run_tracking_run_update(args),
         },
-        TrackingCommand::Checkpoint(args) => run_tracking_checkpoint(args),
+        TrackingCommand::Checkpoint(args) => {
+            run_tracking_checkpoint(binary, force, repo_override, args)
+        }
         TrackingCommand::CloseReady(args) => run_tracking_close_ready(args),
     }
 }
@@ -1900,6 +1904,9 @@ fn run_tracking_run_update(
 }
 
 fn run_tracking_checkpoint(
+    binary: BinaryFlavor,
+    force: bool,
+    repo_override: Option<&str>,
     args: &crate::commands::tracking::TrackingCheckpointArgs,
 ) -> Result<Value, CommandError> {
     use crate::lifecycle_record::{self, PayloadRole};
@@ -2041,24 +2048,35 @@ fn run_tracking_checkpoint(
         None
     };
 
-    // Live checkpoint posting lands in Task 6.1; flag any live request as
-    // blocked until then.
-    let live_blocked = if args.live {
-        Some(json!({
-            "code": "tracking-checkpoint-live-not-implemented",
-            "message": "live tracking checkpoint posting will arrive in Task 6.1",
-            "suggested_unblock": "re-run with --dry-run or use `record post` directly",
-        }))
+    // Live mode: post each rendered role through the same per-role write hop
+    // that `record post` uses. Fixture mode short-circuits the adapter call
+    // but otherwise returns the same response shape so deterministic smoke
+    // probes can exercise the happy path. Pre-existing blockers (stale run
+    // state, missing record, visible-completeness failures) short-circuit
+    // posting before any provider mutation.
+    let summary = if args.live && blocked.is_empty() && !rendered.is_empty() {
+        post_checkpoint_live(args, binary, force, repo_override, &rendered, &mut blocked)?
+    } else if args.live {
+        CheckpointPostSummary {
+            posted: Vec::new(),
+            repair_dashboard_result: None,
+            mode: if args.fixture.is_some() {
+                "fixture"
+            } else {
+                "live"
+            },
+        }
     } else {
-        None
+        CheckpointPostSummary {
+            posted: Vec::new(),
+            repair_dashboard_result: None,
+            mode: "dry-run",
+        }
     };
-    if let Some(extra) = live_blocked {
-        blocked.push(extra);
-    }
 
     Ok(json!({
         "operation": "tracking.checkpoint",
-        "mode": if !args.live { "dry-run" } else { "live" },
+        "mode": summary.mode,
         "fsm_state": reconciled.state.as_str(),
         "roles_planned": roles_planned,
         "roles_skipped": roles_skipped,
@@ -2067,6 +2085,195 @@ fn run_tracking_checkpoint(
         "blocked": blocked,
         "rendered_out": rendered_out.map(|p| p.to_string_lossy().to_string()),
         "repair_dashboard": args.repair_dashboard,
+        "posted": summary.posted,
+        "repair_dashboard_result": summary.repair_dashboard_result,
+    }))
+}
+
+/// Summary of the live (or fixture) posting hop, separated out so the
+/// `--live` branch can return per-role URLs and an optional dashboard repair
+/// result alongside the existing rendered/visible_failures/blocked arrays.
+struct CheckpointPostSummary {
+    posted: Vec<Value>,
+    repair_dashboard_result: Option<Value>,
+    mode: &'static str,
+}
+
+/// Live (or fixture) per-role posting hop for `tracking checkpoint --live`.
+///
+/// In **live mode** this mirrors `run_record_post`'s posting hop:
+/// `resolve_repo_info_for_live` → `provider::select_adapter` →
+/// `write_temp_markdown` → `adapter.comment_issue` per rendered role,
+/// preserving `--post` declaration order. On the first per-role failure the
+/// function stops, pushes a stable `tracking-checkpoint-live-post-failed`
+/// entry into `blocked`, and skips any pending roles plus `--repair-dashboard`
+/// so a half-posted issue does not get a stale dashboard rewrite.
+///
+/// In **fixture mode** (`--fixture <dir>` supplied) the adapter call is
+/// skipped entirely and synthesized `fixture://issue/<n>/<role>` URLs are
+/// returned. This is the deterministic mode the runtime-smoke happy-path
+/// probe relies on.
+///
+/// `tracking-checkpoint-live-not-implemented` is retained as a stable error
+/// code for any future regression that reintroduces a refusal branch on the
+/// `--live` path; the live-mode posting branch above no longer emits it.
+fn post_checkpoint_live(
+    args: &crate::commands::tracking::TrackingCheckpointArgs,
+    binary: BinaryFlavor,
+    force: bool,
+    repo_override: Option<&str>,
+    rendered: &[Value],
+    blocked: &mut Vec<Value>,
+) -> Result<CheckpointPostSummary, CommandError> {
+    let issue_number = match args.issue {
+        Some(n) => n,
+        None => {
+            blocked.push(json!({
+                "code": "tracking-checkpoint-live-missing-issue",
+                "message": "`--issue <number>` is required for live tracking checkpoint",
+                "suggested_unblock": "pass --issue <number>",
+            }));
+            return Ok(CheckpointPostSummary {
+                posted: Vec::new(),
+                repair_dashboard_result: None,
+                mode: if args.fixture.is_some() {
+                    "fixture"
+                } else {
+                    "live"
+                },
+            });
+        }
+    };
+
+    // Fixture mode: synthesize URLs without provider mutation. The smoke
+    // probe writes the rendered comment bodies back into its own fixture
+    // and re-reads them through `tracking close-ready`; this hop only
+    // surfaces the post-attempt shape so the probe can assert it.
+    if args.fixture.is_some() {
+        let posted: Vec<Value> = rendered
+            .iter()
+            .map(|entry| {
+                let role = entry["role"].as_str().unwrap_or("unknown");
+                json!({
+                    "role": role,
+                    "comment_url": format!("fixture://issue/{}/{}", issue_number, role),
+                })
+            })
+            .collect();
+        let repair_dashboard_result = if args.repair_dashboard {
+            Some(json!({
+                "operation": "record.repair-dashboard",
+                "mode": "fixture",
+                "dry_run": true,
+            }))
+        } else {
+            None
+        };
+        return Ok(CheckpointPostSummary {
+            posted,
+            repair_dashboard_result,
+            mode: "fixture",
+        });
+    }
+
+    // True live mode. Refuse on `plan-issue-local`; the binary boundary
+    // mirrors `record post`'s contract.
+    ensure_live_binary_for_command(binary, "tracking checkpoint --live", None)?;
+
+    let provider_repo_arg = args.provider_repo.as_deref().or(repo_override);
+    let repo_info = resolve_repo_info_for_live(binary, provider_repo_arg)?;
+    let adapter = crate::provider::select_adapter(&repo_info, force);
+    let issue_url = repo_info.issue_url(issue_number);
+    let repo = repo_info.slug.clone();
+
+    let mut posted: Vec<Value> = Vec::new();
+    let mut first_failure: Option<Value> = None;
+
+    for entry in rendered {
+        let role = entry["role"].as_str().unwrap_or("unknown");
+        let body = entry["body"].as_str().unwrap_or_default();
+        let comment_path =
+            write_temp_markdown(&format!("tracking-checkpoint-{role}-comment"), body).map_err(
+                |err| CommandError::runtime("tracking-checkpoint-comment-write-failed", err),
+            )?;
+        match adapter.comment_issue(&repo, issue_number, &comment_path) {
+            Ok(url) => {
+                posted.push(json!({
+                    "role": role,
+                    "comment_url": url,
+                }));
+            }
+            Err(err) => {
+                first_failure = Some(json!({
+                    "code": "tracking-checkpoint-live-post-failed",
+                    "role": role,
+                    "message": format!("failed to post {role} comment: {err}"),
+                    "suggested_unblock": "investigate provider error and retry; \
+                                          earlier roles already posted are listed under `posted`",
+                }));
+                break;
+            }
+        }
+    }
+
+    if let Some(failure) = first_failure {
+        blocked.push(failure);
+        return Ok(CheckpointPostSummary {
+            posted,
+            repair_dashboard_result: None,
+            mode: "live",
+        });
+    }
+
+    // All requested roles posted. Optionally repair the dashboard against
+    // the now-updated provider record. Skipping repair on partial failure
+    // avoids overwriting the dashboard with a stale snapshot.
+    let repair_dashboard_result = if args.repair_dashboard {
+        Some(repair_dashboard_after_checkpoint(
+            adapter.as_ref(),
+            &repo,
+            issue_number,
+            &issue_url,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(CheckpointPostSummary {
+        posted,
+        repair_dashboard_result,
+        mode: "live",
+    })
+}
+
+/// Post-checkpoint dashboard repair. Mirrors the live branch of
+/// `run_record_repair_dashboard` but kept local so the tracking checkpoint
+/// path can stop on partial post failure without dragging the repair caller
+/// into the abort logic.
+fn repair_dashboard_after_checkpoint(
+    adapter: &dyn crate::provider::ProviderAdapter,
+    repo: &str,
+    issue_number: u64,
+    issue_url: &str,
+) -> Result<Value, CommandError> {
+    let (body, comments) = adapter.issue_evidence(repo, issue_number).map_err(|err| {
+        CommandError::runtime("tracking-checkpoint-repair-evidence-read-failed", err)
+    })?;
+    let audit = crate::lifecycle_record::audit_record(Some(&body), &comments, None)
+        .map_err(|err| CommandError::runtime("tracking-checkpoint-repair-audit-failed", err))?;
+    let dashboard =
+        crate::lifecycle_record::render_dashboard_from_audit(&audit, None, Some(issue_url));
+    let dashboard_path = write_temp_markdown("tracking-checkpoint-repair-dashboard", &dashboard)
+        .map_err(|err| {
+            CommandError::runtime("tracking-checkpoint-repair-dashboard-write-failed", err)
+        })?;
+    adapter
+        .edit_issue_body(repo, issue_number, &dashboard_path)
+        .map_err(|err| CommandError::runtime("tracking-checkpoint-repair-edit-failed", err))?;
+    Ok(json!({
+        "operation": "record.repair-dashboard",
+        "mode": "live",
+        "issue": {"number": issue_number, "url": issue_url},
     }))
 }
 

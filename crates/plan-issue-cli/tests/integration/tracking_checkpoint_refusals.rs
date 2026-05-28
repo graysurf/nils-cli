@@ -136,58 +136,13 @@ fn tracking_checkpoint_refusals_block_when_run_state_stale_vs_issue_closed() {
     );
 }
 
-#[test]
-fn tracking_checkpoint_refusals_live_mode_blocks_until_task_6_1_lands() {
-    let fixture = write_fixture(&[
-        (
-            "source",
-            json!({"path": "p", "commit": "c"}),
-            "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
-            "2026-05-26T00:00:00Z",
-        ),
-        (
-            "plan",
-            json!({"path": "p", "commit": "c"}),
-            "## Plan Snapshot\n\n- Profile: tracking\n- Path: `p`",
-            "2026-05-26T00:00:01Z",
-        ),
-        (
-            "state",
-            json!({"status": "in-progress", "target_scope": "x", "tasks": [], "prs": []}),
-            "## Execution State\n\n- Profile: tracking\n- Status: in-progress\n\n## Task Ledger\n\n| ID | Status |\n| --- | --- |\n| 1.1 | done |",
-            "2026-05-26T00:00:02Z",
-        ),
-    ]);
-    let tmp = TempDir::new().expect("tmp");
-    let rs_path = tmp.path().join("run-state.json");
-    write_run_state(&rs_path, "implementing");
-
-    let out = common::run_plan_issue(&[
-        "--format",
-        "json",
-        "tracking",
-        "checkpoint",
-        "--run-state",
-        rs_path.to_str().expect("rs"),
-        "--post",
-        "state",
-        "--fixture",
-        fixture.path().to_str().expect("fixture"),
-        "--live",
-    ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
-    let codes: Vec<&str> = result["blocked"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|b| b["code"].as_str().unwrap())
-        .collect();
-    assert!(
-        codes.contains(&"tracking-checkpoint-live-not-implemented"),
-        "blocked codes: {codes:?}"
-    );
-}
+// NOTE: the "tracking-checkpoint-live-not-implemented refusal" coverage that
+// used to live here was retired when `tracking checkpoint --live` started
+// actually posting (the C-phase fix for inbox
+// `tracking-closeout-review-state-complete-gap`). The stable error code is
+// retained in `execute.rs` for forward compatibility, but no live-mode
+// invocation emits it any more. Positive coverage of the new live + fixture
+// posting hop lives in `tracking_checkpoint_live.rs`.
 
 #[test]
 fn tracking_checkpoint_refusals_block_unknown_role() {
