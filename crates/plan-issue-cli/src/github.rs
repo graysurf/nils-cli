@@ -231,14 +231,20 @@ impl GhCliAdapter {
         };
         if !output.success {
             // upstream contract: `gh pr checks --required` exits non-zero
-            // and writes `no required checks reported on the '<branch>'
-            // branch` to stderr when the target branch has no
-            // branch-protection rule. Treat that case as the canonical
-            // zero-required success rollup so non-required failures do
-            // not block the close gate and the renderer can show
-            // `none required` rather than `unknown`. Other non-zero
-            // exits remain failures and propagate as `(None, None, [])`.
-            if output.stderr.contains("no required checks reported") {
+            // and writes one of two stderr messages for a branch with no
+            // required-check rule:
+            //   - `no required checks reported on the '<branch>' branch`
+            //     when the branch has checks but none are required, and
+            //   - `no checks reported on the '<branch>' branch` when the
+            //     branch has no checks at all (note: no "required" word).
+            // Both mean "zero required checks": treat them as the canonical
+            // zero-required success rollup so non-required failures do not
+            // block the close gate and the renderer can show `none required`
+            // rather than `unknown`. Other non-zero exits remain failures and
+            // propagate as `(None, None, [])`.
+            if output.stderr.contains("no required checks reported")
+                || output.stderr.contains("no checks reported")
+            {
                 return (Some("success".to_string()), Some(0), Vec::new());
             }
             return (None, None, Vec::new());
@@ -1122,6 +1128,14 @@ esac
                     stderr: "no required checks reported on the 'feature/x' branch\n".to_string(),
                 })
             },
+            "no_checks" => |_| {
+                Ok(GhRunOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "no checks reported on the 'feature/x' branch\n".to_string(),
+                })
+            },
             "auth" => |_| {
                 Ok(GhRunOutput {
                     success: false,
@@ -1142,6 +1156,22 @@ esac
         let adapter = GhCliAdapter::with_runner(false, stderr_runner("no_required"));
         let (state, count, non_required) =
             adapter.pr_required_summary("sympoies/nils-cli", 553, None);
+        assert_eq!(state.as_deref(), Some("success"));
+        assert_eq!(count, Some(0));
+        assert!(non_required.is_empty());
+    }
+
+    #[test]
+    fn pr_required_summary_recognises_no_checks_reported_stderr() {
+        // A branch with no checks at all makes `gh pr checks --required` exit 1
+        // with "no checks reported on the '<branch>' branch" (no "required"
+        // word). This must also classify as the zero-required success case so
+        // the closeout `Required` column renders `none required`, not the
+        // catch-all `unknown`. Regression for graysurf/plan-tracking-testbed#17
+        // (the sibling case sympoies/nils-cli#557 missed).
+        let adapter = GhCliAdapter::with_runner(false, stderr_runner("no_checks"));
+        let (state, count, non_required) =
+            adapter.pr_required_summary("sympoies/nils-cli", 8, None);
         assert_eq!(state.as_deref(), Some("success"));
         assert_eq!(count, Some(0));
         assert!(non_required.is_empty());
