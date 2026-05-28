@@ -485,11 +485,12 @@ wait_for_homebrew_tap_update() {
 
   local deadline=$((SECONDS + max_seconds))
   local run_id="" status="" conclusion="" url="" title=""
+  local failed_run_seen="" failed_run_seen_count=0
 
   while (( SECONDS < deadline )); do
     local runs_json
     runs_json="$(gh -R "$tap_repo" run list --workflow "$workflow" --limit 30 \
-      --json databaseId,status,conclusion,url,displayTitle,event 2>/dev/null)" \
+      --json databaseId,status,conclusion,url,displayTitle,event,createdAt 2>/dev/null)" \
       || { sleep 10; continue; }
 
     local match
@@ -502,17 +503,21 @@ import sys
 
 tag = sys.argv[1]
 runs = json.loads(sys.argv[2])
+matches = []
 for run in runs:
     title = run.get("displayTitle") or ""
     if tag in title:
-        print(json.dumps({
-            "id": run.get("databaseId"),
-            "status": run.get("status"),
-            "conclusion": run.get("conclusion"),
-            "url": run.get("url"),
-            "title": title,
-        }))
-        break
+        matches.append(run)
+if matches:
+    matches.sort(key=lambda run: (run.get("createdAt") or "", run.get("databaseId") or 0), reverse=True)
+    run = matches[0]
+    print(json.dumps({
+        "id": run.get("databaseId"),
+        "status": run.get("status"),
+        "conclusion": run.get("conclusion"),
+        "url": run.get("url"),
+        "title": run.get("displayTitle") or "",
+    }))
 PY
     )"
 
@@ -533,9 +538,26 @@ PY
         note "${tap_repo} ${workflow} run ${run_id} completed: ${url}"
         return 0
       fi
-      die "${tap_repo} ${workflow} run ${run_id} ended with conclusion='${conclusion}': ${url}"
+
+      local failed_key="${run_id}:${conclusion}"
+      if [[ "$failed_run_seen" == "$failed_key" ]]; then
+        failed_run_seen_count=$((failed_run_seen_count + 1))
+      else
+        failed_run_seen="$failed_key"
+        failed_run_seen_count=1
+      fi
+
+      if (( failed_run_seen_count >= 3 )); then
+        die "${tap_repo} ${workflow} run ${run_id} ended with conclusion='${conclusion}': ${url}"
+      fi
+
+      warn "${tap_repo} ${workflow} latest matching run ${run_id} ended with conclusion='${conclusion}'; waiting for a retry run: ${url}"
+      sleep 20
+      continue
     fi
 
+    failed_run_seen=""
+    failed_run_seen_count=0
     note "waiting for ${tap_repo} ${workflow} run ${run_id} (${status:-pending}, ${title}): ${url}"
     sleep 20
   done
