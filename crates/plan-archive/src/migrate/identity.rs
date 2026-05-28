@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use nils_common::git::{self as gitio, strip_userinfo};
+use nils_common::git::{self as gitio, parse_git_remote_url};
 
 /// Source-repo identity captured at migration time.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -87,32 +87,8 @@ fn head_commit(repo: &Path) -> Result<String, IdentityError> {
 /// (`https://github.com/org/repo.git`), nested GitLab groups, and
 /// optional `.git` suffix.
 pub fn parse_remote_url(url: &str) -> Option<(String, String, String)> {
-    let (host, path) = if let Some(rest) = url.strip_prefix("git@") {
-        let (host, path) = rest.split_once(':')?;
-        (host.to_string(), path.to_string())
-    } else if let Some(rest) = url.strip_prefix("ssh://") {
-        let (host_port, path) = rest.split_once('/')?;
-        let host_port = strip_userinfo(host_port);
-        let host = host_port
-            .split_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(host_port);
-        (host.to_string(), path.to_string())
-    } else if let Some(rest) = url.strip_prefix("https://") {
-        let (host, path) = rest.split_once('/')?;
-        (strip_userinfo(host).to_string(), path.to_string())
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        let (host, path) = rest.split_once('/')?;
-        (strip_userinfo(host).to_string(), path.to_string())
-    } else {
-        return None;
-    };
-
-    let path = path.trim_end_matches(".git").trim_matches('/');
-    if path.is_empty() {
-        return None;
-    }
-    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let parsed = parse_git_remote_url(url)?;
+    let mut segments: Vec<&str> = parsed.path.split('/').filter(|s| !s.is_empty()).collect();
     if segments.len() < 2 {
         return None;
     }
@@ -121,7 +97,7 @@ pub fn parse_remote_url(url: &str) -> Option<(String, String, String)> {
     if org_or_group_path.is_empty() {
         return None;
     }
-    Some((host, org_or_group_path, repo))
+    Some((parsed.host, org_or_group_path, repo))
 }
 
 #[cfg(test)]

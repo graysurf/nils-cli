@@ -148,49 +148,15 @@ pub fn select_adapter(repo: &Repo, force: bool) -> Box<dyn ProviderAdapter> {
 }
 
 fn parse_repo_with_host(raw: &str) -> Option<Repo> {
-    let trimmed = raw.trim().trim_end_matches('/');
-
-    // SSH `git@host:owner/repo(.git)` form uses `:` instead of `/` to
-    // separate host from path. Handle it before the generic split-on-`/`
-    // path so the colon does not contaminate the host segment.
-    if let Some(rest) = trimmed.strip_prefix("git@")
-        && let Some((host, path)) = rest.split_once(':')
-    {
-        return finalize_with_host(host, path);
-    }
-
-    // Strip URL scheme from `https://` / `http://` / `ssh://` form, leaving
-    // `[userinfo@]<host>/<path>`. Any userinfo is dropped below via
-    // `strip_userinfo`.
-    let host_and_path = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-        .or_else(|| trimmed.strip_prefix("ssh://"))
-        .map(|rest| rest.trim_start_matches('/'))
-        .unwrap_or(trimmed);
-
-    let (host, path) = host_and_path.split_once('/')?;
-    let host = common_git::strip_userinfo(host);
-    if !host.contains('.') {
-        // Bare `owner/repo` without a host segment.
-        return None;
-    }
-    finalize_with_host(host, path)
-}
-
-fn finalize_with_host(host: &str, path: &str) -> Option<Repo> {
-    let provider = classify_host(host)?;
-    let slug = path
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
-    if !is_owner_repo(slug) && !is_group_project_path(slug) {
+    let parsed = common_git::parse_git_remote_url(raw)?;
+    let provider = classify_host(&parsed.host)?;
+    if !is_owner_repo(&parsed.path) && !is_group_project_path(&parsed.path) {
         return None;
     }
     Some(Repo {
         provider,
-        slug: slug.to_string(),
-        host: Some(host.to_string()),
+        slug: parsed.path,
+        host: Some(parsed.host),
     })
 }
 
@@ -266,49 +232,12 @@ fn remote_provider() -> Option<(Provider, Option<String>)> {
 }
 
 fn parse_remote_url(remote: &str) -> Option<(String, String, Provider)> {
-    let trimmed = remote.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
+    let parsed = common_git::parse_git_remote_url(remote)?;
+    let provider = classify_host(&parsed.host)?;
+    if !is_owner_repo(&parsed.path) && !is_group_project_path(&parsed.path) {
         return None;
     }
-
-    // git@host:owner/repo(.git)
-    if let Some(rest) = trimmed.strip_prefix("git@")
-        && let Some((host, path)) = rest.split_once(':')
-    {
-        return finalize_remote(host, path);
-    }
-
-    // ssh://[userinfo@]host/owner/repo(.git)
-    if let Some(rest) = trimmed.strip_prefix("ssh://")
-        && let Some((host, path)) = rest.split_once('/')
-    {
-        let host = common_git::strip_userinfo(host);
-        return finalize_remote(host, path);
-    }
-
-    // https://host/owner/repo(.git) or http://...
-    for prefix in ["https://", "http://"] {
-        if let Some(rest) = trimmed.strip_prefix(prefix)
-            && let Some((host, path)) = rest.split_once('/')
-        {
-            let host = common_git::strip_userinfo(host);
-            return finalize_remote(host, path);
-        }
-    }
-
-    None
-}
-
-fn finalize_remote(host: &str, path: &str) -> Option<(String, String, Provider)> {
-    let provider = classify_host(host)?;
-    let slug = path
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
-    if !is_owner_repo(slug) && !is_group_project_path(slug) {
-        return None;
-    }
-    Some((slug.to_string(), host.to_string(), provider))
+    Some((parsed.path, parsed.host, provider))
 }
 
 #[cfg(test)]

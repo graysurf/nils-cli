@@ -101,6 +101,83 @@ pub fn strip_userinfo(host: &str) -> &str {
     host.rsplit_once('@').map(|(_, tail)| tail).unwrap_or(host)
 }
 
+/// Host + path split out of a parsed git remote URL.
+///
+/// `host` carries the bare hostname (port and userinfo removed). `path` carries
+/// the URL path with leading/trailing slashes and a single optional trailing
+/// `.git` removed; callers split it into owner/repo or group/project segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRemoteUrl {
+    pub host: String,
+    pub path: String,
+}
+
+/// Parse a git remote URL into a `host`/`path` pair, accepting the four shapes
+/// git itself accepts:
+///
+/// - `git@<host>:<path>` (SCP-style; `<path>` carries the slashes)
+/// - `ssh://[userinfo@]<host>[:<port>]/<path>`
+/// - `https://[userinfo@]<host>[:<port>]/<path>`
+/// - `http://[userinfo@]<host>[:<port>]/<path>`
+///
+/// Userinfo (`user@`, `user:pass@`, …) is stripped, ports are stripped from
+/// `host`, surrounding slashes and a single trailing `.git` are trimmed from
+/// `path`. Returns `None` for unknown schemes, empty hosts, or empty paths.
+pub fn parse_git_remote_url(url: &str) -> Option<GitRemoteUrl> {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // SCP-style: [user@]host:path (host never contains `/`)
+    if !trimmed.contains("://")
+        && let Some((host_with_user, path)) = trimmed.split_once(':')
+        && !host_with_user.contains('/')
+        && !path.contains("://")
+    {
+        let host = strip_userinfo(host_with_user);
+        return finalize(host, path);
+    }
+
+    // ssh://[userinfo@]host[:port]/path
+    if let Some(rest) = trimmed.strip_prefix("ssh://") {
+        let after_user = strip_userinfo(rest);
+        let (host_port, path) = after_user.split_once('/')?;
+        let host = host_port
+            .split_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port);
+        return finalize(host, path);
+    }
+
+    // https:// / http:// [userinfo@]host[:port]/path
+    for prefix in ["https://", "http://"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let (host_with_user, path) = rest.split_once('/')?;
+            let host_no_user = strip_userinfo(host_with_user);
+            let host = host_no_user
+                .split_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(host_no_user);
+            return finalize(host, path);
+        }
+    }
+
+    None
+}
+
+fn finalize(host: &str, path: &str) -> Option<GitRemoteUrl> {
+    let host = host.trim();
+    let path = path.trim_matches('/').trim_end_matches(".git");
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(GitRemoteUrl {
+        host: host.to_string(),
+        path: path.to_string(),
+    })
+}
+
 pub fn staged_name_only() -> io::Result<String> {
     staged_name_only_inner(None)
 }
@@ -667,5 +744,64 @@ mod tests {
     fn strip_userinfo_drops_user_password_prefix() {
         assert_eq!(strip_userinfo("user:pass@github.com"), "github.com");
         assert_eq!(strip_userinfo("user:p@ss@gitlab.com"), "gitlab.com");
+    }
+
+    #[test]
+    fn parse_git_remote_url_handles_scp_form() {
+        let r = parse_git_remote_url("git@github.com:sympoies/nils-cli.git").expect("scp");
+        assert_eq!(r.host, "github.com");
+        assert_eq!(r.path, "sympoies/nils-cli");
+    }
+
+    #[test]
+    fn parse_git_remote_url_handles_scp_form_nested_gitlab_group() {
+        let r = parse_git_remote_url("git@gitlab.example.com:acme/platform/backend/ingest.git")
+            .expect("scp nested");
+        assert_eq!(r.host, "gitlab.example.com");
+        assert_eq!(r.path, "acme/platform/backend/ingest");
+    }
+
+    #[test]
+    fn parse_git_remote_url_handles_ssh_with_userinfo_and_port() {
+        let r = parse_git_remote_url("ssh://deploy@gitlab.example.com:2222/group/proj.git")
+            .expect("ssh");
+        assert_eq!(r.host, "gitlab.example.com");
+        assert_eq!(r.path, "group/proj");
+    }
+
+    #[test]
+    fn parse_git_remote_url_handles_https_with_basic_auth() {
+        let r = parse_git_remote_url("https://user:pass@github.com/sympoies/nils-cli.git")
+            .expect("https");
+        assert_eq!(r.host, "github.com");
+        assert_eq!(r.path, "sympoies/nils-cli");
+    }
+
+    #[test]
+    fn parse_git_remote_url_handles_https_with_port() {
+        let r = parse_git_remote_url("https://gitlab.example.com:8443/group/proj").expect("port");
+        assert_eq!(r.host, "gitlab.example.com");
+        assert_eq!(r.path, "group/proj");
+    }
+
+    #[test]
+    fn parse_git_remote_url_handles_http() {
+        let r = parse_git_remote_url("http://gitlab.example.com/group/proj.git").expect("http");
+        assert_eq!(r.host, "gitlab.example.com");
+        assert_eq!(r.path, "group/proj");
+    }
+
+    #[test]
+    fn parse_git_remote_url_rejects_unknown_schemes_and_empty() {
+        assert!(parse_git_remote_url("").is_none());
+        assert!(parse_git_remote_url("file:///tmp/x.git").is_none());
+        assert!(parse_git_remote_url("ftp://host/path").is_none());
+    }
+
+    #[test]
+    fn parse_git_remote_url_rejects_empty_host_or_path() {
+        assert!(parse_git_remote_url("https://user:pass@/owner/repo").is_none());
+        assert!(parse_git_remote_url("ssh://deploy@/owner/repo").is_none());
+        assert!(parse_git_remote_url("https://github.com/").is_none());
     }
 }
