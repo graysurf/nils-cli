@@ -93,11 +93,10 @@ pub fn trim_trailing_newlines(input: &str) -> String {
     input.trim_end_matches(['\n', '\r']).to_string()
 }
 
-/// Strip the `userinfo@` prefix from the host segment of a parsed git remote
-/// URL. Returns the input unchanged when no `@` is present. Splits at the
-/// last `@` so embedded `@` characters inside basic-auth credentials are
-/// removed alongside the userinfo. Callers must pass the host segment after
-/// the scheme has been removed; passing a full URL is not supported.
+/// Return the substring after the last `@`, or the input unchanged when no
+/// `@` is present. Used by git remote URL parsers to drop the `userinfo@`
+/// prefix from a host segment (or a host+path string, since `/` cannot appear
+/// inside userinfo, splitting at the last `@` is safe for both shapes).
 pub fn strip_userinfo(host: &str) -> &str {
     host.rsplit_once('@').map(|(_, tail)| tail).unwrap_or(host)
 }

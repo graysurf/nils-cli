@@ -160,12 +160,15 @@ pub fn parse_host(url: &str) -> Option<String> {
     }
     if let Some(rest) = trimmed.strip_prefix("https://") {
         return host_before_path(rest)
-            .map(|host| nils_common::git::strip_userinfo(&host).to_string());
+            .map(|host| nils_common::git::strip_userinfo(&host).to_string())
+            .filter(|host| !host.is_empty());
     }
     if let Some(rest) = trimmed.strip_prefix("ssh://") {
         // ssh://[user@]host[:port]/owner/repo
         let after_user = nils_common::git::strip_userinfo(rest);
-        return host_before_path(after_user).map(strip_port);
+        return host_before_path(after_user)
+            .map(strip_port)
+            .filter(|host| !host.is_empty());
     }
     if let Some((user_host, _)) = trimmed.split_once(':')
         && let Some((_, host)) = user_host.rsplit_once('@')
@@ -286,6 +289,20 @@ mod tests {
             parse_host("ssh://deploy@gitlab.example.com:2222/group/proj.git"),
             Some("gitlab.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn parse_host_then_classify_recovers_provider_for_userinfo_remotes() {
+        let host = parse_host("https://user:pass@github.com/owner/repo.git").expect("host");
+        assert_eq!(classify_host(&host), Some(Provider::GitHub));
+        let host = parse_host("ssh://deploy@gitlab.example.com:22/group/proj.git").expect("host");
+        assert_eq!(classify_host(&host), Some(Provider::GitLab));
+    }
+
+    #[test]
+    fn parse_host_rejects_empty_after_userinfo() {
+        assert_eq!(parse_host("https://user:pass@/owner/repo"), None);
+        assert_eq!(parse_host("ssh://deploy@/owner/repo"), None);
     }
 
     #[test]

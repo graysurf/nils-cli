@@ -159,12 +159,13 @@ fn parse_repo_with_host(raw: &str) -> Option<Repo> {
         return finalize_with_host(host, path);
     }
 
-    // Strip URL scheme + optional `git@` prefix from `ssh://` form, leaving
-    // `<host>/<path>`.
+    // Strip URL scheme from `https://` / `http://` / `ssh://` form, leaving
+    // `[userinfo@]<host>/<path>`. Any userinfo is dropped below via
+    // `strip_userinfo`.
     let host_and_path = trimmed
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
-        .or_else(|| trimmed.strip_prefix("ssh://git@"))
+        .or_else(|| trimmed.strip_prefix("ssh://"))
         .map(|rest| rest.trim_start_matches('/'))
         .unwrap_or(trimmed);
 
@@ -276,10 +277,11 @@ fn parse_remote_url(remote: &str) -> Option<(String, String, Provider)> {
         return finalize_remote(host, path);
     }
 
-    // ssh://git@host/owner/repo(.git)
-    if let Some(rest) = trimmed.strip_prefix("ssh://git@")
+    // ssh://[userinfo@]host/owner/repo(.git)
+    if let Some(rest) = trimmed.strip_prefix("ssh://")
         && let Some((host, path)) = rest.split_once('/')
     {
+        let host = common_git::strip_userinfo(host);
         return finalize_remote(host, path);
     }
 
@@ -410,6 +412,24 @@ mod tests {
         assert_eq!(repo.provider, Provider::GitHub);
         assert_eq!(repo.slug, "sympoies/nils-cli");
         assert_eq!(repo.host.as_deref(), Some("github.com"));
+    }
+
+    #[test]
+    fn parse_remote_url_strips_userinfo_from_ssh_scheme() {
+        let (slug, host, provider) =
+            parse_remote_url("ssh://deploy@gitlab.example.com/group/proj.git").expect("parse");
+        assert_eq!(slug, "group/proj");
+        assert_eq!(host, "gitlab.example.com");
+        assert_eq!(provider, Provider::GitLab);
+    }
+
+    #[test]
+    fn parse_repo_with_host_strips_userinfo_from_ssh_scheme() {
+        let repo =
+            parse_repo_with_host("ssh://deploy@gitlab.example.com/group/proj").expect("parse");
+        assert_eq!(repo.provider, Provider::GitLab);
+        assert_eq!(repo.slug, "group/proj");
+        assert_eq!(repo.host.as_deref(), Some("gitlab.example.com"));
     }
 
     #[test]
