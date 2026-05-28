@@ -306,6 +306,68 @@ fn tracking_checkpoint_dry_run_skips_empty_session_and_validation_roles() {
 }
 
 #[test]
+fn tracking_checkpoint_blocks_review_role_without_decision() {
+    // Finding #20 from the plan-tracking testbed: `--post state,review` with
+    // no review decision in run state used to post only `state` and report
+    // `blocked: []`, silently dropping `review`. A review checkpoint with no
+    // decision carries no delivery evidence, so a requested-but-empty review
+    // must surface as a `review-missing-decision` blocker. (session/validation
+    // keep the skip-empty behavior covered by the test above.)
+    let fixture = write_fixture(&[
+        (
+            "source",
+            json!({"path": "p", "commit": "c"}),
+            "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:00Z",
+        ),
+        (
+            "plan",
+            json!({"path": "p", "commit": "c"}),
+            "## Plan Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:01Z",
+        ),
+    ]);
+    let tmp = TempDir::new().expect("tmp");
+    let rs_path = tmp.path().join("run-state.json");
+    write_run_state(&rs_path, "reviewing", &[]); // no review decision recorded
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "checkpoint",
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--post",
+        "review",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let result = json_stdout(&out)["payload"]["result"].clone();
+    let blocked_codes: Vec<&str> = result["blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["code"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        blocked_codes.contains(&"review-missing-decision"),
+        "blocked should carry review-missing-decision, got: {blocked_codes:?}"
+    );
+    let planned: Vec<&str> = result["roles_planned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        planned.is_empty(),
+        "review must not be planned without a decision: {planned:?}"
+    );
+}
+
+#[test]
 fn tracking_checkpoint_dry_run_writes_rendered_bodies_under_run_dir() {
     let fixture = write_fixture(&[
         (
