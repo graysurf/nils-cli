@@ -2213,7 +2213,6 @@ dependencies = [
  "indexmap",
  "nils-build-info",
  "nils-common",
- "nils-markdown",
  "nils-test-support",
  "pretty_assertions",
  "serde",
