@@ -41,3 +41,54 @@ fn derive_role(input: &CommentInput) -> PayloadRole {
         LifecycleCommentKind::Closeout => PayloadRole::Closeout,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::record::{LifecycleCommentKind, RecordProfile};
+
+    fn input(kind: LifecycleCommentKind) -> CommentInput {
+        CommentInput {
+            profile: RecordProfile::Tracking,
+            kind,
+            path: Some("plans/demo.md".to_string()),
+            commit: Some("abc123".to_string()),
+            content: Some("visible body".to_string()),
+            title: None,
+            details_summary: None,
+        }
+    }
+
+    #[test]
+    fn render_maps_every_comment_kind_to_registry_role() {
+        let cases = [
+            (LifecycleCommentKind::Source, PayloadRole::Source, "source"),
+            (LifecycleCommentKind::Plan, PayloadRole::Plan, "plan"),
+            (LifecycleCommentKind::State, PayloadRole::State, "state"),
+            (
+                LifecycleCommentKind::Session,
+                PayloadRole::Session,
+                "session",
+            ),
+            (
+                LifecycleCommentKind::Validation,
+                PayloadRole::Validation,
+                "validation",
+            ),
+            (LifecycleCommentKind::Review, PayloadRole::Review, "review"),
+            (
+                LifecycleCommentKind::Closeout,
+                PayloadRole::Closeout,
+                "closeout",
+            ),
+        ];
+
+        for (kind, role, marker_role) in cases {
+            let rendered = render(input(kind)).expect("comment renders");
+            assert_eq!(rendered.role, role);
+            assert_eq!(rendered.spec.role, role);
+            assert_eq!(rendered.spec.marker_role, marker_role);
+            assert!(rendered.body.contains("- Profile: tracking"));
+        }
+    }
+}

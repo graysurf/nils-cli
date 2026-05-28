@@ -26,6 +26,41 @@ struct Scenario {
     plan_path: PathBuf,
 }
 
+#[derive(Debug)]
+struct CmdOutput {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl CmdOutput {
+    fn stdout_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).to_string()
+    }
+
+    fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).to_string()
+    }
+}
+
+fn plan_archive_bin() -> PathBuf {
+    nils_test_support::bin::resolve("plan-archive")
+}
+
+fn run_plan_archive_in(dir: &Path, args: &[String], envs: &[(&str, String)]) -> CmdOutput {
+    let mut command = Command::new(plan_archive_bin());
+    command.args(args).current_dir(dir);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().expect("plan-archive command");
+    CmdOutput {
+        code: output.status.code().unwrap_or(1),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -42,6 +77,21 @@ fn git(repo: &Path, args: &[&str]) {
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout),
     );
+}
+
+fn git_stdout(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\nstderr={}\nstdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
 }
 
 fn build_scenario() -> Scenario {
@@ -89,6 +139,102 @@ fn build_scenario() -> Scenario {
         hosts,
         plan_path: PathBuf::from("docs/plans/2026-05-27-demo-plan"),
     }
+}
+
+fn arg_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn cli_migrate_args(scenario: &Scenario, apply: bool) -> Vec<String> {
+    let mut args = vec![
+        "migrate".to_string(),
+        "--plan".to_string(),
+        arg_path(&scenario.plan_path),
+        "--source-repo".to_string(),
+        arg_path(&scenario.source_repo),
+        "--archive".to_string(),
+        arg_path(&scenario.archive),
+        "--hosts".to_string(),
+        arg_path(&scenario.hosts),
+        "--issue".to_string(),
+        "https://github.com/sympoies/nils-cli/issues/571".to_string(),
+    ];
+    if apply {
+        args.push("--apply".to_string());
+    }
+    args
+}
+
+fn configure_archive_push_remote(scenario: &Scenario) {
+    let remote = scenario
+        .archive
+        .parent()
+        .expect("scenario root")
+        .join("archive-remote.git");
+    let out = Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(&remote)
+        .output()
+        .expect("git init --bare");
+    assert!(
+        out.status.success(),
+        "git init --bare failed:\nstderr={}\nstdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let remote_arg = arg_path(&remote);
+    git(&scenario.archive, &["remote", "add", "origin", &remote_arg]);
+    git(&scenario.archive, &["push", "-u", "origin", "main"]);
+}
+
+#[cfg(unix)]
+fn install_semantic_commit_stub(scenario: &Scenario) -> PathBuf {
+    let bin_dir = scenario
+        .archive
+        .parent()
+        .expect("scenario root")
+        .join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("semantic-commit");
+    fs::write(
+        &stub,
+        r#"#!/bin/sh
+repo=
+msg=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo)
+      repo="$2"
+      shift 2
+      ;;
+    -m)
+      msg="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ -z "$repo" ] || [ -z "$msg" ]; then
+  echo "missing repo or message" >&2
+  exit 2
+fi
+git -C "$repo" -c user.name=tester -c user.email=tester@example.com -c commit.gpgsign=false commit -q -m "$msg"
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(&stub).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&stub, perms).unwrap();
+    bin_dir
+}
+
+#[cfg(unix)]
+fn path_with_prepend(dir: &Path) -> String {
+    let current = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{current}", dir.display())
 }
 
 fn args_for(scenario: &Scenario) -> DispatchArgs {
@@ -139,6 +285,73 @@ fn dry_run_resolves_identity_target_and_files() {
     );
 
     assert_serialized_metadata(&report.metadata);
+}
+
+#[test]
+fn cli_dry_run_renders_plan_summary_without_mutating() {
+    let scenario = build_scenario();
+    let output = run_plan_archive_in(
+        &scenario.source_repo,
+        &cli_migrate_args(&scenario, false),
+        &[],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let stdout = output.stdout_text();
+    assert!(stdout.contains("plan-archive migrate (dry-run)"));
+    assert!(stdout.contains("archive exists?   : no"));
+    assert!(stdout.contains("classification    : personal"));
+    assert!(stdout.contains("files to copy     : 2"));
+    assert!(stdout.contains("issue : https://github.com/sympoies/nils-cli/issues/571"));
+    assert!(stdout.contains("(no files modified; pass --apply to commit)"));
+    assert!(scenario.source_repo.join(&scenario.plan_path).exists());
+    assert_eq!(output.stderr_text(), "");
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_apply_copies_plan_writes_metadata_pushes_archive_and_deletes_source() {
+    let scenario = build_scenario();
+    configure_archive_push_remote(&scenario);
+    let stub_dir = install_semantic_commit_stub(&scenario);
+
+    let output = run_plan_archive_in(
+        &scenario.source_repo,
+        &cli_migrate_args(&scenario, true),
+        &[("PATH", path_with_prepend(&stub_dir))],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let stdout = output.stdout_text();
+    assert!(stdout.contains("plan-archive migrate (applied)"));
+    assert!(stdout.contains("files copied           : 2"));
+
+    let target = scenario
+        .archive
+        .join("plans/github.com/graysurf/agent-runtime-kit/2026-05-27-demo-plan");
+    assert!(target.join("PLAN.md").exists());
+    assert!(target.join("notes.md").exists());
+    let metadata = fs::read_to_string(target.join("metadata.yaml")).unwrap();
+    assert!(metadata.contains("captured_classification:"));
+    assert!(metadata.contains("issue: https://github.com/sympoies/nils-cli/issues/571"));
+    assert!(scenario.archive.join("catalog.json").exists());
+    assert!(!scenario.source_repo.join(&scenario.plan_path).exists());
+
+    assert_eq!(
+        git_stdout(&scenario.source_repo, &["status", "--porcelain"]),
+        ""
+    );
+    assert_eq!(
+        git_stdout(&scenario.archive, &["status", "--porcelain"]),
+        ""
+    );
+    assert!(
+        git_stdout(
+            &scenario.archive,
+            &["ls-remote", "--heads", "origin", "main"]
+        )
+        .contains("refs/heads/main")
+    );
 }
 
 fn assert_serialized_metadata(m: &MetadataPayload) {

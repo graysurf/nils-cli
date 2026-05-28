@@ -15,6 +15,31 @@ fn binary_path() -> std::path::PathBuf {
     nils_test_support::bin::resolve("md-render")
 }
 
+fn write_fixture(
+    tmp: &TempDir,
+    template_name: &str,
+    template_body: &str,
+    data_body: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let template_path = tmp.path().join(template_name);
+    std::fs::write(&template_path, template_body).expect("write template");
+    let data_path = tmp.path().join("data.json");
+    std::fs::write(&data_path, data_body).expect("write data");
+    (template_path, data_path)
+}
+
+fn run_md_render(args: &[&str]) -> std::process::Output {
+    Command::new(binary_path())
+        .args(args)
+        .output()
+        .expect("md-render binary runs")
+}
+
+fn json_stdout(output: &std::process::Output) -> serde_json::Value {
+    let stdout = String::from_utf8(output.stdout.clone()).expect("stdout is UTF-8");
+    serde_json::from_str(stdout.trim()).expect("stdout is a JSON envelope")
+}
+
 #[test]
 fn md_render_text_envelope_writes_rendered_template_to_stdout() {
     let tmp = TempDir::new().expect("tempdir");
@@ -95,6 +120,189 @@ fn md_render_json_envelope_wraps_body_in_render_v1_envelope() {
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["data"]["template"], "greeting");
     assert_eq!(envelope["data"]["body"], "hi world\n");
+}
+
+#[test]
+fn md_render_render_subcommand_accepts_explicit_format_equals_json() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (template_path, data_path) = write_fixture(
+        &tmp,
+        "explicit.tera",
+        "hello {{ name }}",
+        r#"{"name":"Ada"}"#,
+    );
+
+    let output = run_md_render(&[
+        "--format=json",
+        "render",
+        "--template",
+        template_path.to_str().unwrap(),
+        "--data",
+        data_path.to_str().unwrap(),
+    ]);
+
+    assert!(output.status.success(), "md-render exited non-zero");
+    let envelope = json_stdout(&output);
+    assert_eq!(envelope["schema_version"], "cli.md-render.render.v1");
+    assert_eq!(envelope["data"]["template"], "explicit");
+    assert_eq!(envelope["data"]["body"], "hello Ada");
+}
+
+#[test]
+fn md_render_completion_exports_bash_and_zsh_scripts() {
+    let bash = run_md_render(&["completion", "bash"]);
+    assert!(bash.status.success(), "bash completion failed");
+    let bash_stdout = String::from_utf8(bash.stdout).expect("bash stdout is UTF-8");
+    assert!(bash_stdout.contains("complete -o nospace -F _md-render"));
+    assert!(bash_stdout.contains("md-render"));
+    assert!(bash_stdout.contains("render"));
+
+    let zsh = run_md_render(&["completion", "zsh"]);
+    assert!(zsh.status.success(), "zsh completion failed");
+    let zsh_stdout = String::from_utf8(zsh.stdout).expect("zsh stdout is UTF-8");
+    assert!(zsh_stdout.contains("#compdef md-render"));
+    assert!(zsh_stdout.contains("completion"));
+}
+
+#[test]
+fn md_render_unknown_subcommand_honors_json_format_detection() {
+    let output = run_md_render(&["--format=json", "nope"]);
+
+    assert!(!output.status.success(), "unknown subcommand should fail");
+    let envelope = json_stdout(&output);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "unknown-subcommand");
+}
+
+#[test]
+fn md_render_missing_data_argument_returns_json_contract_error() {
+    let tmp = TempDir::new().expect("tempdir");
+    let template_path = tmp.path().join("missing-data.tera");
+    std::fs::write(&template_path, "hi").expect("write template");
+
+    let output = run_md_render(&[
+        "--format",
+        "json",
+        "--template",
+        template_path.to_str().unwrap(),
+    ]);
+
+    assert!(!output.status.success(), "missing data should fail");
+    let envelope = json_stdout(&output);
+    assert_eq!(envelope["error"]["code"], "missing-argument");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--data is required")
+    );
+}
+
+#[test]
+fn md_render_invalid_template_stem_is_reported_before_reading_files() {
+    let tmp = TempDir::new().expect("tempdir");
+    let template_path = tmp.path().join(".tera");
+    std::fs::write(&template_path, "not read").expect("write template");
+    let data_path = tmp.path().join("data.json");
+    std::fs::write(&data_path, "{}").expect("write data");
+
+    let output = run_md_render(&[
+        "--format",
+        "json",
+        "--template",
+        template_path.to_str().unwrap(),
+        "--data",
+        data_path.to_str().unwrap(),
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "invalid template stem should fail"
+    );
+    let envelope = json_stdout(&output);
+    assert_eq!(envelope["error"]["code"], "invalid-template-path");
+}
+
+#[test]
+fn md_render_file_and_json_errors_keep_stable_error_codes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let template_path = tmp.path().join("broken.tera");
+    std::fs::write(&template_path, "{{ name }}").expect("write template");
+    let data_path = tmp.path().join("bad.json");
+    std::fs::write(&data_path, "{").expect("write data");
+
+    let missing_template = run_md_render(&[
+        "--format",
+        "json",
+        "--template",
+        tmp.path().join("missing.tera").to_str().unwrap(),
+        "--data",
+        data_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        json_stdout(&missing_template)["error"]["code"],
+        "template-read-failed"
+    );
+
+    let missing_data = run_md_render(&[
+        "--format",
+        "json",
+        "--template",
+        template_path.to_str().unwrap(),
+        "--data",
+        tmp.path().join("missing.json").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        json_stdout(&missing_data)["error"]["code"],
+        "data-read-failed"
+    );
+
+    let bad_json = run_md_render(&[
+        "--format",
+        "json",
+        "--template",
+        template_path.to_str().unwrap(),
+        "--data",
+        data_path.to_str().unwrap(),
+    ]);
+    assert_eq!(json_stdout(&bad_json)["error"]["code"], "data-parse-failed");
+}
+
+#[test]
+fn md_render_template_register_and_render_errors_are_distinct() {
+    let tmp = TempDir::new().expect("tempdir");
+    let data_path = tmp.path().join("data.json");
+    std::fs::write(&data_path, "{}").expect("write data");
+
+    let register_error_template = tmp.path().join("uses-now.tera");
+    std::fs::write(&register_error_template, "{{ now() }}").expect("write template");
+    let register_error = run_md_render(&[
+        "--format",
+        "json",
+        "--template",
+        register_error_template.to_str().unwrap(),
+        "--data",
+        data_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        json_stdout(&register_error)["error"]["code"],
+        "template-register-failed"
+    );
+
+    let render_error_template = tmp.path().join("missing-field.tera");
+    std::fs::write(&render_error_template, "{{ missing.field }}").expect("write template");
+    let render_error = run_md_render(&[
+        "--format",
+        "json",
+        "--template",
+        render_error_template.to_str().unwrap(),
+        "--data",
+        data_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        json_stdout(&render_error)["error"]["code"],
+        "template-render-failed"
+    );
 }
 
 #[test]
