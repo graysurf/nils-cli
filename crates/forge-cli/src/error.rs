@@ -263,10 +263,10 @@ impl ForgeError {
         }
     }
 
-    /// Render the error through the workspace envelope and return the
-    /// exit-code constant.
-    pub fn emit(&self, format: OutputFormat) -> i32 {
-        let code = self.exit_code();
+    /// Build the JSON envelope wire string the error would produce. Pulled out
+    /// of [`emit`] so unit tests can lock the parity-gated shape without
+    /// capturing stdout.
+    fn render_json(&self) -> String {
         let envelope_error = EnvelopeError::new(self.kind(), self.message());
         let envelope_error = match self.detail() {
             Some(detail) => envelope_error.with_details(serde_json::json!({ "detail": detail })),
@@ -274,23 +274,32 @@ impl ForgeError {
         };
         let envelope: Envelope<EnvelopeStub> =
             Envelope::failure(self.schema_version().to_string(), envelope_error);
+        serde_json::to_string(&envelope).unwrap_or_else(|_| String::from("{\"ok\":false}"))
+    }
 
+    /// Build the text envelope wire string the error would produce.
+    fn render_text(&self) -> String {
+        let kind = self.kind();
+        let detail_suffix = self
+            .detail()
+            .map(|d| format!("\n  detail: {d}"))
+            .unwrap_or_default();
+        format!(
+            "error: {kind}: {message}{detail_suffix}",
+            message = self.message()
+        )
+    }
+
+    /// Render the error through the workspace envelope and return the
+    /// exit-code constant.
+    pub fn emit(&self, format: OutputFormat) -> i32 {
+        let code = self.exit_code();
         match format {
             OutputFormat::Json => {
-                let serialized = serde_json::to_string(&envelope)
-                    .unwrap_or_else(|_| String::from("{\"ok\":false}"));
-                println!("{serialized}");
+                println!("{}", self.render_json());
             }
             OutputFormat::Text => {
-                let kind = self.kind();
-                let detail_suffix = self
-                    .detail()
-                    .map(|d| format!("\n  detail: {d}"))
-                    .unwrap_or_default();
-                eprintln!(
-                    "error: {kind}: {message}{detail_suffix}",
-                    message = self.message()
-                );
+                eprintln!("{}", self.render_text());
             }
         }
         let _ = BINARY; // silence unused-import lint when this module is consumed in isolation
@@ -350,6 +359,47 @@ mod tests {
         for (err, expected) in cases {
             assert_eq!(err.exit_code(), expected, "{}", err.kind());
         }
+    }
+
+    #[test]
+    fn json_envelope_carries_schema_ok_false_and_error_block() {
+        let err = ForgeError::provider_unsupported(
+            "cli.forge-cli.error.v1",
+            "unsupported forge host: bitbucket.org",
+            Some("remote_url=https://bitbucket.org/o/r.git".into()),
+        );
+        assert_eq!(
+            err.render_json(),
+            "{\"schema_version\":\"cli.forge-cli.error.v1\",\"ok\":false,\"error\":{\"code\":\"provider_unsupported\",\"message\":\"unsupported forge host: bitbucket.org\",\"details\":{\"detail\":\"remote_url=https://bitbucket.org/o/r.git\"}}}"
+        );
+    }
+
+    #[test]
+    fn json_envelope_omits_details_when_no_detail() {
+        let err = ForgeError::backend_missing("cli.forge-cli.error.v1", "gh not installed", None);
+        assert_eq!(
+            err.render_json(),
+            "{\"schema_version\":\"cli.forge-cli.error.v1\",\"ok\":false,\"error\":{\"code\":\"backend_missing\",\"message\":\"gh not installed\"}}"
+        );
+    }
+
+    #[test]
+    fn text_envelope_renders_kind_message_and_optional_detail() {
+        let err = ForgeError::provider_unsupported(
+            "cli.forge-cli.error.v1",
+            "unsupported forge host: bitbucket.org",
+            Some("remote_url=https://bitbucket.org/o/r.git".into()),
+        );
+        assert_eq!(
+            err.render_text(),
+            "error: provider_unsupported: unsupported forge host: bitbucket.org\n  detail: remote_url=https://bitbucket.org/o/r.git"
+        );
+
+        let err = ForgeError::backend_missing("cli.forge-cli.error.v1", "gh not installed", None);
+        assert_eq!(
+            err.render_text(),
+            "error: backend_missing: gh not installed"
+        );
     }
 
     #[test]
