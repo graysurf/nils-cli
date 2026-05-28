@@ -93,6 +93,15 @@ pub fn trim_trailing_newlines(input: &str) -> String {
     input.trim_end_matches(['\n', '\r']).to_string()
 }
 
+/// Strip the `userinfo@` prefix from the host segment of a parsed git remote
+/// URL. Returns the input unchanged when no `@` is present. Splits at the
+/// last `@` so embedded `@` characters inside basic-auth credentials are
+/// removed alongside the userinfo. Callers must pass the host segment after
+/// the scheme has been removed; passing a full URL is not supported.
+pub fn strip_userinfo(host: &str) -> &str {
+    host.rsplit_once('@').map(|(_, tail)| tail).unwrap_or(host)
+}
+
 pub fn staged_name_only() -> io::Result<String> {
     staged_name_only_inner(None)
 }
@@ -637,5 +646,27 @@ mod tests {
 
         let staged = staged_name_only().expect("staged names");
         assert!(staged.contains("docs.md"));
+    }
+
+    #[test]
+    fn strip_userinfo_passthrough_when_no_at() {
+        assert_eq!(strip_userinfo("github.com"), "github.com");
+        assert_eq!(
+            strip_userinfo("gitlab.example.com:2222"),
+            "gitlab.example.com:2222"
+        );
+        assert_eq!(strip_userinfo(""), "");
+    }
+
+    #[test]
+    fn strip_userinfo_drops_user_only_prefix() {
+        assert_eq!(strip_userinfo("git@github.com"), "github.com");
+        assert_eq!(strip_userinfo("x-access-token@gitlab.com"), "gitlab.com");
+    }
+
+    #[test]
+    fn strip_userinfo_drops_user_password_prefix() {
+        assert_eq!(strip_userinfo("user:pass@github.com"), "github.com");
+        assert_eq!(strip_userinfo("user:p@ss@gitlab.com"), "gitlab.com");
     }
 }
