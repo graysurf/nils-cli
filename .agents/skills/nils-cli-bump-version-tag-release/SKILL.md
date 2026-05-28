@@ -14,17 +14,18 @@ Prereqs:
 - `forge-cli` available on `PATH` for the default PR-based delivery (`forge-cli pr deliver`).
   Falls back to legacy direct-push only when `--direct-push` or `--skip-push` is passed.
 - `gh` available on `PATH` to use the CI-gated fast path (required for strict `--ci-gate-main`)
-  and to wait on `release.yml` runs during the tap stage.
+  and to wait on source / tap GitHub Actions runs during the tap stage.
 - `cargo-nextest` available on `PATH` when full release checks are required (`NILS_CLI_TEST_RUNNER=nextest`).
 - Release checks available at `.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh` (unless `--skip-checks`).
-- Tap stage prereqs (only when the tap stage runs — auto-skipped otherwise):
-  - `curl` and `ruby` on `PATH`. `brew` is recommended; `brew style` is skipped with a warning if absent.
-  - A homebrew-tap git work tree resolvable via one of:
-    - `--tap-dir <path>` flag,
-    - `NILS_CLI_HOMEBREW_TAP_DIR` env var,
-    - convention `<nils-cli repo parent>/homebrew-tap`.
-  - Tap on `main`, clean, and fast-forwardable from `origin/main`. The script fetches with
-    `--no-tags` to avoid stale-tag clobbers (e.g. legacy unprefixed tags).
+- Tap stage prereqs (only when the tap stage runs):
+  - `sympoies/nils-cli` repo secret `HOMEBREW_TAP_DISPATCH_TOKEN` must allow
+    `repository_dispatch` on `sympoies/homebrew-tap`.
+  - `sympoies/homebrew-tap` default branch must include
+    `.github/workflows/update-nils-cli-formula.yml`.
+  - `brew` is optional but required for the final local install / upgrade check.
+  - A local homebrew-tap work tree is optional; when resolvable via `--tap-dir`,
+    `NILS_CLI_HOMEBREW_TAP_DIR`, or convention, it is fast-forwarded after the
+    tap update completes.
 
 Inputs:
 
@@ -57,18 +58,21 @@ Inputs:
   - `NILS_CLI_PR_WAIT` (env var; PR mode only: budget passed to `forge-cli pr deliver --timeout`,
     default `30m`)
 - Optional (tap stage):
-  - `--tap-dir <path>` (overrides env + convention resolution)
+  - `--tap-repo <owner/repo>` (tap repo to wait on, default `sympoies/homebrew-tap`;
+    env `NILS_CLI_HOMEBREW_TAP_REPO`)
+  - `--tap-dir <path>` (optional local tap checkout to fast-forward after the remote update)
   - `--skip-tap` (skip the tap stage entirely)
-  - `--skip-tap-wait` (do not wait for tap `release.yml` after pushing the prefix tag)
-  - `--skip-tap-tag` (commit + push tap formula bump but do not create the prefix tag)
-  - `--from-tap` (resume mode: skip nils-cli stages 1-8 and run only the tap stage; requires
+  - `--skip-tap-wait` (do not wait for the tap formula-update workflow)
+  - `--skip-tap-tag` (legacy local-tap option; not used by the dispatch-based default path)
+  - `--from-tap` (resume mode: skip nils-cli stages 1-8 and wait for the tap stage; requires
     an existing local `v<version>` tag in the nils-cli work tree)
   - `--tap-formula <name>` (formula basename, default `nils-cli`; reserved for AWL et al.)
   - `--skip-dev-clean` (do not clear `~/.local/nils-cli/bin` after a successful release)
-  - `--skip-local-brew-upgrade` (do not run `brew update` + `brew upgrade <formula>` for an installed local formula after a successful tap release)
-  - `NILS_CLI_HOMEBREW_TAP_DIR` (env var; tap path)
+  - `--skip-local-brew-upgrade` (do not run `brew update` + `brew upgrade/install <formula>` after a successful tap update)
+  - `NILS_CLI_HOMEBREW_TAP_DIR` (env var; optional local tap checkout path)
+  - `NILS_CLI_HOMEBREW_TAP_REPO` (env var; tap repo slug)
   - `NILS_CLI_RELEASE_WAIT_SECONDS` (env var; max seconds to wait for source `release.yml`, default 1200)
-  - `NILS_CLI_TAP_WAIT_SECONDS` (env var; max seconds to wait for tap `release.yml`, default 1200)
+  - `NILS_CLI_TAP_WAIT_SECONDS` (env var; max seconds to wait for tap formula update, default 1200)
 
 Default delivery mode (PR-based):
 
@@ -80,7 +84,9 @@ Default delivery mode (PR-based):
   squash-merges into `main` (deleting the source branch).
 - Fast-forwards local `main` to the merge commit, creates the annotated tag `vX.Y.Z` on that
   commit, and pushes the tag to trigger `release.yml`.
-- The tap stage then runs as before.
+- The tap stage waits for the source release workflow to finish, then waits for
+  the dispatched `sympoies/homebrew-tap` formula-update workflow to finish before
+  performing the local Homebrew install / upgrade check.
 
 Use `--direct-push` to opt out and reuse the legacy "commit + tag directly on the current
 branch" path. Use `--skip-push` to keep everything local without opening a PR (also implies
@@ -105,10 +111,9 @@ Default tap stage activation:
 
 - The tap stage runs automatically after a successful nils-cli tag push when ALL of:
   - `--skip-push` is **not** set,
-  - `--skip-tap` is **not** set,
-  - tap directory resolves via flag/env/convention.
-- If no flag/env is set and the conventional path does not exist, the tap stage is skipped
-  with a one-line note (no failure). If a flag or env is set but invalid, the script fails loud.
+  - `--skip-tap` is **not** set.
+- The tap workflow update runs remotely through GitHub Actions; a local
+  homebrew-tap checkout is optional and only used for a best-effort fast-forward.
 
 Outputs (nils-cli stage):
 
@@ -134,17 +139,15 @@ Outputs (nils-cli stage):
 
 Outputs (tap stage):
 
-- Fetches tap `origin/main` with `--no-tags`, fast-forwards `main`.
-- Waits for the source repo's `release.yml` run on tag `vX.Y.Z` to complete `success` (so artifacts exist).
-- Parses artifact origin (`<owner>/<repo>`) from the existing formula URL — no hardcoded source.
-- Fetches `.tar.gz.sha256` sidecars for all four platforms (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`) from that origin.
-- Rewrites `Formula/<formula>.rb` URL + sha256 lines for those four platforms (idempotent: no-op when already at target).
-- Validates with `ruby -c` and (when available) `HOMEBREW_NO_AUTO_UPDATE=1 brew style`.
-- Creates a tap-side semantic commit `chore(formula): bump <formula> to v<version>` and pushes `main`.
-- Creates an annotated prefix tag `<formula>-v<version>` and pushes it to trigger the tap `release.yml`.
-- Unless `--skip-tap-wait`, waits for the tap `release.yml` run on the prefix tag to finish `success`.
+- Waits for the source repo's `release.yml` run on tag `vX.Y.Z` to complete `success`.
+- The source release workflow dispatches `sympoies/homebrew-tap` after the GitHub Release and assets exist.
+- Unless `--skip-tap-wait`, waits for `update-nils-cli-formula.yml` in the tap repo to finish `success`.
+- The tap workflow fetches `.tar.gz.sha256` sidecars for all four platforms, rewrites
+  `Formula/nils-cli.rb`, validates and brew-tests it on Linux/macOS, commits to tap `main`,
+  and creates the tap release record for `nils-cli-vX.Y.Z`.
+- If a local tap checkout resolves and is clean/on `main`, fast-forwards it after the remote update.
 - Unless `--skip-dev-clean`, clears `~/.local/nils-cli/bin` so the freshly published brew formula takes precedence over any prior dev install (no-op when the directory is missing or already empty).
-- Unless `--skip-local-brew-upgrade`, when Homebrew is available and `<formula>` is installed locally, runs `brew update`, runs `brew upgrade <formula>`, and verifies `brew list --versions <formula>` matches `X.Y.Z`.
+- Unless `--skip-local-brew-upgrade`, when Homebrew is available, taps `sympoies/tap` when needed, runs `brew update`, installs or upgrades `<formula>`, and verifies `brew list --versions <formula>` matches `X.Y.Z`.
 
 Exit codes:
 
@@ -173,14 +176,10 @@ Failure modes:
   without that verification.
 - Commit or tag creation fails.
 - Tap stage failures (only when the tap stage runs):
-  - `--tap-dir` or `NILS_CLI_HOMEBREW_TAP_DIR` set but does not resolve to a git work tree.
-  - `--from-tap` requested without a matching local `v<version>` tag, without an `origin` slug, or without a resolvable tap directory.
-  - Tap is dirty, off `main`, or not fast-forward to `origin/main`.
-  - `curl` / `ruby` missing on `PATH`.
+  - `--from-tap` requested without a matching local `v<version>` tag or without a resolvable source repo slug.
   - `release.yml` wait exceeds `NILS_CLI_RELEASE_WAIT_SECONDS` (or the run finishes non-success).
-  - Formula does not reference all four expected archs (would silently miss platforms otherwise).
-  - sha256 sidecar fetch fails or returns non-hex content.
-  - `ruby -c` or `brew style` fail on the rewritten formula.
+  - Source release workflow cannot dispatch `sympoies/homebrew-tap` because `HOMEBREW_TAP_DISPATCH_TOKEN` is missing or unauthorized.
+  - Tap `update-nils-cli-formula.yml` wait exceeds `NILS_CLI_TAP_WAIT_SECONDS` or finishes non-success.
   - Local Homebrew upgrade fails, or the installed local formula version remains different from `X.Y.Z`.
   - `--from-tap` and `--skip-tap` passed together (mutually exclusive).
 
@@ -193,7 +192,7 @@ Failure modes:
 - Validate inputs and environment.
 - Probe `RUSTC_WRAPPER` and disable it when it is incompatible with the active `rustc`.
 - Resolve delivery mode (PR by default; `--direct-push` or `--skip-push` switches to legacy).
-- `--from-tap` shortcut: skip nils-cli bump+tag and jump to the tap stage.
+- `--from-tap` shortcut: skip nils-cli bump+tag and wait for the tap stage for an existing tag.
 - nils-cli stage:
   - Optional pre-bump strict gate: `--ci-gate-main` requires the prior `origin/main` commit's `ci.yml` to be green (otherwise dies).
   - PR mode: switch from `main` to a freshly created `chore/release-X-Y-Z` branch
@@ -210,16 +209,11 @@ Failure modes:
     the source `release.yml` and `ci.yml`. Unless `--skip-ci-wait`, wait for `ci.yml` on the
     bump commit to reach `completed success` before entering the tap stage (use
     `NILS_CLI_CI_WAIT_SECONDS` to tune the timeout).
-- Tap stage (auto-skipped on `--skip-push` / `--skip-tap` / unresolved tap dir):
-  - Verify tap is on clean `main`; fetch `--no-tags` and fast-forward.
+- Tap stage (auto-skipped on `--skip-push` / `--skip-tap`):
   - Wait for source `release.yml` on `vX.Y.Z` to reach `completed success`.
-  - Parse artifact origin from existing formula; fetch four `.sha256` sidecars.
-  - Rewrite `Formula/<formula>.rb` URL + sha256 lines (idempotent: no-op if already at target).
-  - Validate with `ruby -c` (+ `brew style` when available).
-  - `semantic-commit` + push `main` (only when formula changed).
-  - Create + push annotated prefix tag `<formula>-vX.Y.Z` to trigger tap `release.yml`.
-  - Unless `--skip-tap-wait`, wait for tap `release.yml` to finish `success`.
-  - Clear stale dev-install binaries, then upgrade the installed local Homebrew formula when present.
+  - Unless `--skip-tap-wait`, wait for tap `update-nils-cli-formula.yml` to finish `success`.
+  - Best-effort fast-forward a local tap checkout when one resolves cleanly.
+  - Clear stale dev-install binaries, then install or upgrade the local Homebrew formula.
 
 ## Alternate entry points
 
