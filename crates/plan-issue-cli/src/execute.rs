@@ -241,16 +241,28 @@ fn resolve_record_bundle(
     })
 }
 
+// Resolve a working directory for git operations targeting `path`.
+// Using the path's parent (rather than the process cwd) lets the
+// caller pass absolute bundle paths that live in a different repo
+// than the one they happened to launch the binary from — git itself
+// walks up to the `.git` toplevel from there.
+fn git_cwd_for_path(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+
 fn last_commit_for_path(path: &Path) -> Result<String, CommandError> {
     let arg_path = path.to_string_lossy().to_string();
-    let output =
-        common_git::run_output(&["log", "-n", "1", "--format=%H", "--", arg_path.as_str()])
-            .map_err(|err| {
-                CommandError::runtime(
-                    "record-open-git-log-failed",
-                    format!("git log {arg_path} failed: {err}"),
-                )
-            })?;
+    let cwd = git_cwd_for_path(path);
+    let output = common_git::run_output_in(
+        cwd,
+        &["log", "-n", "1", "--format=%H", "--", arg_path.as_str()],
+    )
+    .map_err(|err| {
+        CommandError::runtime(
+            "record-open-git-log-failed",
+            format!("git log {arg_path} failed: {err}"),
+        )
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(CommandError::runtime(
@@ -273,13 +285,15 @@ fn last_commit_for_path(path: &Path) -> Result<String, CommandError> {
 
 fn path_is_dirty(path: &Path) -> Result<bool, CommandError> {
     let arg_path = path.to_string_lossy().to_string();
-    let output = common_git::run_output(&["status", "--porcelain", "--", arg_path.as_str()])
-        .map_err(|err| {
-            CommandError::runtime(
-                "record-open-git-status-failed",
-                format!("git status {arg_path} failed: {err}"),
-            )
-        })?;
+    let cwd = git_cwd_for_path(path);
+    let output =
+        common_git::run_output_in(cwd, &["status", "--porcelain", "--", arg_path.as_str()])
+            .map_err(|err| {
+                CommandError::runtime(
+                    "record-open-git-status-failed",
+                    format!("git status {arg_path} failed: {err}"),
+                )
+            })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(CommandError::runtime(
@@ -2327,16 +2341,40 @@ fn render_checkpoint_role(
         _ => unreachable!(),
     };
 
+    // For the `state` role, render from the bundle's canonical
+    // `execution-state.md` when one is known. This carries the full
+    // per-task ledger (maintained by `plan-tooling ledger-update`)
+    // into the lifecycle comment instead of the single-row synthesized
+    // baseline. Fall back to the synthesized payload when no execution
+    // state file is recorded or the file can't be read — the renderer
+    // then continues to emit the deterministic baseline body.
+    let summary = if matches!(role, PayloadRole::State) {
+        load_state_markdown_summary(run)
+    } else {
+        None
+    };
+    let summary_ref = summary.as_deref();
+
     let body = lifecycle_record::render_record_post_comment_with_display(
         RecordProfile::Tracking,
         kind,
         payload,
-        None,
+        summary_ref,
         Some(run.updated_at.as_str()),
         TaskLedgerDisplay::Auto,
     )
     .map_err(|err| CommandError::runtime("tracking-checkpoint-render-failed", err))?;
     Ok(CheckpointRoleResult::Rendered(body))
+}
+
+fn load_state_markdown_summary(run: &crate::tracking::run_state::ExecutionRun) -> Option<String> {
+    let path = run.execution_state_file.as_ref()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.contains("## Task Ledger") {
+        Some(content)
+    } else {
+        None
+    }
 }
 
 fn synthesize_state_payload(run: &crate::tracking::run_state::ExecutionRun) -> Value {
@@ -2488,6 +2526,19 @@ fn resolve_checkpoint_inputs(
         )?),
         None => None,
     };
+    // Auto-fetch live provider evidence when no fixture / explicit files
+    // were supplied but the issue is named. The live checkpoint path
+    // needs body + comments to determine `RECORD_OPEN_INITIAL` and avoid
+    // the `issue-evidence-missing` blocker; without this, callers must
+    // pre-snapshot before every checkpoint.
+    if body.is_none()
+        && comments.is_none()
+        && let (Some(repo), Some(issue)) = (args.provider_repo.as_deref(), args.issue)
+    {
+        let (b, c) =
+            auto_fetch_issue_evidence(repo, issue, "tracking-checkpoint-evidence-fetch-failed")?;
+        return Ok((Some(b), Some(c)));
+    }
     Ok((body, comments))
 }
 
@@ -2676,7 +2727,36 @@ fn resolve_close_ready_inputs(
         )?),
         None => None,
     };
+    // Fall back to live provider lookup when no fixture / explicit files
+    // were given but the caller named the issue. Keeps the close-ready
+    // surface usable in the prescribed live `tracking close-ready
+    // --provider-repo … --issue …` shape without forcing every caller to
+    // pre-snapshot the issue.
+    if body.is_none()
+        && comments.is_none()
+        && let (Some(repo), Some(issue)) = (args.provider_repo.as_deref(), args.issue)
+    {
+        let (b, c) =
+            auto_fetch_issue_evidence(repo, issue, "tracking-close-ready-evidence-fetch-failed")?;
+        return Ok((Some(b), Some(c)));
+    }
     Ok((body, comments))
+}
+
+/// Auto-fetch (body, comments_json) for live tracking calls so callers do
+/// not have to pre-snapshot the issue when `--provider-repo` + `--issue`
+/// are available. Read-only; uses the default `force=false` adapter.
+fn auto_fetch_issue_evidence(
+    provider_repo: &str,
+    issue: u64,
+    error_code: &'static str,
+) -> Result<(String, String), CommandError> {
+    let repo_info = crate::provider::resolve_repo(Some(provider_repo))
+        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+    let adapter = crate::provider::select_adapter(&repo_info, false);
+    adapter
+        .issue_evidence(&repo_info.slug, issue)
+        .map_err(|err| CommandError::runtime(error_code, err))
 }
 
 fn default_run_id(issue: u64, now: &str) -> String {
@@ -2789,9 +2869,18 @@ fn resolve_tracking_status_inputs(
         None => None,
     };
     if body.is_none() && comments.is_none() {
+        // Auto-fetch live provider evidence when the issue is named but no
+        // file / fixture inputs were supplied. Keeps `tracking status
+        // --provider-repo … --issue …` usable without a preceding
+        // `gh issue view …` snapshot.
+        if let (Some(repo), Some(issue)) = (args.provider_repo.as_deref(), args.issue) {
+            let (b, c) =
+                auto_fetch_issue_evidence(repo, issue, "tracking-status-evidence-fetch-failed")?;
+            return Ok((Some(b), Some(c)));
+        }
         return Err(CommandError::usage(
             "tracking-status-missing-input",
-            "tracking status requires --fixture <dir>, --comments-json <path>, or --body-file <path>",
+            "tracking status requires --fixture <dir>, --comments-json <path>, --body-file <path>, or `--provider-repo` + `--issue` for live fetch",
         ));
     }
     Ok((body, comments))

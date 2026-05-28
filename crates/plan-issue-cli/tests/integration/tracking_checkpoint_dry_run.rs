@@ -69,6 +69,32 @@ fn write_run_state(path: &std::path::Path, phase: &str, notes: &[&str]) {
     fs::write(path, body.to_string()).expect("run-state");
 }
 
+fn write_run_state_with_exec_file(
+    path: &std::path::Path,
+    phase: &str,
+    notes: &[&str],
+    exec_file: &std::path::Path,
+) {
+    let body = json!({
+        "schema": "plan-issue.execution-run.v1",
+        "run_id": "run-1",
+        "repo": "owner/repo",
+        "issue": 123,
+        "profile": "tracking",
+        "phase": phase,
+        "created_at": "2026-05-26T00:00:00Z",
+        "updated_at": "2026-05-26T01:00:00Z",
+        "execution_state_file": exec_file.to_string_lossy(),
+        "selected_scope": {
+            "task": "1.2",
+            "title": "demo"
+        },
+        "branch": "feat/x",
+        "notes": notes,
+    });
+    fs::write(path, body.to_string()).expect("run-state");
+}
+
 #[test]
 fn tracking_checkpoint_dry_run_renders_state_role_from_run_state() {
     let fixture = write_fixture(&[
@@ -127,6 +153,105 @@ fn tracking_checkpoint_dry_run_renders_state_role_from_run_state() {
     let body = rendered[0]["body"].as_str().expect("body").to_string();
     assert!(body.starts_with("<!-- plan-issue-record:v2 role=state"));
     assert!(body.contains("## Task Ledger"));
+}
+
+#[test]
+fn tracking_checkpoint_state_body_renders_full_execution_state_ledger() {
+    // Regression guard for the render-layer half of the
+    // plan-task-ledger-durability rollout: when the run state declares
+    // an `execution_state_file`, the state lifecycle body must carry
+    // the *full* per-task ledger from that file, not just the
+    // synthesized `selected_task` row.
+    let fixture = write_fixture(&[
+        (
+            "source",
+            json!({"path": "p", "commit": "c"}),
+            "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:00Z",
+        ),
+        (
+            "plan",
+            json!({"path": "p", "commit": "c"}),
+            "## Plan Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:01Z",
+        ),
+        (
+            "state",
+            json!({"status": "in-progress", "target_scope": "x", "tasks": [], "prs": []}),
+            "## Execution State\n\n- Profile: tracking\n- Status: in-progress\n\n## Task Ledger\n\n| ID | Status |\n| --- | --- |\n| 1.1 | done |",
+            "2026-05-26T00:00:02Z",
+        ),
+    ]);
+    let tmp = TempDir::new().expect("tmp");
+    let exec_path = tmp.path().join("plan-execution-state.md");
+    fs::write(
+        &exec_path,
+        "\
+# Demo Plan Execution State
+
+<!-- plan-issue-record:v2 role=state profile=tracking -->
+## Execution State
+
+- Status: in-progress
+- Target scope: demo
+- Current task: Task 1.2
+
+## Task Ledger
+
+| ID | Status | Task | Evidence | Notes |
+| --- | --- | --- | --- | --- |
+| 1.1 | done | First task | https://example/c/aaa | initial |
+| 1.2 | in-progress | Second task | — | continuing |
+| 1.3 | pending | Third task | — | not started |
+",
+    )
+    .expect("write exec state");
+
+    let rs_path = tmp.path().join("run-state.json");
+    write_run_state_with_exec_file(&rs_path, "implementing", &["progress"], &exec_path);
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "checkpoint",
+        "--profile",
+        "tracking",
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--post",
+        "state",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let result = json_stdout(&out)["payload"]["result"].clone();
+    let body = result["rendered"][0]["body"]
+        .as_str()
+        .expect("body")
+        .to_string();
+    assert!(
+        body.contains("## Task Ledger"),
+        "body missing ledger: {body}"
+    );
+    assert!(
+        body.contains("| 1.1 | done |"),
+        "body missing row 1.1 done: {body}"
+    );
+    assert!(
+        body.contains("| 1.2 | in-progress |"),
+        "body missing row 1.2 in-progress: {body}"
+    );
+    assert!(
+        body.contains("| 1.3 | pending |"),
+        "body missing row 1.3 pending: {body}"
+    );
+    // The fallback synthesizer emits a single "selected" placeholder row;
+    // assert we did NOT regress to it.
+    assert!(
+        !body.contains("| Task 1.2 | in-progress | selected |"),
+        "regressed to single-row synthesized fallback: {body}"
+    );
 }
 
 #[test]
