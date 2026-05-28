@@ -330,3 +330,23 @@ pub struct TrackingStatusArgs {
     #[arg(long = "expect-visible", default_value_t = false)]
     pub expect_visible: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RunPhaseArg;
+    use pretty_assertions::assert_eq;
+
+    /// `RunPhaseArg::as_str` is the run-state JSON `phase` contract (see
+    /// `execute.rs`). Pin every variant's snake_case wire value so a
+    /// renamed or reordered arm cannot silently change emitted run state.
+    #[test]
+    fn run_phase_arg_as_str_matches_wire_contract() {
+        assert_eq!(RunPhaseArg::Initial.as_str(), "initial");
+        assert_eq!(RunPhaseArg::Implementing.as_str(), "implementing");
+        assert_eq!(RunPhaseArg::Validating.as_str(), "validating");
+        assert_eq!(RunPhaseArg::Reviewing.as_str(), "reviewing");
+        assert_eq!(RunPhaseArg::Blocked.as_str(), "blocked");
+        assert_eq!(RunPhaseArg::ReadyForClose.as_str(), "ready_for_close");
+        assert_eq!(RunPhaseArg::Closed.as_str(), "closed");
+    }
+}
