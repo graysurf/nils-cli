@@ -125,6 +125,28 @@ assert_workspace_manifest_escalates_to_workspace() {
   output="$(plan_for --changed-file Cargo.toml)"
   assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=workspace"
   assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_REASON=workspace manifest changed: Cargo.toml"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_THIRD_PARTY_ARTIFACTS=1"
+  echo "ok"
+}
+
+assert_package_manifest_requests_third_party_artifacts() {
+  echo "== package manifest requests third-party artifact audit =="
+  local output
+  output="$(plan_for --changed-file crates/plan-tooling/Cargo.toml)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=packages"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE=nils-plan-tooling"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_THIRD_PARTY_ARTIFACTS=1"
+  echo "ok"
+}
+
+assert_third_party_artifact_change_escapes_docs_only() {
+  echo "== third-party artifact change escapes docs-only mode =="
+  local output
+  output="$(plan_for --changed-file THIRD_PARTY_LICENSES.md)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=workspace"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_CHECKS=1"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_THIRD_PARTY_ARTIFACTS=1"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_REASON=third-party artifact output changed: THIRD_PARTY_LICENSES.md"
   echo "ok"
 }
 
@@ -156,6 +178,8 @@ assert_shared_crate_escalates_to_workspace
 assert_docs_only_uses_docs_mode
 assert_docs_only_plan_does_not_require_cargo
 assert_workspace_manifest_escalates_to_workspace
+assert_package_manifest_requests_third_party_artifacts
+assert_third_party_artifact_change_escapes_docs_only
 assert_docs_plus_package_runs_both
 assert_shell_script_is_reported
 
