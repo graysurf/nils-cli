@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, anyhow};
 use nils_common::git as common_git;
 use std::process::Output;

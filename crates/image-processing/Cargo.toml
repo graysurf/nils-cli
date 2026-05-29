@@ -19,15 +19,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-globset = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 nils-common = { version = "0.27.0", path = "../nils-common", package = "nils-common" }
 nils-term = { version = "0.27.0", path = "../nils-term", package = "nils-term" }
 resvg = "0.47"
 roxmltree = "0.21"
-usvg = "0.47"
 uuid = { version = "1", features = ["v4"] }
-walkdir = "2"
 
 [dev-dependencies]
 nils-test-support = { version = "0.27.0", path = "../nils-test-support" }

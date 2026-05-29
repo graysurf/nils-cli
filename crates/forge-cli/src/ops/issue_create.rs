@@ -259,11 +259,6 @@ fn render_text(payload: &IssueCreatePayload) {
     );
 }
 
-// `_path` placeholder kept for IDE breadcrumb when grepping for body-file
-// callers; the real path comes from the tempfile handle.
-#[allow(dead_code)]
-const _PATH_BREADCRUMB: &str = "body-file -> tempfile";
-
 #[cfg(test)]
 mod tests {
     use super::*;

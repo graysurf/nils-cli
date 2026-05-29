@@ -139,7 +139,6 @@ pub fn resolve_repo(repo_override: Option<&str>) -> Result<Repo, String> {
 /// whose methods all return a `provider_not_implemented` error. Sprint 2.2
 /// fills in the actual GitLab calls (via `forge-cli` subprocesses) and wires
 /// this factory into the per-dispatcher adapter construction sites.
-#[allow(dead_code)]
 pub fn select_adapter(repo: &Repo, force: bool) -> Box<dyn ProviderAdapter> {
     match repo.provider {
         Provider::GitHub => Box::new(crate::github::GhCliAdapter::new(force)),
