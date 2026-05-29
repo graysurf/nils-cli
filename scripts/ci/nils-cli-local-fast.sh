@@ -11,6 +11,8 @@ Description:
   - Detects changed files against a merge-base with <ref> plus staged,
     unstaged, and untracked files.
   - Runs docs-only checks for documentation-only changes.
+  - Runs third-party artifact audit when Cargo manifests, Cargo.lock, the
+    generator scripts, or the generated third-party artifact files change.
   - Runs package-scoped fmt/clippy/tests for non-shared crate changes.
   - Escalates to a workspace Rust gate for shared crates or workspace-level
     files where package-scoped checks can miss reverse-dependency breakage.
@@ -163,15 +165,32 @@ def is_doc_path(path):
     )
 
 
+def affects_third_party_artifacts(path):
+    return (
+        path in {
+            "Cargo.toml",
+            "Cargo.lock",
+            "THIRD_PARTY_LICENSES.md",
+            "THIRD_PARTY_NOTICES.md",
+            "scripts/generate-third-party-artifacts.sh",
+            "scripts/ci/third-party-artifacts-audit.sh",
+        }
+        or (path.startswith("crates/") and path.endswith("/Cargo.toml"))
+    )
+
+
 if not changed:
     emit("mode", "none")
     emit("docs_checks", "0")
     emit("changed_count", "0")
     sys.exit(0)
 
-if all(is_doc_path(path) for path in changed):
+third_party_artifacts = any(affects_third_party_artifacts(path) for path in changed)
+
+if all(is_doc_path(path) for path in changed) and not third_party_artifacts:
     emit("mode", "docs-only")
     emit("docs_checks", "1")
+    emit("third_party_artifacts", "0")
     emit("changed_count", str(len(changed)))
     for path in changed:
         emit("changed", path)
@@ -217,6 +236,9 @@ for path in changed:
     if path.endswith(".sh"):
         shell_files.append(path)
 
+    if path in {"THIRD_PARTY_LICENSES.md", "THIRD_PARTY_NOTICES.md"}:
+        workspace_reasons.append(f"third-party artifact output changed: {path}")
+
     if is_doc_path(path):
         docs_checks = True
         continue
@@ -251,6 +273,7 @@ else:
 
 emit("mode", mode)
 emit("docs_checks", "1" if docs_checks else "0")
+emit("third_party_artifacts", "1" if third_party_artifacts else "0")
 emit("changed_count", str(len(changed)))
 for path in changed:
     emit("changed", path)
@@ -267,6 +290,7 @@ PY
 
 mode=""
 docs_checks=0
+third_party_artifacts=0
 changed_count=0
 declare -a packages=()
 declare -a package_doctests=()
@@ -278,6 +302,7 @@ while IFS=$'\t' read -r key value; do
   case "$key" in
     mode) mode="$value" ;;
     docs_checks) docs_checks="$value" ;;
+    third_party_artifacts) third_party_artifacts="$value" ;;
     changed_count) changed_count="$value" ;;
     package) packages+=("$value") ;;
     package_doctest) package_doctests+=("$value") ;;
@@ -296,6 +321,7 @@ print_plan() {
   echo "LOCAL_FAST_MODE=$mode"
   echo "LOCAL_FAST_BASE=$base"
   echo "LOCAL_FAST_DOCS_CHECKS=$docs_checks"
+  echo "LOCAL_FAST_THIRD_PARTY_ARTIFACTS=$third_party_artifacts"
   echo "LOCAL_FAST_CHANGED_COUNT=$changed_count"
   for path in "${changed_files[@]}"; do
     echo "LOCAL_FAST_CHANGED=$path"
@@ -402,6 +428,10 @@ fi
 for shell_file in "${shell_files[@]}"; do
   run bash -n "$shell_file"
 done
+
+if [[ "$third_party_artifacts" -eq 1 ]]; then
+  run bash scripts/ci/third-party-artifacts-audit.sh --strict
+fi
 
 test_runner="$(select_test_runner)"
 echo "LOCAL_FAST_TEST_RUNNER=$test_runner"
