@@ -2003,7 +2003,7 @@ fn run_tracking_checkpoint(
 
     for role in &requested_roles {
         let spec = registry::role(*role);
-        let body_result = render_checkpoint_role(*role, &run, args)?;
+        let body_result = render_checkpoint_role(*role, &run, args.profile)?;
         match body_result {
             CheckpointRoleResult::Empty(reason) => {
                 roles_skipped.push(json!({
@@ -2314,9 +2314,9 @@ enum CheckpointRoleResult {
 fn render_checkpoint_role(
     role: crate::lifecycle_record::PayloadRole,
     run: &crate::tracking::run_state::ExecutionRun,
-    _args: &crate::commands::tracking::TrackingCheckpointArgs,
+    profile: crate::commands::record::RecordProfile,
 ) -> Result<CheckpointRoleResult, CommandError> {
-    use crate::commands::record::{LifecycleCommentKind, RecordProfile, TaskLedgerDisplay};
+    use crate::commands::record::{LifecycleCommentKind, TaskLedgerDisplay};
     use crate::lifecycle_record::{self, PayloadRole};
     let kind = match role {
         PayloadRole::State => LifecycleCommentKind::State,
@@ -2371,7 +2371,7 @@ fn render_checkpoint_role(
     let summary_ref = summary.as_deref();
 
     let body = lifecycle_record::render_record_post_comment_with_display(
-        RecordProfile::Tracking,
+        profile,
         kind,
         payload,
         summary_ref,
@@ -6214,6 +6214,40 @@ mod tests {
         );
         let ids: Vec<&str> = tasks.iter().map(|t| t["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["1.1", "1.2", "2.1"]);
+    }
+
+    #[test]
+    fn checkpoint_marker_reflects_selected_profile() {
+        use crate::commands::record::RecordProfile;
+        use crate::lifecycle_record::PayloadRole;
+        use crate::tracking::run_state::{ExecutionRun, RunPhase};
+
+        let run = ExecutionRun::new(
+            "run-p",
+            "owner/repo",
+            9,
+            "dispatch",
+            RunPhase::Implementing,
+            "2026-05-29T00:00:00Z",
+        );
+
+        let marker = |profile| match render_checkpoint_role(PayloadRole::State, &run, profile)
+            .expect("render")
+        {
+            CheckpointRoleResult::Rendered(body) => body,
+            CheckpointRoleResult::Empty(reason) => panic!("unexpected empty: {reason}"),
+        };
+
+        let dispatch_body = marker(RecordProfile::Dispatch);
+        assert!(
+            dispatch_body.contains("role=state profile=dispatch"),
+            "dispatch checkpoint must mark profile=dispatch, got: {dispatch_body}"
+        );
+        let tracking_body = marker(RecordProfile::Tracking);
+        assert!(
+            tracking_body.contains("role=state profile=tracking"),
+            "tracking checkpoint must mark profile=tracking, got: {tracking_body}"
+        );
     }
 
     #[test]
