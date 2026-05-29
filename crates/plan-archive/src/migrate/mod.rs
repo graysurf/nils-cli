@@ -16,9 +16,11 @@ use serde::Serialize;
 use crate::source::{self, SourceError};
 use crate::validate::hosts::{HostClass, HostEntry};
 
+pub mod execution_state;
 pub mod identity;
 pub mod path;
 
+pub use execution_state::reconcile_archived_execution_state;
 pub use identity::{SourceIdentity, derive_source_identity};
 pub use path::{archive_target_path, parse_plan_folder};
 
@@ -124,6 +126,9 @@ pub struct ApplyReport {
     pub archive_target: String,
     pub files_copied: usize,
     pub scrub_log: Option<String>,
+    /// Archive-relative path of the execution-state doc whose `## Execution
+    /// State` header was reconciled to a terminal status, if any.
+    pub execution_state_reconciled: Option<String>,
 }
 
 /// Errors produced by the migration pipeline.
@@ -401,6 +406,9 @@ fn emit_apply(format: OutputFormat, report: ApplyReport) -> i32 {
                 "  source deletion commit : {}",
                 report.source_deletion_commit
             );
+            if let Some(path) = &report.execution_state_reconciled {
+                println!("  execution-state        : reconciled to terminal status ({path})");
+            }
             exit::SUCCESS
         }
     }
@@ -464,15 +472,45 @@ fn apply(args: DispatchArgs, report: DryRunReport) -> Result<ApplyReport, Migrat
     let archive_abs_target = PathBuf::from(&report.archive_target.absolute_path);
     fs::create_dir_all(&archive_abs_target).map_err(|e| MigrateError::Io(e.to_string()))?;
 
+    // The terminal status defers to the issue ref when present, else the
+    // PR/MR ref. Migrate only ever archives a closed plan, so reconciling the
+    // header here keeps the archived bundle from freezing at a mid-flight
+    // status (see `execution_state`).
+    let primary_ref = report
+        .metadata
+        .refs
+        .issue
+        .as_deref()
+        .or(report.metadata.refs.pr.as_deref())
+        .or(report.metadata.refs.mr.as_deref());
+
     let mut copied = 0usize;
+    let mut execution_state_reconciled = None;
     for rel in &report.files_to_copy {
         let src = source_repo.join(rel);
         let rel_from_plan = pathdiff(rel, &plan_path_in_repo);
-        let dest = archive_abs_target.join(rel_from_plan);
+        let dest = archive_abs_target.join(&rel_from_plan);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| MigrateError::Io(e.to_string()))?;
         }
-        fs::copy(&src, &dest).map_err(|e| MigrateError::Io(e.to_string()))?;
+
+        let reconciled = if rel.ends_with("execution-state.md") {
+            fs::read_to_string(&src)
+                .ok()
+                .and_then(|content| reconcile_archived_execution_state(rel, &content, primary_ref))
+        } else {
+            None
+        };
+
+        match reconciled {
+            Some(new_content) => {
+                fs::write(&dest, new_content).map_err(|e| MigrateError::Io(e.to_string()))?;
+                execution_state_reconciled = Some(rel_from_plan.display().to_string());
+            }
+            None => {
+                fs::copy(&src, &dest).map_err(|e| MigrateError::Io(e.to_string()))?;
+            }
+        }
         copied += 1;
     }
 
@@ -533,6 +571,7 @@ fn apply(args: DispatchArgs, report: DryRunReport) -> Result<ApplyReport, Migrat
         archive_target: report.archive_target.relative_path,
         files_copied: copied,
         scrub_log: None,
+        execution_state_reconciled,
     })
 }
 
