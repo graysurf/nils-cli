@@ -60,6 +60,14 @@ versioning.
 
 ### Fixed
 
+- `tracking checkpoint --profile dispatch` now marks its lifecycle comments
+  (`state` / `session` / `validation` / `review`) with `profile=dispatch`.
+  `render_checkpoint_role` previously hardcoded `RecordProfile::Tracking` and
+  ignored the selected `--profile`, so dispatch lane checkpoints emitted
+  `profile=tracking` markers — mismatching `record open --profile dispatch` and
+  potentially misleading dispatch dashboard/audit reconciliation. The render
+  path now threads the checkpoint's profile through.
+  (graysurf/plan-tracking-testbed#28)
 - `plan-issue record close` closeout-comment table renders the
   `Required` column as `none required` for GitLab linked-PR rows
   instead of the misleading `unknown` label that the GitLab adapter
