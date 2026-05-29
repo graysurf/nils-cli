@@ -75,9 +75,17 @@ pub enum LifecycleCommentKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 pub enum TaskLedgerDisplay {
+    /// Expand the rows when the state is terminal, collapse them otherwise.
     Auto,
+    /// Wrap the rows in a closed `<details>` fold.
     Collapsed,
+    /// Render the rows directly with no fold (required for the final
+    /// pre-closeout state; visible-lint forbids a `<details>` wrapper there).
     Expanded,
+    /// Wrap the rows in an open `<details open>` fold — the toggle stays, but
+    /// the ledger is visible by default. Used for the first Execution State so
+    /// the full plan is visible on load while remaining collapsible.
+    Open,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -263,7 +271,8 @@ pub struct RecordPostArgs {
     #[arg(long = "summary-file", value_name = "path")]
     pub summary_file: Option<PathBuf>,
 
-    /// Task Ledger display mode for state lifecycle comments.
+    /// Task Ledger display mode for state lifecycle comments
+    /// (`auto`, `collapsed`, `expanded`, `open`).
     #[arg(
         long = "task-ledger-display",
         value_enum,

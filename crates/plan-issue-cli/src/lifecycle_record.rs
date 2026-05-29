@@ -1766,6 +1766,7 @@ fn render_state_markdown_with_task_ledger_display(
     let effective = match display {
         TaskLedgerDisplay::Expanded => TaskLedgerDisplay::Expanded,
         TaskLedgerDisplay::Collapsed => TaskLedgerDisplay::Collapsed,
+        TaskLedgerDisplay::Open => TaskLedgerDisplay::Open,
         TaskLedgerDisplay::Auto => {
             if is_terminal_state(state) {
                 TaskLedgerDisplay::Expanded
@@ -1777,6 +1778,12 @@ fn render_state_markdown_with_task_ledger_display(
     if effective == TaskLedgerDisplay::Expanded {
         return Ok(markdown);
     }
+    // `Collapsed` renders a closed fold; `Open` keeps the same fold toggle but
+    // adds the `open` attribute so the ledger is visible by default.
+    let details_open_tag = match effective {
+        TaskLedgerDisplay::Open => "<details open>",
+        _ => "<details>",
+    };
 
     let lines: Vec<&str> = markdown.lines().collect();
     let Some(start) = lines
@@ -1805,7 +1812,7 @@ fn render_state_markdown_with_task_ledger_display(
     let mut out = Vec::new();
     out.extend(lines[..=start].iter().map(|line| (*line).to_string()));
     out.push(String::new());
-    out.push("<details>".to_string());
+    out.push(details_open_tag.to_string());
     out.push("<summary>Show task ledger</summary>".to_string());
     out.push(String::new());
     out.push(body);
@@ -3042,6 +3049,58 @@ mod sprint3_tests {
         assert_eq!(payload.schema, PAYLOAD_SCHEMA_V2);
         assert_eq!(payload.role, PayloadRole::State);
         assert!(body.contains("session summary"), "{body}");
+    }
+
+    fn state_summary_with_task_ledger() -> &'static str {
+        "## Execution State\n\n\
+         - Status: in-progress\n\n\
+         ## Task Ledger\n\n\
+         | ID | Status | Task |\n\
+         | --- | --- | --- |\n\
+         | 1.1 | pending | Demo task |\n"
+    }
+
+    fn render_state_with_display(display: TaskLedgerDisplay) -> String {
+        render_record_post_comment_with_display(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::State,
+            json!({
+                "status": "in-progress",
+                "tasks": [{"id": "1.1", "status": "pending", "title": "Demo task"}],
+                "prs": [],
+                "blockers": [],
+                "links": {}
+            }),
+            Some(state_summary_with_task_ledger()),
+            None,
+            display,
+        )
+        .expect("render")
+    }
+
+    #[test]
+    fn task_ledger_display_open_emits_open_fold() {
+        let body = render_state_with_display(TaskLedgerDisplay::Open);
+        assert!(body.contains("<details open>"), "{body}");
+        assert!(
+            body.contains("<summary>Show task ledger</summary>"),
+            "{body}"
+        );
+        assert!(body.contains("| 1.1 | pending | Demo task |"), "{body}");
+    }
+
+    #[test]
+    fn task_ledger_display_collapsed_emits_closed_fold() {
+        let body = render_state_with_display(TaskLedgerDisplay::Collapsed);
+        assert!(body.contains("<details>"), "{body}");
+        assert!(!body.contains("<details open>"), "{body}");
+    }
+
+    #[test]
+    fn task_ledger_display_expanded_emits_no_fold() {
+        let body = render_state_with_display(TaskLedgerDisplay::Expanded);
+        assert!(!body.contains("<details"), "{body}");
+        assert!(body.contains("| 1.1 | pending | Demo task |"), "{body}");
     }
 
     #[test]
