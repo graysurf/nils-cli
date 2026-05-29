@@ -10,9 +10,10 @@ pub struct DoctorArgs {
     /// Defaults to the current working directory.
     #[arg(long)]
     pub source_root: Option<PathBuf>,
-    /// Product to diagnose (`codex` or `claude`).
+    /// Product to diagnose (`codex` or `claude`). Required for every class
+    /// except `version-alignment`, which is product-agnostic.
     #[arg(long)]
-    pub product: String,
+    pub product: Option<String>,
     /// Absolute path of the runtime home to inspect. Defaults to the
     /// product's `live_home` from `manifests/runtime-roots.yaml`.
     #[arg(long)]
@@ -41,6 +42,9 @@ pub struct DoctorArgs {
     /// Run a single doctor class instead of the default host/runtime probes.
     #[arg(long = "class", value_enum)]
     pub class: Option<DoctorClassArg>,
+    /// Pin manifest (`<pin-spec>`, YAML or JSON) for `--class version-alignment`.
+    #[arg(long)]
+    pub pin: Option<PathBuf>,
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     pub format: OutputFormat,
@@ -50,12 +54,14 @@ pub struct DoctorArgs {
 #[clap(rename_all = "kebab-case")]
 pub enum DoctorClassArg {
     SkillSurface,
+    VersionAlignment,
 }
 
 impl From<DoctorClassArg> for DoctorClass {
     fn from(value: DoctorClassArg) -> Self {
         match value {
             DoctorClassArg::SkillSurface => DoctorClass::SkillSurface,
+            DoctorClassArg::VersionAlignment => DoctorClass::VersionAlignment,
         }
     }
 }
@@ -85,16 +91,34 @@ pub fn run(args: DoctorArgs) -> anyhow::Result<u8> {
         );
     }
 
+    let class: Option<DoctorClass> = args.class.map(Into::into);
+
+    // `version-alignment` is product-agnostic; every other class requires a
+    // product. Resolve a placeholder for the former so the shared entrypoint
+    // signature is unchanged.
+    let product = match class {
+        Some(DoctorClass::VersionAlignment) => {
+            args.product.clone().unwrap_or_else(|| "host".to_string())
+        }
+        _ => match args.product.clone() {
+            Some(product) => product,
+            None => anyhow::bail!(
+                "agent-runtime doctor: --product <codex|claude> is required unless --class version-alignment"
+            ),
+        },
+    };
+
     let root = SourceRoot::from_arg_or_cwd(args.source_root.as_deref())?;
     let options = DoctorOptions {
         overlay_enabled: !args.no_overlay,
         overlay_path: args.overlay_path.clone(),
         cli_tools_profile: args.profile.clone(),
         check_project: args.check_project.clone(),
-        class_filter: args.class.map(Into::into),
+        class_filter: class,
+        pin_path: args.pin.clone(),
     };
     let outcome = doctor::run(
-        &args.product,
+        &product,
         root.path(),
         args.live_home.as_deref(),
         args.state_home.as_deref(),
@@ -171,6 +195,22 @@ fn print_text(outcome: &doctor::DoctorOutcome, suggest_upgrade: bool) {
             probe.path.display(),
         );
     }
+    if let Some(report) = outcome.version_alignment.as_ref() {
+        for item in &report.items {
+            eprintln!(
+                "  {} {} target={} expected={} observed={}",
+                match item.severity {
+                    DoctorSeverity::Ok => "ok",
+                    DoctorSeverity::Warn => "warn",
+                    DoctorSeverity::Block => "block",
+                },
+                item.check,
+                item.target,
+                item.expected,
+                item.observed.as_deref().unwrap_or("none"),
+            );
+        }
+    }
     for finding in &outcome.findings {
         print_finding(finding);
     }
@@ -197,6 +237,8 @@ struct DoctorJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     skill_surface: Option<&'a doctor::skill_surface::SkillSurfaceReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    version_alignment: Option<&'a doctor::version_alignment::VersionAlignmentReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     acceptance_boundary: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     upgrade_suggestions: Vec<String>,
@@ -221,6 +263,7 @@ fn print_json(outcome: &doctor::DoctorOutcome, suggest_upgrade: bool) -> anyhow:
         exit_code: outcome.exit_code(),
         findings: &outcome.findings,
         skill_surface: outcome.skill_surface.as_ref(),
+        version_alignment: outcome.version_alignment.as_ref(),
         acceptance_boundary: outcome.acceptance_boundary.as_deref(),
         upgrade_suggestions,
     };
