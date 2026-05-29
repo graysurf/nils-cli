@@ -254,8 +254,12 @@ fn tracking_checkpoint_state_body_renders_full_execution_state_ledger() {
     );
 }
 
+/// Finding #45: a `session` checkpoint with run-state activity but no explicit
+/// note now renders from that activity (selected task + branch) instead of
+/// being silently skipped. `validation` with no validation summary is still
+/// legitimately skipped.
 #[test]
-fn tracking_checkpoint_dry_run_skips_empty_session_and_validation_roles() {
+fn tracking_checkpoint_dry_run_session_renders_from_activity_validation_still_skips() {
     let fixture = write_fixture(&[
         (
             "source",
@@ -272,7 +276,8 @@ fn tracking_checkpoint_dry_run_skips_empty_session_and_validation_roles() {
     ]);
     let tmp = TempDir::new().expect("tmp");
     let rs_path = tmp.path().join("run-state.json");
-    write_run_state(&rs_path, "implementing", &[]); // no notes, no validation
+    // `write_run_state` sets selected_scope (task 1.2) + branch feat/x; no notes.
+    write_run_state(&rs_path, "implementing", &[]);
 
     let out = common::run_plan_issue(&[
         "--format",
@@ -294,15 +299,92 @@ fn tracking_checkpoint_dry_run_skips_empty_session_and_validation_roles() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert!(planned.is_empty(), "planned should be empty: {planned:?}");
     let skipped: Vec<&str> = result["roles_skipped"]
         .as_array()
         .unwrap()
         .iter()
         .map(|s| s["role"].as_str().unwrap())
         .collect();
-    assert!(skipped.contains(&"session"));
-    assert!(skipped.contains(&"validation"));
+    assert!(
+        planned.contains(&"session"),
+        "session must render from activity: planned={planned:?}"
+    );
+    assert!(
+        !skipped.contains(&"session"),
+        "session must not be skipped when activity exists: skipped={skipped:?}"
+    );
+    assert!(
+        skipped.contains(&"validation"),
+        "validation with no summary still skips: skipped={skipped:?}"
+    );
+
+    // The synthesized session body must carry a non-empty Summary that names
+    // the run-state activity.
+    let rendered = result["rendered"].as_array().expect("rendered array");
+    let session_body = rendered
+        .iter()
+        .find(|e| e["role"] == "session")
+        .expect("session rendered")["body"]
+        .as_str()
+        .expect("session body");
+    assert!(
+        session_body.contains("Task 1.2"),
+        "session summary should name the task: {session_body}"
+    );
+    assert!(
+        session_body.contains("feat/x"),
+        "session summary should name the branch: {session_body}"
+    );
+}
+
+/// A genuinely empty run-state — no scope, branch, PR, or validation and still
+/// at the initial phase — keeps the skip-empty behavior for `session`.
+#[test]
+fn tracking_checkpoint_dry_run_session_skipped_for_bare_run_state() {
+    let fixture = write_fixture(&[(
+        "source",
+        json!({"path": "p", "commit": "c"}),
+        "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
+        "2026-05-26T00:00:00Z",
+    )]);
+    let tmp = TempDir::new().expect("tmp");
+    let rs_path = tmp.path().join("run-state.json");
+    let minimal = json!({
+        "schema": "plan-issue.execution-run.v1",
+        "run_id": "run-1",
+        "repo": "owner/repo",
+        "issue": 123,
+        "profile": "tracking",
+        "phase": "initial",
+        "created_at": "2026-05-26T00:00:00Z",
+        "updated_at": "2026-05-26T01:00:00Z"
+    });
+    fs::write(&rs_path, minimal.to_string()).expect("rs");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "checkpoint",
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--post",
+        "session",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let result = json_stdout(&out)["payload"]["result"].clone();
+    let skipped: Vec<&str> = result["roles_skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["role"].as_str().unwrap())
+        .collect();
+    assert!(
+        skipped.contains(&"session"),
+        "bare run-state should skip session: {skipped:?}"
+    );
 }
 
 #[test]

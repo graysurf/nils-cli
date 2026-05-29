@@ -2559,13 +2559,64 @@ fn synthesize_state_payload(run: &crate::tracking::run_state::ExecutionRun) -> V
 }
 
 fn synthesize_session_payload(run: &crate::tracking::run_state::ExecutionRun) -> Option<Value> {
-    let summary = run.notes.last()?;
-    if summary.trim().is_empty() {
+    use crate::tracking::run_state::RunPhase;
+
+    // An explicit note is the authoritative session summary.
+    if let Some(summary) = run.notes.last().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return Some(json!({
+            "summary": summary,
+            "highlights": run.notes.clone(),
+            "links": {},
+        }));
+    }
+
+    // No explicit note: synthesize a session summary from the run-state
+    // activity (selected scope, branch, linked PRs, validation, phase) so a
+    // requested `session` role posts instead of being silently dropped
+    // (finding #45). This mirrors how `state` already renders straight from
+    // run-state fields. A bare run-state with nothing to report — no scope,
+    // branch, PR, or validation, still at the initial phase — still yields
+    // None so a genuinely empty session checkpoint stays skipped.
+    let mut highlights: Vec<String> = Vec::new();
+    if let Some(scope) = run.selected_scope.as_ref() {
+        match (scope.task.as_deref(), scope.title.as_deref()) {
+            (Some(task), Some(title)) => highlights.push(format!("Task {task}: {title}")),
+            (Some(task), None) => highlights.push(format!("Task {task}")),
+            (None, Some(title)) => highlights.push(format!("Scope: {title}")),
+            (None, None) => {}
+        }
+    }
+    if let Some(branch) = run.branch.as_deref() {
+        highlights.push(format!("Branch: {branch}"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for pr in run.linked_prs.iter().chain(run.pr.iter()) {
+        if seen.insert(pr.r#ref.clone()) {
+            highlights.push(format!("PR: {}", pr.r#ref));
+        }
+    }
+    if let Some(validation) = run.validation.as_ref() {
+        highlights.push(format!("Validation: {}", validation.overall));
+    }
+
+    let phase_has_progress = !matches!(run.phase, RunPhase::Initial);
+    if highlights.is_empty() && !phase_has_progress {
         return None;
     }
+
+    let summary = if highlights.is_empty() {
+        format!("Session checkpoint at phase {}.", run.phase.as_str())
+    } else {
+        format!(
+            "Session checkpoint at phase {}: {}.",
+            run.phase.as_str(),
+            highlights.join("; ")
+        )
+    };
+
     Some(json!({
         "summary": summary,
-        "highlights": run.notes.clone(),
+        "highlights": highlights,
         "links": {},
     }))
 }
