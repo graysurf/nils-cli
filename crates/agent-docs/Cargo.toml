@@ -1,6 +1,6 @@
 [package]
 name = "nils-agent-docs"
-version = "0.28.4"
+version = "0.28.5"
 edition.workspace = true
 license.workspace = true
 
@@ -18,13 +18,13 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "0.28.4", path = "../nils-build-info" }
-nils-common = { version = "0.28.4", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "0.28.5", path = "../nils-build-info" }
+nils-common = { version = "0.28.5", path = "../nils-common", package = "nils-common" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 toml_edit = "0.25"
 
 [dev-dependencies]
-nils-test-support = { version = "0.28.4", path = "../nils-test-support" }
+nils-test-support = { version = "0.28.5", path = "../nils-test-support" }
 tempfile = "3"
