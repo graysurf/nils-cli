@@ -2,6 +2,7 @@ nils-test-support
 nils-build-info
 nils-common
 nils-agent-docs
+nils-agent-memory
 nils-agent-out
 nils-agent-scope-lock
 nils-term

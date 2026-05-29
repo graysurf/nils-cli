@@ -1797,6 +1797,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-agent-memory"
+version = "0.28.0"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "nils-build-info",
+ "nils-common",
+ "pretty_assertions",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-agent-out"
 version = "0.28.0"
 dependencies = [
