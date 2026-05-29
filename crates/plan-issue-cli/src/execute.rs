@@ -494,12 +494,17 @@ fn build_record_seed(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(state_fallback);
-    let state_body = lifecycle_record::render_record_post_comment(
+    // The first Execution State defaults to an open fold (`<details open>`):
+    // the toggle stays, but the full Task Ledger is visible when the issue
+    // loads. Later checkpoints keep the `auto` default (collapsed while
+    // in-progress; expanded raw at the terminal pre-closeout state).
+    let state_body = lifecycle_record::render_record_post_comment_with_display(
         profile,
         crate::commands::record::LifecycleCommentKind::State,
         initial_state,
         Some(state_summary),
         None,
+        crate::commands::record::TaskLedgerDisplay::Open,
     )
     .map_err(|err| CommandError::runtime("record-open-state-render-failed", err))?;
 

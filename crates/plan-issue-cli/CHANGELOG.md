@@ -36,8 +36,21 @@ versioning.
 - `record_compat_baseline` integration tests locking the released
   `record` subcommand surface, envelope, error shape, and tracking
   schema constants before runtime-kit migrates.
+- `record post --task-ledger-display open` — a new fourth display mode
+  that wraps the Task Ledger in an **open** fold (`<details open>`): the
+  collapse toggle stays, but the rows are visible by default. Complements
+  `collapsed` (closed fold) and `expanded` (raw rows, no fold).
 
 ### Changed
+
+- The first Execution State posted by `record open` now defaults to the
+  open fold (`<details open>`) instead of a closed `<details>`: when the
+  bundle's execution-state file carries a `## Task Ledger`, a reader sees
+  the full plan ledger on load while keeping the collapse toggle. Later
+  `record post` / `tracking checkpoint` state comments keep the `auto`
+  default (collapsed while in-progress; raw expanded at the terminal
+  pre-closeout state, which visible-lint requires).
+  (graysurf/plan-tracking-testbed#31)
 
 - `tracking checkpoint --post state` now emits an **accumulative** `tasks[]`
   hidden payload: every state post carries the full per-task table from the

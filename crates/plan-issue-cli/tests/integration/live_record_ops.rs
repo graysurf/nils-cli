@@ -1747,6 +1747,82 @@ fn record_open_dry_run_returns_preview_without_gh_calls() {
     );
 }
 
+/// The first Execution State posted by `record open` defaults to an open fold
+/// (`<details open>`) when the execution-state file carries a `## Task Ledger`,
+/// so a reader sees the full plan on load while the toggle stays. Later
+/// checkpoints keep the `auto` default (collapsed while in-progress).
+#[test]
+fn record_open_initial_state_task_ledger_defaults_to_open_fold() {
+    use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
+
+    let stub = StubBinDir::new();
+    stub.write_exe("gh", record_open_dry_run_gh_stub());
+
+    let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
+    let bundle = repo.path().join("docs/plans/sample");
+    fs::create_dir_all(&bundle).expect("create bundle dir");
+    let source = bundle.join("sample-discussion-source.md");
+    let plan = bundle.join("sample-plan.md");
+    let execution_state = bundle.join("sample-execution-state.md");
+    fs::write(&source, "# Source\n\n- Decision: implement v2 lifecycle.\n").expect("write source");
+    fs::write(
+        &plan,
+        "# Plan: Sample Plan\n\n## Overview\n\n- Sample plan body.\n\n## Read First\n\n- Primary source: docs/plans/sample/sample-discussion-source.md\n- Source type: discussion-to-implementation-doc\n- Open questions carried into execution: none\n\n## Scope\n\n- In scope:\n  - Demo plan.\n- Out of scope:\n  - none.\n\n## Assumptions\n\n1. Demo only.\n\n## Sprint 1: Demo\n\n**Goal**: Demo the surface.\n\n**PR grouping intent**: group\n**Execution Profile**: serial\n\n### Task 1.1: Demo task\n\n- **Location**:\n  - `docs/plans/sample/sample-plan.md`\n- **Description**: Demo task description.\n- **Dependencies**:\n  - none\n- **Complexity**: 1\n- **Acceptance criteria**:\n  - The demo task is complete.\n- **Validation**:\n  - `true`\n",
+    )
+    .expect("write plan");
+    fs::write(
+        &execution_state,
+        "# Sample Execution State\n\n<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n## Execution State\n\n- Status: pending\n- Target scope: Sample Plan\n\n## Task Ledger\n\n| ID | Status | Task |\n| --- | --- | --- |\n| 1.1 | pending | Demo task |\n",
+    )
+    .expect("write execution state");
+    git(repo.path(), &["add", "."]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "seed bundle",
+            "--no-gpg-sign",
+        ],
+    );
+
+    let opts = dry_run_cmd_options(stub.path()).with_cwd(repo.path());
+    let bundle_arg = bundle.to_string_lossy().to_string();
+    let out = nils_test_support::cmd::run_resolved(
+        "plan-issue-local",
+        &[
+            "--format",
+            "json",
+            "record",
+            "open",
+            "--bundle",
+            &bundle_arg,
+        ],
+        &opts,
+    );
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed: Value = serde_json::from_str(&out.stdout_text()).expect("json");
+    let state_comment = parsed["payload"]["result"]["preview"]["comments"]["state"]
+        .as_str()
+        .expect("state comment");
+    assert!(
+        state_comment.contains("<details open>"),
+        "first Execution State should default to an open fold: {state_comment}"
+    );
+    assert!(
+        state_comment.contains("<summary>Show task ledger</summary>"),
+        "open fold must keep the toggle summary: {state_comment}"
+    );
+    assert!(
+        state_comment.contains("| 1.1 | pending | Demo task |"),
+        "ledger rows must be present inside the open fold: {state_comment}"
+    );
+}
+
 /// Sprint 4 Task 4.3: exercise the v3 closeout end-to-end against a sanitized
 /// agent-runtime-kit fixture. Asserts that one `record close` invocation can
 /// audit the issue, verify provider PR merge evidence, render the closeout
