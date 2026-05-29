@@ -595,3 +595,212 @@ fn rate_limits_async_json_partial_failure_keeps_results_array() {
     assert_eq!(beta["error"]["code"], "request-failed");
     assert!(beta["error"]["message"].is_string());
 }
+
+// A valid 200 usage payload whose `rate_limit` is explicitly null. The ChatGPT
+// backend returns this when there is no usage recorded in the current window;
+// it is a benign "no active window" state, not a malformed payload.
+const NULL_RATE_LIMIT_BODY: &str = r#"{
+  "plan_type": "pro",
+  "rate_limit": null,
+  "code_review_rate_limit": null,
+  "additional_rate_limits": null
+}"#;
+
+#[test]
+fn rate_limits_async_text_null_payload_serves_stale_cache() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secret_dir = dir.path().join("secrets");
+    fs::create_dir_all(&secret_dir).expect("secret dir");
+    fs::write(
+        secret_dir.join("alpha.json"),
+        r#"{"tokens":{"access_token":"tok-alpha","account_id":"acct_001"}}"#,
+    )
+    .expect("write alpha");
+
+    // Last successful fetch is well past the TTL, i.e. genuinely stale.
+    let cache_root = dir.path().join("cache_root");
+    let kv_path = cache_kv_path(&cache_root, "alpha");
+    fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    fs::write(
+        &kv_path,
+        "fetched_at=1700000000\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n",
+    )
+    .expect("write alpha cache");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, NULL_RATE_LIMIT_BODY),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--async"],
+        &[
+            ("CODEX_SECRET_DIR", &secret_dir),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+        ],
+    );
+
+    // A null window is benign: degrade to the last-known cached values instead
+    // of failing the whole command.
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(out.contains("91%"), "expected cached 5h value, got:\n{out}");
+    assert!(
+        out.contains("70%"),
+        "expected cached weekly value, got:\n{out}"
+    );
+    assert!(
+        out.contains("(stale)"),
+        "expected stale marker, got:\n{out}"
+    );
+    assert!(
+        !out.contains("invalid usage payload"),
+        "null window must not be reported as a malformed payload, got:\n{out}"
+    );
+}
+
+#[test]
+fn rate_limits_async_text_null_payload_without_cache_shows_na() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secret_dir = dir.path().join("secrets");
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&secret_dir).expect("secret dir");
+    fs::create_dir_all(&cache_root).expect("cache root");
+    fs::write(
+        secret_dir.join("alpha.json"),
+        r#"{"tokens":{"access_token":"tok-alpha","account_id":"acct_001"}}"#,
+    )
+    .expect("write alpha");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, NULL_RATE_LIMIT_BODY),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--async"],
+        &[
+            ("CODEX_SECRET_DIR", &secret_dir),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+        ],
+    );
+
+    // No cache to fall back to, but a null window is still benign: report n/a
+    // rather than a hard failure.
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(out.contains("n/a"), "expected n/a marker, got:\n{out}");
+}
+
+#[test]
+fn rate_limits_async_json_null_payload_is_benign() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secret_dir = dir.path().join("secrets");
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&secret_dir).expect("secret dir");
+    fs::create_dir_all(&cache_root).expect("cache root");
+    fs::write(
+        secret_dir.join("alpha.json"),
+        r#"{"tokens":{"access_token":"tok-alpha","account_id":"acct_001"}}"#,
+    )
+    .expect("write alpha");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, NULL_RATE_LIMIT_BODY),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--async", "--json"],
+        &[
+            ("CODEX_SECRET_DIR", &secret_dir),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["ok"], true);
+    let results = payload["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+    let alpha = &results[0];
+    assert_eq!(alpha["ok"], true);
+    assert_eq!(alpha["status"], "no-rate-limit-window");
+    assert!(alpha["error"].is_null());
+    assert!(alpha["summary"].is_null());
+}
+
+#[test]
+fn rate_limits_async_json_null_payload_serves_stale_cache() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secret_dir = dir.path().join("secrets");
+    fs::create_dir_all(&secret_dir).expect("secret dir");
+    fs::write(
+        secret_dir.join("alpha.json"),
+        r#"{"tokens":{"access_token":"tok-alpha","account_id":"acct_001"}}"#,
+    )
+    .expect("write alpha");
+
+    let cache_root = dir.path().join("cache_root");
+    let kv_path = cache_kv_path(&cache_root, "alpha");
+    fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    fs::write(
+        &kv_path,
+        "fetched_at=1700000000\nnon_weekly_label=5h\nnon_weekly_remaining=91\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n",
+    )
+    .expect("write alpha cache");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, NULL_RATE_LIMIT_BODY),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--async", "--json"],
+        &[
+            ("CODEX_SECRET_DIR", &secret_dir),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["ok"], true);
+    let results = payload["results"].as_array().expect("results");
+    let alpha = &results[0];
+    assert_eq!(alpha["ok"], true);
+    assert_eq!(alpha["source"], "cache-fallback");
+    assert_eq!(alpha["summary"]["non_weekly_remaining"], 91);
+}

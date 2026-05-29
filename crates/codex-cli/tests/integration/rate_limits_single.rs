@@ -307,3 +307,47 @@ fn rate_limits_single_json_invalid_usage_payload_is_structured() {
     assert_eq!(payload["error"]["code"], "invalid-usage-payload");
     assert!(payload["error"]["details"]["raw_usage"].is_object());
 }
+
+#[test]
+fn rate_limits_single_json_null_payload_is_benign() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    fs::create_dir_all(&cache_root).expect("cache root");
+    fs::write(
+        secrets.join("alpha.json"),
+        r#"{"tokens":{"access_token":"tok","account_id":"acct_001"}}"#,
+    )
+    .expect("alpha");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, r#"{"plan_type":"pro","rate_limit":null}"#),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--json", "alpha.json"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+        ],
+    );
+
+    // A null window is benign in single mode too: report it as a success
+    // instead of the "invalid usage payload" hard error (exit 3).
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["mode"], "single");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["ok"], true);
+    assert_eq!(payload["result"]["status"], "no-rate-limit-window");
+}

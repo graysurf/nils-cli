@@ -464,6 +464,19 @@ fn collect_json_result_for_secret(
                         error: None,
                     }
                 }
+                None if render::rate_limit_is_explicit_null(&usage.json) => {
+                    // Benign: the backend reports no active window. Prefer the
+                    // last-known cached values (stale allowed), else report the
+                    // empty window as a success rather than an error.
+                    if allow_cache_fallback {
+                        let fallback =
+                            collect_json_from_cache(target_file, "cache-fallback", false);
+                        if fallback.ok {
+                            return fallback;
+                        }
+                    }
+                    json_result_no_window(target_file)
+                }
                 None => json_result_error(
                     target_file,
                     "network",
@@ -548,6 +561,21 @@ fn json_result_error(
     }
 }
 
+/// Benign "no active rate-limit window" result for a `rate_limit: null` payload
+/// with no cache to fall back to. Reported as a success, not an error.
+fn json_result_no_window(target_file: &Path) -> RateLimitJsonResult {
+    RateLimitJsonResult {
+        name: secret_display_name(target_file),
+        target_file: target_file_name(target_file),
+        status: "no-rate-limit-window".to_string(),
+        ok: true,
+        source: "network".to_string(),
+        summary: None,
+        raw_usage: None,
+        error: None,
+    }
+}
+
 fn secret_display_name(target_file: &Path) -> String {
     cache::secret_name_for_target(target_file).unwrap_or_else(|| {
         target_file
@@ -620,11 +648,22 @@ fn is_sensitive_key(key: &str) -> bool {
     )
 }
 
+#[derive(Default)]
 struct AsyncFetchResult {
     line: Option<String>,
     rc: i32,
     err: String,
+    /// The line was served from cache past its freshness TTL.
+    stale: bool,
+    /// The live fetch succeeded but the backend reported no active rate-limit
+    /// window (`rate_limit: null`) and no cache was available. Benign.
+    no_window: bool,
 }
+
+/// Distinct rc for "live fetch ok, but backend reports no active window". Kept
+/// separate from the network-failure codes (1/2/3) so it is neither retried
+/// nor counted as an error.
+const RC_NO_RATE_LIMIT_WINDOW: i32 = 6;
 
 struct AsyncCollectedItem<T> {
     secret_name: String,
@@ -920,14 +959,18 @@ fn collect_async_round(
             .to_string();
 
         let mut row = Row::empty(secret_name.trim_end_matches(".json").to_string());
+        let mut benign_no_window = false;
         let event = events.remove(&secret_name);
         if let Some(event) = event {
             if !event.err.is_empty() {
                 stderr_map.insert(secret_name.clone(), event.err.clone());
             }
-            if !cached_mode && event.rc != 0 {
+            // A null window (no_window) is benign and must not fail the round;
+            // a stale cache fallback (rc == 0) likewise succeeded.
+            if !cached_mode && event.rc != 0 && !event.no_window {
                 rc = 1;
             }
+            benign_no_window = event.no_window;
 
             if let Some(line) = &event.line
                 && let Some(parsed) = parse_one_line_output(line)
@@ -966,13 +1009,20 @@ fn collect_async_round(
                     }
                 }
 
+                row.state = if event.stale {
+                    RowState::Stale
+                } else {
+                    RowState::Filled
+                };
                 window_labels.insert(row.window_label.clone());
                 rows.push(row);
                 continue;
             }
         }
 
-        if !cached_mode {
+        if benign_no_window {
+            row.state = RowState::NoWindow;
+        } else if !cached_mode {
             rc = 1;
         }
         rows.push(row);
@@ -1011,7 +1061,13 @@ fn render_all_accounts_table(
     rows.sort_by_key(|row| row.sort_key());
 
     for row in rows {
-        let display_non_weekly = if multiple_labels && !row.window_label.is_empty() {
+        // A null window reports "n/a"; a stale fallback keeps its values but is
+        // marked so the reader knows they are not live.
+        let no_window = row.state == RowState::NoWindow;
+
+        let display_non_weekly = if no_window {
+            "n/a".to_string()
+        } else if multiple_labels && !row.window_label.is_empty() {
             if row.non_weekly_remaining >= 0 {
                 format!("{}:{}%", row.window_label, row.non_weekly_remaining)
             } else {
@@ -1031,13 +1087,21 @@ fn render_all_accounts_table(
             .weekly_reset_epoch
             .and_then(|epoch| render::format_until_epoch_compact(epoch, now_epoch))
             .unwrap_or_else(|| "-".to_string());
-        let reset_display = row
-            .weekly_reset_epoch
-            .and_then(render::format_epoch_local_datetime_with_offset)
-            .unwrap_or_else(|| "-".to_string());
+        let mut reset_display = if no_window {
+            "n/a".to_string()
+        } else {
+            row.weekly_reset_epoch
+                .and_then(render::format_epoch_local_datetime_with_offset)
+                .unwrap_or_else(|| "-".to_string())
+        };
+        if row.state == RowState::Stale {
+            reset_display.push_str(" (stale)");
+        }
 
         let non_weekly_display = ansi::format_percent_cell(&display_non_weekly, 8, None);
-        let weekly_display = if row.weekly_remaining >= 0 {
+        let weekly_display = if no_window {
+            ansi::format_percent_cell("n/a", 8, None)
+        } else if row.weekly_remaining >= 0 {
             ansi::format_percent_cell(&format!("{}%", row.weekly_remaining), 8, None)
         } else {
             ansi::format_percent_cell("-", 8, None)
@@ -1152,6 +1216,11 @@ fn async_fetch_one_line(
         errors.push(err);
     }
 
+    // A null window is benign — the backend simply has no usage recorded in the
+    // current window. Degrade to the last-known cached values (marked stale)
+    // rather than surfacing it as a failure.
+    let no_window_live = result.rc == RC_NO_RATE_LIMIT_WINDOW;
+
     let missing_line = result
         .line
         .as_ref()
@@ -1159,7 +1228,7 @@ fn async_fetch_one_line(
         .unwrap_or(true);
 
     if result.rc != 0 || missing_line {
-        let cached = fetch_one_line_cached(target_file);
+        let cached = fetch_one_line_cached_allow_stale(target_file);
         if !cached.err.is_empty() {
             errors.push(cached.err.clone());
         }
@@ -1170,7 +1239,9 @@ fn async_fetch_one_line(
                 .map(|line| !line.trim().is_empty())
                 .unwrap_or(false)
         {
-            if result.rc != 0 {
+            // Only annotate the fallback for genuine failures; a null window is
+            // an expected, quiet condition.
+            if result.rc != 0 && !no_window_live {
                 let _ = secret_name;
                 errors.push(format!(
                     "codex-rate-limits-async: falling back to cache (rc={})",
@@ -1179,8 +1250,15 @@ fn async_fetch_one_line(
             }
             result = AsyncFetchResult {
                 line: cached.line,
-                rc: 0,
-                err: String::new(),
+                stale: cached.stale,
+                ..Default::default()
+            };
+        } else if no_window_live {
+            // No cache to borrow from, but a null window is still benign.
+            result = AsyncFetchResult {
+                rc: RC_NO_RATE_LIMIT_WINDOW,
+                no_window: true,
+                ..Default::default()
             };
         }
     }
@@ -1191,6 +1269,8 @@ fn async_fetch_one_line(
         line,
         rc: result.rc,
         err,
+        stale: result.stale,
+        no_window: result.no_window,
     }
 }
 
@@ -1200,6 +1280,7 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
             line: None,
             rc: 1,
             err: format!("codex-rate-limits: {} not found", target_file.display()),
+            ..Default::default()
         };
     }
 
@@ -1228,12 +1309,14 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
                         "codex-rate-limits: missing access_token in {}",
                         target_file.display()
                     ),
+                    ..Default::default()
                 };
             }
             return AsyncFetchResult {
                 line: None,
                 rc: 3,
                 err: msg,
+                ..Default::default()
             };
         }
     };
@@ -1243,6 +1326,7 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
             line: None,
             rc: 4,
             err: err.to_string(),
+            ..Default::default()
         };
     }
 
@@ -1254,6 +1338,7 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
                         line: None,
                         rc: 5,
                         err: sync_err.unwrap_or_default(),
+                        ..Default::default()
                     };
                 }
             }
@@ -1261,7 +1346,7 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
                 return AsyncFetchResult {
                     line: None,
                     rc: 1,
-                    err: String::new(),
+                    ..Default::default()
                 };
             }
         }
@@ -1270,10 +1355,17 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
     let usage_data = match render::parse_usage(&usage.json) {
         Some(value) => value,
         None => {
+            if render::rate_limit_is_explicit_null(&usage.json) {
+                return AsyncFetchResult {
+                    rc: RC_NO_RATE_LIMIT_WINDOW,
+                    ..Default::default()
+                };
+            }
             return AsyncFetchResult {
                 line: None,
                 rc: 3,
                 err: "codex-rate-limits: invalid usage payload".to_string(),
+                ..Default::default()
             };
         }
     };
@@ -1303,7 +1395,7 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
             weekly.weekly_reset_epoch,
         )),
         rc: 0,
-        err: String::new(),
+        ..Default::default()
     }
 }
 
@@ -1318,12 +1410,39 @@ fn fetch_one_line_cached(target_file: &Path) -> AsyncFetchResult {
                 entry.weekly_reset_epoch,
             )),
             rc: 0,
-            err: String::new(),
+            ..Default::default()
         },
         Err(err) => AsyncFetchResult {
             line: None,
             rc: 1,
             err: err.to_string(),
+            ..Default::default()
+        },
+    }
+}
+
+/// Reads the cached one-line value without enforcing the freshness TTL, marking
+/// the result `stale` when it is past the TTL. Used as the diag-path fallback
+/// so a transient null/failed live fetch degrades to the last-known values.
+fn fetch_one_line_cached_allow_stale(target_file: &Path) -> AsyncFetchResult {
+    match cache::read_cache_entry_allow_stale(target_file) {
+        Ok(read) => AsyncFetchResult {
+            line: Some(format_one_line_output(
+                target_file,
+                &read.entry.non_weekly_label,
+                read.entry.non_weekly_remaining,
+                read.entry.weekly_remaining,
+                read.entry.weekly_reset_epoch,
+            )),
+            rc: 0,
+            stale: read.stale,
+            ..Default::default()
+        },
+        Err(err) => AsyncFetchResult {
+            line: None,
+            rc: 1,
+            err: err.to_string(),
+            ..Default::default()
         },
     }
 }
@@ -1753,6 +1872,9 @@ fn run_single_mode(
     let usage_data = match render::parse_usage(&usage.json) {
         Some(value) => value,
         None => {
+            if render::rate_limit_is_explicit_null(&usage.json) {
+                return emit_single_no_window(&target_file, output_json, one_line);
+            }
             if output_json {
                 diag_output::emit_error(
                     DIAG_SCHEMA_VERSION,
@@ -1846,6 +1968,71 @@ fn run_single_mode(
         values.secondary_label, values.secondary_remaining, secondary_reset
     );
 
+    Ok(0)
+}
+
+/// Renders a benign `rate_limit: null` response in single mode: serve the
+/// last-known cached values (marked stale) when available, otherwise report
+/// "no active rate-limit window" as a success rather than a malformed payload.
+fn emit_single_no_window(target_file: &Path, output_json: bool, one_line: bool) -> Result<i32> {
+    if let Ok(read) = cache::read_cache_entry_allow_stale(target_file) {
+        if output_json {
+            let result = collect_json_from_cache(target_file, "cache-fallback", false);
+            let ok = result.ok;
+            diag_output::emit_json(&RateLimitSingleEnvelope {
+                schema_version: DIAG_SCHEMA_VERSION.to_string(),
+                command: DIAG_COMMAND.to_string(),
+                mode: "single".to_string(),
+                ok,
+                result,
+            })?;
+            return Ok(0);
+        }
+
+        let entry = read.entry;
+        let stale_suffix = if read.stale { " (stale)" } else { "" };
+        if one_line {
+            let weekly_reset_iso = render::format_epoch_local_datetime(entry.weekly_reset_epoch)
+                .unwrap_or_else(|| "?".to_string());
+            println!(
+                "{}:{}% W:{}% {}{}",
+                entry.non_weekly_label,
+                entry.non_weekly_remaining,
+                entry.weekly_remaining,
+                weekly_reset_iso,
+                stale_suffix
+            );
+            return Ok(0);
+        }
+
+        let weekly_reset = render::format_epoch_local_datetime(entry.weekly_reset_epoch)
+            .unwrap_or_else(|| "?".to_string());
+        let non_weekly_reset = entry
+            .non_weekly_reset_epoch
+            .and_then(render::format_epoch_local_datetime)
+            .unwrap_or_else(|| "?".to_string());
+        println!("Rate limits remaining{stale_suffix}");
+        println!(
+            "{} {}% • {}",
+            entry.non_weekly_label, entry.non_weekly_remaining, non_weekly_reset
+        );
+        println!("Weekly {}% • {}", entry.weekly_remaining, weekly_reset);
+        return Ok(0);
+    }
+
+    if output_json {
+        let result = json_result_no_window(target_file);
+        diag_output::emit_json(&RateLimitSingleEnvelope {
+            schema_version: DIAG_SCHEMA_VERSION.to_string(),
+            command: DIAG_COMMAND.to_string(),
+            mode: "single".to_string(),
+            ok: true,
+            result,
+        })?;
+        return Ok(0);
+    }
+
+    println!("No active rate-limit window");
     Ok(0)
 }
 
@@ -1974,6 +2161,18 @@ fn env_timeout(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    /// No value available (genuine fetch failure with no cache to fall back to).
+    Missing,
+    /// Fresh live (or within-TTL cache) values.
+    Filled,
+    /// Last-known values served from cache past the freshness TTL.
+    Stale,
+    /// Backend reported no active rate-limit window and no cache was available.
+    NoWindow,
+}
+
 struct Row {
     name: String,
     window_label: String,
@@ -1982,6 +2181,7 @@ struct Row {
     weekly_remaining: i64,
     weekly_reset_epoch: Option<i64>,
     weekly_reset_iso: String,
+    state: RowState,
 }
 
 impl Row {
@@ -1994,6 +2194,7 @@ impl Row {
             weekly_remaining: -1,
             weekly_reset_epoch: None,
             weekly_reset_iso: String::new(),
+            state: RowState::Missing,
         }
     }
 

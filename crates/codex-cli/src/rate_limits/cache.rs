@@ -162,6 +162,38 @@ pub fn read_cache_entry_for_cached_mode(target_file: &Path) -> Result<CacheEntry
     Ok(entry)
 }
 
+/// A cached entry plus whether it is past the freshness TTL.
+pub struct StaleCacheRead {
+    pub entry: CacheEntry,
+    pub stale: bool,
+}
+
+/// Reads the cached entry without rejecting stale data, reporting whether it is
+/// past the freshness TTL.
+///
+/// Unlike [`read_cache_entry_for_cached_mode`] (which enforces the TTL for the
+/// explicit `--cached` mode), this serves the last-known values regardless of
+/// age so the diag command can degrade gracefully when a live fetch yields no
+/// usable window. Callers surface the `stale` flag to the user.
+pub fn read_cache_entry_allow_stale(target_file: &Path) -> Result<StaleCacheRead> {
+    let entry = read_cache_entry(target_file)?;
+    let stale = cache_entry_is_stale(&entry);
+    Ok(StaleCacheRead { entry, stale })
+}
+
+fn cache_entry_is_stale(entry: &CacheEntry) -> bool {
+    let fetched_at = match entry.fetched_at_epoch {
+        Some(value) if value > 0 => value,
+        _ => return true,
+    };
+    let now_epoch = chrono::Utc::now().timestamp();
+    if now_epoch <= 0 {
+        return false;
+    }
+    let ttl_i64 = i64::try_from(cache_ttl_seconds()).unwrap_or(i64::MAX);
+    now_epoch.saturating_sub(fetched_at) > ttl_i64
+}
+
 pub fn write_prompt_segment_cache(
     target_file: &Path,
     fetched_at_epoch: i64,
