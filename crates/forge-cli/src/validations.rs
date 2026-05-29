@@ -18,9 +18,16 @@ use std::path::Path;
 use std::process::Command;
 
 use nils_common::cli_contract::schema_version_for;
+use serde::Serialize;
 
 use crate::cli::BINARY;
 use crate::error::ForgeError;
+
+/// Hint appended to the `body_missing_*` validation `details` pointing the
+/// operator at the body scaffold so a missing section is one command away
+/// from fixed.
+pub const BODY_SCAFFOLD_HINT: &str =
+    "scaffold a valid body with `agent-runtime pr-body render --kind <kind>`";
 
 /// PR/MR kind declared by the caller via `--kind`. Drives the
 /// `branch_kind_matches` rule plus the macro in Sprint 6. The set tracks
@@ -264,7 +271,10 @@ pub fn body_summary(body: &str, headings: &BodyHeadings) -> Result<(), ForgeErro
                 "body is missing a non-empty '{heading}' section",
                 heading = headings.summary
             ),
-            Some(format!("rule=non-empty H2 '{}' section", headings.summary)),
+            Some(format!(
+                "rule=non-empty H2 '{}' section; {BODY_SCAFFOLD_HINT}",
+                headings.summary
+            )),
         ))
     }
 }
@@ -282,7 +292,7 @@ pub fn body_test_plan(body: &str, headings: &BodyHeadings) -> Result<(), ForgeEr
                 heading = headings.test_plan
             ),
             Some(format!(
-                "rule=non-empty H2 '{}' section",
+                "rule=non-empty H2 '{}' section; {BODY_SCAFFOLD_HINT}",
                 headings.test_plan
             )),
         ))
@@ -317,6 +327,37 @@ fn is_h2_heading(line: &str) -> bool {
     // `## …` exactly — three or more `#` would be H3+ and must not collide
     // with `## Summary`.
     line.starts_with("## ") && !line.starts_with("### ")
+}
+
+/// Rule 2 (aggregate) — body must contain non-empty `## Summary` AND
+/// `## Test plan` sections.
+///
+/// When exactly one section is missing, this returns that section's canonical
+/// error (`body_missing_summary` / `body_missing_test_plan`) so existing
+/// single-section consumers keep matching on the same `error.kind`. When both
+/// are missing, it returns a single `body_missing_sections` error enumerating
+/// every missing section, with the per-section codes preserved in `details`
+/// so the additive aggregation never hides which sections failed.
+pub fn body_sections(body: &str, headings: &BodyHeadings) -> Result<(), ForgeError> {
+    let summary = body_summary(body, headings);
+    let test_plan = body_test_plan(body, headings);
+    match (summary, test_plan) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+        (Err(summary_err), Err(test_plan_err)) => Err(ForgeError::validation(
+            schema(),
+            "body_missing_sections",
+            format!(
+                "body is missing required sections: '{}' and '{}'",
+                headings.summary, headings.test_plan
+            ),
+            Some(format!(
+                "missing={},{}; {BODY_SCAFFOLD_HINT}",
+                summary_err.kind(),
+                test_plan_err.kind()
+            )),
+        )),
+    }
 }
 
 /// Rule 4 — `git status --porcelain` is empty (no staged, unstaged, or
@@ -377,6 +418,135 @@ where
 pub struct HeadState {
     pub head_sha: String,
     pub upstream_sha: Option<String>,
+}
+
+/// One rule's verdict in a non-short-circuiting local preflight. `code` and
+/// `message` are populated only on failure (mirroring the rule's
+/// [`ForgeError`] `kind` and message). Serialized additively into the
+/// `pr deliver --dry-run` envelope's `local_preflight` block.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RuleVerdict {
+    pub rule: &'static str,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl RuleVerdict {
+    fn from_result(rule: &'static str, result: Result<(), ForgeError>) -> Self {
+        match result {
+            Ok(()) => Self {
+                rule,
+                ok: true,
+                code: None,
+                message: None,
+            },
+            Err(err) => Self {
+                rule,
+                ok: false,
+                code: Some(err.kind().to_string()),
+                message: Some(err.to_string()),
+            },
+        }
+    }
+
+    fn not_evaluated(rule: &'static str, why: &str) -> Self {
+        Self {
+            rule,
+            ok: false,
+            code: None,
+            message: Some(format!("not evaluated: {why}")),
+        }
+    }
+}
+
+/// Resolved inputs for the local preflight. The caller resolves the head
+/// branch and body up front so the runner stays a pure string/`git`
+/// evaluation with no provider calls.
+#[derive(Debug, Clone)]
+pub struct PreflightInputs<'a> {
+    pub branch: &'a str,
+    pub kind: PrKind,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub headings: &'a BodyHeadings,
+}
+
+/// Evaluate the non-mutating lock-down rules (1a, 1b, 3, 2a, 2b, 4, 5)
+/// without returning early on the first failure, collecting a per-rule
+/// verdict for each. This is the faithful-preflight runner behind
+/// `pr deliver --dry-run`: it never invokes a provider backend, only local
+/// string checks plus the injected local `git` readers. A `git` reader that
+/// errors (e.g. not a repo) surfaces as that rule's failing verdict rather
+/// than aborting the sweep.
+pub fn run_local_preflight<FS, FH>(
+    inputs: &PreflightInputs<'_>,
+    workdir: &Path,
+    git_status_fn: FS,
+    head_state_fn: FH,
+) -> Vec<RuleVerdict>
+where
+    FS: FnOnce(&Path) -> Result<String, ForgeError>,
+    FH: FnOnce(&Path) -> Result<HeadState, ForgeError>,
+{
+    let mut verdicts = Vec::with_capacity(7);
+
+    // Rule 1a — branch name. Capture the prefix for Rule 1b.
+    let branch_result = branch_name(inputs.branch);
+    let prefix = branch_result.as_ref().ok().copied();
+    verdicts.push(RuleVerdict::from_result(
+        "branch_name",
+        branch_result.map(|_| ()),
+    ));
+
+    // Rule 1b — kind matches branch prefix. Only checkable once 1a resolves a
+    // prefix; otherwise reported as not-evaluated so the sweep stays complete.
+    verdicts.push(match prefix {
+        Some(prefix) => {
+            RuleVerdict::from_result("branch_kind", branch_kind_matches(prefix, inputs.kind))
+        }
+        None => RuleVerdict::not_evaluated("branch_kind", "branch name is invalid"),
+    });
+
+    // Rule 3 — title length.
+    verdicts.push(RuleVerdict::from_result(
+        "title_length",
+        title_length(inputs.title),
+    ));
+
+    // Rules 2a / 2b — body sections, reported individually so the preflight
+    // surfaces every missing section at once.
+    verdicts.push(RuleVerdict::from_result(
+        "body_summary",
+        body_summary(inputs.body, inputs.headings),
+    ));
+    verdicts.push(RuleVerdict::from_result(
+        "body_test_plan",
+        body_test_plan(inputs.body, inputs.headings),
+    ));
+
+    // Rule 4 — clean worktree (local git read).
+    verdicts.push(RuleVerdict::from_result(
+        "worktree_clean",
+        worktree_clean(workdir, git_status_fn),
+    ));
+
+    // Rule 5 — head pushed / matches upstream (local git read).
+    verdicts.push(RuleVerdict::from_result(
+        "head_pushed",
+        head_pushed(workdir, head_state_fn),
+    ));
+
+    verdicts
+}
+
+/// Resolve the current branch via `git -C <workdir> rev-parse --abbrev-ref
+/// HEAD`. Used by `pr deliver --dry-run` to feed the preflight when no
+/// explicit `--head` is given.
+pub fn git_current_branch(workdir: &Path) -> Result<String, ForgeError> {
+    run_git_capture(workdir, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|s| s.trim().to_string())
 }
 
 /// Default porcelain reader used in production. Spawns `git -C <workdir>
@@ -688,6 +858,134 @@ mod tests {
         })
         .expect_err("divergent");
         assert_eq!(err_kind(err), "head_not_pushed");
+    }
+
+    fn clean_status(_: &Path) -> Result<String, ForgeError> {
+        Ok(String::new())
+    }
+
+    fn pushed_head(_: &Path) -> Result<HeadState, ForgeError> {
+        Ok(HeadState {
+            head_sha: "deadbeef".into(),
+            upstream_sha: Some("deadbeef".into()),
+        })
+    }
+
+    fn unpushed_head(_: &Path) -> Result<HeadState, ForgeError> {
+        Ok(HeadState {
+            head_sha: "deadbeef".into(),
+            upstream_sha: None,
+        })
+    }
+
+    #[test]
+    fn body_sections_accepts_complete_body() {
+        let body = "## Summary\n\nWhat.\n\n## Test plan\n\nHow.\n";
+        body_sections(body, &BodyHeadings::default()).expect("both present");
+    }
+
+    #[test]
+    fn body_sections_returns_canonical_code_when_only_one_missing() {
+        // Existing single-section consumers keep matching the canonical codes.
+        let only_test_plan = "## Test plan\n\nHow.\n";
+        let err = body_sections(only_test_plan, &BodyHeadings::default()).expect_err("no summary");
+        assert_eq!(err_kind(err), "body_missing_summary");
+
+        let only_summary = "## Summary\n\nWhat.\n";
+        let err = body_sections(only_summary, &BodyHeadings::default()).expect_err("no test plan");
+        assert_eq!(err_kind(err), "body_missing_test_plan");
+    }
+
+    #[test]
+    fn body_sections_aggregates_when_both_missing() {
+        let body = "no required sections here\n";
+        let err = body_sections(body, &BodyHeadings::default()).expect_err("both missing");
+        assert_eq!(err.kind(), "body_missing_sections");
+        // Message enumerates both headings; details preserve the per-section
+        // codes so the aggregation never hides which sections failed.
+        assert!(err.message().contains("## Summary"), "{}", err.message());
+        assert!(err.message().contains("## Test plan"), "{}", err.message());
+        let detail = err.detail().expect("detail present");
+        assert!(detail.contains("body_missing_summary"), "{detail}");
+        assert!(detail.contains("body_missing_test_plan"), "{detail}");
+    }
+
+    fn verdict<'a>(verdicts: &'a [RuleVerdict], rule: &str) -> &'a RuleVerdict {
+        verdicts
+            .iter()
+            .find(|v| v.rule == rule)
+            .unwrap_or_else(|| panic!("missing verdict for {rule}"))
+    }
+
+    #[test]
+    fn run_local_preflight_all_green_for_valid_inputs() {
+        let headings = BodyHeadings::default();
+        let inputs = PreflightInputs {
+            branch: "feat/demo",
+            kind: PrKind::Feature,
+            title: "demo",
+            body: "## Summary\n\nx\n\n## Test plan\n\ny\n",
+            headings: &headings,
+        };
+        let verdicts = run_local_preflight(&inputs, Path::new("."), clean_status, pushed_head);
+        assert_eq!(verdicts.len(), 7);
+        assert!(verdicts.iter().all(|v| v.ok), "{verdicts:?}");
+    }
+
+    #[test]
+    fn run_local_preflight_reports_every_failure_without_short_circuit() {
+        // Empty body + unpushed head must both surface in one sweep.
+        let headings = BodyHeadings::default();
+        let inputs = PreflightInputs {
+            branch: "feat/demo",
+            kind: PrKind::Feature,
+            title: "demo",
+            body: "",
+            headings: &headings,
+        };
+        let verdicts = run_local_preflight(&inputs, Path::new("."), clean_status, unpushed_head);
+        assert!(verdict(&verdicts, "branch_name").ok);
+        assert!(verdict(&verdicts, "branch_kind").ok);
+        assert!(verdict(&verdicts, "title_length").ok);
+        assert_eq!(
+            verdict(&verdicts, "body_summary").code.as_deref(),
+            Some("body_missing_summary")
+        );
+        assert_eq!(
+            verdict(&verdicts, "body_test_plan").code.as_deref(),
+            Some("body_missing_test_plan")
+        );
+        assert!(verdict(&verdicts, "worktree_clean").ok);
+        assert_eq!(
+            verdict(&verdicts, "head_pushed").code.as_deref(),
+            Some("head_not_pushed")
+        );
+    }
+
+    #[test]
+    fn run_local_preflight_marks_branch_kind_not_evaluated_on_invalid_branch() {
+        let headings = BodyHeadings::default();
+        let inputs = PreflightInputs {
+            branch: "not-a-valid-branch",
+            kind: PrKind::Feature,
+            title: "demo",
+            body: "## Summary\n\nx\n\n## Test plan\n\ny\n",
+            headings: &headings,
+        };
+        let verdicts = run_local_preflight(&inputs, Path::new("."), clean_status, pushed_head);
+        let branch = verdict(&verdicts, "branch_name");
+        assert!(!branch.ok);
+        assert_eq!(branch.code.as_deref(), Some("branch_name_invalid"));
+        let kind = verdict(&verdicts, "branch_kind");
+        assert!(!kind.ok);
+        assert!(kind.code.is_none(), "kind not evaluated -> no code");
+        assert!(
+            kind.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("not evaluated"),
+            "{kind:?}"
+        );
     }
 
     #[test]

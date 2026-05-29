@@ -36,8 +36,8 @@ use crate::ops::label::{LabelTarget, validate_label_inputs};
 use crate::ops::repo_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::{
-    BodyHeadings, PrKind, body_summary, body_test_plan, branch_kind_matches, branch_name,
-    git_head_state, git_status_porcelain, head_pushed, title_length, worktree_clean,
+    BodyHeadings, PrKind, body_sections, branch_kind_matches, branch_name, git_head_state,
+    git_status_porcelain, head_pushed, title_length, worktree_clean,
 };
 
 const SCHEMA: &str = "pr.create";
@@ -172,8 +172,7 @@ pub fn run_with<R: BackendRunner>(
     let kind: PrKind = args.kind.into_kind();
     branch_kind_matches(prefix, kind)?;
     title_length(&args.title)?;
-    body_summary(&body, &env.headings)?;
-    body_test_plan(&body, &env.headings)?;
+    body_sections(&body, &env.headings)?;
     let label_target = match ctx.provider {
         Provider::GitHub => LabelTarget::Pr,
         Provider::GitLab => LabelTarget::Mr,
@@ -246,8 +245,7 @@ pub fn compute<R: BackendRunner>(
     let kind: PrKind = args.kind.into_kind();
     branch_kind_matches(prefix, kind)?;
     title_length(&args.title)?;
-    body_summary(&body, &env.headings)?;
-    body_test_plan(&body, &env.headings)?;
+    body_sections(&body, &env.headings)?;
     let label_target = match ctx.provider {
         Provider::GitHub => LabelTarget::Pr,
         Provider::GitLab => LabelTarget::Mr,

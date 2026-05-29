@@ -171,3 +171,50 @@ fn pr_body_render_rejects_missing_required_content_file() {
     assert!(stderr.contains("agent-runtime pr-body"), "{stderr}");
     assert!(stderr.contains("test-first"), "{stderr}");
 }
+
+#[test]
+fn pr_body_render_generic_kinds_emit_forge_compatible_body() {
+    // The four non-feature/bug kinds match `forge-cli pr deliver --kind` and
+    // render a generic Summary / Test-First / Test plan / Risk skeleton with
+    // no feature- or bug-specific sections and no extra required files.
+    for kind in ["chore", "docs", "ci", "refactor"] {
+        let fixture = Fixture::new();
+        let summary = fixture.write("summary.md", "Bumps the pinned toolchain.\n");
+        let test_first = fixture.write(
+            "test-first.md",
+            "- Change classification: chore\n- Waiver reason: mechanical change\n",
+        );
+        let test_plan = fixture.write("test-plan.md", "- cargo test -p agent-runtime-cli (pass)\n");
+
+        let output = run(&[
+            "pr-body",
+            "render",
+            "--kind",
+            kind,
+            "--summary-file",
+            &summary,
+            "--test-first-file",
+            &test_first,
+            "--test-plan-file",
+            &test_plan,
+        ]);
+
+        assert_eq!(
+            output.code,
+            0,
+            "kind={kind} stderr={}",
+            output.stderr_text()
+        );
+        let stdout = output.stdout_text();
+        assert!(stdout.contains("## Summary"), "kind={kind}: {stdout}");
+        assert!(stdout.contains("## Test plan"), "kind={kind}: {stdout}");
+        assert!(
+            stdout.contains("## Test-First Evidence"),
+            "kind={kind}: {stdout}"
+        );
+        assert!(stdout.contains("## Risk / Notes"), "kind={kind}: {stdout}");
+        // Generic kinds omit the feature/bug-specific sections.
+        assert!(!stdout.contains("## Changes"), "kind={kind}: {stdout}");
+        assert!(!stdout.contains("## Problem"), "kind={kind}: {stdout}");
+    }
+}

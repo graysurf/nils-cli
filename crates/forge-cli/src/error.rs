@@ -239,7 +239,8 @@ impl ForgeError {
         }
     }
 
-    fn message(&self) -> &str {
+    /// Return the human-readable error message.
+    pub fn message(&self) -> &str {
         match self {
             Self::NotImplemented { message, .. }
             | Self::BackendUnavailable { message, .. }
@@ -251,7 +252,8 @@ impl ForgeError {
         }
     }
 
-    fn detail(&self) -> Option<&str> {
+    /// Return the optional structured detail string.
+    pub fn detail(&self) -> Option<&str> {
         match self {
             Self::NotImplemented { .. } => None,
             Self::BackendUnavailable { detail, .. }

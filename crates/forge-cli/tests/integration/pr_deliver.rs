@@ -161,6 +161,60 @@ fn pr_deliver_dry_run_method_override_threads_through_merge_plan() {
 }
 
 #[test]
+fn pr_deliver_dry_run_reports_local_preflight_without_backend() {
+    // FORBIDDEN_STUB exits 99 if the gh backend is ever invoked. A bad body
+    // must surface in data.local_preflight without aborting (dry-run exits 0)
+    // and without calling the provider.
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "demo",
+            "--head",
+            "feat/demo",
+            "--body",
+            "no required sections here",
+        ],
+    );
+    assert_eq!(out.code, 0, "dry-run must not abort; stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let preflight = env["data"]["local_preflight"]
+        .as_array()
+        .expect("local_preflight array present");
+
+    let lookup = |rule: &str| {
+        preflight
+            .iter()
+            .find(|v| v["rule"] == rule)
+            .unwrap_or_else(|| panic!("missing verdict for {rule}: {preflight:?}"))
+    };
+
+    // Deterministic, git-independent rules.
+    assert_eq!(lookup("branch_name")["ok"], true);
+    assert_eq!(lookup("branch_kind")["ok"], true);
+    assert_eq!(lookup("title_length")["ok"], true);
+    // The bad body surfaces both section failures in one sweep.
+    assert_eq!(lookup("body_summary")["ok"], false);
+    assert_eq!(lookup("body_summary")["code"], "body_missing_summary");
+    assert_eq!(lookup("body_test_plan")["ok"], false);
+    assert_eq!(lookup("body_test_plan")["code"], "body_missing_test_plan");
+    // The worktree/head rules are present too (their verdict depends on the
+    // local git state, so only presence is asserted here).
+    assert!(preflight.iter().any(|v| v["rule"] == "worktree_clean"));
+    assert!(preflight.iter().any(|v| v["rule"] == "head_pushed"));
+}
+
+#[test]
 fn pr_deliver_help_lists_every_documented_flag() {
     let stub = StubEnv::new();
     let out = run_forge_cli(&stub, &["pr", "deliver", "--help"]);
