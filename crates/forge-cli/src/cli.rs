@@ -611,6 +611,9 @@ pub struct LabelEnsureArgs {
 /// `pr deliver` arguments. Maps to
 /// `forge-cli-ops-v1.yaml::operations.pr.deliver` inputs.
 #[derive(Args, Debug, Clone)]
+#[command(
+    after_help = "With --dry-run this runs a faithful local preflight: it evaluates the non-mutating lock-down rules (branch name, branch/kind match, title length, body Summary/Test plan sections, clean worktree, head pushed) and reports each verdict in data.local_preflight[] without invoking any provider backend, so one dry-run predicts whether the real run's local gates will pass."
+)]
 pub struct PrDeliverArgs {
     /// PR / MR kind (selects branch-prefix rule). Required.
     #[arg(long, value_enum)]

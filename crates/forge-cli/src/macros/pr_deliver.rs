@@ -29,7 +29,10 @@ use crate::ops::pr_create::{self, Environment};
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
 use crate::ops::{auth_status, pr_checks, pr_merge, pr_ready, pr_wait_checks, repo_view};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::validations::git_status_porcelain;
+use crate::validations::{
+    BodyHeadings, PreflightInputs, RuleVerdict, git_current_branch, git_head_state,
+    git_status_porcelain, run_local_preflight,
+};
 
 pub const SCHEMA: &str = "pr.deliver";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -66,12 +69,18 @@ pub struct Step {
 
 /// Dry-run envelope. `plan_steps[]` enumerates every atom that would run
 /// in this invocation; the macro never spawns a backend in dry-run.
+/// `local_preflight[]` reports each non-mutating lock-down rule's verdict so
+/// a single dry-run predicts whether the real run's local gates will pass.
 #[derive(Debug, Clone, Serialize)]
 pub struct PrDeliverDryRun {
     pub provider: &'static str,
     pub kind: &'static str,
     pub plan_steps: Vec<DryRunStep>,
     pub no_merge: bool,
+    /// Per-rule verdicts from the non-mutating local preflight (Rules 1a, 1b,
+    /// 3, 2a, 2b, 4, 5). Additive: consumers that predate this field ignore
+    /// it. The dry-run path never invokes a provider backend to compute it.
+    pub local_preflight: Vec<RuleVerdict>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,7 +116,7 @@ pub fn run_with<R: BackendRunner, C: Clock>(
     )?;
 
     if global.dry_run {
-        return Ok(emit_dry_run(&ctx, &args, format));
+        return Ok(emit_dry_run(&ctx, &args, format, workdir));
     }
 
     execute_sequence(runner, clock, global, &ctx, &args, format, workdir)
@@ -327,7 +336,27 @@ fn build_create_args(args: &PrDeliverArgs, default_branch: &str) -> PrCreateArgs
     }
 }
 
-fn emit_dry_run(ctx: &ProviderContext, args: &PrDeliverArgs, format: OutputFormat) -> i32 {
+/// Resolve the body the real run would validate, without consuming stdin.
+/// `--body-file -` (stdin) is treated as unknown (empty) for the preview so a
+/// dry-run never blocks reading from the terminal.
+fn resolve_preview_body(args: &PrDeliverArgs) -> String {
+    if let Some(body) = &args.body {
+        return body.clone();
+    }
+    if let Some(path) = &args.body_file
+        && path.as_str() != "-"
+    {
+        return std::fs::read_to_string(path).unwrap_or_default();
+    }
+    String::new()
+}
+
+fn emit_dry_run(
+    ctx: &ProviderContext,
+    args: &PrDeliverArgs,
+    format: OutputFormat,
+    workdir: &Path,
+) -> i32 {
     let mut plan_steps = vec![
         DryRunStep {
             step: "auth_status",
@@ -363,11 +392,32 @@ fn emit_dry_run(ctx: &ProviderContext, args: &PrDeliverArgs, format: OutputForma
             plan: pr_merge_dry_plan(ctx, args),
         });
     }
+    // Faithful local preflight: evaluate every non-mutating lock-down rule
+    // and report each verdict. This runs local string / `git` checks only —
+    // never a provider backend — so a dry-run predicts the real run's local
+    // gates (e.g. a bad body and an unpushed head surface together).
+    let branch = match &args.head {
+        Some(head) => head.clone(),
+        None => git_current_branch(workdir).unwrap_or_default(),
+    };
+    let body = resolve_preview_body(args);
+    let headings = BodyHeadings::default();
+    let inputs = PreflightInputs {
+        branch: &branch,
+        kind: args.kind.into_kind(),
+        title: &args.title,
+        body: &body,
+        headings: &headings,
+    };
+    let local_preflight =
+        run_local_preflight(&inputs, workdir, git_status_porcelain, git_head_state);
+
     let payload = PrDeliverDryRun {
         provider: ctx.provider.as_str(),
         kind: args.kind.as_str(),
         plan_steps,
         no_merge: args.no_merge,
+        local_preflight,
     };
     let envelope = Envelope::success(schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION), payload);
     write_envelope(&envelope, format);

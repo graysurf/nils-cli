@@ -19,7 +19,10 @@ pub enum PrBodyCommand {
 
 #[derive(Args, Debug)]
 pub struct PrBodyRenderArgs {
-    /// Body kind. `feature` renders the feature template; `bug` renders the bug template.
+    /// Body kind. `feature` and `bug` render their dedicated templates;
+    /// `chore`, `docs`, `ci`, and `refactor` render a generic
+    /// Summary / Test-First / Test plan / Risk skeleton. The set matches the
+    /// six kinds `forge-cli pr deliver --kind` accepts.
     #[arg(long, value_enum)]
     pub kind: PrBodyKind,
     /// One-paragraph summary of the change and scope.
@@ -59,6 +62,10 @@ pub struct PrBodyRenderArgs {
 pub enum PrBodyKind {
     Feature,
     Bug,
+    Chore,
+    Docs,
+    Ci,
+    Refactor,
 }
 
 pub fn run(args: PrBodyArgs) -> anyhow::Result<u8> {
@@ -112,6 +119,9 @@ fn render(args: PrBodyRenderArgs) -> anyhow::Result<u8> {
                 &risk,
             )
         }
+        PrBodyKind::Chore | PrBodyKind::Docs | PrBodyKind::Ci | PrBodyKind::Refactor => {
+            render_generic(&summary, &test_first, &test_plan, &risk)
+        }
     };
 
     validate_forge_sections(&body)?;
@@ -143,6 +153,16 @@ fn render_feature(
 ) -> String {
     format!(
         "## Summary\n\n{summary}\n\n## Changes\n\n{changes}\n\n## Test-First Evidence\n\n{test_first}\n\n## Test plan\n\n{test_plan}\n\n## Risk / Notes\n\n{risk}\n"
+    )
+}
+
+/// Generic skeleton for kinds without a dedicated template
+/// (`chore` / `docs` / `ci` / `refactor`). Emits the forge-cli-required
+/// `## Summary` and `## Test plan` sections plus test-first evidence and
+/// risk notes, with no kind-specific sections.
+fn render_generic(summary: &str, test_first: &str, test_plan: &str, risk: &str) -> String {
+    format!(
+        "## Summary\n\n{summary}\n\n## Test-First Evidence\n\n{test_first}\n\n## Test plan\n\n{test_plan}\n\n## Risk / Notes\n\n{risk}\n"
     )
 }
 
