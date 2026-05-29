@@ -1,0 +1,171 @@
+# plan-issue record restore (rehydrate bundle from issue) — Source
+
+| Field              | Value                                                                                                                                                                                                                             |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Status             | Ready for plan generation                                                                                                                                                                                                         |
+| Date               | 2026-05-30                                                                                                                                                                                                                        |
+| Source             | Discussion 2026-05-30: a plan-tracking issue embeds full frozen snapshots of the bundle, but `plan-issue` has no inverse command to re-materialize them, so an unmerged bundle branch is the only place the canonical files live. |
+| Intended next step | Generate a plan to add `plan-issue record restore`, making the issue a durable source-of-truth so the bundle branch / main-merge becomes a convenience, not a requirement.                                                        |
+
+## Purpose
+
+A plan-tracking issue already embeds the full content of all three
+bundle files as frozen snapshots (the `source`, `plan`, and `state`
+lifecycle comments). But `plan-issue` has no inverse command to turn
+those snapshots back into the `docs/plans/<slug>/` files. Today, if the
+bundle branch is pruned before it lands on the default branch, the
+canonical files are gone from git and recovery means hand-copying out
+of the issue comments. A `record restore` command closes that gap: the
+issue becomes a true source-of-truth, so keeping the branch alive or
+merging to main is a convenience rather than a durability requirement.
+
+## Confirmed facts
+
+- `record open` / `record attach` embed each bundle file's full content
+  as a frozen snapshot inside a `<details>` block, one per lifecycle
+  role (`source`, `plan`, `state`), each followed by a trailer comment
+  `<!-- plan-issue-record-payload:hex:<hex> -->`. Verified on
+  `sympoies/nils-cli#650`.
+- The hex payload (`plan-issue-record.payload.v2`) carries metadata
+  **only** — `path`, `commit`, `title`, `summary` — **not** the file
+  bytes. Decoded from the `#650` source payload:
+  `{"role":"source","data":{"path":"docs/plans/.../...-discussion-source.md","commit":"964ca9e…","title":null,"summary":null}}`.
+  The file content lives only in the visible `<details>` markdown block.
+- `plan-issue` exposes no restore / extract / materialize / sync
+  command. `plan-issue record --help` lists only `open`, `attach`,
+  `post`, `repair-dashboard`, `close`, `audit`, `template`.
+- `source` and `plan` are posted once at open (and re-attachable);
+  `state` is re-posted across the lifecycle via `record post`. So a
+  faithful restore must take the **latest** snapshot per role.
+- The issue body + comments are already retrievable through the same
+  provider read path `record audit` consumes (it accepts
+  `--body-file` / `--comments-json`), so restore can reuse that and run
+  offline when given the JSON.
+
+## Decisions (locked at this source doc)
+
+1. Add `plan-issue record restore --repo <owner/repo> --issue <N>
+   --out <dir>` that reconstructs the bundle's `source`, `plan`, and
+   `state` files from the issue's latest snapshot of each role.
+2. Extraction source: take the file bytes from each role's visible
+   `<details>` snapshot block, keyed by the canonical `path` from that
+   role's hex payload. The payload supplies path + provenance; the
+   `<details>` block supplies content.
+3. Restore the **latest** snapshot per role (state evolves over the
+   lifecycle). Record each role's snapshot `commit` from the payload as
+   provenance in the output, but never require that commit to still
+   exist — recovering when the commit is gone is the whole point.
+4. Reuse the `record audit` read path: resolve the issue via the
+   provider by default, and accept offline `--body-file` /
+   `--comments-json` inputs so restore works without network.
+5. Non-destructive by default: refuse to overwrite existing files
+   unless `--force`. Support `--format json` returning the restored
+   file paths and each role's recorded commit.
+6. Scope to the tracking profile's three bundle roles (`source`,
+   `plan`, `state`). Session / validation / review / closeout comments
+   are lifecycle records, not bundle files, and are out of scope.
+
+## Scope
+
+- The `record restore` subcommand and its snapshot parser (the inverse
+  of the existing snapshot renderer).
+- Round-trip tests proving `open` then `restore` reproduces the bundle.
+
+## Non-scope
+
+- Changing the snapshot format or embedding full content / a content
+  hash in the hex payload (a possible separate hardening — see Risks).
+- Restoring non-bundle lifecycle roles (session / validation / review /
+  closeout).
+- Auto-committing or auto-merging the restored files.
+
+## Implementation boundaries
+
+- Keep the restore parser symmetric with the existing snapshot renderer
+  (same `<details>` + payload-trailer format) and co-located so a format
+  change updates both; guard the symmetry with a round-trip test.
+- Use the same provider read `record audit` uses, and support the same
+  offline `--body-file` / `--comments-json` inputs.
+- No new third-party dependency (preserve `third-party-artifacts` and
+  the `Cargo.lock` locked-build gate).
+
+## Requirements
+
+- `record restore --repo <owner/repo> --issue <N> --out <dir>` writes
+  the `source`, `plan`, and `state` files at their canonical paths
+  under the output directory, from the latest snapshot of each role.
+- Idempotent and non-destructive: refuses to clobber existing files
+  without `--force`; `--format json` lists restored paths and each
+  role's recorded commit.
+- Runs offline when given `--comments-json` / `--body-file`.
+
+## Acceptance criteria
+
+- Round-trip: `record open` a bundle, then `record restore --out <tmp>`
+  reproduces the three files matching the originals (byte-exact, modulo
+  a documented trailing-newline normalization if any).
+- Restoring an issue whose `state` was updated after open yields the
+  latest state snapshot, not the initial one.
+- A missing required role produces a clear error; `--force` governs
+  overwrite of existing files.
+- DEVELOPMENT.md required checks plus the completion audits pass with no
+  new dependency.
+
+## Validation plan
+
+- `cargo test -p nils-plan-issue-cli` (snapshot parser, open->restore
+  round-trip, latest-state selection, missing-role error, overwrite /
+  `--force`).
+- Manual: `record restore --repo sympoies/nils-cli --issue 650 --out
+  <tmp>` and `diff -r` against the committed bundle — expect a match.
+- Full required checks (`nils-cli-checks-entrypoint.sh --local-fast`)
+  and the completion audits before PR.
+
+## Findings
+
+| Priority | Issue | Evidence | Fix location | Acceptance |
+| --- | --- | --- | --- | --- |
+| HIGH | No inverse of `record open`: bundle snapshots embedded in the issue cannot be re-materialized into files, so an unmerged/pruned branch loses the canonical bundle | `plan-issue record --help` (open/attach/post/repair-dashboard/close/audit/template — no restore); `#650` payload carries only path+commit, content only in `<details>` | new `record restore` subcommand in `plan-issue-cli` + the snapshot parser | round-trip `open`->`restore` reproduces the bundle |
+
+## Risks and guardrails
+
+- Snapshot drift: extraction reads the visible `<details>` block, so a
+  hand-edited snapshot would restore the edited text. Mitigation: treat
+  snapshots as frozen; a future hardening could embed a
+  `content_sha256` in the payload for integrity verification (noted
+  non-scope).
+- Renderer/parser divergence: a format change to `record open` could
+  silently break restore. Mitigation: keep them symmetric and pin an
+  `open`->`restore` round-trip test.
+- Latest-vs-initial state: restoring the wrong snapshot would resurrect
+  stale state. Mitigation: explicit latest-per-role selection plus a
+  test that mutates state then restores.
+
+## Execution
+
+- Recommended plan: docs/plans/plan-issue-record-restore/plan-issue-record-restore-plan.md
+- Recommended execution state: docs/plans/plan-issue-record-restore/plan-issue-record-restore-execution-state.md
+- Status: ready for plan generation; to be tracked by a plan-tracking issue.
+- Next-task source: this document.
+
+## Retention intent
+
+- Plan-scoped. Clean up `docs/plans/plan-issue-record-restore/` after
+  execution lands and the PR merges, unless promoted into a plan-issue
+  runbook.
+
+## Read-first references
+
+- The `plan-issue` snapshot renderer module (the `<details>` +
+  `plan-issue-record-payload:hex` format `record open` emits).
+- The `record audit` provider read path (`--body-file` /
+  `--comments-json`) — restore reuses it.
+- `plan-issue record` subcommand wiring (where `restore` is added).
+- `sympoies/nils-cli#650` — a live tracking issue usable as a restore
+  fixture.
+
+## Recommended next artifact
+
+- A plan (`*-plan.md`) sequencing: snapshot parser -> `record restore`
+  subcommand -> round-trip + edge tests -> required checks, tracked via
+  `create-plan-tracking-issue`.
