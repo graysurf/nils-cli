@@ -74,14 +74,35 @@ set -euo pipefail
 
 scenario="${MOCK_GH_SCENARIO:-success}"
 calls_file="${MOCK_GH_CALLS:-/tmp/mock-gh-calls}"
+dispatch_file="${MOCK_GH_DISPATCHED_FILE:-${calls_file}.dispatched}"
 echo "$*" >> "$calls_file"
 
 if [[ "${1:-}" == "workflow" && "${2:-}" == "run" ]]; then
+  touch "$dispatch_file"
   exit 0
 fi
 
 if [[ "${1:-}" == "run" && "${2:-}" == "list" ]]; then
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$scenario" == "old-run-only" ]]; then
+    cat <<JSON
+[
+  {
+    "databaseId": 111111,
+    "createdAt": "${now}",
+    "headBranch": "main",
+    "url": "https://github.com/sympoies/nils-cli/actions/runs/111111",
+    "status": "completed",
+    "conclusion": "failure"
+  }
+]
+JSON
+    exit 0
+  fi
+  if [[ ! -f "$dispatch_file" ]]; then
+    printf '[]\n'
+    exit 0
+  fi
   conclusion="success"
   if [[ "$scenario" == "watch-fail" ]]; then
     conclusion="failure"
@@ -133,6 +154,16 @@ echo "unexpected gh command: $*" >&2
 exit 1
 MOCK
   chmod +x "${dir}/gh"
+}
+
+create_mock_sleep() {
+  local dir="$1"
+  cat > "${dir}/sleep" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+MOCK
+  chmod +x "${dir}/sleep"
 }
 
 create_mock_agent_out() {
@@ -246,8 +277,10 @@ test_publish_wait_failure() {
   create_mock_gh "$bin_dir"
 
   local report="${tmp}/report-failed.md"
+  local gh_calls="${tmp}/gh-calls.log"
   set +e
   PATH="${bin_dir}:$PATH" \
+    MOCK_GH_CALLS="$gh_calls" \
     MOCK_GH_SCENARIO="watch-fail" \
     "$entrypoint" --crate nils-a --skip-status-check --report-file "$report" \
     >"${tmp}/stdout.log" 2>"${tmp}/stderr.log"
@@ -257,6 +290,34 @@ test_publish_wait_failure() {
   [[ "$rc" -eq 1 ]] || fail "expected exit code 1 when workflow run fails, got $rc"
   assert_contains "$report" 'Run conclusion: `failure`'
   assert_contains "$report" 'Status snapshot: `skipped`'
+}
+
+test_publish_discovery_ignores_preexisting_runs() {
+  local tmp
+  tmp="$(mktemp -d)"
+  local repo="${tmp}/repo"
+  local bin_dir="${tmp}/bin"
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo"
+  create_mock_cargo "$bin_dir"
+  create_mock_gh "$bin_dir"
+  create_mock_sleep "$bin_dir"
+
+  local report="${tmp}/report-stale.md"
+  local gh_calls="${tmp}/gh-calls.log"
+  set +e
+  PATH="${bin_dir}:$PATH" \
+    MOCK_GH_CALLS="$gh_calls" \
+    MOCK_GH_SCENARIO="old-run-only" \
+    PUBLISH_CRATES_IO_SLEEP_BIN="${bin_dir}/sleep" \
+    "$entrypoint" --crate nils-a --skip-status-check --report-file "$report" --discover-timeout-seconds 0 \
+    >"${tmp}/stdout.log" 2>"${tmp}/stderr.log"
+  local rc=$?
+  set -e
+
+  [[ "$rc" -eq 1 ]] || fail "expected exit code 1 when only preexisting workflow runs are listed, got $rc"
+  assert_contains "${tmp}/stderr.log" "failed to locate dispatched workflow run"
+  [[ ! -f "$report" ]] || fail "did not expect a report for an undiscovered run"
 }
 
 test_dry_run_no_wait_dispatches_workflow() {
@@ -294,7 +355,9 @@ test_default_report_file_uses_agent_out_project_dir() {
   create_mock_gh "$bin_dir"
   create_mock_agent_out "$bin_dir"
 
+  local gh_calls="${tmp}/gh-calls.log"
   PATH="${bin_dir}:$PATH" \
+    MOCK_GH_CALLS="$gh_calls" \
     MOCK_AGENT_OUT_DIR="$report_dir" \
     "$entrypoint" --crate nils-a --dry-run-only --no-wait \
     >"${tmp}/stdout.log" 2>"${tmp}/stderr.log"
@@ -321,6 +384,7 @@ fi
 
 test_publish_wait_success
 test_publish_wait_failure
+test_publish_discovery_ignores_preexisting_runs
 test_dry_run_no_wait_dispatches_workflow
 test_default_report_file_uses_agent_out_project_dir
 

@@ -108,6 +108,7 @@ discover_run_id() {
   local since_epoch="$1"
   local timeout_seconds="$2"
   local poll_seconds="$3"
+  local known_run_ids_json="$4"
   local elapsed=0
 
   while (( elapsed <= timeout_seconds )); do
@@ -117,7 +118,7 @@ discover_run_id() {
     fi
 
     local run_id
-    run_id="$("$python_bin" - "$since_epoch" "$ref" "$run_list_json" <<'PY'
+    run_id="$("$python_bin" - "$since_epoch" "$ref" "$known_run_ids_json" "$run_list_json" <<'PY'
 from __future__ import annotations
 
 from datetime import datetime
@@ -126,7 +127,20 @@ import sys
 
 since_epoch = int(sys.argv[1])
 target_ref = sys.argv[2]
-raw = sys.argv[3] if len(sys.argv) > 3 else "[]"
+known_raw = sys.argv[3] if len(sys.argv) > 3 else "[]"
+raw = sys.argv[4] if len(sys.argv) > 4 else "[]"
+
+try:
+    known_ids = set()
+    for value in json.loads(known_raw):
+        if isinstance(value, dict):
+            run_id = value.get("databaseId")
+        else:
+            run_id = value
+        if run_id is not None:
+            known_ids.add(str(run_id))
+except Exception:
+    known_ids = set()
 
 try:
     runs = json.loads(raw)
@@ -136,10 +150,19 @@ except Exception:
 def to_epoch(value: str) -> int:
     if not value:
         return 0
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return 0
     return int(dt.timestamp())
 
-threshold = max(0, since_epoch - 300)
+threshold = max(0, since_epoch - 10)
+
+def is_new_candidate(run) -> bool:
+    run_id = run.get("databaseId")
+    if run_id is None or str(run_id) in known_ids:
+        return False
+    return to_epoch(run.get("createdAt", "")) >= threshold
 
 def select(candidates):
     if not candidates:
@@ -149,11 +172,11 @@ def select(candidates):
 filtered = [
     run
     for run in runs
-    if to_epoch(run.get("createdAt", "")) >= threshold and run.get("headBranch") == target_ref
+    if is_new_candidate(run) and run.get("headBranch") == target_ref
 ]
 picked = select(filtered)
 if picked is None:
-    fallback = [run for run in runs if to_epoch(run.get("createdAt", "")) >= threshold]
+    fallback = [run for run in runs if is_new_candidate(run)]
     picked = select(fallback)
 
 if picked is None:
@@ -513,6 +536,7 @@ note "report: $report_file"
 
 run_started_at="$(now_utc)"
 dispatch_start_epoch="$(date +%s)"
+known_run_ids_json="$("$gh_bin" run list --workflow "$workflow" --event workflow_dispatch --limit 50 --json databaseId 2>/dev/null || printf '[]')"
 
 declare -a dispatch_cmd=(
   "$gh_bin" workflow run "$workflow"
@@ -527,7 +551,7 @@ fi
 "${dispatch_cmd[@]}"
 note "workflow dispatched"
 
-run_id="$(discover_run_id "$dispatch_start_epoch" "$discover_timeout_seconds" "$poll_seconds" || true)"
+run_id="$(discover_run_id "$dispatch_start_epoch" "$discover_timeout_seconds" "$poll_seconds" "$known_run_ids_json" || true)"
 [[ -n "$run_id" ]] || die "failed to locate dispatched workflow run for '$workflow' within ${discover_timeout_seconds}s"
 
 run_url=""
