@@ -6172,6 +6172,51 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_profile_state_checkpoint_payload_is_also_accumulative() {
+        // The state-payload builder is profile-agnostic: `tracking checkpoint
+        // --profile dispatch --post state` shares `state_checkpoint_payload`,
+        // so a dispatch run with an execution-state ledger gets the same
+        // accumulative `tasks[]` as the tracking profile. This locks that
+        // parity so a future profile split cannot silently regress dispatch.
+        use crate::tracking::run_state::{ExecutionRun, RunPhase};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let ledger = tmp.path().join("slug-execution-state.md");
+        std::fs::write(
+            &ledger,
+            concat!(
+                "## Task Ledger\n\n",
+                "| ID | Status | Task | Evidence | Notes |\n",
+                "| --- | --- | --- | --- | --- |\n",
+                "| 1.1 | done | Lane A | log | a |\n",
+                "| 1.2 | in-progress | Lane B | — | b |\n",
+                "| 2.1 | pending | Lane C | — | c |\n",
+            ),
+        )
+        .expect("write ledger");
+
+        let mut run = ExecutionRun::new(
+            "run-d",
+            "owner/repo",
+            7,
+            "dispatch",
+            RunPhase::Implementing,
+            "2026-05-29T00:00:00Z",
+        );
+        run.execution_state_file = Some(ledger);
+
+        let payload = state_checkpoint_payload(&run);
+        let tasks = payload["tasks"].as_array().expect("tasks array");
+        assert_eq!(
+            tasks.len(),
+            3,
+            "dispatch checkpoint must carry the full accumulative ledger"
+        );
+        let ids: Vec<&str> = tasks.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["1.1", "1.2", "2.1"]);
+    }
+
+    #[test]
     fn render_status_and_build_options_helpers_are_deterministic() {
         let rows = vec![
             task_row("S1T1", "issue/s1-t1", "wt-1", "#1", "planned", "sprint=S1"),
