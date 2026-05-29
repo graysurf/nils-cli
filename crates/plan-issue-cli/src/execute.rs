@@ -2327,7 +2327,7 @@ fn render_checkpoint_role(
     };
 
     let payload = match role {
-        PayloadRole::State => synthesize_state_payload(run),
+        PayloadRole::State => state_checkpoint_payload(run),
         PayloadRole::Session => match synthesize_session_payload(run) {
             Some(value) => value,
             None => {
@@ -2392,12 +2392,67 @@ fn load_state_markdown_summary(run: &crate::tracking::run_state::ExecutionRun) -
     }
 }
 
+/// Build the `state` checkpoint payload.
+///
+/// When the run names a canonical execution-state ledger, the hidden payload's
+/// `tasks[]` carries the FULL accumulative per-task table (every task known at
+/// post-time), so the provider issue is self-contained per-task history that
+/// matches the visible Task Ledger. Falls back to the single-current
+/// synthesized baseline when no ledger is recorded or it cannot be parsed.
+fn state_checkpoint_payload(run: &crate::tracking::run_state::ExecutionRun) -> Value {
+    let mut payload = synthesize_state_payload(run);
+    if let Some(tasks) = accumulative_state_tasks(run)
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("tasks".to_string(), Value::Array(tasks));
+    }
+    payload
+}
+
+/// Parse the canonical execution-state `## Task Ledger` into the accumulative
+/// `tasks[]` payload shape. Returns `None` when no ledger is recorded, it
+/// cannot be read, or it has no rows.
+fn accumulative_state_tasks(run: &crate::tracking::run_state::ExecutionRun) -> Option<Vec<Value>> {
+    let path = run.execution_state_file.as_ref()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let rows = plan_tooling::ledger::read_rows(&raw, path).ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    Some(
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "status": normalize_task_status(&row.status),
+                    "title": row.task,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Map a ledger Status cell to a valid `state.tasks[].status` value. The
+/// execution-state ledger and the state payload share one status vocabulary;
+/// unknown or empty cells degrade to `pending` so a malformed row never breaks
+/// payload deserialization.
+fn normalize_task_status(status: &str) -> &'static str {
+    match status.trim() {
+        "in-progress" => "in-progress",
+        "done" => "done",
+        "deferred" => "deferred",
+        "blocked" => "blocked",
+        "waived" => "waived",
+        _ => "pending",
+    }
+}
+
 fn synthesize_state_payload(run: &crate::tracking::run_state::ExecutionRun) -> Value {
     // Build a placeholder task row from the selected scope so the rendered
-    // body carries a `## Task Ledger` section. v1 controller leaves rich
-    // task ledger rendering to the canonical execution-state Markdown that
-    // skills supply via record post; this synthesizer is a deterministic
-    // baseline for `tracking checkpoint` previews.
+    // body carries a `## Task Ledger` section. This synthesizer is the
+    // deterministic single-current baseline for `tracking checkpoint`
+    // previews; `state_checkpoint_payload` replaces `tasks[]` with the full
+    // accumulative ledger when the run names an execution-state file.
     let task_id = run
         .selected_scope
         .as_ref()
@@ -6047,6 +6102,73 @@ mod tests {
         let local_repo = resolve_repo_for_live(BinaryFlavor::PlanIssueLocal, Some("foo/bar"))
             .expect_err("local binary should fail before resolving repo");
         assert_eq!(local_repo.code, "live-command-unavailable");
+    }
+
+    #[test]
+    fn state_checkpoint_payload_carries_full_accumulative_ledger() {
+        use crate::tracking::run_state::{ExecutionRun, RunPhase};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let ledger = tmp.path().join("slug-execution-state.md");
+        std::fs::write(
+            &ledger,
+            concat!(
+                "# Execution State\n\n",
+                "## Task Ledger\n\n",
+                "| ID | Status | Task | Evidence | Notes |\n",
+                "| --- | --- | --- | --- | --- |\n",
+                "| 1.1 | done | Append line A | log | first |\n",
+                "| 1.2 | in-progress | Append line B | — | second |\n",
+                "| 1.3 | blocked | Append line C | — | third |\n",
+                "| 1.4 | waived | Skip D | — | fourth |\n",
+            ),
+        )
+        .expect("write ledger");
+
+        let mut run = ExecutionRun::new(
+            "run-1",
+            "owner/repo",
+            1,
+            "tracking",
+            RunPhase::Implementing,
+            "2026-05-29T00:00:00Z",
+        );
+        run.execution_state_file = Some(ledger.clone());
+
+        let payload = state_checkpoint_payload(&run);
+        let tasks = payload["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 4, "hidden payload must carry the full ledger");
+        let ids: Vec<&str> = tasks.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["1.1", "1.2", "1.3", "1.4"]);
+        let statuses: Vec<&str> = tasks
+            .iter()
+            .map(|t| t["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, ["done", "in-progress", "blocked", "waived"]);
+        assert_eq!(tasks[0]["title"].as_str().unwrap(), "Append line A");
+
+        // The accumulative payload must round-trip through the typed StateData
+        // reader (record audit path), exercising the blocked/waived variants.
+        let state = serde_json::from_value::<crate::lifecycle_record::StateData>(payload.clone())
+            .expect("accumulative payload deserializes into StateData");
+        assert_eq!(state.tasks.len(), 4);
+
+        // Fallback: no execution-state ledger -> single-current baseline.
+        let mut bare = ExecutionRun::new(
+            "run-2",
+            "owner/repo",
+            1,
+            "tracking",
+            RunPhase::Implementing,
+            "2026-05-29T00:00:00Z",
+        );
+        bare.execution_state_file = None;
+        let baseline = state_checkpoint_payload(&bare);
+        assert_eq!(
+            baseline["tasks"].as_array().expect("tasks array").len(),
+            1,
+            "without a ledger the payload stays single-current"
+        );
     }
 
     #[test]

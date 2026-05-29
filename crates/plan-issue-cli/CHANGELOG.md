@@ -39,6 +39,17 @@ versioning.
 
 ### Changed
 
+- `tracking checkpoint --post state` now emits an **accumulative** `tasks[]`
+  hidden payload: every state post carries the full per-task table from the
+  canonical execution-state `## Task Ledger` (when one is recorded), so the
+  provider issue is self-contained per-task history matching the visible
+  ledger. Falls back to the single-current synthesized baseline when no
+  execution-state file is recorded. New-format-only; no v2 reader or mixed
+  old/new stream reconciliation. (graysurf/plan-tracking-testbed#16,
+  sympoies/nils-cli#628)
+- `state.tasks[].status` now shares the execution-state ledger vocabulary
+  (`pending|in-progress|done|deferred|blocked|waived`); the `TaskRowStatus`
+  payload enum gained `blocked` and `waived`.
 - Documented the next state payload replacement as a new-format-only contract:
   `record audit`, `record repair-dashboard`, `tracking status`, and
   `tracking close-ready` target the active payload contract, while old

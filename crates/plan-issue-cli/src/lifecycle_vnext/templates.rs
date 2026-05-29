@@ -150,7 +150,8 @@ fn role_payload_skeleton(role: PayloadRole) -> serde_json::Value {
             "current": "<current task or state>",
             "next_action": "<next task or unblock action>",
             "tasks": [
-                {"id": "1.1", "status": "pending|in-progress|done|deferred", "title": "<task title>"}
+                {"id": "1.1", "status": "pending|in-progress|done|deferred|blocked|waived", "title": "<task title>"},
+                {"id": "1.2", "status": "pending|in-progress|done|deferred|blocked|waived", "title": "<accumulative: full per-task ledger>"}
             ],
             "prs": [
                 {"ref": "owner/repo#123", "url": "<url>", "status": "open|merged|closed"}

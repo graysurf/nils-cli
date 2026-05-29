@@ -126,6 +126,13 @@ Per-role `data` shapes:
 
 ### `state`
 
+`tasks[]` is **accumulative**: each `state` post carries the complete per-task
+table the agent is aware of at post time (every row of the canonical
+execution-state `## Task Ledger`), not just the current/selected task. This
+makes the provider issue self-contained per-task history that matches the
+visible Task Ledger. `tasks[].status` shares the ledger's status vocabulary
+(`pending|in-progress|done|deferred|blocked|waived`).
+
 ```json
 {
   "status": "in-progress|complete|blocked",
@@ -133,7 +140,9 @@ Per-role `data` shapes:
   "current": "<text>",
   "next_action": "<text>",
   "tasks": [
-    {"id": "1.1", "status": "pending|in-progress|done|deferred", "title": "<text>"}
+    {"id": "1.1", "status": "done", "title": "<text>"},
+    {"id": "1.2", "status": "in-progress", "title": "<text>"},
+    {"id": "1.3", "status": "pending|in-progress|done|deferred|blocked|waived", "title": "<text>"}
   ],
   "prs": [
     {"ref": "owner/repo#123", "url": "<url>", "status": "open|merged|closed"}
@@ -201,11 +210,14 @@ identity. Audit logic must reject unknown schema names rather than guess.
 
 ## State Payload Replacement Policy
 
-The next state payload contract replaces the current v2 state payload semantics
-instead of preserving them as a supported old format. In that replacement:
+The state payload contract replaces the earlier v2/current-only state payload
+semantics instead of preserving them as a supported old format. As landed:
 
-- `state.tasks[]` becomes the complete accumulative task-ledger payload for the
-  state post, not a v2/current-only compatibility stream.
+- `state.tasks[]` is the complete accumulative task-ledger payload for the
+  state post, not a v2/current-only compatibility stream. The checkpoint
+  writer populates it from the canonical execution-state `## Task Ledger` when
+  one is recorded, and falls back to the single-current synthesized baseline
+  otherwise.
 - `record audit`, `record repair-dashboard`, `tracking status`, and
   `tracking close-ready` target the active payload contract only. They do not
   carry a long-term v2 reader or mixed old/new stream reconciliation rule.

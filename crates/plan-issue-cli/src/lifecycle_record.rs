@@ -1042,6 +1042,8 @@ pub enum TaskRowStatus {
     InProgress,
     Done,
     Deferred,
+    Blocked,
+    Waived,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -1851,10 +1853,12 @@ fn normalize_state_markdown_for_comment(markdown: &str) -> Result<String, String
 
 fn is_terminal_state(state: &StateData) -> bool {
     state.status == Some(StateStatus::Complete)
-        && state
-            .tasks
-            .iter()
-            .all(|task| matches!(task.status, TaskRowStatus::Done | TaskRowStatus::Deferred))
+        && state.tasks.iter().all(|task| {
+            matches!(
+                task.status,
+                TaskRowStatus::Done | TaskRowStatus::Deferred | TaskRowStatus::Waived
+            )
+        })
 }
 
 fn render_state_payload_visible(state: &StateData) -> String {
@@ -2093,6 +2097,8 @@ fn task_row_status_label(status: TaskRowStatus) -> &'static str {
         TaskRowStatus::InProgress => "in-progress",
         TaskRowStatus::Done => "done",
         TaskRowStatus::Deferred => "deferred",
+        TaskRowStatus::Blocked => "blocked",
+        TaskRowStatus::Waived => "waived",
     }
 }
 
