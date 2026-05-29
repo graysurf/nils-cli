@@ -147,6 +147,12 @@ pub struct ExecutionRun {
     pub worktree: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<LinkedPr>,
+    /// Every linked PR observed across the run, accumulated in first-seen
+    /// order (dedup by ref). `pr` stays the current / most-recent lane PR;
+    /// `linked_prs` lets a dispatch dashboard name *every* lane PR instead of
+    /// only the latest. `#[serde(default)]` keeps older run states readable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_prs: Vec<LinkedPr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reconciled: Option<LastReconciled>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,6 +196,7 @@ impl ExecutionRun {
             branch: None,
             worktree: None,
             pr: None,
+            linked_prs: Vec::new(),
             last_reconciled: None,
             pending_transition: None,
             validation: None,
@@ -198,6 +205,21 @@ impl ExecutionRun {
             notes: Vec::new(),
             extra: None,
         }
+    }
+
+    /// Record the current linked PR and accumulate it into `linked_prs`
+    /// (dedup by ref, first-seen order). `pr` tracks the most-recent lane PR
+    /// for backward compatibility; `linked_prs` retains every lane PR so the
+    /// dispatch dashboard can name them all, not just the latest.
+    pub fn set_linked_pr(&mut self, pr: LinkedPr) {
+        if !self
+            .linked_prs
+            .iter()
+            .any(|existing| existing.r#ref == pr.r#ref)
+        {
+            self.linked_prs.push(pr.clone());
+        }
+        self.pr = Some(pr);
     }
 }
 
