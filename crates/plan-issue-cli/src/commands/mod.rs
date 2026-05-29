@@ -308,6 +308,7 @@ impl RecordArgs {
             record::RecordCommand::Close(_) => "record.close",
             record::RecordCommand::Audit(_) => "record.audit",
             record::RecordCommand::Template(_) => "record.template",
+            record::RecordCommand::Restore(_) => "record.restore",
         }
     }
 }
