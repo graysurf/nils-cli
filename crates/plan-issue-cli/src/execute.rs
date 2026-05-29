@@ -2089,7 +2089,15 @@ fn run_tracking_checkpoint(
     // state, missing record, visible-completeness failures) short-circuit
     // posting before any provider mutation.
     let summary = if args.live && blocked.is_empty() && !rendered.is_empty() {
-        post_checkpoint_live(args, binary, force, repo_override, &rendered, &mut blocked)?
+        post_checkpoint_live(
+            args,
+            &run,
+            binary,
+            force,
+            repo_override,
+            &rendered,
+            &mut blocked,
+        )?
     } else if args.live {
         CheckpointPostSummary {
             posted: Vec::new(),
@@ -2153,19 +2161,29 @@ struct CheckpointPostSummary {
 /// `--live` path; the live-mode posting branch above no longer emits it.
 fn post_checkpoint_live(
     args: &crate::commands::tracking::TrackingCheckpointArgs,
+    run: &crate::tracking::run_state::ExecutionRun,
     binary: BinaryFlavor,
     force: bool,
     repo_override: Option<&str>,
     rendered: &[Value],
     blocked: &mut Vec<Value>,
 ) -> Result<CheckpointPostSummary, CommandError> {
-    let issue_number = match args.issue {
+    // Resolve the target issue: prefer the explicit `--issue` flag, then fall
+    // back to the issue persisted in the run-state (written by `tracking run
+    // init --issue`). The run-state is already this command's source of truth
+    // for every other field, and `status` / `close-ready` consume `--issue`
+    // the same way, so honoring it here lets the documented dispatch entrypoint
+    // (`--run-state <rs>` with no `--provider-repo`/`--issue`) post instead of
+    // silently no-opping with status=ok (finding #44). `issue == 0` is the
+    // never-written sentinel and is treated as absent so the loud blocker
+    // below still fires when nothing can be resolved.
+    let issue_number = match args.issue.or((run.issue != 0).then_some(run.issue)) {
         Some(n) => n,
         None => {
             blocked.push(json!({
                 "code": "tracking-checkpoint-live-missing-issue",
-                "message": "`--issue <number>` is required for live tracking checkpoint",
-                "suggested_unblock": "pass --issue <number>",
+                "message": "`--issue <number>` is required for live tracking checkpoint and the run-state carries no issue to inherit",
+                "suggested_unblock": "pass --issue <number>, or re-run `tracking run init --issue <number>` so the run-state carries it",
             }));
             return Ok(CheckpointPostSummary {
                 posted: Vec::new(),
@@ -2214,7 +2232,14 @@ fn post_checkpoint_live(
     // mirrors `record post`'s contract.
     ensure_live_binary_for_command(binary, "tracking checkpoint --live", None)?;
 
-    let provider_repo_arg = args.provider_repo.as_deref().or(repo_override);
+    // Mirror the issue fallback: prefer the flag / global `--repo` override,
+    // then the run-state `repo` (finding #44). An empty slug is treated as
+    // absent so `resolve_repo_info_for_live` can still apply its own discovery.
+    let provider_repo_arg = args
+        .provider_repo
+        .as_deref()
+        .or(repo_override)
+        .or((!run.repo.is_empty()).then_some(run.repo.as_str()));
     let repo_info = resolve_repo_info_for_live(binary, provider_repo_arg)?;
     let adapter = crate::provider::select_adapter(&repo_info, force);
     let issue_url = repo_info.issue_url(issue_number);
