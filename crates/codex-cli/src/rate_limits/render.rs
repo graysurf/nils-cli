@@ -36,6 +36,19 @@ pub fn parse_usage(json: &Value) -> Option<UsageData> {
     Some(UsageData { primary, secondary })
 }
 
+/// True when the usage payload is a valid response that explicitly reports no
+/// active rate-limit window (`"rate_limit": null`).
+///
+/// The ChatGPT backend returns this when there is no usage recorded in the
+/// current window (and it transiently returned it for every account during an
+/// upstream incident). It is a benign "no data yet" state, not a malformed
+/// payload, so callers should degrade gracefully (serve cache / show n/a)
+/// rather than reporting an error. This mirrors the official codex client,
+/// which maps a null `rate_limit` to empty windows instead of failing.
+pub fn rate_limit_is_explicit_null(json: &Value) -> bool {
+    matches!(json.get("rate_limit"), Some(Value::Null))
+}
+
 fn parse_window(value: &Value) -> Option<Window> {
     let limit_window_seconds = value.get("limit_window_seconds")?.as_i64()?;
     let used_percent = value
