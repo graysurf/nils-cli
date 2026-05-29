@@ -37,6 +37,8 @@ mod parity_guardrails;
 mod record_audit;
 #[path = "integration/record_compat_baseline.rs"]
 mod record_compat_baseline;
+#[path = "integration/record_restore.rs"]
+mod record_restore;
 #[path = "integration/record_template.rs"]
 mod record_template;
 #[path = "integration/resolve_approval.rs"]

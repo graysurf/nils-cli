@@ -133,6 +133,7 @@ fn run_record(
         RecordCommand::Close(args) => run_record_close(binary, dry_run, force, repo_override, args),
         RecordCommand::Audit(args) => run_record_audit(args),
         RecordCommand::Template(args) => run_record_template(args),
+        RecordCommand::Restore(args) => run_record_restore(force, repo_override, args),
     }
 }
 
@@ -1706,6 +1707,168 @@ fn derive_lint_hints(
         _ => {}
     }
     hints
+}
+
+struct RestorePlan {
+    role: &'static str,
+    path: String,
+    commit: String,
+    content: String,
+}
+
+fn run_record_restore(
+    force: bool,
+    repo_override: Option<&str>,
+    args: &crate::commands::record::RecordRestoreArgs,
+) -> Result<Value, CommandError> {
+    use crate::lifecycle_record::{self, PayloadRole};
+
+    // Resolve issue evidence: prefer offline comments JSON; otherwise fetch
+    // live through the same provider read path `record audit` / `tracking
+    // status` consume.
+    let comments_json = if let Some(path) = &args.comments_json {
+        read_text_file(path, "record-restore-comments-read-failed")?
+    } else if let Some(issue_ref) = &args.issue {
+        let repo = repo_override.ok_or_else(|| {
+            CommandError::usage(
+                "record-restore-missing-repo",
+                "online restore requires `--repo owner/repo`; pass --comments-json for offline restore",
+            )
+        })?;
+        let issue = parse_issue_reference(issue_ref)?;
+        let repo_info = crate::provider::resolve_repo(Some(repo))
+            .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+        let (_body, comments) =
+            auto_fetch_issue_evidence(&repo_info.slug, issue, "record-restore-fetch-failed")?;
+        comments
+    } else {
+        return Err(CommandError::usage(
+            "record-restore-missing-input",
+            "provide --comments-json <path> for offline restore, or --issue <n> with --repo for live restore",
+        ));
+    };
+
+    let bodies = lifecycle_record::latest_role_bodies(&comments_json, args.profile)
+        .map_err(|err| CommandError::runtime("record-restore-parse-failed", err))?;
+
+    // Only `source` and `plan` embed a verbatim file snapshot; `state` is a
+    // rendered lifecycle view with a structured payload (no file path), so it
+    // is intentionally out of scope.
+    let mut plans: Vec<RestorePlan> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for (role, name) in [(PayloadRole::Source, "source"), (PayloadRole::Plan, "plan")] {
+        let Some(body) = bodies.get(&role) else {
+            missing.push(name);
+            continue;
+        };
+        let payload = lifecycle_record::extract_payload(body).map_err(|err| {
+            CommandError::runtime(
+                "record-restore-payload-failed",
+                format!("{name} snapshot payload could not be parsed: {err}"),
+            )
+        })?;
+        let snapshot = payload.parse_snapshot().map_err(|err| {
+            CommandError::runtime(
+                "record-restore-payload-failed",
+                format!("{name} snapshot payload is not a source/plan snapshot: {err}"),
+            )
+        })?;
+        let content = lifecycle_record::extract_snapshot_content(body).map_err(|err| {
+            CommandError::runtime(
+                "record-restore-content-failed",
+                format!("{name} snapshot content could not be extracted: {err}"),
+            )
+        })?;
+        plans.push(RestorePlan {
+            role: name,
+            path: snapshot.path,
+            commit: snapshot.commit,
+            content,
+        });
+    }
+
+    if !missing.is_empty() {
+        return Err(CommandError::runtime(
+            "record-restore-missing-role",
+            format!(
+                "tracking issue is missing required snapshot role(s): {}",
+                missing.join(", ")
+            ),
+        ));
+    }
+
+    // Validate canonical paths and detect overwrite conflicts before writing
+    // anything, so a refused restore leaves the output directory untouched.
+    let mut targets: Vec<(PathBuf, bool)> = Vec::new();
+    for plan in &plans {
+        let rel = Path::new(&plan.path);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(CommandError::runtime(
+                "record-restore-unsafe-path",
+                format!(
+                    "refusing to restore `{}` to unsafe path `{}`",
+                    plan.role, plan.path
+                ),
+            ));
+        }
+        let abs = args.out.join(rel);
+        let exists = abs.exists();
+        targets.push((abs, exists));
+    }
+
+    let conflicts: Vec<&str> = plans
+        .iter()
+        .zip(&targets)
+        .filter(|(_, (_, exists))| *exists)
+        .map(|(plan, _)| plan.path.as_str())
+        .collect();
+    if !conflicts.is_empty() && !force {
+        return Err(CommandError::runtime(
+            "record-restore-would-overwrite",
+            format!(
+                "refusing to overwrite existing file(s) without --force: {}",
+                conflicts.join(", ")
+            ),
+        ));
+    }
+
+    let mut restored: Vec<Value> = Vec::new();
+    for (plan, (abs, existed)) in plans.iter().zip(&targets) {
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                CommandError::runtime(
+                    "record-restore-mkdir-failed",
+                    format!("failed to create {}: {err}", parent.display()),
+                )
+            })?;
+        }
+        fs::write(abs, &plan.content).map_err(|err| {
+            CommandError::runtime(
+                "record-restore-write-failed",
+                format!("failed to write {}: {err}", abs.display()),
+            )
+        })?;
+        restored.push(json!({
+            "role": plan.role,
+            "path": plan.path,
+            "commit": plan.commit,
+            "absolute_path": abs.display().to_string(),
+            "bytes": plan.content.len(),
+            "overwritten": *existed,
+        }));
+    }
+
+    Ok(json!({
+        "operation": "record.restore",
+        "out_dir": args.out.display().to_string(),
+        "restored": restored,
+        "roles": plans.iter().map(|plan| plan.role).collect::<Vec<_>>(),
+        "note": "source and plan documents are restored verbatim from their <details> snapshots; the state role is a rendered lifecycle view, not a restorable file snapshot",
+    }))
 }
 
 fn run_tracking(

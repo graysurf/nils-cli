@@ -3,13 +3,21 @@
 ## Overview
 
 Add a `plan-issue record restore` subcommand that re-materializes a
-plan bundle's `source`, `plan`, and `state` files from a tracking
-issue's frozen snapshots. The issue already embeds each file's full
-content in a `<details>` block plus a `plan-issue-record-payload:hex`
-trailer that carries the canonical path; restore parses the latest
-snapshot of each role and writes the files back under an output
-directory. This makes the issue a durable source-of-truth, so an
-unmerged or pruned bundle branch no longer loses the canonical files.
+plan bundle's `source` and `plan` files from a tracking issue's frozen
+snapshots. The issue embeds those two files' full content verbatim in a
+`<details>` block plus a `plan-issue-record-payload:hex` trailer that
+carries the canonical path; restore parses the latest snapshot of each
+role and writes the files back under an output directory. This makes the
+issue a durable source-of-truth, so an unmerged or pruned bundle branch
+no longer loses the canonical design docs.
+
+**Scope correction (verified during implementation, 2026-05-30):** the
+`state` (execution-state) file is **out of scope**. Unlike `source` /
+`plan`, the `state` comment is rendered from structured `StateData`
+(not embedded verbatim) and its payload carries no path, so it is not a
+restorable file snapshot. Its latest rendered form stays visible on the
+issue and a fresh execution-state is regenerable. See the discussion
+source doc's Confirmed facts.
 
 Source: this bundle's discussion source doc (Read First, below). The
 one design choice (extract content from the visible `<details>` block,
@@ -51,15 +59,18 @@ carried into execution.
 
 - In scope:
   - A snapshot parser that, given an issue body + comments, extracts
-    for each of `source` / `plan` / `state` the canonical path (from
-    the hex payload) and the file content (from the `<details>` block),
+    for each of `source` / `plan` the canonical path (from the hex
+    payload) and the file content (from the `<details>` block),
     selecting the latest snapshot per role.
   - A `record restore --repo --issue --out` subcommand that writes the
-    three files at their canonical paths under the output directory,
-    non-destructive by default with `--force`, and a `--format json`
-    envelope listing restored paths and each role's recorded commit.
+    two files at their canonical paths under the output directory,
+    non-destructive by default with `--force` (the global flag), and a
+    `--format json` envelope listing restored paths and each role's
+    recorded commit.
   - Offline operation via `--body-file` / `--comments-json`.
 - Out of scope:
+  - Restoring the `state` (execution-state) file — rendered, not a
+    verbatim snapshot, and its payload carries no path.
   - Snapshot format changes or payload content/hash embedding.
   - Non-bundle lifecycle roles (session / validation / review /
     closeout).
@@ -67,28 +78,29 @@ carried into execution.
 
 ## Assumptions
 
-- The `<details>` snapshot block contains the file content verbatim as
-  posted by `record open` / `attach`, so extraction is faithful absent
-  manual edits to the comment.
-- `state` is the only role re-posted across the lifecycle; latest-per-
-  role selection therefore matters mainly for `state`.
+- The `source` / `plan` `<details>` snapshot block contains the file
+  content verbatim (not HTML-escaped) as posted by `record open` /
+  `attach`, so extraction is faithful absent manual edits to the
+  comment.
+- `source` / `plan` can be re-attached across the lifecycle, so
+  latest-per-role selection keeps restore on the freshest snapshot.
 - The provider read used by `record audit` is sufficient to obtain the
   issue body and all comments for parsing.
 
 ## Sprint 1: snapshot parser + restore command
 
-**Goal**: `plan-issue record restore` reconstructs a bundle's three
-files from an issue's latest snapshots, online or from offline JSON,
-with round-trip fidelity against `record open`.
+**Goal**: `plan-issue record restore` reconstructs a bundle's `source`
+and `plan` files from an issue's latest snapshots, online or from
+offline JSON, with round-trip fidelity against `record open`.
 
 **Demo/Validation**:
 
 - Commands:
   - `cargo test -p nils-plan-issue-cli`
-  - `plan-issue record restore --repo sympoies/nils-cli --issue 650 --out /tmp/restore-650 --format json`
-- Verify: the three bundle files appear under the out dir at their
-  canonical paths and match the committed bundle; the JSON lists each
-  role's recorded commit.
+  - `plan-issue record restore --repo sympoies/nils-cli --issue 651 --out /tmp/restore-651 --format json`
+- Verify: the `source` / `plan` bundle files appear under the out dir
+  at their canonical paths and match the committed bundle; the JSON
+  lists each role's recorded commit.
 
 ### Task 1.1: Snapshot parser (inverse of the renderer)
 
@@ -96,16 +108,17 @@ with round-trip fidelity against `record open`.
   - `crates/plan-issue-cli` snapshot module (new inverse parser beside
     the existing renderer)
 - **Description**: Parse an issue body + comments into per-role records.
-  For each of `source` / `plan` / `state`, decode the
+  For each of `source` / `plan`, decode the
   `plan-issue-record-payload:hex` trailer for the canonical path and
-  extract the file content from the role's `<details>` block, selecting
-  the latest snapshot when a role appears more than once.
+  extract the file content from the role's `<details>` block (depth-
+  tracking nested `<details>` in the content), selecting the latest
+  snapshot when a role appears more than once.
 - **Dependencies**: none
 - **Complexity**: 3
 - **Acceptance criteria**:
-  - Given a known issue payload, the parser returns the three roles with
-    correct paths and verbatim content.
-  - When `state` appears multiple times, the latest is selected.
+  - Given a known issue payload, the parser returns `source` / `plan`
+    with correct paths and verbatim content.
+  - When a role appears multiple times, the latest snapshot is selected.
 - **Validation**:
   - `cargo test -p nils-plan-issue-cli`
 
@@ -122,26 +135,27 @@ with round-trip fidelity against `record open`.
 - **Dependencies**: Task 1.1
 - **Complexity**: 3
 - **Acceptance criteria**:
-  - Restoring `#650` into an empty dir writes the three bundle files at
-    their canonical paths.
+  - Restoring `#651` into an empty dir writes the `source` / `plan`
+    files at their canonical paths.
   - Existing files are not clobbered unless `--force` is passed.
   - `--comments-json` input restores without any network call.
 - **Validation**:
   - `cargo test -p nils-plan-issue-cli`
-  - manual restore of `#650` then `diff -r` against the committed bundle
+  - manual restore of `#651` then `diff` against the committed bundle
 
 ### Task 1.3: Round-trip and edge tests
 
 - **Location**:
   - `crates/plan-issue-cli` tests
-- **Description**: Add an `open`->`restore` round-trip test (fixture
-  bundle in, snapshots out, restore back, compare), plus latest-state
-  selection, missing-role error, and overwrite / `--force` cases.
+- **Description**: Add an `open`->`restore` round-trip test (render
+  `source` / `plan` snapshots, restore back, compare), plus a nested-
+  `<details>`-in-content case, latest-per-role selection, missing-role
+  error, and overwrite / `--force` cases.
 - **Dependencies**: Task 1.2
 - **Complexity**: 2
 - **Acceptance criteria**:
-  - Round-trip reproduces the fixture bundle byte-for-byte (modulo a
-    documented trailing-newline normalization if any).
+  - Round-trip reproduces the `source` / `plan` content byte-for-byte
+    (modulo a documented trailing-newline normalization if any).
   - Missing a required role errors clearly; `--force` governs overwrite.
 - **Validation**:
   - `cargo test -p nils-plan-issue-cli`
@@ -189,6 +203,7 @@ full required checks pass with no new dependency.
   hand-edited snapshot restores the edited text. Mitigation: treat
   snapshots as frozen; a payload `content_sha256` integrity check is a
   noted future hardening, out of scope here.
-- **R-3**: Restoring the wrong (initial) `state` snapshot would
-  resurrect stale state. Mitigation: explicit latest-per-role selection
-  plus a mutate-then-restore test (Task 1.3).
+- **R-3**: Restoring an earlier (re-attached) `source` / `plan`
+  snapshot instead of the latest would resurrect stale docs.
+  Mitigation: explicit latest-per-role selection (by `created_at`)
+  plus a multiple-snapshot test (Task 1.3).

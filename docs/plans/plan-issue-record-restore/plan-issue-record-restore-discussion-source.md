@@ -21,15 +21,28 @@ merging to main is a convenience rather than a durability requirement.
 
 ## Confirmed facts
 
-- `record open` / `record attach` embed each bundle file's full content
-  as a frozen snapshot inside a `<details>` block, one per lifecycle
-  role (`source`, `plan`, `state`), each followed by a trailer comment
-  `<!-- plan-issue-record-payload:hex:<hex> -->`. Verified on
-  `sympoies/nils-cli#650`.
-- The hex payload (`plan-issue-record.payload.v2`) carries metadata
-  **only** — `path`, `commit`, `title`, `summary` — **not** the file
-  bytes. Decoded from the `#650` source payload:
-  `{"role":"source","data":{"path":"docs/plans/.../...-discussion-source.md","commit":"964ca9e…","title":null,"summary":null}}`.
+- **Scope correction (verified during implementation, 2026-05-30).** Only
+  the `source` and `plan` roles embed the bundle file's full content
+  verbatim inside a `<details>` block. The `state` role is **not** a
+  verbatim file snapshot: `record open` renders it with
+  `render_record_post_comment_with_display` from structured `StateData`
+  (status / scope / task ledger / prs / blockers), which drops the
+  execution-state file's `# … — Execution State` H1, injects a
+  `- Profile:` bullet, and wraps the task ledger in `<details open>`.
+  Its hidden payload is structured `StateData` and carries **no file
+  path**. Restore therefore targets `source` and `plan` only; see the
+  revised Scope / Decisions below. Verified on `sympoies/nils-cli#651`
+  (`crates/plan-issue-cli/src/execute.rs:474-509`,
+  `templates/lifecycle_record/snapshot.md.tera`).
+- `record open` / `record attach` embed the `source` and `plan` file
+  content verbatim inside a `<details>` block, each followed by a trailer
+  comment `<!-- plan-issue-record-payload:hex:<hex> -->`. The content is
+  not HTML-escaped, so it round-trips byte-for-byte. Verified on
+  `sympoies/nils-cli#651`.
+- The hex payload (`plan-issue-record.payload.v2`) for `source` / `plan`
+  carries metadata **only** — `path`, `commit`, `title`, `summary` —
+  **not** the file bytes. Decoded from the `#651` source payload:
+  `{"role":"source","data":{"path":"docs/plans/.../...-discussion-source.md","commit":"bad23a4…","title":null,"summary":null}}`.
   The file content lives only in the visible `<details>` markdown block.
 - `plan-issue` exposes no restore / extract / materialize / sync
   command. `plan-issue record --help` lists only `open`, `attach`,
@@ -45,8 +58,10 @@ merging to main is a convenience rather than a durability requirement.
 ## Decisions (locked at this source doc)
 
 1. Add `plan-issue record restore --repo <owner/repo> --issue <N>
-   --out <dir>` that reconstructs the bundle's `source`, `plan`, and
-   `state` files from the issue's latest snapshot of each role.
+   --out <dir>` that reconstructs the bundle's `source` and `plan`
+   files from the issue's latest snapshot of each role. The `state`
+   file is out of scope: it is rendered, not a verbatim snapshot (see
+   Confirmed facts), and its payload carries no path.
 2. Extraction source: take the file bytes from each role's visible
    `<details>` snapshot block, keyed by the canonical `path` from that
    role's hex payload. The payload supplies path + provenance; the
@@ -61,9 +76,12 @@ merging to main is a convenience rather than a durability requirement.
 5. Non-destructive by default: refuse to overwrite existing files
    unless `--force`. Support `--format json` returning the restored
    file paths and each role's recorded commit.
-6. Scope to the tracking profile's three bundle roles (`source`,
-   `plan`, `state`). Session / validation / review / closeout comments
-   are lifecycle records, not bundle files, and are out of scope.
+6. Scope to the two verbatim-snapshot bundle roles (`source`, `plan`).
+   The `state` role is rendered, not snapshotted, so it is out of
+   scope; the issue still shows its latest rendered form for humans and
+   a fresh execution-state is regenerable. Session / validation /
+   review / closeout comments are lifecycle records, not bundle files,
+   and are out of scope.
 
 ## Scope
 
@@ -73,6 +91,11 @@ merging to main is a convenience rather than a durability requirement.
 
 ## Non-scope
 
+- Restoring the `state` (execution-state) file: it is rendered from
+  structured payload data, not embedded verbatim, and its payload
+  carries no path. A future enhancement could make it restorable by
+  embedding the raw execution-state verbatim at `record open` or
+  carrying path + content in the payload; out of scope here.
 - Changing the snapshot format or embedding full content / a content
   hash in the hex payload (a possible separate hardening — see Risks).
 - Restoring non-bundle lifecycle roles (session / validation / review /
@@ -92,8 +115,8 @@ merging to main is a convenience rather than a durability requirement.
 ## Requirements
 
 - `record restore --repo <owner/repo> --issue <N> --out <dir>` writes
-  the `source`, `plan`, and `state` files at their canonical paths
-  under the output directory, from the latest snapshot of each role.
+  the `source` and `plan` files at their canonical paths under the
+  output directory, from the latest snapshot of each role.
 - Idempotent and non-destructive: refuses to clobber existing files
   without `--force`; `--format json` lists restored paths and each
   role's recorded commit.
@@ -102,22 +125,24 @@ merging to main is a convenience rather than a durability requirement.
 ## Acceptance criteria
 
 - Round-trip: `record open` a bundle, then `record restore --out <tmp>`
-  reproduces the three files matching the originals (byte-exact, modulo
-  a documented trailing-newline normalization if any).
-- Restoring an issue whose `state` was updated after open yields the
-  latest state snapshot, not the initial one.
-- A missing required role produces a clear error; `--force` governs
-  overwrite of existing files.
+  reproduces the `source` and `plan` files matching the originals
+  (byte-exact, modulo a documented trailing-newline normalization if
+  any).
+- Restoring an issue with multiple `source` snapshots yields the latest
+  snapshot, not an earlier one.
+- A missing required role (`source` or `plan`) produces a clear error;
+  `--force` governs overwrite of existing files.
 - DEVELOPMENT.md required checks plus the completion audits pass with no
   new dependency.
 
 ## Validation plan
 
 - `cargo test -p nils-plan-issue-cli` (snapshot parser, open->restore
-  round-trip, latest-state selection, missing-role error, overwrite /
-  `--force`).
-- Manual: `record restore --repo sympoies/nils-cli --issue 650 --out
-  <tmp>` and `diff -r` against the committed bundle — expect a match.
+  round-trip for source/plan, nested-`<details>` content, latest-per-
+  role selection, missing-role error, overwrite / `--force`).
+- Manual: `record restore --comments-json <#651 export> --out <tmp>`
+  and `diff` the restored `source` / `plan` against the committed
+  bundle — expect a byte-exact match (verified 2026-05-30).
 - Full required checks (`nils-cli-checks-entrypoint.sh --local-fast`)
   and the completion audits before PR.
 

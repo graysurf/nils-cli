@@ -43,6 +43,16 @@ pub enum RecordCommand {
     /// Preview the visible Markdown or JSON payload skeleton for a lifecycle
     /// role. Non-mutating; backed by the vNext lifecycle role registry.
     Template(Box<RecordTemplateArgs>),
+
+    /// Re-materialize a plan bundle's `source` and `plan` documents from a
+    /// tracking issue's frozen snapshot comments, writing each file to its
+    /// canonical path under `--out`. The inverse of `record open`'s
+    /// snapshot rendering. The `state` role is a rendered lifecycle view
+    /// (not a verbatim file snapshot) and is not restored.
+    #[command(
+        after_help = "Only the `source` and `plan` roles embed a verbatim file snapshot in a <details> block. The `state` role is rendered from structured payload data, so it is not a restorable file snapshot; its latest rendered form stays visible on the issue."
+    )]
+    Restore(Box<RecordRestoreArgs>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -156,6 +166,37 @@ pub struct RecordAuditArgs {
     /// `visible` block of the audit result.
     #[arg(long = "expect-visible", default_value_t = false)]
     pub expect_visible: bool,
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
+pub struct RecordRestoreArgs {
+    /// Provider issue number or full URL to restore from (online mode).
+    /// Requires the global `--repo owner/repo`. Omit when reading offline
+    /// snapshots via `--comments-json`.
+    #[arg(long, value_name = "issue")]
+    pub issue: Option<String>,
+
+    /// Output directory. Restored files are written at their canonical
+    /// repo-relative paths under this directory.
+    #[arg(long, value_name = "dir")]
+    pub out: PathBuf,
+
+    /// Offline issue body Markdown (optional; the dashboard body is not
+    /// required for restore since snapshots live in comments).
+    #[arg(long = "body-file", value_name = "path")]
+    pub body_file: Option<PathBuf>,
+
+    /// Offline comments JSON from `gh issue view --json comments` (or a raw
+    /// array of comment objects). When provided, restore runs without any
+    /// provider call.
+    #[arg(long = "comments-json", value_name = "path")]
+    pub comments_json: Option<PathBuf>,
+
+    /// Restrict restoration to a lifecycle profile. When omitted, source and
+    /// plan snapshots of any profile are accepted. Overwrite of existing
+    /// files is governed by the global `--force` flag.
+    #[arg(long, value_enum)]
+    pub profile: Option<RecordProfile>,
 }
 
 #[derive(Debug, Clone, Args, Serialize)]

@@ -1623,6 +1623,68 @@ pub fn render_record_snapshot_comment(
         .map_err(|err| format!("snapshot template render failed: {err}"))
 }
 
+/// Extract the verbatim file content embedded in a `source`/`plan` snapshot
+/// comment's `<details>` block. This is the inverse of the content placement
+/// in [`render_record_snapshot_comment`]: that renderer emits
+/// `<details>`/`<summary>…</summary>` then a blank line, the file content
+/// verbatim, a blank line, and `</details>` (see `snapshot.md.tera`). This
+/// returns the lines between the blank line after `<summary>` and the
+/// snapshot wrapper's matching `</details>`, accounting for any `<details>`
+/// blocks nested inside the content itself.
+///
+/// The renderer surrounds the content with structural blank lines, so the
+/// trailing blank padding is dropped and the result is normalized to end with
+/// exactly one `\n`. Bundle Markdown files conventionally end with a single
+/// trailing newline, so this round-trips byte-for-byte for well-formed files.
+pub fn extract_snapshot_content(comment_body: &str) -> Result<String, String> {
+    let lines: Vec<&str> = comment_body.lines().collect();
+    let open_idx = lines
+        .iter()
+        .position(|line| line.trim().starts_with("<details"))
+        .ok_or_else(|| "snapshot comment has no <details> block".to_string())?;
+
+    // The wrapper opener is followed by `<summary>…</summary>` and one blank
+    // line of template padding before the content begins.
+    let mut start = open_idx + 1;
+    if start < lines.len() && lines[start].trim_start().starts_with("<summary") {
+        start += 1;
+    }
+    if start < lines.len() && lines[start].trim().is_empty() {
+        start += 1;
+    }
+
+    // Collect content until the wrapper's matching `</details>`, tracking
+    // nested `<details>` blocks that may appear inside the file content.
+    let mut depth = 1usize;
+    let mut content: Vec<&str> = Vec::new();
+    let mut closed = false;
+    for line in &lines[start..] {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<details") {
+            depth += 1;
+        } else if trimmed.starts_with("</details>") {
+            depth -= 1;
+            if depth == 0 {
+                closed = true;
+                break;
+            }
+        }
+        content.push(line);
+    }
+    if !closed {
+        return Err("snapshot <details> block is not closed".to_string());
+    }
+
+    // Drop the renderer's trailing blank-line padding, then normalize to a
+    // single trailing newline.
+    while content.last().is_some_and(|line| line.trim().is_empty()) {
+        content.pop();
+    }
+    let mut out = content.join("\n");
+    out.push('\n');
+    Ok(out)
+}
+
 /// Render the canonical v2 lifecycle comment used by `record post` for
 /// state, session, validation, review, and closeout kinds. Source/plan
 /// kinds are rejected because `record open` owns them.
