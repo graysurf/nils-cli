@@ -28,6 +28,9 @@ _agent-memory() {
             agent__memory,env)
                 cmd="agent__memory__env"
                 ;;
+            agent__memory,help)
+                cmd="agent__memory__help"
+                ;;
             agent__memory,index)
                 cmd="agent__memory__index"
                 ;;
@@ -56,7 +59,7 @@ _agent-memory() {
 
     case "${cmd}" in
         agent__memory)
-            opts="-h -V --help --version path list index agents personas init-agent init-persona resolve env doctor completion"
+            opts="-h -V --help --version path list index agents personas init-agent init-persona resolve env doctor completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -112,6 +115,20 @@ _agent-memory() {
             return 0
             ;;
         agent__memory__env)
+            opts="-h --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__memory__help)
             opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

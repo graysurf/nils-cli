@@ -52,6 +52,24 @@ fn run(root: &Path, args: &[&str]) -> CmdOutput {
     }
 }
 
+#[test]
+fn no_args_and_help_print_usage() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_layout(tmp.path());
+
+    let no_args = run(tmp.path(), &[]);
+    assert_eq!(no_args.code, 0, "stderr={}", no_args.stderr_text());
+    assert!(
+        no_args
+            .stdout_text()
+            .contains("Usage: agent-memory <COMMAND>")
+    );
+
+    let help = run(tmp.path(), &["help"]);
+    assert_eq!(help.code, 0, "stderr={}", help.stderr_text());
+    assert!(help.stdout_text().contains("Usage: agent-memory <COMMAND>"));
+}
+
 fn seed_layout(root: &Path) {
     fs::create_dir_all(root.join("global")).expect("global dir");
     fs::create_dir_all(root.join("agents")).expect("agents dir");

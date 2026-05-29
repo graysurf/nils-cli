@@ -101,6 +101,12 @@ _arguments "${_arguments_options[@]}" : \
 ':shell:(bash zsh)' \
 && ret=0
 ;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -120,6 +126,7 @@ _agent-memory_commands() {
 'env:Emit shell exports for the resolved layout' \
 'doctor:Verify memory-store layout' \
 'completion:Print shell completion script' \
+'help:Print help' \
     )
     _describe -t commands 'agent-memory commands' commands "$@"
 }
@@ -142,6 +149,11 @@ _agent-memory__subcmd__doctor_commands() {
 _agent-memory__subcmd__env_commands() {
     local commands; commands=()
     _describe -t commands 'agent-memory env commands' commands "$@"
+}
+(( $+functions[_agent-memory__subcmd__help_commands] )) ||
+_agent-memory__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-memory help commands' commands "$@"
 }
 (( $+functions[_agent-memory__subcmd__index_commands] )) ||
 _agent-memory__subcmd__index_commands() {

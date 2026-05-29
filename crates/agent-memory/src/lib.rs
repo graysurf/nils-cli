@@ -6,8 +6,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
 use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
 use serde_json::json;
 
 use cli::{Cli, Command, IdArgs, ScopeArgs};
@@ -26,8 +26,19 @@ pub fn run() -> i32 {
 pub fn run_with_args<I, T>(args: I) -> i32
 where
     I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
+    T: Into<OsString>,
 {
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    if args.len() == 1 {
+        return match print_help() {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!("agent-memory: {}", err.message);
+                err.exit_code
+            }
+        };
+    }
+
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(err) => {
@@ -72,7 +83,17 @@ fn dispatch(cli: Cli) -> Result<i32, CliError> {
         }
         Command::Doctor => doctor(&layout),
         Command::Completion(args) => Ok(completion::run(args.shell)),
+        Command::Help => print_help(),
     }
+}
+
+fn print_help() -> Result<i32, CliError> {
+    let mut command = Cli::command();
+    command
+        .print_long_help()
+        .map_err(|err| CliError::runtime(format!("failed to print help: {err}")))?;
+    println!();
+    Ok(EXIT_OK)
 }
 
 #[derive(Debug)]
