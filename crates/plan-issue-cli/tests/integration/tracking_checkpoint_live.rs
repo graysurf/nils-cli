@@ -307,11 +307,16 @@ fn tracking_checkpoint_live_visible_completeness_failure_short_circuits_before_p
     );
 }
 
+/// Regression for finding #44: the documented dispatch entrypoint passes only
+/// `--run-state` (no `--provider-repo`/`--issue`). The run-state already
+/// carries the issue (written by `tracking run init --issue`), so the live
+/// checkpoint must inherit it and post — not silently no-op with status=ok.
 #[test]
-fn tracking_checkpoint_live_fixture_missing_issue_blocks_with_stable_code() {
+fn tracking_checkpoint_live_inherits_issue_from_run_state() {
     let fixture = pre_closeout_fixture();
     let tmp = TempDir::new().expect("tmp");
     let rs_path = tmp.path().join("run-state.json");
+    // `write_run_state` persists `issue: 999`.
     write_run_state(&rs_path, "ready_for_close");
 
     let out = common::run_plan_issue(&[
@@ -325,7 +330,68 @@ fn tracking_checkpoint_live_fixture_missing_issue_blocks_with_stable_code() {
         "state",
         "--fixture",
         fixture.path().to_str().expect("fixture"),
-        "--live", // no --issue
+        "--live", // no --issue: must be inherited from run-state
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let result = json_stdout(&out)["payload"]["result"].clone();
+    let blocked_codes: Vec<&str> = result["blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        !blocked_codes.contains(&"tracking-checkpoint-live-missing-issue"),
+        "run-state issue must be inherited, not blocked: {blocked_codes:?}"
+    );
+    let posted = result["posted"].as_array().expect("posted array");
+    assert_eq!(posted.len(), 1, "state role must post: {posted:?}");
+    assert_eq!(posted[0]["role"], "state");
+    assert_eq!(
+        posted[0]["comment_url"].as_str().expect("url"),
+        "fixture://issue/999/state",
+        "posted URL must reflect the run-state issue (999)"
+    );
+}
+
+/// The loud `tracking-checkpoint-live-missing-issue` blocker still fires when
+/// neither `--issue` nor a run-state issue can be resolved (`issue: 0` is the
+/// never-written sentinel). The fix in #44 only adds the run-state fallback; it
+/// does not remove the guard against a genuinely unresolvable target.
+#[test]
+fn tracking_checkpoint_live_missing_issue_blocks_when_run_state_has_none() {
+    let fixture = pre_closeout_fixture();
+    let tmp = TempDir::new().expect("tmp");
+    let rs_path = tmp.path().join("run-state.json");
+    // Mirror `write_run_state` but with the `issue: 0` sentinel so there is
+    // nothing to inherit.
+    let body = json!({
+        "schema": "plan-issue.execution-run.v1",
+        "run_id": "run-1",
+        "repo": "owner/repo",
+        "issue": 0,
+        "profile": "tracking",
+        "phase": "ready_for_close",
+        "created_at": "2026-05-26T00:00:00Z",
+        "updated_at": "2026-05-26T01:00:00Z",
+        "selected_scope": {"task": "1.2", "title": "demo"},
+        "branch": "feat/x",
+        "review": {"decision": "approve", "evidence": null}
+    });
+    fs::write(&rs_path, body.to_string()).expect("run-state");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "checkpoint",
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--post",
+        "state",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+        "--live", // no --issue and run-state issue is the 0 sentinel
     ]);
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     let result = json_stdout(&out)["payload"]["result"].clone();
@@ -342,6 +408,6 @@ fn tracking_checkpoint_live_fixture_missing_issue_blocks_with_stable_code() {
     let posted = result["posted"].as_array().expect("posted array");
     assert!(
         posted.is_empty(),
-        "no posting may occur without --issue: {posted:?}"
+        "no posting may occur with no resolvable issue: {posted:?}"
     );
 }
