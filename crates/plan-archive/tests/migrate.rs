@@ -354,6 +354,79 @@ fn cli_apply_copies_plan_writes_metadata_pushes_archive_and_deletes_source() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn cli_apply_reconciles_execution_state_header_to_terminal() {
+    let scenario = build_scenario();
+
+    // Seed a mid-flight execution-state doc into the plan folder and commit it
+    // so the apply path's clean-tree check passes.
+    let exec_state = scenario
+        .source_repo
+        .join(&scenario.plan_path)
+        .join("2026-05-27-demo-plan-execution-state.md");
+    fs::write(
+        &exec_state,
+        "<!-- execute-from-tracking-issue:state:v1 -->\n\
+# Demo Execution State\n\
+\n\
+## Execution State\n\
+\n\
+- Status: implementation complete — all tasks done; repo PR\n  \
+delivery pending\n\
+- Current task: delivering the repo PR\n\
+- Next task: close-ready handoff\n\
+- Last updated: 2026-05-30\n\
+\n\
+## Task Ledger\n\
+\n\
+- Task 1.1 | done | seed\n",
+    )
+    .unwrap();
+    git(&scenario.source_repo, &["add", "docs/plans"]);
+    git(
+        &scenario.source_repo,
+        &["commit", "-q", "-m", "seed execution state"],
+    );
+
+    configure_archive_push_remote(&scenario);
+    let stub_dir = install_semantic_commit_stub(&scenario);
+
+    let output = run_plan_archive_in(
+        &scenario.source_repo,
+        &cli_migrate_args(&scenario, true),
+        &[("PATH", path_with_prepend(&stub_dir))],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+
+    let archived = scenario
+        .archive
+        .join("plans/github.com/graysurf/agent-runtime-kit/2026-05-27-demo-plan")
+        .join("2026-05-27-demo-plan-execution-state.md");
+    let body = fs::read_to_string(&archived).expect("archived execution-state doc");
+
+    // Terminal header, deferring to the issue ref migrate carried.
+    assert!(body.contains(
+        "- Status: archived — plan bundle migrated to agent-plan-archive; \
+final state tracked in https://github.com/sympoies/nils-cli/issues/571"
+    ));
+    assert!(body.contains("- Current task: none — archived"));
+    assert!(body.contains("- Next task: none — archived"));
+    // The mid-flight wording and its wrapped continuation are gone.
+    assert!(!body.contains("delivery pending"));
+    assert!(!body.contains("implementation complete"));
+    // Everything outside the section is preserved verbatim.
+    assert!(body.contains("- Last updated: 2026-05-30"));
+    assert!(body.contains("## Task Ledger"));
+    assert!(body.contains("- Task 1.1 | done | seed"));
+    // Sibling plan files are still copied verbatim.
+    let target_dir = scenario
+        .archive
+        .join("plans/github.com/graysurf/agent-runtime-kit/2026-05-27-demo-plan");
+    assert!(target_dir.join("PLAN.md").exists());
+    assert!(target_dir.join("notes.md").exists());
+}
+
 fn assert_serialized_metadata(m: &MetadataPayload) {
     assert_eq!(m.version, 1);
     assert_eq!(m.source.host, "github.com");

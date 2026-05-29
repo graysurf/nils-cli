@@ -93,6 +93,15 @@ plan-archive migrate \
   commits the archive via the released `semantic-commit` binary,
   pushes the archive, and only on push success deletes the source
   folder and commits that deletion in the working repo.
+- While copying, an `*-execution-state.md` whose `## Execution State`
+  header is still mid-flight (e.g. "delivery pending") gets its
+  `Status` / `Current task` / `Next task` bullets rewritten to a
+  terminal "archived" status that defers to the issue/PR ref. Migrate
+  only archives closed plans, so this stops the archived bundle's
+  human-readable header from freezing before merge/closeout. The
+  rewrite is purely textual; the rest of the bundle is copied
+  verbatim, and the authoritative live state stays in the `_index/`
+  issue snapshot and `catalog.json` refs.
 
 Stable error codes (Sprint 3):
 
