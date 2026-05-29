@@ -10,6 +10,7 @@ pub mod project;
 pub mod skill_surface;
 pub mod upgrade;
 pub mod version;
+pub mod version_alignment;
 
 use crate::install::link_map::{LinkMap, LinkMapError};
 use crate::install::overlay::{self, LinkMapOverlay, OverlaySummary};
@@ -27,6 +28,7 @@ pub struct DoctorOptions {
     pub cli_tools_profile: String,
     pub check_project: Option<PathBuf>,
     pub class_filter: Option<DoctorClass>,
+    pub pin_path: Option<PathBuf>,
 }
 
 impl Default for DoctorOptions {
@@ -37,6 +39,7 @@ impl Default for DoctorOptions {
             cli_tools_profile: "recommended".to_string(),
             check_project: None,
             class_filter: None,
+            pin_path: None,
         }
     }
 }
@@ -44,6 +47,7 @@ impl Default for DoctorOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoctorClass {
     SkillSurface,
+    VersionAlignment,
 }
 
 #[derive(Debug, Error)]
@@ -56,6 +60,8 @@ pub enum DoctorError {
     Plan(#[from] PlanError),
     #[error("coverage: {0}")]
     Coverage(#[from] coverage::CoverageError),
+    #[error("version-alignment: {0}")]
+    VersionAlignment(#[from] version_alignment::VersionAlignmentError),
     #[error("unknown product `{product}`; expected `codex` or `claude`")]
     UnknownProduct { product: String },
 }
@@ -165,6 +171,7 @@ pub struct DoctorOutcome {
     pub coverage_probes: Vec<coverage::CoverageFinding>,
     pub project_probes: Vec<project::ProjectOverlayFinding>,
     pub skill_surface: Option<skill_surface::SkillSurfaceReport>,
+    pub version_alignment: Option<version_alignment::VersionAlignmentReport>,
     pub acceptance_boundary: Option<String>,
     pub ok: usize,
     pub warn: usize,
@@ -197,6 +204,9 @@ pub fn run(
 ) -> Result<DoctorOutcome, DoctorError> {
     if matches!(options.class_filter, Some(DoctorClass::SkillSurface)) {
         return run_skill_surface_only(product, source_root, options);
+    }
+    if matches!(options.class_filter, Some(DoctorClass::VersionAlignment)) {
+        return run_version_alignment_only(options);
     }
 
     let runtime_roots = load_runtime_roots(source_root)?;
@@ -280,6 +290,7 @@ pub fn run(
         coverage_probes,
         project_probes,
         skill_surface: None,
+        version_alignment: None,
         acceptance_boundary: None,
         ok: report.ok,
         warn,
@@ -303,6 +314,7 @@ fn run_skill_surface_only(
                 coverage_probes: Vec::new(),
                 project_probes: Vec::new(),
                 skill_surface: Some(skill_surface::SkillSurfaceReport::empty(product)),
+                version_alignment: None,
                 acceptance_boundary: skill_surface::acceptance_boundary(product)
                     .map(str::to_string),
                 ok: 0,
@@ -336,6 +348,48 @@ fn run_skill_surface_only(
         coverage_probes: Vec::new(),
         project_probes: Vec::new(),
         skill_surface: Some(report),
+        version_alignment: None,
+        acceptance_boundary,
+        ok,
+        warn,
+        block,
+        overlay: None,
+    })
+}
+
+fn run_version_alignment_only(options: &DoctorOptions) -> Result<DoctorOutcome, DoctorError> {
+    let Some(pin_path) = options.pin_path.as_deref() else {
+        return Err(DoctorError::VersionAlignment(
+            version_alignment::VersionAlignmentError::MissingPin,
+        ));
+    };
+    // The host binary IS `agent-runtime`, so its own compile-time version is
+    // the authoritative "what `agent-runtime --version` reports" value.
+    let report = version_alignment::check(pin_path, env!("CARGO_PKG_VERSION"))?;
+    let ok = report
+        .items
+        .iter()
+        .filter(|item| item.severity == DoctorSeverity::Ok)
+        .count();
+    let warn = report
+        .items
+        .iter()
+        .filter(|item| item.severity == DoctorSeverity::Warn)
+        .count();
+    let block = report
+        .items
+        .iter()
+        .filter(|item| item.severity == DoctorSeverity::Block)
+        .count();
+    let acceptance_boundary = report.acceptance_boundary.clone();
+    Ok(DoctorOutcome {
+        product: "host".to_string(),
+        findings: report.findings.clone(),
+        version_probes: Vec::new(),
+        coverage_probes: Vec::new(),
+        project_probes: Vec::new(),
+        skill_surface: None,
+        version_alignment: Some(report),
         acceptance_boundary,
         ok,
         warn,

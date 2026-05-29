@@ -23,6 +23,8 @@ mod doctor_skill_surface;
 mod doctor_upgrade;
 #[path = "integration/doctor_version.rs"]
 mod doctor_version;
+#[path = "integration/doctor_version_alignment.rs"]
+mod doctor_version_alignment;
 #[path = "integration/gc_backups.rs"]
 mod gc_backups;
 #[path = "integration/install_flags.rs"]
