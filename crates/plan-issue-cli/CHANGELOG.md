@@ -73,8 +73,20 @@ versioning.
 
 ### Fixed
 
+- The dispatch dashboard now names **every** lane PR, not just the latest.
+  The run state accumulates each `tracking run update --linked-pr` into a new
+  `linked_prs[]` (dedup by ref; `pr` still tracks the current one), and
+  `tracking checkpoint --post state` carries them in the state payload's
+  `prs[]`. Previously the run state kept a single `pr` slot and the
+  synthesized state payload hardcoded `prs: []`, so the dashboard's
+  `Linked PRs` line — built from the latest state payload — rendered
+  `none yet` even after `record close --linked-pr A --linked-pr B`.
+  `#[serde(default)]` keeps older run states readable.
+  (graysurf/plan-tracking-testbed#35)
 - `tracking checkpoint --profile dispatch` now marks its lifecycle comments
   (`state` / `session` / `validation` / `review`) with `profile=dispatch`.
+  `render_checkpoint_role` previously hardcoded `RecordProfile::Tracking` and
+  ignored the selected `--profile`, so dispatch lane checkpoints emitted
   `render_checkpoint_role` previously hardcoded `RecordProfile::Tracking` and
   ignored the selected `--profile`, so dispatch lane checkpoints emitted
   `profile=tracking` markers — mismatching `record open --profile dispatch` and

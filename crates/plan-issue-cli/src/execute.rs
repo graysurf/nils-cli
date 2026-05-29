@@ -1761,7 +1761,7 @@ fn run_tracking_run_init(
     run.branch = args.branch.clone();
     run.worktree = args.worktree.clone();
     if let Some(linked) = &args.linked_pr {
-        run.pr = Some(crate::tracking::run_state::LinkedPr {
+        run.set_linked_pr(crate::tracking::run_state::LinkedPr {
             r#ref: linked.clone(),
             url: None,
             status: None,
@@ -1844,7 +1844,7 @@ fn run_tracking_run_update(
         changes.push("branch");
     }
     if let Some(pr) = &args.linked_pr {
-        run.pr = Some(LinkedPr {
+        run.set_linked_pr(LinkedPr {
             r#ref: pr.clone(),
             url: None,
             status: None,
@@ -2406,12 +2406,48 @@ fn load_state_markdown_summary(run: &crate::tracking::run_state::ExecutionRun) -
 /// synthesized baseline when no ledger is recorded or it cannot be parsed.
 fn state_checkpoint_payload(run: &crate::tracking::run_state::ExecutionRun) -> Value {
     let mut payload = synthesize_state_payload(run);
-    if let Some(tasks) = accumulative_state_tasks(run)
-        && let Some(object) = payload.as_object_mut()
-    {
-        object.insert("tasks".to_string(), Value::Array(tasks));
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(tasks) = accumulative_state_tasks(run) {
+            object.insert("tasks".to_string(), Value::Array(tasks));
+        }
+        // Carry every linked PR so the dashboard (built from the latest state
+        // payload's `prs[]`) names all lane PRs, not just the current one.
+        let prs = accumulative_state_prs(run);
+        if !prs.is_empty() {
+            object.insert("prs".to_string(), Value::Array(prs));
+        }
     }
     payload
+}
+
+/// Build the accumulative `prs[]` payload from every linked PR the run has
+/// seen (`linked_prs`), falling back to the current `pr` for run states
+/// written before lane-PR accumulation. Dedup by ref, first-seen order, so a
+/// dispatch dashboard names every lane PR instead of only the latest.
+fn accumulative_state_prs(run: &crate::tracking::run_state::ExecutionRun) -> Vec<Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for pr in run.linked_prs.iter().chain(run.pr.iter()) {
+        if seen.insert(pr.r#ref.clone()) {
+            out.push(json!({
+                "ref": pr.r#ref,
+                "url": pr.url.clone(),
+                "status": normalize_pr_status(pr.status.as_deref()),
+            }));
+        }
+    }
+    out
+}
+
+/// Map a run-state PR status into the `state.prs[].status` enum
+/// (`open|merged|closed`); anything unknown degrades to `open` so the
+/// synthesized payload always deserializes into `StateData`.
+fn normalize_pr_status(status: Option<&str>) -> &'static str {
+    match status.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("merged") => "merged",
+        Some("closed") => "closed",
+        _ => "open",
+    }
 }
 
 /// Parse the canonical execution-state `## Task Ledger` into the accumulative
@@ -6173,6 +6209,72 @@ mod tests {
             baseline["tasks"].as_array().expect("tasks array").len(),
             1,
             "without a ledger the payload stays single-current"
+        );
+    }
+
+    #[test]
+    fn state_checkpoint_payload_accumulates_linked_prs() {
+        use crate::tracking::run_state::{ExecutionRun, LinkedPr, RunPhase};
+
+        let mut run = ExecutionRun::new(
+            "run-prs",
+            "owner/repo",
+            1,
+            "dispatch",
+            RunPhase::Implementing,
+            "2026-05-29T00:00:00Z",
+        );
+        // Two lanes each link their PR; the most-recent stays `pr`, both
+        // accumulate into `linked_prs`. A repeated ref must not duplicate.
+        run.set_linked_pr(LinkedPr {
+            r#ref: "owner/repo#1".to_string(),
+            url: None,
+            status: None,
+        });
+        run.set_linked_pr(LinkedPr {
+            r#ref: "owner/repo#2".to_string(),
+            url: None,
+            status: None,
+        });
+        run.set_linked_pr(LinkedPr {
+            r#ref: "owner/repo#1".to_string(),
+            url: None,
+            status: None,
+        });
+        assert_eq!(run.pr.as_ref().unwrap().r#ref, "owner/repo#1");
+        assert_eq!(run.linked_prs.len(), 2, "ref dedup keeps two lane PRs");
+
+        let payload = state_checkpoint_payload(&run);
+        let refs: Vec<&str> = payload["prs"]
+            .as_array()
+            .expect("prs array")
+            .iter()
+            .map(|p| p["ref"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            refs,
+            ["owner/repo#1", "owner/repo#2"],
+            "dashboard prs[] names every lane PR in first-seen order"
+        );
+        assert_eq!(payload["prs"][0]["status"].as_str().unwrap(), "open");
+        let state = serde_json::from_value::<crate::lifecycle_record::StateData>(payload)
+            .expect("payload with prs[] deserializes into StateData");
+        assert_eq!(state.prs.len(), 2);
+
+        // No linked PR -> prs[] stays empty (no regression for the
+        // ledger-only accumulative path).
+        let bare = ExecutionRun::new(
+            "run-bare",
+            "owner/repo",
+            1,
+            "tracking",
+            RunPhase::Implementing,
+            "2026-05-29T00:00:00Z",
+        );
+        let bare_prs = state_checkpoint_payload(&bare)["prs"].clone();
+        assert!(
+            bare_prs.as_array().map(|a| a.is_empty()).unwrap_or(true),
+            "no linked PR -> prs stays empty"
         );
     }
 
