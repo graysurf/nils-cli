@@ -83,8 +83,18 @@ warn() {
 }
 
 refresh_lockfile() {
-  note "refreshing Cargo.lock for release changes"
-  cargo generate-lockfile
+  # Re-pin only the workspace crate versions in Cargo.lock for the release
+  # bump. `cargo update --workspace` rewrites the path/workspace members to
+  # their new Cargo.toml versions and leaves every registry/transitive
+  # dependency at its committed, CI-verified pin. A full `cargo
+  # generate-lockfile` instead floats *all* deps to "latest compatible",
+  # which both smuggles unreviewed dependency upgrades into a release bump
+  # and can break the build outright (e.g. bitflags 2.12.0 hit dispatch2
+  # 0.3.1's `bitflags!` recursion limit). The committed lock is the source of
+  # truth for transitive pins; `cargo check --workspace --locked` below still
+  # fails loudly if the workspace re-pin leaves the lock inconsistent.
+  note "refreshing Cargo.lock workspace versions for release changes"
+  cargo update --workspace
 }
 
 verify_workspace_locked() {
