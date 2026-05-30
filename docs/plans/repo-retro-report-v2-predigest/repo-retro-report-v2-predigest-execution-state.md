@@ -3,20 +3,21 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: Sprint 1 complete — the repo-retro v2 pre-digestion layer landed on
-  `feat/repo-retro-report-v2` and passes the local-fast gate; PR1 delivery in
-  progress. Sprint 2 (release) and Sprint 3 (consumer + pin refresh) remain.
+- Status: complete — all three sprints delivered and merged; ready for close.
+  repo-retro report v2 shipped in `nils-cli v0.31.0` and is adopted by
+  agent-runtime-kit; the EXACT-match version-alignment pin gate is cleared.
 - Target scope: `repo-retro` report pre-digestion layer + schema v2 in
   `crates/agent-workflow-primitives` (`sympoies/nils-cli`), then a release and
   the lockstep `agent-runtime-kit` consumer / pin refresh.
 - Execution window: Sprint 1 (pre-digestion + schema v2, PR1) → Sprint 2
   (release + tap bump) → Sprint 3 (agent-runtime-kit consumers + pin bump),
-  serial.
-- Current task: Task 2.1 — cut release + Homebrew tap bump.
-- Next task: Task 3.1 — agent-runtime-kit consumer refresh + surface-pin bump.
+  serial — all complete.
+- Current task: none — closeout.
+- Next task: none.
 - Last updated: 2026-05-31
-- Branch/commit/PR: `feat/repo-retro-report-v2`; Sprint 1 implementation commit
-  `0c0aad9`; PR1 delivery in progress.
+- Branch/commit/PR: Sprint 1 `sympoies/nils-cli#694` (squash `1d93bb5`);
+  Sprint 2 release tag `v0.31.0` (`7a42080`, #695); Sprint 3
+  `graysurf/agent-runtime-kit#201` (squash `442d17b`).
 - Source document: docs/plans/repo-retro-report-v2-predigest/repo-retro-report-v2-predigest-plan.md
 - Direct source-doc execution waiver: not applicable
 - Tracking issue: sympoies/nils-cli#693
@@ -51,8 +52,8 @@
 | 1.2 | done | L2 fields: `churnByClass`, `archival`, commit-frequency hotspots | churnByClass (reconciles to summary), archival (net-deletion primary), commit-frequency topFiles w/ class+netDeleted; tests churn_by_class_reconciles_to_summary_total, hotspots_rank_by_commit_count_and_carry_class_and_net_deleted, net_deletion_drives_archival_facts; commit 0c0aad9 | Depends on 1.1. Class sums reconcile to `summary.changedLines`; net-deletion is the primary archival signal; `topFiles` ranked by `commits` with `class` + `netDeleted`. |
 | 1.3 | done | Schema v2 bump + noise-aware L3 rewrite | schema v2 (no v1 dual-emit) + themes/follow-ups read class split with net-deletion guard; test analysis_skips_net_deleted_files_and_splits_churn_by_class; e2e on agent-runtime-kit no longer nominates archived plan; commit 0c0aad9 | Depends on 1.2. `...report.v2`, no v1 dual-emit; themes lead with source/tests churn; follow-ups never nominate a `netDeleted` file. |
 | 1.4 | done | Contract, completion, tests, PR1 delivery | integration tests + crate README to v2; nils-cli-checks-entrypoint.sh --local-fast green (122/122, fmt+clippy+doc-tests); completion matrix unchanged (clap-derived flag) | Depends on 1.3. Update `cli-output-contract-v1.md` + completion matrix; local-fast gate + `gh pr checks` self-gated. |
-| 2.1 | todo | Cut release + Homebrew tap bump | — | Depends on 1.4. Published surface must carry repo-retro v2. |
-| 3.1 | todo | agent-runtime-kit consumer refresh + pin bump | — | Depends on 2.1. Refresh `meta:repo-retro` + `reporting:project-retro`; bump surface pin via `meta:nils-cli-bump`; EXACT-match gate forces lockstep. |
+| 2.1 | done | Cut release + Homebrew tap bump | released nils-cli v0.31.0 (tag v0.31.0; release.yml + homebrew-tap workflows green; brew upgraded 0.30.2->0.31.0); published repo-retro emits report.v2 with churnByClass | Depends on 1.4. Published surface must carry repo-retro v2. |
+| 3.1 | done | agent-runtime-kit consumer refresh + pin bump | agent-runtime-kit PR graysurf/agent-runtime-kit#201 merged (442d17b): pin v0.30.2->v0.31.0 + project-retro migrated to report v2 + goldens re-rendered; scripts/ci/all.sh positions 1-13 green; EXACT-match pin gate cleared | Depends on 2.1. Refresh `meta:repo-retro` + `reporting:project-retro`; bump surface pin via `meta:nils-cli-bump`; EXACT-match gate forces lockstep. |
 
 ## Session Log
 
@@ -89,6 +90,23 @@
   (122/122). e2e against agent-runtime-kit confirms the previously-nominated
   archived plan is no longer surfaced for review. PR1 delivery and the full
   `gh pr checks` self-gate are next.
+- 2026-05-31: Delivered Sprint 1 as `sympoies/nils-cli#694` —
+  `forge-cli pr deliver --no-merge`, self-gated the full `gh pr checks` set
+  (test / test_macos / coverage / CodeQL all green), then `ready` + squash-merge
+  `1d93bb5`. Posted state + validation checkpoints to #693.
+- 2026-05-31: Sprint 2 — released `nils-cli v0.31.0` via the
+  bump-version-tag-release flow: all crates `0.30.2 → 0.31.0`, release PR #695
+  merged (tag `v0.31.0` at `7a42080`), `release.yml` + `sympoies/homebrew-tap`
+  formula workflow green, `brew upgrade` to `0.31.0`. Verified the published
+  `repo-retro 0.31.0` emits `cli.repo-retro.report.v2` with `churnByClass`.
+- 2026-05-31: Sprint 3 — adopted v2 in agent-runtime-kit
+  (`graysurf/agent-runtime-kit#201`, squash `442d17b`): bumped the surface pin
+  `v0.30.2 → v0.31.0`, refreshed the surface snapshot, migrated the
+  `project-retro` consumer to report v2, updated the runtime-smoke schema
+  asserts, and re-rendered the goldens. `scripts/ci/all.sh` positions 1-13
+  green; `version-alignment` `block=0`; the EXACT-match pin gate is cleared.
+  All sprints complete; reconciled this ledger (`2.1` / `3.1` → done) and the
+  tracker is being closed.
 
 ## Validation
 
@@ -97,6 +115,9 @@
 | `cargo test -p nils-agent-workflow-primitives --lib repo_retro` | pass | 8 repo_retro unit tests green incl. classifier+override, churn reconciliation, commit-frequency ranking, archival, and the analysis net-deletion guard. | local |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | 122/122 package tests, fmt, clippy `-D warnings`, doc-tests, markdown lint all green. | local |
 | `repo-retro report --repo <agent-runtime-kit> --days 3 --format json` | pass | v2 envelope; churnByClass separates source/process; the previously-nominated archived plan is no longer in followUps. | local e2e |
+| `gh pr checks 694` (Sprint 1) | pass | test / test_macos / coverage / CodeQL all green; squash-merged `1d93bb5`. | PR #694 |
+| `repo-retro --version` on published `v0.31.0` (Sprint 2) | pass | brew `0.31.0`; emits `cli.repo-retro.report.v2` with `churnByClass`. | release `v0.31.0` |
+| `bash scripts/ci/all.sh` in agent-runtime-kit (Sprint 3) | pass | positions 1-13 green; `version-alignment` `block=0` (host `v0.31.0` == pin); PR #201 CI green, squash-merged `442d17b`. | PR #201 |
 
 ## Notes
 
