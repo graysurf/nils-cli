@@ -1,3 +1,9 @@
+pre-commit:
+  commands:
+    markdown-format:
+      glob: "*.md"
+      run: bash scripts/ci/markdownlint-audit.sh --strict
+
 pre-push:
   commands:
     signed-commits:
