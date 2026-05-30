@@ -34,7 +34,7 @@
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
 | 1.1 | done | Driver provider-neutral seam | graysurf/agent-runtime-kit#200 (merge 65aa344) | agent-runtime-kit; GitHub stays green. |
-| 1.2 | pending | Local-provider contract schema spec | — | nils-cli docs/specs; resolves runbook drift. |
+| 1.2 | done | Local-provider contract schema spec | sympoies/nils-cli@77399d7 (direct-to-main) | nils-cli docs/specs; resolves runbook drift. |
 | 2.1 | pending | forge-cli Provider::Local backend | — | The meat; file-backed, issue half real + PR half seeded. Dep 1.2. |
 | 2.2 | pending | plan-issue-cli local routing | — | Parameterize forge_cli_adapter.rs:127. Dep 2.1. |
 | 3.1 | pending | Cross-provider conformance harness | — | local+github+gitlab. Dep 2.2. |
