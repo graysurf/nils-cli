@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
 use serde::{Deserialize, Serialize};
 
-use crate::query::decode_basic_stamp;
+use crate::query::{IndexEntry, decode_basic_stamp, scan};
 use crate::refresh::refparse::{RefKind, RefTarget, parse_ref_url};
 use crate::validate;
 
@@ -65,6 +65,9 @@ pub struct DispatchArgs {
     pub grep: Option<String>,
     pub area: Option<String>,
     pub refs_to: Option<String>,
+    /// Extend `--grep` to also match issue / PR / MR body and comment
+    /// text (via the latest snapshot), not just catalog metadata.
+    pub deep: bool,
     pub archive: Option<PathBuf>,
     pub format: OutputFormat,
 }
@@ -114,6 +117,8 @@ pub fn run(args: &DispatchArgs) -> Result<CatalogReport, CatalogError> {
         args.grep.as_deref(),
         args.area.as_deref(),
         args.refs_to.as_deref(),
+        args.deep,
+        &archive,
     )?;
     let catalog_path = archive.join("catalog.json");
     if args.write {
@@ -305,6 +310,8 @@ fn filter_records(
     grep: Option<&str>,
     area: Option<&str>,
     refs_to: Option<&str>,
+    deep: bool,
+    archive: &Path,
 ) -> Result<Vec<CatalogRecord>, CatalogError> {
     let grep = grep.map(|s| s.to_ascii_lowercase());
     let refs_to = refs_to
@@ -318,7 +325,10 @@ fn filter_records(
     Ok(records
         .iter()
         .filter(|record| match grep.as_deref() {
-            Some(term) => record_matches_grep(record, term),
+            Some(term) => {
+                record_matches_grep(record, term)
+                    || (deep && record_matches_deep(archive, record, term))
+            }
             None => true,
         })
         .filter(|record| match area {
@@ -351,6 +361,23 @@ fn record_matches_grep(record: &CatalogRecord, term: &str) -> bool {
                 || r.title.to_ascii_lowercase().contains(term)
                 || r.state.to_ascii_lowercase().contains(term)
         })
+}
+
+/// Does any of the record's refs' latest snapshot match `term` in its
+/// body or comments? Backs `catalog --deep`. A snapshot read error for
+/// one ref is treated as "no match" for that ref so a single unreadable
+/// snapshot never aborts the whole filter.
+fn record_matches_deep(archive: &Path, record: &CatalogRecord, term: &str) -> bool {
+    record.refs.iter().any(|r| {
+        let entry = IndexEntry {
+            host: record.host.clone(),
+            org_or_group_path: record.org.clone(),
+            repo: record.repo.clone(),
+            kind: r.kind,
+            number: r.number,
+        };
+        scan::entry_matches(archive, &entry, term).unwrap_or(false)
+    })
 }
 
 fn write_document(path: &Path, document: &CatalogDocument) -> Result<(), CatalogError> {
@@ -551,18 +578,131 @@ mod tests {
             files: Vec::new(),
         };
 
+        let no_archive = std::path::Path::new("/nonexistent");
         assert_eq!(
-            filter_records(std::slice::from_ref(&record), Some("search"), None, None).unwrap(),
+            filter_records(
+                std::slice::from_ref(&record),
+                Some("search"),
+                None,
+                None,
+                false,
+                no_archive,
+            )
+            .unwrap(),
             vec![record.clone()]
         );
         assert_eq!(
-            filter_records(std::slice::from_ref(&record), None, Some("archive"), None).unwrap(),
+            filter_records(
+                std::slice::from_ref(&record),
+                None,
+                Some("archive"),
+                None,
+                false,
+                no_archive,
+            )
+            .unwrap(),
             vec![record.clone()]
         );
         assert!(
-            filter_records(&[record], None, Some("other"), None)
+            filter_records(&[record], None, Some("other"), None, false, no_archive)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn deep_grep_matches_body_only_term() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path();
+        let entry = IndexEntry {
+            host: "github.com".into(),
+            org_or_group_path: "graysurf".into(),
+            repo: "agent-runtime-kit".into(),
+            kind: RefKind::Issue,
+            number: 55,
+        };
+        let dir = archive.join(entry.index_dir());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("20260527T052454Z.json"),
+            r#"{"data":{"body":"steps after live acceptance with rollback proven","comments":[]}}"#,
+        )
+        .unwrap();
+
+        let record = CatalogRecord {
+            slug: "cutover".into(),
+            host: "github.com".into(),
+            org: "graysurf".into(),
+            repo: "agent-runtime-kit".into(),
+            date: "2026-05-23".into(),
+            original_path: "docs/plans/cutover/".into(),
+            archive_commit: "abc".into(),
+            title: "plain title".into(),
+            summary: String::new(),
+            area: vec!["archive".into()],
+            refs: vec![CatalogRef {
+                url: "https://github.com/graysurf/agent-runtime-kit/issues/55".into(),
+                kind: RefKind::Issue,
+                number: 55,
+                state: "closed".into(),
+                title: "no keyword here".into(),
+                latest_snapshot: None,
+                fetched_at: None,
+            }],
+            files: Vec::new(),
+        };
+
+        // Shallow grep misses a body-only term.
+        assert!(
+            filter_records(
+                std::slice::from_ref(&record),
+                Some("rollback"),
+                None,
+                None,
+                false,
+                archive,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        // --deep finds it.
+        assert_eq!(
+            filter_records(
+                std::slice::from_ref(&record),
+                Some("rollback"),
+                None,
+                None,
+                true,
+                archive,
+            )
+            .unwrap(),
+            vec![record.clone()]
+        );
+        // --deep composes with a matching --area...
+        assert_eq!(
+            filter_records(
+                std::slice::from_ref(&record),
+                Some("rollback"),
+                Some("archive"),
+                None,
+                true,
+                archive,
+            )
+            .unwrap(),
+            vec![record.clone()]
+        );
+        // ...and a non-matching --area still excludes it.
+        assert!(
+            filter_records(
+                &[record],
+                Some("rollback"),
+                Some("other"),
+                None,
+                true,
+                archive
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 }

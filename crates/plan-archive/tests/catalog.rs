@@ -72,6 +72,7 @@ fn base_args(archive: &Path) -> DispatchArgs {
         grep: None,
         area: None,
         refs_to: None,
+        deep: false,
         archive: Some(archive.to_path_buf()),
         format: OutputFormat::Json,
     }

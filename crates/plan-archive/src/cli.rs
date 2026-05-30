@@ -211,6 +211,10 @@ enum Command {
         /// Return plans that reference this issue/PR/MR URL.
         #[arg(long = "refs-to")]
         refs_to: Option<String>,
+        /// With `--grep`, also match issue/PR/MR body and comment text
+        /// (from each ref's latest snapshot), not just catalog metadata.
+        #[arg(long)]
+        deep: bool,
         /// Archive clone path. Defaults to the machine-local config's
         /// `archive_clone_path`.
         #[arg(long)]
@@ -322,12 +326,14 @@ pub fn run() -> i32 {
             grep,
             area,
             refs_to,
+            deep,
             archive,
         } => crate::catalog::dispatch(crate::catalog::DispatchArgs {
             write,
             grep,
             area,
             refs_to,
+            deep,
             archive,
             format,
         }),
