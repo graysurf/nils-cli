@@ -137,6 +137,7 @@ pub fn resolve_with_configs_with_mode(
 
     let mut extension_documents: Vec<ResolvedDocument> = Vec::new();
     let mut extension_indices: HashMap<ResolveKey, usize> = HashMap::new();
+    let mut opt_outs: HashMap<ResolveKey, ResolvedDocument> = HashMap::new();
 
     let home_project_scope_applies = scope_rules::home_catalog_project_scope_applies(roots);
 
@@ -153,7 +154,19 @@ pub fn resolve_with_configs_with_mode(
             &merge_context,
             &mut extension_documents,
             &mut extension_indices,
+            &mut opt_outs,
         );
+    }
+
+    // Apply opt-outs: a project that declares a `required = false` entry for a
+    // builtin's own key downgrades that builtin in place, keeping its position
+    // and emitting a `builtin-opt-out` source so the choice stays auditable.
+    if !opt_outs.is_empty() {
+        for document in documents.iter_mut() {
+            if let Some(opt_out) = opt_outs.get(&ResolveKey::from_document(document)) {
+                *document = opt_out.clone();
+            }
+        }
     }
 
     documents.extend(extension_documents);
@@ -185,6 +198,7 @@ fn merge_extension_documents(
     merge_context: &ExtensionMergeContext<'_>,
     extension_documents: &mut Vec<ResolvedDocument>,
     extension_indices: &mut HashMap<ResolveKey, usize>,
+    opt_outs: &mut HashMap<ResolveKey, ResolvedDocument>,
 ) {
     let config = merge_context.config;
     for (index, entry) in config.documents.iter().enumerate() {
@@ -206,6 +220,28 @@ fn merge_extension_documents(
         );
         let key = ResolveKey::new(merge_context.context, entry.scope, resolved_path.clone());
         if merge_context.builtin_keys.contains(&key) {
+            // A matching extension entry can only ADD requirements to a builtin
+            // key, never re-declare it required. The single exception is an
+            // explicit opt-out (`required = false`) from a non-startup builtin,
+            // which downgrades the builtin to optional. Later configs win.
+            if !entry.required && merge_context.context != Context::Startup {
+                opt_outs.insert(
+                    key,
+                    ResolvedDocument {
+                        context: merge_context.context,
+                        scope: entry.scope,
+                        path: resolved_path.clone(),
+                        required: false,
+                        status: if resolved_path.exists() {
+                            DocumentStatus::Present
+                        } else {
+                            DocumentStatus::Missing
+                        },
+                        source: DocumentSource::BuiltinOptOut,
+                        why: opt_out_why(config, index, entry),
+                    },
+                );
+            }
             continue;
         }
 
@@ -282,6 +318,24 @@ fn extension_why(config: &ConfigScopeFile, index: usize, entry: &ConfigDocumentE
         ),
         None => format!(
             "extension document from {} document[{index}]",
+            config.file_path.display()
+        ),
+    }
+}
+
+fn opt_out_why(config: &ConfigScopeFile, index: usize, entry: &ConfigDocumentEntry) -> String {
+    match entry
+        .notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|notes| !notes.is_empty())
+    {
+        Some(notes) => format!(
+            "builtin requirement opted out by {} document[{index}] (required=false) notes={notes}",
+            config.file_path.display()
+        ),
+        None => format!(
+            "builtin requirement opted out by {} document[{index}] (required=false)",
             config.file_path.display()
         ),
     }

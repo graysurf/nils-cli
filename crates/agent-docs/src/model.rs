@@ -211,6 +211,7 @@ impl fmt::Display for DocumentStatus {
 pub enum DocumentSource {
     Builtin,
     BuiltinFallback,
+    BuiltinOptOut,
     ExtensionHome,
     ExtensionProject,
 }
@@ -220,6 +221,7 @@ impl DocumentSource {
         match self {
             Self::Builtin => "builtin",
             Self::BuiltinFallback => "builtin-fallback",
+            Self::BuiltinOptOut => "builtin-opt-out",
             Self::ExtensionHome => "extension-home",
             Self::ExtensionProject => "extension-project",
         }

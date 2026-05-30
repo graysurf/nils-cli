@@ -82,6 +82,33 @@ Project-local `AGENT_DOCS.toml` files cannot declare `scope = "global"`.
 
 `AGENTS.override.md` precedence is evaluated per scope independently.
 
+### Opting out of a built-in requirement
+
+A project can opt out of a non-`startup` built-in requirement by declaring a
+matching `[[document]]` entry with `required = false` for the built-in's own
+`(context, scope, path)` key in its `AGENT_DOCS.toml`. The built-in is then
+downgraded to optional in both `resolve` and `baseline --check` output with
+`source = builtin-opt-out`, so it no longer counts toward `missing_required`
+while staying visible for audit. The foundational `startup` policy cannot be
+opted out.
+
+This is intended for content/archive repositories that are not software
+projects and legitimately have no `DEVELOPMENT.md`:
+
+```toml
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "DEVELOPMENT.md"
+required = false
+notes = "content/archive repo: no DEVELOPMENT.md needed"
+```
+
+A `required = false` entry only opts a built-in out from a config that is
+actually applied to the repository: a project-local `AGENT_DOCS.toml`, or the
+home catalog when it identifies the same Git repository. A home catalog cannot
+opt an unrelated project out of its built-ins.
+
 ## Command Surface
 
 ```text
@@ -452,7 +479,9 @@ suggested_actions:
 2. Load extension configs in fixed order: `$AGENT_DOCS_HOME/AGENT_DOCS.toml` then `$PROJECT_PATH/AGENT_DOCS.toml`.
 3. Consider only extension entries with `required = true` and `scope` included by `--target`.
    `--target home` includes `home` and `global`; `--target project` includes
-   `project`.
+   `project`. A `required = false` entry that matches a built-in key opts that
+   built-in out (downgraded to optional, `source = builtin-opt-out`), except
+   `startup`.
 4. Resolve each extension path, then de-dup by key: `(context, scope, normalized_path)`.
 5. Same-key override order:
    - within one config file, later `[[document]]` wins (last-write-wins)
@@ -484,14 +513,14 @@ notes = "Track required external CLIs for this project"
 
 ### Field contract
 
-| Field      | Type   | Required | Rules                                                              |
-| ---------- | ------ | -------- | ------------------------------------------------------------------ |
-| `context`  | string | yes      | One of: `startup`, `skill-dev`, `task-tools`, `project-dev`        |
-| `scope`    | string | yes      | One of: `home`, `project`, `global`; `global` is home-catalog only |
-| `path`     | string | yes      | Relative or absolute path to markdown doc                          |
-| `required` | bool   | no       | Default `false`                                                    |
-| `when`     | string | no       | Default `always`; supported values: `always`                       |
-| `notes`    | string | no       | Free text, default empty string                                    |
+| Field      | Type   | Required | Rules                                                                        |
+| ---------- | ------ | -------- | ---------------------------------------------------------------------------- |
+| `context`  | string | yes      | One of: `startup`, `skill-dev`, `task-tools`, `project-dev`                  |
+| `scope`    | string | yes      | One of: `home`, `project`, `global`; `global` is home-catalog only           |
+| `path`     | string | yes      | Relative or absolute path to markdown doc                                    |
+| `required` | bool   | no       | Default `false`; `false` on a built-in's own key opts it out (not `startup`) |
+| `when`     | string | no       | Default `always`; supported values: `always`                                 |
+| `notes`    | string | no       | Free text, default empty string                                              |
 
 ### Deterministic merge contract
 
@@ -509,7 +538,10 @@ For `resolve --context <ctx>`:
    - relative path: join with root selected by entry `scope`
 6. De-dup with merge key: `(context, scope, normalized_path)`.
 7. Conflict resolution order:
-   - built-in keys are immutable and cannot be removed or downgraded.
+   - extensions cannot re-declare a built-in key as required; a matching entry
+     with `required = true` is ignored and the built-in stands.
+   - a matching entry with `required = false` opts the built-in out (downgraded
+     to optional, `source = builtin-opt-out`), except for `startup`.
    - for non-built-in duplicates, later source wins (`project` config overrides `home` config).
    - within one file, later table wins (last-write-wins).
 8. Final output order is stable:
@@ -522,8 +554,8 @@ This merge behavior is deterministic and test-friendly.
 
 - Same key appears twice in `$PROJECT_PATH/AGENT_DOCS.toml`: second entry wins.
 - Same key appears in both home and project configs: project entry wins.
-- Key matches built-in required doc (for example project `DEVELOPMENT.md` in `project-dev`): built-in contract remains required and present
-  in output.
+- Key matches built-in required doc (for example project `DEVELOPMENT.md` in `project-dev`): the built-in contract remains required and present
+  in output, unless a project entry sets `required = false` to opt out (then it is downgraded to optional with `source = builtin-opt-out`).
 
 ## Invalid Schema Behavior
 
