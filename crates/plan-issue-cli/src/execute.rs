@@ -242,37 +242,46 @@ fn resolve_record_bundle(
     })
 }
 
-// Resolve a working directory for git operations targeting `path`.
-// Using the path's parent (rather than the process cwd) lets the
-// caller pass absolute bundle paths that live in a different repo
-// than the one they happened to launch the binary from — git itself
-// walks up to the `.git` toplevel from there.
-fn git_cwd_for_path(path: &Path) -> &Path {
-    path.parent().unwrap_or_else(|| Path::new("."))
+// Resolve a git working dir + pathspec for `path`.
+//
+// Running git from the path's parent (rather than the process cwd) lets the
+// caller pass an absolute bundle path that lives in a different repo than the
+// one they launched the binary from — git walks up to the `.git` toplevel from
+// there. The pathspec must then be the bare file name, *relative to that cwd*:
+// passing the full path re-anchors it under the subdir cwd (double-prefixed),
+// matches nothing, and the empty result was mis-reported as
+// `record-open-uncommitted` whenever `--bundle` was a relative path even though
+// the bundle files were committed and reachable from HEAD.
+fn git_cwd_and_pathspec(path: &Path) -> (&Path, String) {
+    let cwd = path.parent().unwrap_or_else(|| Path::new("."));
+    let pathspec = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+    (cwd, pathspec)
 }
 
-fn last_commit_for_path(path: &Path) -> Result<String, CommandError> {
-    let arg_path = path.to_string_lossy().to_string();
-    let cwd = git_cwd_for_path(path);
+fn last_commit_for_path(path: &Path, allow_dirty: bool) -> Result<String, CommandError> {
+    let (cwd, pathspec) = git_cwd_and_pathspec(path);
     let output = common_git::run_output_in(
         cwd,
-        &["log", "-n", "1", "--format=%H", "--", arg_path.as_str()],
+        &["log", "-n", "1", "--format=%H", "--", pathspec.as_str()],
     )
     .map_err(|err| {
         CommandError::runtime(
             "record-open-git-log-failed",
-            format!("git log {arg_path} failed: {err}"),
+            format!("git log {} failed: {err}", path.display()),
         )
     })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(CommandError::runtime(
             "record-open-git-log-failed",
-            format!("git log {arg_path}: {stderr}"),
+            format!("git log {}: {stderr}", path.display()),
         ));
     }
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if sha.is_empty() {
+    if sha.is_empty() && !allow_dirty {
         return Err(CommandError::runtime(
             "record-open-uncommitted",
             format!(
@@ -281,25 +290,28 @@ fn last_commit_for_path(path: &Path) -> Result<String, CommandError> {
             ),
         ));
     }
+    // With `--allow-dirty` a never-committed bundle file is allowed through with
+    // an empty commit; the snapshot renderer omits the `Commit:` line for it,
+    // so the error hint above ("pass --allow-dirty") now actually bypasses the
+    // check it advertises.
     Ok(sha)
 }
 
 fn path_is_dirty(path: &Path) -> Result<bool, CommandError> {
-    let arg_path = path.to_string_lossy().to_string();
-    let cwd = git_cwd_for_path(path);
+    let (cwd, pathspec) = git_cwd_and_pathspec(path);
     let output =
-        common_git::run_output_in(cwd, &["status", "--porcelain", "--", arg_path.as_str()])
+        common_git::run_output_in(cwd, &["status", "--porcelain", "--", pathspec.as_str()])
             .map_err(|err| {
                 CommandError::runtime(
                     "record-open-git-status-failed",
-                    format!("git status {arg_path} failed: {err}"),
+                    format!("git status {} failed: {err}", path.display()),
                 )
             })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(CommandError::runtime(
             "record-open-git-status-failed",
-            format!("git status {arg_path}: {stderr}"),
+            format!("git status {}: {stderr}", path.display()),
         ));
     }
     Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
@@ -333,8 +345,8 @@ fn resolve_bundle_snapshots(
         }
     }
 
-    let source_commit = last_commit_for_path(&bundle.source_file)?;
-    let plan_commit = last_commit_for_path(&bundle.plan_file)?;
+    let source_commit = last_commit_for_path(&bundle.source_file, allow_dirty)?;
+    let plan_commit = last_commit_for_path(&bundle.plan_file, allow_dirty)?;
 
     let source_snapshot = lifecycle_record::SnapshotData {
         path: relative_repo_path(&bundle.source_file),
