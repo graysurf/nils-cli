@@ -178,7 +178,7 @@ fn dispatch(cli: Cli) -> i32 {
                 }
             };
             let documents = resolver::resolve_all_documents(&roots, fallback_mode, &catalog);
-            let validations = resolver::all_validation_contracts(&catalog);
+            let validations = resolver::all_validation_contracts(&roots, &catalog);
             let intents = resolver::available_intents(&catalog);
             let report = ListReport {
                 docs_home: roots.docs_home.clone(),
