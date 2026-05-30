@@ -2826,13 +2826,18 @@ fn render_checkpoint_role(
     };
     let summary_ref = summary.as_deref();
 
-    let body = lifecycle_record::render_record_post_comment_with_display(
+    let body = lifecycle_record::render_record_post_comment_with_display_mode(
         profile,
         kind,
         payload,
         summary_ref,
         Some(run.updated_at.as_str()),
         TaskLedgerDisplay::Auto,
+        // The checkpoint controller derives live state from run-state, so the
+        // visible Execution State header is re-rendered from the payload rather
+        // than echoed from the (possibly stale) execution-state.md header
+        // (graysurf/plan-tracking-testbed#54 / sympoies/nils-cli#700).
+        lifecycle_record::StateHeaderMode::DeriveFromPayload,
     )
     .map_err(|err| CommandError::runtime("tracking-checkpoint-render-failed", err))?;
     Ok(CheckpointRoleResult::Rendered(body))

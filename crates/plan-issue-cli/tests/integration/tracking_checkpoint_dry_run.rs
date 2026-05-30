@@ -254,6 +254,129 @@ fn tracking_checkpoint_state_body_renders_full_execution_state_ledger() {
     );
 }
 
+#[test]
+fn tracking_checkpoint_state_body_renders_live_header_not_frozen_preflight() {
+    // graysurf/plan-tracking-testbed#54 / sympoies/nils-cli#700 (Part B): the
+    // visible Execution State header must be re-rendered from the derived
+    // payload, not spliced verbatim from the execution-state.md. Otherwise a
+    // completed plan keeps its pre-flight header ("ready-to-start", "tbd",
+    // "snapshot: pending"). The `## Task Ledger` and any other authored
+    // sections (e.g. `## Validation Plan`) still come from the file.
+    let fixture = write_fixture(&[
+        (
+            "source",
+            json!({"path": "p", "commit": "c"}),
+            "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:00Z",
+        ),
+        (
+            "plan",
+            json!({"path": "p", "commit": "c"}),
+            "## Plan Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:01Z",
+        ),
+        (
+            "state",
+            json!({"status": "in-progress", "target_scope": "x", "tasks": [], "prs": []}),
+            "## Execution State\n\n- Profile: tracking\n- Status: in-progress\n\n## Task Ledger\n\n| ID | Status |\n| --- | --- |\n| 1.1 | done |",
+            "2026-05-26T00:00:02Z",
+        ),
+    ]);
+    let tmp = TempDir::new().expect("tmp");
+    let exec_path = tmp.path().join("plan-execution-state.md");
+    fs::write(
+        &exec_path,
+        "\
+# Demo Plan Execution State
+
+<!-- plan-issue-record:v2 role=state profile=tracking -->
+## Execution State
+
+- Status: ready-to-start; tracking issue not yet opened.
+- Target scope: two append-only commits to notes.md
+- Current task: none (tracking issue not yet opened).
+- Next task: Task 1.1
+- Tracking issue: tbd
+- Source snapshot: pending
+
+## Validation Plan
+
+- Per-task: git diff shows one added line.
+
+## Task Ledger
+
+| ID | Status | Task | Evidence | Notes |
+| --- | --- | --- | --- | --- |
+| 1.1 | done | Append line A | log | first |
+| 1.2 | done | Append line B | log | second |
+",
+    )
+    .expect("write exec state");
+
+    let rs_path = tmp.path().join("run-state.json");
+    write_run_state_with_exec_file(&rs_path, "ready_for_close", &["done"], &exec_path);
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "checkpoint",
+        "--profile",
+        "tracking",
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--post",
+        "state",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let body = json_stdout(&out)["payload"]["result"]["rendered"][0]["body"]
+        .as_str()
+        .expect("body")
+        .to_string();
+
+    // Header re-rendered from the derived payload, reflecting completion.
+    assert!(
+        body.contains("- Status: complete"),
+        "want live `Status: complete`; body:\n{body}"
+    );
+    assert!(
+        body.contains("- Current task: complete"),
+        "want `Current task: complete`; body:\n{body}"
+    );
+    assert!(
+        body.contains("- Next task: closeout"),
+        "want `Next task: closeout`; body:\n{body}"
+    );
+    // Frozen pre-flight header bullets must be gone.
+    assert!(
+        !body.contains("ready-to-start"),
+        "frozen `Status: ready-to-start` leaked; body:\n{body}"
+    );
+    assert!(
+        !body.contains("Tracking issue: tbd"),
+        "frozen `Tracking issue: tbd` leaked; body:\n{body}"
+    );
+    assert!(
+        !body.contains("snapshot: pending"),
+        "frozen `snapshot: pending` leaked; body:\n{body}"
+    );
+    // The ledger and other authored sections still come from the file.
+    assert!(
+        body.contains("## Task Ledger"),
+        "ledger missing; body:\n{body}"
+    );
+    assert!(
+        body.contains("| 1.1 | done |"),
+        "ledger row missing; body:\n{body}"
+    );
+    assert!(
+        body.contains("## Validation Plan"),
+        "authored `## Validation Plan` section dropped; body:\n{body}"
+    );
+}
+
 /// Finding #45: a `session` checkpoint with run-state activity but no explicit
 /// note now renders from that activity (selected task + branch) instead of
 /// being silently skipped. `validation` with no validation summary is still
