@@ -25,7 +25,7 @@ pub enum DocsHomeSource {
     Flag,
     /// Derived from the install symlink (`dirname(readlink ~/.claude/CLAUDE.md)`).
     Symlink,
-    /// The legacy `AGENT_DOCS_HOME` environment variable fallback.
+    /// The `AGENT_DOCS_HOME` environment variable (lowest-precedence fallback).
     Env,
 }
 

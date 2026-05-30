@@ -53,7 +53,7 @@ When `--docs-home` is omitted, the docs-home is resolved in this order:
 2. The install symlink: the directory that `~/.claude/CLAUDE.md` (or the Codex
    equivalent `~/.codex/AGENTS.md`) resolves to, i.e.
    `dirname(readlink ~/.claude/CLAUDE.md)`.
-3. The legacy `AGENT_DOCS_HOME` environment variable.
+3. The `AGENT_DOCS_HOME` environment variable (lowest-precedence fallback).
 4. Otherwise a clear error instructing the caller to pass `--docs-home`.
 
 `audit` reports the symlink wiring (intact / mismatch / missing) so a broken
