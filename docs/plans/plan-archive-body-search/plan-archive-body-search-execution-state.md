@@ -3,17 +3,18 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: Sprint 1 implemented (PR1 pending) — shared scan core and
-  `catalog --deep` landed on the feature branch; Sprint 2 not started.
+- Status: Sprint 2 in progress — PR1 (Sprint 1) merged to main; the `search`
+  subcommand has landed on the Sprint 2 branch; PR2 delivery and the release
+  remain.
 - Target scope: `crates/plan-archive` body / full-text search surface in
   `sympoies/nils-cli` (shared scan core + `catalog --deep` + `search`).
 - Execution window: Sprint 1 (shared core + `catalog --deep`, PR1) → Sprint 2
   (`search` subcommand + delivery, PR2), serial.
-- Current task: none — Sprint 1 complete locally; PR1 delivery pending.
-- Next task: Task 2.1 — `plan-archive search` subcommand (Sprint 2).
+- Current task: Task 2.2 — tests / help done; PR2 delivery and release pending.
+- Next task: deliver PR2, then release `0.30.2` and close out.
 - Last updated: 2026-05-30
-- Branch/commit/PR: scan core `f8fdef2` + `catalog --deep` `aa107e8` on
-  `feat/plan-archive-body-search`; PR1 not yet opened.
+- Branch/commit/PR: PR1 squash-merged to main (`0247278`, PR #690); `search`
+  subcommand `a436526` on `feat/plan-archive-search`; PR2 not yet opened.
 - Source document: docs/plans/plan-archive-body-search/plan-archive-body-search-plan.md
 - Direct source-doc execution waiver: not applicable
 - Tracking issue: sympoies/nils-cli#689
@@ -41,7 +42,7 @@
 | --- | --- | --- | --- | --- |
 | 1.1 | done | Shared body-scan core over `data.body` + `data.comments[].body` | commit f8fdef2 on feat/plan-archive-body-search; 10 scan unit tests (red→green); clippy -D warnings + fmt clean | Build on `query::index` (`walk_index` / `parse_index_path` / `canonical_url`); return hits with url + matched field + snippet. No second scanner. |
 | 1.2 | done | `catalog --deep` flag | commit aa107e8; catalog --deep unit test (body-only term + --area compose, red→green); 108 lib + integration tests green, clippy + fmt clean | Depends on 1.1. Body/comment match projected to de-duplicated records; composes with `--grep` / `--area` / `--refs-to`. PR1 with 1.1. |
-| 2.1 | todo | `plan-archive search <term>` subcommand | — | Depends on 1.1. Hit-level output (plan slug + ref URL + matched field + snippet) in a documented versioned shape; substring, latest snapshot per ref, no ranking. |
+| 2.1 | done | `plan-archive search <term>` subcommand | commit a436526; 4 search integration tests (red→green); smoke on real archive: search rollback returns hit-level snippets, catalog --grep rollback --deep matches 12 plans that shallow --grep returns [] | Depends on 1.1. Hit-level output (plan slug + ref URL + matched field + snippet) in a documented versioned shape; substring, latest snapshot per ref, no ranking. |
 | 2.2 | todo | Tests, `--help` / completion snapshot, and release | — | Depends on 2.1. Golden fixture for `search`; document `catalog --deep` vs `search` roles; PR self-gated via `gh pr checks`; release + tap bump. |
 
 ## Session Log
@@ -68,6 +69,17 @@
   gate green (108 lib + integration tests, clippy `-D warnings`, fmt). PR1
   (Sprint 1) delivery and the full workspace required-checks gate are pending
   via `deliver-plan-tracking-issue`.
+- 2026-05-30: Delivered PR1 #690 — `forge-cli pr deliver --no-merge` then
+  self-gated on the full `gh pr checks` set (test / test_macos / coverage /
+  CodeQL all green; `wait-checks` alone reported success only because no checks
+  are branch-protection-required), then `ready` + squash-merge `0247278`.
+  Implemented Sprint 2 Task 2.1 off updated main, test-first: the hit-level
+  `plan-archive search <term>` subcommand on the shared scan core (owning plan
+  slug + ref URL + matched field + snippet, versioned JSON), commit `a436526`,
+  4 integration tests red-first. Smoke on the real archive: `search rollback`
+  returns hit-level snippets and `catalog --grep rollback --deep` matches 12
+  plans where shallow `--grep` returns none. PR2 and the `0.30.2` release
+  remain.
 
 ## Validation
 
@@ -76,6 +88,9 @@
 | `cargo test -p nils-plan-archive` | pass | 108 lib + integration tests green, incl. 10 scan-core cases and the `catalog --deep` body-only/`--area`-compose case. | local |
 | `cargo clippy -p nils-plan-archive --all-targets -- -D warnings` | pass | No warnings. | local |
 | `cargo fmt -p nils-plan-archive -- --check` | pass | Clean. | local |
+| `cargo test -p nils-plan-archive --test search` | pass | 4 search integration tests green (body + comment hits with plan resolution, empty-term error, case-insensitive). | local |
+| `nils-cli-checks-entrypoint.sh --local-fast` | pass | 185 tests green incl. completion + command-surface; output-contract lint clean. | local |
+| `gh pr checks 690` | pass | PR1: test / test_macos / coverage / CodeQL all green; squash-merged 0247278. | PR #690 |
 
 ## Notes
 
