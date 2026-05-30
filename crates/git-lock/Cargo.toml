@@ -1,6 +1,6 @@
 [package]
 name = "nils-git-lock"
-version = "0.28.5"
+version = "0.28.6"
 edition.workspace = true
 license.workspace = true
 
@@ -14,12 +14,12 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "0.28.5", path = "../nils-build-info" }
+nils-build-info = { version = "0.28.6", path = "../nils-build-info" }
 chrono = { version = "0.4", features = ["clock"] }
-nils-term = { version = "0.28.5", path = "../nils-term", package = "nils-term" }
-nils-common = { version = "0.28.5", path = "../nils-common", package = "nils-common" }
+nils-term = { version = "0.28.6", path = "../nils-term", package = "nils-term" }
+nils-common = { version = "0.28.6", path = "../nils-common", package = "nils-common" }
 
 [dev-dependencies]
-nils-test-support = { version = "0.28.5", path = "../nils-test-support" }
+nils-test-support = { version = "0.28.6", path = "../nils-test-support" }
 tempfile = "3"
 pretty_assertions = { workspace = true }
