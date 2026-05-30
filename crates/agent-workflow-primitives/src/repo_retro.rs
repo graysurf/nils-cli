@@ -1199,6 +1199,21 @@ fn is_test_path(path: &str) -> bool {
         .is_match(path)
 }
 
+/// Test-tree paths: a `tests/` / `test/` directory segment or a test-file
+/// name. Unlike `is_test_path` this omits a bare `specs/` directory, so
+/// `docs/specs` product docs are not swept in. It is checked before the `.md`
+/// rule so generated Markdown fixtures under `tests/golden/**` classify as
+/// tests, not product-docs.
+fn is_test_tree_path(path: &str) -> bool {
+    static TEST_TREE_RE: OnceLock<Regex> = OnceLock::new();
+    TEST_TREE_RE
+        .get_or_init(|| {
+            Regex::new(r"(^|/)tests?/|(^|/)(test_[^/]+|[^/]+_test)\.|(\.spec|\.test)\.")
+                .expect("regex")
+        })
+        .is_match(path)
+}
+
 fn top_level_area(path: &str) -> String {
     path.split('/').next().unwrap_or(".").to_string()
 }
@@ -1252,9 +1267,15 @@ fn default_path_class(path: &str) -> PathClass {
     {
         return PathClass::ProcessArtifacts;
     }
-    // Any remaining Markdown is documentation, classified before the test/spec
-    // heuristic — `is_test_path` also matches `specs/` segments (e.g.
-    // `docs/specs/`), which are product docs, not tests.
+    // Test-tree files — including generated Markdown fixtures under
+    // `tests/golden/**` — are tests, classified before the `.md` rule so they
+    // are not mislabeled product-docs.
+    if is_test_tree_path(path) {
+        return PathClass::Tests;
+    }
+    // Any remaining Markdown is documentation, classified before the residual
+    // test/spec heuristic — `is_test_path` also matches a bare `specs/` segment
+    // (e.g. `docs/specs/`), which is product docs, not tests.
     if path.to_lowercase().ends_with(".md") {
         return PathClass::ProductDocs;
     }
@@ -2690,6 +2711,23 @@ mod tests {
             PathClass::ProductDocs
         );
         assert_eq!(classifier.classify("scripts/ci/run.sh"), PathClass::Source);
+        // Generated Markdown fixtures under a `tests/` tree are tests, not
+        // product-docs — checked before the `.md` rule, without re-sweeping
+        // `docs/specs` product docs above.
+        assert_eq!(
+            classifier.classify(
+                "tests/golden/claude/plugins/reporting/skills/project-retro/expected/SKILL.md"
+            ),
+            PathClass::Tests
+        );
+        assert_eq!(
+            classifier.classify("crates/x/tests/golden/sample.md"),
+            PathClass::Tests
+        );
+        assert_eq!(
+            classifier.classify("tests/runtime-smoke/cases/meta/run.sh"),
+            PathClass::Tests
+        );
     }
 
     #[test]
