@@ -21,19 +21,19 @@
 
 ## Task Ledger
 
-| ID       | Status  | Task                                              | Evidence | Notes                                                          |
-| -------- | ------- | ------------------------------------------------- | -------- | -------------------------------------------------------------- |
-| Task 1.1 | done    | Reproduce the abort with a failing test           | `branch_cleanup_squash_skips_unrelated_history_branch` failed pre-fix on the merge-base abort | orphan-history fixture + real squash-merge |
-| Task 1.2 | done    | Skip no-merge-base branches instead of aborting   | `branch.rs` squash-loop merge-base `Err` arm now `continue` | unrelated history can't be a squash-merge of base |
-| Task 1.3 | done    | Format, lint, and full crate gate                 | `cargo test -p nils-git-cli` 119 passed; fmt + clippy clean | no new dependency                          |
+| ID       | Status | Task                                            | Evidence                                                                                      | Notes                                             |
+| -------- | ------ | ----------------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| Task 1.1 | done   | Reproduce the abort with a failing test         | `branch_cleanup_squash_skips_unrelated_history_branch` failed pre-fix on the merge-base abort | orphan-history fixture + real squash-merge        |
+| Task 1.2 | done   | Skip no-merge-base branches instead of aborting | `branch.rs` squash-loop merge-base `Err` arm now `continue`                                   | unrelated history can't be a squash-merge of base |
+| Task 1.3 | done   | Format, lint, and full crate gate               | `cargo test -p nils-git-cli` 119 passed; fmt + clippy clean                                   | no new dependency                                 |
 
 ## Validation
 
-| Command                                                                    | Status | Summary                            | Artifact |
-| -------------------------------------------------------------------------- | ------ | ---------------------------------- | -------- |
-| `cargo test -p nils-git-cli`                                               | pass   | 119 passed incl. orphan-skip test  | —        |
-| `cargo fmt --all -- --check`                                               | pass   | formatting clean                   | —        |
-| `cargo clippy -p nils-git-cli --all-targets --all-features -- -D warnings` | pass   | no warnings                        | —        |
+| Command                                                                    | Status | Summary                           | Artifact |
+| -------------------------------------------------------------------------- | ------ | --------------------------------- | -------- |
+| `cargo test -p nils-git-cli`                                               | pass   | 119 passed incl. orphan-skip test | —        |
+| `cargo fmt --all -- --check`                                               | pass   | formatting clean                  | —        |
+| `cargo clippy -p nils-git-cli --all-targets --all-features -- -D warnings` | pass   | no warnings                       | —        |
 
 ## Blockers
 
