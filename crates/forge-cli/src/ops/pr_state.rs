@@ -19,7 +19,8 @@ use crate::provider::Provider;
 pub fn normalize_state(raw: &str, provider: Provider) -> Result<&'static str, ForgeError> {
     let lower = raw.trim().to_ascii_lowercase();
     let mapped = match provider {
-        Provider::GitHub => match lower.as_str() {
+        // Local rides the GitHub wire format (`OPEN` / `CLOSED` / `MERGED`).
+        Provider::GitHub | Provider::Local => match lower.as_str() {
             "open" => "open",
             "closed" => "closed",
             "merged" => "merged",

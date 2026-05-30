@@ -97,7 +97,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 fn build_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("pr"),
             OsString::from("comment"),
             OsString::from(id.to_string()),
@@ -119,7 +119,7 @@ fn build_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall
 fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("pr"),
             OsString::from("view"),
             OsString::from(id.to_string()),
@@ -206,6 +206,7 @@ mod tests {
             remote: "origin".into(),
             provider,
             repo: None,
+            store_root: None,
             dry_run,
         }
     }

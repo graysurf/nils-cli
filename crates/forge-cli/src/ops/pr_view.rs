@@ -50,6 +50,10 @@ pub struct PrViewPayload {
 }
 
 pub fn run(global: &GlobalFlags, id: String, format: OutputFormat) -> Result<i32, ForgeError> {
+    if global.is_local() {
+        let runner = crate::local::LocalRunner::from_global(global)?;
+        return run_with(&runner, global, &id, format, git_remote_url);
+    }
     let runner = ProcessRunner;
     run_with(&runner, global, &id, format, git_remote_url)
 }
@@ -101,7 +105,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 pub(crate) fn build_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("pr"),
             OsString::from("view"),
             OsString::from(id),
@@ -126,7 +130,7 @@ fn resolve_branch_id<R: BackendRunner>(
     branch: &str,
 ) -> Result<String, ForgeError> {
     match ctx.provider {
-        Provider::GitHub => Ok(branch.to_string()),
+        Provider::GitHub | Provider::Local => Ok(branch.to_string()),
         Provider::GitLab => {
             let mut argv: Vec<OsString> = vec![
                 OsString::from("mr"),
@@ -168,7 +172,7 @@ pub fn parse_view_output(
         ForgeError::software(schema_err(), "pr view JSON is invalid", Some(e.to_string()))
     })?;
     match ctx.provider {
-        Provider::GitHub => parse_github(&value, ctx),
+        Provider::GitHub | Provider::Local => parse_github(&value, ctx),
         Provider::GitLab => parse_gitlab(&value, ctx),
     }
 }

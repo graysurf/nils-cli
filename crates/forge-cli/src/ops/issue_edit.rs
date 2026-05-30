@@ -39,6 +39,10 @@ pub fn run(
     args: IssueEditArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
+    if global.is_local() {
+        let runner = crate::local::LocalRunner::from_global(global)?;
+        return run_with(&runner, global, args, format, git_remote_url);
+    }
     let runner = ProcessRunner;
     run_with(&runner, global, args, format, git_remote_url)
 }
@@ -102,7 +106,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 fn build_edit_call(ctx: &ProviderContext, args: &IssueEditArgs, body: Option<&str>) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("issue"),
             OsString::from("edit"),
             OsString::from(args.id.to_string()),
@@ -119,7 +123,7 @@ fn build_edit_call(ctx: &ProviderContext, args: &IssueEditArgs, body: Option<&st
     }
     if let Some(b) = body {
         let body_flag = match ctx.provider {
-            Provider::GitHub => "--body",
+            Provider::GitHub | Provider::Local => "--body",
             Provider::GitLab => "--description",
         };
         argv.push(OsString::from(body_flag));
@@ -127,7 +131,7 @@ fn build_edit_call(ctx: &ProviderContext, args: &IssueEditArgs, body: Option<&st
     }
     for label in &args.add_label {
         let flag = match ctx.provider {
-            Provider::GitHub => "--add-label",
+            Provider::GitHub | Provider::Local => "--add-label",
             Provider::GitLab => "--label",
         };
         argv.push(OsString::from(flag));
@@ -135,7 +139,7 @@ fn build_edit_call(ctx: &ProviderContext, args: &IssueEditArgs, body: Option<&st
     }
     for label in &args.remove_label {
         let flag = match ctx.provider {
-            Provider::GitHub => "--remove-label",
+            Provider::GitHub | Provider::Local => "--remove-label",
             Provider::GitLab => "--unlabel",
         };
         argv.push(OsString::from(flag));
@@ -143,7 +147,7 @@ fn build_edit_call(ctx: &ProviderContext, args: &IssueEditArgs, body: Option<&st
     }
     for assignee in &args.add_assignee {
         let flag = match ctx.provider {
-            Provider::GitHub => "--add-assignee",
+            Provider::GitHub | Provider::Local => "--add-assignee",
             Provider::GitLab => "--assignee",
         };
         argv.push(OsString::from(flag));
@@ -319,6 +323,7 @@ mod tests {
                 remote: "origin".into(),
                 provider,
                 repo: None,
+                store_root: None,
                 dry_run,
             }
         }

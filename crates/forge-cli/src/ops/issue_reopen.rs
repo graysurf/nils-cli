@@ -75,7 +75,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 fn build_reopen_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub | Provider::GitLab => vec![
+        Provider::GitHub | Provider::GitLab | Provider::Local => vec![
             OsString::from("issue"),
             OsString::from("reopen"),
             OsString::from(id.to_string()),

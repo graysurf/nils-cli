@@ -187,6 +187,87 @@ pub fn snapshot<R: BackendRunner>(
     match ctx.provider {
         Provider::GitHub => snapshot_github(runner, ctx, args),
         Provider::GitLab => pr_checks_gitlab::snapshot(runner, ctx, args),
+        Provider::Local => snapshot_local(global, ctx, args),
+    }
+}
+
+/// Build a checks snapshot for `Provider::Local` from the seeded `PrRecord`
+/// rollup. The local store records the aggregate (`required_state`,
+/// `required_count`, `non_required_failures`), not individual checks, so we
+/// synthesize gating entries that reproduce that rollup and reuse the shared
+/// [`aggregate`] so the payload shape matches the real backends.
+fn snapshot_local(
+    global: &GlobalFlags,
+    ctx: &ProviderContext,
+    args: &PrChecksArgs,
+) -> Result<PrChecksPayload, ForgeError> {
+    let root = crate::local::resolve_store_root(global)?;
+    let slug = crate::local::resolve_slug(global.repo.as_deref());
+    let store = crate::local::store::Store::open(root, &slug)?;
+    let id: u64 = args.id.parse().map_err(|_| {
+        ForgeError::software(
+            schema_err(),
+            "local pr checks: id must be numeric",
+            Some(format!("id={}", args.id)),
+        )
+    })?;
+    let pr = store.read_pr(id)?;
+    let required_count = pr.required_count.unwrap_or(0);
+    let required_state = pr
+        .required_state
+        .as_deref()
+        .or(pr.checks.as_deref())
+        .unwrap_or("success");
+    let mut checks: Vec<CheckItem> = Vec::new();
+    for i in 0..required_count {
+        // The first required check carries the rollup state; the rest pass so
+        // the aggregate reproduces the seeded `required_state`.
+        let state = if i == 0 {
+            map_local_check_state(required_state)
+        } else {
+            CheckState::Success
+        };
+        checks.push(local_check_item(format!("required-{}", i + 1), state, true));
+    }
+    // Zero declared required checks but a non-success rollup: surface one
+    // required entry so the gate reflects the seed rather than reporting green.
+    if required_count == 0 && !matches!(map_local_check_state(required_state), CheckState::Success)
+    {
+        checks.push(local_check_item(
+            "required".to_string(),
+            map_local_check_state(required_state),
+            true,
+        ));
+    }
+    for name in &pr.non_required_failures {
+        checks.push(local_check_item(name.clone(), CheckState::Failure, false));
+    }
+    Ok(aggregate(ctx, checks, args.required_only, None))
+}
+
+fn local_check_item(name: String, state: CheckState, required: bool) -> CheckItem {
+    CheckItem {
+        name,
+        state: state.as_str(),
+        url: None,
+        conclusion: None,
+        workflow: None,
+        required,
+        started_at: None,
+        completed_at: None,
+    }
+}
+
+fn map_local_check_state(raw: &str) -> CheckState {
+    match raw.to_ascii_lowercase().as_str() {
+        "success" => CheckState::Success,
+        "failure" | "error" => CheckState::Failure,
+        "pending" => CheckState::Pending,
+        "cancelled" | "canceled" => CheckState::Cancelled,
+        "skipped" => CheckState::Skipped,
+        "neutral" => CheckState::Neutral,
+        "timed_out" => CheckState::TimedOut,
+        _ => CheckState::Pending,
     }
 }
 
@@ -239,8 +320,10 @@ pub fn build_github_required_call(ctx: &ProviderContext, id: &str) -> BackendCal
 /// downstream atoms (e.g. `pr wait-checks` dry-run) can reuse it.
 pub fn build_dry_run_call(ctx: &ProviderContext, args: &PrChecksArgs) -> BackendCall {
     match ctx.provider {
-        Provider::GitHub if args.required_only => build_github_required_call(ctx, &args.id),
-        Provider::GitHub => build_github_call(ctx, &args.id),
+        Provider::GitHub | Provider::Local if args.required_only => {
+            build_github_required_call(ctx, &args.id)
+        }
+        Provider::GitHub | Provider::Local => build_github_call(ctx, &args.id),
         Provider::GitLab => pr_checks_gitlab::build_status_call(ctx, &args.id),
     }
 }

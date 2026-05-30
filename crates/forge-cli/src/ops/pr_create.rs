@@ -176,7 +176,7 @@ pub fn run_with<R: BackendRunner>(
     body_sections(&body, &env.headings)?;
     no_local_path(&body, "body")?;
     let label_target = match ctx.provider {
-        Provider::GitHub => LabelTarget::Pr,
+        Provider::GitHub | Provider::Local => LabelTarget::Pr,
         Provider::GitLab => LabelTarget::Mr,
     };
     validate_label_inputs(
@@ -251,7 +251,7 @@ pub fn compute<R: BackendRunner>(
     body_sections(&body, &env.headings)?;
     no_local_path(&body, "body")?;
     let label_target = match ctx.provider {
-        Provider::GitHub => LabelTarget::Pr,
+        Provider::GitHub | Provider::Local => LabelTarget::Pr,
         Provider::GitLab => LabelTarget::Mr,
     };
     validate_label_inputs(
@@ -373,7 +373,7 @@ fn build_create_call(
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = Vec::new();
     match ctx.provider {
-        Provider::GitHub => {
+        Provider::GitHub | Provider::Local => {
             argv.push(OsString::from("pr"));
             argv.push(OsString::from("create"));
             if draft {
@@ -427,7 +427,7 @@ fn build_create_call(
 fn build_view_call(ctx: &ProviderContext, number: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("pr"),
             OsString::from("view"),
             OsString::from(number.to_string()),
@@ -487,7 +487,7 @@ fn extract_pr_url(line: &str) -> Option<String> {
 
 fn parse_url_number(url: &str, provider: Provider) -> Option<u64> {
     let needle = match provider {
-        Provider::GitHub => "/pull/",
+        Provider::GitHub | Provider::Local => "/pull/",
         Provider::GitLab => "/merge_requests/",
     };
     let idx = url.find(needle)? + needle.len();
@@ -511,7 +511,7 @@ pub fn parse_view_output(
             format!(
                 "{program} {sub} view JSON is invalid",
                 program = match ctx.provider {
-                    Provider::GitHub => "gh pr",
+                    Provider::GitHub | Provider::Local => "gh pr",
                     Provider::GitLab => "glab mr",
                 },
                 sub = "post-create"
@@ -521,7 +521,7 @@ pub fn parse_view_output(
     })?;
 
     match ctx.provider {
-        Provider::GitHub => Ok(PrCreatePayload {
+        Provider::GitHub | Provider::Local => Ok(PrCreatePayload {
             provider: ctx.provider.as_str(),
             number,
             url: value
@@ -818,6 +818,7 @@ mod tests {
             remote: "origin".into(),
             provider: None,
             repo: None,
+            store_root: None,
             dry_run: true,
         };
         let body = "## Summary\n\nyes.\n\n## Test plan\n\nverified.\n";
@@ -844,6 +845,7 @@ mod tests {
             remote: "origin".into(),
             provider: None,
             repo: None,
+            store_root: None,
             dry_run: true,
         };
         let body = "## Summary\n\nyes.\n\n## Test plan\n\nverified.\n";
@@ -867,6 +869,7 @@ mod tests {
             remote: "origin".into(),
             provider: None,
             repo: None,
+            store_root: None,
             dry_run: true,
         };
         let body = "## Summary\n\nyes.\n\n## Test plan\n\nverified.\n";
@@ -890,6 +893,7 @@ mod tests {
             remote: "origin".into(),
             provider: None,
             repo: None,
+            store_root: None,
             dry_run: true,
         };
         let body = "## Test plan\n\nyes.\n";

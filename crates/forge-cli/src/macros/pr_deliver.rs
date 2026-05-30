@@ -428,7 +428,7 @@ fn repo_view_dry_plan(ctx: &ProviderContext) -> Vec<String> {
     let mut call = BackendCall::new(
         BackendProgram::for_provider(ctx.provider),
         match ctx.provider {
-            Provider::GitHub => vec![
+            Provider::GitHub | Provider::Local => vec![
                 std::ffi::OsString::from("repo"),
                 std::ffi::OsString::from("view"),
                 std::ffi::OsString::from("--json"),
@@ -456,7 +456,7 @@ fn pr_create_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String
         .unwrap_or_else(|| "<current-branch>".into());
     let base = args.base.clone().unwrap_or_else(|| "<repo-default>".into());
     let mut argv = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             "pr",
             "create",
             "--head",
@@ -486,7 +486,7 @@ fn pr_create_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String
     }
     let joined_labels = args.labels.join(",");
     match ctx.provider {
-        Provider::GitHub => {
+        Provider::GitHub | Provider::Local => {
             for label in &args.labels {
                 argv.extend_from_slice(&["--label", label]);
             }
@@ -509,7 +509,9 @@ fn pr_create_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String
 fn pr_wait_checks_dry_plan(ctx: &ProviderContext) -> Vec<String> {
     let prog = BackendProgram::for_provider(ctx.provider).default_executable();
     match ctx.provider {
-        Provider::GitHub => pr_checks::build_github_required_call(ctx, "<pr-number>").plan_argv(),
+        Provider::GitHub | Provider::Local => {
+            pr_checks::build_github_required_call(ctx, "<pr-number>").plan_argv()
+        }
         Provider::GitLab => vec![
             prog.into(),
             "ci".into(),
@@ -523,7 +525,7 @@ fn pr_wait_checks_dry_plan(ctx: &ProviderContext) -> Vec<String> {
 fn pr_ready_dry_plan(ctx: &ProviderContext) -> Vec<String> {
     let prog = BackendProgram::for_provider(ctx.provider).default_executable();
     match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             prog.into(),
             "pr".into(),
             "ready".into(),
@@ -543,7 +545,7 @@ fn pr_merge_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String>
     let prog = BackendProgram::for_provider(ctx.provider).default_executable();
     let method = args.method.into_method();
     let mut out: Vec<String> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             prog.into(),
             "pr".into(),
             "merge".into(),
@@ -566,7 +568,7 @@ fn pr_merge_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String>
     let cfg = ForgeConfig::default();
     if cfg.resolve_delete_branch(None) {
         match ctx.provider {
-            Provider::GitHub => out.push("--delete-branch".into()),
+            Provider::GitHub | Provider::Local => out.push("--delete-branch".into()),
             Provider::GitLab => out.push("--remove-source-branch".into()),
         }
     }

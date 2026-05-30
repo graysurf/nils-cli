@@ -284,7 +284,7 @@ fn fetch_labels<R: BackendRunner>(
 fn build_list_call(ctx: &ProviderContext, limit: u32) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("label"),
             OsString::from("list"),
             OsString::from("--limit"),
@@ -308,7 +308,7 @@ fn build_list_call(ctx: &ProviderContext, limit: u32) -> BackendCall {
 fn build_create_call(ctx: &ProviderContext, label: &CatalogLabel) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("label"),
             OsString::from("create"),
             OsString::from(&label.name),
@@ -339,7 +339,7 @@ fn build_update_call(
 ) -> Option<BackendCall> {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("label"),
             OsString::from("edit"),
             OsString::from(&expected.name),
@@ -700,6 +700,7 @@ mod tests {
             host: match provider {
                 Provider::GitHub => "github.com",
                 Provider::GitLab => "gitlab.com",
+                Provider::Local => "local",
             }
             .into(),
             source: crate::provider::DetectionSource::Flag,

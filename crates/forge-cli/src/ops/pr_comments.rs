@@ -46,6 +46,10 @@ pub fn run(
     args: PrCommentsArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
+    if global.is_local() {
+        let runner = crate::local::LocalRunner::from_global(global)?;
+        return run_with(&runner, global, args, format, git_remote_url);
+    }
     let runner = ProcessRunner;
     run_with(&runner, global, args, format, git_remote_url)
 }
@@ -84,7 +88,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
     let comments_output = runner.run(&comments_call)?;
     let comments = match ctx.provider {
-        Provider::GitHub => parse_github_comments(&comments_output)?,
+        Provider::GitHub | Provider::Local => parse_github_comments(&comments_output)?,
         Provider::GitLab => parse_gitlab_notes(&comments_output, &view.url)?,
     };
 
@@ -120,6 +124,23 @@ fn build_comments_call(
             );
             Ok(BackendCall::new(
                 BackendProgram::Gh,
+                [
+                    OsString::from("api"),
+                    OsString::from("--paginate"),
+                    OsString::from(path),
+                ],
+            ))
+        }
+        Provider::Local => {
+            // The synthetic `local://<slug>/pull/<n>` URL has no github-style
+            // owner/repo segment to parse; the local runner only needs the PR
+            // number, so pass it directly.
+            let path = format!(
+                "repos/local/issues/{n}/comments?per_page=100",
+                n = view.number
+            );
+            Ok(BackendCall::new(
+                BackendProgram::Local,
                 [
                     OsString::from("api"),
                     OsString::from("--paginate"),
@@ -416,6 +437,7 @@ mod tests {
             remote: "origin".into(),
             provider: Some(crate::cli::ProviderFlag::Github),
             repo: Some("o/r".into()),
+            store_root: None,
             dry_run: false,
         }
     }
@@ -579,6 +601,7 @@ mod tests {
             remote: "origin".into(),
             provider: Some(crate::cli::ProviderFlag::Gitlab),
             repo: Some("grp/proj".into()),
+            store_root: None,
             dry_run: false,
         };
         let code = run_with(

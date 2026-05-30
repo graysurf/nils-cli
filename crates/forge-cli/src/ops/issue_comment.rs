@@ -35,6 +35,10 @@ pub fn run(
     args: IssueCommentArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
+    if global.is_local() {
+        let runner = crate::local::LocalRunner::from_global(global)?;
+        return run_with(&runner, global, args, format, git_remote_url);
+    }
     let runner = ProcessRunner;
     run_with(&runner, global, args, format, git_remote_url)
 }
@@ -92,7 +96,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 fn build_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("issue"),
             OsString::from("comment"),
             OsString::from(id.to_string()),
@@ -213,6 +217,7 @@ mod tests {
                 remote: "origin".into(),
                 provider,
                 repo: None,
+                store_root: None,
                 dry_run,
             }
         }

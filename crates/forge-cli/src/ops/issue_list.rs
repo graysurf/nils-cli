@@ -52,6 +52,10 @@ pub fn run(
     args: IssueListArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
+    if global.is_local() {
+        let runner = crate::local::LocalRunner::from_global(global)?;
+        return run_with(&runner, global, args, format, git_remote_url);
+    }
     let runner = ProcessRunner;
     run_with(&runner, global, args, format, git_remote_url)
 }
@@ -96,7 +100,7 @@ fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
     let limit = args.limit.max(1);
     let mut argv: Vec<OsString> = Vec::new();
     match ctx.provider {
-        Provider::GitHub => {
+        Provider::GitHub | Provider::Local => {
             argv.push(OsString::from("issue"));
             argv.push(OsString::from("list"));
             argv.push(OsString::from("--state"));
@@ -187,7 +191,7 @@ pub fn parse_list_output(
 
 fn parse_item(raw: &serde_json::Value, ctx: &ProviderContext) -> Result<IssueListItem, ForgeError> {
     match ctx.provider {
-        Provider::GitHub => Ok(IssueListItem {
+        Provider::GitHub | Provider::Local => Ok(IssueListItem {
             number: raw
                 .get("number")
                 .and_then(|v| v.as_u64())

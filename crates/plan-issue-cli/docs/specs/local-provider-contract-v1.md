@@ -40,9 +40,10 @@ Out of scope:
 - The cross-provider conformance suite scope (Task 3.1). This spec defines the
   shape the local backend must conform to; it does not enumerate the shared
   scenario table.
-- The store-locator surface (`--store-root <path>` flag and/or a
-  `FORGE_CLI_LOCAL_STORE` env, and the `--repo` slug shape for local). These
-  remain open and are resolved during `forge-cli` implementation.
+
+(The store-locator surface — flag, env, and `--repo` slug shape — was an open
+question in the source spike; it is resolved below in
+[Store Locator](#store-locator).)
 
 ## Source of Truth (as-built)
 
@@ -116,12 +117,15 @@ current `gh api` branch/issue wiping the driver performs against GitHub).
   "slug": "<name>",
   "provider": "local",
   "next_issue": 13,
-  "next_pr": 8
+  "next_pr": 8,
+  "clock": 42
 }
 ```
 
-`next_issue` and `next_pr` are monotonic allocation counters (see
-[Determinism](#determinism)).
+`next_issue` and `next_pr` are monotonic allocation counters. `clock` is the
+monotonic timestamp counter (seconds past the deterministic base) consumed one
+tick per synthesized `created_at` (see [Determinism](#determinism)). All three
+are owned by `forge-cli`; the driver never writes `repo.json`.
 
 ### `IssueRecord` (`issues/<n>.json`) — Half A, authoritative
 
@@ -270,6 +274,31 @@ local backend is `forge-cli` `Provider::Local`, the file the driver writes
 --provider local` then read back exactly what the driver seeded.
 
 A `seed-pr` convenience command is explicitly deferred (a nicety, not v1).
+
+## Store Locator
+
+`forge-cli` selects the local backend with `--provider local` and resolves the
+store root in this order:
+
+1. The `--store-root <path>` global flag.
+2. Otherwise the `FORGE_CLI_LOCAL_STORE` environment variable.
+
+A missing store root is a hard error (`UNAVAILABLE`, `error.kind =
+local_store_unconfigured`) — the backend never falls back to an implicit
+location.
+
+The `--repo` slug accepts an optional `local:` scheme prefix (`--repo
+local:<name>`); the prefix is stripped and the bare `<name>` is recorded as the
+store's `slug` in `repo.json` and embedded in synthetic `local://<name>/…`
+URLs. When `--repo` is omitted the slug defaults to `local`. One store root
+holds exactly one repository.
+
+`forge-cli` models only the commands this contract covers under
+`--provider local` — the issue lifecycle (`issue create / view / list / edit /
+comment / close`) and the PR read surface (`pr view / checks / comments`). Any
+other command (PR mutation, `repo` / `auth` / `label` / `inbox`, the
+`pr deliver` macro) is rejected up front with a `provider_unsupported` error
+rather than reaching a backend.
 
 ## Relationship to `forge-cli` and the Driver
 

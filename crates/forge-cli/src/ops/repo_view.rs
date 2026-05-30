@@ -93,7 +93,7 @@ fn build_call(ctx: &ProviderContext) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = Vec::new();
     match ctx.provider {
-        Provider::GitHub => {
+        Provider::GitHub | Provider::Local => {
             argv.push(OsString::from("repo"));
             argv.push(OsString::from("view"));
             if let Some(slug) = ctx.repo.as_deref() {
@@ -128,7 +128,7 @@ pub fn parse_backend_output(
     output: &BackendSuccess,
 ) -> Result<RepoViewPayload, ForgeError> {
     match ctx.provider {
-        Provider::GitHub => parse_github(&output.stdout, ctx),
+        Provider::GitHub | Provider::Local => parse_github(&output.stdout, ctx),
         Provider::GitLab => parse_gitlab(&output.stdout, ctx),
     }
 }

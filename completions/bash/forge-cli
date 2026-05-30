@@ -350,7 +350,7 @@ _forge-cli() {
 
     case "${cmd}" in
         forge__cli)
-            opts="-h -V --format --remote --provider --repo --dry-run --help --version pr issue label inbox repo auth completion help"
+            opts="-h -V --format --remote --provider --repo --store-root --dry-run --help --version pr issue label inbox repo auth completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -365,10 +365,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -380,7 +384,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__auth)
-            opts="-h --format --remote --provider --repo --dry-run --help status help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help status help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -395,10 +399,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -452,7 +460,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__auth__status)
-            opts="-h --format --remote --provider --repo --dry-run --help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -467,10 +475,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -482,7 +494,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__completion)
-            opts="-h --format --remote --provider --repo --dry-run --help bash elvish fish powershell zsh"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help bash elvish fish powershell zsh"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -497,10 +509,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1016,7 +1032,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox)
-            opts="-h --format --remote --provider --repo --dry-run --help status list next help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help status list next help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1031,10 +1047,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1116,7 +1136,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox__list)
-            opts="-h --gitlab-host --kind --item-type --limit --gitlab-vpn --gitlab-vpn-check --gitlab-vpn-check-timeout --gitlab-openvpn-profile --provider-timeout --strict-providers --cache-fallback --cache-max-age --no-cache --format --remote --provider --repo --dry-run --help"
+            opts="-h --gitlab-host --kind --item-type --limit --gitlab-vpn --gitlab-vpn-check --gitlab-vpn-check-timeout --gitlab-openvpn-profile --provider-timeout --strict-providers --cache-fallback --cache-max-age --no-cache --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1171,10 +1191,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1186,7 +1210,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox__next)
-            opts="-h --gitlab-host --kind --item-type --limit --gitlab-vpn --gitlab-vpn-check --gitlab-vpn-check-timeout --gitlab-openvpn-profile --provider-timeout --strict-providers --cache-fallback --cache-max-age --no-cache --format --remote --provider --repo --dry-run --help"
+            opts="-h --gitlab-host --kind --item-type --limit --gitlab-vpn --gitlab-vpn-check --gitlab-vpn-check-timeout --gitlab-openvpn-profile --provider-timeout --strict-providers --cache-fallback --cache-max-age --no-cache --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1241,10 +1265,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1256,7 +1284,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__inbox__status)
-            opts="-h --gitlab-host --kind --item-type --limit --gitlab-vpn --gitlab-vpn-check --gitlab-vpn-check-timeout --gitlab-openvpn-profile --provider-timeout --strict-providers --cache-fallback --cache-max-age --no-cache --format --remote --provider --repo --dry-run --help"
+            opts="-h --gitlab-host --kind --item-type --limit --gitlab-vpn --gitlab-vpn-check --gitlab-vpn-check-timeout --gitlab-openvpn-profile --provider-timeout --strict-providers --cache-fallback --cache-max-age --no-cache --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1311,10 +1339,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1326,7 +1358,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue)
-            opts="-h --format --remote --provider --repo --dry-run --help create view list edit comment close reopen help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help create view list edit comment close reopen help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1341,10 +1373,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1356,7 +1392,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue__close)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1371,10 +1407,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1386,7 +1426,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue__comment)
-            opts="-h --body --body-file --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --body --body-file --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1409,10 +1449,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1424,7 +1468,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue__create)
-            opts="-h --title --body --body-file --label --assignee --format --remote --provider --repo --dry-run --help"
+            opts="-h --title --body --body-file --label --assignee --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1459,10 +1503,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1474,7 +1522,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue__edit)
-            opts="-h --title --body --body-file --add-label --remove-label --add-assignee --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --title --body --body-file --add-label --remove-label --add-assignee --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1513,10 +1561,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1654,7 +1706,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue__list)
-            opts="-h --state --label --author --assignee --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --state --label --author --assignee --limit --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1689,10 +1741,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1704,7 +1760,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue__reopen)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1719,10 +1775,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1734,7 +1794,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue__view)
-            opts="-h --with-comments --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --with-comments --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1749,10 +1809,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1764,7 +1828,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__label)
-            opts="-h --format --remote --provider --repo --dry-run --help list audit ensure help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help list audit ensure help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1779,10 +1843,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1794,7 +1862,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__label__audit)
-            opts="-h --catalog --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --catalog --limit --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1817,10 +1885,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1832,7 +1904,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__label__ensure)
-            opts="-h --catalog --update-existing --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --catalog --update-existing --limit --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1855,10 +1927,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1940,7 +2016,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__label__list)
-            opts="-h --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --limit --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1959,10 +2035,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1974,7 +2054,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr)
-            opts="-h --format --remote --provider --repo --dry-run --help create view list edit comment comments ready merge close checks wait-checks deliver help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help create view list edit comment comments ready merge close checks wait-checks deliver help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1989,10 +2069,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2004,7 +2088,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__checks)
-            opts="-h --required-only --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --required-only --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2023,10 +2107,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2038,7 +2126,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__close)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2053,10 +2141,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2068,7 +2160,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__comment)
-            opts="-h --body --body-file --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --body --body-file --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2091,10 +2183,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2106,7 +2202,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__comments)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2121,10 +2217,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2136,7 +2236,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__create)
-            opts="-h --head --base --title --body --body-file --kind --no-draft --reviewer --label --label-catalog --strict-labels --format --remote --provider --repo --dry-run --help"
+            opts="-h --head --base --title --body --body-file --kind --no-draft --reviewer --label --label-catalog --strict-labels --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2187,10 +2287,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2202,7 +2306,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__deliver)
-            opts="-h --kind --title --body --body-file --head --base --method --reviewer --label --label-catalog --strict-labels --timeout --no-merge --allow-non-default-base --format --remote --provider --repo --dry-run --help"
+            opts="-h --kind --title --body --body-file --head --base --method --reviewer --label --label-catalog --strict-labels --timeout --no-merge --allow-non-default-base --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2261,10 +2365,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2276,7 +2384,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__edit)
-            opts="-h --title --body --body-file --base --add-label --remove-label --add-reviewer --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --title --body --body-file --base --add-label --remove-label --add-reviewer --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2319,10 +2427,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2530,7 +2642,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__list)
-            opts="-h --state --author --head --limit --format --remote --provider --repo --dry-run --help"
+            opts="-h --state --author --head --limit --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2561,10 +2673,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2576,7 +2692,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__merge)
-            opts="-h --method --keep-branch --allow-non-default-base --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --method --keep-branch --allow-non-default-base --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2595,10 +2711,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2610,7 +2730,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__ready)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2625,10 +2745,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2640,7 +2764,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__view)
-            opts="-h --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2655,10 +2779,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2670,7 +2798,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__wait__checks)
-            opts="-h --timeout --interval --required-only --format --remote --provider --repo --dry-run --help <ID>"
+            opts="-h --timeout --interval --required-only --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2697,10 +2825,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2712,7 +2844,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__repo)
-            opts="-h --format --remote --provider --repo --dry-run --help view help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help view help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2727,10 +2859,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -2784,7 +2920,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__repo__view)
-            opts="-h --format --remote --provider --repo --dry-run --help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2799,10 +2935,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --provider)
-                    COMPREPLY=($(compgen -W "github gitlab" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

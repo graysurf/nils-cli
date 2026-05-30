@@ -111,7 +111,7 @@ pub fn parse_backend_output(
 ) -> Result<AuthStatusPayload, ForgeError> {
     let combined = format!("{}\n{}", output.stdout, output.stderr);
     match ctx.provider {
-        Provider::GitHub => parse_github(&combined, ctx),
+        Provider::GitHub | Provider::Local => parse_github(&combined, ctx),
         Provider::GitLab => parse_gitlab(&combined, ctx),
     }
 }
