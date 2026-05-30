@@ -37,7 +37,7 @@ use crate::ops::repo_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::{
     BodyHeadings, PrKind, body_sections, branch_kind_matches, branch_name, git_head_state,
-    git_status_porcelain, head_pushed, title_length, worktree_clean,
+    git_status_porcelain, head_pushed, no_local_path, title_length, worktree_clean,
 };
 
 const SCHEMA: &str = "pr.create";
@@ -172,7 +172,9 @@ pub fn run_with<R: BackendRunner>(
     let kind: PrKind = args.kind.into_kind();
     branch_kind_matches(prefix, kind)?;
     title_length(&args.title)?;
+    no_local_path(&args.title, "title")?;
     body_sections(&body, &env.headings)?;
+    no_local_path(&body, "body")?;
     let label_target = match ctx.provider {
         Provider::GitHub => LabelTarget::Pr,
         Provider::GitLab => LabelTarget::Mr,
@@ -245,7 +247,9 @@ pub fn compute<R: BackendRunner>(
     let kind: PrKind = args.kind.into_kind();
     branch_kind_matches(prefix, kind)?;
     title_length(&args.title)?;
+    no_local_path(&args.title, "title")?;
     body_sections(&body, &env.headings)?;
+    no_local_path(&body, "body")?;
     let label_target = match ctx.provider {
         Provider::GitHub => LabelTarget::Pr,
         Provider::GitLab => LabelTarget::Mr,

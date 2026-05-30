@@ -18,7 +18,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::issue_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::validations::title_length;
+use crate::validations::{no_local_path, title_length};
 
 const SCHEMA: &str = "issue.edit";
 const SCHEMA_VERSION: u32 = 1;
@@ -58,12 +58,16 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     )?;
     if let Some(ref t) = args.title {
         title_length(t)?;
+        no_local_path(t, "title")?;
     }
     let body = if args.body.is_some() || args.body_file.is_some() {
         Some(read_body(args.body.as_deref(), args.body_file.as_deref())?)
     } else {
         None
     };
+    if let Some(ref b) = body {
+        no_local_path(b, "body")?;
+    }
     let call = build_edit_call(&ctx, &args, body.as_deref());
 
     if global.dry_run {

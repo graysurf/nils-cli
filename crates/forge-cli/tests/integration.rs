@@ -11,6 +11,7 @@ mod integration {
     mod inbox;
     mod issue_atoms;
     mod label_ops;
+    mod local_path_guard;
     mod parity;
     mod pr_checks_github;
     mod pr_checks_gitlab;

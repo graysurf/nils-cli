@@ -10,7 +10,7 @@
 use forge_cli::error::ForgeError;
 use forge_cli::validations::{
     BodyHeadings, BranchPrefix, HeadState, PrKind, body_summary, body_test_plan,
-    branch_kind_matches, branch_name, head_pushed, title_length, worktree_clean,
+    branch_kind_matches, branch_name, head_pushed, no_local_path, title_length, worktree_clean,
 };
 
 #[test]
@@ -26,6 +26,7 @@ fn validation_kinds_match_spec_catalog() {
         ("body_test_plan (missing)", "body_missing_test_plan"),
         ("worktree_clean (dirty)", "dirty_worktree"),
         ("head_pushed (no upstream)", "head_not_pushed"),
+        ("no_local_path (home path)", "local_path_present"),
     ];
 
     let errs: Vec<&'static str> = vec![
@@ -51,6 +52,9 @@ fn validation_kinds_match_spec_catalog() {
         })
         .unwrap_err()
         .kind(),
+        no_local_path("clone into /Users/dev/repo", "body")
+            .unwrap_err()
+            .kind(),
     ];
 
     for ((label, expected), got) in cases.iter().zip(errs.iter()) {
