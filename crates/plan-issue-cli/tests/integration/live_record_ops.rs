@@ -1747,6 +1747,183 @@ fn record_open_dry_run_returns_preview_without_gh_calls() {
     );
 }
 
+/// Write the minimal source/plan/execution-state trio used by the `record open`
+/// dry-run tests into `bundle` (created if needed).
+fn write_sample_bundle(bundle: &Path) {
+    fs::create_dir_all(bundle).expect("create bundle dir");
+    fs::write(
+        bundle.join("sample-discussion-source.md"),
+        "# Source\n\n- Decision: implement v2 lifecycle.\n",
+    )
+    .expect("write source");
+    fs::write(
+        bundle.join("sample-plan.md"),
+        "# Plan: Sample Plan\n\n## Overview\n\n- Sample plan body.\n\n## Read First\n\n- Primary source: docs/plans/sample/sample-discussion-source.md\n- Source type: discussion-to-implementation-doc\n- Open questions carried into execution: none\n\n## Scope\n\n- In scope:\n  - Demo plan.\n- Out of scope:\n  - none.\n\n## Assumptions\n\n1. Demo only.\n\n## Sprint 1: Demo\n\n**Goal**: Demo the surface.\n\n**PR grouping intent**: group\n**Execution Profile**: serial\n\n### Task 1.1: Demo task\n\n- **Location**:\n  - `docs/plans/sample/sample-plan.md`\n- **Description**: Demo task description.\n- **Dependencies**:\n  - none\n- **Complexity**: 1\n- **Acceptance criteria**:\n  - The demo task is complete.\n- **Validation**:\n  - `true`\n",
+    )
+    .expect("write plan");
+    fs::write(
+        bundle.join("sample-execution-state.md"),
+        "# Sample Execution State\n\n<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n## Execution State\n\n- Status: pending\n- Target scope: Sample Plan\n",
+    )
+    .expect("write execution state");
+}
+
+fn commit_all(repo: &Path) {
+    use nils_test_support::git::git;
+    git(repo, &["add", "."]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "seed bundle",
+            "--no-gpg-sign",
+        ],
+    );
+}
+
+/// Regression for the false `record-open-uncommitted` tracked in
+/// graysurf/plan-tracking-testbed#48: a committed bundle passed through a
+/// *relative* `--bundle` must resolve its commit, not be misread as
+/// uncommitted. Before the fix `last_commit_for_path` ran `git log` from the
+/// bundle's parent dir but passed the full relative path as the pathspec, which
+/// re-anchored under that subdir cwd and matched nothing.
+#[test]
+fn record_open_dry_run_resolves_relative_bundle() {
+    use nils_test_support::git::{InitRepoOptions, init_repo_with};
+
+    let stub = StubBinDir::new();
+    stub.write_exe("gh", record_open_dry_run_gh_stub());
+
+    let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
+    write_sample_bundle(&repo.path().join("docs/plans/sample"));
+    commit_all(repo.path());
+
+    // Relative `--bundle`, resolved against the process cwd (the repo root).
+    let opts = dry_run_cmd_options(stub.path()).with_cwd(repo.path());
+    let out = nils_test_support::cmd::run_resolved(
+        "plan-issue-local",
+        &[
+            "--format",
+            "json",
+            "record",
+            "open",
+            "--bundle",
+            "docs/plans/sample",
+        ],
+        &opts,
+    );
+    assert_eq!(
+        out.code,
+        0,
+        "relative --bundle must succeed; stderr: {}",
+        out.stderr_text()
+    );
+    let parsed: Value = serde_json::from_str(&out.stdout_text()).expect("json");
+    let preview = &parsed["payload"]["result"]["preview"];
+    let source_commit = preview["source_commit"]
+        .as_str()
+        .expect("source_commit string");
+    let plan_commit = preview["plan_commit"].as_str().expect("plan_commit string");
+    assert!(
+        !source_commit.is_empty(),
+        "committed source must resolve a commit: {preview}"
+    );
+    assert!(
+        !plan_commit.is_empty(),
+        "committed plan must resolve a commit: {preview}"
+    );
+    let source_comment = preview["comments"]["source"]
+        .as_str()
+        .expect("source comment");
+    assert!(
+        source_comment.contains("- Commit: `"),
+        "committed source snapshot should render a Commit line:\n{source_comment}"
+    );
+}
+
+/// Companion to graysurf/plan-tracking-testbed#48: `--allow-dirty` must actually
+/// bypass the commit check, as its error hint advertises. A never-committed
+/// bundle is rejected by default but allowed through with `--allow-dirty`,
+/// recording an empty commit (no rendered `Commit:` line) instead of failing
+/// `record-open-uncommitted`.
+#[test]
+fn record_open_allow_dirty_permits_uncommitted_bundle() {
+    use nils_test_support::git::{InitRepoOptions, init_repo_with};
+
+    let stub = StubBinDir::new();
+    stub.write_exe("gh", record_open_dry_run_gh_stub());
+
+    // The repo has history (initial commit), but the bundle files below are
+    // never committed — the realistic "open a record before committing the
+    // bundle" case, distinct from an empty repo with an unborn HEAD.
+    let repo = init_repo_with(
+        InitRepoOptions::new()
+            .with_branch("main")
+            .with_initial_commit(),
+    );
+    write_sample_bundle(&repo.path().join("docs/plans/sample"));
+    // Intentionally left uncommitted (untracked working-tree files).
+
+    let opts = dry_run_cmd_options(stub.path()).with_cwd(repo.path());
+
+    // Default: an uncommitted bundle is rejected.
+    let blocked = nils_test_support::cmd::run_resolved(
+        "plan-issue-local",
+        &[
+            "--format",
+            "json",
+            "record",
+            "open",
+            "--bundle",
+            "docs/plans/sample",
+        ],
+        &opts,
+    );
+    assert_ne!(
+        blocked.code, 0,
+        "an uncommitted bundle must be rejected without --allow-dirty"
+    );
+
+    // With --allow-dirty: the open proceeds and the snapshot omits the commit.
+    let out = nils_test_support::cmd::run_resolved(
+        "plan-issue-local",
+        &[
+            "--format",
+            "json",
+            "record",
+            "open",
+            "--bundle",
+            "docs/plans/sample",
+            "--allow-dirty",
+        ],
+        &opts,
+    );
+    assert_eq!(
+        out.code,
+        0,
+        "--allow-dirty must bypass the commit check; stderr: {}",
+        out.stderr_text()
+    );
+    let parsed: Value = serde_json::from_str(&out.stdout_text()).expect("json");
+    let preview = &parsed["payload"]["result"]["preview"];
+    assert_eq!(
+        preview["source_commit"], "",
+        "uncommitted snapshot records an empty commit: {preview}"
+    );
+    let source_comment = preview["comments"]["source"]
+        .as_str()
+        .expect("source comment");
+    assert!(
+        !source_comment.contains("- Commit:"),
+        "uncommitted snapshot should omit the Commit line:\n{source_comment}"
+    );
+}
+
 /// The first Execution State posted by `record open` defaults to an open fold
 /// (`<details open>`) when the execution-state file carries a `## Task Ledger`,
 /// so a reader sees the full plan on load while the toggle stays. Later
