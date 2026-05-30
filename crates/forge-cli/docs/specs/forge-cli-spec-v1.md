@@ -415,6 +415,17 @@ backend implementations cannot diverge.
     `glab`). Disable with `--keep-branch`. Local branch cleanup is
     out of scope for `forge-cli` and remains the bash wrapper's job
     in agent-kit skills.
+11. **Portable paths.** PR/MR and issue title, body, and comment text MUST
+    NOT embed a machine-local home path (`/Users/<owner>/…`,
+    `/home/<owner>/…`). This mirrors the repo-side portable-paths file hook on
+    the provider egress path so local paths cannot leak into provider content.
+    The error `detail` enumerates each offending line and its `$HOME`-relative
+    fix. Literal container / CI-runner home roots (`/home/agent`,
+    `/home/linuxbrew`, and the CI runner work root) are allowlisted — see the
+    `no_local_path` entry in `forge-cli-ops-v1.yaml` for the exact list; set
+    `FORGE_CLI_ALLOW_LOCAL_PATH=1` to bypass a verified false positive. Enforced
+    by `pr create`, `pr edit`, `issue create`, `issue edit`, `pr comment`, and
+    `issue comment`.
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 
@@ -433,6 +444,7 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `checks_failed`            | 8 (`RUNTIME 1`)   |
 | `merge_method_unsupported` | 9                 |
 | `keep_branch_conflict`     | 10                |
+| `local_path_present`       | 11                |
 
 ## Inbox output contract
 

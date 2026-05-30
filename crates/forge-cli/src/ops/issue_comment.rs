@@ -18,6 +18,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::issue_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::validations::no_local_path;
 
 const SCHEMA: &str = "issue.comment";
 const SCHEMA_VERSION: u32 = 1;
@@ -60,6 +61,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             None,
         ));
     }
+    no_local_path(&body, "comment")?;
     let call = build_comment_call(&ctx, args.id, &body);
 
     if global.dry_run {

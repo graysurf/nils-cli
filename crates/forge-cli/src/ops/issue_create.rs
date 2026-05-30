@@ -23,7 +23,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::issue_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::validations::title_length;
+use crate::validations::{no_local_path, title_length};
 
 const SCHEMA: &str = "issue.create";
 const SCHEMA_VERSION: u32 = 1;
@@ -62,7 +62,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         remote_url_lookup,
     )?;
     title_length(&args.title)?;
+    no_local_path(&args.title, "title")?;
     let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
+    no_local_path(&body, "body")?;
     let body_tempfile = write_body_tempfile(&body)?;
     let body_path = body_tempfile.path().to_path_buf();
     let call = build_create_call(

@@ -208,6 +208,9 @@ fn pr_deliver_dry_run_reports_local_preflight_without_backend() {
     assert_eq!(lookup("body_summary")["code"], "body_missing_summary");
     assert_eq!(lookup("body_test_plan")["ok"], false);
     assert_eq!(lookup("body_test_plan")["code"], "body_missing_test_plan");
+    // Rule 11 — the local-path verdicts are present and pass for portable text.
+    assert_eq!(lookup("title_local_path")["ok"], true);
+    assert_eq!(lookup("body_local_path")["ok"], true);
     // The worktree/head rules are present too (their verdict depends on the
     // local git state, so only presence is asserted here).
     assert!(preflight.iter().any(|v| v["rule"] == "worktree_clean"));

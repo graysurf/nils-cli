@@ -39,6 +39,10 @@ validations_catalog:
     rule: "len(title) <= 70 and no trailing whitespace"
     error_kind: title_too_long
     exit: DATA
+  no_local_path:
+    rule: "posted title/body/comment text must not embed a machine-local home path (/Users/<owner>/... or /home/<owner>/...); allowlist /home/agent, /home/linuxbrew, /home/runner; bypass with FORGE_CLI_ALLOW_LOCAL_PATH=1"
+    error_kind: local_path_present
+    exit: DATA
   worktree_clean:
     rule: "git status --porcelain is empty"
     error_kind: dirty_worktree
@@ -116,6 +120,7 @@ operations:
       - branch_name
       - branch_kind_matches
       - title_length
+      - no_local_path # title + body
       - body_summary
       - body_test_plan
       - label_catalog # only when --strict-labels is set
@@ -193,6 +198,7 @@ operations:
       - { name: --add-reviewer, type: list<string>, default: [] }
     validations:
       - title_length   # when --title supplied
+      - no_local_path  # title when --title; body when --body / --body-file
       - body_summary   # when --body or --body-file supplied
       - body_test_plan # when --body or --body-file supplied
     backends:
@@ -206,7 +212,8 @@ operations:
       - { name: <id>,        type: integer, required: true }
       - { name: --body,      type: string,  required: false }
       - { name: --body-file, type: path,    required: false }
-    validations: []
+    validations:
+      - no_local_path # comment body
     backends:
       github: { program: gh,   argv: [pr, comment, "{id}", --body, "{body_or_file}"] }
       gitlab: { program: glab, argv: [mr, note,    "{id}", --message, "{body_or_file}"] }
@@ -307,6 +314,7 @@ operations:
       - { name: --assignee,  type: list<string>, default: [] }
     validations:
       - title_length
+      - no_local_path # title + body
     backends:
       github: { program: gh,   argv: [issue, create, --title, "{title}", --body-file, "{body_file_or_temp}"] }
       gitlab: { program: glab, argv: [issue, create, --title, "{title}", --description, "{body_or_file}"] }
@@ -352,6 +360,7 @@ operations:
       - { name: --add-assignee,   type: list<string>, default: [] }
     validations:
       - title_length   # when --title supplied
+      - no_local_path  # title when --title; body when --body / --body-file
     backends:
       github: { program: gh,   argv: [issue, edit,   "{id}"] }
       gitlab: { program: glab, argv: [issue, update, "{id}"] }
@@ -363,6 +372,8 @@ operations:
       - { name: <id>,        type: integer, required: true }
       - { name: --body,      type: string,  required: false }
       - { name: --body-file, type: path,    required: false }
+    validations:
+      - no_local_path # comment body
     backends:
       github: { program: gh,   argv: [issue, comment, "{id}", --body, "{body_or_file}"] }
       gitlab: { program: glab, argv: [issue, note,    "{id}", --message, "{body_or_file}"] }
