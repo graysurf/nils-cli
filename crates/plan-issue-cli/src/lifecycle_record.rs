@@ -1705,6 +1705,21 @@ pub fn render_record_post_comment(
     )
 }
 
+/// Controls how the visible Execution State header is produced.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StateHeaderMode {
+    /// Preserve the authored execution-state header verbatim. Used by
+    /// `record open` and `record post`, where the caller supplies the canonical
+    /// execution-state markdown and expects its metadata bullets preserved.
+    Authored,
+    /// Re-render the header (`Status` / `Target scope` / `Current task` /
+    /// `Next task`) from the derived payload. Used by `tracking checkpoint`,
+    /// where the controller owns deriving live state from run-state so a
+    /// completed plan never keeps a frozen pre-flight header
+    /// (graysurf/plan-tracking-testbed#54 / sympoies/nils-cli#700).
+    DeriveFromPayload,
+}
+
 pub fn render_record_post_comment_with_display(
     profile: RecordProfile,
     kind: LifecycleCommentKind,
@@ -1712,6 +1727,26 @@ pub fn render_record_post_comment_with_display(
     summary: Option<&str>,
     updated_at: Option<&str>,
     task_ledger_display: TaskLedgerDisplay,
+) -> Result<String, String> {
+    render_record_post_comment_with_display_mode(
+        profile,
+        kind,
+        payload_data,
+        summary,
+        updated_at,
+        task_ledger_display,
+        StateHeaderMode::Authored,
+    )
+}
+
+pub fn render_record_post_comment_with_display_mode(
+    profile: RecordProfile,
+    kind: LifecycleCommentKind,
+    payload_data: Value,
+    summary: Option<&str>,
+    updated_at: Option<&str>,
+    task_ledger_display: TaskLedgerDisplay,
+    header_mode: StateHeaderMode,
 ) -> Result<String, String> {
     if matches!(
         kind,
@@ -1723,8 +1758,13 @@ pub fn render_record_post_comment_with_display(
         ));
     }
 
-    let visible_content =
-        render_visible_post_content(kind, &payload_data, summary, task_ledger_display)?;
+    let visible_content = render_visible_post_content(
+        kind,
+        &payload_data,
+        summary,
+        task_ledger_display,
+        header_mode,
+    )?;
     let envelope = RecordPayload {
         schema: PAYLOAD_SCHEMA_V2.to_string(),
         role: payload_role_for_kind(kind),
@@ -1756,6 +1796,7 @@ fn render_visible_post_content(
     payload_data: &Value,
     summary: Option<&str>,
     task_ledger_display: TaskLedgerDisplay,
+    header_mode: StateHeaderMode,
 ) -> Result<String, String> {
     let summary = summary.map(str::trim).filter(|value| !value.is_empty());
     let generated = match kind {
@@ -1768,6 +1809,7 @@ fn render_visible_post_content(
                         text,
                         task_ledger_display,
                         &state,
+                        header_mode,
                     )?
                 }
                 Some(text) => text.to_string(),
@@ -1823,8 +1865,20 @@ fn render_state_markdown_with_task_ledger_display(
     markdown: &str,
     display: TaskLedgerDisplay,
     state: &StateData,
+    header_mode: StateHeaderMode,
 ) -> Result<String, String> {
     let markdown = normalize_state_markdown_for_comment(markdown)?;
+    // On the `tracking checkpoint` path, re-render the authored header
+    // (everything before the first `## ` section) from the derived payload so a
+    // completed plan reflects live progress instead of a frozen pre-flight
+    // header (graysurf/plan-tracking-testbed#54 / sympoies/nils-cli#700).
+    // `record open` / `record post` keep the authored header verbatim. Authored
+    // sections — `## Task Ledger`, `## Validation Plan`, … — are preserved
+    // either way.
+    let markdown = match header_mode {
+        StateHeaderMode::DeriveFromPayload => replace_state_header_from_payload(&markdown, state),
+        StateHeaderMode::Authored => markdown,
+    };
     let effective = match display {
         TaskLedgerDisplay::Expanded => TaskLedgerDisplay::Expanded,
         TaskLedgerDisplay::Collapsed => TaskLedgerDisplay::Collapsed,
@@ -1960,6 +2014,57 @@ fn render_state_payload_visible(state: &StateData) -> String {
         .render(STATE_VISIBLE_TEMPLATE_NAME, &view)
         .expect("state template renders");
     rendered.trim().to_string()
+}
+
+/// Rebuild a normalized execution-state body with its header bullets derived
+/// from the payload, keeping every `## ` section (Task Ledger, Validation Plan,
+/// …) from the authored markdown. The input must already be normalized (marker
+/// and `- Profile:` lines stripped, header starting at the top). When the
+/// payload yields no header bullets the authored body is returned unchanged so
+/// we never drop all visible content.
+fn replace_state_header_from_payload(markdown: &str, state: &StateData) -> String {
+    let header = render_state_header_lines_from_payload(state);
+    if header.is_empty() {
+        return markdown.to_string();
+    }
+    let lines: Vec<&str> = markdown.lines().collect();
+    let first_section = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("## "));
+    let mut out = header;
+    if let Some(idx) = first_section {
+        out.push(String::new());
+        out.extend(lines[idx..].iter().map(|line| (*line).to_string()));
+    }
+    finalize_markdown(out).trim().to_string()
+}
+
+/// Render the canonical Execution State header bullets (`Status` / `Target
+/// scope` / `Current task` / `Next task`) from the payload, omitting any field
+/// that is absent or empty.
+fn render_state_header_lines_from_payload(state: &StateData) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(status) = state.status.map(status_state_label) {
+        lines.push(format!("- Status: {status}"));
+    }
+    if let Some(scope) = state
+        .target_scope
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("- Target scope: {scope}"));
+    }
+    if let Some(current) = state.current.as_deref().filter(|value| !value.is_empty()) {
+        lines.push(format!("- Current task: {current}"));
+    }
+    if let Some(next) = state
+        .next_action
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("- Next task: {next}"));
+    }
+    lines
 }
 
 fn render_session_payload_visible(session: &SessionData, raw: &Value) -> String {
