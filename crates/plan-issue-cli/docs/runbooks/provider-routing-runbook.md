@@ -97,41 +97,46 @@ listed as the authoritative contract reference; any regression here breaks
 
 ### 4.1 Trait shape
 
-The provider boundary is the `ProviderAdapter` trait in
-`crates/plan-issue-cli/src/provider.rs`. All lifecycle code paths in
-`execute.rs` go through this trait — no direct provider CLI shell-out should
-appear outside the adapter implementations.
+The provider boundary is the `ProviderAdapter` trait, **defined** in
+`crates/plan-issue-cli/src/github.rs` and re-exported from
+`crates/plan-issue-cli/src/provider.rs` (`pub use crate::github::ProviderAdapter`).
+The `Provider` / `Repo` routing types plus `select_adapter` / `resolve_repo`
+live in `provider.rs`. All lifecycle code paths in `execute.rs` go through the
+trait — no direct provider CLI shell-out should appear outside the adapter
+implementations. The trait takes `repo: &str` (the slug); call sites pass
+`&repo.slug` (see §4.4). There is no `provider()` method on the trait.
 
 ```rust
-// crates/plan-issue-cli/src/provider.rs
+// crates/plan-issue-cli/src/github.rs — the provider boundary trait
 pub trait ProviderAdapter {
-    fn provider(&self) -> Provider;                              // github | gitlab
-    fn issue_body(&self, repo: &Repo, issue: u64) -> Result<String, String>;
-    fn issue_evidence(&self, repo: &Repo, issue: u64) -> Result<(String, String), String>;
-    fn create_issue(&self, repo: &Repo, title: &str, body_file: &Path, labels: &[String])
+    fn issue_body(&self, repo: &str, issue: u64) -> Result<String, String>;
+    fn issue_evidence(&self, repo: &str, issue: u64) -> Result<(String, String), String>;
+    fn list_open_tracker_issues(&self, repo: &str, labels: &[String]) -> Result<Vec<u64>, String>;
+    fn create_issue(&self, repo: &str, title: &str, body_file: &Path, labels: &[String])
         -> Result<(u64, String), String>;
-    fn edit_issue_body(&self, repo: &Repo, issue: u64, body_file: &Path) -> Result<(), String>;
-    fn comment_issue(&self, repo: &Repo, issue: u64, body_file: &Path) -> Result<String, String>;
+    fn edit_issue_body(&self, repo: &str, issue: u64, body_file: &Path) -> Result<(), String>;
+    fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<String, String>;
     fn edit_issue_labels(
-        &self, repo: &Repo, issue: u64,
-        add: &[String], remove: &[String],
+        &self, repo: &str, issue: u64,
+        add_labels: &[String], remove_labels: &[String],
     ) -> Result<(), String>;
     fn close_issue(
-        &self, repo: &Repo, issue: u64,
-        reason: CloseReason, comment: Option<&str>,
+        &self, repo: &str, issue: u64,
+        reason: CloseReason, close_comment: Option<&str>,
     ) -> Result<(), String>;
-    fn pr_is_merged(&self, repo: &Repo, pr: u64) -> Result<bool, String>;
-    fn pr_merge_summary(&self, repo: &Repo, pr: u64) -> Result<PrMergeSummary, String>;
-    fn pr_comments(&self, repo: &Repo, pr: u64) -> Result<Vec<Value>, String>;
+    fn pr_is_merged(&self, repo: &str, pr: u64) -> Result<bool, String>;
+    fn pr_merge_summary(&self, repo: &str, pr: u64) -> Result<PrMergeSummary, String>;
+    fn pr_comments(&self, repo: &str, pr: u64) -> Result<Vec<Value>, String>;
 }
 
+// crates/plan-issue-cli/src/provider.rs — routing types and adapter selection
 pub struct Repo { pub provider: Provider, pub slug: String, pub host: Option<String> }
 pub enum Provider { GitHub, GitLab }
 
 pub fn select_adapter(repo: &Repo, force: bool) -> Box<dyn ProviderAdapter> {
     match repo.provider {
-        Provider::GitHub => Box::new(GhCliAdapter::new(force)),
-        Provider::GitLab => Box::new(ForgeCliAdapter::new(force)),
+        Provider::GitHub => Box::new(crate::github::GhCliAdapter::new(force)),
+        Provider::GitLab => Box::new(crate::forge_cli_adapter::ForgeCliAdapter::new(force)),
     }
 }
 ```
