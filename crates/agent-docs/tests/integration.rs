@@ -22,6 +22,8 @@ mod exit_codes;
 mod explain_list_remove;
 #[path = "integration/help_snapshot.rs"]
 mod help_snapshot;
+#[path = "integration/home_project_scope.rs"]
+mod home_project_scope;
 #[path = "integration/init.rs"]
 mod init;
 #[path = "integration/preflight.rs"]
