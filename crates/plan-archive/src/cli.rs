@@ -220,6 +220,16 @@ enum Command {
         #[arg(long)]
         archive: Option<PathBuf>,
     },
+    /// Full-text search issue / PR / MR body and comment text across
+    /// snapshots, returning hit-level results with the owning plan.
+    Search {
+        /// Case-insensitive term to match in body and comment text.
+        term: String,
+        /// Archive clone path. Defaults to the machine-local config's
+        /// `archive_clone_path`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+    },
 }
 
 pub fn run() -> i32 {
@@ -334,6 +344,11 @@ pub fn run() -> i32 {
             area,
             refs_to,
             deep,
+            archive,
+            format,
+        }),
+        Command::Search { term, archive } => crate::search::dispatch(crate::search::DispatchArgs {
+            term,
             archive,
             format,
         }),
