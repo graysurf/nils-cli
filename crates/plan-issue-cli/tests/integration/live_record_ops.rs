@@ -1844,6 +1844,10 @@ fn record_open_dry_run_resolves_relative_bundle() {
         source_comment.contains("- Commit: `"),
         "committed source snapshot should render a Commit line:\n{source_comment}"
     );
+    assert!(
+        source_comment.contains("- Snapshot mode: local committed Markdown"),
+        "committed snapshot should be labeled committed:\n{source_comment}"
+    );
 }
 
 /// Companion to graysurf/plan-tracking-testbed#48: `--allow-dirty` must actually
@@ -1921,6 +1925,14 @@ fn record_open_allow_dirty_permits_uncommitted_bundle() {
     assert!(
         !source_comment.contains("- Commit:"),
         "uncommitted snapshot should omit the Commit line:\n{source_comment}"
+    );
+    assert!(
+        source_comment.contains("- Snapshot mode: local uncommitted Markdown"),
+        "uncommitted snapshot should be labeled uncommitted:\n{source_comment}"
+    );
+    assert!(
+        !source_comment.contains("local committed Markdown"),
+        "uncommitted snapshot must not claim committed:\n{source_comment}"
     );
 }
 

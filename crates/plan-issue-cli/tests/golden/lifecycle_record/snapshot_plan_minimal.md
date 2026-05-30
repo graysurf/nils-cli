@@ -3,7 +3,7 @@
 ## Plan Snapshot
 
 - Profile: tracking
-- Snapshot mode: local committed Markdown
+- Snapshot mode: local uncommitted Markdown
 
 <details>
 <summary>Plan snapshot</summary>

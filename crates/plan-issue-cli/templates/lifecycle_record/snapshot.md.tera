@@ -12,7 +12,11 @@
 {%- if summary %}
 - Summary: {{ summary }}
 {%- endif %}
+{%- if commit %}
 - Snapshot mode: local committed Markdown
+{%- else %}
+- Snapshot mode: local uncommitted Markdown
+{%- endif %}
 
 <details>
 <summary>{{ details_summary }}</summary>
