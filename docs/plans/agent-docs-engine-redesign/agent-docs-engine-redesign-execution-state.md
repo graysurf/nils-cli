@@ -3,28 +3,24 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: ready-to-start; tracking issue not yet opened.
+- Status: in-progress — Sprint 1 (catalog foundation) under way.
 - Target scope: `crates/agent-docs` engine redesign in `sympoies/nils-cli`.
   Upstream of graysurf/agent-runtime-kit#181, whose Sprints 2-4 consume this
   release.
 - Execution window: Sprint 1 (catalog foundation) → Sprint 2 (when +
   content validation) → Sprint 3 (command surface + docs-home + init) →
   Sprint 4 (content-emitting preflight + delivery), serial.
-- Current task: none (tracking issue not yet opened).
-- Next task: Task 1.1 — define the catalog schema and model.
+- Current task: Task 1.1 — define the catalog schema and model.
+- Next task: Task 1.2 — remove hardcoded builtins from resolution and baseline.
 - Last updated: 2026-05-30
-- Branch/commit/PR: tbd (PR target: `sympoies/nils-cli` main; suggested branch
-  prefix `feat/agent-docs-engine-redesign`).
+- Branch/commit/PR: `feat/agent-docs-engine-redesign` (isolated worktree off
+  `origin/main`; PR target `sympoies/nils-cli` main).
 - Source document: docs/plans/agent-docs-engine-redesign/agent-docs-engine-redesign-plan.md
 - Direct source-doc execution waiver: not applicable
-- Tracking issue: tbd (to be opened by `create-plan-tracking-issue` against
-  `sympoies/nils-cli`)
-- Source snapshot: pending — posted by `create-plan-tracking-issue` at issue
-  open
-- Plan snapshot: pending — posted by `create-plan-tracking-issue` at issue
-  open
-- Initial state snapshot: pending — posted by `create-plan-tracking-issue`
-  at issue open
+- Tracking issue: sympoies/nils-cli#662
+- Source snapshot: posted by `create-plan-tracking-issue` at issue open
+- Plan snapshot: posted by `create-plan-tracking-issue` at issue open
+- Initial state snapshot: posted by `create-plan-tracking-issue` at issue open
 
 ## Validation Plan
 
@@ -46,15 +42,15 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | pending | Define the catalog schema and model | tbd | `crates/agent-docs` `model.rs` + `config.rs`. Contexts/docs as data; default catalog inheritable. |
-| 1.2 | pending | Remove hardcoded builtins from resolution and baseline | tbd | Depends on 1.1. Drive `resolver.rs` + `baseline.rs` from the catalog; drop the `required=false` opt-out path. |
-| 2.1 | pending | Implement the `when` predicate evaluator | tbd | Depends on 1.2. `path-exists:<glob>` + `\|\|`/`&&`; replaces opt-out. |
-| 2.2 | pending | Add content validation | tbd | Depends on 1.2. Non-empty + marker + optional freshness; placeholder fails. |
-| 3.1 | pending | Collapse command surface; retire old commands; dedupe | tbd | Depends on 1.2. `audit`/`preflight`/`init`/`explain`/`list`/`remove`; drop `resolve`/`baseline`/`scaffold-*`/`startup`; dedupe by resolved path. |
-| 3.2 | pending | Symlink-derived docs-home | tbd | Depends on 3.1. `dirname(readlink ~/.claude/CLAUDE.md)`; keep `--docs-home`; clear error when unresolvable. |
-| 3.3 | pending | `init` annotated override stub | tbd | Depends on 3.1. `--print`/`--dry-run`/`--force`; lists inherited defaults; never dumps full defaults. |
-| 4.1 | pending | Content-emitting `preflight` + validation-contract resolution | tbd | Depends on 2.2, 3.1. Documented, versioned JSON shape; cross-repo contract the kit pins. |
-| 4.2 | pending | Tests, `--help` snapshot, and release | tbd | Depends on 4.1. Update tests/snapshot; PR self-gated via `gh pr checks`; release + tap bump; notify graysurf/agent-runtime-kit#181. |
+| 1.1 | done | Define the catalog schema and model | Engine commit 5ba826b on feat/agent-docs-engine-redesign; cargo test (15 unit + 47 integration), clippy -D warnings, fmt, completion + contract + third-party gates green. | `crates/agent-docs` `model.rs` + `config.rs`. Contexts/docs as data; default catalog inheritable. |
+| 1.2 | done | Remove hardcoded builtins from resolution and baseline | Engine commit 5ba826b on feat/agent-docs-engine-redesign; cargo test (15 unit + 47 integration), clippy -D warnings, fmt, completion + contract + third-party gates green. | Depends on 1.1. Drive `resolver.rs` + `baseline.rs` from the catalog; drop the `required=false` opt-out path. |
+| 2.1 | done | Implement the `when` predicate evaluator | Engine commit 5ba826b on feat/agent-docs-engine-redesign; cargo test (15 unit + 47 integration), clippy -D warnings, fmt, completion + contract + third-party gates green. | Depends on 1.2. `path-exists:<glob>` + `\ | \ | `/`&&`; replaces opt-out. |
+| 2.2 | done | Add content validation | Engine commit 5ba826b on feat/agent-docs-engine-redesign; cargo test (15 unit + 47 integration), clippy -D warnings, fmt, completion + contract + third-party gates green. | Depends on 1.2. Non-empty + marker + optional freshness; placeholder fails. |
+| 3.1 | done | Collapse command surface; retire old commands; dedupe | Engine commit 5ba826b on feat/agent-docs-engine-redesign; cargo test (15 unit + 47 integration), clippy -D warnings, fmt, completion + contract + third-party gates green. | Depends on 1.2. `audit`/`preflight`/`init`/`explain`/`list`/`remove`; drop `resolve`/`baseline`/`scaffold-*`/`startup`; dedupe by resolved path. |
+| 3.2 | done | Symlink-derived docs-home | Engine commit 5ba826b on feat/agent-docs-engine-redesign; cargo test (15 unit + 47 integration), clippy -D warnings, fmt, completion + contract + third-party gates green. | Depends on 3.1. `dirname(readlink ~/.claude/CLAUDE.md)`; keep `--docs-home`; clear error when unresolvable. |
+| 3.3 | done | `init` annotated override stub | Engine commit 5ba826b on feat/agent-docs-engine-redesign; cargo test (15 unit + 47 integration), clippy -D warnings, fmt, completion + contract + third-party gates green. | Depends on 3.1. `--print`/`--dry-run`/`--force`; lists inherited defaults; never dumps full defaults. |
+| 4.1 | done | Content-emitting `preflight` + validation-contract resolution | Engine commit 5ba826b on feat/agent-docs-engine-redesign; cargo test (15 unit + 47 integration), clippy -D warnings, fmt, completion + contract + third-party gates green. | Depends on 2.2, 3.1. Documented, versioned JSON shape; cross-repo contract the kit pins. |
+| 4.2 | in-progress | Tests, `--help` snapshot, and release | Integration tests + --help snapshot updated and green (commit 5ba826b); PR open + release + tap bump pending. | Depends on 4.1. Update tests/snapshot; PR self-gated via `gh pr checks`; release + tap bump; notify graysurf/agent-runtime-kit#181. |
 
 ## Session Log
 
