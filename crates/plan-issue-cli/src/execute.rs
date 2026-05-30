@@ -848,54 +848,112 @@ fn run_record_open(
 
     let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
         .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
+
+    record_open_finalize(
+        adapter.as_ref(),
+        &repo,
+        args.profile,
+        &body_path,
+        &normalized_labels,
+        &seed,
+        binary.execution_mode(),
+    )
+}
+
+/// Create the tracking issue, post the initial lifecycle comments, and repair
+/// the dashboard. If any step *after* issue creation fails (e.g. a comment post
+/// rejected by the markdown guard, or a transient provider error), best-effort
+/// close the just-created issue so a re-run starts clean instead of leaving an
+/// orphaned tracker that re-running would duplicate, then annotate the error
+/// with the rollback outcome. The close is sent without a comment so it still
+/// succeeds when the original failure was a broken comment post.
+///
+/// Split out of `run_record_open` so the rollback path is unit-testable with a
+/// stub adapter — the live `record open` path is otherwise reachable only
+/// through the real `plan-issue` binary.
+fn record_open_finalize(
+    adapter: &dyn ProviderAdapter,
+    repo: &str,
+    profile: crate::commands::record::RecordProfile,
+    body_path: &Path,
+    labels: &[String],
+    seed: &RecordSeed,
+    execution_mode: &'static str,
+) -> Result<Value, CommandError> {
     let (issue_number, issue_url) = adapter
-        .create_issue(&repo, &seed.plan_title, &body_path, &normalized_labels)
+        .create_issue(repo, &seed.plan_title, body_path, labels)
         .map_err(|err| CommandError::runtime("record-open-issue-create-failed", err))?;
 
-    let source_path = write_temp_markdown("record-open-source-comment", &seed.source_body)
-        .map_err(|err| CommandError::runtime("record-open-source-write-failed", err))?;
-    let source_url = adapter
-        .comment_issue(&repo, issue_number, &source_path)
-        .map_err(|err| CommandError::runtime("record-open-source-post-failed", err))?;
-    let plan_path = write_temp_markdown("record-open-plan-comment", &seed.plan_body)
-        .map_err(|err| CommandError::runtime("record-open-plan-write-failed", err))?;
-    let plan_url = adapter
-        .comment_issue(&repo, issue_number, &plan_path)
-        .map_err(|err| CommandError::runtime("record-open-plan-post-failed", err))?;
-    let state_path = write_temp_markdown("record-open-state-comment", &seed.state_body)
-        .map_err(|err| CommandError::runtime("record-open-state-write-failed", err))?;
-    let state_url = adapter
-        .comment_issue(&repo, issue_number, &state_path)
-        .map_err(|err| CommandError::runtime("record-open-state-post-failed", err))?;
+    let populate = || -> Result<Value, CommandError> {
+        let source_path = write_temp_markdown("record-open-source-comment", &seed.source_body)
+            .map_err(|err| CommandError::runtime("record-open-source-write-failed", err))?;
+        let source_url = adapter
+            .comment_issue(repo, issue_number, &source_path)
+            .map_err(|err| CommandError::runtime("record-open-source-post-failed", err))?;
+        let plan_path = write_temp_markdown("record-open-plan-comment", &seed.plan_body)
+            .map_err(|err| CommandError::runtime("record-open-plan-write-failed", err))?;
+        let plan_url = adapter
+            .comment_issue(repo, issue_number, &plan_path)
+            .map_err(|err| CommandError::runtime("record-open-plan-post-failed", err))?;
+        let state_path = write_temp_markdown("record-open-state-comment", &seed.state_body)
+            .map_err(|err| CommandError::runtime("record-open-state-write-failed", err))?;
+        let state_url = adapter
+            .comment_issue(repo, issue_number, &state_path)
+            .map_err(|err| CommandError::runtime("record-open-state-post-failed", err))?;
 
-    // Repair dashboard with freshly-created comment URLs through audit.
-    let (body_after, comments_json) = adapter
-        .issue_evidence(&repo, issue_number)
-        .map_err(|err| CommandError::runtime("record-open-evidence-read-failed", err))?;
-    let audit =
-        lifecycle_record::audit_record(Some(&body_after), &comments_json, Some(args.profile))
-            .map_err(|err| CommandError::runtime("record-open-audit-failed", err))?;
-    let repaired = lifecycle_record::render_dashboard_from_audit(
-        &audit,
-        Some(&seed.plan_title),
-        Some(&issue_url),
-    );
-    let repaired_path = write_temp_markdown("record-open-dashboard", &repaired)
-        .map_err(|err| CommandError::runtime("record-open-dashboard-write-failed", err))?;
-    adapter
-        .edit_issue_body(&repo, issue_number, &repaired_path)
-        .map_err(|err| CommandError::runtime("record-open-dashboard-edit-failed", err))?;
+        // Repair dashboard with freshly-created comment URLs through audit.
+        let (body_after, comments_json) = adapter
+            .issue_evidence(repo, issue_number)
+            .map_err(|err| CommandError::runtime("record-open-evidence-read-failed", err))?;
+        let audit =
+            lifecycle_record::audit_record(Some(&body_after), &comments_json, Some(profile))
+                .map_err(|err| CommandError::runtime("record-open-audit-failed", err))?;
+        let repaired = lifecycle_record::render_dashboard_from_audit(
+            &audit,
+            Some(&seed.plan_title),
+            Some(&issue_url),
+        );
+        let repaired_path = write_temp_markdown("record-open-dashboard", &repaired)
+            .map_err(|err| CommandError::runtime("record-open-dashboard-write-failed", err))?;
+        adapter
+            .edit_issue_body(repo, issue_number, &repaired_path)
+            .map_err(|err| CommandError::runtime("record-open-dashboard-edit-failed", err))?;
 
-    Ok(json!({
-        "operation": "record.open",
-        "execution_mode": binary.execution_mode(),
-        "dry_run": false,
-        "mode": "live",
-        "issue": {"number": issue_number, "url": issue_url},
-        "comments": {"source": source_url, "plan": plan_url, "state": state_url},
-        "labels": normalized_labels,
-        "dashboard_markdown": repaired,
-    }))
+        Ok(json!({
+            "operation": "record.open",
+            "execution_mode": execution_mode,
+            "dry_run": false,
+            "mode": "live",
+            "issue": {"number": issue_number, "url": issue_url.clone()},
+            "comments": {"source": source_url, "plan": plan_url, "state": state_url},
+            "labels": labels.to_vec(),
+            "dashboard_markdown": repaired,
+        }))
+    };
+
+    match populate() {
+        Ok(value) => Ok(value),
+        Err(mut err) => {
+            let rollback_note = match adapter.close_issue(
+                repo,
+                issue_number,
+                crate::commands::plan::CloseReason::NotPlanned,
+                None,
+            ) {
+                Ok(()) => format!(
+                    " (rolled back: closed orphaned issue #{issue_number} {issue_url}; \
+                     re-run `plan-issue record open` to recreate the tracker cleanly)"
+                ),
+                Err(close_err) => format!(
+                    " (rollback FAILED: orphaned issue #{issue_number} {issue_url} is still \
+                     open — close it before retrying so a re-run does not create a duplicate; \
+                     close error: {close_err})"
+                ),
+            };
+            err.message.push_str(&rollback_note);
+            Err(err)
+        }
+    }
 }
 
 fn run_record_attach(
@@ -6253,6 +6311,170 @@ mod tests {
         fn pr_comments(&self, _repo: &str, _pr: u64) -> Result<Vec<Value>, String> {
             unreachable!("pr_comments is not needed in this test")
         }
+    }
+
+    /// Stub adapter that creates issue #1, fails the first comment post, and
+    /// records the `close_issue` call so the `record open` rollback can be
+    /// asserted without the live `plan-issue` binary.
+    struct RollbackProbeAdapter {
+        close_ok: bool,
+        closed_issue: AtomicU64,
+    }
+
+    impl RollbackProbeAdapter {
+        fn new(close_ok: bool) -> Self {
+            Self {
+                close_ok,
+                closed_issue: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl ProviderAdapter for RollbackProbeAdapter {
+        fn issue_body(&self, _repo: &str, _issue: u64) -> Result<String, String> {
+            unreachable!("issue_body is not needed in this test")
+        }
+
+        fn create_issue(
+            &self,
+            _repo: &str,
+            _title: &str,
+            _body_file: &Path,
+            _labels: &[String],
+        ) -> Result<(u64, String), String> {
+            Ok((1, "https://github.com/owner/repo/issues/1".to_string()))
+        }
+
+        fn edit_issue_body(
+            &self,
+            _repo: &str,
+            _issue: u64,
+            _body_file: &Path,
+        ) -> Result<(), String> {
+            unreachable!("edit_issue_body is not needed in this test")
+        }
+
+        fn comment_issue(
+            &self,
+            _repo: &str,
+            _issue: u64,
+            _body_file: &Path,
+        ) -> Result<String, String> {
+            Err("simulated comment post failure".to_string())
+        }
+
+        fn issue_evidence(&self, _repo: &str, _issue: u64) -> Result<(String, String), String> {
+            unreachable!("issue_evidence is not needed in this test")
+        }
+
+        fn pr_merge_summary(
+            &self,
+            _repo: &str,
+            _pr: u64,
+        ) -> Result<crate::github::PrMergeSummary, String> {
+            unreachable!("pr_merge_summary is not needed in this test")
+        }
+
+        fn edit_issue_labels(
+            &self,
+            _repo: &str,
+            _issue: u64,
+            _add_labels: &[String],
+            _remove_labels: &[String],
+        ) -> Result<(), String> {
+            unreachable!("edit_issue_labels is not needed in this test")
+        }
+
+        fn close_issue(
+            &self,
+            _repo: &str,
+            issue: u64,
+            _reason: CloseReason,
+            close_comment: Option<&str>,
+        ) -> Result<(), String> {
+            // Rollback must close without a comment so it still succeeds when the
+            // original failure was a broken comment post.
+            assert!(
+                close_comment.is_none(),
+                "rollback close must not post a comment"
+            );
+            self.closed_issue.store(issue, Ordering::SeqCst);
+            if self.close_ok {
+                Ok(())
+            } else {
+                Err("simulated close failure".to_string())
+            }
+        }
+
+        fn pr_is_merged(&self, _repo: &str, _pr: u64) -> Result<bool, String> {
+            unreachable!("pr_is_merged is not needed in this test")
+        }
+
+        fn pr_comments(&self, _repo: &str, _pr: u64) -> Result<Vec<Value>, String> {
+            unreachable!("pr_comments is not needed in this test")
+        }
+    }
+
+    fn rollback_probe_seed() -> RecordSeed {
+        RecordSeed {
+            plan_title: "Rollback Probe Plan".to_string(),
+            source_path: "docs/plans/probe/probe-discussion-source.md".to_string(),
+            plan_path: "docs/plans/probe/probe-plan.md".to_string(),
+            source_commit: "abc".to_string(),
+            plan_commit: "def".to_string(),
+            source_body: "source body".to_string(),
+            plan_body: "plan body".to_string(),
+            state_body: "state body".to_string(),
+        }
+    }
+
+    #[test]
+    fn record_open_finalize_rolls_back_orphaned_issue_on_post_failure() {
+        let adapter = RollbackProbeAdapter::new(true);
+        let seed = rollback_probe_seed();
+        let err = record_open_finalize(
+            &adapter,
+            "owner/repo",
+            crate::commands::record::RecordProfile::Tracking,
+            Path::new("/tmp/record-open-rollback-body.md"),
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("a failed comment post must surface an error");
+
+        // The original failure code is preserved.
+        assert_eq!(err.code, "record-open-source-post-failed");
+        // The orphaned issue was closed and the message says so.
+        assert_eq!(adapter.closed_issue.load(Ordering::SeqCst), 1);
+        assert!(
+            err.message.contains("rolled back") && err.message.contains("#1"),
+            "expected a rollback note naming the issue, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn record_open_finalize_reports_when_rollback_close_fails() {
+        let adapter = RollbackProbeAdapter::new(false);
+        let seed = rollback_probe_seed();
+        let err = record_open_finalize(
+            &adapter,
+            "owner/repo",
+            crate::commands::record::RecordProfile::Tracking,
+            Path::new("/tmp/record-open-rollback-body.md"),
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("a failed comment post must surface an error");
+
+        assert_eq!(adapter.closed_issue.load(Ordering::SeqCst), 1);
+        assert!(
+            err.message.contains("rollback FAILED") && err.message.contains("#1"),
+            "expected a rollback-failed note, got: {}",
+            err.message
+        );
     }
 
     #[test]
