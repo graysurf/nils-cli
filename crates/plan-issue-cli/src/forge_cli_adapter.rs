@@ -10,7 +10,8 @@
 //! Subprocess details:
 //!
 //! - The adapter shells out to `forge-cli` (overridable via `FORGE_CLI_BIN`).
-//! - Every call passes `--format json --provider gitlab --repo <slug>` so the
+//! - Every call passes `--format json --provider <provider> --repo <slug>`
+//!   (`gitlab`, or `local` for the in-process file-backed backend) so the
 //!   target is unambiguous, even when the cwd's git remote points elsewhere.
 //! - The v1 envelope (`{ok, schema_version, data}` for success or
 //!   `{ok:false, error:{code,message}}`) is parsed into a typed error message
@@ -64,8 +65,14 @@ impl ForgeCliRunner for ProcessForgeCliRunner {
     }
 }
 
-/// `ProviderAdapter` implementation for GitLab repos.
+/// Forge-routed `ProviderAdapter`. Carries the `--provider` string it emits so
+/// the same adapter serves both the GitLab backend and the in-process
+/// `Provider::Local` file-backed backend (`forge-cli --provider local`).
 pub struct ForgeCliAdapter {
+    /// `--provider` value forwarded to every forge-cli call (`gitlab` or
+    /// `local`). Local rides the same forge-cli rail; the store root is read by
+    /// forge-cli from `FORGE_CLI_LOCAL_STORE`.
+    provider: &'static str,
     /// Mirrors `GhCliAdapter::force`. Sprint 2/3 trait methods do not consult
     /// it because forge-cli's own markdown-validation gates already enforce
     /// the same policy; this field is retained so the adapter can grow a
@@ -76,17 +83,39 @@ pub struct ForgeCliAdapter {
 }
 
 impl ForgeCliAdapter {
+    /// GitLab-backed adapter (emits `--provider gitlab`).
     pub fn new(force: bool) -> Self {
+        Self::with_provider("gitlab", force, Box::new(ProcessForgeCliRunner))
+    }
+
+    /// Local-backend adapter (emits `--provider local`). forge-cli reads the
+    /// file store root from `FORGE_CLI_LOCAL_STORE`; the e2e driver sets it.
+    pub fn new_local(force: bool) -> Self {
+        Self::with_provider("local", force, Box::new(ProcessForgeCliRunner))
+    }
+
+    fn with_provider(
+        provider: &'static str,
+        force: bool,
+        runner: Box<dyn ForgeCliRunner + Send + Sync>,
+    ) -> Self {
         Self {
+            provider,
             force,
-            runner: Box::new(ProcessForgeCliRunner),
+            runner,
         }
     }
 
-    /// Test-only constructor that swaps in a scripted runner.
+    /// Test-only constructor that swaps in a scripted runner (GitLab provider).
     #[cfg(test)]
     pub fn with_runner(force: bool, runner: Box<dyn ForgeCliRunner + Send + Sync>) -> Self {
-        Self { force, runner }
+        Self::with_provider("gitlab", force, runner)
+    }
+
+    /// Test-only constructor for the local provider with a scripted runner.
+    #[cfg(test)]
+    pub fn with_runner_local(force: bool, runner: Box<dyn ForgeCliRunner + Send + Sync>) -> Self {
+        Self::with_provider("local", force, runner)
     }
 
     /// Run forge-cli with the given args, parse the v1 envelope, and return
@@ -122,9 +151,16 @@ impl ForgeCliAdapter {
             .ok_or_else(|| format!("forge-cli {} envelope missing `data`", args.join(" ")))
     }
 
-    /// Common argv prefix: `--format json --provider gitlab --repo <slug>`.
+    /// Common argv prefix: `--format json --provider <provider> --repo <slug>`.
     fn base_args<'a>(&self, repo: &'a str) -> Vec<&'a str> {
-        vec!["--format", "json", "--provider", "gitlab", "--repo", repo]
+        vec![
+            "--format",
+            "json",
+            "--provider",
+            self.provider,
+            "--repo",
+            repo,
+        ]
     }
 
     fn body_file_str(path: &Path) -> Result<&str, String> {
@@ -468,6 +504,17 @@ mod tests {
         (ForgeCliAdapter::with_runner(false, Box::new(proxy)), runner)
     }
 
+    fn adapter_with_local(responses: Vec<&str>) -> (ForgeCliAdapter, std::sync::Arc<RunnerHandle>) {
+        let runner = std::sync::Arc::new(RunnerHandle::new(responses));
+        let proxy = RunnerProxy {
+            inner: runner.clone(),
+        };
+        (
+            ForgeCliAdapter::with_runner_local(false, Box::new(proxy)),
+            runner,
+        )
+    }
+
     /// Thread-safe wrapper around `ScriptedRunner` so the adapter trait
     /// bound (`Send + Sync`) is satisfied while keeping the test API tiny.
     struct RunnerHandle {
@@ -544,6 +591,32 @@ mod tests {
         assert_eq!(label_idxs.len(), 2);
         assert_eq!(argv[label_idxs[0] + 1], "type::feature");
         assert_eq!(argv[label_idxs[1] + 1], "area::cli");
+    }
+
+    #[test]
+    fn local_adapter_emits_provider_local() {
+        let (adapter, handle) = adapter_with_local(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.issue.create.v1","data":{"provider":"local","number":1,"url":"local://demo/issues/1"}}"#,
+        ]);
+        let body = PathBuf::from("/tmp/body.md");
+        let (n, url) = adapter
+            .create_issue("demo", "title", &body, &[])
+            .expect("create");
+        assert_eq!(n, 1);
+        assert_eq!(url, "local://demo/issues/1");
+
+        let calls = handle.calls();
+        assert_eq!(calls.len(), 1);
+        let argv = &calls[0];
+        assert_eq!(
+            argv[argv.iter().position(|s| s == "--provider").unwrap() + 1],
+            "local",
+            "local adapter must route through forge-cli --provider local: {argv:?}"
+        );
+        assert_eq!(
+            argv[argv.iter().position(|s| s == "--repo").unwrap() + 1],
+            "demo"
+        );
     }
 
     #[test]
