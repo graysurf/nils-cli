@@ -198,9 +198,18 @@ Exit codes:
 - `69`: required external tool or project environment unavailable
 
 `repo-retro report --format json` uses the service envelope
-`cli.repo-retro.report.v1` and returns a `repo-retro.report.v1` result. The
-default `markdown` output is intended for direct review agendas and does not
-write files unless `--history-dir <dir> --write` is supplied.
+`cli.repo-retro.report.v2` and returns a `repo-retro.report.v2` result. The v2
+report adds a deterministic pre-digestion layer so process-doc churn cannot
+dominate the derived insight: `git.churnByClass` (source / tests / productDocs /
+processArtifacts / other, reconciling to the summary total), `git.archival`
+(net-deleted files, the primary archival signal), and commit-frequency
+`fileHotspots` entries carrying `class` and `netDeleted`. The analysis layer
+reads that split instead of raw line churn and never nominates a net-deleted
+file for review. Path classification uses built-in defaults overridable with
+`--path-class-config <file.json>` (a `{ "<class>": ["<path-prefix>", ...] }`
+map merged over the defaults). The default `markdown` output is intended for
+direct review agendas and does not write files unless `--history-dir <dir>
+--write` is supplied.
 
 ## Secret-safety boundary
 

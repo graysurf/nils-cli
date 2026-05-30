@@ -12,6 +12,10 @@
 - Active days: 2
 - Test-related commits: 3
 
+## Churn By Class
+
+- source: 120 changed lines across 1 file(s), 4 commit(s)
+
 ## Themes
 
 - Refactor: extracted helper
@@ -22,7 +26,7 @@
 
 ## Hotspots
 
-- `src/main.rs`: 120 changed lines across 4 commit(s)
+- `src/main.rs` [source]: 4 commit(s), 120 changed lines
 
 ## Validation Signals
 
