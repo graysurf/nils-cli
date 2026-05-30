@@ -2,18 +2,16 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::model::{
-    BaselineTarget, Context, DocumentWhen, FallbackMode, OutputFormat, ResolveFormat, Scope,
-};
+use crate::model::{AuditTarget, FallbackMode, OutputFormat, Scope};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "agent-docs",
     version,
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
-    about = "Deterministic required-doc discovery for agent workflows",
-    long_about = "Resolve, scaffold, and validate required agent documentation for home, global, and project scopes.",
-    after_help = "EXAMPLES:\n  agent-docs resolve --context startup --strict --format checklist\n  agent-docs --docs-home ~/.agents resolve --context project-dev --strict\n  agent-docs baseline --check --target all --strict\n  agent-docs completion zsh\n\nENVIRONMENT:\n  AGENT_DOCS_HOME  Default docs home when --docs-home is omitted.\n  PROJECT_PATH     Default project root when --project-path is omitted.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data",
+    about = "Data-driven required-doc resolution and auditing for agent workflows",
+    long_about = "Resolve and audit the documents and validation contract a repository declares in its AGENT_DOCS.toml catalog. Policy is data the repo owns; this binary is a generic resolver and auditor.",
+    after_help = "EXAMPLES:\n  agent-docs audit --target all --strict\n  agent-docs preflight --intent project-dev --format json\n  agent-docs init --print\n  agent-docs list\n  agent-docs explain --intent project-dev\n  agent-docs completion zsh\n\nENVIRONMENT:\n  AGENT_DOCS_HOME  Docs-home fallback when --docs-home is omitted and no\n                   install symlink resolves.\n  PROJECT_PATH     Default project root when --project-path is omitted.\n\nDOCS-HOME RESOLUTION:\n  --docs-home flag, else the install symlink (dirname of\n  ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md), else AGENT_DOCS_HOME.\n\nEXIT CODES:\n  0   success\n  1   strict failure (unsatisfied required docs / audit problems)\n  3   catalog (config) error\n  4   runtime error\n  64  command-line usage error",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -21,7 +19,7 @@ pub struct Cli {
         long,
         global = true,
         value_name = "PATH",
-        help = "Override AGENT_DOCS_HOME root path"
+        help = "Override the docs-home root (otherwise derived from the install symlink)"
     )]
     pub docs_home: Option<PathBuf>,
 
@@ -29,7 +27,7 @@ pub struct Cli {
         long,
         global = true,
         value_name = "PATH",
-        help = "Override project root path"
+        help = "Override the project root path"
     )]
     pub project_path: Option<PathBuf>,
 
@@ -50,96 +48,31 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Resolve(ResolveArgs),
-    Contexts(ContextsArgs),
-    Add(AddArgs),
-    ScaffoldAgents(ScaffoldAgentsArgs),
-    Baseline(BaselineArgs),
-    ScaffoldBaseline(ScaffoldBaselineArgs),
+    /// Audit repo health: symlink wiring, declared-doc validity, catalog validity.
+    Audit(AuditArgs),
+    /// Resolve the doc set and validation contract for an intent (for hooks).
+    Preflight(PreflightArgs),
+    /// Emit an annotated project-local override stub.
+    Init(InitArgs),
+    /// Explain what an intent resolves to and why.
+    Explain(ExplainArgs),
+    /// List the declared documents, validation contracts, and intents.
+    List(ListArgs),
+    /// Remove a `[[document]]` entry from the project catalog.
+    Remove(RemoveArgs),
+    /// Generate shell completion scripts.
     Completion(CompletionArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct ResolveArgs {
-    #[arg(long, value_enum, help = "Context to resolve")]
-    pub context: Context,
-
+pub struct AuditArgs {
     #[arg(
         long,
         value_enum,
-        default_value_t = ResolveFormat::Text,
-        help = "Output format"
+        default_value_t = AuditTarget::All,
+        help = "Audit scope target"
     )]
-    pub format: ResolveFormat,
-
-    #[arg(long, help = "Fail when required docs are missing")]
-    pub strict: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ContextsArgs {
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = ResolveFormat::Text,
-        help = "Output format"
-    )]
-    pub format: ResolveFormat,
-}
-
-#[derive(Debug, Args)]
-pub struct AddArgs {
-    #[arg(long, value_enum, help = "Config target to update")]
-    pub target: Scope,
-
-    #[arg(long, value_enum, help = "Context that uses this document")]
-    pub context: Context,
-
-    #[arg(long, value_enum, help = "Scope used to resolve relative paths")]
-    pub scope: Scope,
-
-    #[arg(long, value_name = "PATH", help = "Document path to register")]
-    pub path: PathBuf,
-
-    #[arg(long, help = "Mark this document as required")]
-    pub required: bool,
-
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = DocumentWhen::Always,
-        help = "Condition for when the document is required"
-    )]
-    pub when: DocumentWhen,
-
-    #[arg(long, help = "Optional notes for the document entry")]
-    pub notes: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct ScaffoldAgentsArgs {
-    #[arg(long, value_enum, help = "Scaffold target scope")]
-    pub target: Scope,
-
-    #[arg(long, value_name = "PATH", help = "Explicit output path")]
-    pub output: Option<PathBuf>,
-
-    #[arg(long, help = "Overwrite an existing output file")]
-    pub force: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct BaselineArgs {
-    #[arg(long, help = "Run baseline check mode")]
-    pub check: bool,
-
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = BaselineTarget::All,
-        help = "Baseline scope target"
-    )]
-    pub target: BaselineTarget,
+    pub target: AuditTarget,
 
     #[arg(
         long,
@@ -149,28 +82,104 @@ pub struct BaselineArgs {
     )]
     pub format: OutputFormat,
 
-    #[arg(long, help = "Fail when required baseline docs are missing")]
+    #[arg(long, help = "Exit non-zero when the audit finds problems")]
     pub strict: bool,
 }
 
 #[derive(Debug, Args)]
-pub struct ScaffoldBaselineArgs {
+pub struct PreflightArgs {
+    #[arg(
+        long,
+        value_name = "INTENT",
+        help = "Intent to resolve (for example project-dev)"
+    )]
+    pub intent: String,
+
     #[arg(
         long,
         value_enum,
-        default_value_t = BaselineTarget::All,
-        help = "Baseline scope target"
+        default_value_t = OutputFormat::Text,
+        help = "Output format"
     )]
-    pub target: BaselineTarget,
+    pub format: OutputFormat,
 
-    #[arg(long, help = "Create only missing baseline files")]
-    pub missing_only: bool,
+    #[arg(long, help = "Exit non-zero when required docs are unsatisfied")]
+    pub strict: bool,
+}
 
-    #[arg(long, help = "Overwrite existing baseline files")]
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    #[arg(long, help = "Print the stub to stdout without writing (default)")]
+    pub print: bool,
+
+    #[arg(
+        long = "dry-run",
+        help = "Report the target path and stub without writing"
+    )]
+    pub dry_run: bool,
+
+    #[arg(
+        long,
+        help = "Write the stub, overwriting any existing AGENT_DOCS.toml"
+    )]
     pub force: bool,
 
-    #[arg(long, help = "Preview planned changes without writing files")]
-    pub dry_run: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help = "Output format for dry-run / write reports"
+    )]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ExplainArgs {
+    #[arg(
+        long,
+        value_name = "INTENT",
+        help = "Intent to explain; omit to list available intents"
+    )]
+    pub intent: Option<String>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help = "Output format"
+    )]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help = "Output format"
+    )]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct RemoveArgs {
+    #[arg(
+        long,
+        value_name = "INTENT",
+        help = "Context/intent of the entry to remove"
+    )]
+    pub context: String,
+
+    #[arg(long, value_enum, help = "Scope of the entry to remove")]
+    pub scope: Scope,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Document path of the entry to remove"
+    )]
+    pub path: PathBuf,
 
     #[arg(
         long,

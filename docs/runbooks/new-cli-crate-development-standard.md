@@ -188,23 +188,22 @@ If crate is non-publishable (`publish = false`), verify it is excluded from publ
 
 This document should be required in `project-dev` context.
 
-Use the standard `resolve + add` pattern from `crates/agent-docs/README.md`. Project registration for this document:
+Declare it as a `[[document]]` entry in the project `AGENT_DOCS.toml` catalog
+(see `crates/agent-docs/README.md`):
 
-```bash
-agent-docs add \
-  --target project \
-  --context project-dev \
-  --scope project \
-  --path docs/runbooks/new-cli-crate-development-standard.md \
-  --required \
-  --when always \
-  --notes "New CLI crate standard (human output + JSON contract + publish-ready)"
+```toml
+[[document]]
+context  = "project-dev"
+scope    = "project"
+path     = "docs/runbooks/new-cli-crate-development-standard.md"
+required = true
+notes    = "New CLI crate standard (human output + JSON contract + publish-ready)"
 ```
 
-Then verify strict resolve:
+Then verify strict resolution:
 
 ```bash
-agent-docs resolve --context project-dev --strict --format checklist
+agent-docs preflight --intent project-dev --strict
 ```
 
 ## Review Checklist (PR Gate)

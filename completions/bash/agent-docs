@@ -1,63 +1,309 @@
-# nils-cli bash completion: agent-docs
-
-if [[ -z ${BASH_VERSION-} ]]; then
-  return 0 2>/dev/null || exit 0
-fi
-
-shopt -s progcomp 2>/dev/null || true
-
-_nils_cli_agent-docs_source_common_bash() {
-  declare -F _nils_cli_completion_common_load_generated_bash >/dev/null 2>&1 && return 0
-
-  local source_file="${BASH_SOURCE[0]}"
-  local script_dir=''
-  script_dir="$(cd -- "$(dirname -- "$source_file")" && pwd -P)" || return 1
-
-  local helper_path="${script_dir}/completion-adapter-common.bash"
-  [[ -r "$helper_path" ]] || return 1
-
-  # shellcheck source=/dev/null
-  source "$helper_path" || return 1
-
-  declare -F _nils_cli_completion_common_load_generated_bash >/dev/null 2>&1
-}
-
-_NILS_AGENT_DOCS_BASH_GENERATED_STATE=0
-
-_nils_cli_agent-docs_load_generated_bash() {
-  _nils_cli_agent-docs_source_common_bash || return 1
-
-  # command agent-docs completion bash
-  _nils_cli_completion_common_load_generated_bash \
-    "_NILS_AGENT_DOCS_BASH_GENERATED_STATE" \
-    "_nils_cli_agent_docs_generated" \
-    "agent-docs" \
-    "_agent-docs" \
-    '^if \[\[ "\${BASH_VERSINFO\[0\]}" -eq 4 ' \
-    '^fi$'
-}
-
-_nils_cli_agent-docs_complete() {
-  if ! _nils_cli_agent-docs_load_generated_bash; then
-    if declare -F _nils_cli_completion_common_fail_closed_bash >/dev/null 2>&1; then
-      _nils_cli_completion_common_fail_closed_bash
+_agent-docs() {
+    local i cur prev opts cmd
+    COMPREPLY=()
+    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+        cur="$2"
     else
-      COMPREPLY=()
+        cur="${COMP_WORDS[COMP_CWORD]}"
     fi
-    return 0
-  fi
+    prev="$3"
+    cmd=""
+    opts=""
 
-  local cur="${COMP_WORDS[COMP_CWORD]}"
-  local prev=''
-  if (( COMP_CWORD > 0 )); then
-    prev="${COMP_WORDS[COMP_CWORD-1]}"
-  fi
+    for i in "${COMP_WORDS[@]:0:COMP_CWORD}"
+    do
+        case "${cmd},${i}" in
+            ",$1")
+                cmd="agent__docs"
+                ;;
+            agent__docs,audit)
+                cmd="agent__docs__audit"
+                ;;
+            agent__docs,completion)
+                cmd="agent__docs__completion"
+                ;;
+            agent__docs,explain)
+                cmd="agent__docs__explain"
+                ;;
+            agent__docs,init)
+                cmd="agent__docs__init"
+                ;;
+            agent__docs,list)
+                cmd="agent__docs__list"
+                ;;
+            agent__docs,preflight)
+                cmd="agent__docs__preflight"
+                ;;
+            agent__docs,remove)
+                cmd="agent__docs__remove"
+                ;;
+            *)
+                ;;
+        esac
+    done
 
-  _nils_cli_agent_docs_generated "agent-docs" "$cur" "$prev"
+    case "${cmd}" in
+        agent__docs)
+            opts="-h -V --docs-home --project-path --worktree-fallback --help --version audit preflight init explain list remove completion"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__audit)
+            opts="-h --target --format --strict --docs-home --project-path --worktree-fallback --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --target)
+                    COMPREPLY=($(compgen -W "home project all" -- "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__completion)
+            opts="-h --docs-home --project-path --worktree-fallback --help bash zsh"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__explain)
+            opts="-h --intent --format --docs-home --project-path --worktree-fallback --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --intent)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__init)
+            opts="-h --print --dry-run --force --format --docs-home --project-path --worktree-fallback --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__list)
+            opts="-h --format --docs-home --project-path --worktree-fallback --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__preflight)
+            opts="-h --intent --format --strict --docs-home --project-path --worktree-fallback --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --intent)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__remove)
+            opts="-h --context --scope --path --format --docs-home --project-path --worktree-fallback --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --context)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --scope)
+                    COMPREPLY=($(compgen -W "home project global" -- "${cur}"))
+                    return 0
+                    ;;
+                --path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+    esac
 }
 
-if _nils_cli_agent-docs_source_common_bash; then
-  _nils_cli_completion_common_register_bash _nils_cli_agent-docs_complete agent-docs
+if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+    complete -F _agent-docs -o nosort -o bashdefault -o default agent-docs
 else
-  complete -F _nils_cli_agent-docs_complete agent-docs
+    complete -F _agent-docs -o bashdefault -o default agent-docs
 fi

@@ -41,7 +41,7 @@ Exit codes:
 Failure modes:
 
 - Required policy documents are missing.
-- `agent-docs resolve --context project-dev --strict` fails.
+- `agent-docs preflight --intent project-dev --strict` fails.
 - JSON contract or parity requirements are underspecified and cannot be inferred.
 - Local changed-scope checks or CI-required checks fail.
 
@@ -52,8 +52,8 @@ Failure modes:
 ## Workflow
 
 1. Run preflight policy resolution:
-   - `agent-docs resolve --context startup --strict --format checklist`
-   - `agent-docs resolve --context project-dev --strict --format checklist`
+   - `agent-docs audit --target all --strict`
+   - `agent-docs preflight --intent project-dev --strict`
 2. Read and apply canonical standards:
    - `docs/runbooks/new-cli-crate-development-standard.md`
    - `docs/specs/cli-service-json-contract-guideline-v1.md`

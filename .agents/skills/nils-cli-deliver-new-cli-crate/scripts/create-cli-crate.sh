@@ -12,7 +12,7 @@ Purpose:
 Options:
   --mode <plan|implement>   Show checklist for planning or implementation (default: plan)
   --project-path <path>     Target project path (default: current directory)
-  --strict                  Also run `agent-docs resolve --context project-dev --strict`
+  --strict                  Also run `agent-docs preflight --intent project-dev --strict`
   -h, --help                Show help
 USAGE
 }
@@ -83,8 +83,8 @@ if (( strict == 1 )); then
   command -v agent-docs >/dev/null 2>&1 || die "agent-docs not found on PATH"
   (
     cd "$repo_root"
-    agent-docs resolve --context project-dev --strict --format checklist >/dev/null
-  ) || die "agent-docs strict resolve failed for project-dev"
+    agent-docs preflight --intent project-dev --strict >/dev/null
+  ) || die "agent-docs strict preflight failed for project-dev"
 fi
 
 echo "ok: create-cli-crate preflight passed"

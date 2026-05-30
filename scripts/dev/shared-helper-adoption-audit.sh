@@ -243,11 +243,6 @@ seed_manifest() {
     'Command::new\("git"\)|fn init_repo|fn git_stdout' \
     "Manual repo init/config/git calls in fallback commit tests."
 
-  add_row "crates/agent-docs/tests/integration/env_paths.rs" \
-    "integration-test.git_setup+fs" "nils-test-support::git/fs" "candidate" "Task 5.3" "medium" \
-    'Command::new\("git"\)' \
-    "Repeated git repo/worktree setup sequences and local fixture writers."
-
   add_row "crates/git-scope/tests/integration/help_outside_repo.rs" \
     "integration-test.bin_resolve" "nils-test-support::bin + cmd" "candidate" "Task 5.4" "low" \
     'CARGO_BIN_EXE_|fn git_scope_bin' \
