@@ -2859,7 +2859,26 @@ fn state_checkpoint_payload(run: &crate::tracking::run_state::ExecutionRun) -> V
     let mut payload = synthesize_state_payload(run);
     if let Some(object) = payload.as_object_mut() {
         if let Some(tasks) = accumulative_state_tasks(run) {
+            // The dashboard renders `Current task` / `Next action` straight
+            // from this payload, so derive them from the durable ledger rather
+            // than the never-advanced `selected_scope`. Otherwise a completed
+            // plan still shows the first selected task and an empty next action
+            // (graysurf/plan-tracking-testbed#54 / sympoies/nils-cli#700).
+            let ready_to_close = matches!(
+                run.phase,
+                crate::tracking::run_state::RunPhase::ReadyForClose
+                    | crate::tracking::run_state::RunPhase::Closed
+            );
+            let (current, next_action) = derive_ledger_progress(&tasks, ready_to_close);
+            object.insert("current".to_string(), Value::String(current));
+            object.insert("next_action".to_string(), Value::String(next_action));
             object.insert("tasks".to_string(), Value::Array(tasks));
+        }
+        // `Target scope` is the issue-backed plan scope, not a status word.
+        // Prefer the authored `- Target scope:` line from the execution-state
+        // header over the synthesized "in-progress" fallback.
+        if let Some(scope) = execution_state_target_scope(run) {
+            object.insert("target_scope".to_string(), Value::String(scope));
         }
         // Carry every linked PR so the dashboard (built from the latest state
         // payload's `prs[]`) names all lane PRs, not just the current one.
@@ -2869,6 +2888,75 @@ fn state_checkpoint_payload(run: &crate::tracking::run_state::ExecutionRun) -> V
         }
     }
     payload
+}
+
+/// Derive the dashboard `current` / `next_action` fields from the accumulative
+/// ledger `tasks[]`. `current` is the first non-terminal row id, or `complete`
+/// when every row is terminal (`done`/`deferred`/`waived`). `next_action` is
+/// the next non-terminal row after `current`, or `closeout` once the run is at
+/// ready-for-close or no work remains.
+fn derive_ledger_progress(tasks: &[Value], ready_to_close: bool) -> (String, String) {
+    let is_terminal = |task: &Value| {
+        matches!(
+            task.get("status").and_then(Value::as_str).unwrap_or(""),
+            "done" | "deferred" | "waived"
+        )
+    };
+    let id_of = |task: &Value| {
+        task.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let pending: Vec<&Value> = tasks.iter().filter(|task| !is_terminal(task)).collect();
+    let current = match pending.first() {
+        Some(task) => id_of(task),
+        None => "complete".to_string(),
+    };
+    let next_action = if ready_to_close || pending.is_empty() {
+        "closeout".to_string()
+    } else {
+        match pending.get(1) {
+            Some(task) => id_of(task),
+            None => "closeout".to_string(),
+        }
+    };
+    (current, next_action)
+}
+
+/// Read the authored `- Target scope:` value from the run's execution-state
+/// header, joining wrapped continuation lines into one string. Returns `None`
+/// when no execution-state file is recorded, it cannot be read, or it has no
+/// scope line. This keeps the dashboard `target_scope` anchored to the durable
+/// plan scope instead of a synthesized status word.
+fn execution_state_target_scope(run: &crate::tracking::run_state::ExecutionRun) -> Option<String> {
+    let path = run.execution_state_file.as_ref()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = raw.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("- Target scope:"))?;
+    let first = lines[start]
+        .trim_start()
+        .strip_prefix("- Target scope:")?
+        .trim();
+    let mut scope = first.to_string();
+    for line in &lines[start + 1..] {
+        let trimmed = line.trim();
+        // Stop at a blank line, the next bullet, or the next heading; only an
+        // indented wrap of the same bullet continues the value.
+        if trimmed.is_empty()
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("## ")
+            || !line.starts_with(char::is_whitespace)
+        {
+            break;
+        }
+        scope.push(' ');
+        scope.push_str(trimmed);
+    }
+    let scope = scope.trim().to_string();
+    (!scope.is_empty()).then_some(scope)
 }
 
 /// Build the accumulative `prs[]` payload from every linked PR the run has
@@ -7309,6 +7397,100 @@ mod tests {
             bare_prs.as_array().map(|a| a.is_empty()).unwrap_or(true),
             "no linked PR -> prs stays empty"
         );
+    }
+
+    #[test]
+    fn state_checkpoint_payload_derives_progress_and_scope_from_ledger() {
+        // graysurf/plan-tracking-testbed#54 (sympoies/nils-cli#700): the
+        // dashboard reads `current` / `next_action` / `target_scope` from the
+        // latest state payload, so the checkpoint payload must derive them from
+        // the durable `## Task Ledger` + execution-state scope header, not from
+        // the never-advanced `selected_scope` or the "in-progress" fallback.
+        use crate::tracking::run_state::{ExecutionRun, RunPhase};
+
+        let tmp = TempDir::new().expect("tempdir");
+
+        // Completed plan at ready-for-close: every row terminal.
+        let done = tmp.path().join("done-execution-state.md");
+        std::fs::write(
+            &done,
+            concat!(
+                "## Execution State\n\n",
+                "- Status: ready-to-start\n",
+                "- Target scope: two append-only commits to `notes.md`,\n",
+                "  one per task, with full lifecycle evidence\n",
+                "- Current task: none\n\n",
+                "## Task Ledger\n\n",
+                "| ID | Status | Task | Evidence | Notes |\n",
+                "| --- | --- | --- | --- | --- |\n",
+                "| 1.1 | done | Append line A | log | first |\n",
+                "| 1.2 | done | Append line B | log | second |\n",
+            ),
+        )
+        .expect("write done ledger");
+        let mut run = ExecutionRun::new(
+            "run-done",
+            "owner/repo",
+            1,
+            "tracking",
+            RunPhase::ReadyForClose,
+            "2026-05-30T00:00:00Z",
+        );
+        run.execution_state_file = Some(done);
+        let payload = state_checkpoint_payload(&run);
+        assert_eq!(
+            payload["current"], "complete",
+            "all rows terminal -> current=complete"
+        );
+        assert_eq!(
+            payload["next_action"], "closeout",
+            "ready-for-close -> next_action=closeout"
+        );
+        let scope = payload["target_scope"].as_str().expect("scope");
+        assert!(
+            scope.starts_with("two append-only commits"),
+            "target_scope must carry the authored scope, got {scope:?}"
+        );
+        assert!(
+            !scope.eq_ignore_ascii_case("in-progress"),
+            "target_scope must never be a lifecycle status word"
+        );
+
+        // Mid-flight plan: derive the in-progress row and the next pending row.
+        let mid = tmp.path().join("mid-execution-state.md");
+        std::fs::write(
+            &mid,
+            concat!(
+                "## Execution State\n\n",
+                "- Target scope: demo scope\n\n",
+                "## Task Ledger\n\n",
+                "| ID | Status | Task | Evidence | Notes |\n",
+                "| --- | --- | --- | --- | --- |\n",
+                "| 1.1 | done | A | log | first |\n",
+                "| 1.2 | in-progress | B | — | second |\n",
+                "| 1.3 | pending | C | — | third |\n",
+            ),
+        )
+        .expect("write mid ledger");
+        let mut run_mid = ExecutionRun::new(
+            "run-mid",
+            "owner/repo",
+            1,
+            "tracking",
+            RunPhase::Implementing,
+            "2026-05-30T00:00:00Z",
+        );
+        run_mid.execution_state_file = Some(mid);
+        let mid_payload = state_checkpoint_payload(&run_mid);
+        assert_eq!(
+            mid_payload["current"], "1.2",
+            "current = first non-terminal ledger row"
+        );
+        assert_eq!(
+            mid_payload["next_action"], "1.3",
+            "next_action = next non-terminal ledger row"
+        );
+        assert_eq!(mid_payload["target_scope"], "demo scope");
     }
 
     #[test]
