@@ -12,7 +12,12 @@ pub struct RecordArgs {
 #[derive(Debug, Clone, Subcommand, Serialize)]
 pub enum RecordCommand {
     /// Open a provider issue from a plan bundle and post initial lifecycle
-    /// comments (v3 issue-backed plan record contract).
+    /// comments (v3 issue-backed plan record contract). Idempotent: re-running
+    /// for the same bundle resumes the existing tracker instead of creating a
+    /// duplicate. The dedup key is the source snapshot identity (repo-relative
+    /// path + last-commit SHA) embedded in the source lifecycle comment; on a
+    /// match only the missing lifecycle comments are attached. A partial open is
+    /// therefore safe to retry.
     Open(Box<RecordOpenArgs>),
 
     /// Attach source, plan, and initial state lifecycle comments to an

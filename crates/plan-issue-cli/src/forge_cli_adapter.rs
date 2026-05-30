@@ -168,6 +168,29 @@ impl ProviderAdapter for ForgeCliAdapter {
         Ok((body, comments_json))
     }
 
+    fn list_open_tracker_issues(&self, repo: &str, labels: &[String]) -> Result<Vec<u64>, String> {
+        let trimmed_labels: Vec<&str> = labels
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut args = self.base_args(repo);
+        args.extend(["issue", "list", "--state", "open"]);
+        for label in &trimmed_labels {
+            args.push("--label");
+            args.push(label);
+        }
+        let data = self.run_envelope(&args)?;
+        let items = data
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "forge-cli issue list data missing `items`".to_string())?;
+        Ok(items
+            .iter()
+            .filter_map(|item| item.get("number").and_then(Value::as_u64))
+            .collect())
+    }
+
     fn create_issue(
         &self,
         repo: &str,

@@ -844,14 +844,42 @@ fn run_record_open(
     // unchanged.
     let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
     let adapter = crate::provider::select_adapter(&repo_info, force);
-    let repo = repo_info.slug;
+    let repo = repo_info.slug.as_str();
+
+    // Auto-detect an already-open tracker for this bundle before creating a new
+    // one. The dedup key is the source snapshot identity (repo-relative path +
+    // last-commit SHA) that `record open` embeds in the source lifecycle
+    // comment, so a re-run resumes the same tracker instead of duplicating it.
+    let identity = BundleIdentity {
+        source_path: relative_repo_path(&bundle.source_file),
+        source_commit: seed.source_commit.clone(),
+    };
+    if let Some((issue_number, audit)) = detect_resumable_tracker(
+        adapter.as_ref(),
+        repo,
+        &normalized_labels,
+        args.profile,
+        &identity,
+    )? {
+        let issue_url = repo_info.issue_url(issue_number);
+        return record_open_resume(
+            adapter.as_ref(),
+            repo,
+            args.profile,
+            &seed,
+            issue_number,
+            &issue_url,
+            &audit,
+            binary.execution_mode(),
+        );
+    }
 
     let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
         .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
 
     record_open_finalize(
         adapter.as_ref(),
-        &repo,
+        repo,
         args.profile,
         &body_path,
         &normalized_labels,
@@ -861,16 +889,25 @@ fn run_record_open(
 }
 
 /// Create the tracking issue, post the initial lifecycle comments, and repair
-/// the dashboard. If any step *after* issue creation fails (e.g. a comment post
-/// rejected by the markdown guard, or a transient provider error), best-effort
-/// close the just-created issue so a re-run starts clean instead of leaving an
-/// orphaned tracker that re-running would duplicate, then annotate the error
-/// with the rollback outcome. The close is sent without a comment so it still
-/// succeeds when the original failure was a broken comment post.
+/// the dashboard.
 ///
-/// Split out of `run_record_open` so the rollback path is unit-testable with a
-/// stub adapter — the live `record open` path is otherwise reachable only
-/// through the real `plan-issue` binary.
+/// The source lifecycle comment is posted **first** because it carries the
+/// bundle's snapshot identity (`path` + `commit`) that `record open` auto-detect
+/// matches on. Until it exists the tracker is unidentifiable, so a failure
+/// *before* the source comment posts best-effort closes (rolls back) the
+/// just-created issue — otherwise a re-run could not match the orphan and would
+/// create a duplicate. The close is sent without a comment so it still succeeds
+/// when the source post itself was the broken step.
+///
+/// Once the source comment exists the tracker is identifiable, so a later
+/// failure (plan/state post or dashboard repair) leaves the partial tracker in
+/// place: the next `record open` detects it and attaches only the missing
+/// roles. This is the resume-by-default behavior; rollback is narrowed to the
+/// pre-identity window.
+///
+/// Split out of `run_record_open` so both paths are unit-testable with a stub
+/// adapter — the live `record open` path is otherwise reachable only through the
+/// real `plan-issue` binary.
 fn record_open_finalize(
     adapter: &dyn ProviderAdapter,
     repo: &str,
@@ -884,12 +921,39 @@ fn record_open_finalize(
         .create_issue(repo, &seed.plan_title, body_path, labels)
         .map_err(|err| CommandError::runtime("record-open-issue-create-failed", err))?;
 
-    let populate = || -> Result<Value, CommandError> {
-        let source_path = write_temp_markdown("record-open-source-comment", &seed.source_body)
-            .map_err(|err| CommandError::runtime("record-open-source-write-failed", err))?;
-        let source_url = adapter
-            .comment_issue(repo, issue_number, &source_path)
-            .map_err(|err| CommandError::runtime("record-open-source-post-failed", err))?;
+    // Post the identity-bearing source comment first; roll back on failure
+    // because the orphan would carry no snapshot to resume from.
+    let source_comment_path = write_temp_markdown("record-open-source-comment", &seed.source_body)
+        .map_err(|err| CommandError::runtime("record-open-source-write-failed", err))?;
+    let source_url = match adapter.comment_issue(repo, issue_number, &source_comment_path) {
+        Ok(url) => url,
+        Err(post_err) => {
+            let mut err = CommandError::runtime("record-open-source-post-failed", post_err);
+            let rollback_note = match adapter.close_issue(
+                repo,
+                issue_number,
+                crate::commands::plan::CloseReason::NotPlanned,
+                None,
+            ) {
+                Ok(()) => format!(
+                    " (rolled back: closed orphaned issue #{issue_number} {issue_url} — it had no \
+                     source snapshot to resume from; re-run `plan-issue record open` to recreate \
+                     the tracker cleanly)"
+                ),
+                Err(close_err) => format!(
+                    " (rollback FAILED: orphaned issue #{issue_number} {issue_url} is still open \
+                     and has no source snapshot to resume from — close it before retrying so a \
+                     re-run does not create a duplicate; close error: {close_err})"
+                ),
+            };
+            err.message.push_str(&rollback_note);
+            return Err(err);
+        }
+    };
+
+    // From here the tracker carries its source identity, so a failure leaves it
+    // in place for the next `record open` to resume instead of rolling back.
+    let populate_rest = || -> Result<Value, CommandError> {
         let plan_path = write_temp_markdown("record-open-plan-comment", &seed.plan_body)
             .map_err(|err| CommandError::runtime("record-open-plan-write-failed", err))?;
         let plan_url = adapter
@@ -931,29 +995,158 @@ fn record_open_finalize(
         }))
     };
 
-    match populate() {
-        Ok(value) => Ok(value),
-        Err(mut err) => {
-            let rollback_note = match adapter.close_issue(
-                repo,
-                issue_number,
-                crate::commands::plan::CloseReason::NotPlanned,
-                None,
-            ) {
-                Ok(()) => format!(
-                    " (rolled back: closed orphaned issue #{issue_number} {issue_url}; \
-                     re-run `plan-issue record open` to recreate the tracker cleanly)"
-                ),
-                Err(close_err) => format!(
-                    " (rollback FAILED: orphaned issue #{issue_number} {issue_url} is still \
-                     open — close it before retrying so a re-run does not create a duplicate; \
-                     close error: {close_err})"
-                ),
-            };
-            err.message.push_str(&rollback_note);
-            Err(err)
+    populate_rest().map_err(|mut err| {
+        err.message.push_str(&format!(
+            " (partial tracker left open as #{issue_number} {issue_url}; re-run \
+             `plan-issue record open` to resume and post the missing lifecycle comments)"
+        ));
+        err
+    })
+}
+
+/// The deterministic identity used to match a bundle to an already-open tracker:
+/// the source snapshot's repo-relative path plus its last-commit SHA, exactly as
+/// embedded in the tracker's source lifecycle comment payload. Matching requires
+/// the same launch cwd across runs (the path is `relative_repo_path`); a cwd
+/// mismatch simply misses detection and falls back to creating a new tracker.
+struct BundleIdentity {
+    source_path: String,
+    source_commit: String,
+}
+
+/// Scan the label-scoped open trackers for one whose source lifecycle comment
+/// carries the same `(path, commit)` snapshot identity as `identity`. Returns
+/// the matching issue number and its audit so the caller can attach only the
+/// missing roles. Unreadable or unparseable candidates are skipped rather than
+/// failing detection — a single malformed tracker must not block opening a new
+/// one.
+fn detect_resumable_tracker(
+    adapter: &dyn ProviderAdapter,
+    repo: &str,
+    labels: &[String],
+    profile: crate::commands::record::RecordProfile,
+    identity: &BundleIdentity,
+) -> Result<Option<(u64, lifecycle_record::RecordAudit)>, CommandError> {
+    let numbers = adapter
+        .list_open_tracker_issues(repo, labels)
+        .map_err(|err| CommandError::runtime("record-open-list-failed", err))?;
+    for number in numbers {
+        let Ok((body, comments_json)) = adapter.issue_evidence(repo, number) else {
+            continue;
+        };
+        let Ok(audit) = lifecycle_record::audit_record(Some(&body), &comments_json, Some(profile))
+        else {
+            continue;
+        };
+        let matches = audit
+            .evidence
+            .get("source")
+            .and_then(|hit| hit.payload.as_ref())
+            .and_then(|payload| payload.parse_snapshot().ok())
+            .is_some_and(|snapshot| {
+                snapshot.path == identity.source_path && snapshot.commit == identity.source_commit
+            });
+        if matches {
+            return Ok(Some((number, audit)));
         }
     }
+    Ok(None)
+}
+
+/// Resume an already-open tracker: post only the lifecycle roles the audit
+/// reports missing (`source` / `plan` / `state`), then repair the dashboard. A
+/// tracker that already has all three is a no-op (`mode: "already-open"`), so a
+/// redundant `record open` neither duplicates the issue nor its comments.
+#[allow(clippy::too_many_arguments)]
+fn record_open_resume(
+    adapter: &dyn ProviderAdapter,
+    repo: &str,
+    profile: crate::commands::record::RecordProfile,
+    seed: &RecordSeed,
+    issue_number: u64,
+    issue_url: &str,
+    audit: &lifecycle_record::RecordAudit,
+    execution_mode: &'static str,
+) -> Result<Value, CommandError> {
+    let missing: std::collections::BTreeSet<&str> =
+        audit.missing_required.iter().map(String::as_str).collect();
+
+    let mut attached: Vec<&'static str> = Vec::new();
+    for &(role, code, temp_label, fail_code) in &[
+        (
+            "source",
+            "source-missing",
+            "record-open-resume-source-comment",
+            "record-open-source-post-failed",
+        ),
+        (
+            "plan",
+            "plan-missing",
+            "record-open-resume-plan-comment",
+            "record-open-plan-post-failed",
+        ),
+        (
+            "state",
+            "state-missing",
+            "record-open-resume-state-comment",
+            "record-open-state-post-failed",
+        ),
+    ] {
+        if !missing.contains(code) {
+            continue;
+        }
+        let body = match role {
+            "source" => seed.source_body.as_str(),
+            "plan" => seed.plan_body.as_str(),
+            _ => seed.state_body.as_str(),
+        };
+        let path = write_temp_markdown(temp_label, body)
+            .map_err(|err| CommandError::runtime("record-open-resume-write-failed", err))?;
+        adapter
+            .comment_issue(repo, issue_number, &path)
+            .map_err(|err| CommandError::runtime(fail_code, err))?;
+        attached.push(role);
+    }
+
+    if attached.is_empty() {
+        return Ok(json!({
+            "operation": "record.open",
+            "execution_mode": execution_mode,
+            "dry_run": false,
+            "mode": "already-open",
+            "issue": {"number": issue_number, "url": issue_url},
+            "attached": attached,
+        }));
+    }
+
+    // Re-read the now-fuller evidence and repair the dashboard so the freshly
+    // attached comment URLs are linked.
+    let (body_after, comments_json) = adapter
+        .issue_evidence(repo, issue_number)
+        .map_err(|err| CommandError::runtime("record-open-evidence-read-failed", err))?;
+    let refreshed =
+        lifecycle_record::audit_record(Some(&body_after), &comments_json, Some(profile))
+            .map_err(|err| CommandError::runtime("record-open-audit-failed", err))?;
+    let repaired = lifecycle_record::render_dashboard_from_audit(
+        &refreshed,
+        Some(&seed.plan_title),
+        Some(issue_url),
+    );
+    let repaired_path = write_temp_markdown("record-open-resume-dashboard", &repaired)
+        .map_err(|err| CommandError::runtime("record-open-dashboard-write-failed", err))?;
+    adapter
+        .edit_issue_body(repo, issue_number, &repaired_path)
+        .map_err(|err| CommandError::runtime("record-open-dashboard-edit-failed", err))?;
+
+    Ok(json!({
+        "operation": "record.open",
+        "execution_mode": execution_mode,
+        "dry_run": false,
+        "mode": "resumed",
+        "issue": {"number": issue_number, "url": issue_url},
+        "attached": attached,
+        "dashboard_markdown": repaired,
+    }))
 }
 
 fn run_record_attach(
@@ -6276,6 +6469,14 @@ mod tests {
             unreachable!("issue_evidence is not needed in this test")
         }
 
+        fn list_open_tracker_issues(
+            &self,
+            _repo: &str,
+            _labels: &[String],
+        ) -> Result<Vec<u64>, String> {
+            unreachable!("list_open_tracker_issues is not needed in this test")
+        }
+
         fn pr_merge_summary(
             &self,
             _repo: &str,
@@ -6365,6 +6566,14 @@ mod tests {
 
         fn issue_evidence(&self, _repo: &str, _issue: u64) -> Result<(String, String), String> {
             unreachable!("issue_evidence is not needed in this test")
+        }
+
+        fn list_open_tracker_issues(
+            &self,
+            _repo: &str,
+            _labels: &[String],
+        ) -> Result<Vec<u64>, String> {
+            unreachable!("list_open_tracker_issues is not needed in this test")
         }
 
         fn pr_merge_summary(
@@ -6475,6 +6684,357 @@ mod tests {
             "expected a rollback-failed note, got: {}",
             err.message
         );
+    }
+
+    /// Stateful stub adapter for the `record open` auto-detect / resume tests.
+    /// Records comment / edit / close calls and serves scripted issue evidence
+    /// so detection and attach-missing are exercisable without the live binary.
+    #[derive(Default)]
+    struct ResumeFakeAdapter {
+        open_issues: Vec<u64>,
+        evidence: HashMap<u64, (String, String)>,
+        create_number: u64,
+        /// When set, `comment_issue` fails on the Nth call (1-based). Used to
+        /// simulate a post failure at a precise point without depending on the
+        /// (shared, race-prone) temp markdown file's contents.
+        fail_on_nth_comment: Option<usize>,
+        /// Issue numbers for each successful comment post, in call order.
+        comment_calls: std::sync::Mutex<Vec<u64>>,
+        edited: std::sync::Mutex<Vec<u64>>,
+        closed: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl ProviderAdapter for ResumeFakeAdapter {
+        fn issue_body(&self, _repo: &str, issue: u64) -> Result<String, String> {
+            self.evidence
+                .get(&issue)
+                .map(|(body, _)| body.clone())
+                .ok_or_else(|| format!("no scripted evidence for issue {issue}"))
+        }
+
+        fn issue_evidence(&self, _repo: &str, issue: u64) -> Result<(String, String), String> {
+            self.evidence
+                .get(&issue)
+                .cloned()
+                .ok_or_else(|| format!("no scripted evidence for issue {issue}"))
+        }
+
+        fn list_open_tracker_issues(
+            &self,
+            _repo: &str,
+            _labels: &[String],
+        ) -> Result<Vec<u64>, String> {
+            Ok(self.open_issues.clone())
+        }
+
+        fn create_issue(
+            &self,
+            _repo: &str,
+            _title: &str,
+            _body_file: &Path,
+            _labels: &[String],
+        ) -> Result<(u64, String), String> {
+            Ok((
+                self.create_number,
+                format!(
+                    "https://github.com/owner/repo/issues/{}",
+                    self.create_number
+                ),
+            ))
+        }
+
+        fn edit_issue_body(
+            &self,
+            _repo: &str,
+            issue: u64,
+            _body_file: &Path,
+        ) -> Result<(), String> {
+            self.edited.lock().unwrap().push(issue);
+            Ok(())
+        }
+
+        fn comment_issue(
+            &self,
+            _repo: &str,
+            issue: u64,
+            _body_file: &Path,
+        ) -> Result<String, String> {
+            let mut calls = self.comment_calls.lock().unwrap();
+            let nth = calls.len() + 1;
+            if self.fail_on_nth_comment == Some(nth) {
+                return Err(format!("simulated comment post failure on call {nth}"));
+            }
+            calls.push(issue);
+            Ok(format!(
+                "https://github.com/owner/repo/issues/{issue}#issuecomment-{nth}"
+            ))
+        }
+
+        fn edit_issue_labels(
+            &self,
+            _repo: &str,
+            _issue: u64,
+            _add_labels: &[String],
+            _remove_labels: &[String],
+        ) -> Result<(), String> {
+            unreachable!("edit_issue_labels is not needed in this test")
+        }
+
+        fn close_issue(
+            &self,
+            _repo: &str,
+            issue: u64,
+            _reason: CloseReason,
+            _close_comment: Option<&str>,
+        ) -> Result<(), String> {
+            self.closed.lock().unwrap().push(issue);
+            Ok(())
+        }
+
+        fn pr_is_merged(&self, _repo: &str, _pr: u64) -> Result<bool, String> {
+            unreachable!("pr_is_merged is not needed in this test")
+        }
+
+        fn pr_merge_summary(
+            &self,
+            _repo: &str,
+            _pr: u64,
+        ) -> Result<crate::github::PrMergeSummary, String> {
+            unreachable!("pr_merge_summary is not needed in this test")
+        }
+
+        fn pr_comments(&self, _repo: &str, _pr: u64) -> Result<Vec<Value>, String> {
+            unreachable!("pr_comments is not needed in this test")
+        }
+    }
+
+    /// Render a real source lifecycle comment carrying the snapshot identity
+    /// (`path` + `commit`) so `audit_record` parses it exactly as in live mode.
+    fn source_identity_comment(path: &str, commit: &str) -> String {
+        lifecycle_record::render_record_snapshot_comment(
+            crate::commands::record::RecordProfile::Tracking,
+            crate::commands::record::LifecycleCommentKind::Source,
+            &lifecycle_record::SnapshotData {
+                path: path.to_string(),
+                commit: commit.to_string(),
+                title: None,
+                summary: None,
+            },
+            "source content",
+            None,
+        )
+        .expect("render source comment")
+    }
+
+    /// Minimal v2 marker comment (no payload) — enough for `audit_record` to
+    /// record the role as present when only presence matters.
+    fn v2_marker_comment(role: &str) -> String {
+        format!("<!-- plan-issue-record:v2 role={role} profile=tracking -->\n")
+    }
+
+    fn comments_envelope(bodies: &[&str]) -> String {
+        let items: Vec<Value> = bodies
+            .iter()
+            .enumerate()
+            .map(|(idx, body)| {
+                json!({
+                    "body": body,
+                    "url": format!("https://github.com/owner/repo/issues/1#c{idx}"),
+                    "created_at": format!("2026-01-{:02}T00:00:00Z", idx + 1),
+                })
+            })
+            .collect();
+        serde_json::to_string(&json!({ "comments": items })).unwrap()
+    }
+
+    fn resume_seed() -> RecordSeed {
+        RecordSeed {
+            plan_title: "Resume Plan".to_string(),
+            source_path: "docs/plans/x/x-discussion-source.md".to_string(),
+            plan_path: "docs/plans/x/x-plan.md".to_string(),
+            source_commit: "abc123".to_string(),
+            plan_commit: "abc123".to_string(),
+            source_body: "SRC-BODY".to_string(),
+            plan_body: "PLN-BODY".to_string(),
+            state_body: "STA-BODY".to_string(),
+        }
+    }
+
+    #[test]
+    fn detect_resumable_tracker_matches_source_snapshot_identity() {
+        let other = source_identity_comment("docs/plans/y/y-discussion-source.md", "zzz999");
+        let wanted = source_identity_comment("docs/plans/x/x-discussion-source.md", "abc123");
+        let mut evidence = HashMap::new();
+        evidence.insert(2, ("body-2".to_string(), comments_envelope(&[&other])));
+        evidence.insert(7, ("body-7".to_string(), comments_envelope(&[&wanted])));
+        let adapter = ResumeFakeAdapter {
+            open_issues: vec![2, 7],
+            evidence,
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: "docs/plans/x/x-discussion-source.md".to_string(),
+            source_commit: "abc123".to_string(),
+        };
+
+        let found = detect_resumable_tracker(
+            &adapter,
+            "owner/repo",
+            &[],
+            crate::commands::record::RecordProfile::Tracking,
+            &identity,
+        )
+        .expect("detection must not error");
+        let (number, audit) = found.expect("a matching tracker must be found");
+        assert_eq!(number, 7);
+        // Only the source role is present on the matched tracker.
+        assert!(audit.missing_required.iter().any(|c| c == "plan-missing"));
+        assert!(audit.missing_required.iter().any(|c| c == "state-missing"));
+    }
+
+    #[test]
+    fn detect_resumable_tracker_returns_none_when_no_identity_matches() {
+        let other = source_identity_comment("docs/plans/y/y-discussion-source.md", "zzz999");
+        let mut evidence = HashMap::new();
+        evidence.insert(2, ("body-2".to_string(), comments_envelope(&[&other])));
+        let adapter = ResumeFakeAdapter {
+            open_issues: vec![2],
+            evidence,
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: "docs/plans/x/x-discussion-source.md".to_string(),
+            source_commit: "abc123".to_string(),
+        };
+
+        let found = detect_resumable_tracker(
+            &adapter,
+            "owner/repo",
+            &[],
+            crate::commands::record::RecordProfile::Tracking,
+            &identity,
+        )
+        .expect("detection must not error");
+        assert!(found.is_none(), "no bundle identity matches, expected None");
+    }
+
+    #[test]
+    fn record_open_resume_attaches_only_missing_roles() {
+        let wanted = source_identity_comment("docs/plans/x/x-discussion-source.md", "abc123");
+        let comments_json = comments_envelope(&[&wanted]);
+        let audit = lifecycle_record::audit_record(
+            Some("body-7"),
+            &comments_json,
+            Some(crate::commands::record::RecordProfile::Tracking),
+        )
+        .expect("audit");
+        // Sanity: source present, plan + state missing.
+        assert!(audit.evidence.contains_key("source"));
+        assert!(audit.missing_required.iter().any(|c| c == "plan-missing"));
+
+        let mut evidence = HashMap::new();
+        evidence.insert(7, ("body-7".to_string(), comments_json));
+        let adapter = ResumeFakeAdapter {
+            evidence,
+            ..Default::default()
+        };
+        let seed = resume_seed();
+
+        let result = record_open_resume(
+            &adapter,
+            "owner/repo",
+            crate::commands::record::RecordProfile::Tracking,
+            &seed,
+            7,
+            "https://github.com/owner/repo/issues/7",
+            &audit,
+            "binary",
+        )
+        .expect("resume must succeed");
+
+        assert_eq!(result["mode"], "resumed");
+        // The result's `attached` carries the role identity (source is skipped,
+        // only plan + state are posted); the call log confirms exactly two posts
+        // to issue 7.
+        assert_eq!(result["attached"], json!(["plan", "state"]));
+        assert_eq!(*adapter.comment_calls.lock().unwrap(), vec![7, 7]);
+        assert_eq!(*adapter.edited.lock().unwrap(), vec![7]);
+        assert!(adapter.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_open_resume_is_noop_when_all_roles_present() {
+        let source = source_identity_comment("docs/plans/x/x-discussion-source.md", "abc123");
+        let plan = v2_marker_comment("plan");
+        let state = v2_marker_comment("state");
+        let comments_json = comments_envelope(&[&source, &plan, &state]);
+        let audit = lifecycle_record::audit_record(
+            Some("body-7"),
+            &comments_json,
+            Some(crate::commands::record::RecordProfile::Tracking),
+        )
+        .expect("audit");
+        assert!(
+            audit.missing_required.is_empty(),
+            "fixture must have all required roles present, got {:?}",
+            audit.missing_required
+        );
+
+        let adapter = ResumeFakeAdapter::default();
+        let seed = resume_seed();
+
+        let result = record_open_resume(
+            &adapter,
+            "owner/repo",
+            crate::commands::record::RecordProfile::Tracking,
+            &seed,
+            7,
+            "https://github.com/owner/repo/issues/7",
+            &audit,
+            "binary",
+        )
+        .expect("resume must succeed");
+
+        assert_eq!(result["mode"], "already-open");
+        assert!(adapter.comment_calls.lock().unwrap().is_empty());
+        assert!(adapter.edited.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_open_finalize_leaves_partial_tracker_after_source_posts() {
+        let adapter = ResumeFakeAdapter {
+            create_number: 1,
+            // Fail the 2nd comment post (plan), i.e. after the source comment.
+            fail_on_nth_comment: Some(2),
+            ..Default::default()
+        };
+        let seed = resume_seed();
+
+        let err = record_open_finalize(
+            &adapter,
+            "owner/repo",
+            crate::commands::record::RecordProfile::Tracking,
+            Path::new("/tmp/record-open-partial-body.md"),
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("a failed plan post must surface an error");
+
+        assert_eq!(err.code, "record-open-plan-post-failed");
+        assert!(
+            err.message.contains("partial tracker left open") && err.message.contains("#1"),
+            "expected a leave-partial note, got: {}",
+            err.message
+        );
+        // The source comment posted, so the tracker is identifiable and must NOT
+        // be rolled back — the next run resumes it.
+        assert!(
+            adapter.closed.lock().unwrap().is_empty(),
+            "must not roll back once the source comment has posted"
+        );
+        // Exactly one successful post (source) happened before the plan failure.
+        assert_eq!(*adapter.comment_calls.lock().unwrap(), vec![1]);
     }
 
     #[test]

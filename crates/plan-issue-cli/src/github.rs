@@ -16,6 +16,12 @@ pub trait ProviderAdapter {
     /// `gh issue view --json comments`.
     fn issue_evidence(&self, repo: &str, issue: u64) -> Result<(String, String), String>;
 
+    /// Enumerate open tracker issues to consider for `record open` resume,
+    /// scoped by `labels` (AND semantics; an empty slice lists every open
+    /// issue). Returns the issue numbers; the caller reads each one's
+    /// lifecycle evidence to match the bundle's source snapshot identity.
+    fn list_open_tracker_issues(&self, repo: &str, labels: &[String]) -> Result<Vec<u64>, String>;
+
     fn create_issue(
         &self,
         repo: &str,
@@ -384,6 +390,40 @@ impl ProviderAdapter for GhCliAdapter {
         let comments_json = serde_json::to_string(&envelope)
             .map_err(|err| format!("failed to serialize issue evidence comments: {err}"))?;
         Ok((body, comments_json))
+    }
+
+    fn list_open_tracker_issues(&self, repo: &str, labels: &[String]) -> Result<Vec<u64>, String> {
+        let mut args = vec![
+            "issue".to_string(),
+            "list".to_string(),
+            "--repo".to_string(),
+            repo.to_string(),
+            "--state".to_string(),
+            "open".to_string(),
+            "--limit".to_string(),
+            // gh defaults to 30; raise the ceiling so detection still sees a
+            // bundle's tracker on a busy repo. A bundle should resolve to one
+            // tracker, so the list is only ever a candidate set to scan.
+            "200".to_string(),
+            "--json".to_string(),
+            "number".to_string(),
+        ];
+        for label in labels {
+            let trimmed = label.trim();
+            if !trimmed.is_empty() {
+                args.push("--label".to_string());
+                args.push(trimmed.to_string());
+            }
+        }
+        let stdout = self.run(&args)?;
+        let json = Self::parse_json(&stdout, "issue list")?;
+        let items = json
+            .as_array()
+            .ok_or_else(|| "gh issue list JSON is not an array".to_string())?;
+        Ok(items
+            .iter()
+            .filter_map(|item| item.get("number").and_then(Value::as_u64))
+            .collect())
     }
 
     fn create_issue(
