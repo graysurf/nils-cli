@@ -1,6 +1,6 @@
 [package]
 name = "nils-agent-memory"
-version = "0.30.1"
+version = "0.30.2"
 edition.workspace = true
 license.workspace = true
 
@@ -18,8 +18,8 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "0.30.1", path = "../nils-build-info" }
-nils-common = { version = "0.30.1", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "0.30.2", path = "../nils-build-info" }
+nils-common = { version = "0.30.2", path = "../nils-common", package = "nils-common" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
