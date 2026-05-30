@@ -152,10 +152,10 @@ fn run_cleanup(args: &[String]) -> i32 {
             // already contains a patch-equivalent commit.
             let merge_base = match git_stdout_trimmed(&["merge-base", &base_ref, &branch]) {
                 Ok(value) => value,
-                Err(_) => {
-                    eprintln!("❌ Failed to find merge-base for {branch} against {base_ref}");
-                    return 1;
-                }
+                // No merge-base means unrelated history (e.g. an orphan fixture
+                // branch). It cannot be a squash-merge of base, so skip it
+                // instead of aborting the whole sweep.
+                Err(_) => continue,
             };
 
             let branch_tree =

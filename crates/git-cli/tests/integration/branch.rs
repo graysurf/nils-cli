@@ -57,6 +57,30 @@ fn setup_repo_with_real_squash() -> tempfile::TempDir {
     dir
 }
 
+fn setup_repo_with_orphan_and_squash() -> tempfile::TempDir {
+    let dir = init_repo();
+    commit_file(dir.path(), "file.txt", "base\n", "base");
+
+    // A real multi-commit squash-merge: the genuine cleanup candidate.
+    git(dir.path(), &["checkout", "-b", "feature-multi-squash"]);
+    commit_file(dir.path(), "a.txt", "alpha\n", "add a");
+    commit_file(dir.path(), "b.txt", "beta\n", "add b");
+    git(dir.path(), &["checkout", "main"]);
+    git(dir.path(), &["merge", "--squash", "feature-multi-squash"]);
+    git(
+        dir.path(),
+        &["commit", "-m", "squash: feature-multi-squash (#1)"],
+    );
+
+    // An orphan branch with unrelated history: its own root commit, so it has
+    // no merge-base with main. The squash sweep must skip it, not abort.
+    git(dir.path(), &["checkout", "--orphan", "orphan-fixture"]);
+    commit_file(dir.path(), "orphan.txt", "orphan\n", "orphan root");
+    git(dir.path(), &["checkout", "main"]);
+
+    dir
+}
+
 #[test]
 fn branch_cleanup_help() {
     let harness = GitCliHarness::new();
@@ -331,4 +355,30 @@ fn branch_cleanup_squash_remove_worktrees_deletes_squashed_branch_with_worktree(
         git(dir.path(), &["branch", "--list", "feature-multi-squash"]),
         ""
     );
+}
+
+#[test]
+fn branch_cleanup_squash_skips_unrelated_history_branch() {
+    let harness = GitCliHarness::new();
+    let dir = setup_repo_with_orphan_and_squash();
+
+    let output = run_with_stdin(
+        &harness,
+        dir.path(),
+        &["branch", "cleanup", "--squash"],
+        "n\n",
+    );
+
+    // The orphan branch has no merge-base with main; the sweep must skip it and
+    // still list the genuine squash-merge, rather than abort the whole run with
+    // a merge-base error.
+    assert!(!output.stderr_text().contains("Failed to find merge-base"));
+    assert!(
+        output
+            .stdout_text()
+            .contains("🧹 Branches to delete (base: HEAD, mode: squash):")
+    );
+    assert!(output.stdout_text().contains("  - feature-multi-squash"));
+    assert!(!output.stdout_text().contains("orphan-fixture"));
+    assert!(output.stdout_text().contains("🚫 Aborted"));
 }
