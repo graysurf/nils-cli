@@ -35,6 +35,28 @@ fn setup_repo_with_branches() -> tempfile::TempDir {
     dir
 }
 
+fn setup_repo_with_real_squash() -> tempfile::TempDir {
+    let dir = init_repo();
+    commit_file(dir.path(), "file.txt", "base\n", "base");
+
+    // A feature branch with multiple commits.
+    git(dir.path(), &["checkout", "-b", "feature-multi-squash"]);
+    commit_file(dir.path(), "a.txt", "alpha\n", "add a");
+    commit_file(dir.path(), "b.txt", "beta\n", "add b");
+    git(dir.path(), &["checkout", "main"]);
+
+    // Simulate a provider squash-merge: collapse the whole branch into a single
+    // commit on main. None of the branch's per-commit patch ids match this
+    // squashed commit, so `git cherry main feature-multi-squash` cannot see it.
+    git(dir.path(), &["merge", "--squash", "feature-multi-squash"]);
+    git(
+        dir.path(),
+        &["commit", "-m", "squash: feature-multi-squash (#1)"],
+    );
+
+    dir
+}
+
 #[test]
 fn branch_cleanup_help() {
     let harness = GitCliHarness::new();
@@ -243,4 +265,70 @@ fn branch_cleanup_remove_worktrees_flag_deletes_linked_worktree_branch() {
     assert!(output.stdout_text().contains("✅ Deleted 1 branch(es)."));
     assert!(!linked_worktree.exists());
     assert_eq!(git(dir.path(), &["branch", "--list", "feature-merged"]), "");
+}
+
+#[test]
+fn branch_cleanup_squash_detects_real_multi_commit_squash() {
+    let harness = GitCliHarness::new();
+    let dir = setup_repo_with_real_squash();
+
+    let output = run_with_stdin(
+        &harness,
+        dir.path(),
+        &["branch", "cleanup", "--squash"],
+        "n\n",
+    );
+
+    assert_eq!(output.code, 1);
+    assert!(
+        output
+            .stdout_text()
+            .contains("🧹 Branches to delete (base: HEAD, mode: squash):")
+    );
+    assert!(output.stdout_text().contains("  - feature-multi-squash"));
+    assert!(output.stdout_text().contains("🚫 Aborted"));
+}
+
+#[test]
+fn branch_cleanup_squash_remove_worktrees_deletes_squashed_branch_with_worktree() {
+    let harness = GitCliHarness::new();
+    let dir = setup_repo_with_real_squash();
+
+    let linked_worktree = dir.path().join("linked-worktree");
+    let linked_worktree_path = linked_worktree.to_str().expect("utf8 linked worktree path");
+    git(
+        dir.path(),
+        &[
+            "worktree",
+            "add",
+            linked_worktree_path,
+            "feature-multi-squash",
+        ],
+    );
+
+    let output = run_with_stdin(
+        &harness,
+        dir.path(),
+        &["branch", "cleanup", "--squash", "--remove-worktrees"],
+        "y\n",
+    );
+
+    assert_eq!(output.code, 0);
+    assert!(output.stdout_text().contains("  - feature-multi-squash"));
+    assert!(
+        output
+            .stdout_text()
+            .contains("⚠️  Linked worktrees to remove (--remove-worktrees):")
+    );
+    assert!(
+        output
+            .stdout_text()
+            .contains("✅ Removed 1 linked worktree(s).")
+    );
+    assert!(output.stdout_text().contains("✅ Deleted 1 branch(es)."));
+    assert!(!linked_worktree.exists());
+    assert_eq!(
+        git(dir.path(), &["branch", "--list", "feature-multi-squash"]),
+        ""
+    );
 }

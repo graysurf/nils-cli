@@ -145,7 +145,44 @@ fn run_cleanup(args: &[String]) -> i32 {
                 continue;
             }
 
-            let cherry_output = match git_output(&["cherry", "-v", &base_ref, &branch]) {
+            // Providers squash a branch's commits into a single commit on base,
+            // so the branch's per-commit patch ids never match a plain
+            // `git cherry base branch`. Collapse the branch's whole diff into one
+            // synthetic commit on top of the merge-base, then ask whether base
+            // already contains a patch-equivalent commit.
+            let merge_base = match git_stdout_trimmed(&["merge-base", &base_ref, &branch]) {
+                Ok(value) => value,
+                Err(_) => {
+                    eprintln!("❌ Failed to find merge-base for {branch} against {base_ref}");
+                    return 1;
+                }
+            };
+
+            let branch_tree =
+                match git_stdout_trimmed(&["rev-parse", &format!("{branch}^{{tree}}")]) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        eprintln!("❌ Failed to resolve tree for {branch}");
+                        return 1;
+                    }
+                };
+
+            let squashed_commit = match git_stdout_trimmed(&[
+                "commit-tree",
+                &branch_tree,
+                "-p",
+                &merge_base,
+                "-m",
+                "squash-detect",
+            ]) {
+                Ok(value) => value,
+                Err(_) => {
+                    eprintln!("❌ Failed to synthesize squash commit for {branch}");
+                    return 1;
+                }
+            };
+
+            let cherry_output = match git_output(&["cherry", &base_ref, &squashed_commit]) {
                 Ok(output) => output,
                 Err(_) => {
                     eprintln!("❌ Failed to compare {branch} against {base_ref}");
@@ -314,7 +351,7 @@ fn print_help() {
         "Usage: git-delete-merged-branches [-b|--base <ref>] [-s|--squash] [-w|--remove-worktrees]"
     );
     println!("  -b, --base <ref>  Base ref used to determine merged branches (default: HEAD)");
-    println!("  -s, --squash      Include branches already applied to base (git cherry)");
+    println!("  -s, --squash      Include branches whose squashed diff already landed on base");
     println!("  -w, --remove-worktrees  Force-remove linked worktrees for candidate branches");
 }
 
