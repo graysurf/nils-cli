@@ -3,23 +3,23 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: not started — bundle authored so `create-plan-tracking-issue` can
-  open the tracker with a populated ledger.
+- Status: Sprint 1 complete — the repo-retro v2 pre-digestion layer landed on
+  `feat/repo-retro-report-v2` and passes the local-fast gate; PR1 delivery in
+  progress. Sprint 2 (release) and Sprint 3 (consumer + pin refresh) remain.
 - Target scope: `repo-retro` report pre-digestion layer + schema v2 in
   `crates/agent-workflow-primitives` (`sympoies/nils-cli`), then a release and
   the lockstep `agent-runtime-kit` consumer / pin refresh.
 - Execution window: Sprint 1 (pre-digestion + schema v2, PR1) → Sprint 2
   (release + tap bump) → Sprint 3 (agent-runtime-kit consumers + pin bump),
   serial.
-- Current task: Task 1.1 — path-class classifier + config.
-- Next task: Task 1.2 — L2 fields (`churnByClass`, `archival`,
-  commit-frequency hotspots).
+- Current task: Task 2.1 — cut release + Homebrew tap bump.
+- Next task: Task 3.1 — agent-runtime-kit consumer refresh + surface-pin bump.
 - Last updated: 2026-05-31
-- Branch/commit/PR: bundle on `feat/repo-retro-report-v2`; no implementation
-  commits yet; PR1 not yet opened.
+- Branch/commit/PR: `feat/repo-retro-report-v2`; Sprint 1 implementation commit
+  `0c0aad9`; PR1 delivery in progress.
 - Source document: docs/plans/repo-retro-report-v2-predigest/repo-retro-report-v2-predigest-plan.md
 - Direct source-doc execution waiver: not applicable
-- Tracking issue: to be assigned by `create-plan-tracking-issue` at open
+- Tracking issue: sympoies/nils-cli#693
 - Source snapshot: posted by `create-plan-tracking-issue` at issue open
 - Plan snapshot: posted by `create-plan-tracking-issue` at issue open
 - Initial state snapshot: posted by `create-plan-tracking-issue` at issue open
@@ -47,10 +47,10 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | todo | Path-class classifier + config (replace `top_level_area`) | — | Classes source/tests/productDocs/processArtifacts/other; built-in defaults + repo-local override; absent conventions yield empty classes. |
-| 1.2 | todo | L2 fields: `churnByClass`, `archival`, commit-frequency hotspots | — | Depends on 1.1. Class sums reconcile to `summary.changedLines`; net-deletion is the primary archival signal; `topFiles` ranked by `commits` with `class` + `netDeleted`. |
-| 1.3 | todo | Schema v2 bump + noise-aware L3 rewrite | — | Depends on 1.2. `...report.v2`, no v1 dual-emit; themes lead with source/tests churn; follow-ups never nominate a `netDeleted` file. |
-| 1.4 | todo | Contract, completion, tests, PR1 delivery | — | Depends on 1.3. Update `cli-output-contract-v1.md` + completion matrix; local-fast gate + `gh pr checks` self-gated. |
+| 1.1 | done | Path-class classifier + config (replace `top_level_area`) | classify_path + --path-class-config JSON override; tests classify_path_uses_built_in_defaults, path_class_config_override_takes_precedence; commit 0c0aad9 | Classes source/tests/productDocs/processArtifacts/other; built-in defaults + repo-local override; absent conventions yield empty classes. |
+| 1.2 | done | L2 fields: `churnByClass`, `archival`, commit-frequency hotspots | churnByClass (reconciles to summary), archival (net-deletion primary), commit-frequency topFiles w/ class+netDeleted; tests churn_by_class_reconciles_to_summary_total, hotspots_rank_by_commit_count_and_carry_class_and_net_deleted, net_deletion_drives_archival_facts; commit 0c0aad9 | Depends on 1.1. Class sums reconcile to `summary.changedLines`; net-deletion is the primary archival signal; `topFiles` ranked by `commits` with `class` + `netDeleted`. |
+| 1.3 | done | Schema v2 bump + noise-aware L3 rewrite | schema v2 (no v1 dual-emit) + themes/follow-ups read class split with net-deletion guard; test analysis_skips_net_deleted_files_and_splits_churn_by_class; e2e on agent-runtime-kit no longer nominates archived plan; commit 0c0aad9 | Depends on 1.2. `...report.v2`, no v1 dual-emit; themes lead with source/tests churn; follow-ups never nominate a `netDeleted` file. |
+| 1.4 | done | Contract, completion, tests, PR1 delivery | integration tests + crate README to v2; nils-cli-checks-entrypoint.sh --local-fast green (122/122, fmt+clippy+doc-tests); completion matrix unchanged (clap-derived flag) | Depends on 1.3. Update `cli-output-contract-v1.md` + completion matrix; local-fast gate + `gh pr checks` self-gated. |
 | 2.1 | todo | Cut release + Homebrew tap bump | — | Depends on 1.4. Published surface must carry repo-retro v2. |
 | 3.1 | todo | agent-runtime-kit consumer refresh + pin bump | — | Depends on 2.1. Refresh `meta:repo-retro` + `reporting:project-retro`; bump surface pin via `meta:nils-cli-bump`; EXACT-match gate forces lockstep. |
 
@@ -74,12 +74,29 @@
   (`~/Project/sympoies/nils-cli-wt/repo-retro-report-v2-predigest`,
   `feat/repo-retro-report-v2`) to avoid disturbing the shared `nils-cli` main
   checkout.
+- 2026-05-31: Implemented Sprint 1 in the worktree. Added `PathClass` +
+  `classify_path` with a `--path-class-config` JSON override
+  (`{ "<class>": ["<prefix>", ...] }` merged over built-in defaults; Markdown
+  is classified before the `is_test_path` heuristic so `docs/specs` is not
+  mistaken for tests). Added `git.churnByClass` (reconciling to the summary
+  total), `git.archival` (net-deletion primary, with a secondary
+  `plansArchivedEstimate` commit-subject heuristic), and re-ranked
+  `fileHotspots.topFiles` by commit-touch count with `class` + `netDeleted`.
+  Bumped both schema strings to `...report.v2` (no v1 dual-emit) and rewrote
+  the analysis layer to read the class split and skip net-deleted files. All
+  4 Sprint 1 tasks `done` (commit `0c0aad9`); integration tests + crate README
+  updated to v2; golden fixtures re-blessed. `--local-fast` gate green
+  (122/122). e2e against agent-runtime-kit confirms the previously-nominated
+  archived plan is no longer surfaced for review. PR1 delivery and the full
+  `gh pr checks` self-gate are next.
 
 ## Validation
 
 | Command | Status | Summary | Artifact |
 | --- | --- | --- | --- |
-| (pending) | — | No implementation run yet; bundle authored for tracker open. | — |
+| `cargo test -p nils-agent-workflow-primitives --lib repo_retro` | pass | 8 repo_retro unit tests green incl. classifier+override, churn reconciliation, commit-frequency ranking, archival, and the analysis net-deletion guard. | local |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | 122/122 package tests, fmt, clippy `-D warnings`, doc-tests, markdown lint all green. | local |
+| `repo-retro report --repo <agent-runtime-kit> --days 3 --format json` | pass | v2 envelope; churnByClass separates source/process; the previously-nominated archived plan is no longer in followUps. | local e2e |
 
 ## Notes
 
