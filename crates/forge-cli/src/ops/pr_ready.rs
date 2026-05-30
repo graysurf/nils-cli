@@ -111,7 +111,7 @@ fn run_backend_and_fetch<R: BackendRunner>(
 fn build_ready_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("pr"),
             OsString::from("ready"),
             OsString::from(id.to_string()),
@@ -130,7 +130,7 @@ fn build_ready_call(ctx: &ProviderContext, id: u64) -> BackendCall {
 fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("pr"),
             OsString::from("view"),
             OsString::from(id.to_string()),
@@ -186,6 +186,7 @@ mod tests {
             remote: "origin".into(),
             provider,
             repo: None,
+            store_root: None,
             dry_run,
         }
     }

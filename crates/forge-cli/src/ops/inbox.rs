@@ -778,6 +778,9 @@ fn resolve_targets(global: &GlobalFlags, gitlab_host: Option<&str>) -> Vec<Provi
             provider: Provider::GitLab,
             host: gitlab_host_for(global, gitlab_host),
         }],
+        // The local provider is a per-repo file store with no cross-repo work
+        // inbox, so it contributes no targets.
+        Some(crate::cli::ProviderFlag::Local) => Vec::new(),
         None => vec![
             ProviderTarget {
                 provider: Provider::GitHub,
@@ -847,7 +850,9 @@ impl ProviderPlan {
     /// values so callers can still inspect what the live path would call.
     fn dry_run_argv(&self, runtime: &InboxRuntimeConfig) -> Vec<Vec<String>> {
         match self.target.provider {
-            Provider::GitHub => github_queries(&self.config)
+            // Local contributes no inbox targets (see `resolve_targets`), so
+            // this arm is unreachable for it; fold for exhaustiveness.
+            Provider::GitHub | Provider::Local => github_queries(&self.config)
                 .into_iter()
                 .map(|q| q.call.plan_argv())
                 .collect(),
@@ -886,7 +891,9 @@ impl ProviderPlan {
         runtime: &InboxRuntimeConfig,
     ) -> Result<ProviderSuccess, ForgeError> {
         match self.target.provider {
-            Provider::GitHub => execute_github(runner, &self.target, &self.config, runtime),
+            Provider::GitHub | Provider::Local => {
+                execute_github(runner, &self.target, &self.config, runtime)
+            }
             Provider::GitLab => execute_gitlab(runner, &self.target, &self.config, runtime),
         }
     }
@@ -2367,6 +2374,7 @@ mod tests {
             remote: "missing-remote".into(),
             provider: None,
             repo: None,
+            store_root: None,
             dry_run: false,
         };
         let targets = resolve_targets(&global, Some("gitlab.com"));

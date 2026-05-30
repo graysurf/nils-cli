@@ -56,6 +56,10 @@ pub fn run(
     args: IssueViewArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
+    if global.is_local() {
+        let runner = crate::local::LocalRunner::from_global(global)?;
+        return run_with(&runner, global, args, format, git_remote_url);
+    }
     let runner = ProcessRunner;
     run_with(&runner, global, args, format, git_remote_url)
 }
@@ -114,7 +118,7 @@ fn build_view_call_with(ctx: &ProviderContext, id: u64, with_comments: bool) -> 
         GH_JSON_FIELDS
     };
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("issue"),
             OsString::from("view"),
             OsString::from(id.to_string()),
@@ -208,7 +212,7 @@ fn parse_view_output_with(
         )
     })?;
     match ctx.provider {
-        Provider::GitHub => parse_github(&value, ctx, with_comments),
+        Provider::GitHub | Provider::Local => parse_github(&value, ctx, with_comments),
         Provider::GitLab => parse_gitlab(&value, ctx),
     }
 }

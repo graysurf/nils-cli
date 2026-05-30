@@ -27,6 +27,10 @@ pub struct IssueClosePayload {
 }
 
 pub fn run(global: &GlobalFlags, id: u64, format: OutputFormat) -> Result<i32, ForgeError> {
+    if global.is_local() {
+        let runner = crate::local::LocalRunner::from_global(global)?;
+        return run_with(&runner, global, id, format, git_remote_url);
+    }
     let runner = ProcessRunner;
     run_with(&runner, global, id, format, git_remote_url)
 }
@@ -76,7 +80,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 fn build_close_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub | Provider::GitLab => vec![
+        Provider::GitHub | Provider::GitLab | Provider::Local => vec![
             OsString::from("issue"),
             OsString::from("close"),
             OsString::from(id.to_string()),

@@ -44,6 +44,10 @@ pub fn run(
     args: IssueCreateArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
+    if global.is_local() {
+        let runner = crate::local::LocalRunner::from_global(global)?;
+        return run_with(&runner, global, args, format, git_remote_url);
+    }
     let runner = ProcessRunner;
     run_with(&runner, global, args, format, git_remote_url)
 }
@@ -118,7 +122,7 @@ fn build_create_call(
 ) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("issue"),
             OsString::from("create"),
             OsString::from("--title"),
@@ -136,7 +140,7 @@ fn build_create_call(
         ],
     };
     match ctx.provider {
-        Provider::GitHub => {
+        Provider::GitHub | Provider::Local => {
             for l in labels {
                 argv.push(OsString::from("--label"));
                 argv.push(OsString::from(l));
@@ -171,7 +175,12 @@ fn parse_create_output(
         .stdout
         .lines()
         .rev()
-        .find(|l| l.trim_start().starts_with("http"))
+        .find(|l| {
+            let t = l.trim_start();
+            // `local://` is the Provider::Local synthetic scheme; both real
+            // backends print an `http(s)://` URL.
+            t.starts_with("http") || t.starts_with("local://")
+        })
         .unwrap_or("")
         .trim()
         .to_string();
@@ -376,6 +385,7 @@ mod tests {
                 remote: "origin".into(),
                 provider,
                 repo: None,
+                store_root: None,
                 dry_run,
             }
         }

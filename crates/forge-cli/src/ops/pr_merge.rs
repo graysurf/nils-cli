@@ -213,7 +213,7 @@ pub fn build_merge_call(
     let program = BackendProgram::for_provider(ctx.provider);
     let id_str = id.to_string();
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => {
+        Provider::GitHub | Provider::Local => {
             let mut v = vec![
                 OsString::from("pr"),
                 OsString::from("merge"),
@@ -271,7 +271,7 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let id_str = id.to_string();
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("pr"),
             OsString::from("view"),
             OsString::from(id_str),
@@ -345,7 +345,7 @@ fn merge_sha_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let id_str = id.to_string();
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("pr"),
             OsString::from("view"),
             OsString::from(id_str),
@@ -373,7 +373,7 @@ fn extract_merge_sha(ctx: &ProviderContext, output: &BackendSuccess) -> Result<S
         )
     })?;
     let sha = match ctx.provider {
-        Provider::GitHub => value
+        Provider::GitHub | Provider::Local => value
             .get("mergeCommit")
             .and_then(|v| v.get("oid"))
             .and_then(|v| v.as_str())

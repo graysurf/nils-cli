@@ -110,7 +110,7 @@ fn build_edit_call(
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = Vec::new();
     match ctx.provider {
-        Provider::GitHub => {
+        Provider::GitHub | Provider::Local => {
             argv.push(OsString::from("pr"));
             argv.push(OsString::from("edit"));
             argv.push(OsString::from(args.id.to_string()));
@@ -176,7 +176,7 @@ fn build_edit_call(
 fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub => vec![
+        Provider::GitHub | Provider::Local => vec![
             OsString::from("pr"),
             OsString::from("view"),
             OsString::from(id.to_string()),
@@ -286,6 +286,7 @@ mod tests {
             remote: "origin".into(),
             provider,
             repo: None,
+            store_root: None,
             dry_run,
         }
     }

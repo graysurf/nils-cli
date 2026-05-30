@@ -32,6 +32,10 @@ pub const STDERR_TAIL_BYTES: usize = 2 * 1024;
 pub enum BackendProgram {
     Gh,
     Glab,
+    /// No external binary — served in-process by
+    /// [`crate::local::LocalRunner`]. The executable/override-env values are
+    /// placeholders never spawned (the local runner dispatches on argv).
+    Local,
 }
 
 impl BackendProgram {
@@ -40,6 +44,7 @@ impl BackendProgram {
         match provider {
             Provider::GitHub => BackendProgram::Gh,
             Provider::GitLab => BackendProgram::Glab,
+            Provider::Local => BackendProgram::Local,
         }
     }
 
@@ -48,6 +53,7 @@ impl BackendProgram {
         match self {
             BackendProgram::Gh => "gh",
             BackendProgram::Glab => "glab",
+            BackendProgram::Local => "forge-cli-local",
         }
     }
 
@@ -56,6 +62,7 @@ impl BackendProgram {
         match self {
             BackendProgram::Gh => ENV_GH_BIN,
             BackendProgram::Glab => ENV_GLAB_BIN,
+            BackendProgram::Local => "FORGE_CLI_LOCAL_BIN",
         }
     }
 

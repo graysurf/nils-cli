@@ -310,6 +310,7 @@ mod tests {
             remote: "origin".into(),
             provider: Some(crate::cli::ProviderFlag::Github),
             repo: None,
+            store_root: None,
             dry_run: false,
         }
     }

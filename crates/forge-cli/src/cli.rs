@@ -47,6 +47,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "owner/name")]
     pub repo: Option<String>,
 
+    /// Root directory of the file-backed store used by `--provider local`.
+    /// Overrides the `FORGE_CLI_LOCAL_STORE` env var.
+    #[arg(long, global = true, value_name = "path")]
+    pub store_root: Option<PathBuf>,
+
     /// Render the backend command that would run, without invoking it. The
     /// envelope's `data.plan` carries the exact argv.
     #[arg(long, global = true, action = ArgAction::SetTrue)]
@@ -63,6 +68,7 @@ pub struct GlobalFlags {
     pub remote: String,
     pub provider: Option<ProviderFlag>,
     pub repo: Option<String>,
+    pub store_root: Option<PathBuf>,
     pub dry_run: bool,
 }
 
@@ -73,6 +79,7 @@ impl From<&Cli> for GlobalFlags {
             remote: cli.remote.clone(),
             provider: cli.provider,
             repo: cli.repo.clone(),
+            store_root: cli.store_root.clone(),
             dry_run: cli.dry_run,
         }
     }
@@ -89,8 +96,16 @@ impl GlobalFlags {
         match self.provider {
             Some(ProviderFlag::Github) => ProviderHint::Forced(crate::provider::Provider::GitHub),
             Some(ProviderFlag::Gitlab) => ProviderHint::Forced(crate::provider::Provider::GitLab),
+            Some(ProviderFlag::Local) => ProviderHint::Forced(crate::provider::Provider::Local),
             None => ProviderHint::Auto,
         }
+    }
+
+    /// True when `--provider local` was passed, i.e. ops should serve calls
+    /// from the file-backed store via [`crate::local::LocalRunner`] instead of
+    /// spawning a backend binary.
+    pub fn is_local(&self) -> bool {
+        matches!(self.provider, Some(ProviderFlag::Local))
     }
 }
 
@@ -100,6 +115,7 @@ impl GlobalFlags {
 pub enum ProviderFlag {
     Github,
     Gitlab,
+    Local,
 }
 
 /// Top-level subcommand tree.
@@ -909,6 +925,12 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
 
     let global: GlobalFlags = (&cli).into();
     let format = global.output_format();
+
+    // `--provider local` only models a subset of the command tree; reject the
+    // rest up front so they never fall through to a real backend spawn.
+    if global.is_local() && !crate::local::command_supported(&cli.command) {
+        return crate::local::unsupported_command().emit(format);
+    }
 
     let result = match cli.command {
         Some(Command::Auth(AuthArgs {

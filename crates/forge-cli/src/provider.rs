@@ -20,6 +20,10 @@ use crate::error::ForgeError;
 pub enum Provider {
     GitHub,
     GitLab,
+    /// In-process, file-backed backend selected by `--provider local`. Rides
+    /// the GitHub op paths (gh-style argv + JSON) but is served by
+    /// [`crate::local::LocalRunner`] against a local store instead of `gh`.
+    Local,
 }
 
 impl Provider {
@@ -28,6 +32,7 @@ impl Provider {
         match self {
             Provider::GitHub => "github",
             Provider::GitLab => "gitlab",
+            Provider::Local => "local",
         }
     }
 }
@@ -133,6 +138,7 @@ fn default_host_for(provider: Provider) -> &'static str {
     match provider {
         Provider::GitHub => "github.com",
         Provider::GitLab => "gitlab.com",
+        Provider::Local => "local",
     }
 }
 

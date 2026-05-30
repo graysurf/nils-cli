@@ -91,7 +91,7 @@ fn build_list_call(ctx: &ProviderContext, args: &PrListArgs) -> BackendCall {
     let limit = args.limit.max(1);
     let mut argv: Vec<OsString> = Vec::new();
     match ctx.provider {
-        Provider::GitHub => {
+        Provider::GitHub | Provider::Local => {
             argv.push(OsString::from("pr"));
             argv.push(OsString::from("list"));
             argv.push(OsString::from("--state"));
@@ -171,7 +171,7 @@ pub fn parse_list_output(
 
 fn parse_item(raw: &serde_json::Value, ctx: &ProviderContext) -> Result<PrListItem, ForgeError> {
     match ctx.provider {
-        Provider::GitHub => Ok(PrListItem {
+        Provider::GitHub | Provider::Local => Ok(PrListItem {
             number: raw
                 .get("number")
                 .and_then(|v| v.as_u64())
@@ -379,6 +379,7 @@ mod tests {
                 remote: "origin".into(),
                 provider,
                 repo: None,
+                store_root: None,
                 dry_run,
             }
         }
