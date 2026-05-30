@@ -154,6 +154,112 @@ fn repo_retro_reports_git_heuristic_analysis_and_sources() {
 }
 
 #[test]
+fn repo_retro_active_days_stay_within_committer_window() {
+    // Active days must stay inside the requested window. Two date-field
+    // mismatches used to leak a date outside it into activeDays:
+    //   1. the window filters on committer date but activeDays collected the
+    //      author date (%ad), so a commit authored before the window but
+    //      committed inside it surfaced its out-of-window author day, and
+    //   2. dates were rendered with --date=short (each commit's stored zone)
+    //      while --since/--until parse the boundaries in local time, so a
+    //      commit made just inside the window in local time but stored in a
+    //      different zone rendered to the previous day.
+    // TZ is pinned so both mechanisms are exercised deterministically.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.name", "Terry"]);
+    git(&repo, &["config", "user.email", "terry@example.com"]);
+
+    // Baseline commit squarely inside the window (Asia/Taipei 2026-05-13).
+    fs::write(repo.join("a.txt"), "a\n").expect("write a");
+    git(&repo, &["add", "a.txt"]);
+    git_with_env(
+        &repo,
+        &["commit", "-q", "-m", "feat: baseline change"],
+        &[
+            ("GIT_AUTHOR_DATE", "2026-05-13T12:00:00+0000"),
+            ("GIT_COMMITTER_DATE", "2026-05-13T12:00:00+0000"),
+        ],
+    );
+
+    // Author/committer skew: authored before the window, committed inside it.
+    // The committer date (2026-05-13) is in-window; the author date
+    // (2026-05-11) must never reach activeDays.
+    fs::write(repo.join("b.txt"), "b\n").expect("write b");
+    git(&repo, &["add", "b.txt"]);
+    git_with_env(
+        &repo,
+        &["commit", "-q", "-m", "fix: land older authored work"],
+        &[
+            ("GIT_AUTHOR_DATE", "2026-05-11T12:00:00+0000"),
+            ("GIT_COMMITTER_DATE", "2026-05-13T04:00:00+0000"),
+        ],
+    );
+
+    // Timezone boundary: committed 2026-05-11 16:30Z == 2026-05-12 00:30 in
+    // Asia/Taipei, so the window includes it, but the stored +0000 zone renders
+    // as 2026-05-11 under the previous --date=short behaviour.
+    fs::write(repo.join("c.txt"), "c\n").expect("write c");
+    git(&repo, &["add", "c.txt"]);
+    git_with_env(
+        &repo,
+        &["commit", "-q", "-m", "chore: late commit near boundary"],
+        &[
+            ("GIT_AUTHOR_DATE", "2026-05-11T16:30:00+0000"),
+            ("GIT_COMMITTER_DATE", "2026-05-11T16:30:00+0000"),
+        ],
+    );
+
+    let repo_arg = out_arg(&repo);
+    let agent_home = tmp.path().join(".agent-home");
+    let agent_home_value = agent_home.to_string_lossy().to_string();
+    let output = run_resolved_in_dir(
+        "repo-retro",
+        tmp.path(),
+        &[
+            "report",
+            "--repo",
+            &repo_arg,
+            "--from",
+            "2026-05-12",
+            "--to",
+            "2026-05-16",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_HOME", &agent_home_value), ("TZ", "Asia/Taipei")],
+        None,
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = json_stdout(&output);
+    let summary = &value["data"]["git"]["summary"];
+    assert_eq!(
+        summary["commitCount"], 3,
+        "all three commits fall in window"
+    );
+    let active_days: Vec<String> = summary["activeDays"]
+        .as_array()
+        .expect("activeDays")
+        .iter()
+        .map(|day| day.as_str().expect("day string").to_string())
+        .collect();
+    assert!(
+        !active_days.iter().any(|day| day.as_str() < "2026-05-12"),
+        "no active day may precede the window start: {active_days:?}"
+    );
+    assert_eq!(
+        active_days,
+        vec!["2026-05-12".to_string(), "2026-05-13".to_string()],
+        "active days use committer date rendered in local time"
+    );
+    assert_eq!(summary["firstCommitDate"], "2026-05-12");
+    assert_eq!(summary["lastCommitDate"], "2026-05-13");
+}
+
+#[test]
 fn repo_retro_loads_all_typed_jsonl_inputs_and_warns_on_malformed_lines() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let repo = create_repo_retro_fixture(tmp.path());
