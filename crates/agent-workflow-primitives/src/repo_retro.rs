@@ -35,6 +35,7 @@ struct RepoRetroView<'a> {
     deletions: i64,
     active_days_count: usize,
     test_related_commits: usize,
+    churn_by_class_block: String,
     themes_block: String,
     attention_items_block: String,
     hotspots_block: String,
@@ -49,8 +50,8 @@ struct RepoRetroView<'a> {
     warnings_block: String,
 }
 
-const REPORT_ENVELOPE_SCHEMA_VERSION: &str = "cli.repo-retro.report.v1";
-const REPORT_SCHEMA_VERSION: &str = "repo-retro.report.v1";
+const REPORT_ENVELOPE_SCHEMA_VERSION: &str = "cli.repo-retro.report.v2";
+const REPORT_SCHEMA_VERSION: &str = "repo-retro.report.v2";
 const INDEX_SCHEMA_VERSION: &str = "repo-retro.index.v1";
 const REPORT_COMMAND: &str = "repo-retro report";
 const COMMIT_TYPES: &[&str] = &[
@@ -180,6 +181,8 @@ struct ReportArgs {
         help = "Write Markdown, raw JSON, and index.jsonl under --history-dir"
     )]
     write: bool,
+    #[arg(long = "path-class-config", value_hint = ValueHint::FilePath, help = "Optional JSON file overriding path-class assignment: {\"<class>\": [\"<path-prefix>\", ...]}")]
+    path_class_config: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -291,6 +294,8 @@ struct GitReport {
     summary: CommitSummary,
     commit_types: BTreeMap<String, usize>,
     authors: Vec<AuthorSummary>,
+    churn_by_class: ChurnByClass,
+    archival: Archival,
     file_hotspots: FileHotspots,
     test_signals: TestSignals,
     recent_commits: Vec<RecentCommit>,
@@ -327,6 +332,8 @@ struct FileChangeSummary {
     insertions: i64,
     deletions: i64,
     changed_lines: i64,
+    class: PathClass,
+    net_deleted: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -337,6 +344,49 @@ struct AreaSummary {
     insertions: i64,
     deletions: i64,
     changed_lines: i64,
+    class: PathClass,
+}
+
+/// Per-class churn rollup — the deterministic headline that separates real
+/// engineering surface from process-doc byproducts.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChurnByClass {
+    source: ClassChurn,
+    tests: ClassChurn,
+    product_docs: ClassChurn,
+    process_artifacts: ClassChurn,
+    other: ClassChurn,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClassChurn {
+    file_count: usize,
+    commits: usize,
+    insertions: i64,
+    deletions: i64,
+    changed_lines: i64,
+}
+
+/// Archival facts. Net-deletion (`insertions == 0 && deletions > 0`) is the
+/// primary signal; `plans_archived_estimate` is a secondary commit-subject
+/// heuristic only.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Archival {
+    net_deleted_file_count: usize,
+    net_deleted_files: Vec<NetDeletedFile>,
+    process_artifacts_deleted_lines: i64,
+    plans_archived_estimate: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetDeletedFile {
+    path: String,
+    deletions: i64,
+    class: PathClass,
 }
 
 #[derive(Serialize)]
@@ -530,7 +580,8 @@ fn build_report(args: &ReportArgs) -> Result<RepoRetroReport, CliError> {
     let (identity, identity_warnings) = repo_identity(&repo);
     warnings.extend(identity_warnings);
     let commits = collect_git_commits(&repo, &window, &mut warnings, &mut sources)?;
-    let git = summarize_commits(&commits);
+    let classifier = load_path_classifier(args.path_class_config.as_ref())?;
+    let git = summarize_commits(&commits, &classifier);
     if commits.is_empty() {
         warnings.push("selected window has no commits".to_string());
     }
@@ -918,20 +969,25 @@ fn parse_numstat(line: &str) -> Option<ChangedFile> {
     })
 }
 
-fn summarize_commits(commits: &[Commit]) -> GitReport {
+fn summarize_commits(commits: &[Commit], classifier: &PathClassifier) -> GitReport {
     let mut type_counts: BTreeMap<String, usize> = COMMIT_TYPES
         .iter()
         .map(|kind| ((*kind).to_string(), 0))
         .collect();
     let mut authors: BTreeMap<String, AuthorSummary> = BTreeMap::new();
     let mut files: BTreeMap<String, FileChangeSummary> = BTreeMap::new();
-    let mut areas: BTreeMap<String, (BTreeSet<String>, i64, i64)> = BTreeMap::new();
+    let mut areas: BTreeMap<String, AreaAccum> = BTreeMap::new();
+    let mut class_accum: BTreeMap<PathClass, ClassAccum> = BTreeMap::new();
     let mut active_days = BTreeSet::new();
     let mut changed_test_files = BTreeSet::new();
     let mut total_insertions = 0;
     let mut total_deletions = 0;
     let mut test_changed_lines = 0;
     let mut test_related_commit_count = 0;
+    let plans_archived_estimate = commits
+        .iter()
+        .filter(|commit| subject_is_archival(&commit.subject))
+        .count();
 
     for commit in commits {
         let commit_type = classify_commit(&commit.subject);
@@ -951,6 +1007,7 @@ fn summarize_commits(commits: &[Commit]) -> GitReport {
             test_related_commit_count += 1;
         }
         for changed in &commit.files {
+            let class = classifier.classify(&changed.path);
             total_insertions += changed.insertions;
             total_deletions += changed.deletions;
             author.insertions += changed.insertions;
@@ -964,16 +1021,23 @@ fn summarize_commits(commits: &[Commit]) -> GitReport {
                     insertions: 0,
                     deletions: 0,
                     changed_lines: 0,
+                    class,
+                    net_deleted: false,
                 });
             file.commits += 1;
             file.insertions += changed.insertions;
             file.deletions += changed.deletions;
             file.changed_lines += changed.changed_lines();
-            let area = top_level_area(&changed.path);
-            let area_item = areas.entry(area).or_default();
-            area_item.0.insert(changed.path.clone());
-            area_item.1 += changed.insertions;
-            area_item.2 += changed.deletions;
+            let area_item = areas.entry(top_level_area(&changed.path)).or_default();
+            area_item.paths.insert(changed.path.clone());
+            area_item.insertions += changed.insertions;
+            area_item.deletions += changed.deletions;
+            *area_item.class_lines.entry(class).or_default() += changed.changed_lines();
+            let class_item = class_accum.entry(class).or_default();
+            class_item.files.insert(changed.path.clone());
+            class_item.commits.insert(commit.hash.clone());
+            class_item.insertions += changed.insertions;
+            class_item.deletions += changed.deletions;
             if is_test_path(&changed.path) {
                 changed_test_files.insert(changed.path.clone());
                 test_changed_lines += changed.changed_lines();
@@ -989,23 +1053,62 @@ fn summarize_commits(commits: &[Commit]) -> GitReport {
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
 
-    let mut top_files: Vec<FileChangeSummary> = files.into_values().collect();
+    let mut all_files: Vec<FileChangeSummary> = files.into_values().collect();
+    for file in &mut all_files {
+        // Net-deletion is the primary archival signal: a file with no
+        // insertions and some deletions across the window was removed, not
+        // reworked, and must never be nominated for review.
+        file.net_deleted = file.insertions == 0 && file.deletions > 0;
+    }
+
+    let mut net_deleted_files: Vec<NetDeletedFile> = all_files
+        .iter()
+        .filter(|file| file.net_deleted)
+        .map(|file| NetDeletedFile {
+            path: file.path.clone(),
+            deletions: file.deletions,
+            class: file.class,
+        })
+        .collect();
+    net_deleted_files.sort_by(|left, right| {
+        right
+            .deletions
+            .cmp(&left.deletions)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let process_artifacts_deleted_lines = net_deleted_files
+        .iter()
+        .filter(|file| file.class == PathClass::ProcessArtifacts)
+        .map(|file| file.deletions)
+        .sum();
+    let archival = Archival {
+        net_deleted_file_count: net_deleted_files.len(),
+        net_deleted_files,
+        process_artifacts_deleted_lines,
+        plans_archived_estimate,
+    };
+
+    // Rank hotspots by how often a file was touched (commit count), not raw
+    // line churn, so an iterated source file outranks a once-written plan.
+    let mut top_files = all_files;
     top_files.sort_by(|left, right| {
         right
-            .changed_lines
-            .cmp(&left.changed_lines)
+            .commits
+            .cmp(&left.commits)
+            .then_with(|| right.changed_lines.cmp(&left.changed_lines))
             .then_with(|| left.path.cmp(&right.path))
     });
     top_files.truncate(10);
 
     let mut top_areas: Vec<AreaSummary> = areas
         .into_iter()
-        .map(|(area, (paths, insertions, deletions))| AreaSummary {
+        .map(|(area, accum)| AreaSummary {
             area,
-            file_count: paths.len(),
-            insertions,
-            deletions,
-            changed_lines: insertions + deletions,
+            file_count: accum.paths.len(),
+            insertions: accum.insertions,
+            deletions: accum.deletions,
+            changed_lines: accum.insertions + accum.deletions,
+            class: dominant_class(&accum.class_lines),
         })
         .collect();
     top_areas.sort_by(|left, right| {
@@ -1015,6 +1118,8 @@ fn summarize_commits(commits: &[Commit]) -> GitReport {
             .then_with(|| left.area.cmp(&right.area))
     });
     top_areas.truncate(10);
+
+    let churn_by_class = build_churn_by_class(&class_accum);
 
     let active_days: Vec<String> = active_days.into_iter().collect();
     let total_changed = total_insertions + total_deletions;
@@ -1030,6 +1135,8 @@ fn summarize_commits(commits: &[Commit]) -> GitReport {
         },
         commit_types: type_counts,
         authors,
+        churn_by_class,
+        archival,
         file_hotspots: FileHotspots {
             top_files,
             top_areas,
@@ -1094,6 +1201,208 @@ fn is_test_path(path: &str) -> bool {
 
 fn top_level_area(path: &str) -> String {
     path.split('/').next().unwrap_or(".").to_string()
+}
+
+/// Deterministic path classification. `source`/`tests`/`productDocs` describe
+/// real engineering surface; `processArtifacts` captures workflow byproducts
+/// (plan and discussion authoring, heuristic-system records) that would
+/// otherwise dominate raw line-churn ranking; `other` is reachable only via an
+/// explicit config override.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum PathClass {
+    Source,
+    Tests,
+    ProductDocs,
+    ProcessArtifacts,
+    Other,
+}
+
+impl PathClass {
+    fn from_config_key(key: &str) -> Option<Self> {
+        match key {
+            "source" => Some(Self::Source),
+            "tests" => Some(Self::Tests),
+            "productDocs" => Some(Self::ProductDocs),
+            "processArtifacts" => Some(Self::ProcessArtifacts),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
+fn path_class_label(class: PathClass) -> &'static str {
+    match class {
+        PathClass::Source => "source",
+        PathClass::Tests => "tests",
+        PathClass::ProductDocs => "product-docs",
+        PathClass::ProcessArtifacts => "process-artifacts",
+        PathClass::Other => "other",
+    }
+}
+
+/// Built-in default classification. Absent any convention (no `docs/plans`,
+/// no `docs`), a repo simply yields `source`/`tests` and empty doc classes —
+/// never a misclassification.
+fn default_path_class(path: &str) -> PathClass {
+    if path.starts_with("docs/plans/")
+        || path.starts_with("docs/discussions/")
+        || path.starts_with("heuristic-system/error-inbox/")
+        || path.starts_with("heuristic-system/operation-records/")
+    {
+        return PathClass::ProcessArtifacts;
+    }
+    // Any remaining Markdown is documentation, classified before the test/spec
+    // heuristic — `is_test_path` also matches `specs/` segments (e.g.
+    // `docs/specs/`), which are product docs, not tests.
+    if path.to_lowercase().ends_with(".md") {
+        return PathClass::ProductDocs;
+    }
+    if is_test_path(path) {
+        return PathClass::Tests;
+    }
+    PathClass::Source
+}
+
+#[derive(Default)]
+struct PathClassifier {
+    /// (class, path-prefix) overrides, checked before the built-in defaults in
+    /// declared order; the first matching prefix wins.
+    overrides: Vec<(PathClass, String)>,
+}
+
+impl PathClassifier {
+    fn classify(&self, path: &str) -> PathClass {
+        for (class, prefix) in &self.overrides {
+            if path.starts_with(prefix.as_str()) {
+                return *class;
+            }
+        }
+        default_path_class(path)
+    }
+}
+
+fn load_path_classifier(path: Option<&PathBuf>) -> Result<PathClassifier, CliError> {
+    let Some(path) = path else {
+        return Ok(PathClassifier::default());
+    };
+    let path = expand_user(path);
+    let body = fs::read_to_string(&path).map_err(|err| {
+        CliError::runtime(
+            "read-path-class-config-failed",
+            format!("failed to read {}: {err}", path.display()),
+            Some(json!({ "path": display_path(&path) })),
+        )
+    })?;
+    let value: Value = serde_json::from_str(&body).map_err(|err| {
+        CliError::data(
+            "invalid-path-class-config",
+            format!("failed to parse {} as JSON: {err}", path.display()),
+            Some(json!({ "path": display_path(&path) })),
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        CliError::data(
+            "invalid-path-class-config",
+            "path-class config must be a JSON object of { class: [path-prefix, ...] }",
+            Some(json!({ "path": display_path(&path) })),
+        )
+    })?;
+    let mut overrides = Vec::new();
+    for (key, entry) in object {
+        let class = PathClass::from_config_key(key).ok_or_else(|| {
+            CliError::data(
+                "invalid-path-class-config",
+                format!(
+                    "unknown path class `{key}`; expected source, tests, productDocs, processArtifacts, or other"
+                ),
+                Some(json!({ "class": key })),
+            )
+        })?;
+        let prefixes = entry.as_array().ok_or_else(|| {
+            CliError::data(
+                "invalid-path-class-config",
+                format!("path class `{key}` must map to an array of path prefixes"),
+                Some(json!({ "class": key })),
+            )
+        })?;
+        for prefix in prefixes {
+            let prefix = prefix.as_str().ok_or_else(|| {
+                CliError::data(
+                    "invalid-path-class-config",
+                    format!("path class `{key}` prefixes must be strings"),
+                    Some(json!({ "class": key })),
+                )
+            })?;
+            overrides.push((class, prefix.to_string()));
+        }
+    }
+    Ok(PathClassifier { overrides })
+}
+
+/// Per-class churn accumulator. `commits` is the set of distinct commit hashes
+/// that touched a file of the class, so a commit spanning several files of one
+/// class still counts once.
+#[derive(Default)]
+struct ClassAccum {
+    files: BTreeSet<String>,
+    commits: BTreeSet<String>,
+    insertions: i64,
+    deletions: i64,
+}
+
+#[derive(Default)]
+struct AreaAccum {
+    paths: BTreeSet<String>,
+    insertions: i64,
+    deletions: i64,
+    class_lines: BTreeMap<PathClass, i64>,
+}
+
+fn build_churn_by_class(accum: &BTreeMap<PathClass, ClassAccum>) -> ChurnByClass {
+    let churn = |class: PathClass| match accum.get(&class) {
+        Some(item) => ClassChurn {
+            file_count: item.files.len(),
+            commits: item.commits.len(),
+            insertions: item.insertions,
+            deletions: item.deletions,
+            changed_lines: item.insertions + item.deletions,
+        },
+        None => ClassChurn {
+            file_count: 0,
+            commits: 0,
+            insertions: 0,
+            deletions: 0,
+            changed_lines: 0,
+        },
+    };
+    ChurnByClass {
+        source: churn(PathClass::Source),
+        tests: churn(PathClass::Tests),
+        product_docs: churn(PathClass::ProductDocs),
+        process_artifacts: churn(PathClass::ProcessArtifacts),
+        other: churn(PathClass::Other),
+    }
+}
+
+/// Dominant class for an area: most changed lines wins; ties resolve to the
+/// lowest `PathClass` ordinal for determinism.
+fn dominant_class(class_lines: &BTreeMap<PathClass, i64>) -> PathClass {
+    let mut best: Option<(PathClass, i64)> = None;
+    for (class, lines) in class_lines {
+        match best {
+            Some((_, best_lines)) if best_lines >= *lines => {}
+            _ => best = Some((*class, *lines)),
+        }
+    }
+    best.map(|(class, _)| class).unwrap_or(PathClass::Other)
+}
+
+fn subject_is_archival(subject: &str) -> bool {
+    static ARCHIVE_RE: OnceLock<Regex> = OnceLock::new();
+    ARCHIVE_RE
+        .get_or_init(|| Regex::new(r"(?i)\barchive\b").expect("regex"))
+        .is_match(subject)
 }
 
 fn summarize_heuristic_system(
@@ -1744,11 +2053,30 @@ fn build_analysis(
             themes.push(format!("{kind} work appeared in {count} commit(s)."));
         }
     }
-    if let Some(area) = git.file_hotspots.top_areas.first() {
+    // Lead with real engineering churn from the class split; report process-doc
+    // movement separately and flag when it is mostly archival, so a doc-heavy
+    // window can no longer crowd the headline.
+    let churn = &git.churn_by_class;
+    let source_lines = churn.source.changed_lines + churn.tests.changed_lines;
+    if source_lines > 0 {
         themes.push(format!(
-            "`{}` carried the largest code/doc movement with {} changed line(s).",
-            area.area, area.changed_lines
+            "Source and test churn was {} changed line(s) across {} file(s).",
+            source_lines,
+            churn.source.file_count + churn.tests.file_count
         ));
+    }
+    let process_lines = churn.process_artifacts.changed_lines;
+    if process_lines > 0 {
+        let archived = git.archival.process_artifacts_deleted_lines;
+        if archived * 2 >= process_lines {
+            themes.push(format!(
+                "Process-doc churn was {process_lines} changed line(s), mostly plan/discussion archival ({archived} deleted)."
+            ));
+        } else {
+            themes.push(format!(
+                "Process-doc (plan/discussion) churn was {process_lines} changed line(s)."
+            ));
+        }
     }
     if themes.is_empty() {
         themes.push(format!(
@@ -1805,10 +2133,21 @@ fn build_analysis(
     }
 
     let mut follow_up_questions = Vec::new();
-    if let Some(file) = git.file_hotspots.top_files.first() {
+    if let Some(file) = git
+        .file_hotspots
+        .top_files
+        .iter()
+        .find(|file| !file.net_deleted)
+    {
         follow_up_questions.push(format!(
-            "Does `{}` need focused review because it was the hottest file?",
-            file.path
+            "Does `{}` need focused review? It was touched in {} commit(s) this window.",
+            file.path, file.commits
+        ));
+    }
+    if git.archival.net_deleted_file_count > 0 {
+        follow_up_questions.push(format!(
+            "{} file(s) were net-deleted this window (likely archival); confirm none needs migration rather than removal.",
+            git.archival.net_deleted_file_count
         ));
     }
     if heuristic.active_inbox.total > 0 {
@@ -1904,15 +2243,51 @@ fn render_markdown(report: &RepoRetroReport) -> String {
             .iter()
             .take(5)
             .map(|item| {
+                let marker = if item.net_deleted {
+                    " (net-deleted)"
+                } else {
+                    ""
+                };
                 format!(
-                    "- `{}`: {} changed lines across {} commit(s)",
-                    item.path, item.changed_lines, item.commits
+                    "- `{}` [{}]: {} commit(s), {} changed lines{}",
+                    item.path,
+                    path_class_label(item.class),
+                    item.commits,
+                    item.changed_lines,
+                    marker
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
         text.push('\n');
         text
+    };
+    let churn_by_class_block = {
+        let churn = &git.churn_by_class;
+        let rows = [
+            ("source", &churn.source),
+            ("tests", &churn.tests),
+            ("product-docs", &churn.product_docs),
+            ("process-artifacts", &churn.process_artifacts),
+            ("other", &churn.other),
+        ];
+        let lines: Vec<String> = rows
+            .iter()
+            .filter(|(_, item)| item.changed_lines > 0)
+            .map(|(label, item)| {
+                format!(
+                    "- {}: {} changed lines across {} file(s), {} commit(s)",
+                    label, item.changed_lines, item.file_count, item.commits
+                )
+            })
+            .collect();
+        if lines.is_empty() {
+            "- No classified changes in the selected window.\n".to_string()
+        } else {
+            let mut text = lines.join("\n");
+            text.push('\n');
+            text
+        }
     };
     let validation_signals_block = format_bullet_block(
         report
@@ -1944,6 +2319,7 @@ fn render_markdown(report: &RepoRetroReport) -> String {
         deletions: git.summary.deletions,
         active_days_count: git.summary.active_days.len(),
         test_related_commits: git.test_signals.test_related_commit_count,
+        churn_by_class_block,
         themes_block,
         attention_items_block,
         hotspots_block,
@@ -2055,6 +2431,49 @@ mod tests {
                 },
                 commit_types: BTreeMap::new(),
                 authors: vec![],
+                churn_by_class: ChurnByClass {
+                    source: ClassChurn {
+                        file_count: 1,
+                        commits: 4,
+                        insertions: 100,
+                        deletions: 20,
+                        changed_lines: 120,
+                    },
+                    tests: ClassChurn {
+                        file_count: 0,
+                        commits: 0,
+                        insertions: 0,
+                        deletions: 0,
+                        changed_lines: 0,
+                    },
+                    product_docs: ClassChurn {
+                        file_count: 0,
+                        commits: 0,
+                        insertions: 0,
+                        deletions: 0,
+                        changed_lines: 0,
+                    },
+                    process_artifacts: ClassChurn {
+                        file_count: 0,
+                        commits: 0,
+                        insertions: 0,
+                        deletions: 0,
+                        changed_lines: 0,
+                    },
+                    other: ClassChurn {
+                        file_count: 0,
+                        commits: 0,
+                        insertions: 0,
+                        deletions: 0,
+                        changed_lines: 0,
+                    },
+                },
+                archival: Archival {
+                    net_deleted_file_count: 0,
+                    net_deleted_files: vec![],
+                    process_artifacts_deleted_lines: 0,
+                    plans_archived_estimate: 0,
+                },
                 file_hotspots: FileHotspots {
                     top_files: vec![FileChangeSummary {
                         path: "src/main.rs".to_string(),
@@ -2062,6 +2481,8 @@ mod tests {
                         insertions: 100,
                         deletions: 20,
                         changed_lines: 120,
+                        class: PathClass::Source,
+                        net_deleted: false,
                     }],
                     top_areas: vec![],
                 },
@@ -2168,5 +2589,263 @@ mod tests {
         ];
         let out = render_markdown(&report);
         assert_or_bless("with_warnings.md", &out);
+    }
+
+    fn commit(hash: &str, subject: &str, files: &[(&str, i64, i64)]) -> Commit {
+        Commit {
+            hash: hash.to_string(),
+            date: "2026-05-30".to_string(),
+            author: "dev".to_string(),
+            email: "dev@example.com".to_string(),
+            subject: subject.to_string(),
+            files: files
+                .iter()
+                .map(|(path, insertions, deletions)| ChangedFile {
+                    path: (*path).to_string(),
+                    insertions: *insertions,
+                    deletions: *deletions,
+                })
+                .collect(),
+        }
+    }
+
+    fn empty_heuristic() -> HeuristicSystemReport {
+        HeuristicSystemReport {
+            state: "not_present".to_string(),
+            active_inbox: empty_active_inbox(),
+            error_inbox_movement: ErrorInboxMovement {
+                added: MovementBucket {
+                    count: 0,
+                    paths: vec![],
+                },
+                modified: MovementBucket {
+                    count: 0,
+                    paths: vec![],
+                },
+                archived: MovementBucket {
+                    count: 0,
+                    paths: vec![],
+                },
+                removed: MovementBucket {
+                    count: 0,
+                    paths: vec![],
+                },
+            },
+            operation_records: OperationRecords {
+                changed_count: 0,
+                by_status: BTreeMap::new(),
+                paths: vec![],
+            },
+            aging: HeuristicAging {
+                oldest_open_days: None,
+                entries_over_30_days: vec![],
+            },
+            boundary: "read_only".to_string(),
+        }
+    }
+
+    fn empty_history() -> HistoryMetadata {
+        HistoryMetadata {
+            enabled: false,
+            write: false,
+            history_dir: None,
+            intended: None,
+            written: vec![],
+            comparison: HistoryComparison {
+                status: "not_requested".to_string(),
+                prior_schema: None,
+                prior_window: None,
+                prior_commit_count: None,
+                commit_count_delta: None,
+            },
+        }
+    }
+
+    #[test]
+    fn classify_path_uses_built_in_defaults() {
+        let classifier = PathClassifier::default();
+        assert_eq!(
+            classifier.classify("docs/plans/x/x-plan.md"),
+            PathClass::ProcessArtifacts
+        );
+        assert_eq!(
+            classifier.classify("docs/discussions/y.md"),
+            PathClass::ProcessArtifacts
+        );
+        assert_eq!(
+            classifier.classify("heuristic-system/error-inbox/z/ENTRY.md"),
+            PathClass::ProcessArtifacts
+        );
+        assert_eq!(
+            classifier.classify("crates/x/src/lib.rs"),
+            PathClass::Source
+        );
+        assert_eq!(
+            classifier.classify("crates/x/tests/foo.rs"),
+            PathClass::Tests
+        );
+        assert_eq!(classifier.classify("README.md"), PathClass::ProductDocs);
+        assert_eq!(
+            classifier.classify("docs/specs/contract.md"),
+            PathClass::ProductDocs
+        );
+        assert_eq!(classifier.classify("scripts/ci/run.sh"), PathClass::Source);
+    }
+
+    #[test]
+    fn path_class_config_override_takes_precedence() {
+        let classifier = PathClassifier {
+            overrides: vec![(PathClass::Source, "docs/specs/".to_string())],
+        };
+        // docs/specs is productDocs by default; the override reclassifies it.
+        assert_eq!(
+            classifier.classify("docs/specs/contract.md"),
+            PathClass::Source
+        );
+        // unrelated paths still follow the defaults.
+        assert_eq!(
+            classifier.classify("docs/plans/x.md"),
+            PathClass::ProcessArtifacts
+        );
+    }
+
+    #[test]
+    fn churn_by_class_reconciles_to_summary_total() {
+        let commits = vec![
+            commit("a1", "feat: x", &[("crates/x/src/lib.rs", 30, 5)]),
+            commit("a2", "test: x", &[("crates/x/tests/x.rs", 10, 0)]),
+            commit(
+                "a3",
+                "docs(plans): archive y",
+                &[("docs/plans/y/y-plan.md", 0, 200)],
+            ),
+            commit("a4", "docs: readme", &[("README.md", 4, 1)]),
+        ];
+        let git = summarize_commits(&commits, &PathClassifier::default());
+        let churn = &git.churn_by_class;
+        let class_total = churn.source.changed_lines
+            + churn.tests.changed_lines
+            + churn.product_docs.changed_lines
+            + churn.process_artifacts.changed_lines
+            + churn.other.changed_lines;
+        assert_eq!(class_total, git.summary.changed_lines);
+        assert_eq!(churn.source.changed_lines, 35);
+        assert_eq!(churn.tests.changed_lines, 10);
+        assert_eq!(churn.product_docs.changed_lines, 5);
+        assert_eq!(churn.process_artifacts.changed_lines, 200);
+    }
+
+    #[test]
+    fn hotspots_rank_by_commit_count_and_carry_class_and_net_deleted() {
+        let commits = vec![
+            commit("c1", "feat", &[("src/iterated.rs", 2, 1)]),
+            commit(
+                "c2",
+                "fix",
+                &[("src/iterated.rs", 1, 1), ("docs/plans/p-plan.md", 0, 500)],
+            ),
+            commit("c3", "refactor", &[("src/iterated.rs", 1, 0)]),
+            commit("c4", "feat", &[("src/bulk.rs", 300, 0)]),
+        ];
+        let git = summarize_commits(&commits, &PathClassifier::default());
+        let top = &git.file_hotspots.top_files;
+        // 3 commits beats the once-written bulk file's 300 lines.
+        assert_eq!(top[0].path, "src/iterated.rs");
+        assert_eq!(top[0].commits, 3);
+        assert_eq!(top[0].class, PathClass::Source);
+        assert!(!top[0].net_deleted);
+        let plan = top
+            .iter()
+            .find(|file| file.path == "docs/plans/p-plan.md")
+            .expect("archived plan present in hotspots");
+        assert!(plan.net_deleted);
+        assert_eq!(plan.class, PathClass::ProcessArtifacts);
+    }
+
+    #[test]
+    fn net_deletion_drives_archival_facts() {
+        let commits = vec![
+            commit(
+                "d1",
+                "docs(plans): archive old",
+                &[("docs/plans/old/old-plan.md", 0, 120)],
+            ),
+            commit("d2", "feat: keep", &[("src/keep.rs", 10, 3)]),
+        ];
+        let git = summarize_commits(&commits, &PathClassifier::default());
+        assert_eq!(git.archival.net_deleted_file_count, 1);
+        assert_eq!(
+            git.archival.net_deleted_files[0].path,
+            "docs/plans/old/old-plan.md"
+        );
+        assert_eq!(git.archival.process_artifacts_deleted_lines, 120);
+        assert_eq!(git.archival.plans_archived_estimate, 1);
+        // a file with insertions is not net-deleted.
+        assert!(
+            !git.file_hotspots
+                .top_files
+                .iter()
+                .any(|file| file.path == "src/keep.rs" && file.net_deleted)
+        );
+    }
+
+    #[test]
+    fn analysis_skips_net_deleted_files_and_splits_churn_by_class() {
+        let commits = vec![
+            commit(
+                "e1",
+                "docs(plans): archive a",
+                &[("docs/plans/a/a-plan.md", 0, 700)],
+            ),
+            commit("e2", "feat: real", &[("src/real.rs", 5, 1)]),
+        ];
+        let git = summarize_commits(&commits, &PathClassifier::default());
+        let analysis = build_analysis(
+            ReviewMode::Team,
+            &git,
+            &empty_heuristic(),
+            &BTreeMap::new(),
+            &[],
+            &empty_history(),
+        );
+        // AC1: the archived plan (net-deleted and largest by lines) is never
+        // nominated for review; only the real source file is.
+        assert!(
+            analysis
+                .follow_up_questions
+                .iter()
+                .all(|question| !question.contains("a-plan.md"))
+        );
+        assert!(
+            analysis
+                .follow_up_questions
+                .iter()
+                .any(|question| question.contains("src/real.rs"))
+        );
+        assert!(
+            analysis
+                .follow_up_questions
+                .iter()
+                .any(|question| question.contains("net-deleted"))
+        );
+        // AC4: themes carry a class-aware split, not a bare docs-largest line.
+        assert!(
+            analysis
+                .themes
+                .iter()
+                .any(|theme| theme.contains("Source and test churn"))
+        );
+        assert!(
+            analysis
+                .themes
+                .iter()
+                .any(|theme| theme.contains("archival"))
+        );
+        assert!(
+            analysis
+                .themes
+                .iter()
+                .all(|theme| !theme.contains("largest code/doc movement"))
+        );
     }
 }

@@ -12,6 +12,9 @@
 - Active days: {{ active_days_count }}
 - Test-related commits: {{ test_related_commits }}
 
+## Churn By Class
+
+{{ churn_by_class_block }}
 ## Themes
 
 {{ themes_block }}

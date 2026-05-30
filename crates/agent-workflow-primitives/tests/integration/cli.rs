@@ -100,8 +100,8 @@ fn repo_retro_reports_git_heuristic_analysis_and_sources() {
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
     let value = json_stdout(&output);
-    assert_eq!(value["schema_version"], "cli.repo-retro.report.v1");
-    assert_eq!(value["data"]["schema"], "repo-retro.report.v1");
+    assert_eq!(value["schema_version"], "cli.repo-retro.report.v2");
+    assert_eq!(value["data"]["schema"], "repo-retro.report.v2");
     assert_eq!(value["data"]["mode"], "team");
     assert_eq!(value["data"]["repo"]["slug"], "repo");
     assert_eq!(value["data"]["window"]["mode"], "fixed");
@@ -321,7 +321,7 @@ fn repo_retro_history_write_creates_index_raw_and_markdown() {
     assert_eq!(
         serde_json::from_str::<Value>(&fs::read_to_string(json_path).expect("raw"))
             .expect("raw json")["schema"],
-        "repo-retro.report.v1"
+        "repo-retro.report.v2"
     );
     let index_rows: Vec<Value> = fs::read_to_string(index_path)
         .expect("index")
