@@ -20,6 +20,7 @@ use serde::Serialize;
 use crate::refresh::refparse::{RefKind, parse_ref_url};
 
 pub mod index;
+pub mod scan;
 
 pub use index::{IndexEntry, parse_index_path};
 
