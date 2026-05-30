@@ -154,6 +154,74 @@ fn repo_retro_reports_git_heuristic_analysis_and_sources() {
 }
 
 #[test]
+fn repo_retro_discovers_core_policies_heuristic_root_with_nested_entries() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = create_repo_retro_core_policies_fixture(tmp.path());
+    let repo_arg = out_arg(&repo);
+
+    let output = run(
+        "repo-retro",
+        tmp.path(),
+        &[
+            "report",
+            "--repo",
+            &repo_arg,
+            "--from",
+            "2026-05-12",
+            "--to",
+            "2026-05-16",
+            "--mode",
+            "team",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = json_stdout(&output);
+    let heuristic = &value["data"]["heuristicSystem"];
+    assert_eq!(heuristic["state"], "present");
+    // Nested `<slug>/ENTRY.md` entries are discovered; archived entries and the
+    // README index are excluded from the active inbox.
+    assert_eq!(heuristic["activeInbox"]["state"], "present");
+    assert_eq!(heuristic["activeInbox"]["total"], 1);
+    assert_eq!(heuristic["activeInbox"]["byStatus"]["triaged"], 1);
+    assert_eq!(heuristic["activeInbox"]["bySeverity"]["medium"], 1);
+    assert_eq!(heuristic["errorInboxMovement"]["archived"]["count"], 1);
+    assert_eq!(heuristic["operationRecords"]["changedCount"], 1);
+}
+
+#[test]
+fn repo_retro_heuristic_root_override_points_at_explicit_directory() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = create_repo_retro_core_policies_fixture(tmp.path());
+    let repo_arg = out_arg(&repo);
+
+    let output = run(
+        "repo-retro",
+        tmp.path(),
+        &[
+            "report",
+            "--repo",
+            &repo_arg,
+            "--heuristic-root",
+            "core/policies/heuristic-system",
+            "--from",
+            "2026-05-12",
+            "--to",
+            "2026-05-16",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = json_stdout(&output);
+    assert_eq!(value["data"]["heuristicSystem"]["state"], "present");
+    assert_eq!(value["data"]["heuristicSystem"]["activeInbox"]["total"], 1);
+}
+
+#[test]
 fn repo_retro_active_days_stay_within_committer_window() {
     // Active days must stay inside the requested window. Two date-field
     // mismatches used to leak a date outside it into activeDays:
@@ -1063,6 +1131,94 @@ fn create_repo_retro_fixture(tmp: &Path) -> std::path::PathBuf {
     git(
         &repo,
         &["add", "heuristic-system/error-inbox/current-gap.md"],
+    );
+    git_with_env(
+        &repo,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "docs: archive resolved heuristic record",
+        ],
+        &[
+            ("GIT_AUTHOR_DATE", "2026-05-15T12:00:00+0000"),
+            ("GIT_COMMITTER_DATE", "2026-05-15T12:00:00+0000"),
+        ],
+    );
+    repo
+}
+
+/// Fixture mirroring the real agent-runtime-kit layout: the heuristic-system
+/// root lives under `core/policies/` and each inbox case is a `<slug>/ENTRY.md`
+/// directory rather than a flat Markdown file.
+fn create_repo_retro_core_policies_fixture(tmp: &Path) -> std::path::PathBuf {
+    let repo = tmp.join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.name", "Terry"]);
+    git(&repo, &["config", "user.email", "terry@example.com"]);
+    commit_retro_file(
+        &repo,
+        "src/retro.rs",
+        "pub fn retro() {}\n",
+        "feat: add repo retro helper",
+        "2026-05-12",
+    );
+    // A README index in the inbox root must never count as an active entry.
+    commit_retro_file(
+        &repo,
+        "core/policies/heuristic-system/error-inbox/README.md",
+        "# Error inbox\n",
+        "docs: seed error inbox index",
+        "2026-05-13",
+    );
+    commit_retro_file(
+        &repo,
+        "core/policies/heuristic-system/error-inbox/runtime-gap/ENTRY.md",
+        "# Runtime Gap\n\n## Status\n\n- Status: open\n- First observed: 2026-05-14\n- Area: repo-retro\n- Severity: high\n",
+        "fix: retain heuristic inbox record",
+        "2026-05-14",
+    );
+    // Evidence files alongside an ENTRY.md must not be miscounted as entries.
+    commit_retro_file(
+        &repo,
+        "core/policies/heuristic-system/error-inbox/runtime-gap/evidence/note.md",
+        "# Evidence\n",
+        "docs: attach inbox evidence",
+        "2026-05-14",
+    );
+    commit_retro_file(
+        &repo,
+        "core/policies/heuristic-system/operation-records/gating/ENTRY.md",
+        "# Gating\n",
+        "docs: add operation record",
+        "2026-05-14",
+    );
+    fs::create_dir_all(
+        repo.join("core/policies/heuristic-system/error-inbox/archive/2026/runtime-gap"),
+    )
+    .expect("archive dir");
+    git(
+        &repo,
+        &[
+            "mv",
+            "core/policies/heuristic-system/error-inbox/runtime-gap/ENTRY.md",
+            "core/policies/heuristic-system/error-inbox/archive/2026/runtime-gap/ENTRY.md",
+        ],
+    );
+    fs::create_dir_all(repo.join("core/policies/heuristic-system/error-inbox/current-gap"))
+        .expect("current gap dir");
+    fs::write(
+        repo.join("core/policies/heuristic-system/error-inbox/current-gap/ENTRY.md"),
+        "# Current Gap\n\n## Status\n\n- Status: triaged\n- First observed: 2026-05-15\n- Area: repo-retro\n- Severity: medium\n",
+    )
+    .expect("current gap");
+    git(
+        &repo,
+        &[
+            "add",
+            "core/policies/heuristic-system/error-inbox/current-gap/ENTRY.md",
+        ],
     );
     git_with_env(
         &repo,
