@@ -25,13 +25,14 @@ out of scope for this governance inventory; flag it as a follow-up.
 
 | Job | Step | Canonical owner | Decision | Notes |
 | --- | --- | --- | --- | --- |
-| `test`, `test_macos` | `Checkout`, `Set up Rust`, `Cache cargo`, `Set up Node.js`, tool bootstrap | Upstream GitHub Actions + runner bootstrap shell | keep | Platform bootstrap stays in workflow. |
-| `test`, `test_macos` | `Nils CLI checks (includes third-party-artifacts-audit, Completion asset audit, docs-hygiene-audit, test-stale-audit)` | `scripts/ci/nils-cli-checks-entrypoint.sh` -> `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh` | keep | Full CI verification contract after setup. |
+| `changes` | `Detect docs-only change set` | `scripts/ci/detect-docs-only.sh` (shares `scripts/ci/lib/doc_classify.py`) | keep | Emits `docs_only`; downstream jobs read `needs.changes.outputs.docs_only`. |
+| `test`, `test_macos` | `Checkout`, `Set up Rust`, `Cache cargo`, `Set up Node.js`, tool bootstrap | Upstream GitHub Actions + runner bootstrap shell | keep | Platform bootstrap stays in workflow; runs in both lanes (docs-only still needs node/rg/plan-tooling). |
+| `test`, `test_macos` | `Nils CLI checks (includes third-party-artifacts-audit, Completion asset audit, docs-hygiene-audit, test-stale-audit)` | `scripts/ci/nils-cli-checks-entrypoint.sh` -> `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh` | keep | Full CI verification contract after setup; passes `--docs-only` when `needs.changes.outputs.docs_only == 'true'`. |
 | `test`, `test_macos` | `Third-party artifact audit` (removed) | replaced by required-checks script ordering | delete | Duplicate workflow fragment removed. |
 | `test`, `test_macos` | `Completion asset audit` (removed) | replaced by required-checks script ordering | delete | Duplicate workflow fragment removed. |
 | `test`, `test_macos` | `Publish JUnit report`, `Upload JUnit XML` | upstream Actions artifacts/reporting | keep | Post-check reporting only. |
-| `coverage` | coverage generation/report/upload/cleanup steps | `cargo llvm-cov` + `scripts/ci/coverage-summary.sh` + upload/comment actions | keep | Coverage artifacts are created and cleaned only in this job. |
-| `coverage_badge` | badge generation/publish | `scripts/ci/coverage-badge.sh` + git push flow | keep | Push-only automation path. |
+| `coverage` | coverage generation/report/upload/cleanup steps | `cargo llvm-cov` + `scripts/ci/coverage-summary.sh` + upload/comment actions | keep | Coverage artifacts are created and cleaned only in this job. Each step carries a `docs_only != 'true'` guard (step-level, never job-level) so the check still concludes `success` on docs-only commits and the `release.yml` gate stays satisfied. |
+| `coverage_badge` | badge generation/publish | `scripts/ci/coverage-badge.sh` + git push flow | keep | Push-only automation path; skipped on docs-only pushes (no LCOV artifact is produced). |
 
 ### `.github/workflows/release.yml`
 
@@ -75,6 +76,7 @@ records the keep/delete decision plus the active caller evidence.
 | `scripts/ci/completion-flag-parity-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` step |
 | `scripts/ci/coverage-badge.sh` | keep | `.github/workflows/ci.yml` `coverage_badge` job |
 | `scripts/ci/coverage-summary.sh` | keep | `.github/workflows/ci.yml` `coverage` job + `DEVELOPMENT.md` coverage flow |
+| `scripts/ci/detect-docs-only.sh` | keep | `.github/workflows/ci.yml` `changes` job + `scripts/ci/tests/detect-docs-only.test.sh` |
 | `scripts/ci/docs-hygiene-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/docs-placement-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/markdownlint-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
@@ -87,6 +89,7 @@ records the keep/delete decision plus the active caller evidence.
 
 | Path | Decision | Active caller evidence |
 | --- | --- | --- |
+| `scripts/ci/lib/doc_classify.py` | keep | imported by `scripts/ci/nils-cli-local-fast.sh` planner + `scripts/ci/detect-docs-only.sh` |
 | `wrappers/plan-tooling` | keep | `README.md` wrapper contributor flow + workspace wrapper directory contract |
 | `wrappers/git-cli` | keep | `README.md` wrapper contributor flow + `git-cli` wrapper behavior |
 

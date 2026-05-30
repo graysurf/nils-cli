@@ -152,41 +152,14 @@ changed = [
     if line.strip()
 ]
 
+# is_doc_path / affects_third_party_artifacts live in scripts/ci/lib so the CI
+# docs-only gate (scripts/ci/detect-docs-only.sh) shares one definition.
+sys.path.insert(0, str(repo / "scripts" / "ci" / "lib"))
+from doc_classify import affects_third_party_artifacts, is_doc_path
+
+
 def emit(key, value):
     print(f"{key}\t{value}")
-
-
-def is_doc_path(path):
-    # Inside a crate, only the crate README and the crate docs/ tree are
-    # documentation. Every other .md under a crate (include_str! templates and
-    # snapshots, plan-template.md, Markdown test fixtures / golden files) is a
-    # source or test asset whose contents are asserted by that crate's tests, so
-    # it must NOT take the docs-only lane. This mirrors the markdownlint-audit.sh
-    # scope and docs/specs/crate-docs-placement-policy.md, which exclude embedded
-    # template assets and test fixtures under non-docs directories.
-    if path.startswith("crates/"):
-        rel = path.split("/", 2)[2] if path.count("/") >= 2 else ""
-        return rel == "README.md" or rel.startswith("docs/")
-    return (
-        path.endswith(".md")
-        or path.startswith("docs/")
-        or "/docs/" in path
-        or path in {"README", "LICENSE", "NOTICE"}
-    )
-
-
-def affects_third_party_artifacts(path):
-    return (
-        path in {
-            "Cargo.toml",
-            "Cargo.lock",
-            "THIRD_PARTY_LICENSES.md",
-            "THIRD_PARTY_NOTICES.md",
-            "scripts/generate-third-party-artifacts.sh",
-            "scripts/ci/third-party-artifacts-audit.sh",
-        }
-        or (path.startswith("crates/") and path.endswith("/Cargo.toml"))
-    )
 
 
 if not changed:

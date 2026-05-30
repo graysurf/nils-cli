@@ -15,6 +15,7 @@ Runs the full CI/parity checks from DEVELOPMENT.md:
   - bash scripts/ci/forge-cli-fixture-lint.sh --strict
   - bash scripts/ci/tests/install-local-release-binaries.test.sh
   - bash scripts/ci/tests/local-fast-checks.test.sh
+  - bash scripts/ci/tests/detect-docs-only.test.sh
   - bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
   - bash scripts/ci/test-stale-audit.sh --strict
   - bash scripts/ci/workspace-version-lockstep.sh --strict
@@ -132,6 +133,7 @@ fi
 
 run bash scripts/ci/tests/install-local-release-binaries.test.sh
 run bash scripts/ci/tests/local-fast-checks.test.sh
+run bash scripts/ci/tests/detect-docs-only.test.sh
 run bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
 run bash scripts/ci/test-stale-audit.sh --strict
 run bash scripts/ci/workspace-version-lockstep.sh --strict
