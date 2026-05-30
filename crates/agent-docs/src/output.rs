@@ -1,189 +1,172 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::commands::scaffold_baseline::ScaffoldBaselineReport;
 use crate::model::{
-    BaselineCheckReport, Context as DocContext, OutputFormat, ResolveFormat, ResolveReport,
-    StubReport,
+    AuditReport, InitMode, InitReport, ListReport, OutputFormat, PreflightReport, RemoveReport,
+    ResolvedDocument, ValidationContract,
 };
 
+pub fn render_audit(format: OutputFormat, report: &AuditReport) -> Result<String> {
+    match format {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(report).context("failed to serialize audit output")
+        }
+        OutputFormat::Text => Ok(render_audit_text(report)),
+    }
+}
+
+pub fn render_preflight(format: OutputFormat, report: &PreflightReport) -> Result<String> {
+    match format {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(report).context("failed to serialize preflight output")
+        }
+        OutputFormat::Text => Ok(render_preflight_text(report)),
+    }
+}
+
+pub fn render_list(format: OutputFormat, report: &ListReport) -> Result<String> {
+    match format {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(report).context("failed to serialize list output")
+        }
+        OutputFormat::Text => Ok(render_list_text(report)),
+    }
+}
+
+pub fn render_remove(format: OutputFormat, report: &RemoveReport) -> Result<String> {
+    match format {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(report).context("failed to serialize remove output")
+        }
+        OutputFormat::Text => Ok(format!(
+            "remove: outcome={} context={} scope={} path={} config={} remaining_documents={}",
+            report.outcome,
+            report.context,
+            report.scope,
+            report.path.display(),
+            report.config_path.display(),
+            report.remaining_documents
+        )),
+    }
+}
+
+pub fn render_init(format: OutputFormat, report: &InitReport) -> Result<String> {
+    if report.mode == InitMode::Print {
+        // Print mode emits the stub verbatim regardless of --format so it can be
+        // redirected straight into AGENT_DOCS.toml.
+        return Ok(report.stub.clone());
+    }
+    match format {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(report).context("failed to serialize init output")
+        }
+        OutputFormat::Text => Ok(format!(
+            "init: mode={} target={} wrote={}",
+            report.mode,
+            report.target_path.display(),
+            report.wrote
+        )),
+    }
+}
+
 #[derive(Debug, Serialize)]
-struct ContextsOutput<'a> {
-    contexts: &'a [DocContext],
+pub struct ExplainIntent<'a> {
+    pub intent: &'a str,
+    pub documents: &'a [ResolvedDocument],
+    pub validation: &'a ValidationContract,
 }
 
-pub fn render_contexts(format: ResolveFormat, contexts: &[DocContext]) -> Result<String> {
+#[derive(Debug, Serialize)]
+pub struct ExplainIntents<'a> {
+    pub intents: &'a [String],
+}
+
+pub fn render_explain_intent(format: OutputFormat, payload: &ExplainIntent<'_>) -> Result<String> {
     match format {
-        ResolveFormat::Text => Ok(contexts
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")),
-        ResolveFormat::Json => serde_json::to_string_pretty(&ContextsOutput { contexts })
-            .context("failed to serialize contexts output"),
-        ResolveFormat::Checklist => Ok(render_contexts_checklist(contexts)),
-    }
-}
-
-fn render_contexts_checklist(contexts: &[DocContext]) -> String {
-    let total = contexts.len();
-    let mut lines = Vec::with_capacity(total + 2);
-    lines.push(format!("CONTEXTS_BEGIN total={total}"));
-    for ctx in contexts {
-        lines.push(ctx.to_string());
-    }
-    lines.push(format!("CONTEXTS_END total={total}"));
-    lines.join("\n")
-}
-
-pub fn render_resolve(format: ResolveFormat, report: &ResolveReport) -> Result<String> {
-    match format {
-        ResolveFormat::Text => Ok(render_resolve_text(report)),
-        ResolveFormat::Json => {
-            serde_json::to_string_pretty(report).context("failed to serialize resolve output")
-        }
-        ResolveFormat::Checklist => Ok(render_resolve_checklist(report)),
-    }
-}
-
-pub fn render_stub(
-    format: OutputFormat,
-    command: &str,
-    message: impl Into<String>,
-) -> Result<String> {
-    let report = StubReport {
-        command: command.to_string(),
-        implemented: false,
-        message: message.into(),
-    };
-
-    match format {
-        OutputFormat::Text => Ok(format!("{}: {}", report.command, report.message)),
         OutputFormat::Json => {
-            serde_json::to_string_pretty(&report).context("failed to serialize stub output")
+            serde_json::to_string_pretty(payload).context("failed to serialize explain output")
+        }
+        OutputFormat::Text => {
+            let mut lines = vec![format!("INTENT: {}", payload.intent)];
+            if payload.documents.is_empty() {
+                lines.push("  (no documents declared for this intent)".to_string());
+            }
+            for doc in payload.documents {
+                lines.push(format!(
+                    "  - {} (scope={}, {}) status={} valid={} why=\"{}\"",
+                    doc.path.display(),
+                    doc.scope,
+                    required_label(doc),
+                    doc.status,
+                    doc.validation.valid,
+                    doc.why
+                ));
+            }
+            lines.push(render_contract_line(payload.validation));
+            Ok(lines.join("\n"))
         }
     }
 }
 
-pub fn render_baseline(format: OutputFormat, report: &BaselineCheckReport) -> Result<String> {
-    match format {
-        OutputFormat::Text => Ok(render_baseline_text(report)),
-        OutputFormat::Json => {
-            serde_json::to_string_pretty(report).context("failed to serialize baseline output")
-        }
-    }
-}
-
-pub fn render_scaffold_baseline(
+pub fn render_explain_intents(
     format: OutputFormat,
-    report: &ScaffoldBaselineReport,
+    payload: &ExplainIntents<'_>,
 ) -> Result<String> {
     match format {
-        OutputFormat::Text => Ok(render_scaffold_baseline_text(report)),
-        OutputFormat::Json => serde_json::to_string_pretty(report)
-            .context("failed to serialize scaffold-baseline output"),
+        OutputFormat::Json => serde_json::to_string_pretty(payload)
+            .context("failed to serialize explain intents output"),
+        OutputFormat::Text => {
+            if payload.intents.is_empty() {
+                return Ok("no intents declared in the catalog".to_string());
+            }
+            let mut lines = vec!["INTENTS:".to_string()];
+            lines.extend(payload.intents.iter().map(|intent| format!("  - {intent}")));
+            lines.push("run `agent-docs explain --intent <intent>` for details".to_string());
+            Ok(lines.join("\n"))
+        }
     }
 }
 
-fn render_resolve_text(report: &ResolveReport) -> String {
+fn render_audit_text(report: &AuditReport) -> String {
     let mut lines = Vec::new();
-    lines.push(format!("CONTEXT: {}", report.context));
-    lines.push(format!("AGENT_DOCS_HOME: {}", report.docs_home.display()));
-    lines.push(format!("PROJECT_PATH: {}", report.project_path.display()));
+    lines.push(format!("AUDIT: {}", report.target));
+    lines.push(format!("docs_home: {}", report.docs_home.display()));
+    lines.push(format!("project_path: {}", report.project_path.display()));
     lines.push(String::new());
 
-    for doc in &report.documents {
-        let required_label = if doc.required { "required" } else { "optional" };
+    lines.push("wiring:".to_string());
+    if report.wiring.is_empty() {
+        lines.push("  - (none for this target)".to_string());
+    }
+    for check in &report.wiring {
         lines.push(format!(
-            "[{}] {} {} {} source={} status={} why=\"{}\"",
-            required_label,
+            "  [{}] {}: {}",
+            if check.ok { "ok" } else { "FAIL" },
+            check.name,
+            check.detail
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("documents:".to_string());
+    if report.documents.is_empty() {
+        lines.push("  - (no documents declared)".to_string());
+    }
+    for doc in &report.documents {
+        lines.push(format!(
+            "  [{}] {} (context={}, scope={}) status={} valid={} when=\"{}\"",
+            required_label(doc),
+            doc.path.display(),
             doc.context,
             doc.scope,
-            doc.path.display(),
-            doc.source,
             doc.status,
-            doc.why
+            doc.validation.valid,
+            doc.when
         ));
     }
 
     lines.push(String::new());
-    lines.push(format!(
-        "summary: required_total={} present_required={} missing_required={} strict={}",
-        report.summary.required_total,
-        report.summary.present_required,
-        report.summary.missing_required,
-        report.strict
-    ));
-
-    lines.join("\n")
-}
-
-fn render_resolve_checklist(report: &ResolveReport) -> String {
-    let mode = if report.strict {
-        "strict"
-    } else {
-        "non-strict"
-    };
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "REQUIRED_DOCS_BEGIN context={} mode={mode}",
-        report.context
-    ));
-
-    for doc in report.documents.iter().filter(|doc| doc.required) {
-        let file_name = doc
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| doc.path.display().to_string());
-        lines.push(format!(
-            "{} status={} path={}",
-            file_name,
-            doc.status,
-            doc.path.display()
-        ));
-    }
-
-    lines.push(format!(
-        "REQUIRED_DOCS_END required={} present={} missing={} mode={mode} context={}",
-        report.summary.required_total,
-        report.summary.present_required,
-        report.summary.missing_required,
-        report.context
-    ));
-
-    lines.join("\n")
-}
-
-fn render_baseline_text(report: &BaselineCheckReport) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!("BASELINE CHECK: {}", report.target));
-    lines.push(format!("AGENT_DOCS_HOME: {}", report.docs_home.display()));
-    lines.push(format!("PROJECT_PATH: {}", report.project_path.display()));
-    lines.push(String::new());
-
-    for item in &report.items {
-        let required_label = if item.required {
-            "required"
-        } else {
-            "optional"
-        };
-        lines.push(format!(
-            "[{}] {:<15} {} {} {} source={} why=\"{}\"",
-            item.scope,
-            item.label,
-            item.path.display(),
-            required_label,
-            item.status,
-            item.source,
-            item.why
-        ));
-    }
-
-    lines.push(String::new());
-    lines.push(format!("missing_required: {}", report.missing_required));
-    lines.push(format!("missing_optional: {}", report.missing_optional));
+    lines.push(format!("problems: {}", report.problems));
     lines.push("suggested_actions:".to_string());
     if report.suggested_actions.is_empty() {
         lines.push("  - (none)".to_string());
@@ -199,34 +182,104 @@ fn render_baseline_text(report: &BaselineCheckReport) -> String {
     lines.join("\n")
 }
 
-fn render_scaffold_baseline_text(report: &ScaffoldBaselineReport) -> String {
+fn render_preflight_text(report: &PreflightReport) -> String {
     let mut lines = Vec::new();
-    lines.push(format!("SCAFFOLD BASELINE: {}", report.target));
-    lines.push(format!("AGENT_DOCS_HOME: {}", report.docs_home.display()));
-    lines.push(format!("PROJECT_PATH: {}", report.project_path.display()));
+    lines.push(format!("PREFLIGHT: intent={}", report.intent));
+    lines.push(format!("docs_home: {}", report.docs_home.display()));
+    lines.push(format!("project_path: {}", report.project_path.display()));
     lines.push(String::new());
 
-    for item in &report.items {
+    lines.push("documents:".to_string());
+    if report.documents.is_empty() {
+        lines.push("  - (no documents resolved for this intent)".to_string());
+    }
+    for doc in &report.documents {
         lines.push(format!(
-            "[{}] {:<15} {} action={} reason=\"{}\"",
-            item.scope,
-            item.label,
-            item.path.display(),
-            item.action,
-            item.reason
+            "  [{}] {} status={} valid={} when=\"{}\"",
+            required_label(doc),
+            doc.path.display(),
+            doc.status,
+            doc.validation.valid,
+            doc.when
         ));
     }
 
     lines.push(String::new());
+    lines.push(render_contract_line(&report.validation));
+
+    lines.push(String::new());
     lines.push(format!(
-        "summary: created={} overwritten={} skipped={} planned_create={} planned_overwrite={} planned_skip={}",
-        report.created,
-        report.overwritten,
-        report.skipped,
-        report.planned_create,
-        report.planned_overwrite,
-        report.planned_skip
+        "summary: required_total={} satisfied_required={} missing_required={} invalid_required={} strict={}",
+        report.summary.required_total,
+        report.summary.satisfied_required,
+        report.summary.missing_required,
+        report.summary.invalid_required,
+        report.strict
     ));
 
     lines.join("\n")
+}
+
+fn render_list_text(report: &ListReport) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("docs_home: {}", report.docs_home.display()));
+    lines.push(format!("project_path: {}", report.project_path.display()));
+    lines.push(String::new());
+
+    lines.push(format!("intents: {}", report.intents.join(", ")));
+    lines.push(String::new());
+
+    lines.push("documents:".to_string());
+    if report.documents.is_empty() {
+        lines.push("  - (none)".to_string());
+    }
+    for doc in &report.documents {
+        lines.push(format!(
+            "  [{}] context={} scope={} {} status={} source={}",
+            required_label(doc),
+            doc.context,
+            doc.scope,
+            doc.path.display(),
+            doc.status,
+            doc.source
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("validation contracts:".to_string());
+    if report.validations.is_empty() {
+        lines.push("  - (none)".to_string());
+    }
+    for contract in &report.validations {
+        lines.push(format!(
+            "  context={} commands={:?}",
+            contract.context, contract.commands
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn render_contract_line(contract: &ValidationContract) -> String {
+    if !contract.declared {
+        return format!(
+            "validation contract: none declared for intent {}",
+            contract.context
+        );
+    }
+    let mut line = format!(
+        "validation contract ({}): commands={:?}",
+        contract.context, contract.commands
+    );
+    if let Some(marker) = &contract.marker {
+        line.push_str(&format!(" marker={marker}"));
+    }
+    if let Some(description) = &contract.description {
+        line.push_str(&format!(" description=\"{description}\""));
+    }
+    line
+}
+
+fn required_label(doc: &ResolvedDocument) -> &'static str {
+    if doc.required { "required" } else { "optional" }
 }

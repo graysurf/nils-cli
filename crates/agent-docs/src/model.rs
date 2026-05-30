@@ -4,54 +4,46 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum Context {
-    Startup,
-    SkillDev,
-    TaskTools,
-    ProjectDev,
-}
+/// A free-form intent identifier (for example `project-dev` or `task-tools`).
+///
+/// Contexts are declared by the catalog, not compiled into the binary, so the
+/// engine treats them as opaque kebab-case-ish identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct Context(String);
 
 impl Context {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Startup => "startup",
-            Self::SkillDev => "skill-dev",
-            Self::TaskTools => "task-tools",
-            Self::ProjectDev => "project-dev",
+    /// Validate and construct a context identifier. Allowed characters are
+    /// ASCII alphanumerics, `-`, `_`, `.`, and `/` so catalog authors can use
+    /// readable intent names without surprising the parser.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("context cannot be empty".to_string());
         }
+        if let Some(bad) = trimmed
+            .chars()
+            .find(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/')))
+        {
+            return Err(format!(
+                "context `{trimmed}` contains unsupported character `{bad}`; allowed: a-z A-Z 0-9 - _ . /"
+            ));
+        }
+        Ok(Self(trimmed.to_string()))
     }
 
-    pub const fn supported_values() -> &'static [&'static str] {
-        &["startup", "skill-dev", "task-tools", "project-dev"]
-    }
-
-    pub fn from_config_value(value: &str) -> Option<Self> {
-        match value {
-            "startup" => Some(Self::Startup),
-            "skill-dev" => Some(Self::SkillDev),
-            "task-tools" => Some(Self::TaskTools),
-            "project-dev" => Some(Self::ProjectDev),
-            _ => None,
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
 impl fmt::Display for Context {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.0)
     }
 }
 
-pub const SUPPORTED_CONTEXTS: [Context; 4] = [
-    Context::Startup,
-    Context::SkillDev,
-    Context::TaskTools,
-    Context::ProjectDev,
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Scope {
     Home,
@@ -136,39 +128,14 @@ impl fmt::Display for FallbackMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum, Default)]
 #[serde(rename_all = "kebab-case")]
-pub enum ResolveFormat {
-    #[default]
-    Text,
-    Json,
-    Checklist,
-}
-
-impl ResolveFormat {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Json => "json",
-            Self::Checklist => "checklist",
-        }
-    }
-}
-
-impl fmt::Display for ResolveFormat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum BaselineTarget {
+pub enum AuditTarget {
     Home,
     Project,
     #[default]
     All,
 }
 
-impl BaselineTarget {
+impl AuditTarget {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Home => "home",
@@ -176,9 +143,17 @@ impl BaselineTarget {
             Self::All => "all",
         }
     }
+
+    pub fn includes_scope(self, scope: Scope) -> bool {
+        match self {
+            Self::Home => matches!(scope, Scope::Home | Scope::Global),
+            Self::Project => scope == Scope::Project,
+            Self::All => true,
+        }
+    }
 }
 
-impl fmt::Display for BaselineTarget {
+impl fmt::Display for AuditTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -206,24 +181,26 @@ impl fmt::Display for DocumentStatus {
     }
 }
 
+/// Which catalog file a resolved document originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DocumentSource {
-    Builtin,
-    BuiltinFallback,
-    BuiltinOptOut,
-    ExtensionHome,
-    ExtensionProject,
+    Home,
+    Project,
 }
 
 impl DocumentSource {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Builtin => "builtin",
-            Self::BuiltinFallback => "builtin-fallback",
-            Self::BuiltinOptOut => "builtin-opt-out",
-            Self::ExtensionHome => "extension-home",
-            Self::ExtensionProject => "extension-project",
+            Self::Home => "home",
+            Self::Project => "project",
+        }
+    }
+
+    pub fn from_scope(scope: Scope) -> Self {
+        match scope {
+            Scope::Home | Scope::Global => Self::Home,
+            Scope::Project => Self::Project,
         }
     }
 }
@@ -234,176 +211,264 @@ impl fmt::Display for DocumentSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ResolvedDocument {
-    pub context: Context,
-    pub scope: Scope,
-    pub path: PathBuf,
-    pub required: bool,
-    pub status: DocumentStatus,
-    pub source: DocumentSource,
-    pub why: String,
+/// A `when` predicate: `path-exists:<glob>` atoms composed with `||` and `&&`.
+///
+/// The empty / `always` predicate is unconditionally true. `&&` binds tighter
+/// than `||`, so the predicate is an OR of AND-clauses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum When {
+    Always,
+    /// OR of AND-clauses; the predicate holds when any clause holds, and a
+    /// clause holds when every atom in it holds.
+    Any(Vec<Vec<WhenAtom>>),
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ResolveSummary {
-    pub required_total: usize,
-    pub present_required: usize,
-    pub missing_required: usize,
-}
-
-impl ResolveSummary {
-    pub fn from_documents(documents: &[ResolvedDocument]) -> Self {
-        let required_total = documents.iter().filter(|doc| doc.required).count();
-        let present_required = documents
-            .iter()
-            .filter(|doc| doc.required && doc.status == DocumentStatus::Present)
-            .count();
-        let missing_required = required_total.saturating_sub(present_required);
-
-        Self {
-            required_total,
-            present_required,
-            missing_required,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ResolveReport {
-    pub context: Context,
-    pub strict: bool,
-    pub docs_home: PathBuf,
-    pub project_path: PathBuf,
-    pub is_linked_worktree: bool,
-    pub git_common_dir: Option<PathBuf>,
-    pub primary_worktree_path: Option<PathBuf>,
-    pub documents: Vec<ResolvedDocument>,
-    pub summary: ResolveSummary,
-}
-
-impl ResolveReport {
-    pub fn has_missing_required(&self) -> bool {
-        self.summary.missing_required > 0
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct BaselineCheckItem {
-    pub scope: Scope,
-    pub context: Context,
-    pub label: String,
-    pub path: PathBuf,
-    pub required: bool,
-    pub status: DocumentStatus,
-    pub source: DocumentSource,
-    pub why: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct BaselineCheckReport {
-    pub target: BaselineTarget,
-    pub strict: bool,
-    pub docs_home: PathBuf,
-    pub project_path: PathBuf,
-    pub items: Vec<BaselineCheckItem>,
-    pub missing_required: usize,
-    pub missing_optional: usize,
-    pub suggested_actions: Vec<String>,
-}
-
-impl BaselineCheckReport {
-    pub fn from_items(
-        target: BaselineTarget,
-        strict: bool,
-        docs_home: PathBuf,
-        project_path: PathBuf,
-        items: Vec<BaselineCheckItem>,
-        suggested_actions: Vec<String>,
-    ) -> Self {
-        let missing_required = items
-            .iter()
-            .filter(|item| item.required && item.status == DocumentStatus::Missing)
-            .count();
-        let missing_optional = items
-            .iter()
-            .filter(|item| !item.required && item.status == DocumentStatus::Missing)
-            .count();
-
-        Self {
-            target,
-            strict,
-            docs_home,
-            project_path,
-            items,
-            missing_required,
-            missing_optional,
-            suggested_actions,
-        }
-    }
-
-    pub fn has_missing_required(&self) -> bool {
-        self.missing_required > 0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum DocumentWhen {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum WhenAtom {
+    /// True when at least one filesystem path matching `glob` exists under the
+    /// resolved project root.
+    PathExists { glob: String },
+    /// An explicit always-true atom (the `always` keyword).
     Always,
 }
 
-impl DocumentWhen {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Always => "always",
-        }
-    }
+/// Result of validating a resolved document's content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DocumentValidation {
+    pub exists: bool,
+    pub non_empty: bool,
+    /// `None` when no marker is declared; otherwise whether the marker string
+    /// appears in the document content.
+    pub marker_present: Option<bool>,
+    pub freshness: FreshnessCheck,
+    /// Overall verdict: a declared, required document is satisfied only when
+    /// `valid` is true.
+    pub valid: bool,
+}
 
-    pub const fn supported_values() -> &'static [&'static str] {
-        &["always"]
-    }
-
-    pub fn from_config_value(value: &str) -> Option<Self> {
-        match value {
-            "always" => Some(Self::Always),
-            _ => None,
+impl DocumentValidation {
+    pub fn missing() -> Self {
+        Self {
+            exists: false,
+            non_empty: false,
+            marker_present: None,
+            freshness: FreshnessCheck::NotDeclared,
+            valid: false,
         }
     }
 }
 
-impl fmt::Display for DocumentWhen {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FreshnessCheck {
+    /// No `last-reviewed-within-days` declared for this entry.
+    NotDeclared,
+    /// Declared and the document carries a recent enough `last-reviewed` date.
+    Fresh,
+    /// Declared but the document's `last-reviewed` date is too old.
+    Stale,
+    /// Declared but no parseable `last-reviewed: YYYY-MM-DD` line was found.
+    Unknown,
+}
+
+impl FreshnessCheck {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDeclared => "not-declared",
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// A freshness verdict passes unless it is explicitly stale or unknown for a
+    /// declared freshness requirement.
+    pub const fn passes(self) -> bool {
+        matches!(self, Self::NotDeclared | Self::Fresh)
+    }
+}
+
+impl fmt::Display for FreshnessCheck {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
+/// A document required (or conditionally required) for a given intent, after
+/// `when` evaluation and content validation.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedDocument {
+    pub context: Context,
+    pub scope: Scope,
+    pub path: PathBuf,
+    /// Whether the catalog marked the entry `required = true`.
+    pub declared_required: bool,
+    /// Whether the entry is required for this run (`declared_required` AND the
+    /// `when` predicate evaluated true).
+    pub required: bool,
+    pub when: String,
+    pub when_satisfied: bool,
+    pub status: DocumentStatus,
+    pub validation: DocumentValidation,
+    pub source: DocumentSource,
+    pub why: String,
+    /// Document content, populated by `preflight` content emission only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+impl ResolvedDocument {
+    /// A required document is satisfied when it exists and passes validation.
+    pub fn satisfied(&self) -> bool {
+        !self.required || (self.status == DocumentStatus::Present && self.validation.valid)
+    }
+}
+
+/// The per-repo validation contract for an intent, resolved from `[[validation]]`
+/// catalog entries.
+#[derive(Debug, Clone, Serialize)]
+pub struct ValidationContract {
+    pub context: Context,
+    pub declared: bool,
+    pub commands: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolveSummary {
+    pub required_total: usize,
+    pub satisfied_required: usize,
+    pub missing_required: usize,
+    pub invalid_required: usize,
+}
+
+impl ResolveSummary {
+    pub fn from_documents(documents: &[ResolvedDocument]) -> Self {
+        let required: Vec<&ResolvedDocument> =
+            documents.iter().filter(|doc| doc.required).collect();
+        let required_total = required.len();
+        let satisfied_required = required.iter().filter(|doc| doc.satisfied()).count();
+        let missing_required = required
+            .iter()
+            .filter(|doc| doc.status == DocumentStatus::Missing)
+            .count();
+        let invalid_required = required
+            .iter()
+            .filter(|doc| doc.status == DocumentStatus::Present && !doc.validation.valid)
+            .count();
+
+        Self {
+            required_total,
+            satisfied_required,
+            missing_required,
+            invalid_required,
+        }
+    }
+
+    pub fn all_satisfied(&self) -> bool {
+        self.required_total == self.satisfied_required
+    }
+}
+
+/// The output of `preflight --intent X`: the resolved doc set plus the
+/// validation contract for that intent.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreflightReport {
+    pub schema_version: &'static str,
+    pub intent: Context,
+    pub strict: bool,
+    pub docs_home: PathBuf,
+    pub project_path: PathBuf,
+    pub is_linked_worktree: bool,
+    pub documents: Vec<ResolvedDocument>,
+    pub validation: ValidationContract,
+    pub summary: ResolveSummary,
+}
+
+impl PreflightReport {
+    pub const SCHEMA_VERSION: &'static str = "agent-docs.preflight.v1";
+
+    pub fn has_unsatisfied_required(&self) -> bool {
+        !self.summary.all_satisfied()
+    }
+}
+
+/// A single wiring check performed by `audit` (for example, "is the
+/// `~/.claude/CLAUDE.md` symlink intact and pointing at the docs-home?").
+#[derive(Debug, Clone, Serialize)]
+pub struct WiringCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditReport {
+    pub schema_version: &'static str,
+    pub target: AuditTarget,
+    pub strict: bool,
+    pub docs_home: PathBuf,
+    pub project_path: PathBuf,
+    pub wiring: Vec<WiringCheck>,
+    pub documents: Vec<ResolvedDocument>,
+    pub problems: usize,
+    pub suggested_actions: Vec<String>,
+}
+
+impl AuditReport {
+    pub const SCHEMA_VERSION: &'static str = "agent-docs.audit.v1";
+
+    pub fn has_problems(&self) -> bool {
+        self.problems > 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Catalog (parsed AGENT_DOCS.toml) types
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ConfigDocumentEntry {
+pub struct DocumentEntry {
     pub context: Context,
     pub scope: Scope,
     pub path: PathBuf,
     pub required: bool,
-    pub when: DocumentWhen,
+    pub when: When,
+    /// The raw `when` string as written in the catalog (for display / audit).
+    pub when_raw: String,
+    pub marker: Option<String>,
+    pub freshness_days: Option<u64>,
     pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ConfigScopeFile {
+pub struct ValidationEntry {
+    pub context: Context,
+    pub commands: Vec<String>,
+    pub marker: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScopeCatalog {
     pub source_scope: Scope,
     pub root: PathBuf,
     pub file_path: PathBuf,
-    pub documents: Vec<ConfigDocumentEntry>,
+    pub documents: Vec<DocumentEntry>,
+    pub validations: Vec<ValidationEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
-pub struct LoadedConfigs {
-    pub home: Option<ConfigScopeFile>,
-    pub project: Option<ConfigScopeFile>,
+pub struct LoadedCatalog {
+    pub home: Option<ScopeCatalog>,
+    pub project: Option<ScopeCatalog>,
 }
 
-impl LoadedConfigs {
-    pub fn in_load_order(&self) -> Vec<&ConfigScopeFile> {
+impl LoadedCatalog {
+    pub fn in_load_order(&self) -> Vec<&ScopeCatalog> {
         let mut ordered = Vec::new();
         if let Some(home) = self.home.as_ref() {
             ordered.push(home);
@@ -414,6 +479,10 @@ impl LoadedConfigs {
         ordered
     }
 }
+
+// ---------------------------------------------------------------------------
+// Config-load errors
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -449,9 +518,13 @@ pub struct ConfigErrorLocation {
 pub struct ConfigLoadError {
     pub kind: ConfigErrorKind,
     pub file_path: PathBuf,
-    pub document_index: Option<usize>,
+    /// The catalog array this error belongs to (for example `document` or
+    /// `validation`), when applicable.
+    pub section: Option<&'static str>,
+    pub entry_index: Option<usize>,
     pub field: Option<String>,
-    pub location: Option<ConfigErrorLocation>,
+    // Boxed to keep the error variant small (clippy::result_large_err).
+    pub location: Option<Box<ConfigErrorLocation>>,
     pub message: String,
 }
 
@@ -460,7 +533,8 @@ impl ConfigLoadError {
         Self {
             kind: ConfigErrorKind::Io,
             file_path,
-            document_index: None,
+            section: None,
+            entry_index: None,
             field: None,
             location: None,
             message: message.into(),
@@ -475,23 +549,26 @@ impl ConfigLoadError {
         Self {
             kind: ConfigErrorKind::Parse,
             file_path,
-            document_index: None,
+            section: None,
+            entry_index: None,
             field: None,
-            location,
+            location: location.map(Box::new),
             message: message.into(),
         }
     }
 
     pub fn validation(
         file_path: PathBuf,
-        document_index: usize,
+        section: &'static str,
+        entry_index: usize,
         field: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
         Self {
             kind: ConfigErrorKind::Validation,
             file_path,
-            document_index: Some(document_index),
+            section: Some(section),
+            entry_index: Some(entry_index),
             field: Some(field.into()),
             location: None,
             message: message.into(),
@@ -506,7 +583,8 @@ impl ConfigLoadError {
         Self {
             kind: ConfigErrorKind::Validation,
             file_path,
-            document_index: None,
+            section: None,
+            entry_index: None,
             field: Some(field.into()),
             location: None,
             message: message.into(),
@@ -516,97 +594,102 @@ impl ConfigLoadError {
 
 impl fmt::Display for ConfigLoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.document_index, self.field.as_deref(), self.location) {
-            (Some(index), Some(field), Some(location)) => write!(
-                f,
-                "{}:{}:{} [{}] document[{index}].{field}: {}",
-                self.file_path.display(),
-                location.line,
-                location.column,
-                self.kind,
-                self.message
-            ),
-            (Some(index), Some(field), None) => write!(
-                f,
-                "{} [{}] document[{index}].{field}: {}",
-                self.file_path.display(),
-                self.kind,
-                self.message
-            ),
-            (None, None, Some(location)) => write!(
-                f,
-                "{}:{}:{} [{}]: {}",
-                self.file_path.display(),
-                location.line,
-                location.column,
-                self.kind,
-                self.message
-            ),
-            (None, Some(field), Some(location)) => write!(
-                f,
-                "{}:{}:{} [{}] {field}: {}",
-                self.file_path.display(),
-                location.line,
-                location.column,
-                self.kind,
-                self.message
-            ),
-            (None, Some(field), None) => write!(
-                f,
-                "{} [{}] {field}: {}",
-                self.file_path.display(),
-                self.kind,
-                self.message
-            ),
-            _ => write!(
-                f,
-                "{} [{}]: {}",
-                self.file_path.display(),
-                self.kind,
-                self.message
-            ),
+        write!(f, "{}", self.file_path.display())?;
+        if let Some(location) = &self.location {
+            write!(f, ":{}:{}", location.line, location.column)?;
         }
+        write!(f, " [{}]", self.kind)?;
+        match (self.section, self.entry_index, self.field.as_deref()) {
+            (Some(section), Some(index), Some(field)) => {
+                write!(f, " {section}[{index}].{field}")?;
+            }
+            (Some(section), Some(index), None) => {
+                write!(f, " {section}[{index}]")?;
+            }
+            (_, _, Some(field)) => {
+                write!(f, " {field}")?;
+            }
+            _ => {}
+        }
+        write!(f, ": {}", self.message)
     }
 }
 
 impl std::error::Error for ConfigLoadError {}
 
+// ---------------------------------------------------------------------------
+// init / list / remove report types
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum AddDocumentAction {
-    Inserted,
-    Updated,
+pub enum InitMode {
+    Print,
+    DryRun,
+    Write,
 }
 
-impl AddDocumentAction {
+impl InitMode {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Inserted => "inserted",
-            Self::Updated => "updated",
+            Self::Print => "print",
+            Self::DryRun => "dry-run",
+            Self::Write => "write",
         }
     }
 }
 
-impl fmt::Display for AddDocumentAction {
+impl fmt::Display for InitMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AddDocumentReport {
-    pub target: Scope,
-    pub target_root: PathBuf,
-    pub config_path: PathBuf,
-    pub created_config: bool,
-    pub action: AddDocumentAction,
-    pub entry: ConfigDocumentEntry,
-    pub document_count: usize,
+#[derive(Debug, Clone, Serialize)]
+pub struct InitReport {
+    pub mode: InitMode,
+    pub target_path: PathBuf,
+    pub wrote: bool,
+    pub stub: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct StubReport {
-    pub command: String,
-    pub implemented: bool,
-    pub message: String,
+pub struct ListReport {
+    pub docs_home: PathBuf,
+    pub project_path: PathBuf,
+    pub intents: Vec<String>,
+    pub documents: Vec<ResolvedDocument>,
+    pub validations: Vec<ValidationContract>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoveOutcome {
+    Removed,
+    NotFound,
+}
+
+impl RemoveOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::NotFound => "not-found",
+        }
+    }
+}
+
+impl fmt::Display for RemoveOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoveReport {
+    pub config_path: PathBuf,
+    pub outcome: RemoveOutcome,
+    pub context: String,
+    pub scope: Scope,
+    pub path: PathBuf,
+    pub remaining_documents: usize,
 }

@@ -5,63 +5,58 @@ use toml::Value;
 
 use crate::env::ResolvedRoots;
 use crate::model::{
-    ConfigDocumentEntry, ConfigErrorLocation, ConfigLoadError, ConfigScopeFile, Context,
-    DocumentWhen, LoadedConfigs, Scope,
+    ConfigErrorLocation, ConfigLoadError, Context, DocumentEntry, LoadedCatalog, Scope,
+    ScopeCatalog, ValidationEntry, When,
 };
+use crate::predicate::parse_when;
 
 pub const CONFIG_FILE_NAME: &str = "AGENT_DOCS.toml";
 
-const ALLOWED_DOCUMENT_FIELDS: [&str; 6] =
-    ["context", "scope", "path", "required", "when", "notes"];
+const ALLOWED_DOCUMENT_FIELDS: [&str; 8] = [
+    "context",
+    "scope",
+    "path",
+    "required",
+    "when",
+    "marker",
+    "last-reviewed-within-days",
+    "notes",
+];
+
+const ALLOWED_VALIDATION_FIELDS: [&str; 4] = ["context", "commands", "marker", "description"];
 
 pub fn config_path_for_root(root: &Path) -> PathBuf {
     root.join(CONFIG_FILE_NAME)
 }
 
-pub fn load_configs_from_roots(roots: &ResolvedRoots) -> Result<LoadedConfigs, ConfigLoadError> {
-    load_configs(&roots.docs_home, &roots.project_path)
+pub fn load_catalog_from_roots(roots: &ResolvedRoots) -> Result<LoadedCatalog, ConfigLoadError> {
+    load_catalog(&roots.docs_home, &roots.project_path)
 }
 
-pub fn load_configs(
+pub fn load_catalog(
     docs_home: &Path,
     project_path: &Path,
-) -> Result<LoadedConfigs, ConfigLoadError> {
-    let home = load_scope_config(Scope::Home, docs_home)?;
-    let project_global_handling = if same_config_file(docs_home, project_path) {
-        ProjectGlobalHandling::Skip
-    } else {
-        ProjectGlobalHandling::Reject
-    };
-    let project = load_scope_config_with_project_global_handling(
-        Scope::Project,
-        project_path,
-        project_global_handling,
-    )?;
-    Ok(LoadedConfigs { home, project })
+) -> Result<LoadedCatalog, ConfigLoadError> {
+    let home = load_scope_catalog(Scope::Home, docs_home)?;
+
+    // When the docs-home and project share the same catalog file (a repo that
+    // is its own docs-home, e.g. the kit itself), load it once as the home
+    // catalog and leave the project slot empty to avoid duplicate entries.
+    if same_config_file(docs_home, project_path) {
+        return Ok(LoadedCatalog {
+            home,
+            project: None,
+        });
+    }
+
+    let project = load_scope_catalog(Scope::Project, project_path)?;
+    Ok(LoadedCatalog { home, project })
 }
 
-pub fn load_scope_config(
+pub fn load_scope_catalog(
     source_scope: Scope,
     root: &Path,
-) -> Result<Option<ConfigScopeFile>, ConfigLoadError> {
-    load_scope_config_with_project_global_handling(
-        source_scope,
-        root,
-        ProjectGlobalHandling::Reject,
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectGlobalHandling {
-    Reject,
-    Skip,
-}
-
-fn load_scope_config_with_project_global_handling(
-    source_scope: Scope,
-    root: &Path,
-    project_global_handling: ProjectGlobalHandling,
-) -> Result<Option<ConfigScopeFile>, ConfigLoadError> {
+) -> Result<Option<ScopeCatalog>, ConfigLoadError> {
     let file_path = config_path_for_root(root);
     if !file_path.exists() {
         return Ok(None);
@@ -70,17 +65,19 @@ fn load_scope_config_with_project_global_handling(
     let raw = fs::read_to_string(&file_path).map_err(|err| {
         ConfigLoadError::io(
             file_path.clone(),
-            format!("failed to read {}: {err}", CONFIG_FILE_NAME),
+            format!("failed to read {CONFIG_FILE_NAME}: {err}"),
         )
     })?;
     let parsed = parse_toml(&file_path, &raw)?;
-    let documents = parse_documents(source_scope, &file_path, &parsed, project_global_handling)?;
+    let documents = parse_documents(source_scope, &file_path, &parsed)?;
+    let validations = parse_validations(&file_path, &parsed)?;
 
-    Ok(Some(ConfigScopeFile {
+    Ok(Some(ScopeCatalog {
         source_scope,
         root: root.to_path_buf(),
         file_path,
         documents,
+        validations,
     }))
 }
 
@@ -98,29 +95,38 @@ fn parse_toml(file_path: &Path, raw: &str) -> Result<Value, ConfigLoadError> {
         .map_err(|err| parse_error(file_path, raw, &err))
 }
 
+fn array_of_tables<'a>(
+    parsed: &'a Value,
+    file_path: &Path,
+    key: &str,
+) -> Result<Option<&'a Vec<Value>>, ConfigLoadError> {
+    let Some(root_table) = parsed.as_table() else {
+        return Err(ConfigLoadError::validation_root(
+            file_path.to_path_buf(),
+            key,
+            "root TOML value must be a table",
+        ));
+    };
+    let Some(value) = root_table.get(key) else {
+        return Ok(None);
+    };
+    let Some(array) = value.as_array() else {
+        return Err(ConfigLoadError::validation_root(
+            file_path.to_path_buf(),
+            key,
+            format!("key `{key}` must be an array of [[{key}]] tables"),
+        ));
+    };
+    Ok(Some(array))
+}
+
 fn parse_documents(
     source_scope: Scope,
     file_path: &Path,
     parsed: &Value,
-    project_global_handling: ProjectGlobalHandling,
-) -> Result<Vec<ConfigDocumentEntry>, ConfigLoadError> {
-    let Some(root_table) = parsed.as_table() else {
-        return Err(ConfigLoadError::validation_root(
-            file_path.to_path_buf(),
-            "document",
-            "root TOML value must be a table",
-        ));
-    };
-
-    let Some(raw_documents) = root_table.get("document") else {
+) -> Result<Vec<DocumentEntry>, ConfigLoadError> {
+    let Some(raw_documents) = array_of_tables(parsed, file_path, "document")? else {
         return Ok(Vec::new());
-    };
-    let Some(raw_documents) = raw_documents.as_array() else {
-        return Err(ConfigLoadError::validation_root(
-            file_path.to_path_buf(),
-            "document",
-            "key `document` must be an array of [[document]] tables",
-        ));
     };
 
     let mut documents = Vec::with_capacity(raw_documents.len());
@@ -128,30 +134,39 @@ fn parse_documents(
         let Some(table) = raw_document.as_table() else {
             return Err(ConfigLoadError::validation(
                 file_path.to_path_buf(),
+                "document",
                 index,
                 "document",
                 "entry must be a TOML table declared with [[document]]",
             ));
         };
 
-        validate_unknown_fields(file_path, index, table)?;
-        let context = parse_context(file_path, index, table)?;
+        validate_unknown_fields(
+            file_path,
+            "document",
+            index,
+            table,
+            &ALLOWED_DOCUMENT_FIELDS,
+        )?;
+        let context = parse_context(file_path, "document", index, table)?;
         let scope = parse_scope(file_path, index, table)?;
-        if should_skip_scope_for_source(source_scope, scope, project_global_handling) {
-            continue;
-        }
         validate_scope_for_source(source_scope, scope, file_path, index)?;
         let path = parse_path(file_path, index, table)?;
-        let required = parse_required(file_path, index, table)?;
-        let when = parse_when(file_path, index, table)?;
-        let notes = parse_notes(file_path, index, table)?;
+        let required = parse_bool(file_path, index, table, "required")?.unwrap_or(false);
+        let (when, when_raw) = parse_when_field(file_path, index, table)?;
+        let marker = parse_opt_string(file_path, "document", index, table, "marker")?;
+        let freshness_days = parse_u64(file_path, index, table, "last-reviewed-within-days")?;
+        let notes = parse_opt_string(file_path, "document", index, table, "notes")?;
 
-        documents.push(ConfigDocumentEntry {
+        documents.push(DocumentEntry {
             context,
             scope,
             path,
             required,
             when,
+            when_raw,
+            marker,
+            freshness_days,
             notes,
         });
     }
@@ -159,14 +174,47 @@ fn parse_documents(
     Ok(documents)
 }
 
-fn should_skip_scope_for_source(
-    source_scope: Scope,
-    document_scope: Scope,
-    project_global_handling: ProjectGlobalHandling,
-) -> bool {
-    source_scope == Scope::Project
-        && document_scope == Scope::Global
-        && project_global_handling == ProjectGlobalHandling::Skip
+fn parse_validations(
+    file_path: &Path,
+    parsed: &Value,
+) -> Result<Vec<ValidationEntry>, ConfigLoadError> {
+    let Some(raw_validations) = array_of_tables(parsed, file_path, "validation")? else {
+        return Ok(Vec::new());
+    };
+
+    let mut validations = Vec::with_capacity(raw_validations.len());
+    for (index, raw_validation) in raw_validations.iter().enumerate() {
+        let Some(table) = raw_validation.as_table() else {
+            return Err(ConfigLoadError::validation(
+                file_path.to_path_buf(),
+                "validation",
+                index,
+                "validation",
+                "entry must be a TOML table declared with [[validation]]",
+            ));
+        };
+
+        validate_unknown_fields(
+            file_path,
+            "validation",
+            index,
+            table,
+            &ALLOWED_VALIDATION_FIELDS,
+        )?;
+        let context = parse_context(file_path, "validation", index, table)?;
+        let commands = parse_commands(file_path, index, table)?;
+        let marker = parse_opt_string(file_path, "validation", index, table, "marker")?;
+        let description = parse_opt_string(file_path, "validation", index, table, "description")?;
+
+        validations.push(ValidationEntry {
+            context,
+            commands,
+            marker,
+            description,
+        });
+    }
+
+    Ok(validations)
 }
 
 fn validate_scope_for_source(
@@ -178,29 +226,32 @@ fn validate_scope_for_source(
     if source_scope == Scope::Project && document_scope == Scope::Global {
         return Err(ConfigLoadError::validation(
             file_path.to_path_buf(),
+            "document",
             index,
             "scope",
             "global scope is allowed only in the home catalog; use scope = \"project\" for project-local requirements",
         ));
     }
-
     Ok(())
 }
 
 fn validate_unknown_fields(
     file_path: &Path,
+    section: &'static str,
     index: usize,
     table: &toml::map::Map<String, Value>,
+    allowed: &[&str],
 ) -> Result<(), ConfigLoadError> {
     for key in table.keys() {
-        if !ALLOWED_DOCUMENT_FIELDS.contains(&key.as_str()) {
+        if !allowed.contains(&key.as_str()) {
             return Err(ConfigLoadError::validation(
                 file_path.to_path_buf(),
+                section,
                 index,
                 key,
                 format!(
                     "unsupported field `{key}`; allowed fields: {}",
-                    ALLOWED_DOCUMENT_FIELDS.join(", ")
+                    allowed.join(", ")
                 ),
             ));
         }
@@ -210,20 +261,13 @@ fn validate_unknown_fields(
 
 fn parse_context(
     file_path: &Path,
+    section: &'static str,
     index: usize,
     table: &toml::map::Map<String, Value>,
 ) -> Result<Context, ConfigLoadError> {
-    let raw = required_string(file_path, index, table, "context")?;
-    Context::from_config_value(raw).ok_or_else(|| {
-        ConfigLoadError::validation(
-            file_path.to_path_buf(),
-            index,
-            "context",
-            format!(
-                "unsupported context `{raw}`; allowed: {}",
-                Context::supported_values().join(", ")
-            ),
-        )
+    let raw = required_string(file_path, section, index, table, "context")?;
+    Context::parse(raw).map_err(|message| {
+        ConfigLoadError::validation(file_path.to_path_buf(), section, index, "context", message)
     })
 }
 
@@ -232,10 +276,11 @@ fn parse_scope(
     index: usize,
     table: &toml::map::Map<String, Value>,
 ) -> Result<Scope, ConfigLoadError> {
-    let raw = required_string(file_path, index, table, "scope")?;
+    let raw = required_string(file_path, "document", index, table, "scope")?;
     Scope::from_config_value(raw).ok_or_else(|| {
         ConfigLoadError::validation(
             file_path.to_path_buf(),
+            "document",
             index,
             "scope",
             format!(
@@ -251,11 +296,12 @@ fn parse_path(
     index: usize,
     table: &toml::map::Map<String, Value>,
 ) -> Result<PathBuf, ConfigLoadError> {
-    let raw = required_string(file_path, index, table, "path")?;
+    let raw = required_string(file_path, "document", index, table, "path")?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(ConfigLoadError::validation(
             file_path.to_path_buf(),
+            "document",
             index,
             "path",
             "path cannot be empty",
@@ -264,38 +310,17 @@ fn parse_path(
     Ok(PathBuf::from(trimmed))
 }
 
-fn parse_required(
+fn parse_when_field(
     file_path: &Path,
     index: usize,
     table: &toml::map::Map<String, Value>,
-) -> Result<bool, ConfigLoadError> {
-    let Some(value) = table.get("required") else {
-        return Ok(false);
-    };
-    let Some(required) = value.as_bool() else {
-        return Err(ConfigLoadError::validation(
-            file_path.to_path_buf(),
-            index,
-            "required",
-            format!(
-                "invalid type for `required`: expected boolean, found {}",
-                value_type(value)
-            ),
-        ));
-    };
-    Ok(required)
-}
-
-fn parse_when(
-    file_path: &Path,
-    index: usize,
-    table: &toml::map::Map<String, Value>,
-) -> Result<DocumentWhen, ConfigLoadError> {
-    let when_value = match table.get("when") {
+) -> Result<(When, String), ConfigLoadError> {
+    let raw = match table.get("when") {
         Some(value) => {
             let Some(value) = value.as_str() else {
                 return Err(ConfigLoadError::validation(
                     file_path.to_path_buf(),
+                    "document",
                     index,
                     "when",
                     format!(
@@ -304,48 +329,166 @@ fn parse_when(
                     ),
                 ));
             };
-            value
+            value.to_string()
         }
-        None => "always",
+        None => "always".to_string(),
     };
 
-    DocumentWhen::from_config_value(when_value).ok_or_else(|| {
-        ConfigLoadError::validation(
-            file_path.to_path_buf(),
-            index,
-            "when",
-            format!(
-                "unsupported when value `{when_value}`; allowed: {}",
-                DocumentWhen::supported_values().join(", ")
-            ),
-        )
-    })
+    let when = parse_when(&raw).map_err(|message| {
+        ConfigLoadError::validation(file_path.to_path_buf(), "document", index, "when", message)
+    })?;
+    Ok((when, raw))
 }
 
-fn parse_notes(
+fn parse_commands(
     file_path: &Path,
     index: usize,
     table: &toml::map::Map<String, Value>,
-) -> Result<Option<String>, ConfigLoadError> {
-    let Some(value) = table.get("notes") else {
-        return Ok(None);
-    };
-    let Some(notes) = value.as_str() else {
+) -> Result<Vec<String>, ConfigLoadError> {
+    let Some(value) = table.get("commands") else {
         return Err(ConfigLoadError::validation(
             file_path.to_path_buf(),
+            "validation",
             index,
-            "notes",
+            "commands",
+            "missing required field `commands`",
+        ));
+    };
+    let Some(array) = value.as_array() else {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            "validation",
+            index,
+            "commands",
             format!(
-                "invalid type for `notes`: expected string, found {}",
+                "invalid type for `commands`: expected array of strings, found {}",
                 value_type(value)
             ),
         ));
     };
-    Ok(Some(notes.to_string()))
+    if array.is_empty() {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            "validation",
+            index,
+            "commands",
+            "`commands` must list at least one command",
+        ));
+    }
+    let mut commands = Vec::with_capacity(array.len());
+    for item in array {
+        let Some(command) = item.as_str() else {
+            return Err(ConfigLoadError::validation(
+                file_path.to_path_buf(),
+                "validation",
+                index,
+                "commands",
+                format!(
+                    "invalid command entry: expected string, found {}",
+                    value_type(item)
+                ),
+            ));
+        };
+        let command = command.trim();
+        if command.is_empty() {
+            return Err(ConfigLoadError::validation(
+                file_path.to_path_buf(),
+                "validation",
+                index,
+                "commands",
+                "command entries cannot be empty",
+            ));
+        }
+        commands.push(command.to_string());
+    }
+    Ok(commands)
+}
+
+fn parse_bool(
+    file_path: &Path,
+    index: usize,
+    table: &toml::map::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<bool>, ConfigLoadError> {
+    let Some(value) = table.get(field) else {
+        return Ok(None);
+    };
+    let Some(parsed) = value.as_bool() else {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            "document",
+            index,
+            field,
+            format!(
+                "invalid type for `{field}`: expected boolean, found {}",
+                value_type(value)
+            ),
+        ));
+    };
+    Ok(Some(parsed))
+}
+
+fn parse_u64(
+    file_path: &Path,
+    index: usize,
+    table: &toml::map::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<u64>, ConfigLoadError> {
+    let Some(value) = table.get(field) else {
+        return Ok(None);
+    };
+    let Some(parsed) = value.as_integer() else {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            "document",
+            index,
+            field,
+            format!(
+                "invalid type for `{field}`: expected positive integer, found {}",
+                value_type(value)
+            ),
+        ));
+    };
+    if parsed <= 0 {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            "document",
+            index,
+            field,
+            format!("`{field}` must be a positive integer (days)"),
+        ));
+    }
+    Ok(Some(parsed as u64))
+}
+
+fn parse_opt_string(
+    file_path: &Path,
+    section: &'static str,
+    index: usize,
+    table: &toml::map::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<String>, ConfigLoadError> {
+    let Some(value) = table.get(field) else {
+        return Ok(None);
+    };
+    let Some(text) = value.as_str() else {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            section,
+            index,
+            field,
+            format!(
+                "invalid type for `{field}`: expected string, found {}",
+                value_type(value)
+            ),
+        ));
+    };
+    Ok(Some(text.to_string()))
 }
 
 fn required_string<'a>(
     file_path: &Path,
+    section: &'static str,
     index: usize,
     table: &'a toml::map::Map<String, Value>,
     field: &'static str,
@@ -353,6 +496,7 @@ fn required_string<'a>(
     let Some(value) = table.get(field) else {
         return Err(ConfigLoadError::validation(
             file_path.to_path_buf(),
+            section,
             index,
             field,
             format!("missing required field `{field}`"),
@@ -361,6 +505,7 @@ fn required_string<'a>(
     let Some(value) = value.as_str() else {
         return Err(ConfigLoadError::validation(
             file_path.to_path_buf(),
+            section,
             index,
             field,
             format!(

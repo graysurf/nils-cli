@@ -2,642 +2,258 @@
 
 ## Overview
 
-`agent-docs` is a deterministic policy-document discovery CLI for Codex/agent workflows.
+`agent-docs` resolves and audits the documents and validation contract a
+repository declares in its `AGENT_DOCS.toml` catalog. Policy is **data the repo
+owns**; the binary is a generic resolver and auditor with no hardcoded required
+documents.
 
-It resolves required Markdown documents by context and scope, with explicit precedence rules for:
+It is built for two non-agent-facing jobs:
 
-- startup policy files (`AGENTS.override.md` > `AGENTS.md`)
-- home, global, and project extension config (`AGENT_DOCS.toml`)
-- strict vs non-strict missing-doc behavior
+- `audit` — repo health: install-symlink wiring, declared-doc presence and
+  content validity, and catalog validity, for CI and a daily healthcheck.
+- `preflight --intent X` — resolve what THIS repo requires for an intent (the
+  document set and the per-repo validation contract), emitted in a versioned
+  JSON shape that consuming hooks inject and enforce.
 
-The CLI does not replace runtime `AGENTS.md` loading. It provides a testable resolution contract.
+Plus catalog management: `init` / `explain` / `list` / `remove`.
 
-## Non-goals
+The agent does not run a per-task `agent-docs` preflight: always-on policy is
+delivered by the harness (auto-loaded prompt files), intent docs are
+hook-injected, and enforcement happens at the finish line. See the cross-repo
+design in `graysurf/agent-runtime-kit`
+(`docs/plans/2026-05-30-agent-docs-redesign/`).
 
-- Replacing or bypassing how any runtime natively loads `AGENTS.md`.
-- Auto-editing arbitrary existing policy files in-place.
-- Discovering non-markdown policy files without explicit `AGENT_DOCS.toml` entries.
-- Remote policy sync or network-backed policy lookups.
+## Command surface
 
-## Path Resolution Precedence
+| Command | Purpose |
+| --- | --- |
+| `audit` | Repo health: wiring + declared-doc validity + catalog validity. |
+| `preflight --intent X` | Resolve the doc set + validation contract for an intent (JSON for hooks). |
+| `init` | Emit an annotated project-local override stub. |
+| `explain` | Explain what an intent resolves to and why. |
+| `list` | List declared documents, validation contracts, and intents. |
+| `remove` | Remove a `[[document]]` entry from the project catalog. |
+| `completion` | Generate shell completion scripts. |
 
-Path resolution is deterministic and applies to all commands.
+There are no `resolve` / `baseline` / `scaffold-*` / `add` / `contexts`
+commands and no `startup` per-task context — they were retired in the engine
+redesign.
 
-### `AGENT_DOCS_HOME`
+### Global options
 
-1. `--docs-home <path>` (command flag)
-2. `AGENT_DOCS_HOME` environment variable
+- `--docs-home <PATH>` — override the docs-home root.
+- `--project-path <PATH>` — override the project root.
+- `--worktree-fallback <auto|local-only>` — linked-worktree fallback mode.
 
-If neither is provided, the binary errors with
-`AGENT_DOCS_HOME is required; set AGENT_DOCS_HOME or pass --docs-home`.
+## docs-home resolution
 
-> The previous `--agent-home` flag and `AGENT_HOME` env var were retired in
-> this release; no fallback is shipped. Adapters that previously exported
-> `AGENT_HOME` to drive `agent-docs` must rename it to `AGENT_DOCS_HOME` (or
-> pass `--docs-home`) when upgrading.
+When `--docs-home` is omitted, the docs-home is resolved in this order:
 
-### `PROJECT_PATH`
+1. `--docs-home <PATH>` flag.
+2. The install symlink: the directory that `~/.claude/CLAUDE.md` (or the Codex
+   equivalent `~/.codex/AGENTS.md`) resolves to, i.e.
+   `dirname(readlink ~/.claude/CLAUDE.md)`.
+3. The legacy `AGENT_DOCS_HOME` environment variable.
+4. Otherwise a clear error instructing the caller to pass `--docs-home`.
 
-1. `--project-path <path>` (command flag)
-2. `PROJECT_PATH` environment variable
-3. `git rev-parse --show-toplevel` from current working directory
-4. current working directory
+`audit` reports the symlink wiring (intact / mismatch / missing) so a broken
+install surfaces instead of failing silently.
 
-### Normalization Rules
+## Catalog model
 
-- Paths are normalized lexically (`.` removed, duplicate separators collapsed).
-- Relative document paths in `AGENT_DOCS.toml` are resolved from their declared `scope` root.
-  `home` and `global` resolve from `AGENT_DOCS_HOME`; `project` resolves from
-  `PROJECT_PATH`.
-- Absolute document paths are kept absolute and ignore scope root joining.
+Two catalog files are loaded and merged: the **docs-home** catalog
+(`<docs_home>/AGENT_DOCS.toml`, the shared defaults a repo inherits) and the
+**project** catalog (`<project>/AGENT_DOCS.toml`, per-repo overrides). When the
+docs-home and project are the same directory the file is loaded once.
 
-## Scope and Context Model
+A catalog declares two array-of-tables sections:
+
+```toml
+# A required (or conditionally required) document.
+[[document]]
+context  = "project-dev"            # free-form intent identifier
+scope    = "project"                # home | project | global
+path     = "DEVELOPMENT.md"         # relative to the scope root
+required = true                     # default: false
+when     = "path-exists:Cargo.toml" # default: always (see grammar below)
+marker   = "## Validation"          # optional: content must contain this string
+last-reviewed-within-days = 180     # optional freshness window
+notes    = "why this document matters"
+
+# A per-intent validation contract.
+[[validation]]
+context     = "project-dev"
+commands    = ["bash scripts/ci/all.sh"]   # run before declaring done
+marker      = "target/.agent-validation-ok" # optional finish-line marker
+description = "Run the full check stack before delivery."
+```
 
 ### Scopes
 
-- `home`: rooted at effective `AGENT_DOCS_HOME`
-- `project`: rooted at effective `PROJECT_PATH`
-- `global`: rooted at effective `AGENT_DOCS_HOME` and inherited from the home catalog by every project repo
+- `home` / `global` — resolved against the docs-home root. `global` is allowed
+  only in the docs-home catalog (it is a cross-repo pointer that applies to all
+  projects).
+- `project` — resolved against the project root.
 
-Home-catalog `scope = "project"` entries apply only when `AGENT_DOCS_HOME` and
-`PROJECT_PATH` identify the same Git repository, including linked worktrees.
-Project-local `AGENT_DOCS.toml` files cannot declare `scope = "global"`.
+### Contexts (intents)
 
-### Built-in contexts
+Contexts are free-form identifiers (ASCII alphanumerics plus `-_./`) declared
+by the catalog; they are not compiled in. `preflight --intent X` resolves every
+document and validation entry whose `context` equals `X`.
 
-- `startup`
-- `skill-dev`
-- `task-tools`
-- `project-dev`
+### `when` grammar
 
-### Built-in required docs by context
-
-| Context       | Scope     | Required document contract                              | Required |
-| ------------- | --------- | ------------------------------------------------------- | -------- |
-| `startup`     | `home`    | Use `AGENTS.override.md` when present; else `AGENTS.md` | `true`   |
-| `startup`     | `project` | Use `AGENTS.override.md` when present; else `AGENTS.md` | `true`   |
-| `skill-dev`   | `home`    | `DEVELOPMENT.md`                                        | `true`   |
-| `task-tools`  | `home`    | `core/policies/cli-tools.md`                            | `true`   |
-| `project-dev` | `project` | `DEVELOPMENT.md`                                        | `true`   |
-
-`AGENTS.override.md` precedence is evaluated per scope independently.
-
-### Opting out of a built-in requirement
-
-A project can opt out of a non-`startup` built-in requirement by declaring a
-matching `[[document]]` entry with `required = false` for the built-in's own
-`(context, scope, path)` key in its `AGENT_DOCS.toml`. The built-in is then
-downgraded to optional in both `resolve` and `baseline --check` output with
-`source = builtin-opt-out`, so it no longer counts toward `missing_required`
-while staying visible for audit. The foundational `startup` policy cannot be
-opted out.
-
-This is intended for content/archive repositories that are not software
-projects and legitimately have no `DEVELOPMENT.md`:
-
-```toml
-[[document]]
-context = "project-dev"
-scope = "project"
-path = "DEVELOPMENT.md"
-required = false
-notes = "content/archive repo: no DEVELOPMENT.md needed"
-```
-
-A `required = false` entry only opts a built-in out from a config that is
-actually applied to the repository: a project-local `AGENT_DOCS.toml`, or the
-home catalog when it identifies the same Git repository. A home catalog cannot
-opt an unrelated project out of its built-ins.
-
-## Command Surface
+`when` is an OR of AND-clauses of `path-exists` atoms:
 
 ```text
-Usage:
-  agent-docs [OPTIONS] <command> [options]
-
-Commands:
-  resolve            Resolve required docs for a context
-  contexts           List supported contexts
-  add                Upsert one AGENT_DOCS.toml entry
-  scaffold-agents    Scaffold default AGENTS.md template
-  baseline           Check baseline doc coverage
-  scaffold-baseline  Scaffold missing baseline docs
-  completion         Print shell completion script (bash, zsh)
+when   := clause ("||" clause)*
+clause := atom ("&&" atom)*
+atom   := "path-exists:" <glob> | "always"
 ```
 
-Use `agent-docs --help` (or `agent-docs <command> --help`) for CLI help text.
-
-### Top-level options
-
-These options sit before the subcommand and apply to every command:
-
-- `--docs-home <path>` — override `AGENT_DOCS_HOME` root path
-- `--project-path <path>` — override project root path
-- `--worktree-fallback <auto|local-only>` (default: `auto`) — `auto` enables
-  linked-worktree fallback to the primary worktree; `local-only` disables fallback
-  and enforces local project files only
-- `-h`, `--help` — print help
-- `-V`, `--version` — print version
-
-For convenience, the same `--docs-home`, `--project-path`, and
-`--worktree-fallback` flags are also accepted positionally on each subcommand.
-
-## Commands and Flags
-
-### `contexts`
-
-Print supported context names.
-
-Flags:
-
-- `--format text|json` (default: `text`)
-- `--docs-home <path>`
-- `--project-path <path>`
-
-### `resolve`
-
-Resolve effective required/optional docs for one context.
-
-Flags:
-
-- `--context startup|skill-dev|task-tools|project-dev` (required)
-- `--format text|json|checklist` (default: `text`)
-- `--strict` (missing required docs become exit code `1`)
-- `--docs-home <path>`
-- `--project-path <path>`
-
-Format guidance:
-
-- `text`: human-readable output for manual inspection and debugging.
-- `json`: machine-readable output for structured parsing/integration.
-- `checklist`: line-oriented required-doc contract for shell verification and CI guards.
-
-### `add`
-
-Create/update one `AGENT_DOCS.toml` entry in home or project scope.
-
-Flags:
-
-- `--target home|project` (required)
-- `--context startup|skill-dev|task-tools|project-dev` (required)
-- `--scope home|project|global` (required; target root for `path` resolution)
-- `--path <doc-path>` (required)
-- `--required` (set `required=true`; omitted means `required=false`)
-- `--when <condition>` (default: `always`)
-- `--notes <text>`
-- `--docs-home <path>`
-- `--project-path <path>`
-
-### Copy-pastable `resolve` + `add` flow
-
-```bash
-# 1) Resolve built-in project-dev requirements
-agent-docs resolve --context project-dev --format text
-
-# 2) Register BINARY_DEPENDENCIES.md as required for project-dev
-agent-docs add \
-  --target project \
-  --context project-dev \
-  --scope project \
-  --path BINARY_DEPENDENCIES.md \
-  --required \
-  --when always \
-  --notes "External runtime tools required by the repo"
-```
-
-`add` stdout shape:
-
-```text
-add: target=project action=<inserted|updated> config=<PROJECT_PATH>/AGENT_DOCS.toml entries=<N>
-```
-
-Use `--target home --scope global` for cross-repo home-catalog requirements.
-`--target project --scope global` is rejected because project-local catalogs
-cannot define global requirements.
-
-Verify both built-in and extension docs are present:
-
-```bash
-agent-docs resolve --context project-dev --format checklist \
-  | rg "REQUIRED_DOCS_BEGIN|REQUIRED_DOCS_END|DEVELOPMENT\\.md|BINARY_DEPENDENCIES\\.md"
-```
-
-### `scaffold-agents`
-
-Scaffold default `AGENTS.md` template.
-
-Flags:
-
-- `--target home|project` (required)
-- `--output <path>` (optional explicit output file path)
-- `--force` (overwrite when file exists)
-- `--docs-home <path>`
-- `--project-path <path>`
-
-Semantics:
-
-- Default output: `<target-root>/AGENTS.md`
-- Without `--force`, existing target file is not modified.
-
-### `baseline`
-
-Audit minimum baseline documents.
-
-Flags:
-
-- `--check` (run baseline check mode; required to produce a baseline report)
-- `--target home|project|all` (default: `all`)
-- `--format text|json` (default: `text`)
-- `--strict` (missing required baseline docs become exit code `1`)
-- `--docs-home <path>`
-- `--project-path <path>`
-
-### `scaffold-baseline`
-
-Scaffold baseline docs from deterministic templates/inputs.
-
-Flags:
-
-- `--target home|project|all` (default: `all`)
-- `--missing-only` (create only missing baseline docs)
-- `--force` (overwrite existing files)
-- `--dry-run` (print planned writes only)
-- `--format text|json` (default: `text`)
-- `--docs-home <path>`
-- `--project-path <path>`
-
-### `completion`
-
-Print a shell completion script to stdout. Pipe the output into your shell's
-completion loader.
-
-Usage:
-
-```bash
-agent-docs completion <bash|zsh>
-```
-
-Arguments:
-
-- `<SHELL>` — one of `bash`, `zsh`
-
-## Exit Codes
-
-- `0`: success (or non-strict missing-doc report)
-- `1`: strict policy failure (`--strict` and one or more required docs missing)
-- `2`: usage error (invalid flags, invalid command, missing required argument)
-- `3`: config/schema error (`AGENT_DOCS.toml` invalid)
-- `4`: runtime error (I/O failure, git probe failure not recoverable)
-
-## Strict Semantics
-
-### `resolve --strict`
-
-- Required docs are evaluated after built-ins + TOML merge.
-- If any required doc is missing on disk, command exits `1`.
-- Without `--strict`, missing required docs are reported but exit code remains `0`.
-
-### `baseline --strict`
-
-- Evaluates baseline required docs for selected target scope(s).
-- Missing required baseline docs cause exit `1` only when `--strict` is set.
-
-## Worktree fallback
-
-Worktree fallback is deterministic and applies only to project-scope required docs when running from a linked worktree in `auto` mode.
-
-### Fallback order (project scope)
-
-`startup` project policy:
-
-1. `<PROJECT_PATH>/AGENTS.override.md`
-2. `<PROJECT_PATH>/AGENTS.md`
-3. `<PRIMARY_WORKTREE_PATH>/AGENTS.override.md` (fallback)
-4. `<PRIMARY_WORKTREE_PATH>/AGENTS.md` (fallback)
-
-`project-dev` required project docs (built-ins and required project-scope extension entries):
-
-1. `<PROJECT_PATH>/<doc-path>`
-2. `<PRIMARY_WORKTREE_PATH>/<doc-path>` (fallback)
-
-### Strict and compatibility semantics
-
-- `--strict` exits `1` only when all candidates in the deterministic order are missing.
-- `local-only` mode disables `<PRIMARY_WORKTREE_PATH>` fallback candidates and enforces local project paths only.
-- Non-worktree repositories are unchanged: only `<PROJECT_PATH>` candidates are evaluated.
-
-### Output disclosure and local-only operation
-
-When fallback is used, output must disclose fallback provenance in addition to required-doc presence.
-
-- `text`/`json`: include a fallback source marker and the resolved fallback path.
-- `checklist`: keep required-doc status lines and include fallback provenance in the same report.
-
-To disable fallback, run resolve/baseline in `local-only` mode.
-
-```bash
-agent-docs --worktree-fallback local-only resolve --context startup --strict --format checklist
-agent-docs --worktree-fallback local-only baseline --check --target project --strict --format text
-```
-
-## Output Contract
-
-### `resolve` text example
-
-```text
-$ agent-docs resolve --context startup
-CONTEXT: startup
-AGENT_DOCS_HOME: /Users/example/.agents
-PROJECT_PATH: /Users/example/work/nils-cli
-
-[required] startup home /Users/example/.agents/AGENTS.override.md source=builtin status=present why="startup home policy (AGENTS.override.md preferred over AGENTS.md)"
-[required] startup project /Users/example/work/nils-cli/AGENTS.md source=builtin-fallback status=present why="startup project policy (AGENTS.override.md missing, fallback AGENTS.md)"
-
-summary: required_total=2 present_required=2 missing_required=0 strict=false
-```
-
-### `resolve` JSON example
+`&&` binds tighter than `||`. A `path-exists:<glob>` atom is true when at least
+one filesystem path matching `<glob>` exists under the resolved project root.
+Globs support `*`, `?`, `[...]`, and `**` (which matches across directory
+segments). A document whose `when` evaluates false is not required — a docs-only
+repo (no `Cargo.toml` / `package.json` / `src/**`) auto-skips code docs with no
+manual opt-out.
+
+### Content validation
+
+A required document is satisfied only when it exists AND passes content
+validation: non-empty, contains its declared `marker` (when one is declared),
+and — if `last-reviewed-within-days` is set — carries a recent enough
+`last-reviewed: YYYY-MM-DD` line. A scaffolded placeholder therefore fails.
+
+Resolved documents are de-duplicated by resolved path; a project-catalog entry
+overrides a docs-home entry that resolves to the same path.
+
+## `preflight --intent X` JSON contract
+
+`agent-docs preflight --intent <X> --format json` emits the
+`agent-docs.preflight.v1` shape. This is the **cross-repo contract** consumed by
+agent-runtime-kit hooks (start-of-task awareness injection and the finish-line
+validation gate). The fields below are stable within the `v1` schema:
 
 ```json
 {
-  "context": "startup",
+  "schema_version": "agent-docs.preflight.v1",
+  "intent": "project-dev",
   "strict": false,
-  "docs_home": "/Users/example/.agents",
-  "project_path": "/Users/example/work/nils-cli",
+  "docs_home": "/abs/docs-home",
+  "project_path": "/abs/project",
   "is_linked_worktree": false,
-  "git_common_dir": null,
-  "primary_worktree_path": null,
   "documents": [
     {
-      "context": "startup",
-      "scope": "home",
-      "path": "/Users/example/.agents/AGENTS.override.md",
-      "required": true,
-      "status": "present",
-      "source": "builtin",
-      "why": "startup home policy (AGENTS.override.md preferred over AGENTS.md)"
-    },
-    {
-      "context": "startup",
+      "context": "project-dev",
       "scope": "project",
-      "path": "/Users/example/work/nils-cli/AGENTS.md",
+      "path": "/abs/project/DEVELOPMENT.md",
+      "declared_required": true,
       "required": true,
+      "when": "path-exists:Cargo.toml || path-exists:package.json",
+      "when_satisfied": true,
       "status": "present",
-      "source": "builtin-fallback",
-      "why": "startup project policy (AGENTS.override.md missing, fallback AGENTS.md)"
+      "validation": {
+        "exists": true,
+        "non_empty": true,
+        "marker_present": true,
+        "freshness": "not-declared",
+        "valid": true
+      },
+      "source": "home",
+      "why": "home catalog /abs/docs-home/AGENT_DOCS.toml document, scope=project when=\"...\" (matched)",
+      "content": "# Dev\n\n## Validation\n\nrun the tests\n"
     }
   ],
+  "validation": {
+    "context": "project-dev",
+    "declared": true,
+    "commands": ["bash scripts/ci/all.sh"],
+    "description": "Run before declaring done."
+  },
   "summary": {
-    "required_total": 2,
-    "present_required": 2,
-    "missing_required": 0
+    "required_total": 1,
+    "satisfied_required": 1,
+    "missing_required": 0,
+    "invalid_required": 0
   }
 }
 ```
 
-The `is_linked_worktree`, `git_common_dir`, and `primary_worktree_path` fields are
-emitted on every `resolve --format json` invocation. They are populated only when
-the project root is a linked Git worktree (see "Worktree fallback").
+Field notes:
 
-### `resolve` checklist example
+- `documents[].content` is the full document body, emitted so a hook can inject
+  the doc without re-reading the file. It is present only for resolved, present
+  documents (omitted for missing ones).
+- `documents[].required` is `declared_required && when_satisfied`.
+- `validation.declared` is `false` when no `[[validation]]` entry matches the
+  intent (then `commands` is empty).
+- `validation.marker` / `validation.description` are omitted when not declared.
+- `summary.satisfied_required` counts required docs that are present and
+  content-valid; `missing_required` and `invalid_required` break down the rest.
 
-Checklist mode is designed for copy-paste verification. The required-doc section is delimited by `REQUIRED_DOCS_BEGIN` and
-`REQUIRED_DOCS_END`, with one required document per line: `<filename> status=<present|missing> path=<absolute-path>`.
+A consuming hook typically injects an awareness cue listing
+`validation.commands` on `project-dev` / `task-tools` intent at the start of a
+task, and at the finish line blocks turn-end when `validation.declared` is true,
+non-doc code was edited, and there is no evidence the commands ran.
 
-```text
-$ agent-docs resolve --context project-dev --format checklist
-REQUIRED_DOCS_BEGIN context=project-dev mode=non-strict
-DEVELOPMENT.md status=present path=/Users/example/work/nils-cli/DEVELOPMENT.md
-BINARY_DEPENDENCIES.md status=present path=/Users/example/work/nils-cli/BINARY_DEPENDENCIES.md
-REQUIRED_DOCS_END required=2 present=2 missing=0 mode=non-strict context=project-dev
-```
+## `audit` JSON
 
-### `resolve` checklist strict + missing required example
-
-When `--strict` is set and any required doc is missing, checklist output is still emitted and the process exits with code `1`.
-
-```text
-$ agent-docs resolve --context skill-dev --format checklist --strict
-REQUIRED_DOCS_BEGIN context=skill-dev mode=strict
-DEVELOPMENT.md status=missing path=/Users/example/.agents/DEVELOPMENT.md
-REQUIRED_DOCS_END required=1 present=0 missing=1 mode=strict context=skill-dev
-$ echo $?
-1
-```
-
-### `baseline --check` text example
-
-```text
-$ agent-docs baseline --check --target all
-BASELINE CHECK: all
-AGENT_DOCS_HOME: $HOME/.agents
-PROJECT_PATH: $HOME/work/nils-cli
-
-[home] startup policy $HOME/.agents/AGENTS.md required present source=builtin-fallback why="startup home policy (AGENTS.override.md missing, fallback AGENTS.md)"
-[home] skill-dev $HOME/.agents/DEVELOPMENT.md required missing source=builtin why="skill development guidance from AGENT_DOCS_HOME/DEVELOPMENT.md"
-[home] task-tools $HOME/.agents/core/policies/cli-tools.md required present source=builtin why="tool-selection guidance from AGENT_DOCS_HOME/core/policies/cli-tools.md"
-[project] startup policy $HOME/work/nils-cli/AGENTS.md required present source=builtin-fallback why="startup project policy (AGENTS.override.md missing, fallback AGENTS.md)"
-[project] project-dev $HOME/work/nils-cli/DEVELOPMENT.md required present source=builtin why="project development guidance from PROJECT_PATH/DEVELOPMENT.md"
-
-missing_required: 1
-missing_optional: 0
-suggested_actions:
-  - agent-docs scaffold-baseline --missing-only --target home
-```
-
-### `baseline --check` JSON example
+`agent-docs audit --format json` emits `agent-docs.audit.v1`:
 
 ```json
 {
+  "schema_version": "agent-docs.audit.v1",
   "target": "all",
   "strict": false,
-  "docs_home": "/Users/example/.agents",
-  "project_path": "/Users/example/work/nils-cli",
-  "items": [
-    {
-      "scope": "home",
-      "context": "skill-dev",
-      "label": "skill-dev",
-      "path": "/Users/example/.agents/DEVELOPMENT.md",
-      "required": true,
-      "status": "missing",
-      "source": "builtin",
-      "why": "skill development guidance from AGENT_DOCS_HOME/DEVELOPMENT.md"
-    }
+  "docs_home": "/abs/docs-home",
+  "project_path": "/abs/project",
+  "wiring": [
+    { "name": "install-symlink", "ok": true, "detail": "~/.claude/CLAUDE.md -> /abs/docs-home" }
   ],
-  "missing_required": 1,
-  "missing_optional": 0,
-  "suggested_actions": ["agent-docs scaffold-baseline --missing-only --target home"]
+  "documents": [],
+  "problems": 0,
+  "suggested_actions": []
 }
 ```
 
-### `baseline` extension merge order (deterministic)
+`problems` counts unsatisfied required documents plus failed wiring checks.
+`suggested_actions` lists fix hints (it never repairs anything).
 
-`baseline --check` applies extension documents with explicit, deterministic merge rules:
+## `init`
 
-1. Start with built-in baseline items for selected `--target`.
-2. Load extension configs in fixed order: `$AGENT_DOCS_HOME/AGENT_DOCS.toml` then `$PROJECT_PATH/AGENT_DOCS.toml`.
-3. Consider only extension entries with `required = true` and `scope` included by `--target`.
-   `--target home` includes `home` and `global`; `--target project` includes
-   `project`. A `required = false` entry that matches a built-in key opts that
-   built-in out (downgraded to optional, `source = builtin-opt-out`), except
-   `startup`.
-4. Resolve each extension path, then de-dup by key: `(context, scope, normalized_path)`.
-5. Same-key override order:
-   - within one config file, later `[[document]]` wins (last-write-wins)
-   - across files, project config wins over home config (loaded later)
-6. Output order is stable:
-   - built-ins stay in built-in declaration order
-   - extension items keep first-seen key order; when overridden, the item is replaced in place
+`agent-docs init --print` writes an annotated `AGENT_DOCS.toml` override stub to
+stdout. The stub lists the inherited docs-home defaults as comments, embeds the
+schema and `when` grammar, and pre-fills `when` examples for a detected
+`Cargo.toml` / `package.json`. It declares **no** active entries, so a project
+that runs it and makes no edits adds zero requirements. Use `--dry-run` to
+preview the target path without writing, or `--force` to write the file.
 
-This ensures baseline output is reproducible while still honoring later overrides.
+## Exit codes
 
-## `AGENT_DOCS.toml` Schema
+| Code | Meaning |
+| --- | --- |
+| 0 | success |
+| 1 | strict failure (unsatisfied required docs / audit problems) |
+| 3 | catalog (config) error |
+| 4 | runtime error |
+| 64 | command-line usage error |
 
-Each scope may define `AGENT_DOCS.toml` at:
+`--strict` makes `audit` and `preflight` exit `1` when the resolved state is not
+clean (problems, or unsatisfied required documents).
 
-- `$AGENT_DOCS_HOME/AGENT_DOCS.toml`
-- `$PROJECT_PATH/AGENT_DOCS.toml`
+## Worktree fallback
 
-Schema uses repeated `[[document]]` tables.
+For `scope = "project"` documents, when the project path is a linked git
+worktree and `--worktree-fallback auto` (the default) is in effect, a document
+missing in the linked worktree is resolved from the primary worktree. Pass
+`--worktree-fallback local-only` to disable this and enforce local files only.
 
-```toml
-[[document]]
-context = "project-dev"
-scope = "project"
-path = "BINARY_DEPENDENCIES.md"
-required = true
-when = "always"
-notes = "Track required external CLIs for this project"
-```
+## Catalog validation errors
 
-### Field contract
-
-| Field      | Type   | Required | Rules                                                                        |
-| ---------- | ------ | -------- | ---------------------------------------------------------------------------- |
-| `context`  | string | yes      | One of: `startup`, `skill-dev`, `task-tools`, `project-dev`                  |
-| `scope`    | string | yes      | One of: `home`, `project`, `global`; `global` is home-catalog only           |
-| `path`     | string | yes      | Relative or absolute path to markdown doc                                    |
-| `required` | bool   | no       | Default `false`; `false` on a built-in's own key opts it out (not `startup`) |
-| `when`     | string | no       | Default `always`; supported values: `always`                                 |
-| `notes`    | string | no       | Free text, default empty string                                              |
-
-### Deterministic merge contract
-
-For `resolve --context <ctx>`:
-
-1. Start with built-in entries for `<ctx>`.
-2. Load entries from `$AGENT_DOCS_HOME/AGENT_DOCS.toml` (if file exists).
-3. Load entries from `$PROJECT_PATH/AGENT_DOCS.toml` (if file exists).
-4. Filter entries by exact `context == <ctx>` and catalog inheritance rules:
-   home-catalog `global` entries apply to every project; home-catalog
-   `project` entries apply only to the same Git repository; project-catalog
-   `global` entries are invalid.
-5. Normalize each entry path:
-   - absolute path: keep as-is
-   - relative path: join with root selected by entry `scope`
-6. De-dup with merge key: `(context, scope, normalized_path)`.
-7. Conflict resolution order:
-   - extensions cannot re-declare a built-in key as required; a matching entry
-     with `required = true` is ignored and the built-in stands.
-   - a matching entry with `required = false` opts the built-in out (downgraded
-     to optional, `source = builtin-opt-out`), except for `startup`.
-   - for non-built-in duplicates, later source wins (`project` config overrides `home` config).
-   - within one file, later table wins (last-write-wins).
-8. Final output order is stable:
-   - built-ins in built-in declaration order
-   - merged extension entries in load order after de-dup replacement
-
-This merge behavior is deterministic and test-friendly.
-
-### De-dup examples
-
-- Same key appears twice in `$PROJECT_PATH/AGENT_DOCS.toml`: second entry wins.
-- Same key appears in both home and project configs: project entry wins.
-- Key matches built-in required doc (for example project `DEVELOPMENT.md` in `project-dev`): the built-in contract remains required and present
-  in output, unless a project entry sets `required = false` to opt out (then it is downgraded to optional with `source = builtin-opt-out`).
-
-## Invalid Schema Behavior
-
-If any `AGENT_DOCS.toml` entry is invalid, command exits `3` and prints actionable error.
-
-### Error example: invalid context
+Invalid catalogs fail with a precise error naming the section, entry index, and
+field, for example:
 
 ```text
-error[AGENT_DOCS_SCHEMA]: /Users/example/work/nils-cli/AGENT_DOCS.toml:4:11
-invalid value for `context`: "project"
-allowed: startup, skill-dev, task-tools, project-dev
+/abs/AGENT_DOCS.toml [validation] document[0].when: unsupported atom `file-exists:x`; expected `path-exists:<glob>` or `always`
 ```
-
-### Error example: missing required field
-
-```text
-error[AGENT_DOCS_SCHEMA]: /Users/example/.agents/AGENT_DOCS.toml:1:1
-missing required key `path` in [[document]]
-```
-
-### Error example: unsupported `when`
-
-```text
-error[AGENT_DOCS_SCHEMA]: /Users/example/work/nils-cli/AGENT_DOCS.toml:7:8
-invalid value for `when`: "if-env:CI"
-allowed: always
-```
-
-## Explicit `BINARY_DEPENDENCIES.md` Support Example
-
-Add required `BINARY_DEPENDENCIES.md` for `project-dev` context.
-
-CLI command:
-
-```bash
-agent-docs add \
-  --target project \
-  --context project-dev \
-  --scope project \
-  --path BINARY_DEPENDENCIES.md \
-  --required \
-  --when always \
-  --notes "External runtime tools required by the repo"
-```
-
-Equivalent TOML entry:
-
-```toml
-[[document]]
-context = "project-dev"
-scope = "project"
-path = "BINARY_DEPENDENCIES.md"
-required = true
-when = "always"
-notes = "External runtime tools required by the repo"
-```
-
-`resolve --context project-dev` must include this document after merge, without removing built-in project `DEVELOPMENT.md`.
-
-Verification command:
-
-```bash
-agent-docs resolve --context project-dev --format checklist \
-  | rg "REQUIRED_DOCS_BEGIN|REQUIRED_DOCS_END|DEVELOPMENT\\.md|BINARY_DEPENDENCIES\\.md"
-```
-
-## Snapshot Fixture Maintenance
-
-The `add` command has golden/snapshot fixtures under `tests/fixtures/add`.
-
-- Run snapshot-related tests:
-
-  ```bash
-  scripts/ci/agent-docs-snapshots.sh
-  ```
-
-- Re-generate expected snapshots (`--bless`) and immediately verify:
-
-  ```bash
-  scripts/ci/agent-docs-snapshots.sh --bless
-  ```
-
-## Docs
-
-- [Docs index](docs/README.md)

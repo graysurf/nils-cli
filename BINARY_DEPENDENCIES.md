@@ -109,31 +109,24 @@ The codex and opencode adapters must not set this var; they continue to rely on 
 
 ## 5. `agent-docs` integration for `project-dev`
 
-Use `agent-docs add` to register this file as a required project-level document for
-`project-dev` resolution.
+Register this file as a required `project-dev` document by declaring a
+`[[document]]` entry in the project `AGENT_DOCS.toml` catalog:
 
-```bash
-cargo run -p agent-docs -- add \
-  --target project \
-  --context project-dev \
-  --scope project \
-  --path BINARY_DEPENDENCIES.md \
-  --required \
-  --when always \
-  --notes "External runtime tools required by the repo"
+```toml
+[[document]]
+context  = "project-dev"
+scope    = "project"
+path     = "BINARY_DEPENDENCIES.md"
+required = true
+notes    = "External runtime tools required by the repo"
 ```
 
-Expected stdout format:
-
-```text
-add: target=project action=<inserted|updated> config=<PROJECT_PATH>/AGENT_DOCS.toml entries=<N>
-```
-
-Verify resolution includes this document:
+`agent-docs init --print` emits an annotated stub with this schema. Verify
+resolution includes this document:
 
 ```bash
-cargo run -p agent-docs -- resolve --context project-dev --format checklist \
-  | rg "REQUIRED_DOCS_BEGIN|REQUIRED_DOCS_END|BINARY_DEPENDENCIES\\.md"
+cargo run -p agent-docs -- preflight --intent project-dev --format json \
+  | rg "BINARY_DEPENDENCIES\\.md"
 ```
 
 ## 6. Recommended Install Profiles
