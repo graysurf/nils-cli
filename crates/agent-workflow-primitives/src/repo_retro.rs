@@ -838,8 +838,12 @@ fn collect_git_commits(
         "log".to_string(),
         format!("--since={} 00:00:00", window.start),
         format!("--until={} 23:59:59", window.end),
-        "--date=short".to_string(),
-        "--pretty=format:COMMIT%x09%H%x09%ad%x09%an%x09%ae%x09%s".to_string(),
+        // --since/--until select on committer date and parse the boundaries in
+        // local time, so collect the committer date (%cd) rendered in that same
+        // local zone (short-local). Using %ad or the stored-zone short format
+        // can surface a day outside the requested window in activeDays.
+        "--date=short-local".to_string(),
+        "--pretty=format:COMMIT%x09%H%x09%cd%x09%an%x09%ae%x09%s".to_string(),
         "--numstat".to_string(),
     ];
     let command = git_command_text(repo, &args);
@@ -1585,9 +1589,12 @@ fn collect_name_status(
         "log".to_string(),
         format!("--since={} 00:00:00", window.start),
         format!("--until={} 23:59:59", window.end),
-        "--date=short".to_string(),
+        // parse_name_status_log consumes only status and path, so this date
+        // column is unused today. Keep it aligned with collect_git_commits
+        // (committer date in local time) so it stays correct if ever parsed.
+        "--date=short-local".to_string(),
         "--name-status".to_string(),
-        "--pretty=format:COMMIT%x09%H%x09%ad%x09%s".to_string(),
+        "--pretty=format:COMMIT%x09%H%x09%cd%x09%s".to_string(),
         "--".to_string(),
         pathspec.to_string(),
     ];
