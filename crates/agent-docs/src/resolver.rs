@@ -53,7 +53,7 @@ pub fn resolve_intent_with_catalog(
     let documents = resolve_documents(roots, fallback_mode, emit_content, catalog, &mut |entry| {
         entry.context == *intent
     });
-    let validation = resolve_validation_contract(intent, catalog);
+    let validation = resolve_validation_contract(intent, roots, catalog);
     let summary = ResolveSummary::from_documents(&documents);
 
     PreflightReport {
@@ -274,6 +274,7 @@ fn describe_why(
 
 pub fn resolve_validation_contract(
     intent: &Context,
+    roots: &ResolvedRoots,
     catalog: &LoadedCatalog,
 ) -> ValidationContract {
     let mut commands: Vec<String> = Vec::new();
@@ -281,7 +282,17 @@ pub fn resolve_validation_contract(
     let mut description: Option<String> = None;
     let mut declared = false;
 
+    let home_project_scope_applies = home_project_scope_applies(roots);
+
     for scope_catalog in catalog.in_load_order() {
+        // A validation entry carries no scope and is a repo-local contract: the
+        // commands it names (e.g. `bash scripts/ci/all.sh`) only make sense in
+        // the repository that declares them. A docs-home catalog's validation
+        // therefore applies only when the docs-home and the project are the
+        // same repository, so it never leaks into an unrelated project.
+        if scope_catalog.source_scope == Scope::Home && !home_project_scope_applies {
+            continue;
+        }
         for validation in &scope_catalog.validations {
             if validation.context != *intent {
                 continue;
@@ -332,7 +343,10 @@ pub fn available_intents(catalog: &LoadedCatalog) -> Vec<String> {
 }
 
 /// All validation contracts declared in the catalog, one per intent.
-pub fn all_validation_contracts(catalog: &LoadedCatalog) -> Vec<ValidationContract> {
+pub fn all_validation_contracts(
+    roots: &ResolvedRoots,
+    catalog: &LoadedCatalog,
+) -> Vec<ValidationContract> {
     let mut seen: Vec<String> = Vec::new();
     let mut contracts = Vec::new();
     for scope_catalog in catalog.in_load_order() {
@@ -342,7 +356,11 @@ pub fn all_validation_contracts(catalog: &LoadedCatalog) -> Vec<ValidationContra
                 continue;
             }
             seen.push(name);
-            contracts.push(resolve_validation_contract(&validation.context, catalog));
+            contracts.push(resolve_validation_contract(
+                &validation.context,
+                roots,
+                catalog,
+            ));
         }
     }
     contracts
