@@ -157,6 +157,16 @@ def emit(key, value):
 
 
 def is_doc_path(path):
+    # Inside a crate, only the crate README and the crate docs/ tree are
+    # documentation. Every other .md under a crate (include_str! templates and
+    # snapshots, plan-template.md, Markdown test fixtures / golden files) is a
+    # source or test asset whose contents are asserted by that crate's tests, so
+    # it must NOT take the docs-only lane. This mirrors the markdownlint-audit.sh
+    # scope and docs/specs/crate-docs-placement-policy.md, which exclude embedded
+    # template assets and test fixtures under non-docs directories.
+    if path.startswith("crates/"):
+        rel = path.split("/", 2)[2] if path.count("/") >= 2 else ""
+        return rel == "README.md" or rel.startswith("docs/")
     return (
         path.endswith(".md")
         or path.startswith("docs/")

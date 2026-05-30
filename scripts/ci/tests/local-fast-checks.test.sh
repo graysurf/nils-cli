@@ -119,6 +119,53 @@ assert_docs_only_plan_does_not_require_cargo() {
   echo "ok"
 }
 
+assert_crate_src_asset_md_runs_package() {
+  echo "== crate src embedded .md runs package mode, not docs-only =="
+  local output
+  output="$(plan_for --changed-file crates/agent-docs/src/templates/agents_default.md)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=packages"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE=nils-agent-docs"
+  assert_not_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=docs-only"
+  echo "ok"
+}
+
+assert_crate_root_embedded_md_runs_package() {
+  echo "== crate-root embedded .md runs package mode, not docs-only =="
+  local output
+  output="$(plan_for --changed-file crates/plan-tooling/plan-template.md)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=packages"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE=nils-plan-tooling"
+  assert_not_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=docs-only"
+  echo "ok"
+}
+
+assert_crate_test_fixture_md_runs_package() {
+  echo "== crate test fixture .md runs package mode, not docs-only =="
+  local output
+  output="$(plan_for --changed-file crates/plan-tooling/tests/fixtures/plan_bundle/valid-plan.md)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=packages"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE=nils-plan-tooling"
+  echo "ok"
+}
+
+assert_crate_readme_stays_docs_only() {
+  echo "== crate README stays docs-only =="
+  local output
+  output="$(plan_for --changed-file crates/plan-tooling/README.md)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=docs-only"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_CHECKS=1"
+  echo "ok"
+}
+
+assert_crate_docs_tree_stays_docs_only() {
+  echo "== crate docs/ tree stays docs-only =="
+  local output
+  output="$(plan_for --changed-file crates/plan-tooling/docs/specs/plan-source-bundle-contract-v1.md)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=docs-only"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_CHECKS=1"
+  echo "ok"
+}
+
 assert_workspace_manifest_escalates_to_workspace() {
   echo "== workspace manifest escalates to workspace =="
   local output
@@ -177,6 +224,11 @@ assert_library_package_keeps_doctests
 assert_shared_crate_escalates_to_workspace
 assert_docs_only_uses_docs_mode
 assert_docs_only_plan_does_not_require_cargo
+assert_crate_src_asset_md_runs_package
+assert_crate_root_embedded_md_runs_package
+assert_crate_test_fixture_md_runs_package
+assert_crate_readme_stays_docs_only
+assert_crate_docs_tree_stays_docs_only
 assert_workspace_manifest_escalates_to_workspace
 assert_package_manifest_requests_third_party_artifacts
 assert_third_party_artifact_change_escapes_docs_only
