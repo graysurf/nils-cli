@@ -38,16 +38,135 @@ impl fmt::Display for MarkdownPayloadError {
 impl Error for MarkdownPayloadError {}
 
 pub fn markdown_payload_violations(markdown: &str) -> Vec<MarkdownPayloadViolation> {
+    // Literal escaped controls (`\n`, `\r`, `\t`) are legitimate inside code —
+    // a shell example like `printf 'a\nb'` is not corruption — so only flag them
+    // when they appear in prose / structural markdown. Scan with fenced code
+    // blocks and inline code spans removed.
+    let scannable = strip_code_segments(markdown);
     let mut violations = Vec::new();
 
     for sequence in LITERAL_ESCAPED_CONTROLS {
-        let count = markdown.match_indices(sequence).count();
+        let count = scannable.match_indices(sequence).count();
         if count > 0 {
             violations.push(MarkdownPayloadViolation { sequence, count });
         }
     }
 
     violations
+}
+
+/// Return `markdown` with fenced code blocks and inline code spans removed so the
+/// escaped-control guard only inspects prose / structure. Removed spans are
+/// replaced with a space (and skipped fenced lines with a newline) so that
+/// neighbouring characters cannot glue into a literal `\n`-style sequence that
+/// was not present in the source.
+fn strip_code_segments(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut open_fence: Option<(char, usize)> = None;
+
+    for line in markdown.split_inclusive('\n') {
+        if let Some((fence_char, fence_len)) = fence_marker(line) {
+            match open_fence {
+                None => {
+                    // Opening fence — start a code block; drop the fence line.
+                    open_fence = Some((fence_char, fence_len));
+                    out.push('\n');
+                    continue;
+                }
+                Some((open_char, open_len)) if fence_char == open_char && fence_len >= open_len => {
+                    // Closing fence — end the block; drop the fence line.
+                    open_fence = None;
+                    out.push('\n');
+                    continue;
+                }
+                // A fence-looking line of a different kind is block content.
+                Some(_) => {
+                    out.push('\n');
+                    continue;
+                }
+            }
+        }
+        if open_fence.is_some() {
+            // Inside a fenced block — skip the content line.
+            out.push('\n');
+            continue;
+        }
+        out.push_str(&strip_inline_code(line));
+    }
+
+    out
+}
+
+/// If `line` is a fenced-code delimiter (its first non-whitespace content is a
+/// run of three or more backticks or tildes), return the fence character and the
+/// run length; otherwise `None`.
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let fence_char = trimmed.chars().next()?;
+    if fence_char != '`' && fence_char != '~' {
+        return None;
+    }
+    let run = trimmed.chars().take_while(|&c| c == fence_char).count();
+    if run >= 3 {
+        Some((fence_char, run))
+    } else {
+        None
+    }
+}
+
+/// Remove inline code spans (backtick-delimited) from a single line, leaving the
+/// surrounding text. An unterminated backtick run is treated as plain text.
+fn strip_inline_code(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // Measure the opening backtick run.
+        let mut run = 0;
+        while i < chars.len() && chars[i] == '`' {
+            run += 1;
+            i += 1;
+        }
+
+        // Find a closing run of exactly the same length.
+        let mut j = i;
+        let mut closed = false;
+        while j < chars.len() {
+            if chars[j] == '`' {
+                let mut close_run = 0;
+                while j < chars.len() && chars[j] == '`' {
+                    close_run += 1;
+                    j += 1;
+                }
+                if close_run == run {
+                    // [opening run .. closing run] is an inline code span; drop
+                    // it, leaving a space so neighbours do not glue together.
+                    out.push(' ');
+                    i = j;
+                    closed = true;
+                    break;
+                }
+            } else {
+                j += 1;
+            }
+        }
+
+        if !closed {
+            // No matching close — the run is literal text.
+            for _ in 0..run {
+                out.push('`');
+            }
+        }
+    }
+
+    out
 }
 
 pub fn validate_markdown_payload(markdown: &str) -> Result<(), MarkdownPayloadError> {
@@ -178,6 +297,48 @@ mod tests {
         assert_eq!(violations[0].count, 2);
         assert_eq!(violations[1].sequence, r"\t");
         assert_eq!(violations[1].count, 1);
+    }
+
+    #[test]
+    fn markdown_payload_validator_ignores_escaped_controls_in_fenced_code() {
+        let payload = "Prose before.\n\n```sh\nprintf 'a\\nb'\n```\n\nProse after.\n";
+        assert!(
+            validate_markdown_payload(payload).is_ok(),
+            "escaped controls inside a fenced code block must not be flagged"
+        );
+    }
+
+    #[test]
+    fn markdown_payload_validator_ignores_escaped_controls_in_inline_code() {
+        let payload = r"Run `printf 'a\nb'` to print two lines.";
+        assert!(
+            validate_markdown_payload(payload).is_ok(),
+            "escaped controls inside an inline code span must not be flagged"
+        );
+    }
+
+    #[test]
+    fn markdown_payload_validator_still_flags_escaped_controls_in_prose() {
+        // A real escaped newline in prose (outside code) is still corruption.
+        let violations = markdown_payload_violations(r"Status: done.\nNext: ship it.");
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].sequence, r"\n");
+        assert_eq!(violations[0].count, 1);
+    }
+
+    #[test]
+    fn markdown_payload_validator_flags_prose_but_not_code_in_mixed_payload() {
+        // The prose `\n` is flagged once; the occurrences inside the fenced block
+        // and the inline span are ignored.
+        let payload = "Bad prose: a\\nb\n\n```\nprintf 'x\\ny'\n```\n\nUse `echo 'p\\nq'` here.\n";
+        let violations = markdown_payload_violations(payload);
+        assert_eq!(
+            violations.len(),
+            1,
+            "only the prose occurrence counts: {violations:?}"
+        );
+        assert_eq!(violations[0].sequence, r"\n");
+        assert_eq!(violations[0].count, 1);
     }
 
     #[test]
