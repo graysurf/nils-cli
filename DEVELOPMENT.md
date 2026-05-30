@@ -138,6 +138,13 @@ The lint has a self-test under
 `scripts/ci/tests/cli-output-contract-lint.test.sh` that exercises every
 regression class against synthetic fixtures.
 
+In CI, the `changes` job runs `scripts/ci/detect-docs-only.sh` (sharing the
+`scripts/ci/lib/doc_classify.py` classifier with the local-fast planner). When
+every changed file is documentation, the `test` and `test_macos` jobs run
+`--docs-only` and the `coverage` job skips its steps, so docs-only PRs avoid the
+full Rust build/test/coverage cost. The skips are step-level, so all three
+release-gated checks still report success.
+
 ### 3.2 Local fast changed-scope checks
 
 For most local implementation loops:
@@ -205,6 +212,7 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/cli-output-contract-lint.sh --strict`
 - `bash scripts/ci/forge-cli-fixture-lint.sh --strict`
 - `bash scripts/ci/tests/local-fast-checks.test.sh`
+- `bash scripts/ci/tests/detect-docs-only.test.sh`
 - `bash scripts/ci/tests/shared-helper-adoption-audit.test.sh`
 - `bash scripts/ci/test-stale-audit.sh --strict`
 - `bash scripts/ci/workspace-version-lockstep.sh --strict`
