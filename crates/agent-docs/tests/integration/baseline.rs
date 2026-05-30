@@ -393,3 +393,84 @@ notes = "project-alpha"
     assert_eq!(extension_items[0].source, DocumentSource::ExtensionProject);
     assert!(extension_items[0].why.contains("project-alpha"));
 }
+
+#[test]
+fn baseline_project_config_opt_out_downgrades_builtin_development_doc() {
+    let home = TempDir::new().expect("failed to create home tempdir");
+    let project = TempDir::new().expect("failed to create project tempdir");
+    write_markdown(&project.path().join("AGENTS.md"));
+    // No DEVELOPMENT.md on disk: the project opts out of the builtin requirement.
+    write_text(
+        &project.path().join(CONFIG_FILE_NAME),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "DEVELOPMENT.md"
+required = false
+notes = "content/archive repo: no DEVELOPMENT.md needed"
+"#,
+    );
+
+    let report = check_builtin_baseline(BaselineTarget::Project, &roots(&home, &project), false)
+        .expect("baseline check should succeed");
+
+    assert_eq!(report.items.len(), 2);
+    let project_dev = report
+        .items
+        .iter()
+        .find(|item| item.path.ends_with("DEVELOPMENT.md"))
+        .expect("project-dev item should be present");
+    assert_eq!(project_dev.source, DocumentSource::BuiltinOptOut);
+    assert!(
+        !project_dev.required,
+        "opted-out builtin must become optional"
+    );
+    assert_eq!(project_dev.status, DocumentStatus::Missing);
+    assert!(
+        project_dev.why.contains("opted out"),
+        "opt-out why should stay auditable: {}",
+        project_dev.why
+    );
+
+    assert_eq!(report.missing_required, 0);
+    assert!(
+        report.suggested_actions.is_empty(),
+        "opted-out builtin must not suggest scaffolding: {:?}",
+        report.suggested_actions
+    );
+}
+
+#[test]
+fn baseline_strict_passes_when_project_opts_out_of_development_doc() {
+    let home = TempDir::new().expect("failed to create home tempdir");
+    let project = TempDir::new().expect("failed to create project tempdir");
+    write_markdown(&project.path().join("AGENTS.md"));
+    write_text(
+        &project.path().join(CONFIG_FILE_NAME),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "DEVELOPMENT.md"
+required = false
+"#,
+    );
+
+    let exit = run_with_args([
+        "agent-docs",
+        "--docs-home",
+        home.path().to_str().expect("home path should be utf-8"),
+        "--project-path",
+        project
+            .path()
+            .to_str()
+            .expect("project path should be utf-8"),
+        "baseline",
+        "--check",
+        "--target",
+        "project",
+        "--strict",
+    ]);
+    assert_eq!(exit, 0, "strict baseline should pass after opt-out");
+}

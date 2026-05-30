@@ -30,6 +30,27 @@ pub fn check_builtin_baseline_with_mode(
     let configs = load_configs_from_roots(roots)?;
     let configs_in_load_order = configs.in_load_order();
     let home_project_scope_applies = scope_rules::home_catalog_project_scope_applies(roots);
+
+    // A project may opt out of a builtin requirement by declaring a
+    // `required = false` entry for the builtin's own key. Downgrade the
+    // matching builtin item in place so the opt-out stays visible (and so it no
+    // longer counts toward `missing_required`).
+    let opt_outs = collect_builtin_opt_outs(
+        target,
+        roots,
+        fallback_mode,
+        &configs_in_load_order,
+        home_project_scope_applies,
+        &builtin_keys,
+    );
+    if !opt_outs.is_empty() {
+        for item in items.iter_mut() {
+            if let Some(opt_out) = opt_outs.get(&BaselineKey::from_item(item)) {
+                *item = opt_out.clone();
+            }
+        }
+    }
+
     items.extend(required_extension_items(
         target,
         roots,
@@ -350,6 +371,81 @@ fn merge_required_extension_items(
             extension_items.push(item);
             extension_indices.insert(key, next_index);
         }
+    }
+}
+
+fn collect_builtin_opt_outs(
+    target: BaselineTarget,
+    roots: &ResolvedRoots,
+    fallback_mode: FallbackMode,
+    configs_in_load_order: &[&ConfigScopeFile],
+    home_project_scope_applies: bool,
+    builtin_keys: &HashSet<BaselineKey>,
+) -> HashMap<BaselineKey, BaselineCheckItem> {
+    let mut opt_outs: HashMap<BaselineKey, BaselineCheckItem> = HashMap::new();
+
+    for config in configs_in_load_order {
+        for (index, entry) in config.documents.iter().enumerate() {
+            // Only an explicit `required = false` entry opts a builtin out, and
+            // the foundational `startup` policy can never be opted out.
+            if entry.required || entry.context == Context::Startup {
+                continue;
+            }
+            if !target_includes_scope(target, entry.scope) {
+                continue;
+            }
+            if !scope_rules::should_include_extension_entry(
+                config.source_scope,
+                entry.scope,
+                home_project_scope_applies,
+            ) {
+                continue;
+            }
+
+            let path = resolve_extension_path_with_project_fallback(entry, roots, fallback_mode);
+            let key = BaselineKey::new(entry.context, entry.scope, path.clone());
+            if !builtin_keys.contains(&key) {
+                continue;
+            }
+
+            opt_outs.insert(
+                key,
+                BaselineCheckItem {
+                    scope: entry.scope,
+                    context: entry.context,
+                    label: entry.context.as_str().to_string(),
+                    path: path.clone(),
+                    required: false,
+                    status: if path.exists() {
+                        DocumentStatus::Present
+                    } else {
+                        DocumentStatus::Missing
+                    },
+                    source: DocumentSource::BuiltinOptOut,
+                    why: opt_out_why(config, index, entry),
+                },
+            );
+        }
+    }
+
+    opt_outs
+}
+
+fn opt_out_why(config: &ConfigScopeFile, index: usize, entry: &ConfigDocumentEntry) -> String {
+    match entry
+        .notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|notes| !notes.is_empty())
+    {
+        Some(notes) => format!(
+            "builtin requirement opted out by {} document[{index}] (required=false) notes={notes}",
+            config.file_path.display()
+        ),
+        None => format!(
+            "builtin requirement opted out by {} document[{index}] (required=false)",
+            config.file_path.display()
+        ),
     }
 }
 

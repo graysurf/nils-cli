@@ -532,6 +532,115 @@ notes = "same-repo runtime-kit policy"
     assert_eq!(same_repo_doc.path, linked_worktree.join("RUNTIME_ONLY.md"));
 }
 
+#[test]
+fn resolve_project_dev_project_config_opt_out_suppresses_builtin_development_doc() {
+    let workspace = common::FixtureWorkspace::from_fixtures();
+    common::remove_file_if_exists(&workspace.project_path.join("DEVELOPMENT.md"));
+    fs::write(
+        workspace.project_path.join(CONFIG_FILE_NAME),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "DEVELOPMENT.md"
+required = false
+notes = "content/archive repo: no DEVELOPMENT.md needed"
+"#,
+    )
+    .expect("write project config");
+
+    let roots = workspace.roots();
+    let report = resolver::resolve_builtin(Context::ProjectDev, &roots, true);
+
+    assert_eq!(
+        report.documents.len(),
+        1,
+        "project-dev should resolve to the single opted-out doc: {:#?}",
+        report.documents
+    );
+    let doc = &report.documents[0];
+    assert!(doc.path.ends_with("DEVELOPMENT.md"));
+    assert_eq!(doc.source, DocumentSource::BuiltinOptOut);
+    assert!(!doc.required, "opted-out builtin must become optional");
+    assert_eq!(doc.status, DocumentStatus::Missing);
+    assert!(
+        doc.why.contains("opted out") && doc.why.contains("content/archive repo"),
+        "opt-out why should stay auditable: {}",
+        doc.why
+    );
+
+    assert_eq!(report.summary.required_total, 0);
+    assert_eq!(report.summary.present_required, 0);
+    assert_eq!(report.summary.missing_required, 0);
+
+    // Strict resolve now passes because nothing is required after the opt-out.
+    let exit =
+        common::run_resolve_exit_code(&workspace, Context::ProjectDev, OutputFormat::Text, true);
+    assert_eq!(exit, 0, "strict resolve should succeed after opt-out");
+}
+
+#[test]
+fn resolve_project_dev_home_catalog_opt_out_is_ignored_for_unrelated_repo() {
+    let workspace = common::FixtureWorkspace::from_fixtures();
+    common::remove_file_if_exists(&workspace.project_path.join("DEVELOPMENT.md"));
+    // A home catalog cannot opt an unrelated project out of its builtins.
+    fs::write(
+        workspace.docs_home.join(CONFIG_FILE_NAME),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "DEVELOPMENT.md"
+required = false
+notes = "home-catalog opt-out attempt"
+"#,
+    )
+    .expect("write home config");
+
+    let report = resolver::resolve_builtin(Context::ProjectDev, &workspace.roots(), false);
+
+    assert_eq!(report.documents.len(), 1);
+    let doc = &report.documents[0];
+    assert!(doc.path.ends_with("DEVELOPMENT.md"));
+    assert_eq!(
+        doc.source,
+        DocumentSource::Builtin,
+        "unrelated home-catalog entry must not downgrade the builtin"
+    );
+    assert!(doc.required);
+    assert_eq!(report.summary.missing_required, 1);
+}
+
+#[test]
+fn resolve_startup_cannot_be_opted_out_by_required_false_entry() {
+    let workspace = common::FixtureWorkspace::from_fixtures();
+    fs::write(
+        workspace.project_path.join(CONFIG_FILE_NAME),
+        r#"
+[[document]]
+context = "startup"
+scope = "project"
+path = "AGENTS.override.md"
+required = false
+notes = "attempt to opt out of startup policy"
+"#,
+    )
+    .expect("write project config");
+
+    let report = resolver::resolve_builtin(Context::Startup, &workspace.roots(), false);
+    let project_doc = report
+        .documents
+        .iter()
+        .find(|doc| doc.scope.as_str() == "project")
+        .expect("startup should include a project policy doc");
+
+    assert!(
+        project_doc.required,
+        "startup project policy must stay required: {project_doc:#?}"
+    );
+    assert_ne!(project_doc.source, DocumentSource::BuiltinOptOut);
+}
+
 fn all_contexts() -> [Context; 4] {
     [
         Context::Startup,
