@@ -30,6 +30,11 @@ pub use crate::github::ProviderAdapter;
 pub enum Provider {
     GitHub,
     GitLab,
+    /// In-process, file-backed backend reached through `forge-cli --provider
+    /// local`. Selected by an explicit `--repo local:<name>` (no host
+    /// detection); routes through [`crate::forge_cli_adapter::ForgeCliAdapter`]
+    /// like GitLab.
+    Local,
 }
 
 impl Provider {
@@ -37,6 +42,7 @@ impl Provider {
         match self {
             Provider::GitHub => "github",
             Provider::GitLab => "gitlab",
+            Provider::Local => "local",
         }
     }
 }
@@ -64,6 +70,8 @@ impl Repo {
         self.host.as_deref().unwrap_or(match self.provider {
             Provider::GitHub => "github.com",
             Provider::GitLab => "gitlab.com",
+            // Local URLs use the `local://` scheme, not a host (see issue_url).
+            Provider::Local => "local",
         })
     }
 
@@ -83,6 +91,12 @@ impl Repo {
                 host = self.default_host(),
                 slug = self.slug,
             ),
+            // Synthetic scheme matching the forge-cli local backend
+            // (`local://<slug>/issues/<n>`); this is a dashboard hint, the
+            // authoritative URL comes from forge-cli's JSON.
+            Provider::Local => {
+                format!("local://{slug}/issues/{issue_number}", slug = self.slug)
+            }
         }
     }
 
@@ -100,6 +114,9 @@ impl Repo {
                 host = self.default_host(),
                 slug = self.slug,
             ),
+            Provider::Local => {
+                format!("local://{slug}/pull/{pr_number}", slug = self.slug)
+            }
         }
     }
 }
@@ -110,6 +127,19 @@ impl Repo {
 /// provider.
 pub fn resolve_repo(repo_override: Option<&str>) -> Result<Repo, String> {
     if let Some(raw) = repo_override {
+        // Explicit `--repo local:<name>` selects the in-process file-backed
+        // backend; there is no remote host to detect.
+        if let Some(name) = raw.strip_prefix("local:") {
+            let slug = name.trim().trim_end_matches('/');
+            if slug.is_empty() {
+                return Err(format!("invalid --repo value: {raw}"));
+            }
+            return Ok(Repo {
+                provider: Provider::Local,
+                slug: slug.to_string(),
+                host: None,
+            });
+        }
         if let Some(repo) = parse_repo_with_host(raw) {
             return Ok(repo);
         }
@@ -143,6 +173,7 @@ pub fn select_adapter(repo: &Repo, force: bool) -> Box<dyn ProviderAdapter> {
     match repo.provider {
         Provider::GitHub => Box::new(crate::github::GhCliAdapter::new(force)),
         Provider::GitLab => Box::new(crate::forge_cli_adapter::ForgeCliAdapter::new(force)),
+        Provider::Local => Box::new(crate::forge_cli_adapter::ForgeCliAdapter::new_local(force)),
     }
 }
 
@@ -371,6 +402,36 @@ mod tests {
         assert_eq!(repo.provider, Provider::GitLab);
         assert_eq!(repo.slug, "group/proj");
         assert_eq!(repo.host.as_deref(), Some("gitlab.example.com"));
+    }
+
+    #[test]
+    fn resolve_repo_recognises_local_scheme() {
+        let repo = resolve_repo(Some("local:demo")).expect("local");
+        assert_eq!(repo.provider, Provider::Local);
+        assert_eq!(repo.slug, "demo");
+        assert_eq!(repo.host, None);
+
+        let nested = resolve_repo(Some("local:acme/widgets")).expect("local nested");
+        assert_eq!(nested.provider, Provider::Local);
+        assert_eq!(nested.slug, "acme/widgets");
+    }
+
+    #[test]
+    fn resolve_repo_rejects_empty_local_slug() {
+        assert!(resolve_repo(Some("local:")).is_err());
+        assert!(resolve_repo(Some("local:/")).is_err());
+    }
+
+    #[test]
+    fn local_provider_renders_local_scheme_urls() {
+        assert_eq!(Provider::Local.as_str(), "local");
+        let repo = Repo {
+            provider: Provider::Local,
+            slug: "demo".into(),
+            host: None,
+        };
+        assert_eq!(repo.issue_url(12), "local://demo/issues/12");
+        assert_eq!(repo.pr_url(7), "local://demo/pull/7");
     }
 
     #[test]
