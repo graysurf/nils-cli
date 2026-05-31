@@ -39,4 +39,4 @@
 | 2.2 | done | plan-issue-cli local routing | sympoies/nils-cli#707 (merge 66526ce) | Parameterize forge_cli_adapter.rs:127. Dep 2.1. |
 | 3.1 | done | Cross-provider conformance harness | sympoies/nils-cli#709 (merge 2253bb6) | Hermetic; real binary across local+github+gitlab. Dep 2.2. |
 | 3.2 | done | GitLab real e2e target | graysurf/agent-runtime-kit#210 (merge 00024d7) | Happy-path green on self-hosted gitlab.gamania.com; finding graysurf/plan-tracking-testbed#58. Dep 1.1. |
-| 4.1 | pending | Service feasibility eval | — | Gated go/no-go; no build commitment. Dep 3.1. |
+| 4.1 | done | Service feasibility eval | sympoies/nils-cli#711 (merge bcc1e94) | Conditional GO for a Half A issue/plan-tracking service; eval only, no build. Dep 3.1. |
