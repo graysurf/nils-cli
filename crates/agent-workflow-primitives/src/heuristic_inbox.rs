@@ -103,9 +103,16 @@ fn home_path_regex() -> &'static Regex {
 fn token_regexes() -> &'static [Regex] {
     static RES: OnceLock<Vec<Regex>> = OnceLock::new();
     RES.get_or_init(|| {
+        // Patterns that begin with a short literal prefix (`sk-`, `Bearer`) need
+        // a leading boundary so they only match a real token, not the same
+        // substring inside an ordinary hyphenated identifier (e.g. the `sk-`
+        // inside `task-ledger-durability`). The `regex` crate has no lookbehind,
+        // so we require the preceding char to be the start of input or a
+        // non-identifier byte. These patterns are only used via `is_match`, so
+        // consuming that leading byte is harmless.
         let patterns = [
-            r"sk-[A-Za-z0-9_-]{16,}",
-            r"Bearer\s+[A-Za-z0-9._~+/=-]{16,}",
+            r"(?:^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}",
+            r"(?:^|[^A-Za-z0-9_-])Bearer\s+[A-Za-z0-9._~+/=-]{16,}",
             r"(?i)\btoken\s*[:=]\s*[\x22']?[A-Za-z0-9._~+/=-]{16,}",
             r"(?i)\bapi[_-]?key\s*[:=]\s*[\x22']?[A-Za-z0-9._~+/=-]{16,}",
             r"-----BEGIN [A-Z ]+-----",
@@ -1151,6 +1158,28 @@ fn archive_destination(folder: &Path, archive_root: &Path, archive_date: &str) -
     archive_root.join(year).join(name)
 }
 
+/// Inbox directory used to resolve an archive destination. When `--inbox-dir`
+/// is given explicitly it wins; otherwise derive it from the case folder's own
+/// parent so the archive lands in the same inbox tree as the case, regardless of
+/// the shell's current working directory (issue #739). The cwd-relative
+/// [`default_inbox_dir`] is only a last resort for a parentless case path.
+fn resolve_archive_inbox_dir(explicit: Option<&Path>, case_folder: &Path) -> PathBuf {
+    explicit.map(Path::to_path_buf).unwrap_or_else(|| {
+        case_folder
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_inbox_dir)
+    })
+}
+
+/// Archive root for a case. `--archive-root` wins when given; otherwise it is
+/// the `archive/` subtree of the resolved inbox directory.
+fn resolve_archive_root(explicit_root: Option<&Path>, inbox_dir: &Path) -> PathBuf {
+    explicit_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| inbox_dir.join("archive"))
+}
+
 fn render_archive_section(archive_date: &str, reason: &str, link: &str) -> String {
     let view = ArchiveSectionView {
         archive_date,
@@ -1703,10 +1732,6 @@ fn run_set_status(args: &SetStatusArgs) -> Result<SetStatusResult, CliError> {
 
 fn run_archive(args: &ArchiveArgs) -> Result<ArchiveResult, CliError> {
     let archive_date = normalize_archive_date(&args.date)?;
-    let archive_root = args
-        .archive_root
-        .clone()
-        .unwrap_or_else(|| args.inbox_dir.join("archive"));
     let case = resolve_case(&args.entry)?;
     if case.kind != CaseKind::Inbox {
         return Err(CliError::usage(
@@ -1718,6 +1743,8 @@ fn run_archive(args: &ArchiveArgs) -> Result<ArchiveResult, CliError> {
             None,
         ));
     }
+    let inbox_dir = resolve_archive_inbox_dir(args.inbox_dir.as_deref(), &case.folder);
+    let archive_root = resolve_archive_root(args.archive_root.as_deref(), &inbox_dir);
     let destination_folder = archive_destination(&case.folder, &archive_root, &archive_date);
     let destination_doc = destination_folder.join("ENTRY.md");
     let reason = if args.reason.is_empty() {
@@ -1725,12 +1752,7 @@ fn run_archive(args: &ArchiveArgs) -> Result<ArchiveResult, CliError> {
     } else {
         args.reason.clone()
     };
-    let verification = verify_case(
-        &case,
-        Some(&args.inbox_dir),
-        DEFAULT_EVIDENCE_MAX_BYTES,
-        false,
-    )?;
+    let verification = verify_case(&case, Some(&inbox_dir), DEFAULT_EVIDENCE_MAX_BYTES, false)?;
     let parsed = parse_entry(&case.doc_path)?;
     let sections = parsed.sections.clone();
     let fields = parsed.fields.clone();
@@ -2082,10 +2104,8 @@ fn archive_log_targets(args: &ArchiveArgs) -> Vec<SnapshotTarget> {
     if let Ok(case) = resolve_case(&args.entry)
         && let Ok(archive_date) = normalize_archive_date(&args.date)
     {
-        let archive_root = args
-            .archive_root
-            .clone()
-            .unwrap_or_else(|| args.inbox_dir.join("archive"));
+        let inbox_dir = resolve_archive_inbox_dir(args.inbox_dir.as_deref(), &case.folder);
+        let archive_root = resolve_archive_root(args.archive_root.as_deref(), &inbox_dir);
         targets.push(SnapshotTarget {
             label: "destination",
             path: archive_destination(&case.folder, &archive_root, &archive_date),
@@ -2587,9 +2607,10 @@ struct ArchiveArgs {
     #[arg(value_name = "PATH", value_hint = ValueHint::AnyPath)]
     entry: PathBuf,
 
-    /// Inbox directory used for duplicate detection.
-    #[arg(long = "inbox-dir", value_name = "DIR", value_hint = ValueHint::DirPath, default_value_os_t = default_inbox_dir())]
-    inbox_dir: PathBuf,
+    /// Inbox directory for duplicate detection and archive destination
+    /// (defaults to the case folder's own parent inbox).
+    #[arg(long = "inbox-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
+    inbox_dir: Option<PathBuf>,
 
     /// Override archive root (defaults to <inbox-dir>/archive).
     #[arg(long = "archive-root", value_name = "DIR", value_hint = ValueHint::DirPath)]
@@ -2735,6 +2756,34 @@ mod tests {
         assert!(token_regexes().iter().any(|re| re.is_match(text2)));
         let text3 = "-----BEGIN RSA PRIVATE KEY-----";
         assert!(token_regexes().iter().any(|re| re.is_match(text3)));
+    }
+
+    #[test]
+    fn token_regexes_sk_pattern_requires_boundary() {
+        // Real OpenAI-style key tokens still trip the gate, whether at the
+        // start of input or after a non-identifier separator.
+        for text in [
+            "sk-proj-abcdefghijklmnop1234",
+            "OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234",
+            "key: sk-abcdefghijklmnop1234",
+        ] {
+            assert!(
+                token_regexes().iter().any(|re| re.is_match(text)),
+                "expected a token match for {text:?}"
+            );
+        }
+        // Ordinary hyphenated identifiers that merely contain the `sk-`
+        // substring must not be flagged (regression for #740).
+        for text in [
+            "docs/plans/2026-05-28-plan-task-ledger-durability/",
+            "task-ledger-durability",
+            "a-risk-ledger-mitigation-summary",
+        ] {
+            assert!(
+                !token_regexes().iter().any(|re| re.is_match(text)),
+                "did not expect a token match for {text:?}"
+            );
+        }
     }
 
     #[test]
