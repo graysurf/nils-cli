@@ -854,7 +854,7 @@ fn run_record_open(
         source_path: relative_repo_path(&bundle.source_file),
         source_commit: seed.source_commit.clone(),
     };
-    if let Some((issue_number, audit)) = detect_resumable_tracker(
+    let result = if let Some((issue_number, audit)) = detect_resumable_tracker(
         adapter.as_ref(),
         repo,
         &normalized_labels,
@@ -862,7 +862,7 @@ fn run_record_open(
         &identity,
     )? {
         let issue_url = repo_info.issue_url(issue_number);
-        return record_open_resume(
+        record_open_resume(
             adapter.as_ref(),
             repo,
             args.profile,
@@ -871,21 +871,67 @@ fn run_record_open(
             &issue_url,
             &audit,
             binary.execution_mode(),
-        );
+        )?
+    } else {
+        let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
+            .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
+
+        record_open_finalize(
+            adapter.as_ref(),
+            repo,
+            args.profile,
+            &body_path,
+            &normalized_labels,
+            &seed,
+            binary.execution_mode(),
+        )?
+    };
+
+    // Mirror the live tracking-issue URL into the bundle's durable
+    // `*-execution-state.md` so `plan-archive discover` can infer the provider
+    // ref offline. The issue already exists, so a sync failure is reported in
+    // the result rather than rolled back.
+    Ok(attach_open_exec_state_sync(
+        result,
+        bundle.execution_state_file.as_deref(),
+    ))
+}
+
+/// Patch the bundle's execution-state `Tracking issue` bullet to the URL the
+/// `record open` result reports, then annotate the result with an
+/// `execution_state_sync` object (action + whether a follow-up commit is
+/// needed). Non-fatal: the tracker already exists, so a write error is reported
+/// instead of failing the command.
+fn attach_open_exec_state_sync(mut result: Value, execution_state_file: Option<&Path>) -> Value {
+    let issue_url = result
+        .get("issue")
+        .and_then(|issue| issue.get("url"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|url| !url.is_empty());
+    let sync = match (execution_state_file, issue_url) {
+        (Some(path), Some(url)) => {
+            match plan_tooling::exec_state::sync_tracking_issue(path, &url) {
+                Ok(report) => json!({
+                    "file": path.display().to_string(),
+                    "changed": report.changed,
+                    "followup_commit_required": report.changed,
+                    "report": serde_json::to_value(&report).unwrap_or(Value::Null),
+                }),
+                Err(err) => json!({
+                    "file": path.display().to_string(),
+                    "ok": false,
+                    "error": {"code": err.code(), "message": err.to_string()},
+                }),
+            }
+        }
+        (None, _) => json!({"skipped": true, "reason": "no execution-state file in bundle"}),
+        (_, None) => json!({"skipped": true, "reason": "no issue url available"}),
+    };
+    if let Value::Object(map) = &mut result {
+        map.insert("execution_state_sync".to_string(), sync);
     }
-
-    let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
-        .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
-
-    record_open_finalize(
-        adapter.as_ref(),
-        repo,
-        args.profile,
-        &body_path,
-        &normalized_labels,
-        &seed,
-        binary.execution_mode(),
-    )
+    result
 }
 
 /// Create the tracking issue, post the initial lifecycle comments, and repair
@@ -1794,6 +1840,13 @@ fn run_record_close(
             .map_err(|err| CommandError::runtime("record-close-label-edit-failed", err))?;
     }
 
+    // Write the terminal state back into the bundle's execution-state file so
+    // the in-repo copy is final immediately after closeout, not transient-stale
+    // until `plan-archive migrate`. Skipped (and reported) when no --bundle was
+    // provided; a write error is reported, not fatal (the issue is closed).
+    let execution_state_sync =
+        close_exec_state_writeback(args.bundle.as_deref(), &issue_url, &linked_evidence);
+
     Ok(json!({
         "operation": "record.close",
         "execution_mode": binary.execution_mode(),
@@ -1807,7 +1860,78 @@ fn run_record_close(
         "linked_prs": linked_evidence,
         "final_dashboard": final_dashboard,
         "labels": labels_preview,
+        "execution_state_sync": execution_state_sync,
     }))
+}
+
+/// Find a `*-execution-state.md` file directly inside `bundle_dir`.
+fn find_execution_state_file(bundle_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(bundle_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with("-execution-state.md"))
+                .unwrap_or(false)
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Terminal-state writeback for `record close`. Patches the bundle's
+/// execution-state header bullets (`Status`, `Last updated`, `Branch/commit/PR`,
+/// `Tracking issue`) to their final values. Returns the JSON object placed
+/// under `execution_state_sync` in the close result. The `## Task Ledger` rows
+/// are owned by the existing per-task `ledger-update` + `close-ready`
+/// `ledger-rows-pending` gate, so this writeback never rewrites them.
+fn close_exec_state_writeback(
+    bundle: Option<&Path>,
+    issue_url: &str,
+    linked_prs: &[lifecycle_record::LinkedPrEvidence],
+) -> Value {
+    let Some(bundle_dir) = bundle else {
+        return json!({"skipped": true, "reason": "no --bundle provided"});
+    };
+    let Some(exec_state) = find_execution_state_file(bundle_dir) else {
+        return json!({"skipped": true, "reason": "no *-execution-state.md in bundle"});
+    };
+    let branch_commit_pr = if linked_prs.is_empty() {
+        None
+    } else {
+        Some(
+            linked_prs
+                .iter()
+                .map(|pr| match &pr.url {
+                    Some(url) => format!("{} merged ({url})", pr.pr_ref),
+                    None => format!("{} merged", pr.pr_ref),
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    };
+    let state = plan_tooling::exec_state::TerminalState {
+        status: Some("complete; tracking issue closed".to_string()),
+        last_updated: Some(chrono::Utc::now().format("%Y-%m-%d").to_string()),
+        branch_commit_pr,
+        tracking_issue_url: Some(issue_url.to_string()),
+    };
+    match plan_tooling::exec_state::writeback_terminal(&exec_state, &state) {
+        Ok(report) => json!({
+            "file": exec_state.display().to_string(),
+            "changed": report.changed,
+            "followup_commit_required": report.changed,
+            "report": serde_json::to_value(&report).unwrap_or(Value::Null),
+        }),
+        Err(err) => json!({
+            "file": exec_state.display().to_string(),
+            "ok": false,
+            "error": {"code": err.code(), "message": err.to_string()},
+        }),
+    }
 }
 
 fn run_record_template(args: &RecordTemplateArgs) -> Result<Value, CommandError> {
@@ -8255,5 +8379,82 @@ mod tests {
         };
         let body = render_subagent_prompt(&view);
         assert_or_bless_execute("subagent_prompt.md", &body);
+    }
+
+    #[test]
+    fn attach_open_exec_state_sync_writes_tracking_url_and_reports() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = tmp.path().join("demo-execution-state.md");
+        std::fs::write(
+            &state,
+            "## Execution State\n\n- Status: tracking issue opened\n- Tracking issue: not yet opened\n",
+        )
+        .unwrap();
+        let result = json!({
+            "operation": "record.open",
+            "issue": {"number": 738, "url": "https://github.com/o/r/issues/738"},
+        });
+        let out = attach_open_exec_state_sync(result, Some(state.as_path()));
+        let sync = out.get("execution_state_sync").expect("sync field");
+        assert_eq!(sync.get("changed").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            sync.get("followup_commit_required")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let written = std::fs::read_to_string(&state).unwrap();
+        assert!(written.contains("- Tracking issue: <https://github.com/o/r/issues/738>"));
+    }
+
+    #[test]
+    fn attach_open_exec_state_sync_skips_without_bundle_state() {
+        let result = json!({"issue": {"url": "https://github.com/o/r/issues/1"}});
+        let out = attach_open_exec_state_sync(result, None);
+        assert_eq!(
+            out.get("execution_state_sync")
+                .and_then(|s| s.get("skipped"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn close_exec_state_writeback_sets_terminal_header_fields() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = tmp.path().join("demo-execution-state.md");
+        std::fs::write(
+            &state,
+            "## Execution State\n\n- Status: tracking issue opened; implementation not yet started.\n- Last updated: 2026-06-01\n- Branch/commit/PR: no PR opened.\n- Tracking issue: <https://github.com/o/r/issues/738>\n\n## Task Ledger\n\n| ID | Status | Task | Evidence | Notes |\n| --- | --- | --- | --- | --- |\n| 1.1 | done | x | y | z |\n",
+        )
+        .unwrap();
+        let linked = vec![lifecycle_record::LinkedPrEvidence {
+            pr_ref: "o/r#42".to_string(),
+            url: Some("https://github.com/o/r/pull/42".to_string()),
+            merge_sha: Some("abc".to_string()),
+            checks: lifecycle_record::CheckStatus::Pass,
+            required_state: None,
+            required_count: None,
+            non_required_failures: Vec::new(),
+        }];
+        let out = close_exec_state_writeback(
+            Some(tmp.path()),
+            "https://github.com/o/r/issues/738",
+            &linked,
+        );
+        assert_eq!(out.get("changed").and_then(|v| v.as_bool()), Some(true));
+        let written = std::fs::read_to_string(&state).unwrap();
+        assert!(written.contains("- Status: complete; tracking issue closed"));
+        assert!(
+            written.contains("- Branch/commit/PR: o/r#42 merged (https://github.com/o/r/pull/42)")
+        );
+        assert!(written.contains("- Tracking issue: <https://github.com/o/r/issues/738>"));
+        // Task Ledger row preserved verbatim.
+        assert!(written.contains("| 1.1 | done | x | y | z |"));
+    }
+
+    #[test]
+    fn close_exec_state_writeback_skips_without_bundle() {
+        let out = close_exec_state_writeback(None, "https://x/issues/1", &[]);
+        assert_eq!(out.get("skipped").and_then(|v| v.as_bool()), Some(true));
     }
 }
