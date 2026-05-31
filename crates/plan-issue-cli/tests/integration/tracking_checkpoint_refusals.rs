@@ -145,6 +145,81 @@ fn tracking_checkpoint_refusals_block_when_run_state_stale_vs_issue_closed() {
 // posting hop lives in `tracking_checkpoint_live.rs`.
 
 #[test]
+fn tracking_checkpoint_blocks_when_recorded_ledger_ref_is_unresolvable() {
+    // graysurf/plan-tracking-testbed#55: a run that records a bundle /
+    // execution-state ref whose Task Ledger cannot be read must refuse the
+    // `state` checkpoint with `state-ledger-unresolved` instead of silently
+    // posting the single-row synthesized baseline (a wrong-but-plausible state
+    // comment). Here `execution_state_file` points at a path that does not
+    // exist, mirroring a relative ref that does not resolve from the checkpoint
+    // working directory.
+    let fixture = write_fixture(&[
+        (
+            "source",
+            json!({"path": "p", "commit": "c"}),
+            "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:00Z",
+        ),
+        (
+            "plan",
+            json!({"path": "p", "commit": "c"}),
+            "## Plan Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:01Z",
+        ),
+        (
+            "state",
+            json!({"status": "in-progress", "target_scope": "x", "tasks": [], "prs": []}),
+            "## Execution State\n\n- Profile: tracking\n- Status: in-progress\n\n## Task Ledger\n\n| ID | Status |\n| --- | --- |\n| 1.1 | done |",
+            "2026-05-26T00:00:02Z",
+        ),
+    ]);
+    let tmp = TempDir::new().expect("tmp");
+    let rs_path = tmp.path().join("run-state.json");
+    let missing = tmp.path().join("does-not-exist/slug-execution-state.md");
+    let body = json!({
+        "schema": "plan-issue.execution-run.v1",
+        "run_id": "run-1",
+        "repo": "owner/repo",
+        "issue": 123,
+        "profile": "tracking",
+        "phase": "implementing",
+        "created_at": "2026-05-26T00:00:00Z",
+        "updated_at": "2026-05-26T01:00:00Z",
+        "execution_state_file": missing.to_string_lossy(),
+        "selected_scope": {"task": "1.2", "title": "demo"},
+        "branch": "feat/x"
+    });
+    fs::write(&rs_path, body.to_string()).expect("run-state");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "checkpoint",
+        "--profile",
+        "tracking",
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--post",
+        "state",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let result = json_stdout(&out)["payload"]["result"].clone();
+    let codes: Vec<&str> = result["blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["code"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        codes.contains(&"state-ledger-unresolved"),
+        "expected state-ledger-unresolved; blocked codes: {codes:?}"
+    );
+}
+
+#[test]
 fn tracking_checkpoint_refusals_block_unknown_role() {
     let tmp = TempDir::new().expect("tmp");
     let rs_path = tmp.path().join("run-state.json");

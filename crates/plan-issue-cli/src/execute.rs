@@ -2154,6 +2154,16 @@ fn run_tracking(
     }
 }
 
+/// Normalize a path to an absolute, cwd-independent form so a later
+/// `tracking checkpoint` (run from any directory) can still resolve a bundle or
+/// execution-state ref recorded at init time. `std::path::absolute` only
+/// prepends the current directory for relative inputs — it does not require the
+/// path to exist or resolve symlinks. Falls back to the original path when the
+/// current directory cannot be read, so a recorded ref is never dropped.
+fn absolutize(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn run_tracking_run_init(
     _repo_override: Option<&str>,
     args: &crate::commands::tracking::TrackingRunInitArgs,
@@ -2175,8 +2185,14 @@ fn run_tracking_run_init(
         RunPhase::Initial,
         now.clone(),
     );
-    run.bundle = args.bundle.clone();
-    run.execution_state_file = args.execution_state_file.clone();
+    // Persist bundle / execution-state refs as absolute, cwd-independent paths.
+    // `tracking run init` resolves a relative `--bundle` against the current
+    // directory, but a later `tracking checkpoint` may run from elsewhere; a
+    // verbatim relative ref then fails to resolve and the state checkpoint
+    // silently degrades to the single-row baseline
+    // (graysurf/plan-tracking-testbed#55).
+    run.bundle = args.bundle.as_deref().map(absolutize);
+    run.execution_state_file = args.execution_state_file.as_deref().map(absolutize);
     if args.task.is_some() || args.sprint.is_some() {
         run.selected_scope = Some(SelectedScope {
             sprint: args.sprint,
@@ -2423,6 +2439,27 @@ fn run_tracking_checkpoint(
             "code": "issue-evidence-missing",
             "message": "record has not been opened yet",
             "suggested_unblock": "run `plan-issue record open` first",
+        }));
+    }
+
+    // graysurf/plan-tracking-testbed#55: when the run records a ledger source
+    // (a `bundle` or `execution_state_file`) but its Task Ledger cannot be read
+    // — a relative ref that does not resolve from the checkpoint working
+    // directory, or a moved/missing file — the `state` payload would silently
+    // degrade to the single-row synthesized baseline and post a
+    // wrong-but-plausible state comment. Refuse instead of degrading. A run
+    // with no recorded ledger source keeps the synthesized baseline.
+    if requested_roles.contains(&PayloadRole::State)
+        && (run.bundle.is_some() || run.execution_state_file.is_some())
+        && state_ledger_path(&run)
+            .map(|path| std::fs::read_to_string(&path).is_err())
+            .unwrap_or(true)
+    {
+        blocked.push(json!({
+            "code": "state-ledger-unresolved",
+            "role": "state",
+            "message": "run records a bundle / execution-state ref but its Task Ledger could not be read; refusing to post a degraded single-row state comment",
+            "suggested_unblock": "re-run `tracking run init` with an absolute --execution-state-file (or a --bundle whose directory contains a *-execution-state.md), or run checkpoint from a directory where the recorded relative path resolves",
         }));
     }
 
@@ -2843,9 +2880,24 @@ fn render_checkpoint_role(
     Ok(CheckpointRoleResult::Rendered(body))
 }
 
+/// Resolve the execution-state Markdown that backs the `state` checkpoint
+/// ledger. Prefers an explicit `execution_state_file`; otherwise discovers the
+/// `*-execution-state.md` inside the run's `bundle`. The bundle fallback is what
+/// makes `tracking run init --bundle <dir>` (the canonical flow, which records
+/// only `bundle`) render the full Task Ledger instead of the single-row
+/// synthesized baseline (graysurf/plan-tracking-testbed#55).
+fn state_ledger_path(run: &crate::tracking::run_state::ExecutionRun) -> Option<PathBuf> {
+    if let Some(path) = run.execution_state_file.as_ref() {
+        return Some(path.clone());
+    }
+    run.bundle
+        .as_ref()
+        .and_then(|bundle| find_execution_state(bundle))
+}
+
 fn load_state_markdown_summary(run: &crate::tracking::run_state::ExecutionRun) -> Option<String> {
-    let path = run.execution_state_file.as_ref()?;
-    let content = std::fs::read_to_string(path).ok()?;
+    let path = state_ledger_path(run)?;
+    let content = std::fs::read_to_string(&path).ok()?;
     if content.contains("## Task Ledger") {
         Some(content)
     } else {
@@ -2935,8 +2987,8 @@ fn derive_ledger_progress(tasks: &[Value], ready_to_close: bool) -> (String, Str
 /// scope line. This keeps the dashboard `target_scope` anchored to the durable
 /// plan scope instead of a synthesized status word.
 fn execution_state_target_scope(run: &crate::tracking::run_state::ExecutionRun) -> Option<String> {
-    let path = run.execution_state_file.as_ref()?;
-    let raw = std::fs::read_to_string(path).ok()?;
+    let path = state_ledger_path(run)?;
+    let raw = std::fs::read_to_string(&path).ok()?;
     let lines: Vec<&str> = raw.lines().collect();
     let start = lines
         .iter()
@@ -2998,9 +3050,9 @@ fn normalize_pr_status(status: Option<&str>) -> &'static str {
 /// `tasks[]` payload shape. Returns `None` when no ledger is recorded, it
 /// cannot be read, or it has no rows.
 fn accumulative_state_tasks(run: &crate::tracking::run_state::ExecutionRun) -> Option<Vec<Value>> {
-    let path = run.execution_state_file.as_ref()?;
-    let raw = std::fs::read_to_string(path).ok()?;
-    let rows = plan_tooling::ledger::read_rows(&raw, path).ok()?;
+    let path = state_ledger_path(run)?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let rows = plan_tooling::ledger::read_rows(&raw, &path).ok()?;
     if rows.is_empty() {
         return None;
     }
@@ -7336,6 +7388,78 @@ mod tests {
             1,
             "without a ledger the payload stays single-current"
         );
+    }
+
+    #[test]
+    fn state_checkpoint_payload_resolves_ledger_from_bundle_when_only_bundle_recorded() {
+        // graysurf/plan-tracking-testbed#55: the canonical `tracking run init
+        // --bundle <dir>` flow records only `bundle` (no `execution_state_file`).
+        // The state payload must discover the bundle's `*-execution-state.md` and
+        // carry the FULL ledger, not silently fall back to the single-row
+        // synthesized baseline.
+        use crate::tracking::run_state::{ExecutionRun, RunPhase};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let bundle = tmp.path().join("docs/plans/slug");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        std::fs::write(
+            bundle.join("slug-execution-state.md"),
+            concat!(
+                "# Execution State\n\n",
+                "## Task Ledger\n\n",
+                "| ID | Status | Task | Evidence | Notes |\n",
+                "| --- | --- | --- | --- | --- |\n",
+                "| 1.1 | done | Append line A | log | first |\n",
+                "| 1.2 | in-progress | Append line B | — | second |\n",
+                "| 1.3 | pending | Append line C | — | third |\n",
+            ),
+        )
+        .expect("write ledger");
+
+        let mut run = ExecutionRun::new(
+            "run-bundle",
+            "owner/repo",
+            1,
+            "tracking",
+            RunPhase::Implementing,
+            "2026-05-29T00:00:00Z",
+        );
+        run.bundle = Some(bundle.clone());
+        assert!(
+            run.execution_state_file.is_none(),
+            "this case covers --bundle with no explicit execution-state file"
+        );
+
+        let payload = state_checkpoint_payload(&run);
+        let tasks = payload["tasks"].as_array().expect("tasks array");
+        assert_eq!(
+            tasks.len(),
+            3,
+            "state payload must resolve the bundle's *-execution-state.md ledger, not the single-row baseline"
+        );
+        let ids: Vec<&str> = tasks.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["1.1", "1.2", "1.3"]);
+    }
+
+    #[test]
+    fn absolutize_makes_relative_paths_absolute_and_leaves_absolute_paths_absolute() {
+        use std::path::{Path, PathBuf};
+
+        // A relative ref (what `tracking run init --bundle docs/plans/x` records
+        // today) becomes absolute so a later checkpoint resolves it regardless
+        // of its working directory (graysurf/plan-tracking-testbed#55).
+        let rel = absolutize(Path::new("docs/plans/slug"));
+        assert!(
+            rel.is_absolute(),
+            "relative ref must be absolutized: {rel:?}"
+        );
+        assert!(rel.ends_with("docs/plans/slug"));
+
+        // An already-absolute ref stays absolute and idempotent.
+        let abs_in = PathBuf::from("/tmp/bundle/slug-execution-state.md");
+        let abs_out = absolutize(&abs_in);
+        assert!(abs_out.is_absolute());
+        assert_eq!(abs_out, abs_in);
     }
 
     #[test]
