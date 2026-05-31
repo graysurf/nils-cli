@@ -61,6 +61,9 @@ For a new publishable CLI crate:
   - `description = "CLI crate for nils-<name> in the nils-cli workspace."`
   - `repository = "https://github.com/sympoies/nils-cli"`
   - at least one `[[bin]]` target.
+- Crate directory, `[package].name`, and `[[bin]].name` MUST follow
+  `docs/specs/crate-cli-naming-convention-v1.md` (enforced by
+  `scripts/ci/crate-naming-audit.sh`).
 - Crate must be listed in workspace `members` in root `Cargo.toml`.
 - Dependencies should use workspace/shared conventions when available (`[workspace.dependencies]`, local `nils-*` crates with explicit
   `version` + `path` + `package`).
