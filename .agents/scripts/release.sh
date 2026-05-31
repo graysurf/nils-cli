@@ -5,7 +5,7 @@
 # Kept here so the global dispatcher (~/.claude/scripts/release.sh) finds
 # this repo's release flow under the dispatcher convention
 # (<repo>/.agents/scripts/release.sh). The real logic still lives in
-# .agents/skills/nils-cli-bump-version-tag-release/ so codex / opencode
+# .agents/skills/project-bump-version-tag-release/ so codex / opencode
 # discover it through their skill-indexing mechanism — per the multi-CLI
 # mirror rule in claude-kit's docs/dispatcher-commands.md.
 #
@@ -20,7 +20,7 @@ if [[ -z "$repo_root" ]]; then
   exit 2
 fi
 
-canonical="$repo_root/.agents/skills/nils-cli-bump-version-tag-release/scripts/nils-cli-bump-version-tag-release.sh"
+canonical="$repo_root/.agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh"
 if [[ ! -x "$canonical" ]]; then
   echo "release: missing $canonical" >&2
   exit 2

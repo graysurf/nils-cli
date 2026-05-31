@@ -27,7 +27,7 @@ out of scope for this governance inventory; flag it as a follow-up.
 | --- | --- | --- | --- | --- |
 | `changes` | `Detect docs-only change set` | `scripts/ci/detect-docs-only.sh` (shares `scripts/ci/lib/doc_classify.py`) | keep | Emits `docs_only`; downstream jobs read `needs.changes.outputs.docs_only`. |
 | `test`, `test_macos` | `Checkout`, `Set up Rust`, `Cache cargo`, `Set up Node.js`, tool bootstrap | Upstream GitHub Actions + runner bootstrap shell | keep | Platform bootstrap stays in workflow; runs in both lanes (docs-only still needs node/rg/plan-tooling). |
-| `test`, `test_macos` | `Nils CLI checks (includes third-party-artifacts-audit, Completion asset audit, docs-hygiene-audit, test-stale-audit)` | `scripts/ci/nils-cli-checks-entrypoint.sh` -> `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh` | keep | Full CI verification contract after setup; passes `--docs-only` when `needs.changes.outputs.docs_only == 'true'`. |
+| `test`, `test_macos` | `Nils CLI checks (includes third-party-artifacts-audit, Completion asset audit, docs-hygiene-audit, test-stale-audit)` | `scripts/ci/nils-cli-checks-entrypoint.sh` -> `./.agents/skills/project-verify-required-checks/scripts/project-verify-required-checks.sh` | keep | Full CI verification contract after setup; passes `--docs-only` when `needs.changes.outputs.docs_only == 'true'`. |
 | `test`, `test_macos` | `Third-party artifact audit` (removed) | replaced by required-checks script ordering | delete | Duplicate workflow fragment removed. |
 | `test`, `test_macos` | `Completion asset audit` (removed) | replaced by required-checks script ordering | delete | Duplicate workflow fragment removed. |
 | `test`, `test_macos` | `Publish JUnit report`, `Upload JUnit XML` | upstream Actions artifacts/reporting | keep | Post-check reporting only. |
@@ -52,7 +52,7 @@ out of scope for this governance inventory; flag it as a follow-up.
 
 ## Required-Checks Script Ownership
 
-`./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh` is canonical for full CI verification ordering:
+`./.agents/skills/project-verify-required-checks/scripts/project-verify-required-checks.sh` is canonical for full CI verification ordering:
 
 1. docs/stale/third-party/completion audits (`scripts/ci/*`)
 2. completion registration/parity checks
@@ -72,18 +72,18 @@ records the keep/delete decision plus the active caller evidence.
 | Path | Decision | Active caller evidence |
 | --- | --- | --- |
 | `scripts/ci/agent-docs-snapshots.sh` | keep | `crates/agent-docs/README.md` snapshot workflow (`scripts/ci/agent-docs-snapshots.sh [--bless]`) |
-| `scripts/ci/completion-asset-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` step |
-| `scripts/ci/completion-flag-parity-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` step |
+| `scripts/ci/completion-asset-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
+| `scripts/ci/completion-flag-parity-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 | `scripts/ci/coverage-badge.sh` | keep | `.github/workflows/ci.yml` `coverage_badge` job |
 | `scripts/ci/coverage-summary.sh` | keep | `.github/workflows/ci.yml` `coverage` job + `DEVELOPMENT.md` coverage flow |
 | `scripts/ci/detect-docs-only.sh` | keep | `.github/workflows/ci.yml` `changes` job + `scripts/ci/tests/detect-docs-only.test.sh` |
-| `scripts/ci/docs-hygiene-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
-| `scripts/ci/docs-placement-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
-| `scripts/ci/markdownlint-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` docs-only and full passes |
+| `scripts/ci/docs-hygiene-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes |
+| `scripts/ci/docs-placement-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes |
+| `scripts/ci/markdownlint-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/nils-cli-checks-entrypoint.sh` | keep | `.github/workflows/ci.yml` `test` and `test_macos` jobs + `DEVELOPMENT.md` local-fast and CI/full commands |
 | `scripts/ci/release-tarball-third-party-audit.sh` | keep | `.github/workflows/release.yml` `build` job |
-| `scripts/ci/test-stale-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` step |
-| `scripts/ci/third-party-artifacts-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `nils-cli-verify-required-checks.sh` step + dependabot bump skill |
+| `scripts/ci/test-stale-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
+| `scripts/ci/third-party-artifacts-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step + dependabot bump skill |
 
 ## Auxiliary Wrapper / Tooling Decisions
 
@@ -98,8 +98,8 @@ records the keep/delete decision plus the active caller evidence.
 ```bash
 test -f docs/specs/workspace-ci-entrypoint-inventory-v1.md
 ls scripts/ci/*.sh
-rg -n 'scripts/ci/|nils-cli-verify-required-checks' \
+rg -n 'scripts/ci/|project-verify-required-checks' \
   .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/publish-crates.yml \
-  DEVELOPMENT.md .agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh
+  DEVELOPMENT.md .agents/skills/project-verify-required-checks/scripts/project-verify-required-checks.sh
 rg -n 'canonical|delete|delete-candidate|keep|workflow' docs/specs/workspace-ci-entrypoint-inventory-v1.md
 ```
