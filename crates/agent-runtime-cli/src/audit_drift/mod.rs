@@ -132,6 +132,7 @@ pub fn run(root: &SourceRoot) -> Result<DriftReport> {
         classes::extra::check(root, manifests.as_deref(), product, &mut report)?;
     }
     classes::intentional::check(root, manifests.as_deref(), &mut report)?;
+    classes::plugin_manifest_skills::check(root, manifests.as_deref(), &mut report)?;
     agent_home_leak::check_source_tree(root, &mut report)?;
     unsafe_score::check(root, &mut report)?;
     allowlist.apply(&mut report);
