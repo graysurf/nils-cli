@@ -342,7 +342,7 @@ fn set_permissions(_path: &Path, _mode: u32) -> io::Result<()> {
 // Atomic-write helper, off the render path: produces a unique tempfile
 // name for the write-temp-then-rename pattern used by `atomic_write`.
 // The Resolved Decision #9 determinism gate covers the render pipeline
-// (agent-runtime-cli's `src/render/`), which never touches this helper
+// (nils-agent-runtime's `src/render/`), which never touches this helper
 // — `agent-runtime render` writes through `std::fs::write` directly.
 // Allowing `SystemTime::now()` exactly here keeps the gate green
 // without weakening the rule for any new render-path code.

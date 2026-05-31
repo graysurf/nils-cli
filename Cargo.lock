@@ -9,26 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agent-runtime-cli"
-version = "0.31.8"
-dependencies = [
- "anyhow",
- "clap",
- "indexmap",
- "nils-build-info",
- "nils-markdown",
- "nils-test-support",
- "pretty_assertions",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.11.0",
- "tempfile",
- "tera",
- "thiserror",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1823,6 +1803,26 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "nils-agent-runtime"
+version = "0.31.8"
+dependencies = [
+ "anyhow",
+ "clap",
+ "indexmap",
+ "nils-build-info",
+ "nils-markdown",
+ "nils-test-support",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "tempfile",
+ "tera",
+ "thiserror",
 ]
 
 [[package]]

@@ -94,7 +94,7 @@ impl Engine {
     }
 
     /// Attach a domain-specific Tera function under `name`. This is
-    /// the consumer extension point for Task 1.4: agent-runtime-cli's
+    /// the consumer extension point for Task 1.4: nils-agent-runtime's
     /// `cli_ref / script / skill_ref / state_out` helpers register
     /// here without `nils-markdown` knowing the consumer's domain.
     pub fn register_helper<F>(&mut self, name: &str, function: F)
@@ -145,7 +145,7 @@ impl Default for EngineBuilder {
 
 /// Serialize a view into a Tera [`Context`]. Tera requires the
 /// top-level value to be a JSON object; we allow null / empty
-/// callers (the agent-runtime-cli render path passes no view, the
+/// callers (the nils-agent-runtime render path passes no view, the
 /// helpers carry every variable) and map them to an empty context.
 fn serialize_to_context<T: Serialize>(view: &T) -> Result<Context, tera::Error> {
     let value = serde_json::to_value(view).map_err(tera::Error::json)?;
