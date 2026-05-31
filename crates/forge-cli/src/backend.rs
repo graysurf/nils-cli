@@ -538,8 +538,17 @@ mod tests {
         assert_eq!(BackendProgram::Glab.default_executable(), "glab");
     }
 
+    /// Serializes the tests that mutate the process-global `ENV_GH_BIN`
+    /// override. `std::env::set_var` / `remove_var` are not thread-safe, so
+    /// without this guard a concurrently-running env-mutating test can leave
+    /// the override pointing at the wrong binary and flip the expected
+    /// `backend_missing` / `backend_timeout` outcome. Poison is recovered so a
+    /// panic in one test does not cascade-fail the other.
+    static ENV_GH_BIN_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn process_runner_reports_missing_backend() {
+        let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let runner = ProcessRunner;
         // Use a path that definitely does not exist.
         unsafe {
@@ -557,6 +566,7 @@ mod tests {
     fn process_runner_reports_backend_timeout() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let stub = dir.path().join("gh");
         std::fs::write(&stub, "#!/bin/sh\nsleep 2\necho should-not-complete\n")

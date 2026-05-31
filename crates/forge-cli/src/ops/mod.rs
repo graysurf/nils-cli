@@ -28,3 +28,4 @@ pub mod pr_view;
 pub mod pr_wait_checks;
 pub mod repo_view;
 pub mod required_check_gate;
+pub mod search;

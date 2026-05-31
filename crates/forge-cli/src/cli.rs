@@ -131,6 +131,8 @@ pub enum Command {
     Label(LabelArgs),
     /// Personal cross-repo work inbox.
     Inbox(InboxArgs),
+    /// Full-text / reverse-reference search over issues and PRs.
+    Search(SearchArgs),
     /// Repository helpers.
     Repo(RepoArgs),
     /// Backend authentication helpers.
@@ -167,6 +169,12 @@ pub struct LabelArgs {
 pub struct InboxArgs {
     #[command(subcommand)]
     pub command: Option<InboxCommand>,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchArgs {
+    #[command(subcommand)]
+    pub command: Option<SearchCommand>,
 }
 
 #[derive(Args, Debug)]
@@ -761,6 +769,59 @@ pub struct ActivitySummaryArgs {
     pub limit: u32,
 }
 
+/// `search` subtree. Free-text / reverse-reference query over forge issues and
+/// PRs, scoped to a single repository. GitHub-only in v1; GitLab / Local hit a
+/// structured `provider_unsupported` seam.
+#[derive(Subcommand, Debug)]
+pub enum SearchCommand {
+    /// Full-text search over issues (`gh search issues`).
+    Issues(SearchQueryArgs),
+    /// Full-text search over pull requests (`gh search prs`).
+    Prs(SearchQueryArgs),
+}
+
+/// Shared arguments for `search issues` / `search prs`.
+#[derive(Args, Debug, Clone)]
+pub struct SearchQueryArgs {
+    /// Free-text query passed to the provider's search primitive.
+    #[arg(value_name = "QUERY")]
+    pub query: String,
+    /// Restrict matching to these fields (comma-separated or repeatable).
+    /// Defaults to title, body, and comments.
+    #[arg(
+        long = "match",
+        value_enum,
+        value_delimiter = ',',
+        default_values_t = [SearchMatchField::Title, SearchMatchField::Body, SearchMatchField::Comments],
+        value_name = "FIELD"
+    )]
+    pub match_fields: Vec<SearchMatchField>,
+    /// Cap the number of returned results (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub limit: u32,
+}
+
+/// Field a `search` query may match on. Mirrors `gh search --match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum SearchMatchField {
+    Title,
+    Body,
+    Comments,
+}
+
+impl SearchMatchField {
+    /// Stable lower-case rendering used in the `gh search --match` value and
+    /// in the envelope's `match_fields`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchMatchField::Title => "title",
+            SearchMatchField::Body => "body",
+            SearchMatchField::Comments => "comments",
+        }
+    }
+}
+
 /// `inbox` subtree.
 #[derive(Subcommand, Debug)]
 pub enum InboxCommand {
@@ -1082,6 +1143,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Inbox(InboxArgs {
             command: Some(command),
         })) => ops::inbox::run(&global, command, format),
+        Some(Command::Search(SearchArgs {
+            command: Some(command),
+        })) => ops::search::run(&global, command, format),
         Some(Command::Completion(CompletionArgs { shell })) => emit_completion(shell),
         None
         | Some(Command::Auth(AuthArgs { command: None }))
@@ -1090,7 +1154,8 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         | Some(Command::Issue(IssueArgs { command: None }))
         | Some(Command::Activity(ActivityArgs { command: None }))
         | Some(Command::Label(LabelArgs { command: None }))
-        | Some(Command::Inbox(InboxArgs { command: None })) => {
+        | Some(Command::Inbox(InboxArgs { command: None }))
+        | Some(Command::Search(SearchArgs { command: None })) => {
             // No subcommand: print help and exit USAGE so callers don't
             // mistake the no-op for success.
             let _ = <Cli as clap::CommandFactory>::command().print_help();
