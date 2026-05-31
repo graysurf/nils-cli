@@ -5,6 +5,7 @@ mod integration {
     mod auth_status;
     mod cli;
     mod completion_sync;
+    mod conformance;
     mod exit_codes;
     mod exit_codes_full;
     mod fixture_lint;
