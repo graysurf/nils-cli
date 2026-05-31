@@ -75,6 +75,14 @@ validations_catalog:
     rule: "when --strict-labels is set, every selected label exists in --label-catalog, applies to the target, and exclusive groups do not conflict"
     error_kind: label_unknown | label_not_applicable | label_group_conflict | label_catalog_missing
     exit: DATA
+  repo_required:
+    rule: "search resolves a single repo slug from --repo or the detected forge remote"
+    error_kind: repo_required
+    exit: DATA
+  ref_invalid:
+    rule: "search refs-to <ref> parses as a GitHub URL, owner/name#number, or #number / number"
+    error_kind: ref_invalid
+    exit: DATA
 
 # ---------------------------------------------------------------------------
 # Global flags every subcommand inherits.
@@ -551,6 +559,76 @@ operations:
         limit: integer
         query_limit: integer
         items: "ranked normalized inbox items"
+
+  # SearchItem (shared across the three search envelopes):
+  #   { kind: enum<issue|pr>, number, url, title, state, repo,
+  #     matched_field: optional<string> }   # matched_field is null on the gh path
+
+  - id: search.issues
+    schema_version: cli.forge-cli.search.issues.v1
+    summary: Full-text search over issues via the provider search primitive.
+    inputs:
+      - { name: <query>, type: string,                          required: true }
+      - { name: --match, type: list<enum<title|body|comments>>, default: [title, body, comments] }
+      - { name: --limit, type: integer,                         default: 30 }
+    validations:
+      - repo_required
+    backends:
+      github: { program: gh, argv: [search, issues, "{query}", --repo, "{slug}", --match, "{match_csv}", --limit, "{limit}", --json, "number,title,url,state,repository,isPullRequest"] }
+      gitlab: provider_unsupported   # search is GitHub-only in v1
+      local:  provider_unsupported
+    output:
+      data:
+        provider: enum<github>
+        host: string
+        repo: string
+        query: string
+        match_fields: list<enum<title|body|comments>>
+        limit: integer
+        item_count: integer
+        limited: bool
+        items: list<SearchItem>
+    notes: "Single-repo scoped via --repo or the detected remote; the slug is always pushed as gh search --repo. GitLab/Local return provider_unsupported, never a silent empty result."
+
+  - id: search.prs
+    schema_version: cli.forge-cli.search.prs.v1
+    summary: Full-text search over pull requests via the provider search primitive.
+    inputs:
+      - { name: <query>, type: string,                          required: true }
+      - { name: --match, type: list<enum<title|body|comments>>, default: [title, body, comments] }
+      - { name: --limit, type: integer,                         default: 30 }
+    validations:
+      - repo_required
+    backends:
+      github: { program: gh, argv: [search, prs, "{query}", --repo, "{slug}", --match, "{match_csv}", --limit, "{limit}", --json, "number,title,url,state,repository,isPullRequest"] }
+      gitlab: provider_unsupported
+      local:  provider_unsupported
+    output:
+      data: { provider: enum<github>, host, repo, query, match_fields, limit, item_count, limited, items: list<SearchItem> }
+
+  - id: search.refs-to
+    schema_version: cli.forge-cli.search.refs-to.v1
+    summary: List issues/PRs that reference a ref via cross-reference events.
+    inputs:
+      - { name: <ref>,   type: string,  required: true }   # GitHub URL | owner/name#n | #n | n
+      - { name: --limit, type: integer, default: 30 }
+    validations:
+      - ref_invalid
+    backends:
+      github: { program: gh, argv: [api, graphql, -F, "owner={owner}", -F, "name={name}", -F, "number={number}", -F, "first={limit}", -f, "query={cross_referenced_event_query}"] }
+      gitlab: provider_unsupported
+      local:  provider_unsupported
+    output:
+      data:
+        provider: enum<github>
+        host: string
+        repo: string
+        reference_number: integer
+        limit: integer
+        item_count: integer
+        limited: bool
+        items: list<SearchItem>
+    notes: "Queries the target's CROSS_REFERENCED_EVENT timeline items and normalizes the referencing issues/PRs into SearchItem. <ref> is parsed as a URL, owner/name#n, or #n / n (repo from context)."
 
 # ---------------------------------------------------------------------------
 # Macro operations.

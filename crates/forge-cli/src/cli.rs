@@ -132,6 +132,13 @@ pub enum Command {
     /// Personal cross-repo work inbox.
     Inbox(InboxArgs),
     /// Full-text / reverse-reference search over issues and PRs.
+    ///
+    /// `search` complements the other discovery surfaces, which serve distinct
+    /// roles: `issue list` / `pr list` filter by structured fields (state,
+    /// labels, author) within one repo; `inbox` is the personal cross-repo work
+    /// queue; `search` runs free-text (`issues` / `prs`) and reverse-reference
+    /// (`refs-to`) queries the structured lists cannot express. GitHub-only in
+    /// v1; GitLab and Local return a structured `provider_unsupported` error.
     Search(SearchArgs),
     /// Repository helpers.
     Repo(RepoArgs),
@@ -778,6 +785,21 @@ pub enum SearchCommand {
     Issues(SearchQueryArgs),
     /// Full-text search over pull requests (`gh search prs`).
     Prs(SearchQueryArgs),
+    /// List issues / PRs that reference a ref via cross-reference events.
+    #[command(name = "refs-to")]
+    RefsTo(SearchRefsToArgs),
+}
+
+/// Arguments for `search refs-to <ref>`.
+#[derive(Args, Debug, Clone)]
+pub struct SearchRefsToArgs {
+    /// Target issue / PR to find references to. Accepts a GitHub URL,
+    /// `owner/name#number`, or `#number` / `number` (repo from context).
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    /// Cap the number of cross-reference events scanned (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub limit: u32,
 }
 
 /// Shared arguments for `search issues` / `search prs`.

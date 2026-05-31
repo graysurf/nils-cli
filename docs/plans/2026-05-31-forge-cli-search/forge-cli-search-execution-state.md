@@ -46,10 +46,10 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | todo | `search` CLI subtree (`issues` / `prs`) + provider seam | — | No deps. Add `Search` command + arg structs in `cli.rs`, dispatch in `lib.rs`; GitLab / Local → structured `provider_unsupported` (explicit, not silent). PR1. |
-| 1.2 | todo | GitHub `search issues` / `search prs` ops (B) | — | Depends on 1.1. Shared `SearchItem`; `gh search <kind> <query> --repo --match title,body,comments --limit --json`; normalized + versioned envelope; `--dry-run` argv parity; single-repo via `push_repo_override`. PR1 with 1.1. |
-| 2.1 | todo | GitHub `search refs-to <ref>` op (A) | — | Depends on 1.1, 1.2. Parse URL / `owner/name#n` / `#n`; `gh api graphql` CROSS_REFERENCED_EVENT; normalize referencing sources to `SearchItem`; versioned envelope; GitHub-only. PR2. |
-| 2.2 | todo | Docs, `--help` / completion snapshot, and release | — | Depends on 2.1. Document the three envelopes in `forge-cli-spec-v1.md` / `forge-cli-ops-v1.yaml` and the `list` vs `search` vs `inbox` role split; golden fixtures; PR self-gated via `gh pr checks`; release + tap bump. |
+| 1.1 | done | `search` CLI subtree (`issues` / `prs`) + provider seam | PR sympoies/nils-cli#722 (merged b6121ad); cargo test -p nils-forge-cli green, local-fast passed | No deps. Add `Search` command + arg structs in `cli.rs`, dispatch in `lib.rs`; GitLab / Local → structured `provider_unsupported` (explicit, not silent). PR1. |
+| 1.2 | done | GitHub `search issues` / `search prs` ops (B) | PR sympoies/nils-cli#722 (merged b6121ad); search.issues.v1/search.prs.v1 envelopes + golden integration tests | Depends on 1.1. Shared `SearchItem`; `gh search <kind> <query> --repo --match title,body,comments --limit --json`; normalized + versioned envelope; `--dry-run` argv parity; single-repo via `push_repo_override`. PR1 with 1.1. |
+| 2.1 | done | GitHub `search refs-to <ref>` op (A) | Sprint 2 / PR2: search refs-to graphql op (CROSS_REFERENCED_EVENT), ref parsing (URL/owner-name#n/#n/n), unit + golden integration tests | Depends on 1.1, 1.2. Parse URL / `owner/name#n` / `#n`; `gh api graphql` CROSS_REFERENCED_EVENT; normalize referencing sources to `SearchItem`; versioned envelope; GitHub-only. PR2. |
+| 2.2 | in-progress | Docs, `--help` / completion snapshot, and release | Sprint 2 / PR2: forge-cli-spec-v1.md Search output contract + forge-cli-ops-v1.yaml search ops + README + list/search/inbox role split in help + regenerated completion snapshot; release + tap bump pending | Depends on 2.1. Document the three envelopes in `forge-cli-spec-v1.md` / `forge-cli-ops-v1.yaml` and the `list` vs `search` vs `inbox` role split; golden fixtures; PR self-gated via `gh pr checks`; release + tap bump. |
 
 ## Session Log
 

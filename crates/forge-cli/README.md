@@ -145,6 +145,35 @@ time forge-cli --format json inbox list --gitlab-host gitlab.example.com --limit
 Wall-clock latency depends on `gh`/`glab` and remote API responsiveness; treat
 these timings as delivery evidence, not deterministic budgets.
 
+## Search
+
+`forge-cli search` runs free-text and reverse-reference queries the structured
+`issue list` / `pr list` filters cannot express. It delegates to the provider
+search primitives and builds no index. GitHub-only in v1; GitLab and Local
+return a structured `provider_unsupported` error, never a silent empty result.
+
+```sh
+# Full-text issues / PRs (default --match title,body,comments), single-repo scoped
+forge-cli search issues "ratelimit retry" --format json
+forge-cli search prs "cache" --match title --limit 10 --format json
+
+# Reverse reference: which issues/PRs reference this ref?
+forge-cli search refs-to 123 --format json
+forge-cli search refs-to owner/name#123 --format json
+forge-cli search refs-to https://github.com/owner/name/pull/123 --format json
+
+# Preview the exact backend argv without calling the provider
+forge-cli --dry-run --format json search issues "term"
+```
+
+Role split: `issue list` / `pr list` filter by structured fields within one
+repo, `inbox` is the personal cross-repo work queue, and `search` is full-text
+(`issues` / `prs`) and reverse-reference (`refs-to`) query. The repo slug comes
+from `--repo owner/name` or the detected remote. `search issues` / `search prs`
+emit `cli.forge-cli.search.issues.v1` / `...search.prs.v1`; `search refs-to`
+emits `cli.forge-cli.search.refs-to.v1`. Every hit is the shared `SearchItem`
+(`kind`, `number`, `url`, `title`, `state`, `repo`, `matched_field`).
+
 ## GitHub checks compatibility
 
 Starting with `nils-cli` `0.17.0`, GitHub `pr checks` calls request only the
