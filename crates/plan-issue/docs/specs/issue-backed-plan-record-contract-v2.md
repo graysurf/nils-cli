@@ -230,6 +230,40 @@ semantics instead of preserving them as a supported old format. As landed:
   payload shape. Do not add side-by-side v2/new parity tests unless a later
   product decision explicitly reintroduces a migration contract.
 
+## Durable Execution-State Synchronization
+
+The runtime source of truth stays `run-state.json` plus provider lifecycle
+comments. Independently, the canonical `*-execution-state.md` is a durable
+plan-bundle surface consumed by humans and by `plan-archive discover` (which
+infers provider refs only from local Markdown and never calls a provider). To
+stop the two from drifting once a tracking issue exists:
+
+- `record open` writes the live tracking issue URL into the bundle's
+  `*-execution-state.md` (`- Tracking issue:` bullet) and reports the action
+  under `execution_state_sync`. A follow-up commit of the patched bundle is
+  required before the workflow continues.
+- `record close` writes the terminal state back (`- Status:` to a terminal
+  value, `- Last updated:`, `- Branch/commit/PR:`, and the issue URL) through
+  the bundle `--bundle` directory, so the in-repo file is final immediately
+  after closeout rather than transient-stale until `plan-archive migrate`. The
+  `## Task Ledger` rows are not touched here — they are owned by per-task
+  `plan-tooling ledger-update` and the `close-ready` `ledger-rows-pending` gate.
+- `tracking checkpoint --live` reconciles the durable `Tracking issue` bullet
+  with run-state: a missing or placeholder URL is self-healed (the URL is
+  derived offline from the repo slug) and a genuine issue mismatch refuses with
+  `execution-state-issue-mismatch`.
+- `tracking close-ready` is non-mutating: it blocks with
+  `execution-state-issue-missing` or `execution-state-issue-mismatch` and points
+  at the repair command rather than self-healing.
+- `plan-tooling exec-state-sync` is the offline, byte-preserving repair surface
+  for legacy bundles (issue exists, but the local Markdown lacks the URL or is
+  frozen mid-flight).
+
+This is complementary to `plan-archive migrate`, whose archived-header rewrite
+remains the archive-time step: closeout writeback produces the
+`complete`/`closed` terminal state in-repo, and migrate later rewrites the
+archived copy's header to `archived`. Neither overwrites the other.
+
 ## Command Boundary
 
 - `plan-tooling`: plan parsing, validation, sprint and task split modeling.
