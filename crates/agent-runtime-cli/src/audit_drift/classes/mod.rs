@@ -2,3 +2,4 @@
 
 pub mod extra;
 pub mod intentional;
+pub mod plugin_manifest_skills;

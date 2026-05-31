@@ -9,6 +9,8 @@ mod audit_drift_allowlist;
 mod audit_drift_classes;
 #[path = "integration/audit_drift_extra_intentional.rs"]
 mod audit_drift_extra_intentional;
+#[path = "integration/audit_drift_plugin_manifest_skills.rs"]
+mod audit_drift_plugin_manifest_skills;
 #[path = "integration/audit_drift_unsafe_score.rs"]
 mod audit_drift_unsafe_score;
 #[path = "integration/cli.rs"]
