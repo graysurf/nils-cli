@@ -21,3 +21,5 @@ mod open;
 mod reset;
 #[path = "integration/utils.rs"]
 pub mod utils;
+#[path = "integration/worktree.rs"]
+mod worktree;

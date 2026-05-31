@@ -10,3 +10,4 @@ pub mod open;
 pub mod prompt;
 pub mod reset;
 pub mod utils;
+pub mod worktree;

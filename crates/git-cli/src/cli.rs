@@ -3,7 +3,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use nils_common::cli_contract::exit;
 use std::ffi::OsString;
 
-use crate::{branch, ci, commit, completion, open, reset, utils};
+use crate::{branch, ci, commit, completion, open, reset, utils, worktree};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -29,6 +29,8 @@ enum Group {
     Commit(CommitGroup),
     #[command(about = "Branch helpers")]
     Branch(BranchGroup),
+    #[command(about = "Worktree helpers")]
+    Worktree(WorktreeGroup),
     #[command(about = "CI helpers")]
     Ci(CiGroup),
     #[command(about = "Open remote pages")]
@@ -143,6 +145,27 @@ enum BranchCommand {
 
 #[derive(Debug, Args)]
 #[command(disable_help_subcommand = true)]
+struct WorktreeGroup {
+    #[command(subcommand)]
+    command: Option<WorktreeCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeCommand {
+    #[command(about = "Create a managed agent worktree")]
+    Add(RawArgs),
+    #[command(about = "List git worktrees")]
+    List(RawArgs),
+    #[command(about = "Remove a managed worktree by slug or path")]
+    Remove(RawArgs),
+    #[command(about = "Prune stale git worktree metadata")]
+    Prune(RawArgs),
+    #[command(about = "Display help message for worktree")]
+    Help,
+}
+
+#[derive(Debug, Args)]
+#[command(disable_help_subcommand = true)]
 struct CiGroup {
     #[command(subcommand)]
     command: Option<CiCommand>,
@@ -234,6 +257,7 @@ where
         Some(Group::Reset(group)) => run_reset(group),
         Some(Group::Commit(group)) => run_commit(group),
         Some(Group::Branch(group)) => run_branch(group),
+        Some(Group::Worktree(group)) => run_worktree(group),
         Some(Group::Ci(group)) => run_ci(group),
         Some(Group::Open(group)) => run_open(group),
         Some(Group::Completion(raw)) => run_completion(raw),
@@ -298,6 +322,24 @@ fn run_ci(group: CiGroup) -> i32 {
     match group.command {
         Some(CiCommand::Pick(raw)) => ci::dispatch("pick", &raw.args).unwrap_or(exit::USAGE),
         Some(CiCommand::Help) | None => print_group_help("ci"),
+    }
+}
+
+fn run_worktree(group: WorktreeGroup) -> i32 {
+    match group.command {
+        Some(WorktreeCommand::Add(raw)) => {
+            worktree::dispatch("add", &raw.args).unwrap_or(exit::USAGE)
+        }
+        Some(WorktreeCommand::List(raw)) => {
+            worktree::dispatch("list", &raw.args).unwrap_or(exit::USAGE)
+        }
+        Some(WorktreeCommand::Remove(raw)) => {
+            worktree::dispatch("remove", &raw.args).unwrap_or(exit::USAGE)
+        }
+        Some(WorktreeCommand::Prune(raw)) => {
+            worktree::dispatch("prune", &raw.args).unwrap_or(exit::USAGE)
+        }
+        Some(WorktreeCommand::Help) | None => print_group_help("worktree"),
     }
 }
 
@@ -422,5 +464,27 @@ mod tests {
             panic!("expected copy-staged command");
         };
         assert_eq!(raw.args, vec!["--both".to_string()]);
+    }
+
+    #[test]
+    fn clap_dispatches_worktree_raw_args() {
+        let cli =
+            Cli::try_parse_from(["git-cli", "worktree", "add", "topic-one", "--from", "main"])
+                .expect("parse");
+
+        let Some(Group::Worktree(group)) = cli.group else {
+            panic!("expected worktree group");
+        };
+        let Some(WorktreeCommand::Add(raw)) = group.command else {
+            panic!("expected add command");
+        };
+        assert_eq!(
+            raw.args,
+            vec![
+                "topic-one".to_string(),
+                "--from".to_string(),
+                "main".to_string()
+            ]
+        );
     }
 }
