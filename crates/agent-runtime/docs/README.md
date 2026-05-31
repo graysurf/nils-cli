@@ -1,6 +1,6 @@
-# agent-runtime-cli Docs Index
+# agent-runtime Docs Index
 
-> Ownership: Maintained by the `agent-runtime-cli` crate maintainers. Keep
+> Ownership: Maintained by the `agent-runtime` crate maintainers. Keep
 > this index updated when docs are added, moved, or removed.
 
 Crate-local docs here cover nils-cli-owned runtime-kit binary behavior.

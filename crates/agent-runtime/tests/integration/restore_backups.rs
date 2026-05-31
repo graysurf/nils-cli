@@ -14,8 +14,8 @@
 //! - Recursive link-map entries that collide on `(entry_id, basename)`
 //!   produce `SkippedAmbiguous`.
 
-use agent_runtime_cli::install::{self, InstallOptions, Mode as InstallMode};
-use agent_runtime_cli::restore_backups::{
+use agent_runtime::install::{self, InstallOptions, Mode as InstallMode};
+use agent_runtime::restore_backups::{
     self, BackupRunSelector, Mode as RestoreMode, RestoreError, RestoreOptions, RestoredChange,
 };
 use nils_test_support::bin;

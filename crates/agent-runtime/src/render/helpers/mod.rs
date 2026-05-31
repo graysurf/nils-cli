@@ -39,7 +39,7 @@ pub struct HelperContext {
 
 /// Register every renderer helper on `engine` with the shared `ctx`.
 ///
-/// `agent-runtime-cli` keeps the four helper bodies in this crate
+/// `agent-runtime` keeps the four helper bodies in this crate
 /// because they bind to its manifest domain (`ManifestSet`,
 /// `StateOutMode`, `CliToolsManifest`); `nils-markdown` exposes a
 /// generic [`Engine::register_helper`] extension point that this

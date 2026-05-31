@@ -4,13 +4,13 @@
 //! `agent-runtime-kit/docs/source/inventory-target-architecture.md`,
 //! render output must be a pure function of the source-root contents.
 //! `std::time::SystemTime::now()` and `chrono::Utc::now()` are
-//! clippy-banned inside `agent-runtime-cli` and `nils-common`. The
+//! clippy-banned inside `agent-runtime` and `nils-common`. The
 //! single escape hatch is [`source_commit_timestamp`], which returns
 //! the ISO-8601 commit timestamp of the source-root's `HEAD` — a value
 //! that changes only when the source tree itself changes, so two cold
 //! processes rendering the same source produce identical output.
 //!
-//! See `crates/agent-runtime-cli/docs/determinism.md` for the full
+//! See `crates/agent-runtime/docs/determinism.md` for the full
 //! contract.
 
 use anyhow::{Context, Result, anyhow};

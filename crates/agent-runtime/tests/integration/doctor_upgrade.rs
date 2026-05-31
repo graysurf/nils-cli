@@ -1,7 +1,7 @@
 //! Integration coverage for Plan 04 Sprint 3 Task 3.3 doctor upgrade,
 //! project-overlay, and CLI coverage probes.
 
-use agent_runtime_cli::doctor::project::{self, ProjectOverlayStatus};
+use agent_runtime::doctor::project::{self, ProjectOverlayStatus};
 use nils_test_support::cmd::{self, CmdOutput};
 use nils_test_support::{StubBinDir, bin};
 use std::fs;

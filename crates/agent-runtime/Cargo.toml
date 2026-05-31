@@ -8,7 +8,7 @@ description = "Render / install / doctor / audit-drift CLI for graysurf/agent-ru
 repository = "https://github.com/sympoies/nils-cli"
 
 [lib]
-name = "agent_runtime_cli"
+name = "agent_runtime"
 path = "src/lib.rs"
 
 [[bin]]

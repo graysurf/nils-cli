@@ -21,7 +21,7 @@ seeds differ).
 
 Enforcement:
 
-- `crates/agent-runtime-cli/clippy.toml` and
+- `crates/agent-runtime/clippy.toml` and
   `crates/nils-common/clippy.toml` list `std::collections::HashMap`,
   `std::collections::HashSet`,
   `std::collections::hash_map::DefaultHasher`, and
@@ -37,7 +37,7 @@ Enforcement:
   `tests/integration/render_determinism.rs` and the production walk
   in `render::golden::update_golden` both sort before iterating.
 
-Single exemption: `crates/agent-runtime-cli/src/render/helpers/` —
+Single exemption: `crates/agent-runtime/src/render/helpers/` —
 Tera's `Function` trait signature is
 `fn call(&self, args: &HashMap<String, Value>) -> Result<Value>`, so
 the helper closures cannot avoid the type. The module-level

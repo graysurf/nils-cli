@@ -32,4 +32,4 @@ nils-api-rest
 nils-api-grpc
 nils-api-websocket
 nils-api-test
-agent-runtime-cli
+nils-agent-runtime

@@ -12,10 +12,8 @@
 //!   sandbox home survive uninstall byte-identically.
 //! - A second uninstall on an already-clean home is an exit-0 no-op.
 
-use agent_runtime_cli::install::{self, InstallOptions, Mode as InstallMode};
-use agent_runtime_cli::uninstall::{
-    self, Mode as UninstallMode, UninstallOptions, UninstalledChange,
-};
+use agent_runtime::install::{self, InstallOptions, Mode as InstallMode};
+use agent_runtime::uninstall::{self, Mode as UninstallMode, UninstallOptions, UninstalledChange};
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
 use std::fs;

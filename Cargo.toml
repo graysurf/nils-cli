@@ -6,7 +6,7 @@ members = [
   "crates/nils-term",
   "crates/nils-test-support",
   "crates/cli-template",
-  "crates/agent-runtime-cli",
+  "crates/agent-runtime",
   "crates/agent-memory",
   "crates/memo-cli",
   "crates/codex-cli",
