@@ -40,11 +40,11 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | pending | Lock the failing cases and current invariants | - | Preserve the `forge-cli-search` / issue #716 `no-provider-refs` case and the closeout-stale local-state case; prove discover stays offline. |
-| 1.2 | pending | Shared sync routine and create-time URL write | - | One byte-preserving routine owns execution-state writes; `record open` invokes it to record the issue URL. |
-| 1.3 | pending | Closeout terminal-state writeback | - | `record close` writes terminal status, final ledger, linked PR, and URL into the local file; complementary to migrate's archived rewrite. |
-| 1.4 | pending | Consistency and self-heal gate across execute/checkpoint/close | - | Self-heal write-if-missing before any hard block; cover the previously unguarded close path. |
-| 1.5 | pending | Legacy repair and documentation | - | On-demand repair command over the shared routine for bundles such as `forge-cli-search`. |
+| 1.1 | done | Lock the failing cases and current invariants | <https://github.com/sympoies/nils-cli/pull/741> | Preserve the `forge-cli-search` / issue #716 `no-provider-refs` case and the closeout-stale local-state case; prove discover stays offline. |
+| 1.2 | done | Shared sync routine and create-time URL write | <https://github.com/sympoies/nils-cli/pull/741> | One byte-preserving routine owns execution-state writes; `record open` invokes it to record the issue URL. |
+| 1.3 | done | Closeout terminal-state writeback | <https://github.com/sympoies/nils-cli/pull/741> | `record close` writes terminal status, final ledger, linked PR, and URL into the local file; complementary to migrate's archived rewrite. |
+| 1.4 | done | Consistency and self-heal gate across execute/checkpoint/close | <https://github.com/sympoies/nils-cli/pull/741> | Self-heal write-if-missing before any hard block; cover the previously unguarded close path. |
+| 1.5 | done | Legacy repair and documentation | <https://github.com/sympoies/nils-cli/pull/741> | On-demand repair command over the shared routine for bundles such as `forge-cli-search`. |
 | 2.1 | pending | Update agent-runtime-kit create/execute/closeout skill instructions | - | Required: Task 1.2/1.3 change the create and closeout command sequences. |
 
 ## Session Log
