@@ -37,7 +37,7 @@ Options:
                           Legacy local-tap mode only.
   --from-tap              Resume mode: skip nils-cli stages 1-8 and wait for the tap stage.
                           Requires --version and an existing v<version> tag in this repo.
-  --tap-formula <name>    Formula basename to bump (default: nils-cli). Reserved for AWL et al.
+  --tap-formula <name>    Formula basename to bump (default: nils-cli).
   --skip-dev-clean        Do not clear ~/.local/nils-cli/bin after a successful release.
   --skip-local-brew-upgrade
                           Do not update/upgrade an installed local Homebrew formula after tap release.

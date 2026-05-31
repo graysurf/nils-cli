@@ -66,7 +66,7 @@ Inputs:
   - `--skip-tap-tag` (legacy local-tap option; not used by the dispatch-based default path)
   - `--from-tap` (resume mode: skip nils-cli stages 1-8, verify release assets already exist,
     and wait for the tap stage; requires an existing local `v<version>` tag in the nils-cli work tree)
-  - `--tap-formula <name>` (formula basename, default `nils-cli`; reserved for AWL et al.)
+  - `--tap-formula <name>` (formula basename, default `nils-cli`)
   - `--skip-dev-clean` (do not clear `~/.local/nils-cli/bin` after a successful release)
   - `--skip-local-brew-upgrade` (do not run `brew update` + `brew upgrade/install <formula>` after a successful tap update)
   - `NILS_CLI_HOMEBREW_TAP_DIR` (env var; optional local tap checkout path)
