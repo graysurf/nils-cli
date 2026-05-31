@@ -48,14 +48,14 @@ fn agent_runtime_clippy_toml_lists_every_required_entry() {
         assert_contains(
             AGENT_RUNTIME_CLIPPY_TOML,
             ty,
-            "crates/agent-runtime-cli/clippy.toml",
+            "crates/agent-runtime/clippy.toml",
         );
     }
     for m in REQUIRED_DISALLOWED_METHODS {
         assert_contains(
             AGENT_RUNTIME_CLIPPY_TOML,
             m,
-            "crates/agent-runtime-cli/clippy.toml",
+            "crates/agent-runtime/clippy.toml",
         );
     }
 }
@@ -79,7 +79,7 @@ fn agent_runtime_lib_denies_the_determinism_lints() {
     assert_contains(
         AGENT_RUNTIME_LIB_RS,
         "#![deny(clippy::disallowed_types, clippy::disallowed_methods)]",
-        "crates/agent-runtime-cli/src/lib.rs",
+        "crates/agent-runtime/src/lib.rs",
     );
 }
 
@@ -97,7 +97,7 @@ fn helpers_mod_carries_the_only_sanctioned_disallowed_types_allow() {
     assert_contains(
         HELPERS_MOD_RS,
         "#![allow(clippy::disallowed_types)]",
-        "crates/agent-runtime-cli/src/render/helpers/mod.rs",
+        "crates/agent-runtime/src/render/helpers/mod.rs",
     );
 }
 

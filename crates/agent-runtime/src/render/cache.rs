@@ -112,7 +112,7 @@ mod tests {
         assert!(loaded.skills.is_empty());
     }
 
-    /// A cache file written by a future agent-runtime-cli with a newer
+    /// A cache file written by a future agent-runtime with a newer
     /// `schema_version` should be ignored rather than half-trusted —
     /// the entries' shape might have changed.
     #[test]

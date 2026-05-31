@@ -79,7 +79,7 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 
 ### Agent policy and evidence tooling
 
-- [crates/agent-runtime-cli](crates/agent-runtime-cli): Runtime-kit tooling binary (`agent-runtime`) for render, install, doctor,
+- [crates/agent-runtime](crates/agent-runtime): Runtime-kit tooling binary (`agent-runtime`) for render, install, doctor,
   audit-drift, runtime state maintenance, skill listing, and PR/MR body rendering.
 - [crates/agent-docs](crates/agent-docs): Deterministic policy-document resolver for Codex/agent workflows (`resolve`, `contexts`, `add`,
   `baseline`).

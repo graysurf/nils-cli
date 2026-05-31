@@ -1,8 +1,8 @@
 //! Integration coverage for Plan 04 Sprint 3 Task 3.1 doctor probes.
 
-use agent_runtime_cli::doctor::{self, DoctorOptions, DoctorSeverity};
-use agent_runtime_cli::install::{self, InstallOptions, Mode};
-use agent_runtime_cli::managed_block::{CommentStyle, ManagedBlock};
+use agent_runtime::doctor::{self, DoctorOptions, DoctorSeverity};
+use agent_runtime::install::{self, InstallOptions, Mode};
+use agent_runtime::managed_block::{CommentStyle, ManagedBlock};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

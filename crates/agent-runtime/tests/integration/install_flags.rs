@@ -9,7 +9,7 @@
 //! - `--no-overlay` / `--overlay-path`: the `.private/link-map.overrides.yaml`
 //!   merge runs before plan generation and can be redirected or skipped.
 
-use agent_runtime_cli::install::{self, InstallOptions, Mode};
+use agent_runtime::install::{self, InstallOptions, Mode};
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
 use std::fs;
@@ -357,10 +357,10 @@ entries:
         .actions
         .iter()
         .map(|a| match a {
-            agent_runtime_cli::install::plan::PlanAction::Symlink { dest, .. } => {
+            agent_runtime::install::plan::PlanAction::Symlink { dest, .. } => {
                 dest.display().to_string()
             }
-            agent_runtime_cli::install::plan::PlanAction::ManagedBlock { config_file, .. } => {
+            agent_runtime::install::plan::PlanAction::ManagedBlock { config_file, .. } => {
                 config_file.display().to_string()
             }
         })

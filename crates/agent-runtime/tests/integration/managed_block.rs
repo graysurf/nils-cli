@@ -4,7 +4,7 @@
 //! error variants; this suite focuses on the file-system level
 //! idempotence guarantees the installer (Sprint 1 Task 1.2) depends on.
 
-use agent_runtime_cli::managed_block::{CommentStyle, ManagedBlock, ManagedBlockError};
+use agent_runtime::managed_block::{CommentStyle, ManagedBlock, ManagedBlockError};
 use std::fs;
 use tempfile::TempDir;
 

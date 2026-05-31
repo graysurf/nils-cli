@@ -48,7 +48,7 @@ fn pr_body_render_feature_writes_forge_compatible_body_to_stdout() {
     );
     let test_plan = fixture.write(
         "test-plan.md",
-        "- cargo test -p agent-runtime-cli pr_body (pass)\n",
+        "- cargo test -p nils-agent-runtime pr_body (pass)\n",
     );
 
     let output = run(&[
@@ -104,7 +104,7 @@ fn pr_body_render_bug_writes_kind_specific_body_to_file() {
     );
     let test_plan = fixture.write(
         "test-plan.md",
-        "- cargo test -p agent-runtime-cli pr_body (pass)\n",
+        "- cargo test -p nils-agent-runtime pr_body (pass)\n",
     );
     let out_string = out.to_string_lossy().to_string();
 
@@ -184,7 +184,10 @@ fn pr_body_render_generic_kinds_emit_forge_compatible_body() {
             "test-first.md",
             "- Change classification: chore\n- Waiver reason: mechanical change\n",
         );
-        let test_plan = fixture.write("test-plan.md", "- cargo test -p agent-runtime-cli (pass)\n");
+        let test_plan = fixture.write(
+            "test-plan.md",
+            "- cargo test -p nils-agent-runtime (pass)\n",
+        );
 
         let output = run(&[
             "pr-body",

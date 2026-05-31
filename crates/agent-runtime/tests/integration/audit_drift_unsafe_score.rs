@@ -1,7 +1,7 @@
 //! Integration coverage for Plan 04 Task 4.1 `audit-drift` unsafe scoring.
 //!
 //! The plan still names a standalone `crates/audit-drift` crate, but the
-//! current implementation lives inside `agent-runtime-cli::audit_drift`.
+//! current implementation lives inside `agent-runtime::audit_drift`.
 //! These tests pin the user-facing `agent-runtime audit-drift` contract so
 //! the internal module layout can remain local to this repo.
 

@@ -1,8 +1,8 @@
-# agent-runtime-cli
+# agent-runtime
 
 ## Overview
 
-`nils-agent-runtime` is the Rust crate (in `crates/agent-runtime-cli/`) that
+`nils-agent-runtime` is the Rust crate (in `crates/agent-runtime/`) that
 ships the `agent-runtime` binary
 for [`graysurf/agent-runtime-kit`](https://github.com/graysurf/agent-runtime-kit).
 The binary owns deterministic runtime-kit tooling: render / install /
@@ -11,11 +11,11 @@ that should not live in provider wrappers such as `forge-cli`.
 
 ## Package vs binary name
 
-| Field        | Value                      |
-| ------------ | -------------------------- |
-| Directory    | `crates/agent-runtime-cli` |
-| Package name | `nils-agent-runtime`       |
-| Binary name  | `agent-runtime`            |
+| Field        | Value                  |
+| ------------ | ---------------------- |
+| Directory    | `crates/agent-runtime` |
+| Package name | `nils-agent-runtime`   |
+| Binary name  | `agent-runtime`        |
 
 Use the package name (`-p nils-agent-runtime`) for cargo commands and the
 binary name (`agent-runtime`) for installed-binary invocations.

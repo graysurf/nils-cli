@@ -1,7 +1,7 @@
 //! Integration coverage for Plan 04 Sprint 3 Task 3.2 version probes.
 
-use agent_runtime_cli::doctor::DoctorSeverity;
-use agent_runtime_cli::doctor::version::{self, VersionProbeInput, VersionStatus};
+use agent_runtime::doctor::DoctorSeverity;
+use agent_runtime::doctor::version::{self, VersionProbeInput, VersionStatus};
 
 fn input(
     output: &str,

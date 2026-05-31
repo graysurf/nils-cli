@@ -1,11 +1,11 @@
 //! Install pipeline integration tests. Plan 04 Sprint 1 Task 1.2.
 //!
 //! These tests build a deterministic tmp source root + tmp home and
-//! drive `agent_runtime_cli::install::run` end-to-end so the dry-run
+//! drive `agent_runtime::install::run` end-to-end so the dry-run
 //! printer and apply executor both exercise the byte-identical
 //! idempotence guarantee the Plan 04 acceptance criteria require.
 
-use agent_runtime_cli::install::{self, AppliedChange, InstallOptions, Mode};
+use agent_runtime::install::{self, AppliedChange, InstallOptions, Mode};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
