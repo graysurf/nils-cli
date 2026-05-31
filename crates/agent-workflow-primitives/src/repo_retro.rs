@@ -40,11 +40,7 @@ struct RepoRetroView<'a> {
     attention_items_block: String,
     hotspots_block: String,
     validation_signals_block: String,
-    heuristic_state: &'a str,
-    heuristic_active_inbox_total: usize,
-    heuristic_movement_summary: &'a str,
-    heuristic_op_records_changed: usize,
-    heuristic_aging_summary: &'a str,
+    heuristic_block: String,
     follow_up_questions_block: String,
     show_warnings: bool,
     warnings_block: String,
@@ -2420,6 +2416,25 @@ fn render_markdown(report: &RepoRetroReport) -> String {
             .map(String::as_str),
     );
     let warnings_block = format_bullet_block(report.warnings.iter().map(String::as_str));
+    // When no heuristic-system tree was discovered, collapse the section body to
+    // a single explanatory line instead of an all-zero block, so a reader does
+    // not misread "not present" as "no activity this window". The `## HEURISTIC_
+    // SYSTEM` heading and the JSON `heuristicSystem` payload are unchanged.
+    let heuristic_block = if heuristic.state == "not_present" {
+        "- Not present — this repository has no heuristic-system tree (checked \
+         `heuristic-system/` and `core/policies/heuristic-system/`); no inbox or \
+         operation-record signals to report.\n"
+            .to_string()
+    } else {
+        format!(
+            "- State: {}\n- Active inbox entries: {}\n- Error inbox movement: {}\n- Operation records changed: {}\n- Aging: {}\n",
+            heuristic.state,
+            heuristic.active_inbox.total,
+            report.analysis.heuristic_system_review.movement_summary,
+            heuristic.operation_records.changed_count,
+            report.analysis.heuristic_system_review.aging_summary,
+        )
+    };
 
     let view = RepoRetroView {
         repo_name: &report.repo.name,
@@ -2440,11 +2455,7 @@ fn render_markdown(report: &RepoRetroReport) -> String {
         attention_items_block,
         hotspots_block,
         validation_signals_block,
-        heuristic_state: &heuristic.state,
-        heuristic_active_inbox_total: heuristic.active_inbox.total,
-        heuristic_movement_summary: &report.analysis.heuristic_system_review.movement_summary,
-        heuristic_op_records_changed: heuristic.operation_records.changed_count,
-        heuristic_aging_summary: &report.analysis.heuristic_system_review.aging_summary,
+        heuristic_block,
         follow_up_questions_block,
         show_warnings: !report.warnings.is_empty(),
         warnings_block,
@@ -2705,6 +2716,28 @@ mod tests {
         ];
         let out = render_markdown(&report);
         assert_or_bless("with_warnings.md", &out);
+    }
+
+    #[test]
+    fn render_markdown_collapses_heuristic_section_when_not_present() {
+        let mut report = sample_report();
+        report.heuristic_system = empty_heuristic(); // state == "not_present"
+        let out = render_markdown(&report);
+        // The heading stays so the report structure is uniform across repos...
+        assert!(out.contains("## HEURISTIC_SYSTEM"), "heading kept:\n{out}");
+        assert!(out.contains("- Not present"), "one-line note shown:\n{out}");
+        // ...but the all-zero detail block is suppressed to avoid being misread
+        // as "no activity this window".
+        assert!(
+            !out.contains("Active inbox entries:"),
+            "detail block suppressed:\n{out}"
+        );
+        assert!(
+            !out.contains("Error inbox movement:"),
+            "detail block suppressed:\n{out}"
+        );
+        // The JSON payload is unaffected: state is still carried.
+        assert_eq!(report.heuristic_system.state, "not_present");
     }
 
     fn commit(hash: &str, subject: &str, files: &[(&str, i64, i64)]) -> Commit {

@@ -29,12 +29,7 @@
 {{ validation_signals_block }}
 ## HEURISTIC_SYSTEM
 
-- State: {{ heuristic_state }}
-- Active inbox entries: {{ heuristic_active_inbox_total }}
-- Error inbox movement: {{ heuristic_movement_summary }}
-- Operation records changed: {{ heuristic_op_records_changed }}
-- Aging: {{ heuristic_aging_summary }}
-
+{{ heuristic_block }}
 ## Follow-Up Questions
 
 {{ follow_up_questions_block }}
