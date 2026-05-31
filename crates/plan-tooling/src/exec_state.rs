@@ -139,12 +139,18 @@ pub fn is_placeholder(value: &str) -> bool {
 /// Write-if-missing/placeholder/mismatch the `- Tracking issue:` bullet to the
 /// canonical autolinked `url`. Idempotent: a re-run with the same URL is a
 /// no-op. Used by `record open` and by the self-heal path.
-pub fn sync_tracking_issue(path: &Path, url: &str) -> Result<SyncReport, ExecStateError> {
+pub fn sync_tracking_issue(
+    path: &Path,
+    url: &str,
+    dry_run: bool,
+) -> Result<SyncReport, ExecStateError> {
     let raw = read(path)?;
     let value = format_autolink(url);
     let (new_text, change) = set_bullet(&raw, path, TRACKING_ISSUE_LABEL, &value)?;
     let changed = change.action != BulletAction::Unchanged;
-    write_if_changed(path, &raw, &new_text)?;
+    if !dry_run {
+        write_if_changed(path, &raw, &new_text)?;
+    }
     Ok(SyncReport {
         changed,
         bullets: vec![change],
@@ -152,10 +158,12 @@ pub fn sync_tracking_issue(path: &Path, url: &str) -> Result<SyncReport, ExecSta
 }
 
 /// Write the terminal-state bullets back at closeout. Only the fields present
-/// in `state` are touched. Byte-preserving and idempotent.
+/// in `state` are touched. Byte-preserving and idempotent. With `dry_run` the
+/// change set is computed and reported but the file is left untouched.
 pub fn writeback_terminal(
     path: &Path,
     state: &TerminalState,
+    dry_run: bool,
 ) -> Result<SyncReport, ExecStateError> {
     let mut raw = read(path)?;
     let original = raw.clone();
@@ -182,7 +190,9 @@ pub fn writeback_terminal(
     }
 
     let changed = raw != original;
-    write_if_changed(path, &original, &raw)?;
+    if !dry_run {
+        write_if_changed(path, &original, &raw)?;
+    }
     Ok(SyncReport { changed, bullets })
 }
 
@@ -463,6 +473,7 @@ mod tests {
                 branch_commit_pr: Some("o/r#10 merged".to_string()),
                 tracking_issue_url: Some("https://github.com/o/r/issues/9".to_string()),
             },
+            false,
         )
         .expect("writeback");
         assert!(report.changed);
@@ -483,6 +494,7 @@ mod tests {
                 branch_commit_pr: Some("o/r#10 merged".to_string()),
                 tracking_issue_url: Some("https://github.com/o/r/issues/9".to_string()),
             },
+            false,
         )
         .expect("writeback2");
         assert!(!again.changed);

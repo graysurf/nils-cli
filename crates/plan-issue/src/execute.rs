@@ -911,7 +911,7 @@ fn attach_open_exec_state_sync(mut result: Value, execution_state_file: Option<&
         .filter(|url| !url.is_empty());
     let sync = match (execution_state_file, issue_url) {
         (Some(path), Some(url)) => {
-            match plan_tooling::exec_state::sync_tracking_issue(path, &url) {
+            match plan_tooling::exec_state::sync_tracking_issue(path, &url, false) {
                 Ok(report) => json!({
                     "file": path.display().to_string(),
                     "changed": report.changed,
@@ -1919,7 +1919,7 @@ fn close_exec_state_writeback(
         branch_commit_pr,
         tracking_issue_url: Some(issue_url.to_string()),
     };
-    match plan_tooling::exec_state::writeback_terminal(&exec_state, &state) {
+    match plan_tooling::exec_state::writeback_terminal(&exec_state, &state, false) {
         Ok(report) => json!({
             "file": exec_state.display().to_string(),
             "changed": report.changed,

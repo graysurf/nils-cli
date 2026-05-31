@@ -347,6 +347,59 @@ fn build_completion_command() -> Command {
                 ),
         )
         .subcommand(
+            Command::new("exec-state-sync")
+                .about("Repair an execution-state file's tracking issue URL / terminal state")
+                .arg(
+                    Arg::new("bundle")
+                        .long("bundle")
+                        .help("Plan bundle directory containing `*-execution-state.md`")
+                        .value_name("dir"),
+                )
+                .arg(
+                    Arg::new("execution-state")
+                        .long("execution-state")
+                        .help("Explicit execution-state file (overrides --bundle lookup)")
+                        .value_name("path"),
+                )
+                .arg(
+                    Arg::new("issue-url")
+                        .long("issue-url")
+                        .help("Tracking issue URL to record (autolinked)")
+                        .value_name("url"),
+                )
+                .arg(
+                    Arg::new("status")
+                        .long("status")
+                        .help("Terminal `Status` value")
+                        .value_name("text"),
+                )
+                .arg(
+                    Arg::new("last-updated")
+                        .long("last-updated")
+                        .help("`Last updated` stamp")
+                        .value_name("date"),
+                )
+                .arg(
+                    Arg::new("branch-commit-pr")
+                        .long("branch-commit-pr")
+                        .help("`Branch/commit/PR` value")
+                        .value_name("text"),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .help("Report the change set without writing the file")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .help("Output format")
+                        .value_name("fmt")
+                        .value_parser(["text", "json"]),
+                ),
+        )
+        .subcommand(
             Command::new("scaffold")
                 .about("Create a new plan from template")
                 .arg(
