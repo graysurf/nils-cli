@@ -1864,24 +1864,6 @@ fn run_record_close(
     }))
 }
 
-/// Find a `*-execution-state.md` file directly inside `bundle_dir`.
-fn find_execution_state_file(bundle_dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(bundle_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with("-execution-state.md"))
-                .unwrap_or(false)
-        {
-            return Some(path);
-        }
-    }
-    None
-}
-
 /// Terminal-state writeback for `record close`. Patches the bundle's
 /// execution-state header bullets (`Status`, `Last updated`, `Branch/commit/PR`,
 /// `Tracking issue`) to their final values. Returns the JSON object placed
@@ -1896,7 +1878,7 @@ fn close_exec_state_writeback(
     let Some(bundle_dir) = bundle else {
         return json!({"skipped": true, "reason": "no --bundle provided"});
     };
-    let Some(exec_state) = find_execution_state_file(bundle_dir) else {
+    let Some(exec_state) = find_execution_state(bundle_dir) else {
         return json!({"skipped": true, "reason": "no *-execution-state.md in bundle"});
     };
     let branch_commit_pr = if linked_prs.is_empty() {
@@ -2587,6 +2569,65 @@ fn run_tracking_checkpoint(
         }));
     }
 
+    // Task 1.4: reconcile the durable execution-state `Tracking issue` bullet
+    // with run-state. A live checkpoint is already a mutation, so a missing or
+    // placeholder URL is self-healed (the issue URL is derived offline from the
+    // repo slug); a genuine issue mismatch refuses the checkpoint.
+    let mut exec_state_reconcile = json!({"applicable": false});
+    if run.issue != 0
+        && let Some(es_path) = run_execution_state_path(&run)
+        && let Ok(raw) = std::fs::read_to_string(&es_path)
+    {
+        let current = plan_tooling::exec_state::tracking_issue_value(&raw);
+        match classify_exec_state_issue(current.as_deref(), run.issue) {
+            ExecStateIssueClass::Consistent => {
+                exec_state_reconcile = json!({"applicable": true, "status": "consistent"});
+            }
+            ExecStateIssueClass::Mismatch(found) => {
+                exec_state_reconcile =
+                    json!({"applicable": true, "status": "mismatch", "found": found});
+                blocked.push(json!({
+                    "code": "execution-state-issue-mismatch",
+                    "message": format!(
+                        "durable execution-state tracking issue `{found}` does not match run-state issue #{}",
+                        run.issue
+                    ),
+                    "suggested_unblock": format!(
+                        "run `plan-tooling exec-state-sync --execution-state {} --issue-url <correct-url>` or fix the file",
+                        es_path.display()
+                    ),
+                }));
+            }
+            ExecStateIssueClass::Missing => {
+                let mut healed_url = None;
+                if args.live
+                    && let Some(url) = derive_issue_url(&run.repo, run.issue)
+                    && plan_tooling::exec_state::sync_tracking_issue(&es_path, &url, false).is_ok()
+                {
+                    healed_url = Some(url);
+                }
+                if let Some(url) = healed_url {
+                    exec_state_reconcile = json!({
+                        "applicable": true,
+                        "status": "self-healed",
+                        "issue_url": url,
+                        "file": es_path.display().to_string(),
+                    });
+                } else {
+                    exec_state_reconcile = json!({"applicable": true, "status": "missing"});
+                    blocked.push(json!({
+                        "code": "execution-state-issue-missing",
+                        "message": "durable execution-state has no tracking issue URL; archive discovery would block with no-provider-refs",
+                        "suggested_unblock": format!(
+                            "run `plan-tooling exec-state-sync --execution-state {} --issue-url <url>`",
+                            es_path.display()
+                        ),
+                    }));
+                }
+            }
+        }
+    }
+
     // Build per-role payloads from run state and render bodies.
     let mut rendered: Vec<Value> = Vec::new();
     let mut visible_failures: Vec<Value> = Vec::new();
@@ -2716,6 +2757,7 @@ fn run_tracking_checkpoint(
         "repair_dashboard": args.repair_dashboard,
         "posted": summary.posted,
         "repair_dashboard_result": summary.repair_dashboard_result,
+        "execution_state_reconcile": exec_state_reconcile,
     }))
 }
 
@@ -3521,6 +3563,42 @@ fn run_tracking_close_ready(
         }
     }
 
+    // Task 1.4: the durable execution-state `Tracking issue` bullet must be
+    // consistent with run-state before close / archive handoff. Non-mutating
+    // probe — block (do not self-heal) and point at the repair command or a
+    // live checkpoint.
+    if let Some(run) = run.as_ref()
+        && run.issue != 0
+        && let Some(es_path) = run_execution_state_path(run)
+        && let Ok(raw) = std::fs::read_to_string(&es_path)
+    {
+        match classify_exec_state_issue(
+            plan_tooling::exec_state::tracking_issue_value(&raw).as_deref(),
+            run.issue,
+        ) {
+            ExecStateIssueClass::Consistent => {}
+            ExecStateIssueClass::Missing => blockers.push(json!({
+                "code": "execution-state-issue-missing",
+                "message": "durable execution-state has no tracking issue URL; archive discovery would block with no-provider-refs",
+                "suggested_unblock": format!(
+                    "run `plan-tooling exec-state-sync --execution-state {} --issue-url <url>` (or `tracking checkpoint --live` to self-heal)",
+                    es_path.display()
+                ),
+            })),
+            ExecStateIssueClass::Mismatch(found) => blockers.push(json!({
+                "code": "execution-state-issue-mismatch",
+                "message": format!(
+                    "durable execution-state tracking issue `{found}` does not match run-state issue #{}",
+                    run.issue
+                ),
+                "suggested_unblock": format!(
+                    "run `plan-tooling exec-state-sync --execution-state {} --issue-url <correct-url>`",
+                    es_path.display()
+                ),
+            })),
+        }
+    }
+
     // Visible completeness check (Task 6.2 deep gate).
     let mut visible_summary = json!({"checked": false});
     if args.expect_visible
@@ -3569,6 +3647,68 @@ fn find_execution_state(bundle: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Resolve the execution-state file a run records: the explicit
+/// `execution_state_file` (absolutized), else the `*-execution-state.md` inside
+/// the recorded `bundle`.
+fn run_execution_state_path(run: &crate::tracking::run_state::ExecutionRun) -> Option<PathBuf> {
+    if let Some(path) = run.execution_state_file.as_ref() {
+        return Some(absolutize(path));
+    }
+    run.bundle
+        .as_ref()
+        .and_then(|bundle| find_execution_state(bundle))
+}
+
+/// How the durable `Tracking issue` bullet relates to the run-state issue.
+#[derive(Debug, PartialEq, Eq)]
+enum ExecStateIssueClass {
+    /// Bullet absent or a `not yet opened`/placeholder value.
+    Missing,
+    /// Bullet names the same issue (or a non-issue URL we leave alone).
+    Consistent,
+    /// Bullet names a different issue number.
+    Mismatch(String),
+}
+
+/// Classify the current `Tracking issue` value against the expected issue
+/// number. Pure: callers own the IO and any self-heal write. A present value
+/// that is not a parseable issue URL is treated as `Consistent` so the gate
+/// never false-blocks on a hand-authored note.
+fn classify_exec_state_issue(current: Option<&str>, expected_issue: u64) -> ExecStateIssueClass {
+    match current {
+        None => ExecStateIssueClass::Missing,
+        Some(value) if plan_tooling::exec_state::is_placeholder(value) => {
+            ExecStateIssueClass::Missing
+        }
+        Some(value) => match issue_number_from_url(value) {
+            Some(found) if found == expected_issue => ExecStateIssueClass::Consistent,
+            Some(_) => ExecStateIssueClass::Mismatch(value.to_string()),
+            None => ExecStateIssueClass::Consistent,
+        },
+    }
+}
+
+/// Extract the trailing issue number from a GitHub/GitLab issue URL
+/// (`.../issues/<n>` or `.../-/issues/<n>`). `None` for non-issue URLs.
+fn issue_number_from_url(value: &str) -> Option<u64> {
+    let marker = "/issues/";
+    let idx = value.rfind(marker)?;
+    value[idx + marker.len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Canonical issue URL for `repo` + `issue`, derived offline from the repo
+/// slug's host. `None` when the slug cannot be resolved.
+fn derive_issue_url(repo: &str, issue: u64) -> Option<String> {
+    crate::provider::resolve_repo(Some(repo))
+        .ok()
+        .map(|info| info.issue_url(issue))
 }
 
 fn resolve_close_ready_inputs(
@@ -8456,5 +8596,44 @@ mod tests {
     fn close_exec_state_writeback_skips_without_bundle() {
         let out = close_exec_state_writeback(None, "https://x/issues/1", &[]);
         assert_eq!(out.get("skipped").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn issue_number_from_url_parses_github_and_gitlab() {
+        assert_eq!(
+            issue_number_from_url("https://github.com/o/r/issues/738"),
+            Some(738)
+        );
+        assert_eq!(
+            issue_number_from_url("https://gitlab.example.com/g/p/-/issues/42"),
+            Some(42)
+        );
+        assert_eq!(issue_number_from_url("https://github.com/o/r/pull/9"), None);
+        assert_eq!(issue_number_from_url("not yet opened"), None);
+    }
+
+    #[test]
+    fn classify_exec_state_issue_covers_missing_consistent_mismatch() {
+        assert_eq!(
+            classify_exec_state_issue(None, 738),
+            ExecStateIssueClass::Missing
+        );
+        assert_eq!(
+            classify_exec_state_issue(Some("not yet opened"), 738),
+            ExecStateIssueClass::Missing
+        );
+        assert_eq!(
+            classify_exec_state_issue(Some("https://github.com/o/r/issues/738"), 738),
+            ExecStateIssueClass::Consistent
+        );
+        assert_eq!(
+            classify_exec_state_issue(Some("https://github.com/o/r/issues/716"), 738),
+            ExecStateIssueClass::Mismatch("https://github.com/o/r/issues/716".to_string())
+        );
+        // Present but non-issue URL must not false-block.
+        assert_eq!(
+            classify_exec_state_issue(Some("https://github.com/o/r/pull/9"), 738),
+            ExecStateIssueClass::Consistent
+        );
     }
 }
