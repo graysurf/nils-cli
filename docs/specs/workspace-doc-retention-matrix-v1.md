@@ -71,9 +71,9 @@ because BSD-style `-path` lets `*` cross slash boundaries.
 - `crates/memo/docs/specs/memo-storage-schema-v1.md`
 - `crates/memo/docs/specs/memo-workflow-extension-contract-v1.md`
 - `crates/nils-common/docs/specs/markdown-helpers-contract-v1.md`
-- `crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
-- `crates/plan-issue-cli/docs/specs/plan-issue-gate-matrix-v1.md`
-- `crates/plan-issue-cli/docs/specs/plan-issue-state-machine-v1.md`
+- `crates/plan-issue/docs/specs/plan-issue-contract-v2.md`
+- `crates/plan-issue/docs/specs/plan-issue-gate-matrix-v1.md`
+- `crates/plan-issue/docs/specs/plan-issue-state-machine-v1.md`
 - `crates/plan-tooling/docs/runbooks/split-prs-build-task-spec-cutover.md`
 - `crates/plan-tooling/docs/specs/plan-source-bundle-contract-v1.md`
 - `crates/plan-tooling/docs/specs/split-prs-contract-v1.md`
@@ -110,7 +110,7 @@ Top-level crate READMEs (one per workspace member, 25 total):
 - `crates/nils-common/README.md`
 - `crates/nils-term/README.md`
 - `crates/nils-test-support/README.md`
-- `crates/plan-issue-cli/README.md`
+- `crates/plan-issue/README.md`
 - `crates/plan-tooling/README.md`
 - `crates/screen-record/README.md`
 - `crates/semantic-commit/README.md`
@@ -138,7 +138,7 @@ Crate `docs/README.md` index files (one per workspace member, 25 total):
 - `crates/nils-common/docs/README.md`
 - `crates/nils-term/docs/README.md`
 - `crates/nils-test-support/docs/README.md`
-- `crates/plan-issue-cli/docs/README.md`
+- `crates/plan-issue/docs/README.md`
 - `crates/plan-tooling/docs/README.md`
 - `crates/screen-record/docs/README.md`
 - `crates/semantic-commit/docs/README.md`

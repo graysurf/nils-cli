@@ -4,7 +4,7 @@
 //! REAL issue half (create / view / comment / list / close), the seeded PR
 //! read half (view / checks / comments), and the dispatcher guard that rejects
 //! unsupported operations. On-disk contract:
-//! `crates/plan-issue-cli/docs/specs/local-provider-contract-v1.md`.
+//! `crates/plan-issue/docs/specs/local-provider-contract-v1.md`.
 
 use std::path::Path;
 

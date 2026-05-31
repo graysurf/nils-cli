@@ -33,7 +33,7 @@
   path, same-named-repo isolation), `add`/`list`/`remove`/`prune` integration
   against a tempdir repo (incl. skip-primary / skip-in-use safety), and the
   single-helper consolidation (no duplicate porcelain parser in `git-cli`); if
-  `plan-issue-cli` folds in, its `cleanup-worktrees` cases; `--format json`
+  `plan-issue` folds in, its `cleanup-worktrees` cases; `--format json`
   golden fixtures for each subcommand; `--help` / completion snapshot updated;
   clippy `-D warnings`, fmt, `rumdl`, docs-placement audit clean;
   `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` and
@@ -52,7 +52,7 @@
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
 | 1.1 | done | `worktree` CLI subtree + deterministic path convention | Added git-cli worktree add/list/remove/prune with deterministic AGENT_HOME worktree paths; validated by cargo test -p nils-git-cli worktree_ and local-fast. | Implemented in nils-cli PR1; Phase 2 hook remains gated. |
-| 1.2 | done | `remove` / `prune` + consolidate worktree-removal into one helper | Shared worktree porcelain parsing/removal via git-cli worktree helpers and branch cleanup --remove-worktrees reuse; validated by cargo test -p nils-git-cli worktree_ and cargo test -p nils-git-cli. | plan-issue-cli cleanup-worktrees remains separate by documented issue-root convention. |
+| 1.2 | done | `remove` / `prune` + consolidate worktree-removal into one helper | Shared worktree porcelain parsing/removal via git-cli worktree helpers and branch cleanup --remove-worktrees reuse; validated by cargo test -p nils-git-cli worktree_ and cargo test -p nils-git-cli. | plan-issue cleanup-worktrees remains separate by documented issue-root convention. |
 | 1.3 | done | JSON contract, completion, and crate docs | Added JSON envelopes, completion coverage, README updates, and crate-local worktree convention spec; validated by completion syntax checks and local-fast. | Generated completion adapters unchanged; completion export coverage verifies the worktree subcommands. |
 | 2.1 | todo | `block-direct-git-worktree` hook with override escape hatch | — | Depends on Sprint 1 shipped + brew-upgraded. Mirror `block-direct-git-commit.py`; block mutating `worktree` ops, allow read-only `list`; `ALLOW_DIRECT_GIT_WORKTREE=1` override; register in `settings.hooks.jsonc` + `link-map.yaml`. PR2, agent-runtime-kit. |
 | 2.2 | todo | `AGENTS.md` / `AGENT_HOME.md` policy + namespace reconciliation + heuristic promotion | — | Depends on 2.1. Policy clause + convention doc; reconcile "`$AGENT_HOME` artifacts only" note for `worktrees/`; promote/close `worktree-unsigned-commit-config-drift` (criterion c) via `heuristic-inbox` or record why it stays open. PR2. |
@@ -66,7 +66,7 @@
   workflow helpers and already removes worktrees (`branch cleanup
   --remove-worktrees`, `linked_worktrees_by_branch()`), making a `worktree`
   group a natural sibling with no new-crate tax ([F2]); worktree logic is
-  already scattered across `git-cli`, `plan-issue-cli cleanup-worktrees` (with
+  already scattered across `git-cli`, `plan-issue cleanup-worktrees` (with
   its own `$ISSUE_ROOT/worktrees/<mode>` convention), and the
   `meta:worktree-triage` skill ([F3]); the hook-ban mechanism is proven and
   global (`block-direct-git-commit.py` / `block-direct-pr-create.py` registered

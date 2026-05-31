@@ -6,7 +6,7 @@
 //! op swaps [`crate::backend::ProcessRunner`] for [`LocalRunner`], which serves
 //! the call from a [`store::Store`] instead of spawning `gh`. The on-disk
 //! contract is frozen in
-//! `crates/plan-issue-cli/docs/specs/local-provider-contract-v1.md`.
+//! `crates/plan-issue/docs/specs/local-provider-contract-v1.md`.
 //!
 //! The store root comes from `--store-root <path>` (overriding the
 //! `FORGE_CLI_LOCAL_STORE` env); the repo slug comes from `--repo` with a

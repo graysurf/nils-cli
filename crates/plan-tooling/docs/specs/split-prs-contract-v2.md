@@ -8,7 +8,7 @@
 `plan-tooling split-prs` emits deterministic grouping primitives for downstream orchestrators.
 
 v2 intentionally removes task-level runtime execution metadata from `split-prs` output.
-`plan-issue-cli` materializes runtime lane metadata from:
+`plan-issue` materializes runtime lane metadata from:
 
 - parsed plan task content
 - `split-prs` grouping results (`task_id`, `summary`, `pr_group`)
@@ -35,7 +35,7 @@ Compatibility note:
 
 - Runtime-prefix compatibility options are still accepted by the CLI parser for older
   automation, but v2 `split-prs` output is grouping-only. Runtime execution metadata is generated in
-  `plan-issue-cli`.
+  `plan-issue`.
 
 ## Determinism and Grouping Rules
 
@@ -112,7 +112,7 @@ anchor task id, optional sprint metadata hints, and `pr_grouping_intent_source`)
 
 ## Migration Notes (v1 -> v2)
 
-Removed `split-prs` runtime metadata fields are now produced inside `plan-issue-cli` from plan task
+Removed `split-prs` runtime metadata fields are now produced inside `plan-issue` from plan task
 metadata, grouping results, and prefix inputs.
 
 ## Exit Codes

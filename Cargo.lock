@@ -2232,7 +2232,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nils-plan-issue-cli"
+name = "nils-plan-issue"
 version = "0.31.8"
 dependencies = [
  "chrono",

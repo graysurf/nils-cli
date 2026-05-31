@@ -47,11 +47,11 @@ Error responses use stable `error.code` values such as `branch-exists`,
 `worktree-path-exists`, `worktree-not-found`, `refuse-primary-worktree`, and
 `git-worktree-remove-failed`.
 
-## Interaction With plan-issue-cli
+## Interaction With plan-issue
 
-`plan-issue-cli cleanup-worktrees` keeps its issue-ledger targeting and
+`plan-issue cleanup-worktrees` keeps its issue-ledger targeting and
 `$ISSUE_ROOT/worktrees/<mode>/<id>` dispatch convention. `git-cli` consolidates
 its own worktree listing/removal parser so `git-cli worktree` and
 `git-cli branch cleanup --remove-worktrees` share one code path; the
-`plan-issue-cli` flow intentionally remains separate because it is driven by
+`plan-issue` flow intentionally remains separate because it is driven by
 plan rows rather than the git-cli managed path convention.

@@ -19,7 +19,7 @@
 //!
 //! Half A (issue/timeline) is conformance-tested for **behaviour**; Half B
 //! (PR/CI, locally seeded) for **shape**. The scenario subset is documented in
-//! `crates/plan-issue-cli/docs/specs/local-provider-contract-v1.md`
+//! `crates/plan-issue/docs/specs/local-provider-contract-v1.md`
 //! §"Conformance Scenario Subset".
 
 use std::path::Path;

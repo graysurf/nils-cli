@@ -24,7 +24,7 @@ These tools are required for common command paths. Each row is anchored to at le
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
 | `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
 | `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
-| `gh` | `git-cli open *` GitHub helpers, `plan-issue-cli` GitHub I/O, `forge-cli` GitHub backend | Required for GitHub-facing flows | `brew install gh` |
+| `gh` | `git-cli open *` GitHub helpers, `plan-issue` GitHub I/O, `forge-cli` GitHub backend | Required for GitHub-facing flows | `brew install gh` |
 | `glab` | `forge-cli` GitLab backend and GitLab inbox reads | Required for GitLab-facing `forge-cli` flows | `brew install glab` |
 
 ### 1.1 `image-processing` runtime policy
@@ -99,7 +99,7 @@ These are repository scripts (not third-party packages):
 
 ## 4.1 Adapter Opt-Outs
 
-`plan-issue-cli` exposes one runtime opt-out env var consumed at command time.
+`plan-issue` exposes one runtime opt-out env var consumed at command time.
 
 | Env var | Effect | Intended consumer |
 |---|---|---|

@@ -54,7 +54,7 @@ pkg_exception() {
 # published binaries diverge from the "<bin> == <dir>" rule.
 allowed_bins_for() {
   case "$1" in
-    plan-issue-cli) echo "plan-issue plan-issue-local" ;;
+    plan-issue) echo "plan-issue-local" ;;
     nils-markdown) echo "md-render" ;;
     agent-workflow-primitives)
       echo "agent-run browser-session canary-check docs-impact heuristic-inbox model-cross-check review-evidence review-specialists repo-retro skill-usage test-first-evidence"

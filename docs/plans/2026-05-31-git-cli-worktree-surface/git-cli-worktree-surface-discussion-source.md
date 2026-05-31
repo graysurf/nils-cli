@@ -54,10 +54,10 @@ explicit override escape hatch and an `AGENTS.md` clause.
   `git worktree remove --force`. A `worktree` group is a natural sibling of
   `branch` and reuses existing git plumbing — no new-crate tax.
 - [F3] Worktree logic is already scattered across three places:
-  `git-cli branch cleanup --remove-worktrees`; `plan-issue-cli cleanup-worktrees`
-  (`crates/plan-issue-cli/src/execute.rs`), which carries its **own** convention
+  `git-cli branch cleanup --remove-worktrees`; `plan-issue cleanup-worktrees`
+  (`crates/plan-issue/src/execute.rs`), which carries its **own** convention
   `$ISSUE_ROOT/worktrees/<mode>/<id>` for the dispatch flow
-  (`plan-issue-cli-contract-v2.md`); and the `meta:worktree-triage` skill. A new
+  (`plan-issue-contract-v2.md`); and the `meta:worktree-triage` skill. A new
   surface must consolidate or layer above these, not become a fourth scatter
   point / third removal code path.
 - [F4] The hook-ban mechanism is proven and global:
@@ -114,7 +114,7 @@ explicit override escape hatch and an `AGENTS.md` clause.
 - Whether the hook blocks read-only `git worktree list`/`--porcelain` or only
   the mutating subcommands (`add`/`remove`/`move`/`prune`/`repair`/`lock`). Lean:
   block mutation only; let reads through.
-- Whether `plan-issue-cli cleanup-worktrees` is folded into the shared removal
+- Whether `plan-issue cleanup-worktrees` is folded into the shared removal
   helper (cross-crate share) or kept separate with a documented divergence if
   cross-crate sharing is disproportionate. Decide at implementation; at minimum
   `git-cli`'s own two paths (`worktree` group + `branch cleanup`) must share one

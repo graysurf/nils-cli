@@ -9,7 +9,7 @@
   `plan-tooling validate`.
 - [`split-prs Contract v2`](specs/split-prs-contract-v2.md): **active** contract. Grouping-only
   `split-prs` output (`task_id`, `summary`, `pr_group`); runtime lane metadata is materialized by
-  `plan-issue-cli`.
+  `plan-issue`.
 - [`split-prs Contract v1`](specs/split-prs-contract-v1.md): **deprecated**, retained for
   historical reference. Documents the pre-v2 output shape where `split-prs` emitted runtime
   execution metadata fields (`branch`, `worktree`, `owner`, `notes`). Superseded by v2.
