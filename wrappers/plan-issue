@@ -2,7 +2,7 @@
 set -euo pipefail
 
 bin_name="plan-issue"
-crate_name="nils-plan-issue-cli"
+crate_name="nils-plan-issue"
 args=("$@")
 
 self_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

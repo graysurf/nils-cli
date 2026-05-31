@@ -89,7 +89,7 @@ consumer's tests are integration tests rather than unit tests:
 ## Workspace feature unification
 
 Some consumer crates (`forge-cli`, `git-cli`,
-`plan-issue-cli` after PR #548) enable
+`plan-issue` after PR #548) enable
 `serde_json/preserve_order`. Workspace feature unification turns
 that on for ALL crates in workspace test runs (`cargo nextest run
 --workspace`). Per-crate tests (`cargo test -p <crate>`) do NOT

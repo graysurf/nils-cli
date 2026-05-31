@@ -10,7 +10,7 @@ Verifies that every `crates/*/Cargo.toml` `version =` line matches the
 workspace root `Cargo.toml` `version =`, and that every internal cross-dep
 pin (the `version = "X.Y.Z"` field on a `path = "../<crate>"` dependency)
 matches the same workspace version. Catches the "partial bump" anti-pattern
-that broke v0.25.7: only `plan-tooling` + `plan-issue-cli` jumped while the
+that broke v0.25.7: only `plan-tooling` + `plan-issue` jumped while the
 other 31 crates stayed behind, silently breaking downstream consumers that
 treat the release tag as a workspace-wide floor.
 

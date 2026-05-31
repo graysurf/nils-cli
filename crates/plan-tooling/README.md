@@ -4,7 +4,7 @@
 
 plan-tooling works with Plan Format v1 markdown files. It can parse plans to JSON, validate plan files, compute dependency batches for a
 sprint, scaffold new plans, and generate task-to-PR split grouping primitives in deterministic or auto strategy modes. Runtime execution
-metadata for orchestration is materialized by `plan-issue-cli` from split results plus parsed plan content.
+metadata for orchestration is materialized by `plan-issue` from split results plus parsed plan content.
 
 ## Usage
 

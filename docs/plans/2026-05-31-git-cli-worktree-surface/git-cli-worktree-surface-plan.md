@@ -33,9 +33,9 @@ This is cross-repo: Phase 1 (Sprint 1) lands in `sympoies/nils-cli`; Phase 2
     `linked_worktrees_by_branch()` — the porcelain-parse / remove path to share)
   - `crates/git-cli/docs/` (crate docs placement), `crates/git-cli/tests/`
     (integration + completion snapshot)
-  - `crates/plan-issue-cli/src/execute.rs` (`cleanup-worktrees`,
+  - `crates/plan-issue/src/execute.rs` (`cleanup-worktrees`,
     `list_linked_worktrees()` — the second removal path; evaluate sharing)
-  - `crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
+  - `crates/plan-issue/docs/specs/plan-issue-contract-v2.md`
     (the dispatch-flow `$ISSUE_ROOT/worktrees/<mode>` convention to stay
     compatible with)
   - `docs/runbooks/new-cli-crate-development-standard.md`,
@@ -56,7 +56,7 @@ This is cross-repo: Phase 1 (Sprint 1) lands in `sympoies/nils-cli`; Phase 2
     and always with an override escape hatch.
 - Open questions carried into execution: exact `repo-key` hash basis (lean
   toplevel path); whether the hook blocks read-only `worktree list` (lean: block
-  mutation only); whether `plan-issue-cli` removal folds into the shared helper
+  mutation only); whether `plan-issue` removal folds into the shared helper
   or documents a divergence (see the source doc for detail).
 
 ## Scope
@@ -145,7 +145,7 @@ worktree removal into one helper, and document the surface. Lands in
   Extract the porcelain-parse / list / remove primitive into ONE helper and
   rewire `git-cli branch cleanup --remove-worktrees`
   (`linked_worktrees_by_branch()`) onto it so there is no duplicate parser inside
-  `git-cli`. Evaluate folding `plan-issue-cli cleanup-worktrees`
+  `git-cli`. Evaluate folding `plan-issue cleanup-worktrees`
   (`list_linked_worktrees()`) onto the same helper; if cross-crate sharing is
   disproportionate, document the divergence explicitly rather than forcing it —
   but `git-cli`'s own two paths must share one helper.
@@ -156,11 +156,11 @@ worktree removal into one helper, and document the surface. Lands in
   - `worktree remove`/`prune` work and never touch the primary checkout or an
     in-use worktree; `git-cli` has a single worktree-removal/listing code path
     (`branch cleanup --remove-worktrees` delegates to it); existing
-    `git-cli` (and, if folded, `plan-issue-cli`) worktree tests still pass; any
+    `git-cli` (and, if folded, `plan-issue`) worktree tests still pass; any
     intentional divergence is documented.
 - **Validation**:
   - `cargo test -p nils-git-cli` remove/prune + safety (skip primary / in-use)
-    cases; if folded, the relevant `cargo test -p nils-plan-issue-cli`
+    cases; if folded, the relevant `cargo test -p nils-plan-issue`
     cleanup-worktrees cases; clippy `-D warnings`, fmt.
 
 ### Task 1.3: JSON contract, completion, and crate docs
@@ -263,7 +263,7 @@ The tracking issue is complete when:
   fresh `feat/<slug>` branch with the agent never supplying a path; the path
   formula is unit-tested and collision-safe across same-named repos.
 - `git-cli` has a single worktree-removal/listing helper that
-  `branch cleanup --remove-worktrees` delegates to; any `plan-issue-cli`
+  `branch cleanup --remove-worktrees` delegates to; any `plan-issue`
   divergence is either folded in or documented.
 - Each subcommand emits a documented, versioned `--format json` envelope and a
   clean human default; the completion snapshot and crate docs cover the surface

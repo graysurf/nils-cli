@@ -3,7 +3,7 @@
 ## Goal
 
 Replace downstream ad-hoc split generation with `plan-tooling split-prs` grouping primitives while
-keeping `plan-issue-cli build-task-spec` as the runtime metadata materialization authority.
+keeping `plan-issue build-task-spec` as the runtime metadata materialization authority.
 
 ## Current Default Usage
 
@@ -57,7 +57,7 @@ plan-tooling split-prs \
 `split-prs` no longer emits task-spec-compatible runtime metadata TSV. In the cutover model:
 
 - `split-prs` emits grouping primitives only (`task_id`, `summary`, `pr_group`).
-- `plan-issue-cli` materializes `branch`, `worktree`, `owner`, and `notes` from plan content +
+- `plan-issue` materializes `branch`, `worktree`, `owner`, and `notes` from plan content +
   grouping output.
 
 Reduced `split-prs --format tsv` header:

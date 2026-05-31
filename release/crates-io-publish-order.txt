@@ -24,7 +24,7 @@ nils-git-summary
 nils-image-processing
 nils-plan-archive
 nils-plan-tooling
-nils-plan-issue-cli
+nils-plan-issue
 nils-semantic-commit
 nils-macos-agent
 nils-api-gql

@@ -24,7 +24,7 @@ members = [
   "crates/semantic-commit",
   "crates/plan-archive",
   "crates/plan-tooling",
-  "crates/plan-issue-cli",
+  "crates/plan-issue",
   "crates/agent-docs",
   "crates/agent-out",
   "crates/agent-scope-lock",

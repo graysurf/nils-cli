@@ -65,7 +65,7 @@ From the current `execution-manifest.md`:
 | nils-common | 0 | 1 | 1 | parallel |
 | nils-term | 0 | 1 | 0 | parallel |
 | nils-test-support | 0 | 6 | 0 | parallel |
-| plan-issue-cli | 0 | 17 | 3 | parallel |
+| plan-issue | 0 | 17 | 3 | parallel |
 | plan-tooling | 0 | 9 | 2 | parallel |
 | screen-record | 0 | 19 | 1 | parallel |
 | semantic-commit | 0 | 11 | 1 | parallel |

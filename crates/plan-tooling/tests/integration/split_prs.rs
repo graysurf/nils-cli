@@ -652,28 +652,28 @@ fn split_prs_auto_uses_execution_profile_parallel_width_as_target() {
 
 ### Task 1.1: API slice A
 - **Location**:
-  - crates/plan-issue-cli/src/a.rs
+  - crates/plan-issue/src/a.rs
 - **Dependencies**:
   - none
 - **Complexity**: 2
 
 ### Task 1.2: API slice B
 - **Location**:
-  - crates/plan-issue-cli/src/b.rs
+  - crates/plan-issue/src/b.rs
 - **Dependencies**:
   - none
 - **Complexity**: 2
 
 ### Task 1.3: API slice C
 - **Location**:
-  - crates/plan-issue-cli/src/c.rs
+  - crates/plan-issue/src/c.rs
 - **Dependencies**:
   - none
 - **Complexity**: 2
 
 ### Task 1.4: API slice D
 - **Location**:
-  - crates/plan-issue-cli/src/d.rs
+  - crates/plan-issue/src/d.rs
 - **Dependencies**:
   - none
 - **Complexity**: 2
@@ -684,21 +684,21 @@ fn split_prs_auto_uses_execution_profile_parallel_width_as_target() {
 
 ### Task 2.1: Runtime A
 - **Location**:
-  - crates/plan-issue-cli/src/runtime_a.rs
+  - crates/plan-issue/src/runtime_a.rs
 - **Dependencies**:
   - none
 - **Complexity**: 2
 
 ### Task 2.2: Runtime B
 - **Location**:
-  - crates/plan-issue-cli/src/runtime_b.rs
+  - crates/plan-issue/src/runtime_b.rs
 - **Dependencies**:
   - none
 - **Complexity**: 2
 
 ### Task 2.3: Runtime C
 - **Location**:
-  - crates/plan-issue-cli/src/runtime_c.rs
+  - crates/plan-issue/src/runtime_c.rs
 - **Dependencies**:
   - none
 - **Complexity**: 2
@@ -765,14 +765,14 @@ fn split_prs_auto_uses_same_line_sprint_metadata() {
 
 ### Task 1.1: API slice A
 - **Location**:
-  - crates/plan-issue-cli/src/a.rs
+  - crates/plan-issue/src/a.rs
 - **Dependencies**:
   - none
 - **Complexity**: 2
 
 ### Task 1.2: API slice B
 - **Location**:
-  - crates/plan-issue-cli/src/b.rs
+  - crates/plan-issue/src/b.rs
 - **Dependencies**:
   - none
 - **Complexity**: 2
