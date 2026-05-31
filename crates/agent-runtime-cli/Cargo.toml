@@ -1,5 +1,5 @@
 [package]
-name = "agent-runtime-cli"
+name = "nils-agent-runtime"
 version = "0.31.8"
 edition.workspace = true
 license.workspace = true

@@ -12,7 +12,7 @@
 //!
 //! ## Determinism contract (Resolved Decision #9)
 //!
-//! `agent-runtime-cli` consumes this crate on its render path, so
+//! `nils-agent-runtime` consumes this crate on its render path, so
 //! `std::collections::HashMap`, `std::time::SystemTime::now`, and
 //! `chrono::Utc::now` are forbidden inside this crate. The crate-wide
 //! `#![deny(...)]` below pairs with `clippy.toml` to make every

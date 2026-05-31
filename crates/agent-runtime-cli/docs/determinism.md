@@ -103,13 +103,13 @@ Enforcement:
 
 ```bash
 # Determinism gate
-cargo clippy -p agent-runtime-cli -p nils-common --all-targets -- -D warnings
+cargo clippy -p nils-agent-runtime -p nils-common --all-targets -- -D warnings
 
 # Cross-process determinism integration test
-cargo test -p agent-runtime-cli render_determinism
+cargo test -p nils-agent-runtime render_determinism
 
 # Whole render unit + integration suite
-cargo test -p agent-runtime-cli
+cargo test -p nils-agent-runtime
 ```
 
 A failing clippy run, a non-byte-identical second render, or a leaked
