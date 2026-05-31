@@ -526,6 +526,111 @@ esac
     ;;
 esac
 ;;
+(activity)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_forge-cli__subcmd__activity_commands" \
+"*::: :->activity" \
+&& ret=0
+
+    case $state in
+    (activity)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-activity-command-$line[1]:"
+        case $line[1] in
+            (commits)
+_arguments "${_arguments_options[@]}" : \
+'--user=[GitHub login to inspect. Use @me for the authenticated account]:LOGIN:_default' \
+'--since=[Only include commits authored at or after this date/datetime]:DATE_OR_DATETIME:_default' \
+'--limit=[Cap the number of returned commits (default\: 30)]:LIMIT:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(events)
+_arguments "${_arguments_options[@]}" : \
+'--user=[GitHub login to inspect. Use @me for the authenticated account]:LOGIN:_default' \
+'--limit=[Cap the number of returned events (default\: 30)]:LIMIT:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--public-only[Use the public-events endpoint even for @me]' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(summary)
+_arguments "${_arguments_options[@]}" : \
+'--user=[GitHub login to inspect. Use @me for the authenticated account]:LOGIN:_default' \
+'--since=[Only count contributions at or after this date/datetime]:DATE_OR_DATETIME:_default' \
+'--limit=[Maximum repositories to include in the summary (default\: 25)]:LIMIT:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__activity__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-activity-help-command-$line[1]:"
+        case $line[1] in
+            (commits)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(events)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(summary)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
 (label)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
@@ -1033,6 +1138,34 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+(activity)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__help__subcmd__activity_commands" \
+"*::: :->activity" \
+&& ret=0
+
+    case $state in
+    (activity)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-help-activity-command-$line[1]:"
+        case $line[1] in
+            (commits)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(events)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(summary)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (label)
 _arguments "${_arguments_options[@]}" : \
 ":: :_forge-cli__subcmd__help__subcmd__label_commands" \
@@ -1151,6 +1284,7 @@ _forge-cli_commands() {
     local commands; commands=(
 'pr:Pull / merge request lifecycle' \
 'issue:Issue lifecycle' \
+'activity:Personal activity across forge repositories' \
 'label:Repository label catalog audit and ensure operations' \
 'inbox:Personal cross-repo work inbox' \
 'repo:Repository helpers' \
@@ -1159,6 +1293,61 @@ _forge-cli_commands() {
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__activity_commands] )) ||
+_forge-cli__subcmd__activity_commands() {
+    local commands; commands=(
+'commits:Search recent GitHub commits authored by a user' \
+'events:List recent GitHub user activity events' \
+'summary:Summarize GitHub commit contributions by repository' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli activity commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__activity__subcmd__commits_commands] )) ||
+_forge-cli__subcmd__activity__subcmd__commits_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli activity commits commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__activity__subcmd__events_commands] )) ||
+_forge-cli__subcmd__activity__subcmd__events_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli activity events commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__activity__subcmd__help_commands] )) ||
+_forge-cli__subcmd__activity__subcmd__help_commands() {
+    local commands; commands=(
+'commits:Search recent GitHub commits authored by a user' \
+'events:List recent GitHub user activity events' \
+'summary:Summarize GitHub commit contributions by repository' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli activity help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__activity__subcmd__help__subcmd__commits_commands] )) ||
+_forge-cli__subcmd__activity__subcmd__help__subcmd__commits_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli activity help commits commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__activity__subcmd__help__subcmd__events_commands] )) ||
+_forge-cli__subcmd__activity__subcmd__help__subcmd__events_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli activity help events commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__activity__subcmd__help__subcmd__help_commands] )) ||
+_forge-cli__subcmd__activity__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli activity help help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__activity__subcmd__help__subcmd__summary_commands] )) ||
+_forge-cli__subcmd__activity__subcmd__help__subcmd__summary_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli activity help summary commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__activity__subcmd__summary_commands] )) ||
+_forge-cli__subcmd__activity__subcmd__summary_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli activity summary commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__auth_commands] )) ||
 _forge-cli__subcmd__auth_commands() {
@@ -1201,6 +1390,7 @@ _forge-cli__subcmd__help_commands() {
     local commands; commands=(
 'pr:Pull / merge request lifecycle' \
 'issue:Issue lifecycle' \
+'activity:Personal activity across forge repositories' \
 'label:Repository label catalog audit and ensure operations' \
 'inbox:Personal cross-repo work inbox' \
 'repo:Repository helpers' \
@@ -1209,6 +1399,30 @@ _forge-cli__subcmd__help_commands() {
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__activity_commands] )) ||
+_forge-cli__subcmd__help__subcmd__activity_commands() {
+    local commands; commands=(
+'commits:Search recent GitHub commits authored by a user' \
+'events:List recent GitHub user activity events' \
+'summary:Summarize GitHub commit contributions by repository' \
+    )
+    _describe -t commands 'forge-cli help activity commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__activity__subcmd__commits_commands] )) ||
+_forge-cli__subcmd__help__subcmd__activity__subcmd__commits_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help activity commits commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__activity__subcmd__events_commands] )) ||
+_forge-cli__subcmd__help__subcmd__activity__subcmd__events_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help activity events commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__activity__subcmd__summary_commands] )) ||
+_forge-cli__subcmd__help__subcmd__activity__subcmd__summary_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help activity summary commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__auth_commands] )) ||
 _forge-cli__subcmd__help__subcmd__auth_commands() {

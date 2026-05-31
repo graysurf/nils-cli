@@ -2,6 +2,7 @@
 //! function that consumes the parsed CLI plus the resolved `OutputFormat` and
 //! returns `Result<i32, ForgeError>`.
 
+pub mod activity;
 pub mod auth_status;
 pub mod inbox;
 pub mod issue_close;
