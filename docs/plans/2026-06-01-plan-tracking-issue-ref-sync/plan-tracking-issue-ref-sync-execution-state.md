@@ -45,7 +45,7 @@
 | 1.3 | done | Closeout terminal-state writeback | <https://github.com/sympoies/nils-cli/pull/741> | `record close` writes terminal status, final ledger, linked PR, and URL into the local file; complementary to migrate's archived rewrite. |
 | 1.4 | done | Consistency and self-heal gate across execute/checkpoint/close | <https://github.com/sympoies/nils-cli/pull/741> | Self-heal write-if-missing before any hard block; cover the previously unguarded close path. |
 | 1.5 | done | Legacy repair and documentation | <https://github.com/sympoies/nils-cli/pull/741> | On-demand repair command over the shared routine for bundles such as `forge-cli-search`. |
-| 2.1 | pending | Update agent-runtime-kit create/execute/closeout skill instructions | - | Required: Task 1.2/1.3 change the create and closeout command sequences. |
+| 2.1 | done | Update agent-runtime-kit create/execute/closeout skill instructions | <https://github.com/graysurf/agent-runtime-kit/pull/238> | Required: Task 1.2/1.3 change the create and closeout command sequences. |
 
 ## Session Log
 
