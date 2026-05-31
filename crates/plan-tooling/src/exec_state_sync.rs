@@ -3,7 +3,7 @@
 //! On-demand repair surface over [`crate::exec_state`]: writes the tracking
 //! issue URL and/or terminal-state header bullets into a bundle's
 //! `*-execution-state.md`. The same byte-preserving routine that `plan-issue
-//! record open` / `record close` call automatically, exposed so legacy bundles
+//! record open` / `record close` call automatically, exposed so existing bundles
 //! (issue exists, but the local Markdown lacks the URL or is frozen at a
 //! mid-flight status) can be brought to their final state without any provider
 //! lookup.

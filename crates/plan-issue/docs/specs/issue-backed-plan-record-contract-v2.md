@@ -256,7 +256,7 @@ stop the two from drifting once a tracking issue exists:
   `execution-state-issue-missing` or `execution-state-issue-mismatch` and points
   at the repair command rather than self-healing.
 - `plan-tooling exec-state-sync` is the offline, byte-preserving repair surface
-  for legacy bundles (issue exists, but the local Markdown lacks the URL or is
+  for existing bundles (issue exists, but the local Markdown lacks the URL or is
   frozen mid-flight).
 
 This is complementary to `plan-archive migrate`, whose archived-header rewrite

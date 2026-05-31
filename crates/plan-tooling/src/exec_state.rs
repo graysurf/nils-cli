@@ -9,7 +9,7 @@
 //!   `- Last updated:`, `- Branch/commit/PR:`) so the in-repo file is final
 //!   after closeout, not transient-stale until `plan-archive migrate`.
 //! - `plan-tooling exec-state-sync` exposes the same routine as an on-demand
-//!   repair command for legacy bundles.
+//!   repair command for existing bundles.
 //!
 //! Scope is intentionally narrow, mirroring [`crate::ledger`]: only the named
 //! `- <Label>:` bullets inside the `## Execution State` section are touched and
