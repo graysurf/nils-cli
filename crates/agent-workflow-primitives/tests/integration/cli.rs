@@ -2034,6 +2034,69 @@ Promote after a durable fix and validation are linked.\n\n\
     }
 
     #[test]
+    fn archive_without_inbox_dir_resolves_destination_from_case_path() {
+        // Regression for #739: with no --inbox-dir, the destination must derive
+        // from the absolute case path's own inbox, not the (unrelated) cwd.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let foreign_cwd = tmp.path().join("checkout-a");
+        fs::create_dir_all(&foreign_cwd).expect("foreign cwd");
+        let inbox = inbox_root(&tmp.path().join("checkout-b"));
+        let entry = write_entry(
+            &inbox.join("fixture-gap"),
+            EntryOpts {
+                status: "promoted",
+                next_action: "None. Fixed and validated.",
+                ..EntryOpts::default()
+            },
+        );
+        let case_folder = entry.parent().unwrap().to_path_buf();
+        // Run from the unrelated checkout-a cwd, archiving a case that lives in
+        // checkout-b, with no --inbox-dir / --archive-root override.
+        let out = run(
+            "heuristic-inbox",
+            &foreign_cwd,
+            &[
+                "archive",
+                case_folder.to_str().unwrap(),
+                "--date",
+                "2026-05-18",
+                "--yes",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        let destination = PathBuf::from(payload["data"]["destination"].as_str().unwrap());
+        // The reported destination resolved inside the case's own inbox tree.
+        assert!(
+            destination.ends_with(
+                "checkout-b/heuristic-system/error-inbox/archive/2026/fixture-gap/ENTRY.md"
+            ),
+            "destination resolved outside the case's own inbox: {destination:?}"
+        );
+        assert!(
+            destination.exists(),
+            "destination should exist: {destination:?}"
+        );
+        // Filesystem truth (independent of path display): the case moved into
+        // its own inbox archive, and no stray tree was created under the cwd.
+        assert!(!case_folder.exists());
+        assert!(
+            inbox
+                .join("archive")
+                .join("2026")
+                .join("fixture-gap")
+                .join("ENTRY.md")
+                .exists()
+        );
+        assert!(
+            !foreign_cwd.join("heuristic-system").exists(),
+            "archive must not create a stray tree under the cwd"
+        );
+    }
+
+    #[test]
     fn archive_accepts_wontfix_with_durable_link() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let inbox = inbox_root(tmp.path());

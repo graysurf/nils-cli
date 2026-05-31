@@ -84,7 +84,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (archive)
 _arguments "${_arguments_options[@]}" : \
-'--inbox-dir=[Inbox directory used for duplicate detection]:DIR:_files -/' \
+'--inbox-dir=[Inbox directory for duplicate detection and archive destination (defaults to the case folder'\''s own parent inbox)]:DIR:_files -/' \
 '--archive-root=[Override archive root (defaults to <inbox-dir>/archive)]:DIR:_files -/' \
 '--date=[Archive date (YYYY-MM-DD). Defaults to today]:DATE:_default' \
 '--link=[Optional durable outcome link]:LINK:_default' \
