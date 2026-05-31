@@ -83,6 +83,9 @@ pub fn command_supported(command: &Option<crate::cli::Command>) -> bool {
         // `provider_unsupported` for Local until a file-backed implementation
         // exists.
         Some(Command::Activity(_)) => true,
+        // Search likewise owns its own seam: Local reaches the op and returns a
+        // search-specific `provider_unsupported`, never a silent empty result.
+        Some(Command::Search(_)) => true,
         _ => false,
     }
 }
