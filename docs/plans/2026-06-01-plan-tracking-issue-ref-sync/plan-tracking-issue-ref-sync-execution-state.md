@@ -3,7 +3,7 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: tracking issue opened; implementation not yet started.
+- Status: complete; tracking issue closed
 - Target scope: nils-cli durable execution-state synchronization at the open
   and close transitions across `plan-issue`, `plan-tooling`, and
   `plan-archive`, followed by agent-runtime-kit create/execute/closeout skill
@@ -14,9 +14,8 @@
   PR2), serial.
 - Current task: Task 1.1 - not started.
 - Next task: Task 1.1 - lock the failing case and current invariants.
-- Last updated: 2026-06-01
-- Branch/commit/PR: tracker opened from committed bundle `f34b082`; planned
-  implementation branch `feat/plan-tracking-issue-ref-sync`; no PR opened.
+- Last updated: 2026-05-31
+- Branch/commit/PR: sympoies/nils-cli#741 merged (<https://github.com/sympoies/nils-cli/pull/741>); graysurf/agent-runtime-kit#238 merged (<https://github.com/graysurf/agent-runtime-kit/pull/238>)
 - Source document: docs/plans/2026-06-01-plan-tracking-issue-ref-sync/plan-tracking-issue-ref-sync-plan.md
 - Direct source-doc execution waiver: not applicable
 - Tracking issue: <https://github.com/sympoies/nils-cli/issues/738>
