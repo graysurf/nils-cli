@@ -57,7 +57,7 @@ fn emit_parse_error_returns_usage_for_unknown_subcommand() {
     let code = emit_parse_error_to(
         &mut stdout,
         &mut stderr,
-        "memo-cli",
+        "memo",
         OutputFormat::Json,
         "unknown-subcommand",
         "no such subcommand: bogus",

@@ -64,12 +64,12 @@ because BSD-style `-path` lets `*` cross slash boundaries.
 - `crates/gemini-cli/docs/runbooks/json-consumers.md`
 - `crates/gemini-cli/docs/specs/gemini-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - `crates/image-processing/docs/runbooks/llm-svg-workflow.md`
-- `crates/memo-cli/docs/runbooks/memo-cli-agent-workflow.md`
-- `crates/memo-cli/docs/specs/memo-cli-command-contract-v1.md`
-- `crates/memo-cli/docs/specs/memo-cli-json-contract-v1.md`
-- `crates/memo-cli/docs/specs/memo-cli-release-policy.md`
-- `crates/memo-cli/docs/specs/memo-cli-storage-schema-v1.md`
-- `crates/memo-cli/docs/specs/memo-cli-workflow-extension-contract-v1.md`
+- `crates/memo/docs/runbooks/memo-agent-workflow.md`
+- `crates/memo/docs/specs/memo-command-contract-v1.md`
+- `crates/memo/docs/specs/memo-json-contract-v1.md`
+- `crates/memo/docs/specs/memo-release-policy.md`
+- `crates/memo/docs/specs/memo-storage-schema-v1.md`
+- `crates/memo/docs/specs/memo-workflow-extension-contract-v1.md`
 - `crates/nils-common/docs/specs/markdown-helpers-contract-v1.md`
 - `crates/plan-issue-cli/docs/specs/plan-issue-cli-contract-v2.md`
 - `crates/plan-issue-cli/docs/specs/plan-issue-gate-matrix-v1.md`
@@ -106,7 +106,7 @@ Top-level crate READMEs (one per workspace member, 25 total):
 - `crates/git-summary/README.md`
 - `crates/image-processing/README.md`
 - `crates/macos-agent/README.md`
-- `crates/memo-cli/README.md`
+- `crates/memo/README.md`
 - `crates/nils-common/README.md`
 - `crates/nils-term/README.md`
 - `crates/nils-test-support/README.md`
@@ -134,7 +134,7 @@ Crate `docs/README.md` index files (one per workspace member, 25 total):
 - `crates/git-summary/docs/README.md`
 - `crates/image-processing/docs/README.md`
 - `crates/macos-agent/docs/README.md`
-- `crates/memo-cli/docs/README.md`
+- `crates/memo/docs/README.md`
 - `crates/nils-common/docs/README.md`
 - `crates/nils-term/docs/README.md`
 - `crates/nils-test-support/docs/README.md`

@@ -11,7 +11,7 @@ nils-web-evidence
 nils-agent-workflow-primitives
 nils-git-cli
 nils-forge-cli
-nils-memo-cli
+nils-memo
 nils-screen-record
 nils-api-testing-core
 nils-cli-template

@@ -72,7 +72,7 @@ declare -a removed_transient_docs=(
   "crates/plan-tooling/docs/runbooks/split-prs-migration.md"
   "crates/api-test/docs/runbooks/api-test-websocket-adoption.md"
   "crates/api-websocket/docs/runbooks/api-websocket-rollout.md"
-  "crates/memo-cli/docs/runbooks/memo-cli-rollout.md"
+  "crates/memo/docs/runbooks/memo-rollout.md"
 )
 
 for path in "${removed_transient_docs[@]}"; do
