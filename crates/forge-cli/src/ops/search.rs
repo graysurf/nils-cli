@@ -19,7 +19,9 @@ use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, ProcessRunner};
-use crate::cli::{BINARY, GlobalFlags, SearchCommand, SearchMatchField, SearchQueryArgs};
+use crate::cli::{
+    BINARY, GlobalFlags, SearchCommand, SearchMatchField, SearchQueryArgs, SearchRefsToArgs,
+};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
@@ -152,6 +154,9 @@ fn run_github<R: BackendRunner>(
             args,
             format,
         ),
+        SearchCommand::RefsTo(args) => {
+            run_github_refs_to(runner, global, ctx, repo_slug, args, format)
+        }
     }
 }
 
@@ -191,6 +196,301 @@ fn run_github_search<R: BackendRunner>(
         format,
         move |payload| render_search_text(label, payload),
     ))
+}
+
+const REFS_TO_SCHEMA: &str = "search.refs-to";
+
+/// Cross-reference events that reference the target issue / PR. The inline
+/// fragments cover the `issueOrPullRequest` union and the `source` of each
+/// `CrossReferencedEvent` (itself an Issue or PullRequest).
+const REFS_TO_GRAPHQL_QUERY: &str = r#"
+query($owner: String!, $name: String!, $number: Int!, $first: Int!) {
+  repository(owner: $owner, name: $name) {
+    issueOrPullRequest(number: $number) {
+      __typename
+      ... on Issue {
+        timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], first: $first) {
+          nodes { ...xref }
+        }
+      }
+      ... on PullRequest {
+        timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], first: $first) {
+          nodes { ...xref }
+        }
+      }
+    }
+  }
+}
+fragment xref on CrossReferencedEvent {
+  source {
+    __typename
+    ... on Issue { number url title state repository { nameWithOwner } }
+    ... on PullRequest { number url title state repository { nameWithOwner } }
+  }
+}
+"#;
+
+/// Normalized payload for `cli.forge-cli.search.refs-to.v1`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RefsToPayload {
+    pub provider: &'static str,
+    pub host: String,
+    pub repo: String,
+    pub reference_number: u64,
+    pub limit: u32,
+    pub item_count: usize,
+    pub limited: bool,
+    pub items: Vec<SearchItem>,
+}
+
+/// Parsed `<ref>` target: the repository owner / name and issue-or-PR number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefTarget {
+    owner: String,
+    name: String,
+    number: u64,
+}
+
+fn run_github_refs_to<R: BackendRunner>(
+    runner: &R,
+    global: &GlobalFlags,
+    ctx: &ProviderContext,
+    default_slug: &str,
+    args: SearchRefsToArgs,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    let limit = limit_for_provider(args.limit);
+    let target = parse_ref(&args.reference, Some(default_slug))?;
+    let call = build_github_refs_to_call(ctx, &target, limit);
+    if global.dry_run {
+        return Ok(emit_search_dry_run(
+            schema_ok(REFS_TO_SCHEMA),
+            ctx,
+            call,
+            format,
+        ));
+    }
+    let output = runner.run(&call)?;
+    let payload = parse_refs_to_output(&output, &target, limit, ctx)?;
+    Ok(emit_success(
+        schema_ok(REFS_TO_SCHEMA),
+        payload,
+        format,
+        render_refs_to_text,
+    ))
+}
+
+fn build_github_refs_to_call(ctx: &ProviderContext, target: &RefTarget, limit: u32) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    push_github_hostname(ctx, &mut argv);
+    argv.extend([
+        OsString::from("-F"),
+        OsString::from(format!("owner={}", target.owner)),
+        OsString::from("-F"),
+        OsString::from(format!("name={}", target.name)),
+        OsString::from("-F"),
+        OsString::from(format!("number={}", target.number)),
+        OsString::from("-F"),
+        OsString::from(format!("first={limit}")),
+        OsString::from("-f"),
+        OsString::from(format!("query={REFS_TO_GRAPHQL_QUERY}")),
+    ]);
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn push_github_hostname(ctx: &ProviderContext, argv: &mut Vec<OsString>) {
+    if ctx.host != "github.com" {
+        argv.push(OsString::from("--hostname"));
+        argv.push(OsString::from(&ctx.host));
+    }
+}
+
+/// Parse a `<ref>` into its `(owner, name, number)` target. Accepts a GitHub
+/// URL (`https://github.com/owner/name/issues|pull/<n>`), `owner/name#<n>`, or
+/// `#<n>` / `<n>` (which fall back to `default_slug`).
+fn parse_ref(reference: &str, default_slug: Option<&str>) -> Result<RefTarget, ForgeError> {
+    let raw = reference.trim();
+    if let Some(rest) = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+    {
+        // host/owner/name/(issues|pull)/<number>[/...]
+        let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.len() >= 5 && matches!(segments[3], "issues" | "pull") {
+            let number = parse_ref_number(segments[4])?;
+            return Ok(RefTarget {
+                owner: segments[1].to_string(),
+                name: segments[2].to_string(),
+                number,
+            });
+        }
+        return Err(ref_invalid(raw));
+    }
+    if let Some((repo_part, number_part)) = raw.split_once('#') {
+        let number = parse_ref_number(number_part)?;
+        if repo_part.is_empty() {
+            let (owner, name) = split_slug_or_default(default_slug, raw)?;
+            return Ok(RefTarget {
+                owner,
+                name,
+                number,
+            });
+        }
+        let (owner, name) = split_slug(repo_part).ok_or_else(|| ref_invalid(raw))?;
+        return Ok(RefTarget {
+            owner,
+            name,
+            number,
+        });
+    }
+    if raw.chars().all(|c| c.is_ascii_digit()) && !raw.is_empty() {
+        let number = parse_ref_number(raw)?;
+        let (owner, name) = split_slug_or_default(default_slug, raw)?;
+        return Ok(RefTarget {
+            owner,
+            name,
+            number,
+        });
+    }
+    Err(ref_invalid(raw))
+}
+
+fn parse_ref_number(value: &str) -> Result<u64, ForgeError> {
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ref_invalid(value))
+        .and_then(|n| {
+            if n == 0 {
+                Err(ref_invalid(value))
+            } else {
+                Ok(n)
+            }
+        })
+}
+
+fn split_slug(slug: &str) -> Option<(String, String)> {
+    let (owner, name) = slug.split_once('/')?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some((owner.to_string(), name.to_string()))
+}
+
+fn split_slug_or_default(
+    default_slug: Option<&str>,
+    raw: &str,
+) -> Result<(String, String), ForgeError> {
+    default_slug
+        .and_then(split_slug)
+        .ok_or_else(|| ref_invalid(raw))
+}
+
+fn parse_refs_to_output(
+    output: &BackendSuccess,
+    target: &RefTarget,
+    limit: u32,
+    ctx: &ProviderContext,
+) -> Result<RefsToPayload, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "GitHub refs-to GraphQL JSON is invalid",
+            Some(e.to_string()),
+        )
+    })?;
+    let subject = value
+        .pointer("/data/repository/issueOrPullRequest")
+        .filter(|v| !v.is_null())
+        .ok_or_else(|| {
+            ForgeError::software(
+                schema_err(),
+                format!(
+                    "ref {}/{}#{} not found or not visible",
+                    target.owner, target.name, target.number
+                ),
+                None,
+            )
+        })?;
+    let nodes = subject
+        .pointer("/timelineItems/nodes")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| missing("timelineItems.nodes"))?;
+    let items = nodes
+        .iter()
+        .filter_map(|node| node.get("source").filter(|s| !s.is_null()))
+        .map(parse_refs_to_item)
+        .collect::<Result<Vec<_>, _>>()?;
+    let item_count = items.len();
+    Ok(RefsToPayload {
+        provider: ctx.provider.as_str(),
+        host: ctx.host.clone(),
+        repo: format!("{}/{}", target.owner, target.name),
+        reference_number: target.number,
+        limit,
+        item_count,
+        limited: reached_limit(item_count, limit),
+        items,
+    })
+}
+
+fn parse_refs_to_item(source: &serde_json::Value) -> Result<SearchItem, ForgeError> {
+    let kind = match source.get("__typename").and_then(|v| v.as_str()) {
+        Some("PullRequest") => "pr",
+        Some("Issue") => "issue",
+        _ => "issue",
+    }
+    .to_string();
+    Ok(SearchItem {
+        kind,
+        number: source
+            .get("number")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| missing("source.number"))?,
+        url: required_str(source, "url")?,
+        title: required_str(source, "title")?,
+        state: required_str(source, "state")?.to_ascii_lowercase(),
+        repo: source
+            .pointer("/repository/nameWithOwner")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| missing("source.repository.nameWithOwner"))?,
+        matched_field: None,
+    })
+}
+
+fn render_refs_to_text(payload: &RefsToPayload) {
+    println!(
+        "{provider}@{host} search refs-to {repo}#{number}: {count} reference(s){limited}",
+        provider = payload.provider,
+        host = payload.host,
+        repo = payload.repo,
+        number = payload.reference_number,
+        count = payload.item_count,
+        limited = limited_suffix(payload.limited),
+    );
+    for item in &payload.items {
+        println!(
+            "{kind} #{number} [{state}] {repo} {title} - {url}",
+            kind = item.kind,
+            number = item.number,
+            state = item.state,
+            repo = item.repo,
+            title = one_line(&item.title),
+            url = item.url,
+        );
+    }
+}
+
+fn ref_invalid(value: &str) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "ref_invalid",
+        format!(
+            "could not parse ref '{value}': expected a GitHub URL, owner/name#number, or #number"
+        ),
+        None,
+    )
 }
 
 fn build_github_search_call(
@@ -404,6 +704,7 @@ fn command_name(command: &SearchCommand) -> &'static str {
     match command {
         SearchCommand::Issues(_) => "issues",
         SearchCommand::Prs(_) => "prs",
+        SearchCommand::RefsTo(_) => "refs-to",
     }
 }
 
@@ -660,6 +961,144 @@ mod tests {
             &FailingRunner,
             &global(ProviderFlag::Local),
             prs("term"),
+            OutputFormat::Json,
+            |_| None,
+        )
+        .expect_err("local unsupported");
+        assert_eq!(err.kind(), "provider_unsupported");
+    }
+
+    #[test]
+    fn parse_ref_handles_url_issue_pull_slug_and_bare_number() {
+        let want = RefTarget {
+            owner: "acme".into(),
+            name: "widget".into(),
+            number: 42,
+        };
+        assert_eq!(
+            parse_ref("https://github.com/acme/widget/issues/42", None).unwrap(),
+            want
+        );
+        assert_eq!(
+            parse_ref("https://github.com/acme/widget/pull/42", None).unwrap(),
+            want
+        );
+        assert_eq!(parse_ref("acme/widget#42", None).unwrap(), want);
+        assert_eq!(parse_ref("#42", Some("acme/widget")).unwrap(), want);
+        assert_eq!(parse_ref("42", Some("acme/widget")).unwrap(), want);
+    }
+
+    #[test]
+    fn parse_ref_rejects_bad_refs_and_missing_context() {
+        assert_eq!(
+            parse_ref("#42", None).expect_err("no default slug").kind(),
+            "ref_invalid"
+        );
+        assert_eq!(
+            parse_ref("not-a-ref", Some("acme/widget"))
+                .expect_err("garbage")
+                .kind(),
+            "ref_invalid"
+        );
+        assert_eq!(
+            parse_ref("acme/widget#0", None)
+                .expect_err("zero number")
+                .kind(),
+            "ref_invalid"
+        );
+    }
+
+    #[test]
+    fn refs_to_call_builds_graphql_argv() {
+        let target = RefTarget {
+            owner: "acme".into(),
+            name: "widget".into(),
+            number: 7,
+        };
+        let call = build_github_refs_to_call(&ctx(), &target, 30);
+        assert_eq!(call.program, BackendProgram::Gh);
+        let argv = argv_to_strings(&call.argv);
+        assert_eq!(argv[0], "api");
+        assert_eq!(argv[1], "graphql");
+        assert!(argv.iter().any(|a| a == "owner=acme"));
+        assert!(argv.iter().any(|a| a == "name=widget"));
+        assert!(argv.iter().any(|a| a == "number=7"));
+        assert!(argv.iter().any(|a| a == "first=30"));
+        assert!(argv.iter().any(|a| a.starts_with("query=")));
+        // No --hostname for github.com.
+        assert!(!argv.iter().any(|a| a == "--hostname"));
+    }
+
+    #[test]
+    fn refs_to_call_adds_hostname_for_enterprise_host() {
+        let enterprise = ProviderContext {
+            host: "internal.ghe.com".into(),
+            ..ctx()
+        };
+        let target = RefTarget {
+            owner: "acme".into(),
+            name: "widget".into(),
+            number: 7,
+        };
+        let argv = argv_to_strings(&build_github_refs_to_call(&enterprise, &target, 30).argv);
+        assert!(argv.iter().any(|a| a == "--hostname"));
+        assert!(argv.iter().any(|a| a == "internal.ghe.com"));
+    }
+
+    #[test]
+    fn parse_refs_to_output_normalizes_cross_referencing_sources() {
+        let output = BackendSuccess {
+            stdout: r#"{"data":{"repository":{"issueOrPullRequest":{"__typename":"Issue","timelineItems":{"nodes":[
+                {"source":{"__typename":"PullRequest","number":9,"url":"https://github.com/acme/widget/pull/9","title":"close the issue","state":"MERGED","repository":{"nameWithOwner":"acme/widget"}}},
+                {"source":{"__typename":"Issue","number":11,"url":"https://github.com/acme/widget/issues/11","title":"a related issue","state":"OPEN","repository":{"nameWithOwner":"acme/widget"}}}
+            ]}}}}}"#
+            .into(),
+            stderr: String::new(),
+        };
+        let target = RefTarget {
+            owner: "acme".into(),
+            name: "widget".into(),
+            number: 7,
+        };
+        let payload = parse_refs_to_output(&output, &target, 30, &ctx()).expect("parse");
+        assert_eq!(payload.repo, "acme/widget");
+        assert_eq!(payload.reference_number, 7);
+        assert_eq!(payload.item_count, 2);
+        assert_eq!(payload.items[0].kind, "pr");
+        assert_eq!(payload.items[0].number, 9);
+        assert_eq!(payload.items[0].state, "merged");
+        assert_eq!(payload.items[1].kind, "issue");
+        assert_eq!(payload.items[1].state, "open");
+    }
+
+    #[test]
+    fn parse_refs_to_output_errors_when_ref_missing() {
+        let output = BackendSuccess {
+            stdout: r#"{"data":{"repository":{"issueOrPullRequest":null}}}"#.into(),
+            stderr: String::new(),
+        };
+        let target = RefTarget {
+            owner: "acme".into(),
+            name: "widget".into(),
+            number: 999,
+        };
+        let err = parse_refs_to_output(&output, &target, 30, &ctx()).expect_err("missing ref");
+        assert_eq!(err.kind(), "software_error");
+    }
+
+    fn refs_to(reference: &str) -> SearchCommand {
+        SearchCommand::RefsTo(SearchRefsToArgs {
+            reference: reference.into(),
+            limit: 30,
+        })
+    }
+
+    #[test]
+    fn refs_to_local_branch_is_explicitly_unsupported() {
+        let err = run_with(
+            &FailingRunner,
+            &global(ProviderFlag::Local),
+            refs_to("#7"),
             OutputFormat::Json,
             |_| None,
         )

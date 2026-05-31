@@ -933,6 +933,21 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':query -- Free-text query passed to the provider'\''s search primitive:_default' \
 && ret=0
 ;;
+(refs-to)
+_arguments "${_arguments_options[@]}" : \
+'--limit=[Cap the number of cross-reference events scanned (default\: 30)]:LIMIT:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':reference -- Target issue / PR to find references to. Accepts a GitHub URL, `owner/name#number`, or `#number` / `number` (repo from context):_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_forge-cli__subcmd__search__subcmd__help_commands" \
@@ -950,6 +965,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (prs)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(refs-to)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1324,6 +1343,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (prs)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(refs-to)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1748,6 +1771,7 @@ _forge-cli__subcmd__help__subcmd__search_commands() {
     local commands; commands=(
 'issues:Full-text search over issues (\`gh search issues\`)' \
 'prs:Full-text search over pull requests (\`gh search prs\`)' \
+'refs-to:List issues / PRs that reference a ref via cross-reference events' \
     )
     _describe -t commands 'forge-cli help search commands' commands "$@"
 }
@@ -1760,6 +1784,11 @@ _forge-cli__subcmd__help__subcmd__search__subcmd__issues_commands() {
 _forge-cli__subcmd__help__subcmd__search__subcmd__prs_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli help search prs commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__search__subcmd__refs-to_commands] )) ||
+_forge-cli__subcmd__help__subcmd__search__subcmd__refs-to_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help search refs-to commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__inbox_commands] )) ||
 _forge-cli__subcmd__inbox_commands() {
@@ -2173,6 +2202,7 @@ _forge-cli__subcmd__search_commands() {
     local commands; commands=(
 'issues:Full-text search over issues (\`gh search issues\`)' \
 'prs:Full-text search over pull requests (\`gh search prs\`)' \
+'refs-to:List issues / PRs that reference a ref via cross-reference events' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli search commands' commands "$@"
@@ -2182,6 +2212,7 @@ _forge-cli__subcmd__search__subcmd__help_commands() {
     local commands; commands=(
 'issues:Full-text search over issues (\`gh search issues\`)' \
 'prs:Full-text search over pull requests (\`gh search prs\`)' \
+'refs-to:List issues / PRs that reference a ref via cross-reference events' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli search help commands' commands "$@"
@@ -2201,6 +2232,11 @@ _forge-cli__subcmd__search__subcmd__help__subcmd__prs_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli search help prs commands' commands "$@"
 }
+(( $+functions[_forge-cli__subcmd__search__subcmd__help__subcmd__refs-to_commands] )) ||
+_forge-cli__subcmd__search__subcmd__help__subcmd__refs-to_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli search help refs-to commands' commands "$@"
+}
 (( $+functions[_forge-cli__subcmd__search__subcmd__issues_commands] )) ||
 _forge-cli__subcmd__search__subcmd__issues_commands() {
     local commands; commands=()
@@ -2210,6 +2246,11 @@ _forge-cli__subcmd__search__subcmd__issues_commands() {
 _forge-cli__subcmd__search__subcmd__prs_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli search prs commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__search__subcmd__refs-to_commands] )) ||
+_forge-cli__subcmd__search__subcmd__refs-to_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli search refs-to commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_forge-cli" ]; then

@@ -247,3 +247,127 @@ fn search_local_branch_is_provider_unsupported() {
     );
     assert_eq!(envelope["error"]["details"]["detail"], "provider=local");
 }
+
+const GH_REFS_TO_STUB: &str = r#"#!/bin/sh
+case "$*" in
+  "api graphql -F owner=acme -F name=widget -F number=7 -F first=30 -f "*)
+    cat <<'JSON'
+{"data":{"repository":{"issueOrPullRequest":{"__typename":"Issue","timelineItems":{"nodes":[{"source":{"__typename":"PullRequest","number":9,"url":"https://github.com/acme/widget/pull/9","title":"close issue 7","state":"MERGED","repository":{"nameWithOwner":"acme/widget"}}}]}}}}}
+JSON
+    ;;
+  *)
+    echo "unexpected gh argv: $*" >&2
+    exit 97
+    ;;
+esac
+"#;
+
+#[test]
+fn search_refs_to_github_normalizes_cross_references() {
+    let stub = StubEnv::new().gh_stub(GH_REFS_TO_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widget",
+            "--format",
+            "json",
+            "search",
+            "refs-to",
+            "#7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(
+        envelope["schema_version"],
+        "cli.forge-cli.search.refs-to.v1"
+    );
+    assert_eq!(envelope["data"]["repo"], "acme/widget");
+    assert_eq!(envelope["data"]["reference_number"], 7);
+    assert_eq!(envelope["data"]["item_count"], 1);
+    assert_eq!(envelope["data"]["items"][0]["kind"], "pr");
+    assert_eq!(envelope["data"]["items"][0]["number"], 9);
+    assert_eq!(envelope["data"]["items"][0]["state"], "merged");
+}
+
+#[test]
+fn search_refs_to_dry_run_lists_graphql_plan() {
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\nexit 97\n");
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widget",
+            "--dry-run",
+            "--format",
+            "json",
+            "search",
+            "refs-to",
+            "https://github.com/acme/widget/pull/9",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    let plan = envelope["data"]["plan"].as_array().expect("plan array");
+    assert_eq!(plan[1], "api");
+    assert_eq!(plan[2], "graphql");
+    assert!(plan.iter().any(|v| v == "owner=acme"));
+    assert!(plan.iter().any(|v| v == "name=widget"));
+    assert!(plan.iter().any(|v| v == "number=9"));
+}
+
+#[test]
+fn search_refs_to_rejects_unparseable_ref() {
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\nexit 97\n");
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widget",
+            "--format",
+            "json",
+            "search",
+            "refs-to",
+            "not-a-ref",
+        ],
+    );
+    assert_eq!(out.code, 65, "stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "ref_invalid");
+}
+
+#[test]
+fn search_refs_to_gitlab_branch_is_provider_unsupported() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--repo",
+            "acme/widget",
+            "--format",
+            "json",
+            "search",
+            "refs-to",
+            "#7",
+        ],
+    );
+    assert_eq!(out.code, 64, "stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "provider_unsupported");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("search refs-to is GitHub-only in v1"),
+        "unexpected envelope: {envelope}"
+    );
+}

@@ -496,6 +496,44 @@ return `provider_unsupported` in v1.
 - `limited=true` means the returned row count reached the requested bound, so
   more provider-side rows may exist.
 
+## Search output contract
+
+`search` is read-only and runs free-text / reverse-reference queries the
+structured `issue list` / `pr list` filters cannot express. It delegates to the
+provider's search primitives and builds no index. GitHub is the v1 target;
+GitLab and Local return a structured `provider_unsupported` error (search is
+GitHub-only in v1), never a silent empty result.
+
+Role split (documented in `forge-cli search --help`): `issue list` / `pr list`
+filter by structured fields within one repo, `inbox` is the personal cross-repo
+work queue, and `search` is full-text and reverse-reference query.
+
+All three subcommands are single-repo scoped: the repo slug comes from `--repo
+owner/name` or the detected forge remote. Every item is the shared normalized
+`SearchItem`: `kind` (`issue` | `pr`), `number`, `url`, `title`, `state`,
+`repo`, and `matched_field` (best-effort; `null` when the provider does not
+report which field matched, which the GitHub path never does).
+
+- `search issues <query>` emits `cli.forge-cli.search.issues.v1` and
+  `search prs <query>` emits `cli.forge-cli.search.prs.v1`, each with
+  `data.provider`, `data.host`, `data.repo`, `data.query`, `data.match_fields`,
+  `data.limit`, `data.item_count`, `data.limited`, and normalized `data.items[]`.
+  They run `gh search <issues|prs> <query> --repo <slug> --match <fields>
+  --limit <n> --json …`; `--match` defaults to `title,body,comments` and is
+  narrowable. A body-only hit the structured `issue list` cannot surface is
+  returned; an empty result is a well-formed empty envelope.
+- `search refs-to <ref>` emits `cli.forge-cli.search.refs-to.v1` with
+  `data.provider`, `data.host`, `data.repo`, `data.reference_number`,
+  `data.limit`, `data.item_count`, `data.limited`, and normalized
+  `data.items[]`. `<ref>` parses as a GitHub URL, `owner/name#number`, or
+  `#number` / `number` (repo from context); an unparseable ref is
+  `DATA 65` with `error.kind=ref_invalid`. It runs `gh api graphql` over the
+  target's `CROSS_REFERENCED_EVENT` timeline items and normalizes the
+  referencing issues / PRs into `SearchItem`s.
+- All three render the exact backend argv under `--dry-run` (`data.plan`),
+  honor `--format json`, and set `limited=true` when the returned row count
+  reached the requested bound.
+
 ## Inbox output contract
 
 `inbox` is read-only and aggregates personal work discovery across selected
