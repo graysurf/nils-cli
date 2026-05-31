@@ -37,7 +37,7 @@ The serialized crate order is fixed:
 2. `agent-docs` (`serial-2`)
 3. `macos-agent` (`serial-3`)
 4. `fzf-cli` (`serial-4`)
-5. `memo-cli` (`serial-5`)
+5. `memo` (`serial-5`)
 
 All other crates remain `parallel` unless the matrix spec is intentionally revised.
 

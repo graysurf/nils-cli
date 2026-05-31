@@ -2193,7 +2193,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nils-memo-cli"
+name = "nils-memo"
 version = "0.31.8"
 dependencies = [
  "anyhow",

@@ -125,7 +125,7 @@ frozen_serial_crates=(
   agent-docs
   macos-agent
   fzf-cli
-  memo-cli
+  memo
 )
 
 cleanup() {
