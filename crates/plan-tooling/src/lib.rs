@@ -3,6 +3,8 @@ mod batches;
 mod bundle;
 mod cli;
 mod completion;
+pub mod exec_state;
+mod exec_state_sync;
 mod fix;
 pub mod ledger;
 mod ledger_sync;

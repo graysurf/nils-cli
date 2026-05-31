@@ -4,12 +4,14 @@
 ## Execution State
 
 - Status: tracking issue opened; implementation not yet started.
-- Target scope: nils-cli plan-tracking issue ref synchronization across
-  `plan-issue`, `plan-tooling`, and `plan-archive`, followed by
-  agent-runtime-kit skill updates only if the CLI workflow contract changes.
-- Execution window: Sprint 1 (`nils-cli` contract, sync/repair tooling,
-  consistency gate, tests, PR1) -> Sprint 2 (`agent-runtime-kit` skill guidance,
-  PR2 if needed), serial.
+- Target scope: nils-cli durable execution-state synchronization at the open
+  and close transitions across `plan-issue`, `plan-tooling`, and
+  `plan-archive`, followed by agent-runtime-kit create/execute/closeout skill
+  updates.
+- Execution window: Sprint 1 (`nils-cli` contract: shared sync routine,
+  create-time URL write, closeout terminal-state writeback, self-heal gate,
+  legacy repair, tests, PR1) -> Sprint 2 (`agent-runtime-kit` skill guidance,
+  PR2), serial.
 - Current task: Task 1.1 - not started.
 - Next task: Task 1.1 - lock the failing case and current invariants.
 - Last updated: 2026-06-01
@@ -26,22 +28,24 @@
 
 - Bundle creation: targeted plan-source bundle validation and docs-only
   validation before opening the tracker.
-- Sprint 1: targeted Rust tests for `plan-issue` run-state / execution-state
-  sync, execute/checkpoint consistency refusals, and `plan-archive discover`
-  provider-ref inference; then `bash scripts/ci/nils-cli-checks-entrypoint.sh
-  --local-fast` and provider PR checks.
-- Sprint 2: agent-runtime-kit project-dev validation only if skill source or
-  rendered skill surfaces change.
+- Sprint 1: targeted Rust tests for `plan-issue` / `plan-tooling`
+  execution-state sync, closeout terminal-state writeback,
+  self-heal/consistency refusals, and `plan-archive discover` provider-ref
+  inference; then `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
+  and provider PR checks.
+- Sprint 2: agent-runtime-kit project-dev validation for skill source and
+  rendered skill surfaces.
 
 ## Task Ledger
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | pending | Lock the failing case and current invariants | - | Preserve the `forge-cli-search` / issue #716 `no-provider-refs` case and prove discover remains offline. |
-| 1.2 | pending | Synchronize tracking issue URL into execution-state | - | Choose owner command and patch `Tracking issue` once live issue URL is known. |
-| 1.3 | pending | Add execute/checkpoint consistency gate | - | Block or strictly refuse missing, placeholder, or mismatched durable issue refs. |
-| 1.4 | pending | Legacy repair and documentation | - | Provide deterministic repair for existing bundles such as `forge-cli-search`. |
-| 2.1 | pending | Update agent-runtime-kit create/execute skill instructions if needed | - | Runs after nils-cli command contract is settled. |
+| 1.1 | pending | Lock the failing cases and current invariants | - | Preserve the `forge-cli-search` / issue #716 `no-provider-refs` case and the closeout-stale local-state case; prove discover stays offline. |
+| 1.2 | pending | Shared sync routine and create-time URL write | - | One byte-preserving routine owns execution-state writes; `record open` invokes it to record the issue URL. |
+| 1.3 | pending | Closeout terminal-state writeback | - | `record close` writes terminal status, final ledger, linked PR, and URL into the local file; complementary to migrate's archived rewrite. |
+| 1.4 | pending | Consistency and self-heal gate across execute/checkpoint/close | - | Self-heal write-if-missing before any hard block; cover the previously unguarded close path. |
+| 1.5 | pending | Legacy repair and documentation | - | On-demand repair command over the shared routine for bundles such as `forge-cli-search`. |
+| 2.1 | pending | Update agent-runtime-kit create/execute/closeout skill instructions | - | Required: Task 1.2/1.3 change the create and closeout command sequences. |
 
 ## Session Log
 
@@ -53,6 +57,21 @@
   first so run-state and execution-state issue refs stay synchronized, then
   update agent-runtime-kit skills only if the CLI contract changes. Do not make
   `plan-archive discover` perform default provider lookup.
+- 2026-06-01: Expanded scope after review (issue #738 was opened from the
+  original 4-task plan at `f34b082`; this is the refined 6-task plan). Added
+  (a) closeout terminal-state writeback so the in-repo execution-state is the
+  final state after `record close`, not transient-stale until
+  `plan-archive migrate`; (b) a consistency/self-heal gate that also covers the
+  close path; (c) a shared sync routine backing create, closeout, self-heal,
+  and repair; and (d) Sprint 2 is now required because the create/execute/
+  closeout command sequence changes. The expansion is delivered on
+  `feat/plan-tracking-issue-ref-sync`; #738's frozen plan snapshot stays as the
+  open-time record and the scope change is noted in a session checkpoint.
+- 2026-06-01: Bootstrap note (chicken-and-egg). The create-time URL sync and
+  closeout writeback do not exist yet, so this bundle's own execution-state was
+  not auto-patched. The `Tracking issue` URL was recorded manually at open; its
+  terminal state must likewise be written manually (or via the new repair
+  command once Sprint 1 lands) at closeout.
 
 ## Validation
 

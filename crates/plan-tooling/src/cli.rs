@@ -1,5 +1,6 @@
 use crate::{
-    artifact_audit, batches, completion, ledger_sync, ledger_update, scaffold, spec, validate,
+    artifact_audit, batches, completion, exec_state_sync, ledger_sync, ledger_update, scaffold,
+    spec, validate,
 };
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -49,6 +50,11 @@ enum Command {
         about = "Reconcile a ledger Evidence column against tracking-issue evidence"
     )]
     LedgerSync(RawArgs),
+    #[command(
+        name = "exec-state-sync",
+        about = "Repair an execution-state file's tracking issue URL / terminal state"
+    )]
+    ExecStateSync(RawArgs),
     #[command(about = "Create a new plan from template")]
     Scaffold(RawArgs),
     #[command(about = "Dump the validate catalog (class, pattern, rule, example)")]
@@ -92,6 +98,7 @@ where
         Some(Command::SplitPrs(raw)) => crate::split_prs::run(&raw.args),
         Some(Command::LedgerUpdate(raw)) => ledger_update::run(&raw.args),
         Some(Command::LedgerSync(raw)) => ledger_sync::run(&raw.args),
+        Some(Command::ExecStateSync(raw)) => exec_state_sync::run(&raw.args),
         Some(Command::Scaffold(raw)) => scaffold::run(&raw.args),
         Some(Command::Spec(raw)) => spec::run(&raw.args),
         Some(Command::Completion(raw)) => completion::run(&raw.args),

@@ -93,6 +93,13 @@ Direct source-doc execution is allowed only for bounded execution with an explic
 The waiver value must explain the reason. Empty values, `not applicable`, `n/a`, and `none` do not
 waive direct source-doc execution.
 
+Once a tracking issue exists, the execution-state header should carry the issue URL in its
+`- Tracking issue:` bullet, and after closeout it should read its terminal state. `plan-issue record
+open` / `record close` write these automatically, and `plan-tooling exec-state-sync` repairs existing
+bundles offline; see the Durable Execution-State Synchronization section of the issue-backed plan
+record contract. This keeps a completed bundle discoverable by `plan-archive discover`, which infers
+provider refs only from local Markdown.
+
 ## Validation Rules
 
 `plan-tooling validate` fails a bundle when:

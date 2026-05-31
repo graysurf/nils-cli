@@ -456,6 +456,56 @@ fn duplicate_refs_are_deduplicated_across_files() {
     assert_eq!(c.status, DiscoverStatus::Eligible);
 }
 
+/// Regression for the plan-tracking writeback feature: a completed bundle whose
+/// execution-state still carries the `not yet opened` placeholder (the
+/// closeout-stale failure mode, e.g. `forge-cli-search` / issue #716) is blocked
+/// with `no-provider-refs`. Once the tracking-issue URL is written into the
+/// header (what `record open` / `record close` now do), discover infers the ref
+/// offline without any provider lookup or title guessing.
+#[test]
+fn closeout_stale_execution_state_gains_provider_ref_once_url_is_written() {
+    let s = build_base();
+    // Stale: terminal status, but the tracking-issue bullet is a placeholder.
+    write_plan(
+        &s,
+        "2026-05-31-stale",
+        &[(
+            "x-execution-state.md",
+            "## Execution State\n\n- Status: complete; tracking issue closed\n- Tracking issue: not yet opened\n",
+        )],
+    );
+    // Repaired: same bundle after the writeback recorded the issue URL.
+    write_plan(
+        &s,
+        "2026-05-31-repaired",
+        &[(
+            "x-execution-state.md",
+            &format!(
+                "## Execution State\n\n- Status: complete; tracking issue closed\n- Tracking issue: <{ISSUE_URL}>\n"
+            ),
+        )],
+    );
+    commit_all(&s, "seed");
+    let report = discover::scan(&args(&s, true)).expect("scan ok");
+
+    let stale = find(&report, "2026-05-31-stale");
+    assert!(
+        stale.refs.is_empty(),
+        "placeholder URL must not be inferred"
+    );
+    assert!(reason_codes(stale).contains(&"no-provider-refs"));
+    assert_eq!(stale.status, DiscoverStatus::Blocked);
+
+    let repaired = find(&report, "2026-05-31-repaired");
+    assert!(
+        !reason_codes(repaired).contains(&"no-provider-refs"),
+        "written URL must clear the no-provider-refs blocker"
+    );
+    assert_eq!(repaired.refs.len(), 1);
+    assert!(repaired.refs[0].matches_source_repo);
+    assert_eq!(repaired.status, DiscoverStatus::Eligible);
+}
+
 /// Dispatch args with an explicit format and `--hosts` left to default
 /// to `<archive>/config/hosts.yaml`.
 fn dispatch_args(s: &Scenario, include_unknown: bool, format: OutputFormat) -> DispatchArgs {
