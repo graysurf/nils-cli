@@ -108,7 +108,7 @@ The canonical CI/full-check entrypoint remains:
 bash scripts/ci/nils-cli-checks-entrypoint.sh
 ```
 
-This delegates to `./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh`.
+This delegates to `./.agents/skills/project-verify-required-checks/scripts/project-verify-required-checks.sh`.
 It is what CI uses for the full `test` and `test_macos` jobs; it is not the
 default local development loop.
 

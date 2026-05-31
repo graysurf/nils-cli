@@ -9,7 +9,7 @@ Usage:
 Description:
   Canonical cross-platform entrypoint for local-fast and CI verification jobs.
   - By default, runs the full CI parity stack through
-    ./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh
+    ./.agents/skills/project-verify-required-checks/scripts/project-verify-required-checks.sh
   - Reuses the current Bash interpreter so nested audit scripts run with the same shell version.
   - Optionally wraps execution with xvfb-run for Linux runners.
   - Runs the local fast changed-scope gate with --local-fast; this is the
@@ -98,7 +98,7 @@ if [[ -z "$repo_root" || ! -d "$repo_root" ]]; then
 fi
 cd "$repo_root"
 
-verify_script="./.agents/skills/nils-cli-verify-required-checks/scripts/nils-cli-verify-required-checks.sh"
+verify_script="./.agents/skills/project-verify-required-checks/scripts/project-verify-required-checks.sh"
 if [[ ! -f "$verify_script" ]]; then
   echo "error: missing required checks script: $verify_script" >&2
   exit 2
