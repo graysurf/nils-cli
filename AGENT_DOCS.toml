@@ -39,3 +39,9 @@ context = "project-dev"
 commands = ["bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast"]
 marker = ".cache/agent-validation/project-dev.ok"
 description = "Run the nils-cli local-fast CI gate (fmt, clippy, workspace tests, docs/parity audits) before declaring a project-dev task done."
+
+# Opt in to the project-local skill-name prefix lint (agent-docs v1.0+):
+# `agent-docs audit` flags any `.agents/skills/<name>` directory whose name is
+# not lowercase kebab-case starting with `project-` or `private-`.
+[skills]
+enforce_name_prefix = true
