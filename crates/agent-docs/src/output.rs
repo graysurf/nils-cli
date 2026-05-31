@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use nils_common::cli_contract::{Envelope, EnvelopeError, schema_version_for};
 use serde::Serialize;
+use serde_json::json;
 
 use crate::model::{
     AuditReport, InitMode, InitReport, ListReport, OutputFormat, PreflightReport, RemoveReport,
@@ -21,6 +23,39 @@ pub fn render_preflight(format: OutputFormat, report: &PreflightReport) -> Resul
             serde_json::to_string_pretty(report).context("failed to serialize preflight output")
         }
         OutputFormat::Text => Ok(render_preflight_text(report)),
+    }
+}
+
+pub fn render_undeclared_intent_error(
+    format: OutputFormat,
+    intent: &str,
+    available_intents: &[String],
+) -> Result<String> {
+    match format {
+        OutputFormat::Json => {
+            let error = EnvelopeError::new(
+                "undeclared-intent",
+                format!("intent `{intent}` is not declared for this project"),
+            )
+            .with_details(json!({
+                "intent": intent,
+                "available_intents": available_intents,
+            }));
+            let envelope: Envelope<()> =
+                Envelope::failure(schema_version_for("agent-docs", "preflight", 1), error);
+            serde_json::to_string_pretty(&envelope)
+                .context("failed to serialize undeclared-intent error")
+        }
+        OutputFormat::Text => {
+            let available = if available_intents.is_empty() {
+                "none".to_string()
+            } else {
+                available_intents.join(", ")
+            };
+            Ok(format!(
+                "error: undeclared intent `{intent}`; available intents: {available}"
+            ))
+        }
     }
 }
 

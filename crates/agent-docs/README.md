@@ -192,6 +192,37 @@ Field notes:
 - `summary.satisfied_required` counts required docs that are present and
   content-valid; `missing_required` and `invalid_required` break down the rest.
 
+`preflight --require-declared-intent` is an opt-in guard for callers that
+explicitly expect the intent to exist. Without the flag, an unknown intent keeps
+the compatibility behavior above: exit `0`, `documents=[]`, and
+`validation.declared=false`. With the flag, `preflight` exits `65` when the
+requested intent is not declared by any applicable document entry or validation
+contract. Optional documents and documents skipped by `when` still count as a
+declared intent; so do validation-only intents.
+
+In text mode, the guarded failure is written to stderr:
+
+```text
+error: undeclared intent `no-such-intent`; available intents: project-dev, task-tools
+```
+
+In JSON mode, the guarded failure uses the shared CLI error envelope:
+
+```json
+{
+  "schema_version": "cli.agent-docs.preflight.v1",
+  "ok": false,
+  "error": {
+    "code": "undeclared-intent",
+    "message": "intent `no-such-intent` is not declared for this project",
+    "details": {
+      "intent": "no-such-intent",
+      "available_intents": ["project-dev", "task-tools"]
+    }
+  }
+}
+```
+
 A consuming hook typically injects an awareness cue listing
 `validation.commands` on `project-dev` / `task-tools` intent at the start of a
 task, and at the finish line blocks turn-end when `validation.declared` is true,
@@ -238,6 +269,7 @@ preview the target path without writing, or `--force` to write the file.
 | 3 | catalog (config) error |
 | 4 | runtime error |
 | 64 | command-line usage error |
+| 65 | undeclared intent when `preflight --require-declared-intent` is set |
 
 `--strict` makes `audit` and `preflight` exit `1` when the resolved state is not
 clean (problems, or unsatisfied required documents).
