@@ -6,7 +6,7 @@ use toml::Value;
 use crate::env::ResolvedRoots;
 use crate::model::{
     ConfigErrorLocation, ConfigLoadError, Context, DocumentEntry, LoadedCatalog, Scope,
-    ScopeCatalog, ValidationEntry, When,
+    ScopeCatalog, SkillPolicy, ValidationEntry, When,
 };
 use crate::predicate::parse_when;
 
@@ -24,6 +24,8 @@ const ALLOWED_DOCUMENT_FIELDS: [&str; 8] = [
 ];
 
 const ALLOWED_VALIDATION_FIELDS: [&str; 4] = ["context", "commands", "marker", "description"];
+
+const ALLOWED_SKILLS_FIELDS: [&str; 3] = ["enforce_name_prefix", "allowed_prefixes", "dir"];
 
 pub fn config_path_for_root(root: &Path) -> PathBuf {
     root.join(CONFIG_FILE_NAME)
@@ -71,6 +73,7 @@ pub fn load_scope_catalog(
     let parsed = parse_toml(&file_path, &raw)?;
     let documents = parse_documents(source_scope, &file_path, &parsed)?;
     let validations = parse_validations(&file_path, &parsed)?;
+    let skill_policy = parse_skill_policy(&file_path, &parsed)?;
 
     Ok(Some(ScopeCatalog {
         source_scope,
@@ -78,6 +81,7 @@ pub fn load_scope_catalog(
         file_path,
         documents,
         validations,
+        skill_policy,
     }))
 }
 
@@ -215,6 +219,141 @@ fn parse_validations(
     }
 
     Ok(validations)
+}
+
+fn parse_skill_policy(
+    file_path: &Path,
+    parsed: &Value,
+) -> Result<Option<SkillPolicy>, ConfigLoadError> {
+    let Some(root_table) = parsed.as_table() else {
+        return Ok(None);
+    };
+    let Some(value) = root_table.get("skills") else {
+        return Ok(None);
+    };
+    let Some(table) = value.as_table() else {
+        return Err(ConfigLoadError::validation_root(
+            file_path.to_path_buf(),
+            "skills",
+            "key `skills` must be a [skills] table",
+        ));
+    };
+
+    for key in table.keys() {
+        if !ALLOWED_SKILLS_FIELDS.contains(&key.as_str()) {
+            return Err(ConfigLoadError::validation_root(
+                file_path.to_path_buf(),
+                format!("skills.{key}"),
+                format!(
+                    "unsupported field `{key}`; allowed fields: {}",
+                    ALLOWED_SKILLS_FIELDS.join(", ")
+                ),
+            ));
+        }
+    }
+
+    let enforce_name_prefix = match table.get("enforce_name_prefix") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            ConfigLoadError::validation_root(
+                file_path.to_path_buf(),
+                "skills.enforce_name_prefix",
+                format!(
+                    "invalid type for `enforce_name_prefix`: expected boolean, found {}",
+                    value_type(value)
+                ),
+            )
+        })?,
+    };
+
+    let allowed_prefixes = match table.get("allowed_prefixes") {
+        None => SkillPolicy::default_prefixes(),
+        Some(value) => parse_allowed_prefixes(file_path, value)?,
+    };
+
+    let dir = match table.get("dir") {
+        None => SkillPolicy::DEFAULT_DIR.to_string(),
+        Some(value) => {
+            let Some(text) = value.as_str() else {
+                return Err(ConfigLoadError::validation_root(
+                    file_path.to_path_buf(),
+                    "skills.dir",
+                    format!(
+                        "invalid type for `dir`: expected string, found {}",
+                        value_type(value)
+                    ),
+                ));
+            };
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(ConfigLoadError::validation_root(
+                    file_path.to_path_buf(),
+                    "skills.dir",
+                    "`dir` cannot be empty",
+                ));
+            }
+            trimmed.to_string()
+        }
+    };
+
+    Ok(Some(SkillPolicy {
+        enforce_name_prefix,
+        allowed_prefixes,
+        dir,
+    }))
+}
+
+fn parse_allowed_prefixes(file_path: &Path, value: &Value) -> Result<Vec<String>, ConfigLoadError> {
+    let Some(array) = value.as_array() else {
+        return Err(ConfigLoadError::validation_root(
+            file_path.to_path_buf(),
+            "skills.allowed_prefixes",
+            format!(
+                "invalid type for `allowed_prefixes`: expected array of strings, found {}",
+                value_type(value)
+            ),
+        ));
+    };
+    if array.is_empty() {
+        return Err(ConfigLoadError::validation_root(
+            file_path.to_path_buf(),
+            "skills.allowed_prefixes",
+            "`allowed_prefixes` must list at least one prefix",
+        ));
+    }
+    let mut prefixes = Vec::with_capacity(array.len());
+    for item in array {
+        let Some(text) = item.as_str() else {
+            return Err(ConfigLoadError::validation_root(
+                file_path.to_path_buf(),
+                "skills.allowed_prefixes",
+                format!(
+                    "invalid prefix entry: expected string, found {}",
+                    value_type(item)
+                ),
+            ));
+        };
+        let prefix = text.trim();
+        if prefix.is_empty() {
+            return Err(ConfigLoadError::validation_root(
+                file_path.to_path_buf(),
+                "skills.allowed_prefixes",
+                "prefix entries cannot be empty",
+            ));
+        }
+        if !prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(ConfigLoadError::validation_root(
+                file_path.to_path_buf(),
+                "skills.allowed_prefixes",
+                format!("prefix `{prefix}` must be lowercase kebab-case ([a-z0-9-])"),
+            ));
+        }
+        prefixes.push(prefix.to_string());
+    }
+    Ok(prefixes)
 }
 
 fn validate_scope_for_source(

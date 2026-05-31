@@ -405,6 +405,17 @@ pub struct WiringCheck {
     pub detail: String,
 }
 
+/// A single skill-name check performed by `audit` when the project catalog
+/// opts in via `[skills] enforce_name_prefix`. Each immediate subdirectory of
+/// the configured skills directory is checked against the required prefixes.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillCheck {
+    /// The skill directory name (relative to the skills directory).
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditReport {
     pub schema_version: &'static str,
@@ -413,6 +424,8 @@ pub struct AuditReport {
     pub docs_home: PathBuf,
     pub project_path: PathBuf,
     pub wiring: Vec<WiringCheck>,
+    /// Skill-name prefix checks; empty unless the project catalog opts in.
+    pub skills: Vec<SkillCheck>,
     pub documents: Vec<ResolvedDocument>,
     pub problems: usize,
     pub suggested_actions: Vec<String>,
@@ -452,6 +465,58 @@ pub struct ValidationEntry {
     pub description: Option<String>,
 }
 
+/// Opt-in skill-name policy declared by a project catalog's `[skills]` table.
+///
+/// When `enforce_name_prefix` is true, `audit` flags every immediate
+/// subdirectory of `dir` whose name is not lowercase kebab-case starting with
+/// one of `allowed_prefixes` (followed by a hyphen and at least one more
+/// character). This mirrors the `create-project-skill` creation-time rule
+/// (`^(project|private)-[a-z0-9-]+`) so renamed repos stay compliant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkillPolicy {
+    pub enforce_name_prefix: bool,
+    /// Allowed name prefixes (each matched as `<prefix>-`). Defaults to
+    /// `["project", "private"]`.
+    pub allowed_prefixes: Vec<String>,
+    /// Skills directory relative to the project root. Defaults to
+    /// `.agents/skills`.
+    pub dir: String,
+}
+
+impl SkillPolicy {
+    pub const DEFAULT_DIR: &'static str = ".agents/skills";
+
+    pub fn default_prefixes() -> Vec<String> {
+        vec!["project".to_string(), "private".to_string()]
+    }
+
+    /// Whether a skill directory `name` satisfies the policy: lowercase
+    /// kebab-case (`[a-z0-9-]+`) starting with one of the allowed prefixes
+    /// followed by `-` and at least one further character.
+    pub fn name_is_valid(&self, name: &str) -> bool {
+        let kebab = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !kebab {
+            return false;
+        }
+        self.allowed_prefixes.iter().any(|prefix| {
+            let needle = format!("{prefix}-");
+            name.starts_with(&needle) && name.len() > needle.len()
+        })
+    }
+
+    /// Human-readable description of the required prefixes (for audit detail).
+    pub fn prefix_hint(&self) -> String {
+        self.allowed_prefixes
+            .iter()
+            .map(|prefix| format!("{prefix}-"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScopeCatalog {
     pub source_scope: Scope,
@@ -459,6 +524,8 @@ pub struct ScopeCatalog {
     pub file_path: PathBuf,
     pub documents: Vec<DocumentEntry>,
     pub validations: Vec<ValidationEntry>,
+    /// Opt-in skill-name policy; `None` when no `[skills]` table is declared.
+    pub skill_policy: Option<SkillPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]

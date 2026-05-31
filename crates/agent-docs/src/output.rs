@@ -182,6 +182,21 @@ fn render_audit_text(report: &AuditReport) -> String {
         ));
     }
 
+    // The skills section is omitted entirely when the project did not opt in,
+    // so audits in non-participating repos keep their previous output.
+    if !report.skills.is_empty() {
+        lines.push(String::new());
+        lines.push("skills:".to_string());
+        for check in &report.skills {
+            lines.push(format!(
+                "  [{}] {}: {}",
+                if check.ok { "ok" } else { "FAIL" },
+                check.name,
+                check.detail
+            ));
+        }
+    }
+
     lines.push(String::new());
     lines.push("documents:".to_string());
     if report.documents.is_empty() {
