@@ -79,6 +79,10 @@ pub fn command_supported(command: &Option<crate::cli::Command>) -> bool {
             &args.command,
             Some(PrCommand::View { .. } | PrCommand::Comments(_) | PrCommand::Checks(_))
         ),
+        // Activity owns its own provider seam and returns an activity-specific
+        // `provider_unsupported` for Local until a file-backed implementation
+        // exists.
+        Some(Command::Activity(_)) => true,
         _ => false,
     }
 }

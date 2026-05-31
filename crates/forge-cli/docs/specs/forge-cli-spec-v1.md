@@ -47,6 +47,9 @@ In scope (v1):
 
 - Personal work discovery: `inbox list`, `inbox status`, and
   `inbox next` across GitHub and GitLab.
+- Personal activity discovery: `activity commits`, `activity events`, and
+  `activity summary`. v1 ships GitHub only, with GitLab and local backends kept
+  as explicit provider seams for later expansion.
 - PR/MR lifecycle: `create`, `view`, `list`, `edit`, `comment`,
   `ready`, `merge`, `close`.
 - PR/MR checks: `pr checks` (one-shot snapshot) and `pr wait-checks`
@@ -122,6 +125,9 @@ Parity matrix (v1):
 | `inbox list`          | `gh search prs/issues --json …`                                 | `glab api --hostname <host> …`                       | normalized aggregation               |
 | `inbox status`        | same provider reads as `inbox list`                             | same provider reads as `inbox list`                  | bounded counts                       |
 | `inbox next`          | same provider reads as `inbox list`                             | same provider reads as `inbox list`                  | ranked bounded subset                |
+| `activity commits`    | `gh api search/commits`                                         | unsupported in v1                                    | GitHub-only seam                     |
+| `activity events`     | `gh api users/<login>/events[/public]`                          | unsupported in v1                                    | GitHub-only seam                     |
+| `activity summary`    | `gh api graphql` contribution query                             | unsupported in v1                                    | GitHub-only seam                     |
 | `pr deliver`          | macro: `pr create` → `pr wait-checks` → `pr ready` → `pr merge` | same composition with gitlab atoms                   | exact (same macro logic on both)     |
 
 "emulated" means the backend's native command differs in shape, but
@@ -159,6 +165,10 @@ forge-cli
 │   ├── comment
 │   ├── close
 │   └── reopen
+├── activity
+│   ├── commits
+│   ├── events
+│   └── summary
 ├── label
 │   ├── list
 │   ├── audit
@@ -234,6 +244,20 @@ Inbox-local flags:
   selected provider is VPN-unavailable or times out. Cache fallback is opt-in,
   age-bounded by `--cache-max-age` (default `30m`), and disabled with
   `--no-cache`.
+
+Activity-local flags:
+
+- `forge-cli activity commits --user <login|@me> --since <date-or-datetime>
+  --limit <n>` searches recent commits authored by the selected GitHub user.
+- `forge-cli activity events --user <login|@me> --public-only --limit <n>`
+  lists recent user events. Without `--public-only`, `@me` can use the
+  authenticated user's event endpoint.
+- `forge-cli activity summary --user <login|@me> --since <date-or-datetime>
+  --limit <n>` summarizes commit contributions by repository.
+- Activity limits are effective provider page sizes and are clamped to GitHub's
+  v1 per-page maximum of `100`.
+- `@me` resolves through `gh api user`; `--dry-run` includes both the identity
+  lookup and the data query under `data.plans[]`.
 
 Label-local flags:
 
@@ -445,6 +469,32 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `merge_method_unsupported` | 9                 |
 | `keep_branch_conflict`     | 10                |
 | `local_path_present`       | 11                |
+
+## Activity output contract
+
+`activity` is read-only and reports recent personal GitHub activity through the
+same workspace envelope used by the parity ops. GitLab and local providers
+return `provider_unsupported` in v1.
+
+- `activity commits` emits `cli.forge-cli.activity.commits.v1` with
+  `data.provider`, `data.host`, `data.user`, `data.since`, `data.limit`,
+  `data.item_count`, `data.limited`, and normalized `data.items[]`.
+- Commit items include `repo`, `sha`, `url`, `message`, `authored_at`,
+  `committed_at`, `author_name`, and `author_email`.
+- `activity events` emits `cli.forge-cli.activity.events.v1` with
+  `data.provider`, `data.host`, `data.user`, `data.public_only`,
+  `data.limit`, `data.item_count`, `data.limited`, and normalized
+  `data.items[]`.
+- Event items include `id`, `event_type`, `repo`, `actor`, `public`,
+  `created_at`, `summary`, and `url`.
+- `activity summary` emits `cli.forge-cli.activity.summary.v1` with
+  `data.provider`, `data.host`, `data.user`, `data.since`, `data.limit`,
+  `data.total_commit_contributions`, `data.repository_count`,
+  `data.limited`, and normalized `data.repositories[]`.
+- Summary repository rows include `repo`, `commit_contributions`, and
+  `latest_commit_at`.
+- `limited=true` means the returned row count reached the requested bound, so
+  more provider-side rows may exist.
 
 ## Inbox output contract
 

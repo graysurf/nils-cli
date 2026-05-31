@@ -2,6 +2,7 @@
 //! `tests/integration/`.
 
 mod integration {
+    mod activity;
     mod auth_status;
     mod cli;
     mod completion_sync;

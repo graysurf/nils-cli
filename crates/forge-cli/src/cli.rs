@@ -125,6 +125,8 @@ pub enum Command {
     Pr(PrArgs),
     /// Issue lifecycle.
     Issue(IssueArgs),
+    /// Personal activity across forge repositories.
+    Activity(ActivityArgs),
     /// Repository label catalog audit and ensure operations.
     Label(LabelArgs),
     /// Personal cross-repo work inbox.
@@ -147,6 +149,12 @@ pub struct PrArgs {
 pub struct IssueArgs {
     #[command(subcommand)]
     pub command: Option<IssueCommand>,
+}
+
+#[derive(Args, Debug)]
+pub struct ActivityArgs {
+    #[command(subcommand)]
+    pub command: Option<ActivityCommand>,
 }
 
 #[derive(Args, Debug)]
@@ -700,6 +708,59 @@ pub enum IssueCommand {
     },
 }
 
+/// `activity` subtree.
+#[derive(Subcommand, Debug)]
+pub enum ActivityCommand {
+    /// Search recent GitHub commits authored by a user.
+    Commits(ActivityCommitsArgs),
+    /// List recent GitHub user activity events.
+    Events(ActivityEventsArgs),
+    /// Summarize GitHub commit contributions by repository.
+    Summary(ActivitySummaryArgs),
+}
+
+/// `activity commits` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct ActivityCommitsArgs {
+    /// GitHub login to inspect. Use @me for the authenticated account.
+    #[arg(long, default_value = "@me", value_name = "LOGIN")]
+    pub user: String,
+    /// Only include commits authored at or after this date/datetime.
+    #[arg(long, value_name = "DATE_OR_DATETIME")]
+    pub since: Option<String>,
+    /// Cap the number of returned commits (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub limit: u32,
+}
+
+/// `activity events` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct ActivityEventsArgs {
+    /// GitHub login to inspect. Use @me for the authenticated account.
+    #[arg(long, default_value = "@me", value_name = "LOGIN")]
+    pub user: String,
+    /// Cap the number of returned events (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub limit: u32,
+    /// Use the public-events endpoint even for @me.
+    #[arg(long = "public-only", action = ArgAction::SetTrue)]
+    pub public_only: bool,
+}
+
+/// `activity summary` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct ActivitySummaryArgs {
+    /// GitHub login to inspect. Use @me for the authenticated account.
+    #[arg(long, default_value = "@me", value_name = "LOGIN")]
+    pub user: String,
+    /// Only count contributions at or after this date/datetime.
+    #[arg(long, value_name = "DATE_OR_DATETIME")]
+    pub since: Option<String>,
+    /// Maximum repositories to include in the summary (default: 25).
+    #[arg(long, default_value_t = 25)]
+    pub limit: u32,
+}
+
 /// `inbox` subtree.
 #[derive(Subcommand, Debug)]
 pub enum InboxCommand {
@@ -1012,6 +1073,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Issue(IssueArgs {
             command: Some(IssueCommand::Reopen { id }),
         })) => ops::issue_reopen::run(&global, id, format),
+        Some(Command::Activity(ActivityArgs {
+            command: Some(command),
+        })) => ops::activity::run(&global, command, format),
         Some(Command::Label(LabelArgs {
             command: Some(command),
         })) => ops::label::run(&global, command, format),
@@ -1024,6 +1088,7 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         | Some(Command::Repo(RepoArgs { command: None }))
         | Some(Command::Pr(PrArgs { command: None }))
         | Some(Command::Issue(IssueArgs { command: None }))
+        | Some(Command::Activity(ActivityArgs { command: None }))
         | Some(Command::Label(LabelArgs { command: None }))
         | Some(Command::Inbox(InboxArgs { command: None })) => {
             // No subcommand: print help and exit USAGE so callers don't
@@ -1303,6 +1368,72 @@ mod tests {
             };
             let result = parse(&argv);
             assert!(result.is_ok(), "issue {sub} should parse, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn lists_every_activity_v1_subcommand() {
+        for sub in ["commits", "events", "summary"] {
+            let result = parse(&["activity", sub]);
+            assert!(
+                result.is_ok(),
+                "activity {sub} should parse, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn activity_commits_parses_user_since_and_limit() {
+        let cli = parse(&[
+            "activity",
+            "commits",
+            "--user",
+            "alice",
+            "--since",
+            "2026-05-01",
+            "--limit",
+            "7",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Activity(ActivityArgs {
+                command: Some(ActivityCommand::Commits(args)),
+            })) => {
+                assert_eq!(args.user, "alice");
+                assert_eq!(args.since.as_deref(), Some("2026-05-01"));
+                assert_eq!(args.limit, 7);
+            }
+            other => panic!("expected activity commits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activity_events_parses_public_only() {
+        let cli = parse(&["activity", "events", "--public-only"]).expect("parse");
+        match cli.command {
+            Some(Command::Activity(ActivityArgs {
+                command: Some(ActivityCommand::Events(args)),
+            })) => {
+                assert_eq!(args.user, "@me");
+                assert_eq!(args.limit, 30);
+                assert!(args.public_only);
+            }
+            other => panic!("expected activity events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activity_summary_parses_defaults_and_limit() {
+        let cli = parse(&["activity", "summary", "--limit", "5"]).expect("parse");
+        match cli.command {
+            Some(Command::Activity(ActivityArgs {
+                command: Some(ActivityCommand::Summary(args)),
+            })) => {
+                assert_eq!(args.user, "@me");
+                assert_eq!(args.since, None);
+                assert_eq!(args.limit, 5);
+            }
+            other => panic!("expected activity summary, got {other:?}"),
         }
     }
 

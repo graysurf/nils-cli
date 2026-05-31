@@ -13,6 +13,7 @@ fn help_lists_every_top_level_subcommand() {
     for sub in [
         "pr",
         "issue",
+        "activity",
         "label",
         "inbox",
         "repo",
@@ -29,6 +30,39 @@ fn help_lists_every_top_level_subcommand() {
         !out.stdout.contains("--json"),
         "must not surface --json flag"
     );
+}
+
+#[test]
+fn activity_cli_help_lists_every_v1_subcommand() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(&stub, &["activity", "--help"]);
+    assert_eq!(out.code, 0);
+    for sub in ["commits", "events", "summary"] {
+        assert!(
+            out.stdout.contains(sub),
+            "activity --help missing {sub}: stdout={}",
+            out.stdout
+        );
+    }
+}
+
+#[test]
+fn activity_commits_help_describes_contract_inputs() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(&stub, &["activity", "commits", "--help"]);
+    assert_eq!(out.code, 0);
+    for expected in [
+        "Search recent GitHub commits authored by a user",
+        "GitHub login to inspect",
+        "DATE_OR_DATETIME",
+        "Only include commits authored at or after this date/datetime",
+    ] {
+        assert!(
+            out.stdout.contains(expected),
+            "activity commits --help missing {expected}: stdout={}",
+            out.stdout
+        );
+    }
 }
 
 #[test]
