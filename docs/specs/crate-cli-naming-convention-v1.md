@@ -45,7 +45,6 @@ crates MUST NOT rely on these patterns.
 
 | Crate dir | Package name | Binary name(s) | Reason |
 | --- | --- | --- | --- |
-| `agent-runtime-cli` | `agent-runtime-cli` | `agent-runtime` | Flagship umbrella binary |
 | `plan-issue-cli` | `nils-plan-issue-cli` | `plan-issue`, `plan-issue-local` | Published binaries drop `-cli` |
 | `nils-markdown` | `nils-markdown` | `md-render` | Published binary |
 | `agent-workflow-primitives` | `nils-agent-workflow-primitives` | multi-tool set (`agent-run`, `browser-session`, ...) | One crate, many primitive binaries |

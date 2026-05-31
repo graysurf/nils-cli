@@ -46,7 +46,6 @@ cd "$REPO_ROOT"
 # Package names that intentionally diverge from "nils-<dir>".
 pkg_exception() {
   case "$1" in
-    agent-runtime-cli) return 0 ;; # flagship binary crate (package: agent-runtime-cli)
     *) return 1 ;;
   esac
 }
@@ -55,7 +54,6 @@ pkg_exception() {
 # published binaries diverge from the "<bin> == <dir>" rule.
 allowed_bins_for() {
   case "$1" in
-    agent-runtime-cli) echo "agent-runtime" ;;
     plan-issue-cli) echo "plan-issue plan-issue-local" ;;
     nils-markdown) echo "md-render" ;;
     agent-workflow-primitives)
