@@ -18,13 +18,14 @@ use env::{PathOverrides, ResolvedRoots, resolve_roots};
 use model::{ConfigErrorKind, ConfigLoadError, Context, InitMode, ListReport};
 use output::{
     ExplainIntent, ExplainIntents, render_audit, render_explain_intent, render_explain_intents,
-    render_init, render_list, render_preflight, render_remove,
+    render_init, render_list, render_preflight, render_remove, render_undeclared_intent_error,
 };
 
 use nils_common::cli_contract::exit;
 
 const EXIT_OK: i32 = exit::SUCCESS;
 const EXIT_STRICT: i32 = exit::RUNTIME;
+const EXIT_DATA: i32 = exit::DATA;
 const EXIT_USAGE: i32 = exit::USAGE;
 const EXIT_CONFIG: i32 = 3;
 const EXIT_RUNTIME: i32 = 4;
@@ -93,14 +94,36 @@ fn dispatch(cli: Cli) -> i32 {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
-            let report =
-                match resolver::resolve_intent(&intent, &roots, args.strict, fallback_mode, true) {
-                    Ok(report) => report,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        return config_error_exit_code(&err);
-                    }
-                };
+            let catalog = match load_catalog_from_roots(&roots) {
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return config_error_exit_code(&err);
+                }
+            };
+            let report = resolver::resolve_intent_with_catalog(
+                &intent,
+                &roots,
+                args.strict,
+                fallback_mode,
+                true,
+                &catalog,
+            );
+            if args.require_declared_intent
+                && report.documents.is_empty()
+                && !report.validation.declared
+            {
+                let available_intents = resolver::declared_intents(&roots, fallback_mode, &catalog);
+                return print_failure_rendered(
+                    args.format,
+                    render_undeclared_intent_error(
+                        args.format,
+                        intent.as_str(),
+                        &available_intents,
+                    ),
+                    EXIT_DATA,
+                );
+            }
             let exit_code = if args.strict && report.has_unsatisfied_required() {
                 EXIT_STRICT
             } else {
@@ -257,6 +280,26 @@ fn print_rendered(rendered: anyhow::Result<String>, success_exit_code: i32) -> i
         Ok(body) => {
             println!("{body}");
             success_exit_code
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            EXIT_RUNTIME
+        }
+    }
+}
+
+fn print_failure_rendered(
+    format: model::OutputFormat,
+    rendered: anyhow::Result<String>,
+    failure_exit_code: i32,
+) -> i32 {
+    match rendered {
+        Ok(body) => {
+            match format {
+                model::OutputFormat::Json => println!("{body}"),
+                model::OutputFormat::Text => eprintln!("{body}"),
+            }
+            failure_exit_code
         }
         Err(err) => {
             eprintln!("error: {err:#}");

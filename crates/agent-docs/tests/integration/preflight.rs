@@ -77,3 +77,151 @@ fn preflight_unknown_intent_resolves_empty() {
     assert_eq!(json["documents"].as_array().unwrap().len(), 0);
     assert_eq!(json["validation"]["declared"], false);
 }
+
+#[test]
+fn preflight_require_declared_intent_rejects_unknown_text() {
+    let env = env_with_contract();
+    let out = env.run(&[
+        "preflight",
+        "--intent",
+        "no-such-intent",
+        "--require-declared-intent",
+    ]);
+
+    assert_eq!(
+        out.code, 65,
+        "stdout:\n{}\nstderr:\n{}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout.trim().is_empty(),
+        "text failures should not write stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stderr
+            .contains("error: undeclared intent `no-such-intent`"),
+        "stderr should name the undeclared intent: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("available intents: project-dev"),
+        "stderr should list available intents: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn preflight_require_declared_intent_rejects_unknown_json() {
+    let env = env_with_contract();
+    let out = env.run(&[
+        "preflight",
+        "--intent",
+        "no-such-intent",
+        "--require-declared-intent",
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(
+        out.code, 65,
+        "stdout:\n{}\nstderr:\n{}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stderr.trim().is_empty(),
+        "json failures should not write stderr: {}",
+        out.stderr
+    );
+    let json = out.json();
+    assert_eq!(json["schema_version"], "cli.agent-docs.preflight.v1");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "undeclared-intent");
+    assert_eq!(json["error"]["details"]["intent"], "no-such-intent");
+    assert!(
+        json["error"]["details"]["available_intents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "project-dev"),
+        "available intents should include project-dev: {}",
+        out.stdout
+    );
+}
+
+#[test]
+fn preflight_require_declared_intent_accepts_optional_or_skipped_doc_intent() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"optional-tools\"\nscope = \"project\"\npath = \"OPTIONAL.md\"\nrequired = false\nwhen = \"path-exists:missing-marker\"\n",
+    );
+
+    let out = env.run(&[
+        "preflight",
+        "--intent",
+        "optional-tools",
+        "--require-declared-intent",
+        "--format",
+        "json",
+    ]);
+
+    assert!(out.success(), "stderr: {}", out.stderr);
+    let json = out.json();
+    assert_eq!(json["intent"], "optional-tools");
+    assert_eq!(json["documents"].as_array().unwrap().len(), 1);
+    assert_eq!(json["documents"][0]["required"], false);
+    assert_eq!(json["documents"][0]["when_satisfied"], false);
+}
+
+#[test]
+fn preflight_require_declared_intent_accepts_validation_only_intent() {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        "[[validation]]\ncontext = \"release-check\"\ncommands = [\"cargo test -p nils-agent-docs\"]\n",
+    );
+
+    let out = env.run(&[
+        "preflight",
+        "--intent",
+        "release-check",
+        "--require-declared-intent",
+        "--format",
+        "json",
+    ]);
+
+    assert!(out.success(), "stderr: {}", out.stderr);
+    let json = out.json();
+    assert_eq!(json["documents"].as_array().unwrap().len(), 0);
+    assert_eq!(json["validation"]["declared"], true);
+    assert_eq!(
+        json["validation"]["commands"][0],
+        "cargo test -p nils-agent-docs"
+    );
+}
+
+#[test]
+fn preflight_require_declared_intent_preserves_strict_required_doc_failure() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\n",
+    );
+
+    let out = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--require-declared-intent",
+        "--strict",
+    ]);
+
+    assert_eq!(
+        out.code, 1,
+        "stdout:\n{}\nstderr:\n{}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout.contains("PREFLIGHT: intent=project-dev"),
+        "strict required-doc failures still render the preflight report: {}",
+        out.stdout
+    );
+}
