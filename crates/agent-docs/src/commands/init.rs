@@ -152,6 +152,11 @@ const STUB_HEADER: &str = "\
 # marker      = \"target/.agent-validation-ok\" # optional finish-line marker
 # description = \"Run the full check stack before delivery.\"
 #
+# [skills]                              # optional: opt in to skill-name linting
+# enforce_name_prefix = true           # audit flags non-conforming skill dirs
+# allowed_prefixes    = [\"project\", \"private\"] # default; matched as \"<prefix>-\"
+# dir                 = \".agents/skills\"       # default skills directory
+#
 # `when` grammar: `path-exists:<glob>` atoms composed with `||` and `&&`
 # (`&&` binds tighter). Globs support `*`, `?`, `[...]`, and `**`.
 ";

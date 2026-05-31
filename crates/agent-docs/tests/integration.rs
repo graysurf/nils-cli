@@ -30,6 +30,8 @@ mod init;
 mod preflight;
 #[path = "integration/resolution.rs"]
 mod resolution;
+#[path = "integration/skill_policy.rs"]
+mod skill_policy;
 #[path = "integration/when_predicate.rs"]
 mod when_predicate;
 #[path = "integration/worktree.rs"]
