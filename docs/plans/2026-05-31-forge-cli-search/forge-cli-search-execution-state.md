@@ -3,27 +3,30 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: decisions settled; not yet implemented. This bundle is prepared so
-  `create-plan-tracking-issue` can open the tracker with a populated ledger.
+- Status: complete; tracking issue #716 closed on 2026-05-31 after merged
+  PRs #722 and #723 and the v0.31.7 release.
 - Target scope: `crates/forge-cli` (`nils-forge-cli`) `search` surface in
   `sympoies/nils-cli` — top-level `search issues` / `search prs` (full-text,
   B) + `search refs-to` (cross-reference, A), GitHub-only behind the provider
   seam, single-repo.
 - Execution window: Sprint 1 (`search` subtree + seam + GitHub full-text,
-  PR1) → Sprint 2 (`search refs-to` + docs + delivery, PR2), serial.
-- Current task: Task 1.1 — not started.
-- Next task: Task 1.1 — `search` CLI subtree and provider seam.
+  PR1) -> Sprint 2 (`search refs-to` + docs + delivery, PR2), completed
+  serially.
+- Current task: complete.
+- Next task: archive the closed plan bundle.
 - Last updated: 2026-05-31
-- Branch/commit/PR: authored on `feat/forge-cli-search` (worktree
-  `~/Project/sympoies/nils-cli-wt/forge-cli-search`); no implementation commits
-  yet; no PR opened.
+- Branch/commit/PR: delivered through PR sympoies/nils-cli#722
+  (`b6121ad`) and PR sympoies/nils-cli#723 (`4506b3c`); released as
+  nils-cli v0.31.7.
 - Source document: docs/plans/2026-05-31-forge-cli-search/forge-cli-search-plan.md
 - Direct source-doc execution waiver: not applicable
-- Tracking issue: not yet opened
-- Source snapshot: to be posted by `create-plan-tracking-issue` at issue open
-- Plan snapshot: to be posted by `create-plan-tracking-issue` at issue open
-- Initial state snapshot: to be posted by `create-plan-tracking-issue` at issue
-  open
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/716>
+- Source snapshot:
+  <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4586133498>
+- Plan snapshot:
+  <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4586133560>
+- Initial state snapshot:
+  <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4587045156>
 
 ## Validation Plan
 
@@ -49,7 +52,7 @@
 | 1.1 | done | `search` CLI subtree (`issues` / `prs`) + provider seam | PR sympoies/nils-cli#722 (merged b6121ad); cargo test -p nils-forge-cli green, local-fast passed | No deps. Add `Search` command + arg structs in `cli.rs`, dispatch in `lib.rs`; GitLab / Local → structured `provider_unsupported` (explicit, not silent). PR1. |
 | 1.2 | done | GitHub `search issues` / `search prs` ops (B) | PR sympoies/nils-cli#722 (merged b6121ad); search.issues.v1/search.prs.v1 envelopes + golden integration tests | Depends on 1.1. Shared `SearchItem`; `gh search <kind> <query> --repo --match title,body,comments --limit --json`; normalized + versioned envelope; `--dry-run` argv parity; single-repo via `push_repo_override`. PR1 with 1.1. |
 | 2.1 | done | GitHub `search refs-to <ref>` op (A) | Sprint 2 / PR2: search refs-to graphql op (CROSS_REFERENCED_EVENT), ref parsing (URL/owner-name#n/#n/n), unit + golden integration tests | Depends on 1.1, 1.2. Parse URL / `owner/name#n` / `#n`; `gh api graphql` CROSS_REFERENCED_EVENT; normalize referencing sources to `SearchItem`; versioned envelope; GitHub-only. PR2. |
-| 2.2 | in-progress | Docs, `--help` / completion snapshot, and release | Sprint 2 / PR2: forge-cli-spec-v1.md Search output contract + forge-cli-ops-v1.yaml search ops + README + list/search/inbox role split in help + regenerated completion snapshot; release + tap bump pending | Depends on 2.1. Document the three envelopes in `forge-cli-spec-v1.md` / `forge-cli-ops-v1.yaml` and the `list` vs `search` vs `inbox` role split; golden fixtures; PR self-gated via `gh pr checks`; release + tap bump. |
+| 2.2 | done | Docs, `--help` / completion snapshot, and release | PR sympoies/nils-cli#723 merged `4506b3c`; closeout linked release v0.31.7 (#724, tag v0.31.7). | Depends on 2.1. Documented the three envelopes in `forge-cli-spec-v1.md` / `forge-cli-ops-v1.yaml` and the `list` vs `search` vs `inbox` role split; golden fixtures; PR self-gated via `gh pr checks`; release + tap bump completed. |
 
 ## Session Log
 
@@ -70,17 +73,33 @@
   implementation started; this state is prepared so `create-plan-tracking-issue`
   can open the tracker. Authored in an isolated worktree off `main` to avoid
   disturbing the shared `nils-cli` checkout.
+- 2026-05-31: Tracking issue #716 was completed and closed. Lifecycle audit
+  found source, plan, state, session, validation, review, and closeout records
+  visible and complete. Delivery landed through PR #722 and PR #723, followed
+  by release v0.31.7.
 
 ## Validation
 
 | Command | Status | Summary | Artifact |
 | --- | --- | --- | --- |
-| `cargo test -p nils-forge-cli` | pending | Not run; no implementation yet. | — |
-| `cargo clippy -p nils-forge-cli --all-targets -- -D warnings` | pending | Not run; no implementation yet. | — |
-| `cargo fmt -p nils-forge-cli -- --check` | pending | Not run; no implementation yet. | — |
-| `--help` / completion snapshot | pending | Not run; no implementation yet. | — |
-| `rumdl check` (this bundle) | pending | To run on the authored Markdown before delivery. | — |
-| `gh pr checks` | pending | No PR yet. | — |
+| `cargo test -p nils-forge-cli` | pass | Covered by PR #722 / #723 validation and issue #716 validation record. | <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4586929592> |
+| `cargo clippy -p nils-forge-cli --all-targets -- -D warnings` | pass | Covered by PR #722 / #723 validation and issue #716 validation record. | <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4586929592> |
+| `cargo fmt -p nils-forge-cli -- --check` | pass | Covered by local-fast validation and merged PR checks. | <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4586929592> |
+| `--help` / completion snapshot | pass | Search help/completion surfaces were updated and merged in PR #723. | <https://github.com/sympoies/nils-cli/pull/723> |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Issue #716 validation record shows the local-fast gate passed. | <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4586929592> |
+| `gh pr checks` | pass | Closeout records PR #722 and PR #723 checks as passing. | <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4587049026> |
+
+## Closeout
+
+- Status: complete.
+- Closed issue:
+  <https://github.com/sympoies/nils-cli/issues/716>
+- Closeout comment:
+  <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4587049026>
+- Review decision: approve at
+  <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4587045211>.
+- Final validation:
+  <https://github.com/sympoies/nils-cli/issues/716#issuecomment-4586929592>.
 
 ## Notes
 

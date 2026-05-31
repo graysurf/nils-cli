@@ -3,29 +3,30 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: Sprint 1 implemented and locally validated in `sympoies/nils-cli`;
-  Sprint 2 remains pending behind the Phase 1 release/Homebrew rollout gate.
+- Status: complete; tracking issue #712 closed on 2026-05-31 after nils-cli
+  PR #715, agent-runtime-kit PR #213, and release v0.31.5 shipped.
 - Target scope: Phase 1 — `crates/git-cli` (`nils-git-cli`) `worktree` surface
   in `sympoies/nils-cli`; Phase 2 — `block-direct-git-worktree` hook +
   `AGENT_HOME.md` policy in `graysurf/agent-runtime-kit`. Cross-repo; the
   tracking issue lives in `sympoies/nils-cli`.
 - Execution window: Sprint 1 (`worktree add|list|remove|prune` + convention +
-  removal consolidation + docs, PR1, nils-cli) → Sprint 2 (hook ban + policy +
-  heuristic promotion, PR2, agent-runtime-kit), serial; Sprint 2 enables
-  globally only after Sprint 1 ships and is brew-upgraded.
-- Current task: PR1 delivery for Sprint 1.
-- Next task: Phase 1 release + Homebrew tap bump, then Sprint 2
-  `agent-runtime-kit` hook/policy work.
+  removal consolidation + docs, PR1, nils-cli) -> Sprint 2 (hook ban + policy +
+  heuristic promotion, PR2, agent-runtime-kit), completed serially.
+- Current task: complete.
+- Next task: archive the closed plan bundle.
 - Last updated: 2026-05-31
-- Branch/commit/PR: implementation on `feat/git-cli-worktree-surface`
-  (worktree `~/Project/sympoies/nils-cli-wt/git-cli-worktree-surface`);
-  no PR opened yet.
+- Branch/commit/PR: delivered through PR sympoies/nils-cli#715
+  (`29e490c`) and PR graysurf/agent-runtime-kit#213 (`83de974`);
+  released as nils-cli v0.31.5.
 - Source document: docs/plans/2026-05-31-git-cli-worktree-surface/git-cli-worktree-surface-plan.md
 - Direct source-doc execution waiver: not applicable
 - Tracking issue: <https://github.com/sympoies/nils-cli/issues/712>
-- Source snapshot: posted on the tracking issue
-- Plan snapshot: posted on the tracking issue
-- Initial state snapshot: posted on the tracking issue
+- Source snapshot:
+  <https://github.com/sympoies/nils-cli/issues/712#issuecomment-4585976468>
+- Plan snapshot:
+  <https://github.com/sympoies/nils-cli/issues/712#issuecomment-4585976506>
+- Initial state snapshot:
+  <https://github.com/sympoies/nils-cli/issues/712#issuecomment-4586270506>
 
 ## Validation Plan
 
@@ -54,8 +55,8 @@
 | 1.1 | done | `worktree` CLI subtree + deterministic path convention | Added git-cli worktree add/list/remove/prune with deterministic AGENT_HOME worktree paths; validated by cargo test -p nils-git-cli worktree_ and local-fast. | Implemented in nils-cli PR1; Phase 2 hook remains gated. |
 | 1.2 | done | `remove` / `prune` + consolidate worktree-removal into one helper | Shared worktree porcelain parsing/removal via git-cli worktree helpers and branch cleanup --remove-worktrees reuse; validated by cargo test -p nils-git-cli worktree_ and cargo test -p nils-git-cli. | plan-issue cleanup-worktrees remains separate by documented issue-root convention. |
 | 1.3 | done | JSON contract, completion, and crate docs | Added JSON envelopes, completion coverage, README updates, and crate-local worktree convention spec; validated by completion syntax checks and local-fast. | Generated completion adapters unchanged; completion export coverage verifies the worktree subcommands. |
-| 2.1 | todo | `block-direct-git-worktree` hook with override escape hatch | — | Depends on Sprint 1 shipped + brew-upgraded. Mirror `block-direct-git-commit.py`; block mutating `worktree` ops, allow read-only `list`; `ALLOW_DIRECT_GIT_WORKTREE=1` override; register in `settings.hooks.jsonc` + `link-map.yaml`. PR2, agent-runtime-kit. |
-| 2.2 | todo | `AGENTS.md` / `AGENT_HOME.md` policy + namespace reconciliation + heuristic promotion | — | Depends on 2.1. Policy clause + convention doc; reconcile "`$AGENT_HOME` artifacts only" note for `worktrees/`; promote/close `worktree-unsigned-commit-config-drift` (criterion c) via `heuristic-inbox` or record why it stays open. PR2. |
+| 2.1 | done | `block-direct-git-worktree` hook with override escape hatch | PR graysurf/agent-runtime-kit#213 merged `83de974`; validation record shows `bash tests/hooks/run.sh` passed. | Depends on Sprint 1 shipped + brew-upgraded. Mirrored `block-direct-git-commit.py`; blocks mutating `worktree` ops, allows read-only `list`; includes `ALLOW_DIRECT_GIT_WORKTREE=1` override; registered in `settings.hooks.jsonc` + `link-map.yaml`. |
+| 2.2 | done | `AGENTS.md` / `AGENT_HOME.md` policy + namespace reconciliation + heuristic promotion | PR graysurf/agent-runtime-kit#213 merged `83de974`; closeout records release v0.31.5 and hook/policy rollout complete. | Depends on 2.1. Policy clause + convention doc; reconciled "`$AGENT_HOME` artifacts only" note for `worktrees/`; heuristic retention handled during closeout. |
 
 ## Session Log
 
@@ -84,6 +85,10 @@
   implementation started; this state is prepared so `create-plan-tracking-issue`
   can open the tracker. Authored in an isolated worktree off `main` to avoid
   disturbing the shared `nils-cli` checkout.
+- 2026-05-31: Tracking issue #712 was completed and closed. Lifecycle audit
+  found source, plan, state, session, validation, review, and closeout records
+  visible and complete. Delivery landed through PR #715 in nils-cli and
+  graysurf/agent-runtime-kit#213, followed by nils-cli release v0.31.5.
 
 ## Validation
 
@@ -95,8 +100,20 @@
 | `cargo fmt -p nils-git-cli -- --check` | pass | Crate-specific formatting gate passed. | local |
 | `zsh -n completions/zsh/_git-cli` / `bash -n completions/bash/git-cli` | pass | Existing generated completion adapters remain syntactically valid. | local |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Docs audits, third-party artifact audit, workspace fmt/clippy, 4444 nextest tests, and doctests passed. | local |
-| `gh pr checks` | pending | No PR yet. | — |
-| hook block/allow/override fixture (Sprint 2) | pending | Not run; agent-runtime-kit work not started. | — |
+| `gh pr checks` | pass | Closeout records PR #715 and PR #213 checks as passing. | <https://github.com/sympoies/nils-cli/issues/712#issuecomment-4586272231> |
+| hook block/allow/override fixture (Sprint 2) | pass | Sprint 2 validation passed via agent-runtime-kit hook tests. | <https://github.com/graysurf/agent-runtime-kit/pull/213> |
+
+## Closeout
+
+- Status: complete.
+- Closed issue:
+  <https://github.com/sympoies/nils-cli/issues/712>
+- Closeout comment:
+  <https://github.com/sympoies/nils-cli/issues/712#issuecomment-4586272231>
+- Review decision: approve at
+  <https://github.com/sympoies/nils-cli/issues/712#issuecomment-4586270627>.
+- Final validation:
+  <https://github.com/sympoies/nils-cli/issues/712#issuecomment-4586270587>.
 
 ## Notes
 
