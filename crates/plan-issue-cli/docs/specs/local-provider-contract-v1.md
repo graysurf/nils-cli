@@ -337,3 +337,36 @@ checkpoints. Half A is conformance-tested for behaviour against
 for *shape*, not behaviour. The fake earns trust only by satisfying the same
 contract suite as the real adapters — local is a **complement** to real-provider
 e2e, never a replacement.
+
+## Conformance Scenario Subset
+
+The cross-provider conformance harness lives at
+`crates/forge-cli/tests/integration/conformance.rs`. Every arm runs the real
+`forge-cli` binary end to end: `local` against a hermetic temp store (the real
+`LocalRunner`), `github` / `gitlab` against `gh` / `glab` stub scripts wired via
+`FORGE_CLI_GH_BIN` / `FORGE_CLI_GLAB_BIN` that echo the JSON the real provider
+returns for the equivalent state. Each arm therefore exercises its full
+pipeline (`build_*_call` → runner → `parse_*_output` → envelope).
+
+The harness asserts conformance on the **observable** envelope after stripping
+the fields that differ *by design*: `provider`, `url` (scheme/host), and a
+comment's `url` / `author` / `created_at`. The issue comment timeline is
+reduced to its ordered bodies. `assignees` are held empty across the subset
+because the local store does not model assignees (a documented boundary, not a
+silent gap).
+
+| Scenario | Op | Half | Asserted invariant |
+| --- | --- | --- | --- |
+| `issue view` open | `issue view` | A behaviour | `{number, state, title, body, labels, assignees}` identical |
+| `issue view` closed | `issue close` then `issue view` | A behaviour | normalized `state == closed`, rest identical |
+| `issue view --with-comments` | comment ×2 then view | A behaviour | ordered comment bodies identical |
+| `issue list` label filter | `issue list --label` (single + AND-pair) | A behaviour | row set `{number, state, title, labels}` identical |
+| `issue list` empty | `issue list` (no match) | A behaviour | empty item set on all three |
+| `pr view` seeded merged | `pr view` | B shape | same schema + `data` key set; seeded `state == merged`, `merge_commit_sha`, `number` match |
+| `pr checks` seeded success | `pr checks` | B shape | same schema + `data` key set; seeded `state == success` |
+
+A negative-control test feeds the `github` arm a drifted title and asserts the
+observable diverges, so the equality assertions cannot pass vacuously. Half B is
+shape-only by design: the local PR half is seeded, so `title` / `head` / `base`
+legitimately differ from the canned real-provider values and are excluded from
+the value comparison.
