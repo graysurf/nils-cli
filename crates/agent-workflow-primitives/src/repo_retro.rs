@@ -183,6 +183,8 @@ struct ReportArgs {
     write: bool,
     #[arg(long = "path-class-config", value_hint = ValueHint::FilePath, help = "Optional JSON file overriding path-class assignment: {\"<class>\": [\"<path-prefix>\", ...]}")]
     path_class_config: Option<PathBuf>,
+    #[arg(long = "heuristic-root", value_hint = ValueHint::DirPath, help = "Explicit heuristic-system root directory, overriding auto-discovery of heuristic-system / core/policies/heuristic-system")]
+    heuristic_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -585,7 +587,8 @@ fn build_report(args: &ReportArgs) -> Result<RepoRetroReport, CliError> {
     if commits.is_empty() {
         warnings.push("selected window has no commits".to_string());
     }
-    let heuristic_system = summarize_heuristic_system(&repo, &window, &mut sources)?;
+    let heuristic_system =
+        summarize_heuristic_system(&repo, args.heuristic_root.as_deref(), &window, &mut sources)?;
     let optional_inputs = load_optional_inputs(args)?;
     for (label, summary) in &optional_inputs {
         if summary.malformed_lines > 0 {
@@ -1260,14 +1263,30 @@ fn path_class_label(class: PathClass) -> &'static str {
     }
 }
 
+/// Heuristic-system inbox and operation records are process artifacts wherever
+/// the heuristic-system root lives — at the repo top level or nested under
+/// `core/policies/`. Match the canonical sub-path on a path boundary so it is
+/// classified regardless of the enclosing prefix.
+fn is_heuristic_process_path(path: &str) -> bool {
+    const MARKERS: [&str; 2] = [
+        "heuristic-system/error-inbox/",
+        "heuristic-system/operation-records/",
+    ];
+    MARKERS.iter().any(|marker| {
+        path.starts_with(marker)
+            || path
+                .find(marker)
+                .is_some_and(|idx| idx > 0 && path.as_bytes()[idx - 1] == b'/')
+    })
+}
+
 /// Built-in default classification. Absent any convention (no `docs/plans`,
 /// no `docs`), a repo simply yields `source`/`tests` and empty doc classes —
 /// never a misclassification.
 fn default_path_class(path: &str) -> PathClass {
     if path.starts_with("docs/plans/")
         || path.starts_with("docs/discussions/")
-        || path.starts_with("heuristic-system/error-inbox/")
-        || path.starts_with("heuristic-system/operation-records/")
+        || is_heuristic_process_path(path)
     {
         return PathClass::ProcessArtifacts;
     }
@@ -1430,13 +1449,54 @@ fn subject_is_archival(subject: &str) -> bool {
         .is_match(subject)
 }
 
+/// Resolved heuristic-system root: the absolute directory plus its repo-relative
+/// prefix. `rel` scopes the `git log` pathspecs; it is `None` only when an
+/// explicit override resolves outside the repository, in which case git-history
+/// movement is skipped but the on-disk inbox is still summarized.
+struct HeuristicRoot {
+    abs: PathBuf,
+    rel: Option<String>,
+}
+
+/// Discover the heuristic-system root. An explicit `--heuristic-root` override
+/// wins (relative paths resolve against `repo`); otherwise probe the canonical
+/// top-level `heuristic-system/` then the agent-runtime-kit `core/policies/`
+/// location. Returns `None` when no candidate exists on disk.
+fn resolve_heuristic_root(repo: &Path, override_root: Option<&Path>) -> Option<HeuristicRoot> {
+    if let Some(override_root) = override_root {
+        let abs = if override_root.is_absolute() {
+            override_root.to_path_buf()
+        } else {
+            repo.join(override_root)
+        };
+        if !abs.exists() {
+            return None;
+        }
+        let rel = abs
+            .strip_prefix(repo)
+            .ok()
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"));
+        return Some(HeuristicRoot { abs, rel });
+    }
+    for candidate in ["heuristic-system", "core/policies/heuristic-system"] {
+        let abs = repo.join(candidate);
+        if abs.exists() {
+            return Some(HeuristicRoot {
+                abs,
+                rel: Some(candidate.to_string()),
+            });
+        }
+    }
+    None
+}
+
 fn summarize_heuristic_system(
     repo: &Path,
+    override_root: Option<&Path>,
     window: &Window,
     sources: &mut Vec<SourceCommand>,
 ) -> Result<HeuristicSystemReport, CliError> {
-    let root = repo.join("heuristic-system");
-    if !root.exists() {
+    let Some(root) = resolve_heuristic_root(repo, override_root) else {
         return Ok(HeuristicSystemReport {
             state: "not_present".to_string(),
             active_inbox: empty_active_inbox(),
@@ -1448,11 +1508,16 @@ fn summarize_heuristic_system(
             },
             boundary: "read_only".to_string(),
         });
-    }
-    let error_events = collect_name_status(repo, window, "heuristic-system/error-inbox", sources)?;
-    let operation_events =
-        collect_name_status(repo, window, "heuristic-system/operation-records", sources)?;
-    let active_inbox = active_inbox_summary(repo, &window.end);
+    };
+    // `git log` pathspecs only resolve when the root sits inside the repo.
+    let (error_events, operation_events) = match root.rel.as_deref() {
+        Some(rel) => (
+            collect_name_status(repo, window, &format!("{rel}/error-inbox"), sources)?,
+            collect_name_status(repo, window, &format!("{rel}/operation-records"), sources)?,
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    let active_inbox = active_inbox_summary(repo, &root.abs.join("error-inbox"), &window.end);
     let aging = summarize_heuristic_aging(&active_inbox);
     Ok(HeuristicSystemReport {
         state: "present".to_string(),
@@ -1474,8 +1539,7 @@ fn empty_active_inbox() -> ActiveInboxSummary {
     }
 }
 
-fn active_inbox_summary(repo: &Path, window_end: &str) -> ActiveInboxSummary {
-    let inbox = repo.join("heuristic-system").join("error-inbox");
+fn active_inbox_summary(repo: &Path, inbox: &Path, window_end: &str) -> ActiveInboxSummary {
     if !inbox.exists() {
         return empty_active_inbox();
     }
@@ -1483,35 +1547,27 @@ fn active_inbox_summary(repo: &Path, window_end: &str) -> ActiveInboxSummary {
     let mut by_status = BTreeMap::new();
     let mut by_severity = BTreeMap::new();
     let mut entries = Vec::new();
-    if let Ok(read_dir) = fs::read_dir(&inbox) {
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if path.file_name().and_then(|name| name.to_str()) == Some("README.md")
-                || path.extension().and_then(|ext| ext.to_str()) != Some("md")
-            {
-                continue;
-            }
-            let fields = extract_inbox_fields(&path);
-            *by_status.entry(fields.status.clone()).or_insert(0) += 1;
-            *by_severity.entry(fields.severity.clone()).or_insert(0) += 1;
-            let age_days = fields
-                .first_observed
-                .as_deref()
-                .and_then(|value| parse_iso_date(value, "first observed").ok())
-                .and_then(|observed| {
-                    end_date.map(|end| end.to_julian_day() - observed.to_julian_day())
-                });
-            entries.push(InboxEntry {
-                path: path
-                    .strip_prefix(repo)
-                    .map(|path| path.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| path.display().to_string()),
-                status: fields.status,
-                severity: fields.severity,
-                first_observed: fields.first_observed,
-                age_days: age_days.map(i64::from),
+    for path in collect_inbox_entry_files(inbox) {
+        let fields = extract_inbox_fields(&path);
+        *by_status.entry(fields.status.clone()).or_insert(0) += 1;
+        *by_severity.entry(fields.severity.clone()).or_insert(0) += 1;
+        let age_days = fields
+            .first_observed
+            .as_deref()
+            .and_then(|value| parse_iso_date(value, "first observed").ok())
+            .and_then(|observed| {
+                end_date.map(|end| end.to_julian_day() - observed.to_julian_day())
             });
-        }
+        entries.push(InboxEntry {
+            path: path
+                .strip_prefix(repo)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.display().to_string()),
+            status: fields.status,
+            severity: fields.severity,
+            first_observed: fields.first_observed,
+            age_days: age_days.map(i64::from),
+        });
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     ActiveInboxSummary {
@@ -1521,6 +1577,38 @@ fn active_inbox_summary(repo: &Path, window_end: &str) -> ActiveInboxSummary {
         by_severity,
         entries,
     }
+}
+
+/// Collect active inbox entry files, supporting both on-disk layouts:
+/// - flat files: `error-inbox/<name>.md`
+/// - nested case folders: `error-inbox/<slug>/ENTRY.md`
+///
+/// The `archive/` subtree (resolved cases) and the `README.md` index are
+/// excluded, and only `ENTRY.md` is read from a case folder so sibling
+/// `evidence/*.md` files are never miscounted as entries.
+fn collect_inbox_entry_files(inbox: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(read_dir) = fs::read_dir(inbox) else {
+        return files;
+    };
+    for child in read_dir.flatten() {
+        let path = child.path();
+        let name = path.file_name().and_then(|name| name.to_str());
+        if name == Some("archive") {
+            continue;
+        }
+        if path.is_dir() {
+            let entry = path.join("ENTRY.md");
+            if entry.is_file() {
+                files.push(entry);
+            }
+        } else if name != Some("README.md")
+            && path.extension().and_then(|ext| ext.to_str()) == Some("md")
+        {
+            files.push(path);
+        }
+    }
+    files
 }
 
 struct InboxFields {
@@ -2704,6 +2792,21 @@ mod tests {
             classifier.classify("heuristic-system/error-inbox/z/ENTRY.md"),
             PathClass::ProcessArtifacts
         );
+        // The heuristic-system root nested under `core/policies/` (the real
+        // agent-runtime-kit layout) still classifies as a process artifact.
+        assert_eq!(
+            classifier.classify("core/policies/heuristic-system/error-inbox/z/ENTRY.md"),
+            PathClass::ProcessArtifacts
+        );
+        assert_eq!(
+            classifier.classify("core/policies/heuristic-system/operation-records/r/ENTRY.md"),
+            PathClass::ProcessArtifacts
+        );
+        // A coincidental substring that is not on a path boundary stays source.
+        assert_eq!(
+            classifier.classify("crates/x/src/not-heuristic-system/error-inbox/mod.rs"),
+            PathClass::Source
+        );
         assert_eq!(
             classifier.classify("crates/x/src/lib.rs"),
             PathClass::Source
@@ -2752,6 +2855,67 @@ mod tests {
             classifier.classify("docs/plans/x.md"),
             PathClass::ProcessArtifacts
         );
+    }
+
+    #[test]
+    fn resolve_heuristic_root_probes_canonical_then_core_policies() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path();
+        // No heuristic-system anywhere -> None.
+        assert!(resolve_heuristic_root(repo, None).is_none());
+        // The core/policies layout is discovered when the top-level dir is absent.
+        std::fs::create_dir_all(repo.join("core/policies/heuristic-system")).expect("mkdir core");
+        let resolved = resolve_heuristic_root(repo, None).expect("core/policies root");
+        assert_eq!(
+            resolved.rel.as_deref(),
+            Some("core/policies/heuristic-system")
+        );
+        assert_eq!(resolved.abs, repo.join("core/policies/heuristic-system"));
+        // The top-level heuristic-system dir wins over the core/policies fallback.
+        std::fs::create_dir_all(repo.join("heuristic-system")).expect("mkdir top");
+        let resolved = resolve_heuristic_root(repo, None).expect("top-level root");
+        assert_eq!(resolved.rel.as_deref(), Some("heuristic-system"));
+    }
+
+    #[test]
+    fn resolve_heuristic_root_honors_explicit_override() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path();
+        std::fs::create_dir_all(repo.join("heuristic-system")).expect("mkdir top");
+        // A missing override resolves to None rather than falling back silently.
+        assert!(resolve_heuristic_root(repo, Some(std::path::Path::new("missing/root"))).is_none());
+        // A relative override resolves against the repo and is reported relative.
+        std::fs::create_dir_all(repo.join("custom/hs")).expect("mkdir custom");
+        let resolved = resolve_heuristic_root(repo, Some(std::path::Path::new("custom/hs")))
+            .expect("override root");
+        assert_eq!(resolved.rel.as_deref(), Some("custom/hs"));
+        assert_eq!(resolved.abs, repo.join("custom/hs"));
+    }
+
+    #[test]
+    fn collect_inbox_entry_files_handles_flat_nested_and_skips_archive() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = tmp.path().join("error-inbox");
+        std::fs::create_dir_all(inbox.join("nested-case/evidence")).expect("nested dir");
+        std::fs::create_dir_all(inbox.join("archive/2026/old-case")).expect("archive dir");
+        // README index, archived entries, and evidence files must be excluded.
+        std::fs::write(inbox.join("README.md"), "# index\n").expect("readme");
+        std::fs::write(inbox.join("flat-case.md"), "# flat\n").expect("flat");
+        std::fs::write(inbox.join("nested-case/ENTRY.md"), "# nested\n").expect("nested entry");
+        std::fs::write(inbox.join("nested-case/evidence/note.md"), "# ev\n").expect("evidence");
+        std::fs::write(inbox.join("archive/2026/old-case/ENTRY.md"), "# old\n").expect("archived");
+
+        let mut found: Vec<String> = collect_inbox_entry_files(&inbox)
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&inbox)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["flat-case.md", "nested-case/ENTRY.md"]);
     }
 
     #[test]

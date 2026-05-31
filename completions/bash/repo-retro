@@ -125,7 +125,7 @@ _repo-retro() {
             return 0
             ;;
         repo__retro__report)
-            opts="-h --repo --mode --format --since --days --from --to --timeline-jsonl --learnings-jsonl --validation-jsonl --review-jsonl --incidents-jsonl --decisions-jsonl --history-dir --write --help"
+            opts="-h --repo --mode --format --since --days --from --to --timeline-jsonl --learnings-jsonl --validation-jsonl --review-jsonl --incidents-jsonl --decisions-jsonl --history-dir --write --path-class-config --heuristic-root --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -253,6 +253,28 @@ _repo-retro() {
                     return 0
                     ;;
                 --history-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --path-class-config)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
+                    return 0
+                    ;;
+                --heuristic-root)
                     COMPREPLY=()
                     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
                         compopt -o plusdirs
