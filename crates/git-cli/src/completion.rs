@@ -52,6 +52,7 @@ fn build_command_model() -> Command {
         .subcommand(build_reset_group())
         .subcommand(build_commit_group())
         .subcommand(build_branch_group())
+        .subcommand(build_worktree_group())
         .subcommand(build_ci_group())
         .subcommand(build_open_group())
         .subcommand(Command::new("help").about("Display help message for git-cli"))
@@ -301,6 +302,45 @@ fn build_branch_group() -> Command {
         .subcommand(Command::new("help").about("Display help message for branch"))
 }
 
+fn build_worktree_group() -> Command {
+    Command::new("worktree")
+        .about("Worktree helpers")
+        .subcommand(
+            Command::new("add")
+                .about("Create a managed agent worktree")
+                .arg(Arg::new("slug").value_name("slug").required(true))
+                .arg(
+                    Arg::new("from")
+                        .long("from")
+                        .help("Base ref for the new branch")
+                        .value_name("ref"),
+                )
+                .arg(format_arg()),
+        )
+        .subcommand(
+            Command::new("list")
+                .about("List git worktrees")
+                .arg(format_arg()),
+        )
+        .subcommand(
+            Command::new("remove")
+                .about("Remove a managed worktree by slug or path")
+                .arg(
+                    Arg::new("target")
+                        .value_name("slug-or-path")
+                        .required(true)
+                        .value_hint(ValueHint::AnyPath),
+                )
+                .arg(format_arg()),
+        )
+        .subcommand(
+            Command::new("prune")
+                .about("Prune stale git worktree metadata")
+                .arg(format_arg()),
+        )
+        .subcommand(Command::new("help").about("Display help message for worktree"))
+}
+
 fn build_ci_group() -> Command {
     Command::new("ci")
         .about("CI helpers")
@@ -434,4 +474,12 @@ fn build_open_group() -> Command {
 
 fn remotes_arg() -> Arg {
     Arg::new("remote").value_name("remote")
+}
+
+fn format_arg() -> Arg {
+    Arg::new("format")
+        .long("format")
+        .help("Output format")
+        .value_name("format")
+        .value_parser(["text", "json"])
 }

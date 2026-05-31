@@ -2,10 +2,10 @@
 
 ## Overview
 
-git-cli is a Rust CLI that groups Git workflow helpers behind a dispatcher. It exposes seven
-command groups (`utils`, `reset`, `commit`, `branch`, `ci`, `open`, `completion`) with consistent
-help / version handling: `git-cli help` (or `-h`/`--help`) prints top-level usage, `git-cli <group>
-help` prints group usage, and `git-cli -V`/`--version` prints the binary version.
+git-cli is a Rust CLI that groups Git workflow helpers behind a dispatcher. It exposes eight
+command groups (`utils`, `reset`, `commit`, `branch`, `worktree`, `ci`, `open`, `completion`) with
+consistent help / version handling: `git-cli help` (or `-h`/`--help`) prints top-level usage,
+`git-cli <group> help` prints group usage, and `git-cli -V`/`--version` prints the binary version.
 
 ## Usage
 
@@ -17,6 +17,7 @@ subcommands (matching the binary's `--help` output):
 - `commit`: `context`, `context-json` (aliases `context_json`, `contextjson`, `json`),
   `to-stash` (alias `stash`).
 - `branch`: `cleanup` (alias `delete-merged`).
+- `worktree`: `add`, `list`, `remove`, `prune`.
 - `ci`: `pick`.
 - `open`: `repo`, `branch`, `default-branch` (alias `default`), `commit`, `compare`,
   `pr` (aliases `pull-request`, `mr`, `merge-request`), `pulls` (aliases `prs`,
@@ -59,6 +60,17 @@ subcommands (matching the binary's `--help` output):
 
 - `cleanup` (`delete-merged`): Delete merged local branches.
   Options: `-b/--base <ref>`, `-s/--squash`, `-w/--remove-worktrees`.
+
+### worktree
+
+- `add <slug>`: Create a managed worktree under
+  `$AGENT_HOME/worktrees/<repo-key>/<branch-slug>` on a fresh `feat/<branch-slug>` branch.
+  Options: `--from <ref>`, `--format text|json`.
+- `list`: List all linked git worktrees and mark entries managed by the git-cli convention.
+  Options: `--format text|json`.
+- `remove <slug-or-path>`: Remove a linked worktree by managed slug or explicit path, refusing the
+  primary checkout and the current worktree. Options: `--format text|json`.
+- `prune`: Run `git worktree prune`. Options: `--format text|json`.
 
 ### ci
 
@@ -118,3 +130,4 @@ subcommands (matching the binary's `--help` output):
 ## Docs
 
 - [Docs index](docs/README.md)
+- [Worktree convention spec](docs/specs/git-cli-worktree-convention.md)

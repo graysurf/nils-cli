@@ -3,8 +3,8 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: decisions settled; not yet implemented. This bundle is prepared so
-  `create-plan-tracking-issue` can open the tracker with a populated ledger.
+- Status: Sprint 1 implemented and locally validated in `sympoies/nils-cli`;
+  Sprint 2 remains pending behind the Phase 1 release/Homebrew rollout gate.
 - Target scope: Phase 1 — `crates/git-cli` (`nils-git-cli`) `worktree` surface
   in `sympoies/nils-cli`; Phase 2 — `block-direct-git-worktree` hook +
   `AGENT_HOME.md` policy in `graysurf/agent-runtime-kit`. Cross-repo; the
@@ -13,19 +13,19 @@
   removal consolidation + docs, PR1, nils-cli) → Sprint 2 (hook ban + policy +
   heuristic promotion, PR2, agent-runtime-kit), serial; Sprint 2 enables
   globally only after Sprint 1 ships and is brew-upgraded.
-- Current task: Task 1.1 — not started.
-- Next task: Task 1.1 — `worktree` CLI subtree + deterministic path convention.
+- Current task: PR1 delivery for Sprint 1.
+- Next task: Phase 1 release + Homebrew tap bump, then Sprint 2
+  `agent-runtime-kit` hook/policy work.
 - Last updated: 2026-05-31
-- Branch/commit/PR: authored on `feat/git-cli-worktree-surface` (worktree
-  `~/Project/sympoies/nils-cli-wt/git-cli-worktree-surface`); no implementation
-  commits yet; no PR opened.
+- Branch/commit/PR: implementation on `feat/git-cli-worktree-surface`
+  (worktree `~/Project/sympoies/nils-cli-wt/git-cli-worktree-surface`);
+  no PR opened yet.
 - Source document: docs/plans/2026-05-31-git-cli-worktree-surface/git-cli-worktree-surface-plan.md
 - Direct source-doc execution waiver: not applicable
-- Tracking issue: not yet opened
-- Source snapshot: to be posted by `create-plan-tracking-issue` at issue open
-- Plan snapshot: to be posted by `create-plan-tracking-issue` at issue open
-- Initial state snapshot: to be posted by `create-plan-tracking-issue` at issue
-  open
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/712>
+- Source snapshot: posted on the tracking issue
+- Plan snapshot: posted on the tracking issue
+- Initial state snapshot: posted on the tracking issue
 
 ## Validation Plan
 
@@ -51,9 +51,9 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | todo | `worktree` CLI subtree + deterministic path convention | — | No deps. `add <slug> [--from <base>]` / `list` / `remove` / `prune` in `git-cli`; path `$AGENT_HOME/worktrees/<repo-key>/<branch-slug>` (repo-key = toplevel basename + short stable hash); `add` creates fresh `feat/<slug>`, agent never picks path; no `extensions.worktreeConfig`, no per-worktree identity ([F7]). PR1, nils-cli. |
-| 1.2 | todo | `remove` / `prune` + consolidate worktree-removal into one helper | — | Depends on 1.1. Single porcelain-parse/list/remove helper; rewire `branch cleanup --remove-worktrees` onto it; evaluate folding `plan-issue-cli cleanup-worktrees` or document divergence; never touch primary / in-use worktree. PR1. |
-| 1.3 | todo | JSON contract, completion, and crate docs | — | Depends on 1.1, 1.2. Versioned `--format json` envelopes; completion snapshot; crate-local convention spec + README. Pre-existing crate → scaffold/publish-order N/A. PR1. |
+| 1.1 | done | `worktree` CLI subtree + deterministic path convention | Added git-cli worktree add/list/remove/prune with deterministic AGENT_HOME worktree paths; validated by cargo test -p nils-git-cli worktree_ and local-fast. | Implemented in nils-cli PR1; Phase 2 hook remains gated. |
+| 1.2 | done | `remove` / `prune` + consolidate worktree-removal into one helper | Shared worktree porcelain parsing/removal via git-cli worktree helpers and branch cleanup --remove-worktrees reuse; validated by cargo test -p nils-git-cli worktree_ and cargo test -p nils-git-cli. | plan-issue-cli cleanup-worktrees remains separate by documented issue-root convention. |
+| 1.3 | done | JSON contract, completion, and crate docs | Added JSON envelopes, completion coverage, README updates, and crate-local worktree convention spec; validated by completion syntax checks and local-fast. | Generated completion adapters unchanged; completion export coverage verifies the worktree subcommands. |
 | 2.1 | todo | `block-direct-git-worktree` hook with override escape hatch | — | Depends on Sprint 1 shipped + brew-upgraded. Mirror `block-direct-git-commit.py`; block mutating `worktree` ops, allow read-only `list`; `ALLOW_DIRECT_GIT_WORKTREE=1` override; register in `settings.hooks.jsonc` + `link-map.yaml`. PR2, agent-runtime-kit. |
 | 2.2 | todo | `AGENTS.md` / `AGENT_HOME.md` policy + namespace reconciliation + heuristic promotion | — | Depends on 2.1. Policy clause + convention doc; reconcile "`$AGENT_HOME` artifacts only" note for `worktrees/`; promote/close `worktree-unsigned-commit-config-drift` (criterion c) via `heuristic-inbox` or record why it stays open. PR2. |
 
@@ -89,12 +89,12 @@
 
 | Command | Status | Summary | Artifact |
 | --- | --- | --- | --- |
-| `cargo test -p nils-git-cli` | pending | Not run; no implementation yet. | — |
-| `cargo clippy -p nils-git-cli --all-targets -- -D warnings` | pending | Not run; no implementation yet. | — |
-| `cargo fmt -p nils-git-cli -- --check` | pending | Not run; no implementation yet. | — |
-| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pending | Not run; no implementation yet. | — |
-| `--help` / completion snapshot | pending | Not run; no implementation yet. | — |
-| `rumdl check` (this bundle) | pending | To run on the authored Markdown before delivery. | — |
+| `cargo test -p nils-git-cli worktree_` | pass | Targeted failing-first coverage for worktree add/list/remove/prune and branch-cleanup linked-worktree removal. | local |
+| `cargo test -p nils-git-cli` | pass | Full `nils-git-cli` test suite passed. | local |
+| `cargo clippy -p nils-git-cli --all-targets -- -D warnings` | pass | Crate-specific clippy gate passed after implementation cleanup. | local |
+| `cargo fmt -p nils-git-cli -- --check` | pass | Crate-specific formatting gate passed. | local |
+| `zsh -n completions/zsh/_git-cli` / `bash -n completions/bash/git-cli` | pass | Existing generated completion adapters remain syntactically valid. | local |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Docs audits, third-party artifact audit, workspace fmt/clippy, 4444 nextest tests, and doctests passed. | local |
 | `gh pr checks` | pending | No PR yet. | — |
 | hook block/allow/override fixture (Sprint 2) | pending | Not run; agent-runtime-kit work not started. | — |
 

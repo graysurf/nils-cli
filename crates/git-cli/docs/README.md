@@ -4,7 +4,7 @@
 
 ## Specs
 
-- None yet. Add documents under `docs/specs/` and register them here.
+- [git-cli worktree convention](specs/git-cli-worktree-convention.md)
 
 ## Runbooks
 

@@ -1,6 +1,7 @@
 use crate::commit_shared::{git_output, git_status_success, git_stdout_trimmed};
 use crate::prompt;
-use std::collections::{HashMap, HashSet};
+use crate::worktree;
+use std::collections::HashSet;
 use std::process::Output;
 
 pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
@@ -105,7 +106,7 @@ fn run_cleanup(args: &[String]) -> i32 {
         merged_set.insert(branch.clone());
     }
 
-    let linked_worktrees = match linked_worktrees_by_branch() {
+    let linked_worktrees = match worktree::linked_worktrees_by_branch() {
         Ok(value) => value,
         Err(err) => {
             eprintln!("{err:#}");
@@ -372,32 +373,6 @@ fn summarize_git_error(message: &str) -> String {
     summary.replace('\n', " ")
 }
 
-fn linked_worktrees_by_branch() -> anyhow::Result<HashMap<String, String>> {
-    let output = git_output(&["worktree", "list", "--porcelain"])?;
-    let mut branch_worktrees: HashMap<String, String> = HashMap::new();
-    let mut current_worktree_path: Option<String> = None;
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if line.trim().is_empty() {
-            current_worktree_path = None;
-            continue;
-        }
-
-        if let Some(path) = line.strip_prefix("worktree ") {
-            current_worktree_path = Some(path.to_string());
-            continue;
-        }
-
-        if let Some(branch_ref) = line.strip_prefix("branch refs/heads/")
-            && let Some(worktree_path) = &current_worktree_path
-        {
-            branch_worktrees.insert(branch_ref.to_string(), worktree_path.clone());
-        }
-    }
-
-    Ok(branch_worktrees)
-}
-
 fn resolve_base_local(base_ref: &str) -> Option<String> {
     let remote_ref = format!("refs/remotes/{base_ref}");
     if git_status_success(&["show-ref", "--verify", "--quiet", &remote_ref]) {
@@ -419,10 +394,8 @@ fn resolve_base_local(base_ref: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        dispatch, linked_worktrees_by_branch, parse_args, parse_lines, resolve_base_local,
-        summarize_git_error,
-    };
+    use super::{dispatch, parse_args, parse_lines, resolve_base_local, summarize_git_error};
+    use crate::worktree;
     use nils_test_support::{EnvGuard, GlobalStateLock, StubBinDir};
     use pretty_assertions::assert_eq;
     use std::process::Command;
@@ -507,7 +480,7 @@ exit 1
         );
 
         let _guard = EnvGuard::set(&lock, "PATH", &stubs.path_str());
-        let mapping = linked_worktrees_by_branch().expect("parse linked worktrees");
+        let mapping = worktree::linked_worktrees_by_branch().expect("parse linked worktrees");
         assert_eq!(
             mapping.get("feature/topic"),
             Some(&"/repo/wt/topic".to_string())
