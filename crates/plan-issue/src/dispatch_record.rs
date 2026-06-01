@@ -1,7 +1,6 @@
 //! Per-task dispatch record JSON.
 //!
-//! Defined in `agent-kit/skills/automation/plan-issue-delivery/references/RUNTIME_LAYOUT.md`
-//! L48-52 and `plan-issue-contract-v2.md` "Canonical Runtime Artifacts (v2)".
+//! Defined in `plan-issue-contract-v2.md` "Canonical Runtime Artifacts (v2)".
 //!
 //! The binary writes the nine required keys at sprint start. Optional adapter
 //! fields (`runtime_name`, `runtime_role`, `runtime_role_fallback_reason`)

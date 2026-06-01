@@ -162,9 +162,7 @@ adapters that drove plan-issue via `AGENT_HOME` should rename to
 `PLAN_ISSUE_HOME` (or pass `--state-dir`) when upgrading.
 
 See [`CLI contract v2`](docs/specs/plan-issue-contract-v2.md)
-"Canonical Runtime Artifacts (v2)" for the full path catalogue and
-[`agent-kit RUNTIME_LAYOUT.md`](https://github.com/sympoies/agent-kit/blob/main/skills/automation/plan-issue-delivery/references/RUNTIME_LAYOUT.md)
-for the upstream contract.
+"Canonical Runtime Artifacts (v2)" for the full path catalogue.
 
 ## Docs
 

@@ -1,9 +1,7 @@
 //! Heuristic Inbox primitive: manage curated heuristic-system case folders.
 //!
-//! Ported from agent-kit
-//! `skills/workflows/heuristic-system/heuristic-error-inbox/bin/heuristic_error_inbox.py`.
-//! Behaviour parity is the contract; see HEURISTIC_SYSTEM.md and the agent-kit
-//! plan `docs/plans/heuristic-inbox-cli-graduation/`.
+//! Behaviour parity with the original `heuristic-error-inbox` Python
+//! implementation is the contract; see HEURISTIC_SYSTEM.md.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
