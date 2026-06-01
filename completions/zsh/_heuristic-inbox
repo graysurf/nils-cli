@@ -115,6 +115,23 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':case -- Case folder or ENTRY.md/RECORD.md path:_files' \
 && ret=0
 ;;
+(deliver)
+_arguments "${_arguments_options[@]}" : \
+'--root=[Heuristic System root holding the uncommitted records (defaults to <repo>/core/policies/heuristic-system)]:DIR:_files -/' \
+'--slug=[Records branch slug (default\: heuristic-records-<UTC date>)]:SLUG:_default' \
+'--title=[PR title (default\: <type>(heuristic-system)\: deliver retained records)]:TITLE:_default' \
+'(--body-file)--body=[PR body text. Mutually exclusive with --body-file]:BODY:_default' \
+'--body-file=[Read PR body from a file]:PATH:_files' \
+'--kind=[PR kind (selects the records branch-prefix rule)]:KIND:(feature bug chore docs ci refactor)' \
+'--base=[Base branch the records branch forks from (origin/<base>)]:BASE:_default' \
+'--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--dry-run[Render the plan / argv without fetching, creating a worktree, or pushing]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -136,6 +153,7 @@ _heuristic-inbox_commands() {
 'set-status:Update an inbox entry lifecycle status' \
 'archive:Move a completed inbox case folder out of the active inbox' \
 'ingest-evidence:Redact and write an evidence file inside a case folder' \
+'deliver:Deliver uncommitted heuristic-system records as a records-branch PR' \
 'completion:Print shell completion script' \
     )
     _describe -t commands 'heuristic-inbox commands' commands "$@"
@@ -149,6 +167,11 @@ _heuristic-inbox__subcmd__archive_commands() {
 _heuristic-inbox__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'heuristic-inbox completion commands' commands "$@"
+}
+(( $+functions[_heuristic-inbox__subcmd__deliver_commands] )) ||
+_heuristic-inbox__subcmd__deliver_commands() {
+    local commands; commands=()
+    _describe -t commands 'heuristic-inbox deliver commands' commands "$@"
 }
 (( $+functions[_heuristic-inbox__subcmd__ingest-evidence_commands] )) ||
 _heuristic-inbox__subcmd__ingest-evidence_commands() {

@@ -23,7 +23,7 @@ Each binary supports `--version` and `completion <bash|zsh>`.
 | `browser-session` | Record browser goals, steps, statuses, and evidence artifacts. | `browser-session.json` under `--out DIR` |
 | `canary-check` | Run one local command and persist a redacted pass/fail result. | `canary-check.json` under `--out DIR` |
 | `docs-impact` | Classify changed Git paths as docs or non-docs and suggest documentation review. | stdout/JSON only |
-| `heuristic-inbox` | Manage curated HEURISTIC_SYSTEM inbox + operation-record case folders with redaction-enforced evidence ingestion. | `<inbox-dir>/<slug>/ENTRY.md` + automatic `agent-out` execution logs (`invocation.json`, `before.json`, `after.json`) for write ops |
+| `heuristic-inbox` | Manage curated HEURISTIC_SYSTEM inbox + operation-record case folders with redaction-enforced evidence ingestion, plus `deliver` for records-branch PR writeback. | `<inbox-dir>/<slug>/ENTRY.md` + automatic `agent-out` execution logs (`invocation.json`, `before.json`, `after.json`) for write ops |
 | `model-cross-check` | Record primary/checker model observations without owning provider calls. | `model-cross-check.json` under `--out DIR` |
 | `repo-retro` | Generate deterministic repo-local implementation retrospectives from local Git, HEURISTIC_SYSTEM records, and explicit JSONL inputs. | stdout by default; optional Markdown/raw JSON/index under `--history-dir DIR --write` |
 | `review-evidence` | Record review findings and passing validation evidence. | `review-evidence.json` under `--out DIR` |
@@ -131,6 +131,43 @@ tooling can opt in once collaborators have rotated their cases.
 
 `evidence/` files keep the existing strict behaviour: any violation fails
 `verify` regardless of `--strict`.
+
+## `heuristic-inbox deliver` flow
+
+`deliver` ships the uncommitted retained-record changes under a Heuristic System
+root as a records-branch PR, independently of the current branch or working
+directory. It exists because the closeout writeback is deterministic mechanics
+(worktree → stage → commit → push → PR) with no judgment, so it belongs in a
+machine-checkable command rather than skill prose.
+
+```bash
+# Preview the plan (no fetch / worktree / commit / push):
+heuristic-inbox deliver --root core/policies/heuristic-system --dry-run --format json
+
+# Open the docs PR off origin/main on a dedicated records branch:
+heuristic-inbox deliver --root core/policies/heuristic-system --format json
+```
+
+Mechanics:
+
+1. Resolve the canonical repo (`git rev-parse --show-toplevel` from `--root` /
+   cwd) and `git fetch origin <base>` — the records branch always forks from
+   `origin/<base>`, never the current branch.
+2. Create an isolated worktree off `origin/<base>` on a `<prefix>/<slug>` branch
+   whose prefix matches `--kind` (e.g. `--kind docs` → `docs/...`), under the
+   same managed path scheme as `git-cli worktree` so it is removable via
+   `git-cli worktree remove <slug>`.
+3. Copy only the changed files under the heuristic-system root into the
+   worktree, `git add` that path, and **refuse** (`dirty-records-worktree`) if
+   anything outside it is dirty.
+4. Commit via `semantic-commit`, push the records branch, and open the PR via
+   `forge-cli pr create --kind <kind>`.
+
+Output envelope (`cli.heuristic-inbox.deliver.v1`) carries `branch`, `pr_url`,
+`committed_paths`, plus `worktree_path` for cleanup and (on `--dry-run`) the
+ordered `plan`. The `git` / `semantic-commit` / `forge-cli` binaries are
+overridable via `HEURISTIC_INBOX_GIT_BIN`, `HEURISTIC_INBOX_SEMANTIC_COMMIT_BIN`,
+and `FORGE_CLI_BIN`.
 
 ## `skill-usage` flow
 

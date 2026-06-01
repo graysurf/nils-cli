@@ -14,13 +14,16 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum, ValueHint};
+use nils_common::process;
 use nils_markdown::Engine;
 use nils_term::prompt::{self, PromptError, PromptOptions};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::common::{CliError, OutputFormat, display_path, render_error, render_success};
+use crate::common::{
+    CliError, OutputFormat, absolute_path, display_path, render_error, render_success,
+};
 use crate::completion::{self, CompletionShell};
 
 const ARCHIVE_TEMPLATE: &str = include_str!("../templates/heuristic_inbox/archive.md.tera");
@@ -47,6 +50,7 @@ const NEW_SCHEMA_VERSION: &str = "cli.heuristic-inbox.new.v1";
 const SET_STATUS_SCHEMA_VERSION: &str = "cli.heuristic-inbox.set-status.v1";
 const ARCHIVE_SCHEMA_VERSION: &str = "cli.heuristic-inbox.archive.v1";
 const INGEST_SCHEMA_VERSION: &str = "cli.heuristic-inbox.ingest-evidence.v1";
+const DELIVER_SCHEMA_VERSION: &str = "cli.heuristic-inbox.deliver.v1";
 
 const LIST_COMMAND: &str = "heuristic-inbox list";
 const VERIFY_COMMAND: &str = "heuristic-inbox verify";
@@ -54,6 +58,7 @@ const NEW_COMMAND: &str = "heuristic-inbox new";
 const SET_STATUS_COMMAND: &str = "heuristic-inbox set-status";
 const ARCHIVE_COMMAND: &str = "heuristic-inbox archive";
 const INGEST_COMMAND: &str = "heuristic-inbox ingest-evidence";
+const DELIVER_COMMAND: &str = "heuristic-inbox deliver";
 
 const RAW_RECORD_FILENAME: &str = "skill-usage.record.json";
 const RAW_RECORD_SCHEMA: &str = "skill-usage.record.v1";
@@ -2221,6 +2226,730 @@ fn write_execution_log(
 }
 
 // ---------------------------------------------------------------------------
+// deliver: records-branch PR for uncommitted heuristic-system changes
+// ---------------------------------------------------------------------------
+
+/// PR kind for `deliver`. Mirrors the `forge-cli pr create --kind` enum and
+/// carries the branch-prefix rule it pairs with, so a `--kind docs` records
+/// branch is always created as `docs/<slug>` (footgun: a mismatched prefix
+/// makes `forge-cli pr create` refuse with `branch_kind_mismatch`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum DeliverKind {
+    Feature,
+    Bug,
+    Chore,
+    Docs,
+    Ci,
+    Refactor,
+}
+
+impl DeliverKind {
+    /// Value forwarded to `forge-cli pr create --kind`.
+    fn forge_kind(self) -> &'static str {
+        match self {
+            DeliverKind::Feature => "feature",
+            DeliverKind::Bug => "bug",
+            DeliverKind::Chore => "chore",
+            DeliverKind::Docs => "docs",
+            DeliverKind::Ci => "ci",
+            DeliverKind::Refactor => "refactor",
+        }
+    }
+
+    /// Branch prefix the records branch must use for this kind.
+    fn branch_prefix(self) -> &'static str {
+        match self {
+            DeliverKind::Feature => "feat",
+            DeliverKind::Bug => "fix",
+            DeliverKind::Chore => "chore",
+            DeliverKind::Docs => "docs",
+            DeliverKind::Ci => "ci",
+            DeliverKind::Refactor => "refactor",
+        }
+    }
+
+    /// Conventional-commit type passed to `semantic-commit commit --type`.
+    fn commit_type(self) -> &'static str {
+        match self {
+            DeliverKind::Feature => "feat",
+            DeliverKind::Bug => "fix",
+            DeliverKind::Chore => "chore",
+            DeliverKind::Docs => "docs",
+            DeliverKind::Ci => "ci",
+            DeliverKind::Refactor => "refactor",
+        }
+    }
+}
+
+const DELIVER_SCOPE: &str = "heuristic-system";
+const DELIVER_COMMIT_SUBJECT: &str = "deliver retained records";
+const DEFAULT_HEURISTIC_REL: &str = "core/policies/heuristic-system";
+
+/// Result of one external command, abstracted so tests inject scripted output
+/// instead of spawning real `git` / `semantic-commit` / `forge-cli` binaries.
+#[derive(Debug, Clone)]
+struct RunResult {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Subprocess seam for `deliver`. The production impl shells out; tests inject
+/// a scripted runner (see the `deliver_*` unit tests).
+trait CommandRunner {
+    fn run(&self, program: &str, args: &[&str], cwd: Option<&Path>) -> Result<RunResult, CliError>;
+}
+
+/// Default runner: spawns the real binary (cwd-scoped) via `nils_common::process`.
+struct ProcessCommandRunner;
+
+impl CommandRunner for ProcessCommandRunner {
+    fn run(&self, program: &str, args: &[&str], cwd: Option<&Path>) -> Result<RunResult, CliError> {
+        let output = match cwd {
+            Some(dir) => process::run_output_in(program, args, dir),
+            None => process::run_output(program, args),
+        }
+        .map_err(|err| {
+            CliError::runtime(
+                "spawn-failed",
+                format!("failed to execute {program}: {err}"),
+                Some(json!({ "program": program })),
+            )
+        })?;
+        Ok(RunResult {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
+}
+
+fn git_bin() -> String {
+    env_non_empty("HEURISTIC_INBOX_GIT_BIN").unwrap_or_else(|| "git".to_string())
+}
+
+fn semantic_commit_bin() -> String {
+    env_non_empty("HEURISTIC_INBOX_SEMANTIC_COMMIT_BIN")
+        .unwrap_or_else(|| "semantic-commit".to_string())
+}
+
+fn forge_bin() -> String {
+    // Reuse the same override knob `plan-issue` uses so a single env var
+    // redirects every forge-cli caller in this workspace.
+    env_non_empty("FORGE_CLI_BIN").unwrap_or_else(|| "forge-cli".to_string())
+}
+
+fn env_non_empty(key: &str) -> Option<String> {
+    env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().to_string())
+}
+
+/// One planned subprocess, surfaced verbatim by `--dry-run`.
+#[derive(Debug, Clone, Serialize)]
+struct PlanStep {
+    program: String,
+    argv: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+}
+
+/// Envelope payload for `cli.heuristic-inbox.deliver.v1`.
+#[derive(Debug, Serialize)]
+struct DeliverResult {
+    branch: String,
+    base: String,
+    kind: &'static str,
+    dry_run: bool,
+    pr_url: Option<String>,
+    committed_paths: Vec<String>,
+    repo_root: String,
+    worktree_path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    plan: Vec<PlanStep>,
+}
+
+fn render_deliver_text(result: &DeliverResult) -> String {
+    let mut lines = Vec::new();
+    if result.dry_run {
+        lines.push(format!(
+            "dry-run: would deliver {} record(s) on {} (off origin/{})",
+            result.committed_paths.len(),
+            result.branch,
+            result.base
+        ));
+        for step in &result.plan {
+            lines.push(format!("  $ {} {}", step.program, step.argv.join(" ")));
+        }
+    } else {
+        lines.push(format!(
+            "delivered {} record(s) on {}",
+            result.committed_paths.len(),
+            result.branch
+        ));
+        if let Some(url) = &result.pr_url {
+            lines.push(format!("PR: {url}"));
+        }
+        lines.push(format!("worktree: {}", result.worktree_path));
+    }
+    lines.join("\n")
+}
+
+/// Records branch for the kind, e.g. `docs/heuristic-records-2026-06-01`.
+fn records_branch(kind: DeliverKind, slug: &str) -> String {
+    format!("{}/{}", kind.branch_prefix(), slug)
+}
+
+fn default_records_slug() -> String {
+    format!("heuristic-records-{}", today_utc())
+}
+
+/// Parse `git status --porcelain` lines into repo-relative paths. Renames keep
+/// the post-rename path; quoted paths are unquoted on a best-effort basis.
+fn parse_porcelain_paths(stdout: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in stdout.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let rest = &line[3..];
+        let raw = match rest.split_once(" -> ") {
+            Some((_, new_path)) => new_path,
+            None => rest,
+        };
+        let path = unquote_porcelain_path(raw.trim());
+        if !path.is_empty() {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn unquote_porcelain_path(value: &str) -> String {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        value[1..value.len() - 1].replace("\\\"", "\"")
+    } else {
+        value.to_string()
+    }
+}
+
+fn run_deliver(runner: &dyn CommandRunner, args: &DeliverArgs) -> Result<DeliverResult, CliError> {
+    let git = git_bin();
+
+    // 1. Resolve the canonical repo from --root (or cwd) — never the branch.
+    let source_dir = match args.root.as_deref() {
+        Some(root) => absolute_path(root)?,
+        None => env::current_dir().map_err(|err| {
+            CliError::runtime(
+                "cwd-unavailable",
+                format!("failed to read current directory: {err}"),
+                None,
+            )
+        })?,
+    };
+    if !source_dir.exists() {
+        return Err(CliError::usage(
+            "root-not-found",
+            format!("--root does not exist: {}", display_path(&source_dir)),
+            Some(json!({ "root": display_path(&source_dir) })),
+        ));
+    }
+    let toplevel = runner.run(&git, &["rev-parse", "--show-toplevel"], Some(&source_dir))?;
+    if !toplevel.success {
+        return Err(CliError::runtime(
+            "not-a-repository",
+            "could not resolve a git repository from --root / cwd",
+            Some(json!({ "stderr": toplevel.stderr.trim() })),
+        ));
+    }
+    let repo_root = PathBuf::from(toplevel.stdout.trim());
+
+    // 2. Resolve the heuristic-system root and its repo-relative prefix.
+    let hs_root = match args.root.as_deref() {
+        Some(root) => absolute_path(root)?,
+        None => repo_root.join(DEFAULT_HEURISTIC_REL),
+    };
+    let hs_rel = hs_root
+        .strip_prefix(&repo_root)
+        .map(display_path)
+        .map_err(|_| {
+            CliError::usage(
+                "root-outside-repo",
+                "--root must live inside the resolved git repository",
+                Some(json!({
+                    "root": display_path(&hs_root),
+                    "repo_root": display_path(&repo_root),
+                })),
+            )
+        })?;
+    if hs_rel.is_empty() {
+        return Err(CliError::usage(
+            "root-is-repo-root",
+            "--root must be a subdirectory, not the repository root",
+            None,
+        ));
+    }
+
+    // 3. Collect the uncommitted record changes under the heuristic-system root.
+    let status = runner.run(
+        &git,
+        &["status", "--porcelain", "-uall", "--", hs_rel.as_str()],
+        Some(&repo_root),
+    )?;
+    if !status.success {
+        return Err(CliError::runtime(
+            "git-status-failed",
+            "git status failed in the source repository",
+            Some(json!({ "stderr": status.stderr.trim() })),
+        ));
+    }
+    let committed_paths = parse_porcelain_paths(&status.stdout);
+    if committed_paths.is_empty() {
+        return Err(CliError::runtime(
+            "nothing-to-deliver",
+            format!("no uncommitted changes under {hs_rel}"),
+            Some(json!({ "root": hs_rel })),
+        ));
+    }
+
+    // 4. Compute the records branch + managed worktree path (git-cli semantics).
+    let slug = args.slug.clone().unwrap_or_else(default_records_slug);
+    let slug = sanitize_slug_segment(&slug);
+    if slug.is_empty() {
+        return Err(CliError::usage(
+            "invalid-slug",
+            "--slug must contain at least one ASCII letter or digit",
+            None,
+        ));
+    }
+    let branch = records_branch(args.kind, &slug);
+    let worktree_path = managed_worktree_path(&repo_root, &slug);
+    let worktree_display = display_path(&worktree_path);
+    let base = args.base.clone();
+    let origin_base = format!("origin/{base}");
+
+    let title = deliver_title(args);
+    let body = deliver_body(args, &base, &committed_paths)?;
+    let subject = DELIVER_COMMIT_SUBJECT.to_string();
+
+    // Planned subprocesses, in order, for --dry-run rendering and execution.
+    let plan = vec![
+        PlanStep {
+            program: git.clone(),
+            argv: vec!["fetch".into(), "origin".into(), base.clone()],
+            cwd: Some(display_path(&repo_root)),
+        },
+        PlanStep {
+            program: git.clone(),
+            argv: vec![
+                "worktree".into(),
+                "add".into(),
+                "-b".into(),
+                branch.clone(),
+                worktree_display.clone(),
+                origin_base.clone(),
+            ],
+            cwd: Some(display_path(&repo_root)),
+        },
+        PlanStep {
+            program: git.clone(),
+            argv: vec!["add".into(), "-A".into(), "--".into(), hs_rel.clone()],
+            cwd: Some(worktree_display.clone()),
+        },
+        PlanStep {
+            program: semantic_commit_bin(),
+            argv: vec![
+                "commit".into(),
+                "--repo".into(),
+                worktree_display.clone(),
+                "--automation".into(),
+                "--type".into(),
+                args.kind.commit_type().into(),
+                "--scope".into(),
+                DELIVER_SCOPE.into(),
+                "--subject".into(),
+                subject.clone(),
+                "--format".into(),
+                "json".into(),
+            ],
+            cwd: None,
+        },
+        PlanStep {
+            program: git.clone(),
+            argv: vec!["push".into(), "-u".into(), "origin".into(), branch.clone()],
+            cwd: Some(worktree_display.clone()),
+        },
+        PlanStep {
+            program: forge_bin(),
+            argv: vec![
+                "pr".into(),
+                "create".into(),
+                "--head".into(),
+                branch.clone(),
+                "--base".into(),
+                base.clone(),
+                "--kind".into(),
+                args.kind.forge_kind().into(),
+                "--title".into(),
+                title.clone(),
+                "--body".into(),
+                "<rendered-body>".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+            cwd: Some(worktree_display.clone()),
+        },
+    ];
+
+    if args.dry_run {
+        return Ok(DeliverResult {
+            branch,
+            base,
+            kind: args.kind.forge_kind(),
+            dry_run: true,
+            pr_url: None,
+            committed_paths,
+            repo_root: display_path(&repo_root),
+            worktree_path: worktree_display,
+            plan,
+        });
+    }
+
+    // 5. Fetch the base ref so the records branch forks from origin, not local.
+    let fetch = runner.run(&git, &["fetch", "origin", base.as_str()], Some(&repo_root))?;
+    if !fetch.success {
+        return Err(CliError::runtime(
+            "git-fetch-failed",
+            format!("git fetch origin {base} failed"),
+            Some(json!({ "stderr": fetch.stderr.trim() })),
+        ));
+    }
+
+    // 6. Create the isolated records worktree off origin/<base>.
+    let add = runner.run(
+        &git,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch.as_str(),
+            worktree_display.as_str(),
+            origin_base.as_str(),
+        ],
+        Some(&repo_root),
+    )?;
+    if !add.success {
+        return Err(CliError::runtime(
+            "worktree-add-failed",
+            format!("git worktree add for {branch} failed"),
+            Some(json!({
+                "branch": branch,
+                "worktree_path": worktree_display,
+                "stderr": add.stderr.trim(),
+            })),
+        ));
+    }
+
+    // 7. Transfer the working-tree record changes into the records worktree.
+    transfer_records(&repo_root, &worktree_path, &committed_paths)?;
+
+    // 8. Stage ONLY the heuristic-system path; refuse if anything else is dirty.
+    let stage = runner.run(
+        &git,
+        &["add", "-A", "--", hs_rel.as_str()],
+        Some(&worktree_path),
+    )?;
+    if !stage.success {
+        return Err(CliError::runtime(
+            "git-add-failed",
+            "git add failed in the records worktree",
+            Some(json!({ "stderr": stage.stderr.trim() })),
+        ));
+    }
+    let wt_status = runner.run(&git, &["status", "--porcelain"], Some(&worktree_path))?;
+    if !wt_status.success {
+        return Err(CliError::runtime(
+            "git-status-failed",
+            "git status failed in the records worktree",
+            Some(json!({ "stderr": wt_status.stderr.trim() })),
+        ));
+    }
+    let prefix = format!("{hs_rel}/");
+    let stray: Vec<String> = parse_porcelain_paths(&wt_status.stdout)
+        .into_iter()
+        .filter(|path| path != &hs_rel && !path.starts_with(&prefix))
+        .collect();
+    if !stray.is_empty() {
+        return Err(CliError::runtime(
+            "dirty-records-worktree",
+            "records worktree has changes outside the heuristic-system root",
+            Some(json!({ "stray_paths": stray, "worktree_path": worktree_display })),
+        ));
+    }
+
+    // 9. Commit via semantic-commit (in the records worktree).
+    let commit = runner.run(
+        &semantic_commit_bin(),
+        &[
+            "commit",
+            "--repo",
+            worktree_display.as_str(),
+            "--automation",
+            "--type",
+            args.kind.commit_type(),
+            "--scope",
+            DELIVER_SCOPE,
+            "--subject",
+            subject.as_str(),
+            "--format",
+            "json",
+        ],
+        None,
+    )?;
+    if !commit.success {
+        return Err(CliError::runtime(
+            "commit-failed",
+            "semantic-commit failed in the records worktree",
+            Some(json!({
+                "stderr": commit.stderr.trim(),
+                "stdout": commit.stdout.trim(),
+            })),
+        ));
+    }
+
+    // 10. Push the records branch.
+    let push = runner.run(
+        &git,
+        &["push", "-u", "origin", branch.as_str()],
+        Some(&worktree_path),
+    )?;
+    if !push.success {
+        return Err(CliError::runtime(
+            "push-failed",
+            format!("git push for {branch} failed"),
+            Some(json!({ "stderr": push.stderr.trim() })),
+        ));
+    }
+
+    // 11. Open the PR via forge-cli and parse the URL from its JSON envelope.
+    let create = runner.run(
+        &forge_bin(),
+        &[
+            "pr",
+            "create",
+            "--head",
+            branch.as_str(),
+            "--base",
+            base.as_str(),
+            "--kind",
+            args.kind.forge_kind(),
+            "--title",
+            title.as_str(),
+            "--body",
+            body.as_str(),
+            "--format",
+            "json",
+        ],
+        Some(&worktree_path),
+    )?;
+    let pr_url = parse_forge_pr_url(&create)?;
+
+    Ok(DeliverResult {
+        branch,
+        base,
+        kind: args.kind.forge_kind(),
+        dry_run: false,
+        pr_url: Some(pr_url),
+        committed_paths,
+        repo_root: display_path(&repo_root),
+        worktree_path: worktree_display,
+        plan: Vec::new(),
+    })
+}
+
+fn deliver_title(args: &DeliverArgs) -> String {
+    if args.title.trim().is_empty() {
+        format!(
+            "{}({DELIVER_SCOPE}): {DELIVER_COMMIT_SUBJECT}",
+            args.kind.commit_type()
+        )
+    } else {
+        args.title.trim().to_string()
+    }
+}
+
+fn deliver_body(
+    args: &DeliverArgs,
+    base: &str,
+    committed_paths: &[String],
+) -> Result<String, CliError> {
+    if let Some(body) = &args.body {
+        return Ok(body.clone());
+    }
+    if let Some(path) = &args.body_file {
+        return read_text(path);
+    }
+    let files = committed_paths
+        .iter()
+        .map(|path| format!("- `{path}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!(
+        "## Summary\n\nDeliver {n} heuristic-system retained-record change(s) on a dedicated \
+records branch off `origin/{base}`.\n\n{files}\n\n## Test plan\n\n- Records staged from the source \
+working tree under `{rel}` and committed via `semantic-commit`.\n- Branch created off `origin/{base}` \
+without touching the current branch.\n",
+        n = committed_paths.len(),
+        rel = DEFAULT_HEURISTIC_REL,
+    ))
+}
+
+fn parse_forge_pr_url(result: &RunResult) -> Result<String, CliError> {
+    let value: Value = serde_json::from_str(result.stdout.trim()).map_err(|err| {
+        CliError::runtime(
+            "forge-output-invalid",
+            format!("could not parse forge-cli pr create output: {err}"),
+            Some(json!({ "stdout": result.stdout.trim(), "stderr": result.stderr.trim() })),
+        )
+    })?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        let message = value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("forge-cli pr create did not succeed");
+        return Err(CliError::runtime(
+            "forge-create-failed",
+            message.to_string(),
+            Some(value.get("error").cloned().unwrap_or(Value::Null)),
+        ));
+    }
+    value
+        .pointer("/data/url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CliError::runtime(
+                "forge-url-missing",
+                "forge-cli pr create succeeded but returned no PR URL",
+                Some(json!({ "stdout": result.stdout.trim() })),
+            )
+        })
+}
+
+/// Copy each changed working-tree file into the records worktree; remove paths
+/// that no longer exist in the source (deletions). Only paths under the
+/// heuristic-system root are touched.
+fn transfer_records(
+    repo_root: &Path,
+    worktree_path: &Path,
+    paths: &[String],
+) -> Result<(), CliError> {
+    for rel in paths {
+        let src = repo_root.join(rel);
+        let dst = worktree_path.join(rel);
+        if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    CliError::runtime(
+                        "transfer-failed",
+                        format!("failed to create {}: {err}", parent.display()),
+                        Some(json!({ "path": rel })),
+                    )
+                })?;
+            }
+            fs::copy(&src, &dst).map_err(|err| {
+                CliError::runtime(
+                    "transfer-failed",
+                    format!("failed to copy {rel}: {err}"),
+                    Some(json!({ "path": rel })),
+                )
+            })?;
+        } else if !src.exists() && dst.exists() {
+            fs::remove_file(&dst).map_err(|err| {
+                CliError::runtime(
+                    "transfer-failed",
+                    format!("failed to remove {rel}: {err}"),
+                    Some(json!({ "path": rel })),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+// Managed-worktree path resolution, kept byte-compatible with `git-cli
+// worktree` so a `deliver` worktree is discoverable / removable via
+// `git-cli worktree list|remove <slug>`.
+
+fn managed_worktree_path(repo_root: &Path, slug: &str) -> PathBuf {
+    worktree_agent_home()
+        .join("worktrees")
+        .join(repo_key_for_path(repo_root))
+        .join(slug)
+}
+
+fn worktree_agent_home() -> PathBuf {
+    if let Some(value) = env_non_empty("AGENT_HOME") {
+        return PathBuf::from(value);
+    }
+    if let Some(value) = env_non_empty("XDG_STATE_HOME") {
+        return PathBuf::from(value).join("agent-runtime-kit");
+    }
+    if let Some(value) = env_non_empty("HOME") {
+        return PathBuf::from(value).join(".local/state/agent-runtime-kit");
+    }
+    env::temp_dir().join("agent-runtime-kit")
+}
+
+fn repo_key_for_path(repo_root: &Path) -> String {
+    let basename = repo_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("repo");
+    let slug = sanitize_slug_segment(basename);
+    let slug = if slug.is_empty() {
+        "repo".to_string()
+    } else {
+        slug
+    };
+    let hash = stable_short_hash(&repo_root.to_string_lossy());
+    format!("{slug}-{hash}")
+}
+
+/// Sanitize a slug/segment the same way `git-cli worktree` does so branch and
+/// path segments stay aligned across the two tools.
+fn sanitize_slug_segment(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches(['-', '_', '.']);
+    let mut sanitized: String = trimmed.chars().take(80).collect();
+    sanitized = sanitized.trim_matches(['-', '_', '.']).to_string();
+    sanitized
+}
+
+fn stable_short_hash(value: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", hash as u32)
+}
+
+// ---------------------------------------------------------------------------
 // Clap definitions
 // ---------------------------------------------------------------------------
 
@@ -2250,6 +2979,7 @@ where
         Command::SetStatus(args) => dispatch_set_status(args, &argv_strings, &started_at),
         Command::Archive(args) => dispatch_archive(args, &argv_strings, &started_at),
         Command::IngestEvidence(args) => dispatch_ingest(args, &argv_strings, &started_at),
+        Command::Deliver(args) => dispatch_deliver(args, &argv_strings, &started_at),
         Command::Completion(args) => completion::run::<Cli>(args.shell, "heuristic-inbox"),
     }
 }
@@ -2445,6 +3175,32 @@ fn dispatch_ingest(args: IngestArgs, argv: &[String], started_at: &str) -> i32 {
     code
 }
 
+fn dispatch_deliver(args: DeliverArgs, argv: &[String], started_at: &str) -> i32 {
+    let format = args.format;
+    let out_log = args.log_dir.clone();
+    let runner = ProcessCommandRunner;
+    let code = match run_deliver(&runner, &args) {
+        Ok(result) => render_success(
+            DELIVER_SCHEMA_VERSION,
+            DELIVER_COMMAND,
+            format,
+            || render_deliver_text(&result),
+            &result,
+        ),
+        Err(err) => render_error(DELIVER_SCHEMA_VERSION, DELIVER_COMMAND, format, err),
+    };
+    write_execution_log(
+        out_log.as_deref(),
+        DELIVER_COMMAND,
+        argv,
+        code,
+        started_at,
+        None,
+        None,
+    );
+    code
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "heuristic-inbox",
@@ -2453,7 +3209,7 @@ fn dispatch_ingest(args: IngestArgs, argv: &[String], started_at: &str) -> i32 {
     about = "Manage curated HEURISTIC_SYSTEM error-inbox and operation-record case folders.",
     long_about = "Manage curated heuristic-system inbox cases, operation records, evidence ingestion, and archival transitions.",
     disable_help_subcommand = true,
-    after_help = "EXAMPLES:\n  heuristic-inbox list --format json\n  heuristic-inbox verify heuristic-system/error-inbox/<slug>/ --format json\n  heuristic-inbox new --from-skill-usage out/.../skill-usage.record.json --slug pipeline-gap\n  heuristic-inbox new --from-evidence out/.../diagnosis.md --slug worktree-signing-gap\n  heuristic-inbox new --manual --slug live-diagnosis-gap --area cli --severity high\n  heuristic-inbox set-status heuristic-system/error-inbox/<slug>/ --status promoted --link docs/plans/foo.md\n  heuristic-inbox archive heuristic-system/error-inbox/<slug>/ --date 2026-05-18\n  heuristic-inbox ingest-evidence heuristic-system/error-inbox/<slug>/ --from validation.md\n  heuristic-inbox completion zsh\n\nENVIRONMENT:\n  HOME  Fallback base path when expanding home-relative paths.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
+    after_help = "EXAMPLES:\n  heuristic-inbox list --format json\n  heuristic-inbox verify heuristic-system/error-inbox/<slug>/ --format json\n  heuristic-inbox new --from-skill-usage out/.../skill-usage.record.json --slug pipeline-gap\n  heuristic-inbox new --from-evidence out/.../diagnosis.md --slug worktree-signing-gap\n  heuristic-inbox new --manual --slug live-diagnosis-gap --area cli --severity high\n  heuristic-inbox set-status heuristic-system/error-inbox/<slug>/ --status promoted --link docs/plans/foo.md\n  heuristic-inbox archive heuristic-system/error-inbox/<slug>/ --date 2026-05-18\n  heuristic-inbox ingest-evidence heuristic-system/error-inbox/<slug>/ --from validation.md\n  heuristic-inbox deliver --root core/policies/heuristic-system --dry-run --format json\n  heuristic-inbox completion zsh\n\nENVIRONMENT:\n  HOME  Fallback base path when expanding home-relative paths.\n  AGENT_HOME  Managed worktree root for `deliver` (matches git-cli worktree).\n  FORGE_CLI_BIN  Override the forge-cli binary used by `deliver`.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -2475,6 +3231,8 @@ enum Command {
     Archive(ArchiveArgs),
     /// Redact and write an evidence file inside a case folder.
     IngestEvidence(IngestArgs),
+    /// Deliver uncommitted heuristic-system records as a records-branch PR.
+    Deliver(DeliverArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
 }
@@ -2681,6 +3439,50 @@ struct IngestArgs {
 }
 
 #[derive(Debug, Args)]
+struct DeliverArgs {
+    /// Heuristic System root holding the uncommitted records
+    /// (defaults to <repo>/core/policies/heuristic-system).
+    #[arg(long = "root", value_name = "DIR", value_hint = ValueHint::DirPath)]
+    root: Option<PathBuf>,
+
+    /// Records branch slug (default: heuristic-records-<UTC date>).
+    #[arg(long)]
+    slug: Option<String>,
+
+    /// PR title (default: <type>(heuristic-system): deliver retained records).
+    #[arg(long, default_value = "")]
+    title: String,
+
+    /// PR body text. Mutually exclusive with --body-file.
+    #[arg(long, conflicts_with = "body_file")]
+    body: Option<String>,
+
+    /// Read PR body from a file.
+    #[arg(long = "body-file", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    body_file: Option<PathBuf>,
+
+    /// PR kind (selects the records branch-prefix rule).
+    #[arg(long, value_enum, default_value_t = DeliverKind::Docs)]
+    kind: DeliverKind,
+
+    /// Base branch the records branch forks from (origin/<base>).
+    #[arg(long, default_value = "main")]
+    base: String,
+
+    /// Render the plan / argv without fetching, creating a worktree, or pushing.
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+
+    /// Execution log directory override (defaults to agent-out topic heuristic-inbox).
+    #[arg(long = "log-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
+    log_dir: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
 struct CompletionArgs {
     /// Shell to generate completion script for.
     #[arg(value_enum)]
@@ -2866,5 +3668,255 @@ mod tests {
             "Resolve via plan #541.\n\nLifecycle link: `docs/plans/markdown-render-template-layer/`",
         );
         assert_or_bless("next_action_with_link.md", &out);
+    }
+
+    // -----------------------------------------------------------------------
+    // deliver
+    // -----------------------------------------------------------------------
+
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    use nils_test_support::{EnvGuard, GlobalStateLock};
+
+    /// Scripted `CommandRunner` that answers git / semantic-commit / forge-cli
+    /// calls from canned data and records every invocation. The `worktree add`
+    /// handler creates the target directory so `transfer_records` can run on a
+    /// real (temp) filesystem.
+    struct ScriptedRunner {
+        repo_root: PathBuf,
+        source_status: String,
+        worktree_status: String,
+        forge_stdout: String,
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl ScriptedRunner {
+        fn argv_log(&self) -> Vec<String> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|call| call.join(" "))
+                .collect()
+        }
+    }
+
+    impl CommandRunner for ScriptedRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            _cwd: Option<&Path>,
+        ) -> Result<RunResult, CliError> {
+            let mut record = vec![program.to_string()];
+            record.extend(args.iter().map(|a| a.to_string()));
+            self.calls.borrow_mut().push(record);
+
+            let ok = |stdout: &str| {
+                Ok(RunResult {
+                    success: true,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                })
+            };
+            match args {
+                ["rev-parse", "--show-toplevel"] => ok(&format!("{}\n", self.repo_root.display())),
+                ["status", "--porcelain", "-uall", "--", _] => ok(&self.source_status),
+                ["fetch", "origin", _] => ok(""),
+                ["worktree", "add", "-b", _branch, path, _base] => {
+                    fs::create_dir_all(path).expect("stub creates worktree dir");
+                    ok("")
+                }
+                ["add", "-A", "--", _] => ok(""),
+                ["status", "--porcelain"] => ok(&self.worktree_status),
+                ["commit", ..] => ok("{\"ok\":true}"),
+                ["push", "-u", "origin", _] => ok(""),
+                ["pr", "create", ..] => ok(&self.forge_stdout),
+                _ => Ok(RunResult {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: format!("unexpected call: {program} {args:?}"),
+                }),
+            }
+        }
+    }
+
+    const REC_REL: &str = "core/policies/heuristic-system/error-inbox/foo/ENTRY.md";
+
+    fn forge_envelope(url: &str) -> String {
+        format!(
+            "{{\"ok\":true,\"schema_version\":\"cli.forge-cli.pr.create.v1\",\
+\"data\":{{\"provider\":\"github\",\"number\":7,\"url\":\"{url}\",\"head\":\"docs/fixed-slug\",\
+\"base\":\"main\",\"draft\":true,\"title\":\"t\",\"kind\":\"docs\"}}}}"
+        )
+    }
+
+    fn deliver_args(repo: &Path, dry_run: bool) -> DeliverArgs {
+        DeliverArgs {
+            root: Some(repo.join("core/policies/heuristic-system")),
+            slug: Some("fixed-slug".to_string()),
+            title: String::new(),
+            body: None,
+            body_file: None,
+            kind: DeliverKind::Docs,
+            base: "main".to_string(),
+            dry_run,
+            log_dir: None,
+            format: OutputFormat::Json,
+        }
+    }
+
+    fn seed_repo() -> tempfile::TempDir {
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        let file = repo.path().join(REC_REL);
+        fs::create_dir_all(file.parent().unwrap()).expect("mkdir record");
+        fs::write(&file, "# record\n").expect("write record");
+        repo
+    }
+
+    #[test]
+    fn deliver_branch_prefix_tracks_kind() {
+        assert_eq!(records_branch(DeliverKind::Docs, "x"), "docs/x");
+        assert_eq!(records_branch(DeliverKind::Feature, "x"), "feat/x");
+        assert_eq!(records_branch(DeliverKind::Bug, "x"), "fix/x");
+        assert_eq!(records_branch(DeliverKind::Chore, "x"), "chore/x");
+        assert_eq!(records_branch(DeliverKind::Ci, "x"), "ci/x");
+        assert_eq!(records_branch(DeliverKind::Refactor, "x"), "refactor/x");
+    }
+
+    #[test]
+    fn deliver_parse_porcelain_handles_rename_and_untracked() {
+        let stdout = " M core/a.md\n?? core/b.md\nR  core/old.md -> core/new.md\n D core/gone.md\n";
+        let paths = parse_porcelain_paths(stdout);
+        assert_eq!(
+            paths,
+            vec!["core/a.md", "core/b.md", "core/new.md", "core/gone.md"]
+        );
+    }
+
+    #[test]
+    fn deliver_parse_forge_pr_url_extracts_url() {
+        let result = RunResult {
+            success: true,
+            stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            parse_forge_pr_url(&result).expect("url"),
+            "https://github.com/o/r/pull/7"
+        );
+    }
+
+    #[test]
+    fn deliver_parse_forge_pr_url_surfaces_failure_envelope() {
+        let result = RunResult {
+            success: true,
+            stdout:
+                "{\"ok\":false,\"error\":{\"code\":\"dirty_worktree\",\"message\":\"unclean\"}}"
+                    .to_string(),
+            stderr: String::new(),
+        };
+        let err = parse_forge_pr_url(&result).expect_err("should fail");
+        assert_eq!(err.code(), "forge-create-failed");
+    }
+
+    #[test]
+    fn deliver_happy_path_opens_pr() {
+        let lock = GlobalStateLock::new();
+        let repo = seed_repo();
+        let _agent_home = EnvGuard::set(
+            &lock,
+            "AGENT_HOME",
+            &repo.path().join(".agent-home").to_string_lossy(),
+        );
+        let runner = ScriptedRunner {
+            repo_root: repo.path().to_path_buf(),
+            source_status: format!("?? {REC_REL}\n"),
+            worktree_status: format!(" M {REC_REL}\n"),
+            forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let result = run_deliver(&runner, &deliver_args(repo.path(), false)).expect("deliver ok");
+
+        assert_eq!(result.branch, "docs/fixed-slug");
+        assert!(!result.dry_run);
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/7")
+        );
+        assert_eq!(result.committed_paths, vec![REC_REL.to_string()]);
+
+        let log = runner.argv_log();
+        assert!(log.iter().any(|c| c == "git fetch origin main"), "{log:?}");
+        assert!(
+            log.iter().any(
+                |c| c.contains("worktree add -b docs/fixed-slug") && c.ends_with("origin/main")
+            ),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.starts_with("forge-cli pr create")),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn deliver_refuses_when_records_worktree_has_stray_paths() {
+        let lock = GlobalStateLock::new();
+        let repo = seed_repo();
+        let _agent_home = EnvGuard::set(
+            &lock,
+            "AGENT_HOME",
+            &repo.path().join(".agent-home").to_string_lossy(),
+        );
+        let runner = ScriptedRunner {
+            repo_root: repo.path().to_path_buf(),
+            source_status: format!("?? {REC_REL}\n"),
+            // A stray non-heuristic-system path leaked into the records worktree.
+            worktree_status: format!(" M {REC_REL}\n M src/unrelated.rs\n"),
+            forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let err =
+            run_deliver(&runner, &deliver_args(repo.path(), false)).expect_err("should refuse");
+        assert_eq!(err.code(), "dirty-records-worktree");
+
+        // It must refuse BEFORE committing or pushing.
+        let log = runner.argv_log();
+        assert!(
+            !log.iter().any(|c| c.starts_with("semantic-commit commit")),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|c| c.starts_with("git push")), "{log:?}");
+    }
+
+    #[test]
+    fn deliver_dry_run_skips_side_effects() {
+        let lock = GlobalStateLock::new();
+        let repo = seed_repo();
+        let _agent_home = EnvGuard::set(
+            &lock,
+            "AGENT_HOME",
+            &repo.path().join(".agent-home").to_string_lossy(),
+        );
+        let runner = ScriptedRunner {
+            repo_root: repo.path().to_path_buf(),
+            source_status: format!("?? {REC_REL}\n"),
+            worktree_status: String::new(),
+            forge_stdout: String::new(),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let result = run_deliver(&runner, &deliver_args(repo.path(), true)).expect("dry-run ok");
+
+        assert!(result.dry_run);
+        assert!(result.pr_url.is_none());
+        assert_eq!(result.plan.len(), 6);
+        // Only read-only resolution ran: rev-parse + status. No fetch/worktree/push.
+        let log = runner.argv_log();
+        assert!(!log.iter().any(|c| c.contains("worktree add")), "{log:?}");
+        assert!(!log.iter().any(|c| c.starts_with("git fetch")), "{log:?}");
     }
 }
