@@ -124,6 +124,7 @@ _arguments "${_arguments_options[@]}" : \
 '--body-file=[Read PR body from a file]:PATH:_files' \
 '--kind=[PR kind (selects the records branch-prefix rule)]:KIND:(feature bug chore docs ci refactor)' \
 '--base=[Base branch the records branch forks from (origin/<base>)]:BASE:_default' \
+'*--label=[Apply a label to the records PR (repeatable). Forwarded verbatim to \`forge-cli pr create --label\`]:LABEL:_default' \
 '--log-dir=[Execution log directory override (defaults to agent-out topic heuristic-inbox)]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
