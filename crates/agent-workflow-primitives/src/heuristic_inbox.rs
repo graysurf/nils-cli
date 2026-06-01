@@ -2533,6 +2533,13 @@ fn run_deliver(runner: &dyn CommandRunner, args: &DeliverArgs) -> Result<Deliver
     let body = deliver_body(args, &base, &committed_paths)?;
     let subject = DELIVER_COMMIT_SUBJECT.to_string();
 
+    // Labels forwarded verbatim to `forge-cli pr create --label` (repeatable).
+    let label_args: Vec<String> = args
+        .label
+        .iter()
+        .flat_map(|label| ["--label".to_string(), label.clone()])
+        .collect();
+
     // Planned subprocesses, in order, for --dry-run rendering and execution.
     let plan = vec![
         PlanStep {
@@ -2582,22 +2589,26 @@ fn run_deliver(runner: &dyn CommandRunner, args: &DeliverArgs) -> Result<Deliver
         },
         PlanStep {
             program: forge_bin(),
-            argv: vec![
-                "pr".into(),
-                "create".into(),
-                "--head".into(),
-                branch.clone(),
-                "--base".into(),
-                base.clone(),
-                "--kind".into(),
-                args.kind.forge_kind().into(),
-                "--title".into(),
-                title.clone(),
-                "--body".into(),
-                "<rendered-body>".into(),
-                "--format".into(),
-                "json".into(),
-            ],
+            argv: {
+                let mut argv = vec![
+                    "pr".into(),
+                    "create".into(),
+                    "--head".into(),
+                    branch.clone(),
+                    "--base".into(),
+                    base.clone(),
+                    "--kind".into(),
+                    args.kind.forge_kind().into(),
+                    "--title".into(),
+                    title.clone(),
+                    "--body".into(),
+                    "<rendered-body>".into(),
+                    "--format".into(),
+                    "json".into(),
+                ];
+                argv.extend(label_args.clone());
+                argv
+            },
             cwd: Some(worktree_display.clone()),
         },
     ];
@@ -2733,26 +2744,24 @@ fn run_deliver(runner: &dyn CommandRunner, args: &DeliverArgs) -> Result<Deliver
     }
 
     // 11. Open the PR via forge-cli and parse the URL from its JSON envelope.
-    let create = runner.run(
-        &forge_bin(),
-        &[
-            "pr",
-            "create",
-            "--head",
-            branch.as_str(),
-            "--base",
-            base.as_str(),
-            "--kind",
-            args.kind.forge_kind(),
-            "--title",
-            title.as_str(),
-            "--body",
-            body.as_str(),
-            "--format",
-            "json",
-        ],
-        Some(&worktree_path),
-    )?;
+    let mut create_argv: Vec<&str> = vec![
+        "pr",
+        "create",
+        "--head",
+        branch.as_str(),
+        "--base",
+        base.as_str(),
+        "--kind",
+        args.kind.forge_kind(),
+        "--title",
+        title.as_str(),
+        "--body",
+        body.as_str(),
+        "--format",
+        "json",
+    ];
+    create_argv.extend(label_args.iter().map(String::as_str));
+    let create = runner.run(&forge_bin(), &create_argv, Some(&worktree_path))?;
     let pr_url = parse_forge_pr_url(&create)?;
 
     Ok(DeliverResult {
@@ -3469,6 +3478,11 @@ struct DeliverArgs {
     #[arg(long, default_value = "main")]
     base: String,
 
+    /// Apply a label to the records PR (repeatable). Forwarded verbatim to
+    /// `forge-cli pr create --label`.
+    #[arg(long = "label", value_name = "LABEL")]
+    label: Vec<String>,
+
     /// Render the plan / argv without fetching, creating a worktree, or pushing.
     #[arg(long = "dry-run")]
     dry_run: bool,
@@ -3760,6 +3774,7 @@ mod tests {
             body_file: None,
             kind: DeliverKind::Docs,
             base: "main".to_string(),
+            label: Vec::new(),
             dry_run,
             log_dir: None,
             format: OutputFormat::Json,
@@ -3858,6 +3873,74 @@ mod tests {
         assert!(
             log.iter().any(|c| c.starts_with("forge-cli pr create")),
             "{log:?}"
+        );
+    }
+
+    #[test]
+    fn deliver_forwards_labels_to_forge() {
+        let lock = GlobalStateLock::new();
+        let repo = seed_repo();
+        let _agent_home = EnvGuard::set(
+            &lock,
+            "AGENT_HOME",
+            &repo.path().join(".agent-home").to_string_lossy(),
+        );
+        let runner = ScriptedRunner {
+            repo_root: repo.path().to_path_buf(),
+            source_status: format!("?? {REC_REL}\n"),
+            worktree_status: format!(" M {REC_REL}\n"),
+            forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut args = deliver_args(repo.path(), false);
+        args.label = vec![
+            "workflow::heuristic-records".to_string(),
+            "area::skills".to_string(),
+        ];
+
+        run_deliver(&runner, &args).expect("deliver ok");
+
+        let create = runner
+            .argv_log()
+            .into_iter()
+            .find(|c| c.starts_with("forge-cli pr create"))
+            .expect("forge pr create call recorded");
+        assert!(
+            create.contains("--label workflow::heuristic-records"),
+            "{create}"
+        );
+        assert!(create.contains("--label area::skills"), "{create}");
+    }
+
+    #[test]
+    fn deliver_dry_run_renders_labels_in_plan() {
+        let lock = GlobalStateLock::new();
+        let repo = seed_repo();
+        let _agent_home = EnvGuard::set(
+            &lock,
+            "AGENT_HOME",
+            &repo.path().join(".agent-home").to_string_lossy(),
+        );
+        let runner = ScriptedRunner {
+            repo_root: repo.path().to_path_buf(),
+            source_status: format!("?? {REC_REL}\n"),
+            worktree_status: String::new(),
+            forge_stdout: String::new(),
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut args = deliver_args(repo.path(), true);
+        args.label = vec!["workflow::heuristic-records".to_string()];
+
+        let result = run_deliver(&runner, &args).expect("dry-run ok");
+        let forge_step = result
+            .plan
+            .iter()
+            .find(|s| s.argv.first().map(String::as_str) == Some("pr"))
+            .expect("forge plan step");
+        let joined = forge_step.argv.join(" ");
+        assert!(
+            joined.contains("--label workflow::heuristic-records"),
+            "{joined}"
         );
     }
 

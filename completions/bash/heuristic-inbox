@@ -126,7 +126,7 @@ _heuristic-inbox() {
             return 0
             ;;
         heuristic__inbox__deliver)
-            opts="-h --root --slug --title --body --body-file --kind --base --dry-run --log-dir --format --help"
+            opts="-h --root --slug --title --body --body-file --kind --base --label --dry-run --log-dir --format --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -171,6 +171,10 @@ _heuristic-inbox() {
                     return 0
                     ;;
                 --base)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --label)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

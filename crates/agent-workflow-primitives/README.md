@@ -163,6 +163,11 @@ Mechanics:
 4. Commit via `semantic-commit`, push the records branch, and open the PR via
    `forge-cli pr create --kind <kind>`.
 
+Pass `--label <NAME>` (repeatable) to tag the records PR; each label is
+forwarded verbatim to `forge-cli pr create --label` so the PR is identifiable by
+taxonomy (e.g. a `heuristic-session-closeout` records PR carries
+`--label workflow::heuristic-records`).
+
 Output envelope (`cli.heuristic-inbox.deliver.v1`) carries `branch`, `pr_url`,
 `committed_paths`, plus `worktree_path` for cleanup and (on `--dry-run`) the
 ordered `plan`. The `git` / `semantic-commit` / `forge-cli` binaries are
