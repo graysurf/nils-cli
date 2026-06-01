@@ -1390,12 +1390,106 @@ Promote after a durable fix and validation are linked.\n\n\
             "set-status",
             "archive",
             "ingest-evidence",
+            "deliver",
         ] {
             assert!(
                 stdout.contains(keyword),
                 "missing subcommand '{keyword}' in help: {stdout}"
             );
         }
+    }
+
+    fn init_repo_with_record(dir: &Path) {
+        nils_test_support::git::init_repo_at_with(
+            dir,
+            nils_test_support::git::InitRepoOptions::new().with_branch("main"),
+        );
+        let rec = dir.join("core/policies/heuristic-system/error-inbox/foo/ENTRY.md");
+        fs::create_dir_all(rec.parent().unwrap()).expect("mkdir record");
+        fs::write(&rec, "# record\n").expect("write record");
+    }
+
+    #[test]
+    fn deliver_dry_run_renders_plan_without_side_effects() {
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        init_repo_with_record(repo.path());
+
+        let out = run(
+            "heuristic-inbox",
+            repo.path(),
+            &["deliver", "--dry-run", "--format", "json"],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["data"]["dry_run"], true);
+        assert!(payload["data"]["pr_url"].is_null());
+        assert!(
+            payload["data"]["branch"]
+                .as_str()
+                .expect("branch")
+                .starts_with("docs/")
+        );
+        let paths = payload["data"]["committed_paths"]
+            .as_array()
+            .expect("committed_paths array");
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0]
+                .as_str()
+                .expect("path")
+                .ends_with("error-inbox/foo/ENTRY.md")
+        );
+        // The plan must include the forge-cli pr create step but nothing ran.
+        let plan = payload["data"]["plan"].as_array().expect("plan array");
+        assert_eq!(plan.len(), 6);
+    }
+
+    #[test]
+    fn deliver_kind_feature_uses_feat_branch_prefix() {
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        init_repo_with_record(repo.path());
+
+        let out = run(
+            "heuristic-inbox",
+            repo.path(),
+            &[
+                "deliver",
+                "--dry-run",
+                "--kind",
+                "feature",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = json_stdout(&out);
+        assert!(
+            payload["data"]["branch"]
+                .as_str()
+                .expect("branch")
+                .starts_with("feat/")
+        );
+        assert_eq!(payload["data"]["kind"], "feature");
+    }
+
+    #[test]
+    fn deliver_without_records_errors_nothing_to_deliver() {
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        nils_test_support::git::init_repo_at_with(
+            repo.path(),
+            nils_test_support::git::InitRepoOptions::new().with_branch("main"),
+        );
+
+        let out = run(
+            "heuristic-inbox",
+            repo.path(),
+            &["deliver", "--dry-run", "--format", "json"],
+        );
+        assert_ne!(out.code, 0);
+        let payload = json_stdout(&out);
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["error"]["code"], "nothing-to-deliver");
     }
 
     #[test]

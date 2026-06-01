@@ -16,7 +16,7 @@ These tools are required for common command paths. Each row is anchored to at le
 
 | Tool | Used By | Requirement Level | Install (brew/linuxbrew) |
 |---|---|---|---|
-| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `codex-cli`, `gemini-cli`, `fzf-cli git-*` | Required | `brew install git` |
+| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `codex-cli`, `gemini-cli`, `fzf-cli git-*`, `heuristic-inbox deliver` | Required | `brew install git` |
 | `fzf` | `fzf-cli` interactive commands | Required (for `fzf-cli`) | `brew install fzf` |
 | `grpcurl` | `api-grpc` unary backend (via `api-testing-core::grpc::runner`); overridable with `GRPCURL_BIN` | Required (for `api-grpc call` / suite gRPC cases) | `brew install grpcurl` |
 | `ffmpeg` | `screen-record` on Linux (X11 + Wayland portal capture, audio mux) | Required on Linux | `brew install ffmpeg` |

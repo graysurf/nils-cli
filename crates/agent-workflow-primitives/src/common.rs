@@ -32,6 +32,12 @@ struct CliErrorData {
 }
 
 impl CliError {
+    /// Machine-readable error code (the `error.code` envelope field).
+    #[allow(dead_code)]
+    pub fn code(&self) -> &str {
+        &self.0.code
+    }
+
     pub fn usage(
         code: impl Into<String>,
         message: impl Into<String>,
