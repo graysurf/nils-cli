@@ -1,9 +1,7 @@
 //! Canonical runtime layout for plan-issue artifacts.
 //!
-//! Path math derived from
-//! `agent-kit/skills/automation/plan-issue-delivery/references/RUNTIME_LAYOUT.md`.
-//! See also `docs/specs/plan-issue-contract-v2.md` "Canonical Runtime
-//! Artifacts (v2)".
+//! Path math defined by `docs/specs/plan-issue-contract-v2.md` "Canonical
+//! Runtime Artifacts (v2)".
 
 use std::error::Error;
 use std::fmt;

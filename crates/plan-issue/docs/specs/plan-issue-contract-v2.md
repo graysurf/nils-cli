@@ -75,8 +75,7 @@ The header remains stable in v2; only the metadata generation authority changed.
 ## Canonical Runtime Artifacts (v2)
 
 The `start-plan` and `start-sprint` commands materialize runtime artifacts under
-the canonical layout defined by
-`agent-kit/skills/automation/plan-issue-delivery/references/RUNTIME_LAYOUT.md`.
+the canonical layout defined in this document.
 
 Layout root and namespacing:
 
@@ -133,9 +132,7 @@ Per-task dispatch record (owned by `start-sprint`):
 - Optional adapter keys (`runtime_name`, `runtime_role`,
   `runtime_role_fallback_reason`) are intentionally **absent** from the
   binary's emission. The active runtime adapter (claude-code, codex,
-  opencode) injects them at dispatch time per canonical
-  `agent-kit/skills/automation/plan-issue-delivery/SKILL.md` L81-82 +
-  L138-144.
+  opencode) injects them at dispatch time.
 
 Worktree path rules:
 

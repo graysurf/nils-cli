@@ -1237,7 +1237,7 @@ fn create_repo_retro_core_policies_fixture(tmp: &Path) -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// heuristic-inbox integration tests (parity with agent-kit reference helper).
+// heuristic-inbox integration tests (parity with the original reference helper).
 // ---------------------------------------------------------------------------
 
 mod heuristic_inbox {

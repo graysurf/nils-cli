@@ -5,7 +5,7 @@
 This spec is the canonical contract for `forge-cli`, a new binary in the
 `nils-cli` workspace. `forge-cli` provides a provider-neutral surface for
 the remote forge operations that today are run directly against `gh` and
-`glab` from agent-kit skills (PR/MR lifecycle, Issue lifecycle, CI
+`glab` from agent-runtime-kit skills (PR/MR lifecycle, Issue lifecycle, CI
 wait). Two backends ship together: GitHub (wraps `gh`) and GitLab
 (wraps `glab`). Behaviour, validation, and exit semantics are identical
 across backends; only the underlying subprocess and the rendered help
@@ -13,7 +13,7 @@ text differ.
 
 Goals:
 
-- Replace ad-hoc `gh`/`glab` invocations scattered across agent-kit
+- Replace ad-hoc `gh`/`glab` invocations scattered across agent-runtime-kit
   skills with one binary that enforces branch / body / state policy at
   the type level.
 - Manage provider labels from a caller-supplied machine-readable catalog
@@ -39,7 +39,7 @@ Non-goals (v1):
   api` directly from the bash shell until then.
 - Issue *macros* beyond create/view/edit/comment/close/reopen — the
   full plan-issue / dispatch-pr-review orchestration stays in
-  agent-kit skills for now.
+  agent-runtime-kit skills for now.
 
 ## Scope
 
@@ -60,7 +60,7 @@ In scope (v1):
   `label ensure`.
 - Read-only helpers used by the macros: `auth status`, `repo view`.
 - Macro ops: `pr deliver` (kind = `feature` | `bug`), composing the
-  atoms above into the agent-kit standard "open draft → wait CI →
+  atoms above into the agent-runtime-kit standard "open draft → wait CI →
   ready → merge → cleanup" flow.
 
 Out of scope (v1): inbox mutations, release management, label deletion or
@@ -355,7 +355,7 @@ backend mapping, validation rules, and output schema versions.
 
 ## Macro: `pr deliver`
 
-`pr deliver` is the canonical end-to-end flow agent-kit's
+`pr deliver` is the canonical end-to-end flow agent-runtime-kit's
 `deliver-{feature,bug}-pr` skills compose today. It is implemented in
 Rust so behaviour is fixed at the type level and identical across
 providers.
@@ -438,7 +438,7 @@ backend implementations cannot diverge.
     default (`--delete-branch` on `gh`, `--remove-source-branch` on
     `glab`). Disable with `--keep-branch`. Local branch cleanup is
     out of scope for `forge-cli` and remains the bash wrapper's job
-    in agent-kit skills.
+    in agent-runtime-kit skills.
 11. **Portable paths.** PR/MR and issue title, body, and comment text MUST
     NOT embed a machine-local home path (`/Users/<owner>/…`,
     `/home/<owner>/…`). This mirrors the repo-side portable-paths file hook on
@@ -618,7 +618,7 @@ without exception:
 | `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks timeout, GitLab VPN probe failure, backend timeout. |
 | `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).                                                     |
 
-Callers (agent-kit skills, CI scripts) MUST branch on `error.kind`
+Callers (agent-runtime-kit skills, CI scripts) MUST branch on `error.kind`
 when finer granularity is needed. Numeric exit codes alone are
 intentionally not enough to distinguish "branch name invalid" from
 "missing Test plan section" — both are `DATA 65` because both are
@@ -700,12 +700,12 @@ host classification:
 invocation (single call per provider, memoised). They are not refreshed
 mid-run.
 
-## Migration plan: agent-kit skills → forge-cli
+## Migration plan: agent-runtime-kit skills → forge-cli
 
 This is the v1 acceptance target. Every row below MUST be reachable
-through `forge-cli` before agent-kit can adopt the new CLI:
+through `forge-cli` before agent-runtime-kit can adopt the new CLI:
 
-| agent-kit skill                                | forge-cli op                                            |
+| agent-runtime-kit skill                        | forge-cli op                                            |
 | ---------------------------------------------- | ------------------------------------------------------- |
 | `create-github-pr` / `create-feature-pr`       | `forge-cli pr create --kind feature`                    |
 | `create-bug-pr`                                | `forge-cli pr create --kind bug`                        |
