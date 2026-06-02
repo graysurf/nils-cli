@@ -99,4 +99,3 @@ cargo run -p nils-image-processing -- convert \
 ## Docs
 
 - [Docs index](docs/README.md)
-- [LLM SVG workflow runbook](docs/runbooks/llm-svg-workflow.md)
