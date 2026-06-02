@@ -10,7 +10,6 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-const JPEG_QUALITY: u8 = 90;
 const PNG_COMPRESSION: PngCompression = PngCompression::Best;
 const PNG_FILTER: PngFilter = PngFilter::NoFilter;
 
@@ -226,6 +225,7 @@ pub fn render_svg_to_output(
     output_format: &str,
     output_path: &Path,
     raster_size_hint: RasterSizeHint,
+    jpeg_quality: u8,
     dry_run: bool,
 ) -> anyhow::Result<ImageInfo> {
     match output_format {
@@ -255,7 +255,7 @@ pub fn render_svg_to_output(
                 match output_format {
                     "png" => write_png(output_path, width, height, &rgba)?,
                     "webp" => write_webp(output_path, width, height, &rgba)?,
-                    "jpg" => write_jpg(output_path, width, height, &rgba)?,
+                    "jpg" => write_jpg(output_path, width, height, &rgba, jpeg_quality)?,
                     other => {
                         return Err(anyhow::anyhow!("unsupported raster output format: {other}"));
                     }
@@ -453,11 +453,11 @@ fn write_webp(path: &Path, width: u32, height: u32, rgba: &[u8]) -> anyhow::Resu
         .map_err(|err| anyhow::anyhow!("failed to encode webp: {err}"))
 }
 
-fn write_jpg(path: &Path, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<()> {
+fn write_jpg(path: &Path, width: u32, height: u32, rgba: &[u8], quality: u8) -> anyhow::Result<()> {
     let file = File::create(path)?;
     let writer = BufWriter::new(file);
     let rgb = flatten_rgba_to_rgb(rgba);
-    JpegEncoder::new_with_quality(writer, JPEG_QUALITY)
+    JpegEncoder::new_with_quality(writer, quality)
         .encode(&rgb, width, height, ExtendedColorType::Rgb8)
         .map_err(|err| anyhow::anyhow!("failed to encode jpg: {err}"))
 }
