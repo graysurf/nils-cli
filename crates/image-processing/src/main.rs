@@ -93,6 +93,11 @@ fn run() -> i32 {
         } else {
             None
         },
+        quality: if cli.subcommand == Operation::Convert {
+            cli.quality
+        } else {
+            None
+        },
         overwrite: cli.overwrite,
         dry_run: cli.dry_run,
         report_enabled: cli.report,
@@ -201,6 +206,14 @@ fn validate(cli: &Cli) -> Result<(), util::UsageError> {
                 });
             }
 
+            if let Some(quality) = cli.quality
+                && !(1..=100).contains(&quality)
+            {
+                return Err(util::UsageError {
+                    message: "convert --quality must be between 1 and 100".to_string(),
+                });
+            }
+
             if let Some(to) = cli.to.as_deref()
                 && convert::normalize_convert_target(to).is_none()
             {
@@ -230,6 +243,9 @@ fn validate(cli: &Cli) -> Result<(), util::UsageError> {
             }
             if cli.height.is_some() {
                 forbid("--height")?;
+            }
+            if cli.quality.is_some() {
+                forbid("--quality")?;
             }
         }
     }
@@ -267,6 +283,7 @@ mod tests {
             to: None,
             width: None,
             height: None,
+            quality: None,
         }
     }
 
@@ -310,6 +327,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_convert_quality_range() {
+        let mut cli = base_cli(Operation::Convert);
+        cli.inputs = vec!["photo.jpg".to_string()];
+        cli.to = Some("jpg".to_string());
+
+        cli.quality = Some(0);
+        let err = validate(&cli).expect_err("quality 0 should be rejected");
+        assert!(
+            err.to_string()
+                .contains("--quality must be between 1 and 100")
+        );
+
+        cli.quality = Some(101);
+        let err = validate(&cli).expect_err("quality 101 should be rejected");
+        assert!(
+            err.to_string()
+                .contains("--quality must be between 1 and 100")
+        );
+
+        cli.quality = Some(85);
+        assert!(validate(&cli).is_ok());
+    }
+
+    #[test]
     fn validate_svg_validate_contract() {
         let mut cli = base_cli(Operation::SvgValidate);
         let err = validate(&cli).expect_err("svg-validate requires one --in");
@@ -341,6 +382,14 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("svg-validate does not support --width")
+        );
+
+        cli.width = None;
+        cli.quality = Some(80);
+        let err = validate(&cli).expect_err("svg-validate should reject --quality");
+        assert!(
+            err.to_string()
+                .contains("svg-validate does not support --quality")
         );
     }
 }

@@ -47,6 +47,7 @@ pub struct ProcessArgs<'a> {
     pub convert_to: Option<&'a str>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    pub quality: Option<u8>,
     pub overwrite: bool,
     pub dry_run: bool,
     pub report_enabled: bool,
@@ -64,6 +65,7 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
         convert_to,
         width,
         height,
+        quality,
         overwrite,
         dry_run,
         report_enabled,
@@ -71,6 +73,7 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
     } = args;
 
     let _ = json_enabled;
+    let jpeg_quality = quality.unwrap_or(convert::DEFAULT_JPEG_QUALITY);
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let input_abs = util::abs_path(input_path, &cwd);
@@ -112,6 +115,8 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
 
     let mut commands: Vec<String> = Vec::new();
     let mut item_commands: Vec<String> = Vec::new();
+    let mut item_warnings: Vec<String> = Vec::new();
+    let mut auto_orient: Option<bool> = None;
     let mut item_error: Option<String> = None;
     let mut output_info: Option<ImageInfo> = None;
     let mut backend = toolchain::RUST_SVG_VALIDATE_BACKEND;
@@ -130,6 +135,14 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
                 input_format: Some(loaded.input_format().to_string()),
             };
             input_info = loaded.input_info(input_size_bytes);
+            if loaded.source_mode() == "raster" {
+                auto_orient = Some(true);
+            }
+            if quality.is_some() && target != "jpg" {
+                item_warnings.push(format!(
+                    "--quality is ignored for {target} output (png/webp are lossless)"
+                ));
+            }
             let to_raw = convert_to.unwrap_or(target);
 
             let mut cmd = vec![
@@ -148,13 +161,17 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
             if let Some(height) = height {
                 cmd.extend(["--height".to_string(), height.to_string()]);
             }
+            if let Some(quality) = quality {
+                cmd.extend(["--quality".to_string(), quality.to_string()]);
+            }
             if dry_run {
                 cmd.push("--dry-run".to_string());
             }
             item_commands.push(util::command_str(&cmd));
 
-            let render_result = convert_raster_size_hint(width, height)
-                .and_then(|hint| loaded.render_to_output(target, &output_abs, hint, dry_run));
+            let render_result = convert_raster_size_hint(width, height).and_then(|hint| {
+                loaded.render_to_output(target, &output_abs, hint, jpeg_quality, dry_run)
+            });
 
             match render_result {
                 Ok(info) => {
@@ -238,7 +255,7 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
         input_info,
         output_info,
         commands: item_commands,
-        warnings: Vec::new(),
+        warnings: item_warnings.clone(),
         error: item_error,
     }];
 
@@ -277,7 +294,7 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
         dry_run,
         options: SummaryOptions {
             overwrite,
-            auto_orient: None,
+            auto_orient,
             strip_metadata: false,
             background: if convert_target == Some("jpg") {
                 Some("white".to_string())
@@ -289,7 +306,7 @@ pub fn process_items(args: ProcessArgs<'_>) -> anyhow::Result<Summary> {
         commands,
         collisions: Vec::new(),
         skipped: Vec::new(),
-        warnings: Vec::new(),
+        warnings: item_warnings,
         items,
     };
 

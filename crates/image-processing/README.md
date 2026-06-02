@@ -37,6 +37,7 @@ Help:
 - Output: `--out <file>`
 - Output controls: `--overwrite`, `--dry-run`, `--json`, `--report`
 - Render sizing for raster output: `--width`, `--height`
+- JPEG encode quality: `--quality` (1-100)
 
 ## `convert` contract
 
@@ -44,12 +45,16 @@ Help:
 - Supported inputs: `svg`, `png`, `jpg`, `jpeg`, `webp`.
 - `--out` extension must match `--to` (`.jpeg` is accepted for `--to jpg`).
 - Optional: `--width` and `--height` for raster sizing.
+- Optional: `--quality 1-100` sets JPEG quality (default 90). PNG and WebP are
+  lossless, so `--quality` is ignored for them and a warning is reported.
 - `--to jpg` flattens alpha onto a white background.
+- Raster inputs are auto-oriented: any EXIF orientation is applied on decode,
+  and the detected Exif code is reported as `exif_orientation` in JSON output.
 
 ## `svg-validate` contract
 
 - Required: exactly one `--in <svg>` and `--out <svg>`.
-- Forbidden: `--to`, `--width`, `--height`.
+- Forbidden: `--to`, `--width`, `--height`, `--quality`.
 - Output is deterministic for identical input.
 
 ## Examples
