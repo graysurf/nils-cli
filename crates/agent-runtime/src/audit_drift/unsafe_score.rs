@@ -10,6 +10,14 @@
 //! suppressed. Suppressed findings stay in the in-memory report so
 //! `audit-drift --verbose` can explain why a keyword-only line did not
 //! become a warning.
+//!
+//! The high-entropy signal deliberately skips value runs that decompose
+//! into a path / kebab-case / dated identifier (segments split on
+//! `/ - . _` that are each a short lowercase-or-digit word or numeric
+//! token, e.g. `docs/plans/2026-05-27-foo/foo-execution-state.md`). Those
+//! are ordinary documentation cross-references, not secrets. Real
+//! base64/hex tokens still flag: they are one long undelimited run, carry
+//! uppercase / `+` / `=`, or have segments far longer than a word.
 
 use crate::audit_drift::walk;
 use crate::audit_drift::{DriftReport, Finding, PRODUCTS, Severity};
@@ -25,6 +33,12 @@ const BLOCK_THRESHOLD: f64 = 0.8;
 const WARN_THRESHOLD: f64 = 0.4;
 const ENTROPY_THRESHOLD: f64 = 4.0;
 const MIN_VALUE_RUN: usize = 24;
+/// Path / kebab / dated identifier runs decompose into segments no longer
+/// than this; a longer segment looks like an opaque token, not a word.
+const MAX_SLUG_SEGMENT_LEN: usize = 16;
+/// A path / slug run carries at least this many delimiter-separated word
+/// segments; one or two segments is just a token, not a path.
+const MIN_SLUG_SEGMENTS: usize = 3;
 
 const KEYWORDS: &[&str] = &[
     "token",
@@ -215,6 +229,7 @@ fn line_has_keyword_value(line: &str) -> bool {
 fn line_has_high_entropy_run(line: &str) -> bool {
     value_runs(line).any(|run| {
         is_entropy_candidate(run)
+            && !looks_like_path_or_slug(run)
             && run.len() >= MIN_VALUE_RUN
             && shannon_entropy(run) >= ENTROPY_THRESHOLD
     })
@@ -248,6 +263,32 @@ fn is_entropy_candidate(run: &str) -> bool {
     // keeps the entropy signal focused on token-like values and lets
     // keyword/path signals handle lower-entropy secret names.
     run.chars().any(|c| c.is_ascii_digit())
+}
+
+/// True when a value run decomposes into a path / kebab-case / dated
+/// identifier — segments split on `/ - . _` that are each a short
+/// lowercase-or-digit word or numeric token. Such runs are ordinary
+/// documentation cross-references (e.g.
+/// `docs/plans/2026-05-27-foo/foo-execution-state.md`), not credentials.
+///
+/// The lowercase-only and short-segment constraints are what keep real
+/// secrets flagged: base64 tokens carry uppercase and `+` / `=`, and an
+/// undelimited hex/base64 blob is a single long segment, so neither
+/// satisfies "three or more short lowercase-or-digit segments".
+fn looks_like_path_or_slug(run: &str) -> bool {
+    let segments: Vec<&str> = run
+        .split(['/', '-', '.', '_'])
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() < MIN_SLUG_SEGMENTS {
+        return false;
+    }
+    segments.iter().all(|segment| {
+        segment.len() <= MAX_SLUG_SEGMENT_LEN
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    })
 }
 
 fn shannon_entropy(value: &str) -> f64 {
@@ -313,6 +354,57 @@ mod tests {
     fn entropy_signal_ignores_long_path_like_runs_without_digits() {
         assert!(!line_has_high_entropy_run(
             r#"script(path="core/skills/codex_only/SKILL.md.tera")"#
+        ));
+    }
+
+    #[test]
+    fn entropy_signal_skips_dated_path_and_slug_references() {
+        // The exact false-positive class: a dated plan-bundle path and a
+        // long hyphenated case slug. Both have digits and clear the length
+        // and entropy bars, but decompose into short lowercase/numeric words.
+        assert!(!line_has_high_entropy_run(
+            "  `docs/plans/2026-05-27-plan-archive-discover/plan-archive-discover-execution-state.md`",
+        ));
+        assert!(!line_has_high_entropy_run(
+            "- audit-drift-entropy-false-positive-on-slugs-recurrence-2026",
+        ));
+        let analysis = analyze_file(
+            Path::new("core/policies/heuristic-system/operation-records/foo/RECORD.md"),
+            "  `docs/plans/2026-05-27-plan-archive-discover/plan-archive-discover-execution-state.md`\n",
+        );
+        assert_eq!(analysis.entropy_above_threshold, None);
+    }
+
+    #[test]
+    fn entropy_signal_still_flags_real_secrets() {
+        // Undelimited high-entropy token (one segment) still flags.
+        assert!(line_has_high_entropy_run(
+            "export KEY=4fK9zQm2Lp8sVx7Tn3Bc6Rj0WaYd"
+        ));
+        // Hyphen-delimited but uppercase-bearing base64 chunks still flag:
+        // a real token is not all-lowercase words.
+        assert!(line_has_high_entropy_run(
+            "aGVsbG8-d29ybGQ-Zm9vYmFyYmF6-cXV4MTIz"
+        ));
+    }
+
+    #[test]
+    fn looks_like_path_or_slug_classifies_paths_not_tokens() {
+        assert!(looks_like_path_or_slug(
+            "docs/plans/2026-05-27-plan-archive-discover/plan-archive-discover-execution-state.md"
+        ));
+        assert!(looks_like_path_or_slug(
+            "plan-archive-discover-execution-state"
+        ));
+        // Fewer than three segments is a token, not a path.
+        assert!(!looks_like_path_or_slug("a-b"));
+        // Single undelimited run (hex/base64 blob) is not a path.
+        assert!(!looks_like_path_or_slug("4fK9zQm2Lp8sVx7Tn3Bc6Rj0WaYd"));
+        // Uppercase segments mark an opaque token, not a word.
+        assert!(!looks_like_path_or_slug("aGVsbG8-d29ybGQ-Zm9vYmFy"));
+        // A segment longer than a word marks an opaque token.
+        assert!(!looks_like_path_or_slug(
+            "deadbeef0123456789abcdef01234567-a-b"
         ));
     }
 
