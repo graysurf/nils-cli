@@ -29,6 +29,80 @@ impl fmt::Display for NameStatusParseError {
 
 impl Error for NameStatusParseError {}
 
+/// Conventional-commit-style PR / MR kind shared by `forge-cli`
+/// (`pr deliver` / `pr create --kind` and the `branch_kind` preflight) and
+/// `git-cli` (`worktree add --kind` branch-prefix derivation). The kind set
+/// and its branch-prefix mapping live here so the two tools cannot disagree
+/// about which branch a given kind expects: a worktree opened for one kind
+/// then delivers cleanly under the same kind. The set tracks the
+/// Conventional Commits type whitelist (`feature`, `bug`, `chore`, `docs`,
+/// `ci`, `refactor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrKind {
+    Feature,
+    Bug,
+    Chore,
+    Docs,
+    Ci,
+    Refactor,
+}
+
+impl PrKind {
+    /// Render the kind to the lower-case enum literal used in `--kind` argv
+    /// and JSON envelopes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrKind::Feature => "feature",
+            PrKind::Bug => "bug",
+            PrKind::Chore => "chore",
+            PrKind::Docs => "docs",
+            PrKind::Ci => "ci",
+            PrKind::Refactor => "refactor",
+        }
+    }
+
+    /// The branch-name prefix this kind requires, without the trailing `/`.
+    /// `feature -> feat` and `bug -> fix`; every other kind maps to its own
+    /// literal. This is the single source of truth for the mapping
+    /// `forge-cli`'s `branch_kind` rule enforces.
+    pub fn branch_prefix(self) -> &'static str {
+        match self {
+            PrKind::Feature => "feat",
+            PrKind::Bug => "fix",
+            PrKind::Chore => "chore",
+            PrKind::Docs => "docs",
+            PrKind::Ci => "ci",
+            PrKind::Refactor => "refactor",
+        }
+    }
+
+    /// Parse the lower-case `--kind` flag value. Returns `None` for anything
+    /// outside the spec's enum so each caller can emit its own usage error.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "feature" => Some(PrKind::Feature),
+            "bug" => Some(PrKind::Bug),
+            "chore" => Some(PrKind::Chore),
+            "docs" => Some(PrKind::Docs),
+            "ci" => Some(PrKind::Ci),
+            "refactor" => Some(PrKind::Refactor),
+            _ => None,
+        }
+    }
+
+    /// Every kind in declaration order, for help text and exhaustive tests.
+    pub fn all() -> [PrKind; 6] {
+        [
+            PrKind::Feature,
+            PrKind::Bug,
+            PrKind::Chore,
+            PrKind::Docs,
+            PrKind::Ci,
+            PrKind::Refactor,
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NameStatusZEntry<'a> {
     pub status_raw: &'a [u8],
@@ -449,6 +523,25 @@ mod tests {
 
         assert!(!output.status.success());
         assert!(!output.stderr.is_empty());
+    }
+
+    #[test]
+    fn pr_kind_branch_prefix_mapping_is_canonical() {
+        assert_eq!(PrKind::Feature.branch_prefix(), "feat");
+        assert_eq!(PrKind::Bug.branch_prefix(), "fix");
+        assert_eq!(PrKind::Chore.branch_prefix(), "chore");
+        assert_eq!(PrKind::Docs.branch_prefix(), "docs");
+        assert_eq!(PrKind::Ci.branch_prefix(), "ci");
+        assert_eq!(PrKind::Refactor.branch_prefix(), "refactor");
+    }
+
+    #[test]
+    fn pr_kind_parse_round_trips_every_kind_and_rejects_unknown() {
+        for kind in PrKind::all() {
+            assert_eq!(PrKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(PrKind::parse("nope"), None);
+        assert_eq!(PrKind::parse("feat"), None);
     }
 
     #[test]

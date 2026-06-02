@@ -1,6 +1,7 @@
 use crate::commit_shared::{git_output, git_status_success, git_stdout_trimmed_optional};
 use anyhow::Context;
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
+use nils_common::git::PrKind;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -42,6 +43,7 @@ struct WorktreeLayout {
 struct AddArgs {
     slug: String,
     from: Option<String>,
+    kind: PrKind,
     format: OutputFormat,
 }
 
@@ -77,6 +79,7 @@ struct AddOutput {
     repo_root: String,
     repo_key: String,
     slug: String,
+    kind: String,
     branch: String,
     base_ref: String,
     path: String,
@@ -224,7 +227,7 @@ fn run_prune(args: &[String]) -> i32 {
 fn add_worktree(args: &AddArgs) -> Result<AddOutput, CliError> {
     let layout = resolve_layout()?;
     let branch_slug = normalize_slug(&args.slug)?;
-    let branch = format!("feat/{branch_slug}");
+    let branch = format!("{}/{branch_slug}", args.kind.branch_prefix());
     let path = layout
         .worktree_root
         .join(&layout.repo_key)
@@ -285,6 +288,7 @@ fn add_worktree(args: &AddArgs) -> Result<AddOutput, CliError> {
         repo_root: display_path(&layout.repo_root),
         repo_key: layout.repo_key,
         slug: branch_slug,
+        kind: args.kind.as_str().to_string(),
         branch,
         base_ref,
         path: path_arg,
@@ -462,6 +466,7 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, CliError> {
 
     let mut slug: Option<String> = None;
     let mut from: Option<String> = None;
+    let mut kind_raw: Option<String> = None;
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -474,6 +479,17 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, CliError> {
             }
             value if value.starts_with("--from=") => {
                 from = Some(value.trim_start_matches("--from=").to_string());
+                i += 1;
+            }
+            "--kind" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err(CliError::usage("missing-kind", "--kind requires a value"));
+                };
+                kind_raw = Some(value.to_string());
+                i += 2;
+            }
+            value if value.starts_with("--kind=") => {
+                kind_raw = Some(value.trim_start_matches("--kind=").to_string());
                 i += 1;
             }
             value if value.starts_with('-') => {
@@ -496,7 +512,25 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, CliError> {
     }
 
     let slug = slug.ok_or_else(|| CliError::usage("missing-slug", "missing worktree slug"))?;
-    Ok(AddArgs { slug, from, format })
+    // Default to `feature` (branch prefix `feat/`) so the prior behavior is
+    // unchanged; any other kind selects forge-cli's matching branch prefix.
+    let kind = match kind_raw {
+        Some(value) => PrKind::parse(&value).ok_or_else(|| {
+            CliError::usage(
+                "invalid-kind",
+                format!(
+                    "unknown --kind '{value}' (expected one of: feature, bug, chore, docs, ci, refactor)"
+                ),
+            )
+        })?,
+        None => PrKind::Feature,
+    };
+    Ok(AddArgs {
+        slug,
+        from,
+        kind,
+        format,
+    })
 }
 
 fn parse_list_args(args: &[String]) -> Result<ListArgs, CliError> {
@@ -622,7 +656,12 @@ fn reject_extra_args(command: &str, args: &[String]) -> Result<(), CliError> {
 }
 
 fn print_add_help() {
-    println!("Usage: git-cli worktree add <slug> [--from <ref>] [--format text|json]");
+    println!(
+        "Usage: git-cli worktree add <slug> [--from <ref>] [--kind <feature|bug|chore|docs|ci|refactor>] [--format text|json]"
+    );
+    println!(
+        "  --kind selects the branch prefix (feature->feat/, bug->fix/, chore->chore/, docs->docs/, ci->ci/, refactor->refactor/); default: feature"
+    );
 }
 
 fn print_list_help() {
