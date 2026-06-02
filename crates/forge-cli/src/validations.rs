@@ -30,48 +30,12 @@ pub const BODY_SCAFFOLD_HINT: &str =
     "scaffold a valid body with `agent-runtime pr-body render --kind <kind>`";
 
 /// PR/MR kind declared by the caller via `--kind`. Drives the
-/// `branch_kind_matches` rule plus the macro in Sprint 6. The set tracks
-/// the Conventional Commits type whitelist (`feature`, `bug`, `chore`,
-/// `docs`, `ci`, `refactor`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrKind {
-    Feature,
-    Bug,
-    Chore,
-    Docs,
-    Ci,
-    Refactor,
-}
-
-impl PrKind {
-    /// Render the kind to the lower-case enum literal used in envelopes and
-    /// argv.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PrKind::Feature => "feature",
-            PrKind::Bug => "bug",
-            PrKind::Chore => "chore",
-            PrKind::Docs => "docs",
-            PrKind::Ci => "ci",
-            PrKind::Refactor => "refactor",
-        }
-    }
-
-    /// Parse the `--kind` flag value. Anything outside the spec's enum is a
-    /// usage error and is handled at the clap layer; this helper exists for
-    /// internal callers that already hold the string.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "feature" => Some(PrKind::Feature),
-            "bug" => Some(PrKind::Bug),
-            "chore" => Some(PrKind::Chore),
-            "docs" => Some(PrKind::Docs),
-            "ci" => Some(PrKind::Ci),
-            "refactor" => Some(PrKind::Refactor),
-            _ => None,
-        }
-    }
-}
+/// `branch_kind_matches` rule plus the delivery macro. The kind set and its
+/// branch-prefix mapping are defined once in [`nils_common::git::PrKind`] so
+/// `forge-cli`'s `branch_kind` rule and `git-cli`'s `worktree add --kind`
+/// branch derivation cannot disagree; re-exported here for the existing
+/// `crate::validations::PrKind` call sites.
+pub use nils_common::git::PrKind;
 
 /// Branch prefix recovered from a branch name that matches the
 /// `branch_name` rule. The set tracks the Conventional Commits type
@@ -199,16 +163,11 @@ fn branch_name_err(branch: &str, why: &str) -> ForgeError {
 /// (`feature` ↔ `feat/*`, `bug` ↔ `fix/*`, `chore` ↔ `chore/*`,
 /// `docs` ↔ `docs/*`, `ci` ↔ `ci/*`, `refactor` ↔ `refactor/*`).
 pub fn branch_kind_matches(prefix: BranchPrefix, kind: PrKind) -> Result<(), ForgeError> {
-    let ok = matches!(
-        (prefix, kind),
-        (BranchPrefix::Feat, PrKind::Feature)
-            | (BranchPrefix::Fix, PrKind::Bug)
-            | (BranchPrefix::Chore, PrKind::Chore)
-            | (BranchPrefix::Docs, PrKind::Docs)
-            | (BranchPrefix::Ci, PrKind::Ci)
-            | (BranchPrefix::Refactor, PrKind::Refactor)
-    );
-    if ok {
+    // Compare against the single source of truth in `nils_common::git::PrKind`
+    // so this rule and `git-cli`'s `worktree add --kind` derivation share one
+    // mapping. `BranchPrefix::as_str` and `PrKind::branch_prefix` both render
+    // the canonical prefix literal (`feat`, `fix`, ...).
+    if prefix.as_str() == kind.branch_prefix() {
         Ok(())
     } else {
         Err(ForgeError::validation(

@@ -49,6 +49,10 @@ fn worktree_add_creates_deterministic_agent_home_path_and_lists_json() {
     assert_eq!(add_json["schema_version"], "cli.git-cli.worktree.add.v1");
     assert_eq!(add_json["ok"], true);
     assert_eq!(add_json["data"]["slug"], "topic-one");
+    assert_eq!(
+        add_json["data"]["kind"], "feature",
+        "default kind is feature"
+    );
     assert_eq!(add_json["data"]["branch"], "feat/topic-one");
 
     let repo_key = add_json["data"]["repo_key"].as_str().expect("repo key");
@@ -92,6 +96,68 @@ fn worktree_add_creates_deterministic_agent_home_path_and_lists_json() {
         .expect("managed worktree listed");
     assert_eq!(managed["branch"], "feat/topic-one");
     assert_eq!(managed["managed"], true);
+}
+
+#[test]
+fn worktree_add_kind_bug_uses_fix_branch_prefix() {
+    let harness = GitCliHarness::new();
+    let repo = init_repo();
+    let agent_home = tempfile::TempDir::new().expect("agent home");
+
+    let add = run_with_agent_home(
+        &harness,
+        repo.path(),
+        agent_home.path(),
+        &[
+            "worktree",
+            "add",
+            "topic-bug",
+            "--from",
+            "main",
+            "--kind",
+            "bug",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(add.code, 0, "stderr: {}", add.stderr_text());
+    assert_eq!(add.stderr_text(), "");
+
+    let add_json = parse_json(&add);
+    assert_eq!(add_json["ok"], true);
+    assert_eq!(add_json["data"]["slug"], "topic-bug");
+    assert_eq!(add_json["data"]["kind"], "bug");
+    assert_eq!(
+        add_json["data"]["branch"], "fix/topic-bug",
+        "kind=bug derives the fix/ prefix forge-cli's --kind bug expects"
+    );
+
+    let path = add_json["data"]["path"].as_str().expect("path");
+    let porcelain = git(repo.path(), &["worktree", "list", "--porcelain"]);
+    assert!(porcelain.contains("branch refs/heads/fix/topic-bug"));
+    assert!(porcelain.contains(path));
+}
+
+#[test]
+fn worktree_add_rejects_unknown_kind() {
+    let harness = GitCliHarness::new();
+    let repo = init_repo();
+    let agent_home = tempfile::TempDir::new().expect("agent home");
+
+    let add = run_with_agent_home(
+        &harness,
+        repo.path(),
+        agent_home.path(),
+        &[
+            "worktree", "add", "topic-x", "--kind", "nope", "--from", "main", "--format", "json",
+        ],
+    );
+
+    assert_ne!(add.code, 0, "unknown --kind must fail");
+    let add_json = parse_json(&add);
+    assert_eq!(add_json["ok"], false);
+    assert_eq!(add_json["error"]["code"], "invalid-kind");
 }
 
 #[test]
