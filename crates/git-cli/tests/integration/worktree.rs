@@ -225,6 +225,60 @@ fn worktree_remove_parse_error_respects_json_format() {
 }
 
 #[test]
+fn worktree_remove_with_branch_name_hints_slug_in_text_and_json() {
+    let harness = GitCliHarness::new();
+    let repo = init_repo();
+    let agent_home = tempfile::TempDir::new().expect("agent home");
+
+    // A docs-kind worktree: branch `docs/topic-docs`, slug `topic-docs`.
+    let add = run_with_agent_home(
+        &harness,
+        repo.path(),
+        agent_home.path(),
+        &[
+            "worktree",
+            "add",
+            "topic-docs",
+            "--from",
+            "main",
+            "--kind",
+            "docs",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(add.code, 0, "stderr: {}", add.stderr_text());
+    let add_json = parse_json(&add);
+    assert_eq!(add_json["data"]["branch"], "docs/topic-docs");
+
+    // Passing the branch name (text mode) fails but points at the slug + path.
+    let text = run_with_agent_home(
+        &harness,
+        repo.path(),
+        agent_home.path(),
+        &["worktree", "remove", "docs/topic-docs"],
+    );
+    assert_ne!(text.code, 0);
+    let stderr = text.stderr_text();
+    assert!(stderr.contains("hint:"), "stderr: {stderr}");
+    assert!(stderr.contains("branch name"), "stderr: {stderr}");
+    assert!(stderr.contains("slug 'topic-docs'"), "stderr: {stderr}");
+
+    // The same mistake in JSON mode carries the hint on the error envelope.
+    let json = run_with_agent_home(
+        &harness,
+        repo.path(),
+        agent_home.path(),
+        &["worktree", "remove", "docs/topic-docs", "--format", "json"],
+    );
+    assert_ne!(json.code, 0);
+    let json = parse_json(&json);
+    assert_eq!(json["error"]["code"], "worktree-not-found");
+    let hint = json["error"]["hint"].as_str().expect("hint");
+    assert!(hint.contains("slug 'topic-docs'"), "hint: {hint}");
+}
+
+#[test]
 fn worktree_remove_refuses_primary_and_removes_managed_slug() {
     let harness = GitCliHarness::new();
     let repo = init_repo();

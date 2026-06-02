@@ -360,11 +360,15 @@ fn remove_worktree(args: &RemoveArgs) -> Result<RemoveOutput, CliError> {
         .iter()
         .any(|entry| path_key(&entry.path) == target_key);
     if !known {
-        return Err(CliError::data(
+        let mut err = CliError::data(
             "worktree-not-found",
             format!("no linked worktree found for {}", args.target),
         )
-        .with_details(json!({ "target": args.target })));
+        .with_details(json!({ "target": args.target }));
+        if let Some(hint) = branch_name_hint(&args.target, &entries) {
+            err = err.with_hint(hint);
+        }
+        return Err(err);
     }
 
     let target_arg = display_path(&target);
@@ -386,6 +390,28 @@ fn prune_worktrees() -> Result<PruneOutput, CliError> {
     ensure_inside_git_repo()?;
     run_git_worktree_prune()?;
     Ok(PruneOutput { pruned: true })
+}
+
+/// When a `remove` target resolves to no managed path or slug but exactly
+/// matches a linked worktree's branch name, the caller most likely passed the
+/// branch (e.g. `docs/foo`) instead of the slug (`foo`) — and the leading
+/// `docs/` made the path heuristic treat it as a relative path. Point them at
+/// the slug (the managed path's final segment) and the full path so they can
+/// retry without guessing. Matching against live branch names keeps this free
+/// of any hard-coded prefix list.
+fn branch_name_hint(target: &str, entries: &[LinkedWorktree]) -> Option<String> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.branch.as_deref() == Some(target))?;
+    let slug = entry
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(target);
+    Some(format!(
+        "'{target}' is a branch name; remove by slug '{slug}' or path '{}'",
+        display_path(&entry.path)
+    ))
 }
 
 pub(crate) fn linked_worktrees_by_branch() -> anyhow::Result<HashMap<String, String>> {
@@ -929,7 +955,12 @@ fn emit_error(command: &str, format: OutputFormat, err: CliError) -> i32 {
                 Err(serialize_err) => eprintln!("failed to serialize JSON error: {serialize_err}"),
             }
         }
-        OutputFormat::Text => eprintln!("{}", err.message),
+        OutputFormat::Text => {
+            eprintln!("{}", err.message);
+            if let Some(hint) = &err.hint {
+                eprintln!("hint: {hint}");
+            }
+        }
     }
     err.exit_code
 }
@@ -964,10 +995,22 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_slug, parse_worktree_porcelain, repo_key_for_path, resolve_remove_target,
+        LinkedWorktree, branch_name_hint, normalize_slug, parse_worktree_porcelain,
+        repo_key_for_path, resolve_remove_target,
     };
     use pretty_assertions::{assert_eq, assert_ne};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    fn managed_entry(path: &str, branch: Option<&str>) -> LinkedWorktree {
+        LinkedWorktree {
+            path: PathBuf::from(path),
+            head: Some("0123456789abcdef".to_string()),
+            branch: branch.map(str::to_string),
+            bare: false,
+            detached: branch.is_none(),
+            prunable: None,
+        }
+    }
 
     #[test]
     fn repo_key_includes_basename_and_stable_hash() {
@@ -1011,5 +1054,42 @@ mod tests {
             target,
             Path::new("/agent/worktrees/repo-12345678/topic-one")
         );
+    }
+
+    #[test]
+    fn branch_name_hint_points_to_slug_when_target_is_branch() {
+        let entries = vec![managed_entry(
+            "/agent/worktrees/repo-12345678/closeout-records-delivery",
+            Some("docs/closeout-records-delivery"),
+        )];
+        let hint = branch_name_hint("docs/closeout-records-delivery", &entries).expect("hint");
+        assert!(hint.contains("branch name"), "hint was: {hint}");
+        assert!(
+            hint.contains("closeout-records-delivery"),
+            "hint was: {hint}"
+        );
+        assert!(
+            hint.contains("/agent/worktrees/repo-12345678/closeout-records-delivery"),
+            "hint was: {hint}"
+        );
+    }
+
+    #[test]
+    fn branch_name_hint_absent_when_target_matches_no_branch() {
+        let entries = vec![managed_entry(
+            "/agent/worktrees/repo-12345678/closeout-records-delivery",
+            Some("docs/closeout-records-delivery"),
+        )];
+        assert!(branch_name_hint("docs/typo", &entries).is_none());
+        assert!(branch_name_hint("closeout-records-delivery", &entries).is_none());
+    }
+
+    #[test]
+    fn branch_name_hint_skips_detached_entries() {
+        let entries = vec![managed_entry(
+            "/agent/worktrees/repo-12345678/detached",
+            None,
+        )];
+        assert!(branch_name_hint("anything", &entries).is_none());
     }
 }
