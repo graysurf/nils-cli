@@ -17,6 +17,7 @@
 
 use crate::render::manifest::SourceRoot;
 use anyhow::Result;
+use serde::Serialize;
 use std::path::PathBuf;
 
 pub mod agent_home_leak;
@@ -30,7 +31,8 @@ pub mod walk;
 
 pub const PRODUCTS: &[&str] = &["codex", "claude"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Drift that is only visible in verbose output and never affects
     /// the exit code.
@@ -63,7 +65,7 @@ impl Severity {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct Finding {
     /// Stable class name (e.g. `agent-home-leak`). Matches the source
     /// doc's class taxonomy.

@@ -161,3 +161,110 @@ fn unsafe_score_keyword_without_value_is_suppressed_until_verbose() {
         verbose.stderr_text(),
     );
 }
+
+#[test]
+fn json_format_emits_envelope_with_findings_and_exit_code() {
+    let tmp = copy_fixture();
+    write(
+        &tmp.path().join("core/secrets/auth.json"),
+        "token: 4fK9zQm2Lp8sVx7Tn3Bc6Rj0WaYd\n",
+    );
+
+    let out = audit(tmp.path(), &["--format", "json"]);
+    assert_eq!(
+        out.code, 2,
+        "block finding should still exit 2 in json mode"
+    );
+    let stdout = out.stdout_text();
+    assert!(
+        stdout.contains("\"schema_version\": \"agent-runtime-cli.audit-drift.v1\""),
+        "json stdout should carry the schema_version; got\n{stdout}",
+    );
+    assert!(
+        stdout.contains("\"exit_code\": 2"),
+        "json envelope should report exit_code 2; got\n{stdout}",
+    );
+    assert!(
+        stdout.contains("\"block\": 1"),
+        "json envelope should count the block finding; got\n{stdout}",
+    );
+    assert!(
+        stdout.contains("\"severity\": \"block\""),
+        "json findings should serialize severity as a lowercase label; got\n{stdout}",
+    );
+}
+
+#[test]
+fn fail_on_block_demotes_a_warn_only_run_to_exit_zero() {
+    let tmp = copy_fixture();
+    // Entropy-only finding at a non-sensitive path with no keyword scores
+    // 0.4 -> warn (not block).
+    write(
+        &tmp.path().join("core/notes/scratch.md"),
+        "value = 4fK9zQm2Lp8sVx7Tn3Bc6Rj0WaYd\n",
+    );
+
+    let default_run = audit(tmp.path(), &[]);
+    assert_eq!(
+        default_run.code,
+        1,
+        "a warn finding fails by default; stderr=\n{}",
+        default_run.stderr_text(),
+    );
+
+    let block_only = audit(tmp.path(), &["--fail-on", "block"]);
+    assert_eq!(
+        block_only.code,
+        0,
+        "--fail-on block makes a warn-only run non-fatal; stderr=\n{}",
+        block_only.stderr_text(),
+    );
+    assert!(
+        block_only.stderr_text().contains("[unsafe/warn"),
+        "the warn finding should still be reported; stderr=\n{}",
+        block_only.stderr_text(),
+    );
+}
+
+#[test]
+fn fail_on_block_keeps_block_findings_fatal() {
+    let tmp = copy_fixture();
+    write(
+        &tmp.path().join("core/secrets/auth.json"),
+        "token: 4fK9zQm2Lp8sVx7Tn3Bc6Rj0WaYd\n",
+    );
+
+    let out = audit(tmp.path(), &["--fail-on", "block"]);
+    assert_eq!(
+        out.code,
+        2,
+        "--fail-on block must still fail on a block finding; stderr=\n{}",
+        out.stderr_text(),
+    );
+}
+
+#[test]
+fn dated_path_reference_does_not_trip_the_entropy_signal() {
+    let tmp = copy_fixture();
+    // A retained record cross-referencing a dated plan bundle by path: the
+    // exact false positive this scorer change removes.
+    write(
+        &tmp.path()
+            .join("core/policies/heuristic-system/operation-records/foo/RECORD.md"),
+        "- See `docs/plans/2026-05-27-plan-archive-discover/plan-archive-discover-execution-state.md`\n",
+    );
+
+    let out = audit(tmp.path(), &["--verbose"]);
+    assert_eq!(
+        out.code,
+        0,
+        "a dated path reference must not produce a warn; stderr=\n{}",
+        out.stderr_text(),
+    );
+    assert!(
+        !out.stderr_text()
+            .contains("operation-records/foo/RECORD.md"),
+        "the record should produce no unsafe finding at all; stderr=\n{}",
+        out.stderr_text(),
+    );
+}
