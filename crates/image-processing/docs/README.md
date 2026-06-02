@@ -8,7 +8,7 @@
 
 ## Runbooks
 
-- [llm-svg-workflow.md](runbooks/llm-svg-workflow.md) (`docs/runbooks/llm-svg-workflow.md`)
+- None yet. Add documents under `docs/runbooks/` and register them here.
 
 ## Reports
 

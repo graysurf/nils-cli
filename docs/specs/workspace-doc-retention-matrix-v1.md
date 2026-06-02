@@ -63,7 +63,6 @@ because BSD-style `-path` lets `*` cross slash boundaries.
 - `crates/codex-cli/docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - `crates/gemini-cli/docs/runbooks/json-consumers.md`
 - `crates/gemini-cli/docs/specs/gemini-cli-diag-rate-limits-and-auth-json-contract-v1.md`
-- `crates/image-processing/docs/runbooks/llm-svg-workflow.md`
 - `crates/memo/docs/runbooks/memo-agent-workflow.md`
 - `crates/memo/docs/specs/memo-command-contract-v1.md`
 - `crates/memo/docs/specs/memo-json-contract-v1.md`
