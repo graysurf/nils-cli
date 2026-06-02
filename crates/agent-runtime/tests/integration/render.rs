@@ -656,3 +656,127 @@ fn render_support_matrix_update_golden_writes_shared_tree_only() {
     assert!(!root.join("tests/golden/codex").exists());
     assert!(!root.join("tests/golden/claude").exists());
 }
+
+fn write_common_manifests(root: &Path) {
+    write(&root.join("manifests/plugins.yaml"), VALID_PLUGINS);
+    write(&root.join("manifests/surfaces.yaml"), VALID_SURFACES);
+    write(
+        &root.join("manifests/product-capabilities.yaml"),
+        VALID_PRODUCT_CAPABILITIES,
+    );
+    write(
+        &root.join("manifests/runtime-roots.yaml"),
+        VALID_RUNTIME_ROOTS,
+    );
+    write(&root.join("manifests/cli-tools.yaml"), VALID_CLI_TOOLS);
+}
+
+/// Retiring a skill (removing it from `manifests/skills.yaml`) must make
+/// the next render reconcile `build/<product>/`: the retired skill's
+/// outputs and its `.render-cache.json` entry are removed, and the
+/// directory they emptied is pruned, while a sibling skill sharing the
+/// parent dir survives. Without this, render is additive and the stale
+/// build/ tree makes `prune-stale` treat the retired skill as still
+/// expected (its recursive link-map entry expands over the stale tree),
+/// silently keeping it in the live home.
+#[test]
+fn render_retiring_a_skill_reconciles_build_outputs_and_cache_entry() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let root_str = root.to_str().unwrap();
+    write_common_manifests(&root);
+
+    // Two codex skills sharing the `skills/market` parent dir; `retire`
+    // also writes a sibling script to exercise multi-output cleanup.
+    write(
+        &root.join("manifests/skills.yaml"),
+        r#"
+schema_version: 1
+skills:
+  - id: market.keep
+    domain: market
+    source: core/skills/market/keep
+    products:
+      codex:
+        name: /market-keep
+        render_to: skills/market/keep/SKILL.md
+    required_clis: {}
+  - id: market.retire
+    domain: market
+    source: core/skills/market/retire
+    products:
+      codex:
+        name: /market-retire
+        render_to: skills/market/retire/SKILL.md
+    required_clis: {}
+"#,
+    );
+    write(
+        &root.join("core/skills/market/keep/SKILL.md.tera"),
+        "# keep\n",
+    );
+    write(
+        &root.join("core/skills/market/retire/SKILL.md.tera"),
+        "# retire\n",
+    );
+    write(
+        &root.join("core/skills/market/retire/scripts/tool.sh"),
+        "echo hi\n",
+    );
+
+    // First render: both skills land in build/ + cache.
+    let first = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(first.code, 0, "stderr: {}", first.stderr_text());
+    assert!(
+        root.join("build/codex/skills/market/keep/SKILL.md")
+            .exists()
+    );
+    assert!(
+        root.join("build/codex/skills/market/retire/SKILL.md")
+            .exists()
+    );
+    assert!(
+        root.join("build/codex/skills/market/retire/scripts/tool.sh")
+            .exists()
+    );
+    let cache = fs::read_to_string(root.join("build/codex/.render-cache.json")).unwrap();
+    assert!(cache.contains("market.retire"), "{cache}");
+
+    // Retire `market.retire`: remove it from the manifest entirely.
+    write(
+        &root.join("manifests/skills.yaml"),
+        r#"
+schema_version: 1
+skills:
+  - id: market.keep
+    domain: market
+    source: core/skills/market/keep
+    products:
+      codex:
+        name: /market-keep
+        render_to: skills/market/keep/SKILL.md
+    required_clis: {}
+"#,
+    );
+
+    // Second render must reconcile build/: drop the retired skill's
+    // outputs, prune the emptied directory, and drop the cache entry.
+    let second = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(second.code, 0, "stderr: {}", second.stderr_text());
+
+    assert!(
+        root.join("build/codex/skills/market/keep/SKILL.md")
+            .exists(),
+        "kept skill must survive reconcile",
+    );
+    assert!(
+        !root.join("build/codex/skills/market/retire").exists(),
+        "retired skill directory must be removed from build/",
+    );
+    let cache2 = fs::read_to_string(root.join("build/codex/.render-cache.json")).unwrap();
+    assert!(
+        !cache2.contains("market.retire"),
+        "retired cache entry must be gone: {cache2}",
+    );
+    assert!(cache2.contains("market.keep"), "{cache2}");
+}

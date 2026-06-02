@@ -295,10 +295,125 @@ pub(crate) fn write_product_to(
         next_cache.skills.insert(skill.id.clone(), entry);
     }
 
+    // Reconcile retired skills. The per-skill cleanup above only fires for
+    // skills still being rendered, so render is otherwise additive: a skill
+    // removed from the manifest (or moved off this product) leaves its
+    // outputs behind in `build/<product>/`. That stale tree is not just
+    // untidy — `prune-stale` rebuilds its "expected" set by expanding the
+    // recursive link-map entry over the current `build/` tree, so a retired
+    // skill that lingers in build/ is treated as still-expected and silently
+    // kept in the live home (`candidates=0`). Removing the retired outputs
+    // here closes both gaps from one place.
+    reconcile_retired_skills(
+        &prior_cache,
+        &next_cache,
+        &output_root,
+        &canonical_output_root,
+    )?;
+
     next_cache
         .save(&cache_path)
         .with_context(|| format!("write {}", cache_path.display()))?;
     Ok(report)
+}
+
+/// Remove `build/<product>/` outputs for skills recorded in `prior_cache`
+/// that are absent from this run's `next_cache` (retired from the manifest
+/// or moved off this product). Each file is removed with the same
+/// canonicalize-under-output-root guard the cache-miss path uses; the
+/// directories the removals empty are pruned upward, stopping at
+/// `output_root`. Paths still owned by a present skill (shared output) are
+/// never removed, and a shared parent dir that stays non-empty is left in
+/// place, so sibling skills sharing a directory are unaffected.
+fn reconcile_retired_skills(
+    prior_cache: &RenderCache,
+    next_cache: &RenderCache,
+    output_root: &Path,
+    canonical_output_root: &Path,
+) -> Result<()> {
+    // Paths a still-present skill writes this run must never be removed,
+    // even if a retired skill also recorded them.
+    let live_outputs: std::collections::BTreeSet<&String> = next_cache
+        .skills
+        .values()
+        .flat_map(|entry| entry.outputs.iter())
+        .collect();
+
+    for (skill_id, prior) in &prior_cache.skills {
+        if next_cache.skills.contains_key(skill_id) {
+            continue;
+        }
+        for rel in &prior.outputs {
+            if live_outputs.contains(rel) {
+                continue;
+            }
+            let path = sandboxed_join(output_root, rel)?;
+            // May already be gone (manual cleanup, or a path another retired
+            // skill removed first). `symlink_metadata` avoids following a
+            // dangling symlink.
+            if fs::symlink_metadata(&path).is_err() {
+                continue;
+            }
+            // Symlink-escape guard, mirroring the cache-miss removal path: a
+            // hostile cache entry combined with a pre-staged symlink could
+            // resolve outside the build root. Canonicalize and re-verify
+            // before any unlink.
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("canonicalize retired output {}", path.display()))?;
+            if !canonical.starts_with(canonical_output_root) {
+                return Err(anyhow!(
+                    "retired rendered output {} resolves outside the build root \
+                     ({} not under {}) — refusing to remove",
+                    path.display(),
+                    canonical.display(),
+                    canonical_output_root.display(),
+                ));
+            }
+            fs::remove_file(&canonical)
+                .with_context(|| format!("remove retired rendered file {}", canonical.display()))?;
+        }
+        // Prune the directories the removals emptied. Done after all files
+        // for this skill are gone so a leaf dir whose siblings were also
+        // retire-owned collapses fully.
+        for rel in &prior.outputs {
+            prune_empty_dirs_upward(output_root, canonical_output_root, rel);
+        }
+    }
+    Ok(())
+}
+
+/// Remove now-empty ancestor directories of a removed output file, walking
+/// from the file's parent up toward `output_root`. Stops at the first
+/// directory that is non-empty (a sibling still owns content), missing, or
+/// resolves to / above `output_root`. Best-effort: a failed `remove_dir`
+/// (e.g. a race) simply ends the climb without erroring the render.
+fn prune_empty_dirs_upward(output_root: &Path, canonical_output_root: &Path, rel: &str) {
+    let mut dir = match PathBuf::from(rel).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => output_root.join(parent),
+        _ => return,
+    };
+    // Climb ends as soon as a directory no longer canonicalizes (already
+    // removed or never existed).
+    while let Ok(canonical) = dir.canonicalize() {
+        if canonical == *canonical_output_root || !canonical.starts_with(canonical_output_root) {
+            break;
+        }
+        let is_empty = match fs::read_dir(&canonical) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(_) => break,
+        };
+        if !is_empty {
+            break; // a sibling still owns content here
+        }
+        if fs::remove_dir(&canonical).is_err() {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
 }
 
 /// Reject `render_to` values that start with `build/<product>/` (or the
