@@ -81,8 +81,6 @@ struct DriftField {
 
 #[derive(Debug, Clone, Deserialize)]
 struct CatalogRaw {
-    #[allow(dead_code)]
-    schema: Option<String>,
     #[serde(default)]
     groups: Vec<CatalogGroup>,
     labels: Vec<CatalogLabelRaw>,

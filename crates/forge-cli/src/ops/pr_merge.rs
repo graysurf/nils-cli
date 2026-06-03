@@ -470,7 +470,6 @@ struct PrView {
     draft: bool,
     base: String,
     head: String,
-    #[allow(dead_code)]
     state: String,
 }
 

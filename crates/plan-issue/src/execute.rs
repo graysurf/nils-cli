@@ -142,7 +142,6 @@ struct RecordBundle {
     source_file: PathBuf,
     plan_file: PathBuf,
     /// Resolved when present; `None` only when the caller explicitly opted out.
-    #[allow(dead_code)]
     execution_state_file: Option<PathBuf>,
 }
 
