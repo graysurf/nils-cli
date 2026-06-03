@@ -129,7 +129,6 @@ impl PreflightReport {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     pub fn check(&self, id: &str) -> Option<&CheckReport> {
         self.checks.iter().find(|check| check.id == id)
     }

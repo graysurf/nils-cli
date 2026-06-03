@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 pub const EXIT_OK: i32 = exit::SUCCESS;
 pub const EXIT_RUNTIME: i32 = exit::RUNTIME;
 pub const EXIT_USAGE: i32 = exit::USAGE;
-#[allow(dead_code)]
 pub const EXIT_DATA: i32 = exit::DATA;
 pub const EXIT_UNAVAILABLE: i32 = exit::UNAVAILABLE;
 
@@ -51,7 +50,6 @@ impl CliError {
         }))
     }
 
-    #[allow(dead_code)]
     pub fn data(
         code: impl Into<String>,
         message: impl Into<String>,
