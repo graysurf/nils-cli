@@ -32,6 +32,7 @@ members = [
   "crates/agent-workflow-primitives",
   "crates/gemini-cli",
   "crates/forge-cli",
+  "crates/zsh-kit",
 ]
 resolver = "2"
 

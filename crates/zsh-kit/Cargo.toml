@@ -1,0 +1,25 @@
+[package]
+name = "nils-zsh-kit"
+version = "1.0.6"
+edition.workspace = true
+license.workspace = true
+
+description = "CLI crate for nils-zsh-kit in the nils-cli workspace."
+repository = "https://github.com/sympoies/nils-cli"
+
+[[bin]]
+name = "zsh-kit"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+clap_complete = { workspace = true }
+nils-build-info = { version = "1.0.6", path = "../nils-build-info" }
+nils-common = { version = "1.0.6", path = "../nils-common", package = "nils-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+nils-test-support = { version = "1.0.6", path = "../nils-test-support" }
+pretty_assertions = { workspace = true }
+tempfile = "3"
