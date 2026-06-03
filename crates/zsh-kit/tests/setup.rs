@@ -120,6 +120,40 @@ fn apply_clones_repo_and_dispatches_hook() {
 }
 
 #[test]
+fn write_zshenv_preserves_features_and_sources_zdotdir_env() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let dest = temp.path().join("dest");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home dir");
+    fixture_repo(&repo);
+
+    let output = run_zsh_kit(
+        &[
+            "setup",
+            "--repo",
+            &repo.to_string_lossy(),
+            "--dest",
+            &dest.to_string_lossy(),
+            "--apply",
+            "--features",
+            "docker,opencode",
+            "--write-zshenv",
+            "--format",
+            "json",
+        ],
+        &home,
+    );
+
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr_text());
+    let zshenv = fs::read_to_string(home.join(".zshenv")).expect("read zshenv");
+    assert!(zshenv.contains("# Managed by zsh-kit."));
+    assert!(zshenv.contains("export ZSH_FEATURES='docker,opencode'"));
+    assert!(zshenv.contains(r#"if [[ -r "$ZDOTDIR/.zshenv" ]]; then"#));
+    assert!(zshenv.contains(r#"source "$ZDOTDIR/.zshenv""#));
+}
+
+#[test]
 fn missing_hook_refuses_local_source_before_clone() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");

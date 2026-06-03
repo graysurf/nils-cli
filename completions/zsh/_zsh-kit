@@ -38,7 +38,7 @@ _arguments "${_arguments_options[@]}" : \
 '--install-tools=[Tool-install policy forwarded to the repo setup hook]:INSTALL_TOOLS:(skip repo)' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
-'--write-zshenv[Write a managed \$HOME/.zshenv that exports ZDOTDIR to the destination]' \
+'--write-zshenv[Write a managed \$HOME/.zshenv that exports ZDOTDIR and setup features]' \
 '--dry-run[Preview intended actions without filesystem, git, bootstrap, or hook mutation]' \
 '--apply[Mutate the destination and dispatch the repo setup hook]' \
 '--force[Allow guarded overwrite/update paths such as mismatched remotes or .zshenv replacement]' \
