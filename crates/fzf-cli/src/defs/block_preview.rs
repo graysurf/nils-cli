@@ -45,7 +45,7 @@ pub fn run(blocks: &[Block], default_query: &str) -> Result<(i32, Option<String>
         }
         header_to_block.insert(b.header.clone(), rendered);
     }
-    let _ = tmp.flush();
+    tmp.flush().context("flush fzf block data")?;
 
     let mut preview = tempfile::NamedTempFile::new().context("mktemp preview script")?;
     preview
@@ -73,9 +73,11 @@ BEGIN {
 "#,
         )
         .context("write preview script")?;
-    let _ = preview.flush();
+    preview.flush().context("flush preview script")?;
 
-    let _ = std::fs::set_permissions(preview.path(), std::fs::Permissions::from_mode(0o755));
+    let preview_path = preview.into_temp_path();
+    std::fs::set_permissions(&preview_path, std::fs::Permissions::from_mode(0o755))
+        .context("make preview script executable")?;
 
     let input = blocks
         .iter()
@@ -95,7 +97,7 @@ BEGIN {
         "--preview".to_string(),
         format!(
             "FZF_PREVIEW_TARGET={{}} {} {}",
-            preview.path().to_string_lossy(),
+            preview_path.to_string_lossy(),
             tmp.path().to_string_lossy()
         ),
     ];
@@ -182,5 +184,63 @@ cat > "${PBCOPY_OUT:?}"
         assert!(out.contains("line1"));
         let clipboard_out = fs::read_to_string(&clipboard).unwrap();
         assert_eq!(clipboard_out, out);
+    }
+
+    #[test]
+    fn run_preview_script_is_executable_by_fzf() {
+        let lock = GlobalStateLock::new();
+        let temp = TempDir::new().unwrap();
+
+        let clipboard = temp.path().join("clipboard.txt");
+        let stub = StubBinDir::new();
+        stub.write_exe(
+            "fzf",
+            r#"#!/bin/bash
+set -euo pipefail
+
+preview=''
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [[ "${args[$i]}" == "--preview" ]]; then
+    preview="${args[$((i + 1))]}"
+    break
+  fi
+done
+
+selected=''
+while IFS= read -r line; do
+  selected="$line"
+  break
+done
+
+if [[ -n "$preview" ]]; then
+  FZF_PREVIEW_TARGET="$selected" eval "$preview" >/dev/null
+fi
+
+printf '%s\n' "$selected"
+"#,
+        );
+        stub.write_exe(
+            "pbcopy",
+            r#"#!/bin/bash
+set -euo pipefail
+cat > "${PBCOPY_OUT:?}"
+"#,
+        );
+
+        let _guard_path = prepend_path(&lock, stub.path());
+        let clipboard_s = clipboard.to_string_lossy().to_string();
+        let _guard_delim = EnvGuard::set(&lock, "FZF_DEF_DELIM", "---");
+        let _guard_end = EnvGuard::set(&lock, "FZF_DEF_DELIM_END", "+++");
+        let _guard_clip = EnvGuard::set(&lock, "PBCOPY_OUT", &clipboard_s);
+
+        let blocks = vec![Block {
+            header: "Header A".to_string(),
+            body: "line1\nline2".to_string(),
+        }];
+        let (code, out) = run(&blocks, "").expect("run");
+        assert_eq!(code, 0);
+        let out = out.expect("output");
+        assert!(out.contains("Header A"));
     }
 }
