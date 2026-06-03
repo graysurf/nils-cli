@@ -22,6 +22,7 @@ nils-git-lock
 nils-git-scope
 nils-git-summary
 nils-image-processing
+nils-zsh-kit
 nils-plan-archive
 nils-plan-tooling
 nils-plan-issue
