@@ -111,7 +111,7 @@ fn apply_setup(args: &SetupArgs, mut plan: SetupPlan) -> Result<SetupResult, Cli
     let hook_path = find_hook(&plan.dest).ok_or_else(|| missing_hook_error(&plan.dest))?;
 
     if args.write_zshenv {
-        let paths = write_zshenv(&plan.dest, args.force)?;
+        let paths = write_zshenv(&plan.dest, &args.features, args.force)?;
         changed_paths.extend(paths.into_iter().map(|path| display_path(&path)));
     }
 
@@ -281,7 +281,7 @@ fn dispatch_hook(args: &SetupArgs, hook_path: &Path) -> Result<(), CliError> {
     ))
 }
 
-fn write_zshenv(dest: &Path, force: bool) -> Result<Vec<PathBuf>, CliError> {
+fn write_zshenv(dest: &Path, features: &[String], force: bool) -> Result<Vec<PathBuf>, CliError> {
     let home = home_dir()?;
     let zshenv = home.join(".zshenv");
     let mut changed = Vec::new();
@@ -302,9 +302,21 @@ fn write_zshenv(dest: &Path, force: bool) -> Result<Vec<PathBuf>, CliError> {
         }
     }
 
-    let content = format!(
+    let mut content = format!(
         "{ZSHENV_MARKER}\nexport ZDOTDIR={}\n",
         shell_quote(&display_path(dest))
+    );
+    if !features.is_empty() {
+        content.push_str(&format!(
+            "export ZSH_FEATURES={}\n",
+            shell_quote(&features.join(","))
+        ));
+    }
+    content.push_str(
+        r#"if [[ -r "$ZDOTDIR/.zshenv" ]]; then
+  source "$ZDOTDIR/.zshenv"
+fi
+"#,
     );
     fs::write(&zshenv, content).map_err(|err| io_error("io-error", &zshenv, err))?;
     changed.push(zshenv);

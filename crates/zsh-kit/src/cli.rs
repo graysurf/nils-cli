@@ -50,7 +50,7 @@ pub struct SetupArgs {
     #[arg(long = "ref", value_name = "REV", conflicts_with = "branch")]
     pub ref_name: Option<String>,
 
-    /// Write a managed $HOME/.zshenv that exports ZDOTDIR to the destination.
+    /// Write a managed $HOME/.zshenv that exports ZDOTDIR and setup features.
     #[arg(long)]
     pub write_zshenv: bool,
 

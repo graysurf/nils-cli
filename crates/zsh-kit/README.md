@@ -24,7 +24,8 @@ Options:
 
 - `--dest <path>`: destination directory. Defaults to `$HOME/.config/zsh`.
 - `--branch <name>` or `--ref <rev>`: checkout selector.
-- `--write-zshenv`: write a managed `$HOME/.zshenv` that exports `ZDOTDIR`.
+- `--write-zshenv`: write a managed `$HOME/.zshenv` that exports `ZDOTDIR`,
+  preserves `ZSH_FEATURES` when provided, and sources `$ZDOTDIR/.zshenv`.
 - `--features <csv>`: feature list forwarded to the repo hook.
 - `--install-tools <skip|repo>`: tool-install policy forwarded to the repo
   hook. Default: `skip`.
