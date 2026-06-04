@@ -5,7 +5,8 @@
 This runbook covers service consumption of `codex-cli` JSON output for:
 
 - `diag rate-limits` (single/all/async)
-- `auth login|use|save|remove|refresh|auto-refresh|current|sync`
+- `auth login|use|save|remove|refresh|auto-refresh|status|current|sync`
+- `prompt-segment status`
 
 Shared baseline guidance:
 
@@ -19,6 +20,7 @@ Codex-specific contract source:
 
 - `diag rate-limits` => `schema_version=codex-cli.diag.rate-limits.v1`
 - `auth *` => `schema_version=codex-cli.auth.v1`
+- `prompt-segment status` => `schema_version=codex-cli.prompt-segment.v1`
 
 ## Codex-specific integration notes
 
@@ -30,6 +32,8 @@ Codex-specific contract source:
   - `overwrite-confirmation-required`
 - `auth remove` confirmation failure code:
   - `remove-confirmation-required`
+- `auth status` exits `0` for unauthenticated states and reports the machine-readable reason in `result.reason`.
+- `prompt-segment status` exits `0` for non-rendering states and reports the machine-readable reason in `result.reason`.
 - `auth current` secret-dir resolution failure codes:
   - `secret-dir-not-configured`
   - `secret-dir-not-found`
@@ -53,5 +57,7 @@ codex-cli auth login --format json --api-key
 codex-cli auth save --format json --yes team-alpha.json
 codex-cli auth remove --format json --yes team-alpha.json
 codex-cli auth auto-refresh --format json
+codex-cli auth status --format json
 codex-cli auth current --format json
+codex-cli prompt-segment status --format json
 ```

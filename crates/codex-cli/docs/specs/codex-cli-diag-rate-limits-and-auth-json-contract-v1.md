@@ -6,7 +6,8 @@ This document extends `docs/specs/cli-service-json-contract-guideline-v1.md` for
 JSON output from:
 
 - `codex-cli diag rate-limits` (single/all/async)
-- `codex-cli auth login|use|save|remove|refresh|auto-refresh|current|sync`
+- `codex-cli auth login|use|save|remove|refresh|auto-refresh|status|current|sync`
+- `codex-cli prompt-segment status`
 
 Human-readable output remains the default UX. JSON mode must be explicit (`--format json` or
 `--json` where supported for compatibility).
@@ -23,10 +24,14 @@ Human-readable output remains the default UX. JSON mode must be explicit (`--for
 | auth remove | `auth remove` | `codex-cli.auth.v1` | `result` |
 | auth refresh | `auth refresh` | `codex-cli.auth.v1` | `result` |
 | auth auto-refresh | `auth auto-refresh` | `codex-cli.auth.v1` | `result` |
+| auth status | `auth status` | `codex-cli.auth.v1` | `result` |
 | auth current | `auth current` | `codex-cli.auth.v1` | `result` |
 | auth sync | `auth sync` | `codex-cli.auth.v1` | `result` |
+| prompt-segment status | `prompt-segment status` | `codex-cli.prompt-segment.v1` | `result` |
 
-Auth surfaces use one shared schema contract: `codex-cli.auth.v1`.
+Auth surfaces use one shared schema contract: `codex-cli.auth.v1`. Prompt-segment readiness
+uses `codex-cli.prompt-segment.v1` because it reports prompt/cache state rather than auth
+state alone.
 
 ## Required Envelope Rules
 
@@ -61,7 +66,8 @@ Partial failure rule:
 Sensitive data rule:
 
 - Never emit local secrets/tokens (`access_token`, `refresh_token`, raw auth headers, private keys)
-  in either success or failure payloads.
+  in either success or failure payloads. Status payloads may expose boolean presence
+  flags such as `has_oauth_access_token`; they must not expose the token value.
 
 ## Stable vs Informational Fields
 
@@ -87,8 +93,16 @@ Stable (safe for strict parsing):
   - `auth remove`: `target_file`, `removed`
   - `auth refresh`: `target_file`, `refreshed`, `synced`, `refreshed_at`
   - `auth auto-refresh`: `refreshed`, `skipped`, `failed`, `min_age_days`, `targets[*]`
+  - `auth status`: `authenticated`, `prompt_segment_authenticated`, `auth_kind`,
+    `reason`, `exists`, `readable`, `parse_ok`, credential presence booleans
   - `auth current`: `auth_file`, `matched`, `matched_secret`, `match_mode`
   - `auth sync`: `auth_file`, `synced`, `skipped`, `failed`, `updated_files`
+- Prompt segment:
+  - `prompt-segment status`: `enabled`, `authenticated`, `prompt_segment_authenticated`,
+    `cache_exists`, `cache_stale`, `would_render`, `reason`
+
+`prompt_segment_authenticated` is true only when an OAuth access token is present, because
+the prompt segment reads the ChatGPT usage endpoint directly.
 
 Informational (do not hard-depend for schema validation):
 
@@ -98,7 +112,8 @@ Informational (do not hard-depend for schema validation):
 
 ## Compatibility Rules (v1)
 
-- Additive fields are allowed within `codex-cli.diag.rate-limits.v1` and `codex-cli.auth.v1`.
+- Additive fields are allowed within `codex-cli.diag.rate-limits.v1`, `codex-cli.auth.v1`,
+  and `codex-cli.prompt-segment.v1`.
 - Renaming/removing/changing semantics of stable fields is breaking and requires a new schema
   version.
 - Informational fields may be added/adjusted, but must not break stable field interpretation.
@@ -227,6 +242,55 @@ Informational (do not hard-depend for schema validation):
 | `auth login` | `chatgpt-browser` | `chatgpt` |
 | `auth login --device-code` | `chatgpt-device-code` | `chatgpt` |
 | `auth login --api-key` | `api-key` | `openai-api` |
+
+### auth status (success: authenticated OAuth)
+
+```json
+{
+  "schema_version": "codex-cli.auth.v1",
+  "command": "auth status",
+  "ok": true,
+  "result": {
+    "auth_file": "$HOME/.agents/auth.json",
+    "exists": true,
+    "readable": true,
+    "parse_ok": true,
+    "authenticated": true,
+    "prompt_segment_authenticated": true,
+    "auth_kind": "chatgpt-oauth",
+    "has_oauth_access_token": true,
+    "has_oauth_refresh_token": true,
+    "has_api_key": false,
+    "last_refresh": "2025-01-20T12:34:56Z",
+    "identity": "alpha@example.com",
+    "matched_secret": "alpha.json",
+    "match_mode": "exact",
+    "reason": "ready"
+  }
+}
+```
+
+### prompt-segment status (success: ready)
+
+```json
+{
+  "schema_version": "codex-cli.prompt-segment.v1",
+  "command": "prompt-segment status",
+  "ok": true,
+  "result": {
+    "enabled": true,
+    "authenticated": true,
+    "prompt_segment_authenticated": true,
+    "auth_file": "$HOME/.agents/auth.json",
+    "auth_reason": "ready",
+    "cache_file": "$HOME/.config/zsh/cache/codex/prompt-segment-rate-limits/alpha.kv",
+    "cache_exists": true,
+    "cache_stale": false,
+    "would_render": true,
+    "reason": "ready"
+  }
+}
+```
 
 ### auth save (success)
 

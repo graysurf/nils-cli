@@ -1,6 +1,8 @@
+use nils_common::fs as shared_fs;
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOptions, CmdOutput};
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -114,9 +116,16 @@ fn prompt_segment_disabled_prints_nothing() {
 
 #[test]
 fn prompt_segment_is_enabled_exit_codes() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
+
     let output = run(
         &["prompt-segment", "--is-enabled"],
-        &[],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
         &[("CODEX_PROMPT_SEGMENT_ENABLED", "false")],
     );
     assert_exit(&output, 1);
@@ -124,11 +133,73 @@ fn prompt_segment_is_enabled_exit_codes() {
 
     let output = run(
         &["prompt-segment", "--is-enabled"],
-        &[],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
         &[("CODEX_PROMPT_SEGMENT_ENABLED", "true")],
     );
     assert_exit(&output, 0);
     assert!(stdout(&output).trim().is_empty());
+
+    let missing_auth = dir.path().join("missing.json");
+    let output = run(
+        &["prompt-segment", "check"],
+        &[
+            ("CODEX_AUTH_FILE", &missing_auth),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[("CODEX_PROMPT_SEGMENT_ENABLED", "true")],
+    );
+    assert_exit(&output, 1);
+    assert!(stdout(&output).trim().is_empty());
+}
+
+#[test]
+fn prompt_segment_refresh_only_auth_is_not_render_ready() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&cache_root).expect("cache root");
+
+    let auth_file = dir.path().join("auth.json");
+    fs::write(
+        &auth_file,
+        r#"{"tokens":{"refresh_token":"refresh-secret-only"}}"#,
+    )
+    .expect("write refresh-only auth");
+
+    let output = run(
+        &["prompt-segment", "check"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[("CODEX_PROMPT_SEGMENT_ENABLED", "true")],
+    );
+    assert_exit(&output, 1);
+    assert!(stdout(&output).trim().is_empty());
+
+    let output = run(
+        &["prompt-segment", "status", "--json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[("CODEX_PROMPT_SEGMENT_ENABLED", "true")],
+    );
+    assert_exit(&output, 0);
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["authenticated"], true);
+    assert_eq!(payload["result"]["prompt_segment_authenticated"], false);
+    assert_eq!(payload["result"]["would_render"], false);
+    assert_eq!(payload["result"]["reason"], "access-token-missing");
 }
 
 #[test]
@@ -187,6 +258,74 @@ fn prompt_segment_cached_output_formats_and_supports_no_5h() {
 }
 
 #[test]
+fn prompt_segment_status_json_reports_current_render_readiness() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
+
+    let fetched_at = now_epoch().saturating_sub(1).max(1);
+    write_prompt_segment_cache_kv(
+        &cache_root,
+        "alpha",
+        &format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=94\nweekly_remaining=88\nweekly_reset_epoch=1700600000\n"
+        ),
+    );
+
+    let output = run(
+        &["prompt-segment", "status", "--format", "json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[("CODEX_PROMPT_SEGMENT_ENABLED", "true")],
+    );
+    assert_exit(&output, 0);
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["schema_version"], "codex-cli.prompt-segment.v1");
+    assert_eq!(payload["command"], "prompt-segment status");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["enabled"], true);
+    assert_eq!(payload["result"]["authenticated"], true);
+    assert_eq!(payload["result"]["prompt_segment_authenticated"], true);
+    assert_eq!(payload["result"]["cache_exists"], true);
+    assert_eq!(payload["result"]["would_render"], true);
+    assert_eq!(payload["result"]["reason"], "ready");
+}
+
+#[test]
+fn prompt_segment_status_json_reports_missing_auth_without_failure() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&cache_root).expect("cache root");
+    let missing_auth = dir.path().join("missing.json");
+
+    let output = run(
+        &["prompt-segment", "status", "--json"],
+        &[
+            ("CODEX_AUTH_FILE", &missing_auth),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[("CODEX_PROMPT_SEGMENT_ENABLED", "true")],
+    );
+    assert_exit(&output, 0);
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["schema_version"], "codex-cli.prompt-segment.v1");
+    assert_eq!(payload["command"], "prompt-segment status");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["enabled"], true);
+    assert_eq!(payload["result"]["authenticated"], false);
+    assert_eq!(payload["result"]["prompt_segment_authenticated"], false);
+    assert_eq!(payload["result"]["would_render"], false);
+    assert_eq!(payload["result"]["reason"], "auth-file-not-found");
+}
+
+#[test]
 fn prompt_segment_default_time_uses_local_format_and_show_timezone_flag() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
@@ -223,6 +362,38 @@ fn prompt_segment_default_time_uses_local_format_and_show_timezone_flag() {
     );
     assert_exit(&output, 0);
     assert_eq!(stdout(&output), "alpha 5h:94% W:88% 11-21 20:53 +00:00\n");
+}
+
+#[test]
+fn prompt_segment_invalid_auth_suppresses_stale_cache_output() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&cache_root).expect("cache root");
+
+    let auth_file = dir.path().join("auth.json");
+    fs::write(&auth_file, "{not-json").expect("write invalid auth");
+    let hash = shared_fs::sha256_file(&auth_file)
+        .expect("hash invalid auth")
+        .to_lowercase();
+    write_prompt_segment_cache_kv(
+        &cache_root,
+        &format!("auth_{hash}"),
+        "fetched_at=1700000000\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n",
+    );
+
+    let output = run(
+        &["prompt-segment", "--ttl", "1s"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[("CODEX_PROMPT_SEGMENT_ENABLED", "true")],
+    );
+    assert_exit(&output, 0);
+    assert!(stdout(&output).trim().is_empty());
 }
 
 #[test]

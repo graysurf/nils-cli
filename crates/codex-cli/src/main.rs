@@ -132,6 +132,9 @@ fn handle_auth(args: &cli::AuthArgs) -> i32 {
         Some(cli::AuthCommand::AutoRefresh { output }) => {
             auth::auto_refresh::run_with_json(output.is_json()).unwrap_or(1)
         }
+        Some(cli::AuthCommand::Status { output }) => {
+            auth::status::run_with_json(output.is_json()).unwrap_or(1)
+        }
         Some(cli::AuthCommand::Current { output }) => {
             auth::current::run_with_json(output.is_json()).unwrap_or(1)
         }
@@ -175,13 +178,24 @@ fn handle_config(args: &cli::ConfigArgs) -> i32 {
 }
 
 fn handle_prompt_segment(args: &cli::PromptSegmentArgs) -> i32 {
+    if args.is_enabled {
+        return codex_cli::prompt_segment::check();
+    }
+
+    match &args.command {
+        Some(cli::PromptSegmentCommand::Check) => return codex_cli::prompt_segment::check(),
+        Some(cli::PromptSegmentCommand::Status { output }) => {
+            return codex_cli::prompt_segment::status(output.is_json());
+        }
+        None => {}
+    }
+
     let options = codex_cli::prompt_segment::PromptSegmentOptions {
         no_5h: args.no_5h,
         ttl: args.ttl.clone(),
         time_format: args.time_format.clone(),
         show_timezone: args.show_timezone,
         refresh: args.refresh,
-        is_enabled: args.is_enabled,
     };
     codex_cli::prompt_segment::run(&options)
 }

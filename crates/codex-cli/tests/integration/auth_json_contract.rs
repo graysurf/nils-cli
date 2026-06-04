@@ -108,6 +108,145 @@ fn auth_json_contract_current_success_includes_stable_fields() {
 }
 
 #[test]
+fn auth_json_contract_status_oauth_success_includes_readiness_without_secrets() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+
+    let auth_file = dir.path().join("auth.json");
+    let content = auth_json(
+        PAYLOAD_ALPHA,
+        "acct_001",
+        "refresh_secret_value",
+        "2025-01-20T12:34:56Z",
+    );
+    fs::write(&auth_file, &content).expect("write auth");
+    fs::write(secrets.join("alpha.json"), &content).expect("write secret");
+
+    let output = run(
+        &["auth", "status", "--format", "json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+        ],
+    );
+    assert_eq!(output.code, 0);
+
+    let raw = stdout(&output);
+    assert!(!raw.contains("refresh_secret_value"));
+    assert!(!raw.contains(&token(PAYLOAD_ALPHA)));
+
+    let payload: Value = serde_json::from_str(&raw).expect("json");
+    assert_eq!(payload["schema_version"], "codex-cli.auth.v1");
+    assert_eq!(payload["command"], "auth status");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["authenticated"], true);
+    assert_eq!(payload["result"]["prompt_segment_authenticated"], true);
+    assert_eq!(payload["result"]["auth_kind"], "chatgpt-oauth");
+    assert_eq!(payload["result"]["has_oauth_access_token"], true);
+    assert_eq!(payload["result"]["has_oauth_refresh_token"], true);
+    assert_eq!(payload["result"]["has_api_key"], false);
+    assert_eq!(payload["result"]["matched_secret"], "alpha.json");
+    assert_eq!(payload["result"]["reason"], "ready");
+}
+
+#[test]
+fn auth_json_contract_status_api_key_is_authenticated_but_not_prompt_segment_ready() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+
+    let auth_file = dir.path().join("auth.json");
+    fs::write(
+        &auth_file,
+        r#"{"auth_mode":"api-key","OPENAI_API_KEY":"sk-test-secret"}"#,
+    )
+    .expect("write auth");
+
+    let output = run(
+        &["auth", "status", "--json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+        ],
+    );
+    assert_eq!(output.code, 0);
+
+    let raw = stdout(&output);
+    assert!(!raw.contains("sk-test-secret"));
+
+    let payload: Value = serde_json::from_str(&raw).expect("json");
+    assert_eq!(payload["schema_version"], "codex-cli.auth.v1");
+    assert_eq!(payload["command"], "auth status");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["authenticated"], true);
+    assert_eq!(payload["result"]["prompt_segment_authenticated"], false);
+    assert_eq!(payload["result"]["auth_kind"], "openai-api-key");
+    assert_eq!(payload["result"]["has_api_key"], true);
+    assert_eq!(payload["result"]["reason"], "ready");
+}
+
+#[test]
+fn auth_json_contract_status_refresh_token_is_auth_but_not_prompt_segment_ready() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+
+    let auth_file = dir.path().join("auth.json");
+    fs::write(
+        &auth_file,
+        r#"{"tokens":{"refresh_token":"refresh-secret-only"}}"#,
+    )
+    .expect("write auth");
+
+    let output = run(
+        &["auth", "status", "--json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+        ],
+    );
+    assert_eq!(output.code, 0);
+
+    let raw = stdout(&output);
+    assert!(!raw.contains("refresh-secret-only"));
+
+    let payload: Value = serde_json::from_str(&raw).expect("json");
+    assert_eq!(payload["result"]["authenticated"], true);
+    assert_eq!(payload["result"]["prompt_segment_authenticated"], false);
+    assert_eq!(payload["result"]["auth_kind"], "chatgpt-oauth");
+    assert_eq!(payload["result"]["has_oauth_access_token"], false);
+    assert_eq!(payload["result"]["has_oauth_refresh_token"], true);
+    assert_eq!(payload["result"]["reason"], "ready");
+}
+
+#[test]
+fn auth_json_contract_status_missing_auth_file_reports_unauthenticated_state() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let auth_file = dir.path().join("missing.json");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+
+    let output = run(
+        &["auth", "status", "--format", "json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+        ],
+    );
+    assert_eq!(output.code, 0);
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["schema_version"], "codex-cli.auth.v1");
+    assert_eq!(payload["command"], "auth status");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["exists"], false);
+    assert_eq!(payload["result"]["authenticated"], false);
+    assert_eq!(payload["result"]["prompt_segment_authenticated"], false);
+    assert_eq!(payload["result"]["reason"], "auth-file-not-found");
+}
+
+#[test]
 fn auth_json_contract_use_ambiguous_returns_structured_error() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let secrets = dir.path().join("secrets");

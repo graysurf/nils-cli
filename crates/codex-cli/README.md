@@ -16,10 +16,10 @@ Usage:
 
 Groups:
   agent           prompt | advice | knowledge | commit
-  auth            login | use | save | remove | refresh | auto-refresh | current | sync
+  auth            login | use | save | remove | refresh | auto-refresh | status | current | sync
   diag            rate-limits
   config          show | set
-  prompt-segment  (options)
+  prompt-segment  check | status | (render options)
   completion      bash | zsh
 
 Help:
@@ -63,6 +63,7 @@ Agent flag notes:
   mode prompts for confirmation, while non-interactive and JSON mode require `--yes`.
 - `refresh [secret.json]`: Refresh OAuth tokens.
 - `auto-refresh`: Refresh stale tokens across auth + secrets.
+- `status`: Report active auth readiness without exposing token or API-key material.
 - `current`: Show which secret matches `CODEX_AUTH_FILE`.
 - `sync`: Sync `CODEX_AUTH_FILE` back into matching secrets.
 
@@ -74,6 +75,7 @@ Auth examples:
 - `codex-cli auth save team-alpha`: Save to `team-alpha.json` and prompt before overwrite when applicable.
 - `codex-cli auth save --yes team-alpha.json`: Force overwrite without prompt.
 - `codex-cli auth remove --yes team-alpha`: Remove `team-alpha.json`.
+- `codex-cli auth status --format json`: Check active auth readiness for automation.
 
 ### diag
 
@@ -90,8 +92,11 @@ Auth examples:
 
 ### prompt-segment
 
-- `prompt-segment [--no-5h] [--ttl <duration>] [--time-format <strftime>] [--show-timezone] [--refresh] [--is-enabled]`: Render or refresh
-  the prompt segment. Default reset time uses local time without timezone; `--show-timezone` adds the local offset.
+- `prompt-segment [--no-5h] [--ttl <duration>] [--time-format <strftime>] [--show-timezone] [--refresh]`: Render or refresh the prompt
+  segment. Default reset time uses local time without timezone; `--show-timezone` adds the local offset.
+- `prompt-segment check`: Exit `0` only when prompt-segment output is enabled and the active auth file has ChatGPT/OAuth credentials usable
+  by the prompt segment. This command is intended for Starship `when` gates.
+- `prompt-segment status [--format text|json]`: Report prompt-segment readiness, cache state, and the reason it would or would not render.
 
 ### completion
 
@@ -103,7 +108,8 @@ Auth examples:
 - Machine-readable JSON mode is explicit: use `--format json` (preferred) or `--json` where supported for compatibility.
 - Contract spec: `docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - Consumer runbook: `docs/runbooks/json-consumers.md`
-- Covered surfaces: `diag rate-limits` (single/all/async) and `auth login|use|save|remove|refresh|auto-refresh|current|sync`.
+- Covered surfaces: `diag rate-limits` (single/all/async), `auth login|use|save|remove|refresh|auto-refresh|status|current|sync`, and
+  `prompt-segment status`.
 
 ## Environment
 

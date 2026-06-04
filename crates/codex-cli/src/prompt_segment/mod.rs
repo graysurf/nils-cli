@@ -1,9 +1,11 @@
 use std::path::Path;
 
 use crate::auth;
-use crate::paths;
+use crate::auth::status::ActiveAuthStatus;
+use crate::diag_output;
 use crate::rate_limits::cache;
 use nils_common::env as shared_env;
+use serde::Serialize;
 
 mod lock;
 mod refresh;
@@ -17,18 +19,14 @@ pub struct PromptSegmentOptions {
     pub time_format: Option<String>,
     pub show_timezone: bool,
     pub refresh: bool,
-    pub is_enabled: bool,
 }
 
 const DEFAULT_TTL_SECONDS: u64 = 180;
 const DEFAULT_TIME_FORMAT: &str = "%m-%d %H:%M";
 const DEFAULT_TIME_FORMAT_WITH_TIMEZONE: &str = "%m-%d %H:%M %:z";
+const PROMPT_SEGMENT_SCHEMA_VERSION: &str = "codex-cli.prompt-segment.v1";
 
 pub fn run(options: &PromptSegmentOptions) -> i32 {
-    if options.is_enabled {
-        return if prompt_segment_enabled() { 0 } else { 1 };
-    }
-
     let ttl_seconds = match resolve_ttl_seconds(options.ttl.as_deref()) {
         Ok(value) => value,
         Err(_) => {
@@ -41,7 +39,12 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
         return 0;
     }
 
-    let target_file = match paths::resolve_auth_file() {
+    let auth_status = auth::status::inspect_active_auth();
+    if !auth_status.prompt_segment_authenticated {
+        return 0;
+    }
+
+    let target_file = match auth_status.auth_file {
         Some(path) => path,
         None => return 0,
     };
@@ -87,6 +90,41 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
     0
 }
 
+pub fn check() -> i32 {
+    if prompt_segment_enabled() && auth::status::inspect_active_auth().prompt_segment_authenticated
+    {
+        0
+    } else {
+        1
+    }
+}
+
+pub fn status(output_json: bool) -> i32 {
+    let enabled = prompt_segment_enabled();
+    let auth_status = auth::status::inspect_active_auth();
+    let ttl_seconds = resolve_ttl_seconds(None).unwrap_or(DEFAULT_TTL_SECONDS);
+    let result = PromptSegmentStatusResult::from_state(enabled, &auth_status, ttl_seconds);
+
+    if output_json {
+        if diag_output::emit_success_result(
+            PROMPT_SEGMENT_SCHEMA_VERSION,
+            "prompt-segment status",
+            &result,
+        )
+        .is_err()
+        {
+            return 1;
+        }
+    } else {
+        println!(
+            "codex: prompt-segment status enabled={} authenticated={} would_render={} reason={}",
+            result.enabled, result.prompt_segment_authenticated, result.would_render, result.reason
+        );
+    }
+
+    0
+}
+
 fn prompt_segment_enabled() -> bool {
     shared_env::env_truthy("CODEX_PROMPT_SEGMENT_ENABLED")
 }
@@ -108,7 +146,7 @@ fn resolve_ttl_seconds(cli_ttl: Option<&str>) -> Result<u64, ()> {
 fn print_ttl_usage() {
     eprintln!("codex-cli prompt-segment: invalid --ttl");
     eprintln!(
-        "usage: codex-cli prompt-segment [--no-5h] [--ttl <duration>] [--time-format <strftime>] [--show-timezone] [--refresh] [--is-enabled]"
+        "usage: codex-cli prompt-segment [--no-5h] [--ttl <duration>] [--time-format <strftime>] [--show-timezone] [--refresh]"
     );
 }
 
@@ -180,4 +218,88 @@ fn format_email_name(raw: &str, show_full_email: bool) -> String {
         return trimmed.to_string();
     }
     trimmed.split('@').next().unwrap_or(trimmed).to_string()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptSegmentStatusResult {
+    enabled: bool,
+    authenticated: bool,
+    prompt_segment_authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_file: Option<String>,
+    auth_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_file: Option<String>,
+    cache_exists: bool,
+    cache_stale: bool,
+    would_render: bool,
+    reason: String,
+}
+
+impl PromptSegmentStatusResult {
+    fn from_state(enabled: bool, auth_status: &ActiveAuthStatus, ttl_seconds: u64) -> Self {
+        let mut cache_file = None;
+        let mut cache_exists = false;
+        let mut cache_stale = false;
+        let mut would_render = false;
+
+        if enabled
+            && auth_status.prompt_segment_authenticated
+            && let Some(target_file) = auth_status.auth_file.as_deref()
+        {
+            cache_file = cache::cache_file_for_target(target_file)
+                .ok()
+                .map(|path| path.display().to_string());
+            if let Some(path) = cache_file.as_deref() {
+                cache_exists = Path::new(path).is_file();
+            }
+            let (cached, stale) = read_cached_entry(target_file, ttl_seconds);
+            cache_stale = stale;
+            would_render = cached
+                .as_ref()
+                .and_then(|entry| {
+                    render::render_line(
+                        entry,
+                        &resolve_name_prefix(target_file),
+                        shared_env::env_truthy_or("CODEX_PROMPT_SEGMENT_SHOW_5H_ENABLED", true),
+                        DEFAULT_TIME_FORMAT,
+                    )
+                })
+                .map(|line| !line.trim().is_empty())
+                .unwrap_or(false);
+        }
+
+        let reason = if !enabled {
+            "disabled"
+        } else if auth_status.authenticated
+            && !auth_status.prompt_segment_authenticated
+            && !auth_status.has_oauth_access_token
+        {
+            "access-token-missing"
+        } else if !auth_status.prompt_segment_authenticated {
+            auth_status.reason.as_str()
+        } else if would_render {
+            "ready"
+        } else if !cache_exists {
+            "cache-missing"
+        } else {
+            "cache-empty-or-invalid"
+        };
+
+        Self {
+            enabled,
+            authenticated: auth_status.authenticated,
+            prompt_segment_authenticated: auth_status.prompt_segment_authenticated,
+            auth_file: auth_status
+                .auth_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            auth_reason: auth_status.reason.as_str().to_string(),
+            cache_file,
+            cache_exists,
+            cache_stale,
+            would_render,
+            reason: reason.to_string(),
+        }
+    }
 }

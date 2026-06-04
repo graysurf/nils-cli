@@ -164,12 +164,15 @@ fn leaf_paths() -> Vec<Vec<&'static str>> {
         vec!["auth", "remove"],
         vec!["auth", "refresh"],
         vec!["auth", "auto-refresh"],
+        vec!["auth", "status"],
         vec!["auth", "current"],
         vec!["auth", "sync"],
         vec!["diag", "rate-limits"],
         vec!["config", "show"],
         vec!["config", "set"],
         vec!["prompt-segment"],
+        vec!["prompt-segment", "check"],
+        vec!["prompt-segment", "status"],
         vec!["completion"],
     ]
 }

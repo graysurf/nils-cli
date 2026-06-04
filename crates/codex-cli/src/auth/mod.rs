@@ -5,6 +5,7 @@ pub mod output;
 pub mod refresh;
 pub mod remove;
 pub mod save;
+pub mod status;
 pub mod sync;
 pub mod use_secret;
 

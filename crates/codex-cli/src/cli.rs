@@ -187,6 +187,11 @@ pub enum AuthCommand {
         #[command(flatten)]
         output: OutputModeArgs,
     },
+    /// Report active Codex auth readiness without exposing secrets
+    Status {
+        #[command(flatten)]
+        output: OutputModeArgs,
+    },
     /// Show which secret matches CODEX_AUTH_FILE
     Current {
         #[command(flatten)]
@@ -266,6 +271,8 @@ pub enum ConfigCommand {
 
 #[derive(Args)]
 pub struct PromptSegmentArgs {
+    #[command(subcommand)]
+    pub command: Option<PromptSegmentCommand>,
     /// Hide the 5h window output
     #[arg(long = "no-5h")]
     pub no_5h: bool,
@@ -281,9 +288,20 @@ pub struct PromptSegmentArgs {
     /// Force a blocking refresh
     #[arg(long = "refresh")]
     pub refresh: bool,
-    /// Exit 0 if prompt-segment output is enabled
-    #[arg(long = "is-enabled")]
+    /// Exit 0 if prompt-segment output is enabled and active auth is usable
+    #[arg(long = "is-enabled", hide = true)]
     pub is_enabled: bool,
+}
+
+#[derive(Subcommand)]
+pub enum PromptSegmentCommand {
+    /// Exit 0 when Starship should run the prompt segment
+    Check,
+    /// Report prompt-segment readiness without exposing secrets
+    Status {
+        #[command(flatten)]
+        output: OutputModeArgs,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

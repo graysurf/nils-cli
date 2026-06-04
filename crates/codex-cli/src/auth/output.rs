@@ -62,6 +62,31 @@ pub struct AuthAutoRefreshResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AuthStatusResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_file: Option<String>,
+    pub exists: bool,
+    pub readable: bool,
+    pub parse_ok: bool,
+    pub authenticated: bool,
+    pub prompt_segment_authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_kind: Option<String>,
+    pub has_oauth_access_token: bool,
+    pub has_oauth_refresh_token: bool,
+    pub has_api_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refresh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_mode: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AuthCurrentResult {
     pub auth_file: String,
     pub matched: bool,
