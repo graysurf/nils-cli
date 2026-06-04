@@ -21,6 +21,8 @@ Inputs:
 
 - Required:
   - `--pr <N>`: dependabot PR number to deliver.
+  - `--all-open`: deliver all open Dependabot PRs sequentially. Use this when
+    the queue has multiple artifact-drift bumps; it must start from `main`.
 - Optional:
   - `--sync-main` (default): fast-forward merge `origin/main` into the PR branch before refresh.
   - `--no-sync-main`: keep branch as-is; only regenerate artifacts on current commit.
@@ -34,15 +36,18 @@ Outputs:
 
 - Checks out the PR head branch via `gh pr checkout <N>`.
 - Enforces the PR is authored by `dependabot[bot]` and the head branch matches `dependabot/*` (unless `--allow-non-dependabot`).
-- Optionally fast-forward merges `origin/main` into the PR branch (`--sync-main`, on by default).
+- Optionally fast-forward merges `origin/main` into the PR branch (`--sync-main`, on by default). If that is not possible, it requests
+  `@dependabot rebase`, waits for the PR head SHA to change, then checks out the rebased branch with `gh pr checkout --force`.
 - Runs `bash scripts/generate-third-party-artifacts.sh --check` to detect drift.
 - On drift, runs `bash scripts/generate-third-party-artifacts.sh --write`, derives the bumped dep name from the PR title
   (e.g. `libc`, `rand`), stages `THIRD_PARTY_LICENSES.md` + `THIRD_PARTY_NOTICES.md`, and commits via `semantic-commit`
-  with `fix(ci): refresh third-party artifacts for <dep> bump`.
-- Pushes the fix commit to the PR branch on `origin` (unless `--skip-push`).
-- Waits for CI green via `gh pr checks <N> --watch` (unless `--no-ci-wait`).
+  with `fix(ci): refresh third-party artifacts for <dep> bump` and a body line short enough for the commit-body gate.
+- Pushes the fix commit to the PR branch on `origin` (unless `--skip-push`). If the push is rejected because the Dependabot branch moved,
+  fetches the latest PR head, rebases only the refresh commit(s) onto it, and retries.
+- Waits for CI green via `gh pr checks <N> --watch` (unless `--no-ci-wait`). If GitHub has not attached checks to the PR summary yet,
+  falls back to `gh run list` + `gh run watch` for the PR head SHA.
 - Merges the PR via `gh pr merge <N> --<merge-method>` on CI green (unless `--skip-merge`).
-- Restores the starting branch at the end.
+- Restores the starting branch at the end. In `--all-open` mode, syncs `main` after each successful merge before delivering the next PR.
 
 Exit codes:
 
@@ -52,15 +57,17 @@ Exit codes:
 
 Failure modes:
 
-- `--pr` missing or not a positive integer.
+- Neither `--pr` nor `--all-open` supplied, or both supplied.
+- `--pr` is not a positive integer.
+- `--all-open` is run from a branch other than `main`.
 - PR not found or not open.
 - PR author is not `dependabot[bot]` (without `--allow-non-dependabot`).
 - Head branch is not `dependabot/*` (without `--allow-non-dependabot`).
 - Working tree is dirty on the starting branch.
 - `scripts/generate-third-party-artifacts.sh --check` fails with a non-drift error (exit code not in `{0,1}`).
 - `semantic-commit` validation fails.
-- `git push` rejected (e.g. dependabot rebased; retry manually with `@dependabot rebase` then re-run).
-- CI concludes with failure, cancelled, or timeout under `gh pr checks --watch`.
+- `git push` is still rejected after the configured retry count, or the refresh commit cannot be rebased cleanly onto the updated PR head.
+- CI concludes with failure, cancelled, or timeout under both the PR check watcher and the workflow-run fallback.
 - `gh pr merge` rejected (branch protection / required reviews pending).
 
 ## Scripts (only entrypoints)
@@ -70,19 +77,24 @@ Failure modes:
 ## Workflow
 
 1. Validate inputs and environment (`gh auth status`, required binaries, clean tree).
-2. Resolve PR metadata via `gh pr view <N> --json number,state,title,headRefName,author,isCrossRepository`.
+2. Resolve PR metadata via `gh pr view <N> --json number,state,title,headRefName,headRefOid,author,isCrossRepository`.
 3. Enforce dependabot guard (author + branch prefix), unless `--allow-non-dependabot`.
-4. `gh pr checkout <N>` (records starting branch for later restoration).
-5. On `--sync-main`, `git fetch origin main` and `git merge --ff-only origin/main` — abort on non-fast-forward.
-6. Run the drift check; on drift:
+4. In `--all-open` mode, list open Dependabot PRs, then invoke this same script once per PR. After each non-skip merge, restore `main`
+   and fast-forward to `origin/main`.
+5. `gh pr checkout <N> --force` (records starting branch for later restoration).
+6. On `--sync-main`, `git fetch origin main` and `git merge --ff-only origin/main`; on non-fast-forward, comment `@dependabot rebase`,
+   wait for `headRefOid` to change, then checkout the rebased PR head and retry the fast-forward check.
+7. Run the drift check; on drift:
    a. `bash scripts/generate-third-party-artifacts.sh --write`.
    b. `git add THIRD_PARTY_LICENSES.md THIRD_PARTY_NOTICES.md`.
-   c. `printf 'fix(ci): refresh third-party artifacts for %s bump\n\n- Regenerate THIRD_PARTY_LICENSES.md and THIRD_PARTY_NOTICES.md via scripts/generate-third-party-artifacts.sh --write after the %s bump.\n' "$dep" "$dep" | semantic-commit commit`.
-   d. `git push origin HEAD` (unless `--skip-push`).
-7. On `--no-ci-wait` + not merging: exit 0.
-8. Wait for CI via `gh pr checks <N> --watch`; bail on non-success conclusion.
-9. On `--skip-merge`: exit 0.
-10. `gh pr merge <N> --squash` (or configured merge method); restore starting branch.
+   c. `printf 'fix(ci): refresh third-party artifacts for %s bump\n\n- Regenerate third-party artifacts after the %s bump.\n' "$dep" "$dep" | semantic-commit commit`.
+   d. `git push origin HEAD` (unless `--skip-push`); if rejected, fetch the current PR head, `git rebase --onto` the refresh commit(s),
+      and retry.
+8. On `--no-ci-wait` + not merging: exit 0.
+9. Wait for CI via `gh pr checks <N> --watch`; if no checks are reported yet, select the matching pull-request CI run by head SHA and
+   wait with `gh run watch`.
+10. On `--skip-merge`: exit 0.
+11. `gh pr merge <N> --squash` (or configured merge method); restore starting branch.
 
 ## Reference
 
