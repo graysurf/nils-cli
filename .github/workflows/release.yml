@@ -15,7 +15,7 @@ jobs:
       contents: read
     steps:
       - name: Require green CI on tagged commit
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const requiredChecks = ["test", "test_macos", "coverage"];
@@ -242,7 +242,7 @@ jobs:
       contents: read
     steps:
       - name: Dispatch formula update
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           HOMEBREW_TAP_DISPATCH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
         with:
