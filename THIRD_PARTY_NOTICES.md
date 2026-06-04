@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `224687a53cbe82b282cfb72f575df459214cfb095306409f919b1741cf7ece19`
+- Cargo.lock SHA256: `8a567904e08b60a7455f61eec38abd52fa5a090632011a01d4fd8ce90d2a3bc1`
 - Third-party crates (`source != null`): 460
 
 ## Notice Extraction Policy
@@ -3857,7 +3857,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### zbus 5.15.0
+### zbus 5.16.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3865,7 +3865,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### zbus_macros 5.15.0
+### zbus_macros 5.16.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3978,7 +3978,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
   - `LICENSE-ZLIB`
 
-### zvariant 5.11.0
+### zvariant 5.12.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3986,7 +3986,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### zvariant_derive 5.11.0
+### zvariant_derive 5.12.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3994,7 +3994,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### zvariant_utils 3.3.1
+### zvariant_utils 3.4.0
 
 - License: `MIT`
 - Source: `crates.io`
