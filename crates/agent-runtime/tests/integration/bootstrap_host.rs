@@ -2,6 +2,7 @@
 
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
+use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -185,6 +186,15 @@ fn phase<'a>(json: &'a Value, id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing phase {id}: {json:#}"))
 }
 
+fn verification<'a>(json: &'a Value, id: &str) -> &'a Value {
+    json["verification"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == id)
+        .unwrap_or_else(|| panic!("missing verification {id}: {json:#}"))
+}
+
 #[test]
 fn dry_run_json_lists_pending_phases_without_mutation() {
     let tmp = TempDir::new().unwrap();
@@ -209,12 +219,19 @@ fn dry_run_json_lists_pending_phases_without_mutation() {
     assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     let json: Value = serde_json::from_str(&out.stdout_text()).unwrap();
 
-    assert_eq!(
-        json["schema_version"],
-        "cli.agent-runtime.bootstrap-host.v1"
-    );
+    assert_eq!(json["schema_version"], "agent-runtime.bootstrap-report.v1");
     assert_eq!(json["mode"], "dry-run");
+    assert_eq!(json["exit_code"], 0);
+    assert!(json["started_at_unix_ms"].is_number(), "{json:#}");
+    assert!(json["completed_at_unix_ms"].is_number(), "{json:#}");
+    assert!(json["duration_ms"].is_number(), "{json:#}");
+    assert_eq!(json["summary"]["pending"], 9);
+    assert_eq!(json["summary"]["skipped"], 5);
+    assert_eq!(json["summary"]["failed"], 0);
     assert_eq!(phase(&json, "render:codex")["status"], "pending");
+    assert!(phase(&json, "render:codex")["started_at_unix_ms"].is_number());
+    assert!(phase(&json, "render:codex")["completed_at_unix_ms"].is_number());
+    assert_eq!(phase(&json, "render:codex")["exit_code"], Value::Null);
     assert_eq!(phase(&json, "install:claude")["status"], "pending");
     let install_command = phase(&json, "install:claude")["command"].as_str().unwrap();
     assert!(install_command.contains("--live-home"), "{install_command}");
@@ -233,6 +250,18 @@ fn dry_run_json_lists_pending_phases_without_mutation() {
     assert!(
         !root.join("build/codex").exists(),
         "dry-run should not render product output"
+    );
+    assert_eq!(
+        verification(&json, "installed-versions")["status"],
+        "skipped"
+    );
+    assert_eq!(verification(&json, "docs-audit")["status"], "skipped");
+    assert_eq!(verification(&json, "zsh-kit-smoke")["status"], "skipped");
+    assert_eq!(verification(&json, "codex-doctor")["status"], "pending");
+    assert_eq!(verification(&json, "claude-doctor")["status"], "pending");
+    assert_eq!(
+        verification(&json, "codex-prompt-input")["status"],
+        "skipped"
     );
 }
 
@@ -261,7 +290,17 @@ fn apply_json_writes_checkpoint_and_installs_sandbox() {
     let json: Value = serde_json::from_str(&out.stdout_text()).unwrap();
 
     assert_eq!(json["mode"], "apply");
+    assert_eq!(json["exit_code"], 0);
     assert_eq!(phase(&json, "render:codex")["status"], "completed");
+    assert_eq!(phase(&json, "render:codex")["exit_code"], 0);
+    assert!(
+        phase(&json, "render:codex")["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("output=")),
+        "{json:#}"
+    );
     assert_eq!(phase(&json, "install:claude")["status"], "completed");
     assert_eq!(
         phase(&json, "doctor-skill-surface:codex")["status"],
@@ -320,4 +359,56 @@ fn apply_json_writes_checkpoint_and_installs_sandbox() {
     let rerun_json: Value = serde_json::from_str(&rerun.stdout_text()).unwrap();
     assert_eq!(phase(&rerun_json, "render:codex")["status"], "completed");
     assert_eq!(phase(&rerun_json, "install:claude")["status"], "completed");
+}
+
+#[test]
+fn apply_failure_writes_report_and_checkpoint_with_pending_remainder() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let backup_root = tmp.path().join("checkpoint");
+    fs::remove_file(root.join("targets/codex/link-map.yaml")).unwrap();
+
+    let out = run(&[
+        "bootstrap-host",
+        "--source-root",
+        root.to_str().unwrap(),
+        "--backup-root",
+        backup_root.to_str().unwrap(),
+        "--profile",
+        "core",
+        "--product",
+        "codex",
+        "--apply",
+        "--format",
+        "json",
+        "--skip-homebrew-install",
+        "--skip-cli-tools",
+    ]);
+    assert_eq!(out.code, 2, "stderr: {}", out.stderr_text());
+    let json: Value = serde_json::from_str(&out.stdout_text()).unwrap();
+
+    assert_eq!(json["schema_version"], "agent-runtime.bootstrap-report.v1");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["exit_code"], 2);
+    assert_eq!(json["summary"]["completed"], 3);
+    assert_eq!(json["summary"]["failed"], 1);
+    assert_eq!(json["summary"]["pending"], 2);
+    assert_eq!(phase(&json, "render:codex")["status"], "completed");
+    assert_eq!(phase(&json, "install:codex")["status"], "failed");
+    assert_eq!(phase(&json, "install:codex")["exit_code"], 2);
+    assert_eq!(phase(&json, "prune-stale:codex")["status"], "pending");
+    assert!(
+        phase(&json, "install:codex")["message"]
+            .as_str()
+            .unwrap()
+            .contains("link-map.yaml"),
+        "{json:#}"
+    );
+
+    let checkpoint: Value =
+        serde_json::from_str(&fs::read_to_string(backup_root.join("checkpoint.json")).unwrap())
+            .unwrap();
+    assert_eq!(checkpoint["exit_code"], 2);
+    assert_eq!(phase(&checkpoint, "install:codex")["status"], "failed");
+    assert_eq!(phase(&checkpoint, "prune-stale:codex")["status"], "pending");
 }
