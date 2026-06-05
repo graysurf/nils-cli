@@ -17,6 +17,7 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "install",
     "uninstall",
     "doctor",
+    "bootstrap-host",
     "audit-drift",
     "gc-backups",
     "list-skills",
@@ -83,6 +84,26 @@ fn help_lists_every_subcommand() {
             stdout.contains(sub),
             "help should list `{sub}` subcommand: {stdout}"
         );
+    }
+}
+
+#[test]
+fn bootstrap_host_help_lists_setup_flags() {
+    let output = run(&["bootstrap-host", "--help"]);
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr_text());
+    let stdout = output.stdout_text();
+    for flag in [
+        "--dry-run",
+        "--apply",
+        "--profile",
+        "--source-root",
+        "--backup-root",
+        "--skip-homebrew-install",
+        "--skip-cli-tools",
+        "--product",
+        "--format",
+    ] {
+        assert!(stdout.contains(flag), "help should list `{flag}`: {stdout}");
     }
 }
 

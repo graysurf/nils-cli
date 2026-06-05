@@ -55,6 +55,8 @@ pub enum Command {
     Uninstall(commands::uninstall::UninstallArgs),
     /// Diagnose host setup, runtime roots, and required CLI floors.
     Doctor(commands::doctor::DoctorArgs),
+    /// Preview or apply the host bootstrap phases for Codex and Claude.
+    BootstrapHost(commands::bootstrap_host::BootstrapHostArgs),
     /// Detect source-vs-rendered, rendered-vs-live, and unsafe drift.
     AuditDrift(commands::audit_drift::AuditDriftArgs),
     /// Prune old backups under `<state_home>/backups/`.
@@ -78,6 +80,7 @@ impl Command {
             Command::Install(_) => "install",
             Command::Uninstall(_) => "uninstall",
             Command::Doctor(_) => "doctor",
+            Command::BootstrapHost(_) => "bootstrap-host",
             Command::AuditDrift(_) => "audit-drift",
             Command::GcBackups(_) => "gc-backups",
             Command::ListSkills(_) => "list-skills",
@@ -104,6 +107,13 @@ pub fn run() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(err) => {
                 eprintln!("agent-runtime audit-drift: {err:#}");
+                ExitCode::from(2)
+            }
+        },
+        Command::BootstrapHost(args) => match commands::bootstrap_host::run(args) {
+            Ok(code) => ExitCode::from(code),
+            Err(err) => {
+                eprintln!("agent-runtime bootstrap-host: {err:#}");
                 ExitCode::from(2)
             }
         },
