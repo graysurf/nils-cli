@@ -34,10 +34,10 @@ pub struct BootstrapHostArgs {
     /// Render, install, prune, verify, and write a checkpoint.
     #[arg(long, conflicts_with = "dry_run")]
     pub apply: bool,
-    /// Leave Homebrew installation to the caller / legacy setup wrapper.
+    /// Leave Homebrew installation to the caller / existing setup wrapper.
     #[arg(long, default_value_t = false)]
     pub skip_homebrew_install: bool,
-    /// Leave CLI tool installation to the caller / legacy setup wrapper.
+    /// Leave CLI tool installation to the caller / existing setup wrapper.
     #[arg(long, default_value_t = false)]
     pub skip_cli_tools: bool,
     /// Output format.
@@ -243,8 +243,8 @@ impl BootstrapRunner {
             "zsh-kit shell setup remains delegated to the zsh-kit installer; authentication stays out of scope",
         );
         self.delegated_phase(
-            "legacy-setup-delegation",
-            "legacy setup scripts can call this command for render/install/prune/doctor phases while retaining their existing host-tool and shell setup gates",
+            "setup-wrapper-delegation",
+            "setup scripts can call this command for render/install/prune/doctor phases while retaining their existing host-tool and shell setup gates",
         );
 
         let mut report = self.report();
@@ -295,7 +295,7 @@ impl BootstrapRunner {
         let message = if self.args.skip_homebrew_install {
             "Homebrew installation skipped by flag"
         } else {
-            "Homebrew installation remains delegated to legacy setup until wrapper integration"
+            "Homebrew installation remains delegated to existing setup until wrapper integration"
         };
         self.skip_phase("homebrew", None, message);
     }
@@ -304,7 +304,7 @@ impl BootstrapRunner {
         let message = if self.args.skip_cli_tools {
             "CLI tool installation skipped by flag"
         } else {
-            "CLI tool installation remains delegated to legacy setup until wrapper integration"
+            "CLI tool installation remains delegated to existing setup until wrapper integration"
         };
         self.skip_phase("cli-tools", None, message);
     }
