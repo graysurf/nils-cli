@@ -299,6 +299,22 @@ pub fn run(
     })
 }
 
+pub fn resolve_runtime_roots_for_product(
+    product: &str,
+    source_root: &Path,
+    live_home_override: Option<&Path>,
+    state_home_override: Option<&Path>,
+) -> Result<ResolvedRuntimeRoots, DoctorError> {
+    let runtime_roots = load_runtime_roots(source_root)?;
+    let product_root = product_root(&runtime_roots, product)?;
+    Ok(resolve_runtime_roots(
+        product,
+        product_root,
+        live_home_override,
+        state_home_override,
+    ))
+}
+
 fn run_skill_surface_only(
     product: &str,
     source_root: &Path,

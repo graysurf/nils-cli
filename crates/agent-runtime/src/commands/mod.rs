@@ -1,4 +1,5 @@
 pub mod audit_drift;
+pub mod bootstrap_host;
 pub mod doctor;
 pub mod gc_backups;
 pub mod install;
