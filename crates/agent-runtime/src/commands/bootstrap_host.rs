@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: &str = "cli.agent-runtime.bootstrap-host.v1";
+const SCHEMA_VERSION: &str = "agent-runtime.bootstrap-report.v1";
 const CHECKPOINT_FILE: &str = "checkpoint.json";
 
 #[derive(Args, Debug)]
@@ -138,14 +138,29 @@ impl PhaseStatus {
 struct BootstrapHostReport {
     schema_version: &'static str,
     ok: bool,
+    exit_code: u8,
     mode: BootstrapMode,
     profile: BootstrapProfile,
     product: ProductSelection,
     source_root: PathBuf,
+    backup_root: PathBuf,
     checkpoint_root: PathBuf,
     checkpoint_file: PathBuf,
     products: Vec<String>,
+    started_at_unix_ms: u64,
+    completed_at_unix_ms: u64,
+    duration_ms: u64,
+    summary: BootstrapSummary,
     phases: Vec<PhaseReport>,
+    verification: Vec<VerificationReport>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct BootstrapSummary {
+    completed: usize,
+    failed: usize,
+    pending: usize,
+    skipped: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -156,7 +171,20 @@ struct PhaseReport {
     status: PhaseStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     command: Option<String>,
+    started_at_unix_ms: u64,
+    completed_at_unix_ms: u64,
+    duration_ms: u64,
+    exit_code: Option<u8>,
     message: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VerificationReport {
+    id: String,
+    status: PhaseStatus,
+    message: String,
+    evidence: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -168,6 +196,29 @@ struct PreviousCheckpoint {
 struct PreviousPhase {
     id: String,
     status: PhaseStatus,
+}
+
+#[derive(Clone, Copy)]
+struct PhaseTiming {
+    started_at_unix_ms: u64,
+    completed_at_unix_ms: u64,
+}
+
+impl PhaseTiming {
+    fn instant() -> Self {
+        let now = report_now_unix_ms();
+        Self {
+            started_at_unix_ms: now,
+            completed_at_unix_ms: now,
+        }
+    }
+
+    fn completed(started_at_unix_ms: u64) -> Self {
+        Self {
+            started_at_unix_ms,
+            completed_at_unix_ms: report_now_unix_ms(),
+        }
+    }
 }
 
 pub fn run(args: BootstrapHostArgs) -> anyhow::Result<u8> {
@@ -202,15 +253,15 @@ pub fn run(args: BootstrapHostArgs) -> anyhow::Result<u8> {
         manifests: None,
         phases: Vec::new(),
         halted: false,
+        started_at_unix_ms: report_now_unix_ms(),
     };
     let report = runner.run()?;
-    let exit_code = if report.ok { 0 } else { 2 };
 
     match runner.args.format {
         OutputFormat::Text => print_text(&report),
         OutputFormat::Json => print_json(&report)?,
     }
-    Ok(exit_code)
+    Ok(report.exit_code)
 }
 
 struct BootstrapRunner {
@@ -223,6 +274,7 @@ struct BootstrapRunner {
     manifests: Option<Arc<ManifestSet>>,
     phases: Vec<PhaseReport>,
     halted: bool,
+    started_at_unix_ms: u64,
 }
 
 impl BootstrapRunner {
@@ -247,11 +299,15 @@ impl BootstrapRunner {
             "setup scripts can call this command for render/install/prune/doctor phases while retaining their existing host-tool and shell setup gates",
         );
 
-        let mut report = self.report();
+        let ok = !self
+            .phases
+            .iter()
+            .any(|phase| phase.status == PhaseStatus::Failed);
+        let exit_code = if ok { 0 } else { 2 };
+        let report = self.report(ok, exit_code);
         if self.mode == BootstrapMode::Apply {
             std::fs::create_dir_all(&self.checkpoint_root)?;
             write_checkpoint(&self.checkpoint_file, &report)?;
-            report.checkpoint_file = self.checkpoint_file.clone();
         }
         Ok(report)
     }
@@ -595,16 +651,25 @@ impl BootstrapRunner {
             );
             return;
         }
+        let started_at_unix_ms = report_now_unix_ms();
         match action(self) {
-            Ok(message) => self.push_phase(id, product, PhaseStatus::Completed, command, message),
+            Ok(message) => self.push_phase_at(
+                id,
+                product,
+                PhaseStatus::Completed,
+                command,
+                message,
+                PhaseTiming::completed(started_at_unix_ms),
+            ),
             Err(err) => {
                 self.halted = true;
-                self.push_phase(
+                self.push_phase_at(
                     id,
                     product,
                     PhaseStatus::Failed,
                     command,
                     format!("{err:#}"),
+                    PhaseTiming::completed(started_at_unix_ms),
                 );
             }
         }
@@ -618,12 +683,42 @@ impl BootstrapRunner {
         command: Option<String>,
         message: String,
     ) {
+        self.push_phase_at(
+            id,
+            product,
+            status,
+            command,
+            message,
+            PhaseTiming::instant(),
+        );
+    }
+
+    fn push_phase_at(
+        &mut self,
+        id: &str,
+        product: Option<&str>,
+        status: PhaseStatus,
+        command: Option<String>,
+        message: String,
+        timing: PhaseTiming,
+    ) {
+        let evidence = match status {
+            PhaseStatus::Completed | PhaseStatus::Failed => vec![message.clone()],
+            PhaseStatus::Pending | PhaseStatus::Skipped => Vec::new(),
+        };
         self.phases.push(PhaseReport {
             id: id.to_string(),
             product: product.map(str::to_string),
             status,
             command,
+            started_at_unix_ms: timing.started_at_unix_ms,
+            completed_at_unix_ms: timing.completed_at_unix_ms,
+            duration_ms: timing
+                .completed_at_unix_ms
+                .saturating_sub(timing.started_at_unix_ms),
+            exit_code: phase_exit_code(status),
             message,
+            evidence,
         });
     }
 
@@ -688,18 +783,17 @@ impl BootstrapRunner {
         )
     }
 
-    fn report(&self) -> BootstrapHostReport {
-        let ok = !self
-            .phases
-            .iter()
-            .any(|phase| phase.status == PhaseStatus::Failed);
+    fn report(&self, ok: bool, exit_code: u8) -> BootstrapHostReport {
+        let completed_at_unix_ms = report_now_unix_ms();
         BootstrapHostReport {
             schema_version: SCHEMA_VERSION,
             ok,
+            exit_code,
             mode: self.mode,
             profile: self.args.profile,
             product: self.args.product,
             source_root: self.source_root.path().to_path_buf(),
+            backup_root: self.checkpoint_root.clone(),
             checkpoint_root: self.checkpoint_root.clone(),
             checkpoint_file: self.checkpoint_file.clone(),
             products: self
@@ -709,6 +803,10 @@ impl BootstrapRunner {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            started_at_unix_ms: self.started_at_unix_ms,
+            completed_at_unix_ms,
+            duration_ms: completed_at_unix_ms.saturating_sub(self.started_at_unix_ms),
+            summary: summarize_phases(&self.phases),
             phases: self
                 .phases
                 .iter()
@@ -717,11 +815,99 @@ impl BootstrapRunner {
                     product: phase.product.clone(),
                     status: phase.status,
                     command: phase.command.clone(),
+                    started_at_unix_ms: phase.started_at_unix_ms,
+                    completed_at_unix_ms: phase.completed_at_unix_ms,
+                    duration_ms: phase.duration_ms,
+                    exit_code: phase.exit_code,
                     message: phase.message.clone(),
+                    evidence: phase.evidence.clone(),
                 })
                 .collect(),
+            verification: self.verification(),
         }
     }
+
+    fn verification(&self) -> Vec<VerificationReport> {
+        let mut reports = vec![
+            skipped_verification(
+                "installed-versions",
+                "installed version collection remains delegated to host-tool setup integration",
+            ),
+            skipped_verification(
+                "docs-audit",
+                "agent-docs audit remains delegated to the runtime-kit setup integration",
+            ),
+            skipped_verification(
+                "zsh-kit-smoke",
+                "zsh-kit smoke verification remains delegated to the zsh-kit installer",
+            ),
+        ];
+
+        reports.push(self.doctor_verification("codex"));
+        reports.push(self.doctor_verification("claude"));
+        reports.push(skipped_verification(
+            "codex-prompt-input",
+            "Codex prompt-input verification remains delegated until wrapper integration",
+        ));
+        reports
+    }
+
+    fn doctor_verification(&self, product: &str) -> VerificationReport {
+        let id = format!("{product}-doctor");
+        if !self.args.product.products().contains(&product) {
+            return VerificationReport {
+                id,
+                status: PhaseStatus::Skipped,
+                message: format!("{product} was not selected for this bootstrap run"),
+                evidence: Vec::new(),
+            };
+        }
+        let phase_id = format!("doctor-skill-surface:{product}");
+        let Some(phase) = self.phases.iter().find(|phase| phase.id == phase_id) else {
+            return VerificationReport {
+                id,
+                status: PhaseStatus::Pending,
+                message: format!("{product} doctor phase has not run yet"),
+                evidence: Vec::new(),
+            };
+        };
+        VerificationReport {
+            id,
+            status: phase.status,
+            message: phase.message.clone(),
+            evidence: phase.evidence.clone(),
+        }
+    }
+}
+
+fn skipped_verification(id: &str, message: &str) -> VerificationReport {
+    VerificationReport {
+        id: id.to_string(),
+        status: PhaseStatus::Skipped,
+        message: message.to_string(),
+        evidence: Vec::new(),
+    }
+}
+
+fn phase_exit_code(status: PhaseStatus) -> Option<u8> {
+    match status {
+        PhaseStatus::Completed | PhaseStatus::Skipped => Some(0),
+        PhaseStatus::Failed => Some(2),
+        PhaseStatus::Pending => None,
+    }
+}
+
+fn summarize_phases(phases: &[PhaseReport]) -> BootstrapSummary {
+    let mut summary = BootstrapSummary::default();
+    for phase in phases {
+        match phase.status {
+            PhaseStatus::Completed => summary.completed += 1,
+            PhaseStatus::Failed => summary.failed += 1,
+            PhaseStatus::Pending => summary.pending += 1,
+            PhaseStatus::Skipped => summary.skipped += 1,
+        }
+    }
+    summary
 }
 
 fn previous_phase_statuses(path: &Path) -> anyhow::Result<BTreeMap<String, PhaseStatus>> {
@@ -750,12 +936,21 @@ fn print_json(report: &BootstrapHostReport) -> anyhow::Result<()> {
 
 fn print_text(report: &BootstrapHostReport) {
     eprintln!(
-        "agent-runtime bootstrap-host: mode={} profile={} product={} ok={} checkpoint={}",
+        "agent-runtime bootstrap-host: mode={} profile={} product={} ok={} exit_code={} checkpoint={}",
         report.mode.label(),
         report.profile.label(),
         report.product.label(),
         report.ok,
+        report.exit_code,
         report.checkpoint_file.display()
+    );
+    eprintln!(
+        "  summary completed={} failed={} pending={} skipped={} duration_ms={}",
+        report.summary.completed,
+        report.summary.failed,
+        report.summary.pending,
+        report.summary.skipped,
+        report.duration_ms
     );
     for phase in &report.phases {
         let product = phase
@@ -770,6 +965,10 @@ fn print_text(report: &BootstrapHostReport) {
             product,
             phase.message
         );
+    }
+    eprintln!("  verification");
+    for item in &report.verification {
+        eprintln!("    {} {} - {}", item.status.label(), item.id, item.message);
     }
 }
 
@@ -789,4 +988,12 @@ fn default_checkpoint_root() -> PathBuf {
 #[allow(clippy::disallowed_methods)]
 fn install_now() -> SystemTime {
     SystemTime::now()
+}
+
+#[allow(clippy::disallowed_methods)]
+fn report_now_unix_ms() -> u64 {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
