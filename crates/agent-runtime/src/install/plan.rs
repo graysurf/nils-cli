@@ -20,6 +20,14 @@ use thiserror::Error;
 pub enum PlanError {
     #[error("source for entry `{id}` does not exist: {path}")]
     MissingSource { id: String, path: PathBuf },
+    #[error(
+        "missing rendered output for product `{product}`: expected {path}; run `{command}` before `agent-runtime install`"
+    )]
+    MissingRenderOutput {
+        product: String,
+        path: PathBuf,
+        command: String,
+    },
     #[error("io error walking entry `{id}` source `{path}`: {source}")]
     Walk {
         id: String,
@@ -121,10 +129,10 @@ impl InstallPlan {
             }
             match entry.kind {
                 EntryKind::SymlinkedFile => {
-                    expand_symlinked_file(entry, source_root, home, &mut actions)?;
+                    expand_symlinked_file(product, entry, source_root, home, &mut actions)?;
                 }
                 EntryKind::PluginManifestCopy | EntryKind::BackedUpOnReplace => {
-                    expand_single_symlink(entry, source_root, home, &mut actions)?;
+                    expand_single_symlink(product, entry, source_root, home, &mut actions)?;
                 }
                 EntryKind::ManagedBlock => {
                     let dest_abs = home.join(dest_rel);
@@ -187,6 +195,7 @@ fn has_parent_dir_component(p: &Path) -> bool {
 }
 
 fn expand_single_symlink(
+    product: &str,
     entry: &LinkEntry,
     source_root: &Path,
     home: &Path,
@@ -195,10 +204,13 @@ fn expand_single_symlink(
     let source_rel = require_relative_source(entry)?;
     let source_abs = source_root.join(source_rel);
     if !source_abs.exists() {
-        return Err(PlanError::MissingSource {
-            id: entry.id.clone(),
-            path: source_abs,
-        });
+        return Err(missing_source_error(
+            product,
+            source_root,
+            entry,
+            source_rel,
+            source_abs,
+        ));
     }
     let dest_abs = home.join(&entry.destination);
     let requires_backup = is_regular_non_symlink(&dest_abs);
@@ -214,6 +226,7 @@ fn expand_single_symlink(
 }
 
 fn expand_symlinked_file(
+    product: &str,
     entry: &LinkEntry,
     source_root: &Path,
     home: &Path,
@@ -222,10 +235,13 @@ fn expand_symlinked_file(
     let source_rel = require_relative_source(entry)?;
     let source_abs = source_root.join(source_rel);
     if !source_abs.exists() {
-        return Err(PlanError::MissingSource {
-            id: entry.id.clone(),
-            path: source_abs,
-        });
+        return Err(missing_source_error(
+            product,
+            source_root,
+            entry,
+            source_rel,
+            source_abs,
+        ));
     }
     if !entry.recursive {
         let dest_abs = home.join(&entry.destination);
@@ -268,6 +284,38 @@ fn link_mode_for_source(source: &Path) -> SymlinkLinkMode {
     match std::fs::symlink_metadata(source) {
         Ok(meta) if meta.is_dir() => SymlinkLinkMode::Directory,
         _ => SymlinkLinkMode::File,
+    }
+}
+
+fn missing_source_error(
+    product: &str,
+    source_root: &Path,
+    entry: &LinkEntry,
+    source_rel: &str,
+    source_abs: PathBuf,
+) -> PlanError {
+    let render_root_rel = Path::new("build").join(product);
+    let source_rel_path = Path::new(source_rel);
+    if source_rel_path == render_root_rel || source_rel_path.starts_with(&render_root_rel) {
+        let render_root_abs = source_root.join(&render_root_rel);
+        let path = if render_root_abs.exists() {
+            source_abs
+        } else {
+            render_root_abs
+        };
+        return PlanError::MissingRenderOutput {
+            product: product.to_string(),
+            path,
+            command: format!(
+                "agent-runtime render --source-root {} --product {product}",
+                source_root.display()
+            ),
+        };
+    }
+
+    PlanError::MissingSource {
+        id: entry.id.clone(),
+        path: source_abs,
     }
 }
 
@@ -391,6 +439,77 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PlanError::NonRelativeSource { .. }));
+    }
+
+    #[test]
+    fn build_reports_render_command_for_missing_rendered_skill_tree() {
+        let tmp = TempDir::new().unwrap();
+        let source_root = tmp.path().join("src");
+        fs::create_dir_all(source_root.join("build/codex")).unwrap();
+        let expected_path = source_root.join("build/codex/plugins/reporting/skills");
+        let lm = one_entry_map(symlinked_file(
+            "reporting.skills-tree",
+            "build/codex/plugins/reporting/skills",
+            "plugins/reporting/skills",
+        ));
+
+        let err = InstallPlan::build(
+            "codex",
+            &source_root,
+            Path::new("/tmp/home"),
+            Path::new("/tmp/state"),
+            &lm,
+        )
+        .unwrap_err();
+
+        match err {
+            PlanError::MissingRenderOutput {
+                product,
+                path,
+                command,
+            } => {
+                assert_eq!(product, "codex");
+                assert_eq!(path, expected_path);
+                assert_eq!(
+                    command,
+                    format!(
+                        "agent-runtime render --source-root {} --product codex",
+                        source_root.display()
+                    )
+                );
+            }
+            other => panic!("expected MissingRenderOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_keeps_non_render_missing_source_error() {
+        let tmp = TempDir::new().unwrap();
+        let source_root = tmp.path().join("src");
+        fs::create_dir_all(&source_root).unwrap();
+        let expected_path = source_root.join("targets/codex/plugins/reporting/plugin.json");
+        let lm = one_entry_map(symlinked_file(
+            "reporting.plugin-manifest",
+            "targets/codex/plugins/reporting/plugin.json",
+            "plugins/reporting/plugin.json",
+        ));
+
+        let err = InstallPlan::build(
+            "codex",
+            &source_root,
+            Path::new("/tmp/home"),
+            Path::new("/tmp/state"),
+            &lm,
+        )
+        .unwrap_err();
+
+        match err {
+            PlanError::MissingSource { id, path } => {
+                assert_eq!(id, "reporting.plugin-manifest");
+                assert_eq!(path, expected_path);
+            }
+            other => panic!("expected MissingSource, got {other:?}"),
+        }
     }
 
     #[test]

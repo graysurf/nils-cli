@@ -152,6 +152,43 @@ fn dry_run_does_not_mutate_home() {
 }
 
 #[test]
+fn install_missing_render_output_reports_render_command() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_source_root(tmp.path(), "claude");
+    fs::remove_dir_all(source_root.join("build/claude")).unwrap();
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+
+    let err = install::run(
+        "claude",
+        &source_root,
+        &home,
+        &state_home,
+        Mode::DryRun,
+        fixed_time(),
+        &InstallOptions::default(),
+    )
+    .unwrap_err();
+
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("missing rendered output for product `claude`"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&source_root.join("build/claude").display().to_string()),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!(
+            "agent-runtime render --source-root {} --product claude",
+            source_root.display()
+        )),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn apply_writes_symlinks_and_is_byte_identical_on_second_run() {
     let tmp = TempDir::new().unwrap();
     let source_root = build_source_root(tmp.path(), "claude");
