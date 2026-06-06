@@ -2,9 +2,10 @@
 //!
 //! Spec / ops: `cli.forge-cli.pr.comment.v1`. Appends a comment to a PR/MR.
 //! Body can come from `--body`, `--body-file <path>`, or
-//! `--body-file -` (stdin). No lock-down validation runs — comments don't
-//! mutate PR state. The envelope payload reports `{ provider, number,
-//! url }` where `url` is the PR/MR URL (cheap re-fetch via `pr view`).
+//! `--body-file -` (stdin). Provider-bound comment bodies run the same
+//! local-path privacy guard as other remote payloads before the backend call.
+//! The envelope payload reports `{ provider, number, url }` where `url` is
+//! the PR/MR URL (cheap re-fetch via `pr view`).
 
 use std::ffi::OsString;
 use std::fs;

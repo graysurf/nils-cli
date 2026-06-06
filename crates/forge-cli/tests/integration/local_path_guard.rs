@@ -86,6 +86,34 @@ fn issue_comment_with_local_path_body_file_exits_data_65_without_echoing_path() 
 }
 
 #[test]
+fn pr_comment_with_gitlab_home_path_exits_data_65_before_backend() {
+    let stub = StubEnv::new().glab_stub(NEVER_RUN);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "pr",
+            "comment",
+            "3",
+            "--body",
+            "diagnostics under /home/alice/private/run.log",
+        ],
+    );
+    assert_eq!(out.code, DATA, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "local_path_present");
+    let detail = env["error"]["details"]["detail"]
+        .as_str()
+        .expect("detail string");
+    assert!(detail.contains("use $HOME/private/run.log"), "{detail}");
+    assert!(!detail.contains("/home/alice"), "{detail}");
+}
+
+#[test]
 fn issue_create_with_local_path_in_title_exits_data_65() {
     let stub = StubEnv::new().gh_stub(NEVER_RUN);
     let out = run_forge_cli(
