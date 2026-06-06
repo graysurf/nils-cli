@@ -3,7 +3,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 
 #[test]
-fn tracked_warns_when_tree_missing() {
+fn tracked_renders_tree_when_tree_missing() {
     let repo = common::init_repo();
     let root = repo.path();
 
@@ -23,7 +23,10 @@ fn tracked_warns_when_tree_missing() {
         &[("NO_COLOR", "1"), ("PATH", path_env.as_str())],
     );
 
-    assert!(output.contains("tree is not installed"));
+    assert!(output.contains("📂 Directory tree:"));
+    assert!(output.contains("└── tracked.txt"));
+    assert!(output.contains("1 directory, 1 file"));
+    assert!(!output.contains("tree is not installed"));
 }
 
 #[test]

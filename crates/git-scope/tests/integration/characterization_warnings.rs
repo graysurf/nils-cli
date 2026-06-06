@@ -40,7 +40,7 @@ fn commit_invalid_parent_warning_is_stable() {
 }
 
 #[test]
-fn tree_missing_warning_is_stable() {
+fn built_in_tree_output_is_stable_without_tree_on_path() {
     let repo = common::init_repo();
     let root = repo.path();
 
@@ -63,8 +63,12 @@ fn tree_missing_warning_is_stable() {
     );
 
     assert!(
-        output.contains("⚠️  tree is not installed. Install it to see the directory tree."),
-        "missing tree warning not found: {output}"
+        output.contains("📂 Directory tree:\n.\n└── file.txt\n\n1 directory, 1 file"),
+        "built-in tree output not found: {output}"
+    );
+    assert!(
+        !output.contains("tree is not installed"),
+        "external tree warning should not be emitted: {output}"
     );
 }
 

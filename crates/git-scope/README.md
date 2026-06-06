@@ -48,7 +48,7 @@ Options:
 ## Dependencies
 
 - `git` is required for all commands.
-- `tree` is optional; missing or unsupported versions emit a warning and skip tree output.
+- Directory tree rendering is built in; no external `tree` binary is required.
 - `file` is optional; when unavailable, binary detection falls back to content inspection.
 
 ## Environment
