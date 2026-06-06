@@ -151,7 +151,11 @@ fn visible_lint_review_decision_and_disposition() {
         | ID | Severity | Disposition | Summary |\n\
         | --- | --- | --- | --- |\n\
         | F1 | minor | fixed | tiny nit |\n";
-    let pass_no_findings = "## Review Evidence\n\n- Profile: tracking\n- Decision: comments-only\n";
+    let pass_no_findings = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: comments-only\n\
+        - Lenses: testing\n";
+    let no_review_context = "## Review Evidence\n\n- Profile: tracking\n- Decision: approve\n";
     let no_decision = "## Review Evidence\n\n- Profile: tracking\n";
     let with_findings_no_disposition = "## Review Evidence\n\n\
         - Profile: tracking\n\
@@ -170,6 +174,15 @@ fn visible_lint_review_decision_and_disposition() {
 
     let ok_empty = lint_visible(PayloadRole::Review, pass_no_findings, LintHints::default());
     assert!(ok_empty.is_pass(), "{:?}", ok_empty.findings);
+
+    let bad_no_context = lint_visible(PayloadRole::Review, no_review_context, LintHints::default());
+    assert!(
+        bad_no_context
+            .codes()
+            .contains(&codes::REVIEW_MISSING_CONTEXT),
+        "codes={:?}",
+        bad_no_context.codes()
+    );
 
     let bad_no_decision = lint_visible(PayloadRole::Review, no_decision, LintHints::default());
     assert!(

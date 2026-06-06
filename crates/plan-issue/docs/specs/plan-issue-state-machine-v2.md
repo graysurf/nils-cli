@@ -82,7 +82,9 @@ auditable but do not satisfy gate requirements once superseded.
 4. Latest `validation` payload has `overall=pass`.
 5. Latest `review` payload `decision` is `approve` or `comments-only`,
    with no `findings` entry whose disposition is `residual` and severity
-   `blocker` or `major`.
+   `blocker` or `major`. When visible completeness is requested, the latest
+   review comment must also include visible review context: lenses, outcome
+   evidence, or finding rows.
 6. Every entry in latest `state.prs` resolves through the provider to a
    merged PR with a non-empty `merge_sha`.
 7. Approval evidence (`--approval`) is present and parses as a provider

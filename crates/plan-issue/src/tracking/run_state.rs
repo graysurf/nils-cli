@@ -98,9 +98,21 @@ pub struct ValidationCommandRow {
 pub struct ReviewSummary {
     pub decision: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lenses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<ReviewFindingSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings_disposition: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewFindingSummary {
+    pub id: String,
+    pub severity: String,
+    pub disposition: String,
+    pub summary: String,
 }
 
 /// Captured reconciliation snapshot from a prior FSM evaluation.

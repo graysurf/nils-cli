@@ -158,6 +158,18 @@ pub struct TrackingRunUpdateArgs {
     #[arg(long = "review-decision", value_name = "decision")]
     pub review_decision: Option<String>,
 
+    /// Review lens. Repeat to record multiple lenses.
+    #[arg(long = "review-lens", value_name = "lens")]
+    pub review_lens: Vec<String>,
+
+    /// Review outcome comment URL or retained evidence path.
+    #[arg(long = "review-outcome-comment", value_name = "url-or-path")]
+    pub review_outcome_comment: Option<String>,
+
+    /// JSON file containing review finding rows.
+    #[arg(long = "review-findings-file", value_name = "path")]
+    pub review_findings_file: Option<PathBuf>,
+
     /// Free-form note appended to `notes`.
     #[arg(long, value_name = "text")]
     pub note: Option<String>,

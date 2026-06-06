@@ -78,6 +78,7 @@ fn write_run_state(path: &std::path::Path, phase: &str) {
         "branch": "feat/x",
         "review": {
             "decision": "approve",
+            "lenses": ["testing"],
             "evidence": null
         }
     });

@@ -70,7 +70,7 @@ fn write_complete_fixture(tmp: &TempDir) -> std::path::PathBuf {
         (
             "review",
             json!({"decision": "approve", "findings": [], "lenses": ["testing"]}),
-            "## Review Evidence\n\n- Profile: tracking\n- Decision: approve",
+            "## Review Evidence\n\n- Profile: tracking\n- Decision: approve\n- Lenses: testing",
             "2026-05-26T00:00:05Z",
         ),
     ];
