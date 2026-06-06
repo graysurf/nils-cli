@@ -444,8 +444,9 @@ backend implementations cannot diverge.
     `/home/<owner>/…`). This mirrors the repo-side portable-paths file hook on
     the provider egress path so local paths cannot leak into provider content.
     The error `detail` enumerates each offending line and its `$HOME`-relative
-    fix. Literal container / CI-runner home roots (`/home/agent`,
-    `/home/linuxbrew`, and the CI runner work root) are allowlisted — see the
+    fix without echoing the original personal path. Literal container /
+    CI-runner home roots (`/home/agent`, `/home/linuxbrew`, and the CI runner
+    work root) are allowlisted — see the
     `no_local_path` entry in `forge-cli-ops-v1.yaml` for the exact list; set
     `FORGE_CLI_ALLOW_LOCAL_PATH=1` to bypass a verified false positive. Enforced
     by `pr create`, `pr edit`, `issue create`, `issue edit`, `pr comment`, and

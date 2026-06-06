@@ -32,6 +32,43 @@ fn parse_json(stdout: &str) -> Value {
     serde_json::from_str(stdout).expect("stdout is valid JSON")
 }
 
+fn live_record_gh_stub() -> &'static str {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${PLAN_ISSUE_GH_LOG:-}" ]]; then
+  printf '%s\n' "$*" >> "$PLAN_ISSUE_GH_LOG"
+fi
+
+cmd="${1:-}"
+sub="${2:-}"
+case "$cmd $sub" in
+  "issue view")
+    if [[ -n "${PLAN_ISSUE_GH_VIEW_JSON_FILE:-}" ]]; then
+      cat "$PLAN_ISSUE_GH_VIEW_JSON_FILE"
+    else
+      printf '%s\n' "${PLAN_ISSUE_GH_VIEW_JSON:-{\"body\":\"\",\"comments\":[]}}"
+    fi
+    ;;
+  "issue create" | "issue edit" | "issue comment" | "issue close")
+    echo "provider mutation should have been blocked before gh: $*" >&2
+    exit 99
+    ;;
+  *)
+    echo "unsupported gh call: $*" >&2
+    exit 1
+    ;;
+esac
+"#
+}
+
+fn live_record_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
+    common::plan_issue_cmd_options()
+        .with_env_remove_prefix("PLAN_ISSUE_GH_")
+        .with_path_prepend(stub_dir)
+        .with_envs(envs)
+}
+
 fn assert_comment_visible_prefix(body: &str, expected: &str) {
     let payload_start = body
         .find("<!-- plan-issue-record-payload:hex:")
@@ -45,6 +82,28 @@ fn assert_comment_visible_prefix(body: &str, expected: &str) {
         !body.contains(&format!("```{PAYLOAD_FENCE_INFO}")),
         "payload must remain hidden:\n{body}"
     );
+}
+
+fn assert_provider_payload_privacy_error(out: &common::CmdOut, code: &str, home_suggestion: &str) {
+    assert_eq!(out.code, 1, "stdout={} stderr={}", out.stdout, out.stderr);
+    let parsed = parse_json(&out.stdout);
+    assert_eq!(parsed["status"], "error");
+    assert_eq!(
+        parsed["error"]["code"], code,
+        "stdout={} stderr={}",
+        out.stdout, out.stderr
+    );
+    let message = parsed["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("machine-local home path"),
+        "message should name local-path class: {message}"
+    );
+    assert!(
+        message.contains(home_suggestion),
+        "message should suggest $HOME-relative replacement: {message}"
+    );
+    assert!(!message.contains("/Users/dev"), "{message}");
+    assert!(!message.contains("/home/alice"), "{message}");
 }
 
 fn write_fixture_files(dir: &Path, body: &str, comments: &Value) {
@@ -199,6 +258,66 @@ fn record_post_state_summary_file_is_rendered_in_dry_run() {
     assert!(
         body.starts_with("<!-- plan-issue-record:v2 role=state profile=tracking -->"),
         "{body}"
+    );
+}
+
+#[test]
+fn record_post_live_rejects_local_path_from_summary_file_before_provider_mutation() {
+    let tmp = TempDir::new().expect("tempdir");
+    let stub = StubBinDir::new();
+    stub.write_exe("gh", live_record_gh_stub());
+    let log_path = tmp.path().join("gh.log");
+    let log_s = log_path.to_string_lossy().to_string();
+
+    let payload = tmp.path().join("state.json");
+    let summary = tmp.path().join("summary.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "summary surface",
+            "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &summary,
+        "- Evidence: /Users/dev/Project/private/rendered.md\n",
+    )
+    .expect("write summary");
+
+    let out = common::run_plan_issue_with_options(
+        &[
+            "--format",
+            "json",
+            "--repo",
+            "sympoies/nils-cli",
+            "record",
+            "post",
+            "--issue",
+            "217",
+            "--kind",
+            "state",
+            "--payload-file",
+            payload.to_str().expect("payload str"),
+            "--summary-file",
+            summary.to_str().expect("summary str"),
+        ],
+        live_record_options(stub.path(), &[("PLAN_ISSUE_GH_LOG", &log_s)]),
+    );
+
+    assert_provider_payload_privacy_error(
+        &out,
+        "record-post-comment-post-failed",
+        "$HOME/Project/private/rendered.md",
+    );
+    assert!(
+        !log_path.exists(),
+        "gh must not run when final rendered comment is unsafe"
     );
 }
 
@@ -752,6 +871,73 @@ fn record_repair_dashboard_renders_canonical_dashboard_from_body_and_comments() 
         dashboard.contains("https://github.com/owner/repo/issues/9#issuecomment-source"),
         "{dashboard}"
     );
+}
+
+#[test]
+fn record_repair_dashboard_live_rejects_local_path_in_rendered_dashboard_before_edit() {
+    let tmp = TempDir::new().expect("tempdir");
+    let stub = StubBinDir::new();
+    stub.write_exe("gh", live_record_gh_stub());
+    let log_path = tmp.path().join("gh.log");
+    let log_s = log_path.to_string_lossy().to_string();
+
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/9#issuecomment-state-1",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({
+                    "status": "in-progress",
+                    "target_scope": "/Users/dev/Project/private/dashboard",
+                    "current": "repair dashboard",
+                    "next_action": "block unsafe payload",
+                    "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+                    "prs": [],
+                    "blockers": [],
+                    "links": {}
+                }),
+            ),
+            "created_at": "2026-05-23T10:00:00Z"
+        }
+    ]);
+    let view_json = json!({
+        "body": "## Current Dashboard\n\n- Status: stale\n",
+        "comments": comments
+    })
+    .to_string();
+    let view_json_path = tmp.path().join("issue-view.json");
+    fs::write(&view_json_path, &view_json).expect("write view json");
+    let view_json_path_s = view_json_path.to_string_lossy().to_string();
+
+    let out = common::run_plan_issue_with_options(
+        &[
+            "--format",
+            "json",
+            "--repo",
+            "sympoies/nils-cli",
+            "record",
+            "repair-dashboard",
+            "--issue",
+            "217",
+        ],
+        live_record_options(
+            stub.path(),
+            &[
+                ("PLAN_ISSUE_GH_LOG", &log_s),
+                ("PLAN_ISSUE_GH_VIEW_JSON_FILE", &view_json_path_s),
+            ],
+        ),
+    );
+
+    assert_provider_payload_privacy_error(
+        &out,
+        "record-repair-edit-failed",
+        "$HOME/Project/private/dashboard",
+    );
+    let log = fs::read_to_string(&log_path).expect("read gh log");
+    assert!(log.contains("issue view 217"), "{log}");
+    assert!(!log.contains("issue edit 217"), "{log}");
 }
 
 #[test]
