@@ -2037,6 +2037,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-docker-tools"
+version = "1.0.10"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "nils-build-info",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "shell-words",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-forge-cli"
 version = "1.0.11"
 dependencies = [

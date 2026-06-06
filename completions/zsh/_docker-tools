@@ -1,0 +1,535 @@
+#compdef docker-tools
+
+autoload -U is-at-least
+
+_docker-tools() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_docker-tools_commands" \
+"*::: :->docker-tools" \
+&& ret=0
+    case $state in
+    (docker-tools)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-command-$line[1]:"
+        case $line[1] in
+            (container)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_docker-tools__subcmd__container_commands" \
+"*::: :->container" \
+&& ret=0
+
+    case $state in
+    (container)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-container-command-$line[1]:"
+        case $line[1] in
+            (sh)
+_arguments "${_arguments_options[@]}" : \
+'(-r --root)-u+[User inside the container]:user:_default' \
+'(-r --root)--user=[User inside the container]:user:_default' \
+'-r[Exec as root]' \
+'--root[Exec as root]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':container -- Container name or id:_default' \
+&& ret=0
+;;
+(zsh)
+_arguments "${_arguments_options[@]}" : \
+'(-r --root)-u+[User inside the container]:user:_default' \
+'(-r --root)--user=[User inside the container]:user:_default' \
+'-r[Exec as root]' \
+'--root[Exec as root]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':container -- Container name or id:_default' \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+'--no-force[Do not force remove containers]' \
+'-v[Remove anonymous volumes]' \
+'--volumes[Remove anonymous volumes]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::containers -- Container names or ids:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_docker-tools__subcmd__container__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-container-help-command-$line[1]:"
+        case $line[1] in
+            (sh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(zsh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(compose)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_docker-tools__subcmd__compose_commands" \
+"*::: :->compose" \
+&& ret=0
+
+    case $state in
+    (compose)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-compose-command-$line[1]:"
+        case $line[1] in
+            (down)
+_arguments "${_arguments_options[@]}" : \
+'-a[Add --remove-orphans --volumes --rmi all]' \
+'--all[Add --remove-orphans --volumes --rmi all]' \
+'-y[Skip confirmation prompts for --all]' \
+'--yes[Skip confirmation prompts for --all]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::args -- Extra arguments passed after docker compose down:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_docker-tools__subcmd__compose__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-compose-help-command-$line[1]:"
+        case $line[1] in
+            (down)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(run)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_docker-tools__subcmd__run_commands" \
+"*::: :->run" \
+&& ret=0
+
+    case $state in
+    (run)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-run-command-$line[1]:"
+        case $line[1] in
+            (zsh)
+_arguments "${_arguments_options[@]}" : \
+'-w+[Container workdir]:path:_default' \
+'--workdir=[Container workdir]:path:_default' \
+'-n+[Container name]:name:_default' \
+'--name=[Container name]:name:_default' \
+'(-r --root)-u+[User inside the container]:user:_default' \
+'(-r --root)--user=[User inside the container]:user:_default' \
+'--no-mount[Do not mount the current working directory to /work]' \
+'-r[Run as root]' \
+'--root[Run as root]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':image -- Image to run:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_docker-tools__subcmd__run__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-run-help-command-$line[1]:"
+        case $line[1] in
+            (zsh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_docker-tools__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-help-command-$line[1]:"
+        case $line[1] in
+            (container)
+_arguments "${_arguments_options[@]}" : \
+":: :_docker-tools__subcmd__help__subcmd__container_commands" \
+"*::: :->container" \
+&& ret=0
+
+    case $state in
+    (container)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-help-container-command-$line[1]:"
+        case $line[1] in
+            (sh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(zsh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(compose)
+_arguments "${_arguments_options[@]}" : \
+":: :_docker-tools__subcmd__help__subcmd__compose_commands" \
+"*::: :->compose" \
+&& ret=0
+
+    case $state in
+    (compose)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-help-compose-command-$line[1]:"
+        case $line[1] in
+            (down)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(run)
+_arguments "${_arguments_options[@]}" : \
+":: :_docker-tools__subcmd__help__subcmd__run_commands" \
+"*::: :->run" \
+&& ret=0
+
+    case $state in
+    (run)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:docker-tools-help-run-command-$line[1]:"
+        case $line[1] in
+            (zsh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_docker-tools_commands] )) ||
+_docker-tools_commands() {
+    local commands; commands=(
+'container:Container helper commands' \
+'compose:Docker Compose helper commands' \
+'run:Interactive docker run helpers' \
+'completion:Export shell completion script' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'docker-tools commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__completion_commands] )) ||
+_docker-tools__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools completion commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__compose_commands] )) ||
+_docker-tools__subcmd__compose_commands() {
+    local commands; commands=(
+'down:Run docker compose down' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'docker-tools compose commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__compose__subcmd__down_commands] )) ||
+_docker-tools__subcmd__compose__subcmd__down_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools compose down commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__compose__subcmd__help_commands] )) ||
+_docker-tools__subcmd__compose__subcmd__help_commands() {
+    local commands; commands=(
+'down:Run docker compose down' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'docker-tools compose help commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__compose__subcmd__help__subcmd__down_commands] )) ||
+_docker-tools__subcmd__compose__subcmd__help__subcmd__down_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools compose help down commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__compose__subcmd__help__subcmd__help_commands] )) ||
+_docker-tools__subcmd__compose__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools compose help help commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__container_commands] )) ||
+_docker-tools__subcmd__container_commands() {
+    local commands; commands=(
+'sh:Exec into a container with zsh -> bash -> sh fallback' \
+'zsh:Alias for container sh' \
+'rm:Remove one or more containers' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'docker-tools container commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__container__subcmd__help_commands] )) ||
+_docker-tools__subcmd__container__subcmd__help_commands() {
+    local commands; commands=(
+'sh:Exec into a container with zsh -> bash -> sh fallback' \
+'zsh:Alias for container sh' \
+'rm:Remove one or more containers' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'docker-tools container help commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__container__subcmd__help__subcmd__help_commands] )) ||
+_docker-tools__subcmd__container__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools container help help commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__container__subcmd__help__subcmd__rm_commands] )) ||
+_docker-tools__subcmd__container__subcmd__help__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools container help rm commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__container__subcmd__help__subcmd__sh_commands] )) ||
+_docker-tools__subcmd__container__subcmd__help__subcmd__sh_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools container help sh commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__container__subcmd__help__subcmd__zsh_commands] )) ||
+_docker-tools__subcmd__container__subcmd__help__subcmd__zsh_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools container help zsh commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__container__subcmd__rm_commands] )) ||
+_docker-tools__subcmd__container__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools container rm commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__container__subcmd__sh_commands] )) ||
+_docker-tools__subcmd__container__subcmd__sh_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools container sh commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__container__subcmd__zsh_commands] )) ||
+_docker-tools__subcmd__container__subcmd__zsh_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools container zsh commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help_commands] )) ||
+_docker-tools__subcmd__help_commands() {
+    local commands; commands=(
+'container:Container helper commands' \
+'compose:Docker Compose helper commands' \
+'run:Interactive docker run helpers' \
+'completion:Export shell completion script' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'docker-tools help commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__completion_commands] )) ||
+_docker-tools__subcmd__help__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools help completion commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__compose_commands] )) ||
+_docker-tools__subcmd__help__subcmd__compose_commands() {
+    local commands; commands=(
+'down:Run docker compose down' \
+    )
+    _describe -t commands 'docker-tools help compose commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__compose__subcmd__down_commands] )) ||
+_docker-tools__subcmd__help__subcmd__compose__subcmd__down_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools help compose down commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__container_commands] )) ||
+_docker-tools__subcmd__help__subcmd__container_commands() {
+    local commands; commands=(
+'sh:Exec into a container with zsh -> bash -> sh fallback' \
+'zsh:Alias for container sh' \
+'rm:Remove one or more containers' \
+    )
+    _describe -t commands 'docker-tools help container commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__container__subcmd__rm_commands] )) ||
+_docker-tools__subcmd__help__subcmd__container__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools help container rm commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__container__subcmd__sh_commands] )) ||
+_docker-tools__subcmd__help__subcmd__container__subcmd__sh_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools help container sh commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__container__subcmd__zsh_commands] )) ||
+_docker-tools__subcmd__help__subcmd__container__subcmd__zsh_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools help container zsh commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__help_commands] )) ||
+_docker-tools__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools help help commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__run_commands] )) ||
+_docker-tools__subcmd__help__subcmd__run_commands() {
+    local commands; commands=(
+'zsh:Run an image with zsh -> bash -> sh fallback' \
+    )
+    _describe -t commands 'docker-tools help run commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__help__subcmd__run__subcmd__zsh_commands] )) ||
+_docker-tools__subcmd__help__subcmd__run__subcmd__zsh_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools help run zsh commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__run_commands] )) ||
+_docker-tools__subcmd__run_commands() {
+    local commands; commands=(
+'zsh:Run an image with zsh -> bash -> sh fallback' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'docker-tools run commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__run__subcmd__help_commands] )) ||
+_docker-tools__subcmd__run__subcmd__help_commands() {
+    local commands; commands=(
+'zsh:Run an image with zsh -> bash -> sh fallback' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'docker-tools run help commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__run__subcmd__help__subcmd__help_commands] )) ||
+_docker-tools__subcmd__run__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools run help help commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__run__subcmd__help__subcmd__zsh_commands] )) ||
+_docker-tools__subcmd__run__subcmd__help__subcmd__zsh_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools run help zsh commands' commands "$@"
+}
+(( $+functions[_docker-tools__subcmd__run__subcmd__zsh_commands] )) ||
+_docker-tools__subcmd__run__subcmd__zsh_commands() {
+    local commands; commands=()
+    _describe -t commands 'docker-tools run zsh commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_docker-tools" ]; then
+    _docker-tools "$@"
+else
+    compdef _docker-tools docker-tools
+fi

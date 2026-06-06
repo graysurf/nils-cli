@@ -24,6 +24,7 @@ These tools are required for common command paths. Each row is anchored to at le
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
 | `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
 | `security` | `claude-cli prompt-segment` Keychain credential lookup | Required on macOS unless `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` / `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` is supplied | Preinstalled on macOS |
+| `docker` | `docker-tools container *`, `docker-tools run *`, and Docker Compose v2 resolution for `docker-tools compose down` | Required for `docker-tools` Docker-backed commands | `brew install docker` |
 | `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
 | `gh` | `git-cli open *` GitHub helpers, `plan-issue` GitHub I/O, `forge-cli` GitHub backend | Required for GitHub-facing flows | `brew install gh` |
 | `glab` | `forge-cli` GitLab backend and GitLab inbox reads | Required for GitLab-facing `forge-cli` flows | `brew install glab` |
@@ -63,6 +64,7 @@ in `crates/*/src`.
 | `cliclick` | Probed by `macos-agent` preflight as an alternate input backend | `brew install cliclick` |
 | `im-select` | Required by `macos-agent input-source *` and macOS real E2E keyboard/input-source setup | `brew install im-select` |
 | `openvpn` | Optional `forge-cli inbox --gitlab-vpn-check openvpn` readiness dependency probe; `forge-cli` never starts or stops VPN | `brew install openvpn` |
+| `docker-compose` | Fallback backend for `docker-tools compose down` when Docker Compose v2 is unavailable | `brew install docker-compose` |
 
 ## 3. Development and Validation Toolchain
 
