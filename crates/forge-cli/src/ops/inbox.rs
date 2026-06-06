@@ -2475,7 +2475,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_tcp_vpn_probe_connects_and_reports_refused_ports() {
+    fn inbox_tcp_vpn_probe_connects_and_reports_unavailable_ports() {
         let mut runtime = test_runtime();
         runtime.gitlab_vpn_check_timeout = Duration::from_millis(250);
 
@@ -2483,9 +2483,10 @@ mod tests {
         let port = listener.local_addr().expect("listener addr").port();
         run_tcp_vpn_check("127.0.0.1", port, &runtime).expect("tcp probe connects");
 
-        drop(listener);
-        let err = run_tcp_vpn_check("127.0.0.1", port, &runtime)
-            .expect_err("closed listener should fail readiness");
+        // Port 0 is reserved for local bind requests and cannot race with
+        // another test binding a just-released ephemeral listener port.
+        let err = run_tcp_vpn_check("127.0.0.1", 0, &runtime)
+            .expect_err("reserved zero port should fail readiness");
         assert_eq!(err.kind(), "vpn_unavailable");
     }
 
