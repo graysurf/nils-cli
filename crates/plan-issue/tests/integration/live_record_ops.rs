@@ -7,6 +7,7 @@ use tempfile::TempDir;
 
 use nils_test_support::StubBinDir;
 use nils_test_support::cmd::CmdOptions;
+use plan_issue::commands::record::RecordProfile;
 
 use crate::common;
 
@@ -2458,6 +2459,63 @@ fn record_post_dry_run_includes_label_mutations() {
     assert_eq!(result["mode"], "dry-run");
     assert_eq!(result["labels"]["add"][0], "state::blocked");
     assert_eq!(result["labels"]["remove"][0], "state::in-progress");
+}
+
+#[test]
+fn record_post_live_refuses_when_lifecycle_lock_is_busy() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state_dir = TempDir::new().expect("state-dir");
+    let stub = StubBinDir::new();
+    stub.write_exe("gh", live_record_gh_stub());
+
+    plan_issue::state::set_state_dir_override(Some(state_dir.path().to_path_buf()));
+    let _busy_lock = plan_issue::lifecycle_lock::acquire_for_identity(
+        "github",
+        Some("github.com"),
+        "owner/repo",
+        448,
+        RecordProfile::Tracking,
+    )
+    .expect("pre-acquire lifecycle lock");
+    plan_issue::state::set_state_dir_override(None);
+
+    let payload = tmp.path().join("state.json");
+    fs::write(
+        &payload,
+        json!({"status": "blocked", "tasks": [], "prs": [], "blockers": [], "links": {}})
+            .to_string(),
+    )
+    .expect("write payload");
+
+    let state_dir_arg = state_dir.path().to_string_lossy().to_string();
+    let payload_arg = payload.to_string_lossy().to_string();
+    let out = common::run_plan_issue_with_options(
+        &[
+            "--format",
+            "json",
+            "--state-dir",
+            &state_dir_arg,
+            "--repo",
+            "https://github.com/owner/repo.git",
+            "record",
+            "post",
+            "--issue",
+            "448",
+            "--kind",
+            "state",
+            "--payload-file",
+            &payload_arg,
+        ],
+        live_record_options(stub.path(), &[]),
+    );
+
+    assert_eq!(out.code, 1, "stdout={} stderr={}", out.stdout, out.stderr);
+    let parsed = parse_json(&out.stdout);
+    assert_eq!(parsed["status"], "error");
+    assert_eq!(parsed["error"]["code"], "plan-issue-lifecycle-lock-busy");
+    let message = parsed["error"]["message"].as_str().expect("message");
+    assert!(message.contains("issue=448"), "{message}");
+    assert!(message.contains("profile=tracking"), "{message}");
 }
 
 /// `record close --add-label / --remove-label` shows the planned closeout

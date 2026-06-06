@@ -18,6 +18,7 @@ use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+use plan_issue::commands::record::RecordProfile;
 use plan_issue::lifecycle_record::PAYLOAD_SCHEMA_V2;
 
 use crate::common;
@@ -155,6 +156,53 @@ fn tracking_checkpoint_live_fixture_returns_posted_state_role_with_synthesized_u
     assert_eq!(posted[0]["role"], "state");
     let url = posted[0]["comment_url"].as_str().expect("url");
     assert_eq!(url, "fixture://issue/144/state");
+}
+
+#[test]
+fn tracking_checkpoint_live_fixture_refuses_when_lifecycle_lock_is_busy() {
+    let fixture = pre_closeout_fixture();
+    let tmp = TempDir::new().expect("tmp");
+    let state_dir = TempDir::new().expect("state-dir");
+    let rs_path = tmp.path().join("run-state.json");
+    write_run_state(&rs_path, "ready_for_close");
+
+    plan_issue::state::set_state_dir_override(Some(state_dir.path().to_path_buf()));
+    let _busy_lock = plan_issue::lifecycle_lock::acquire_for_identity(
+        "local",
+        None,
+        "owner/repo",
+        144,
+        RecordProfile::Tracking,
+    )
+    .expect("pre-acquire lifecycle lock");
+    plan_issue::state::set_state_dir_override(None);
+
+    let state_dir_arg = state_dir.path().to_string_lossy().to_string();
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "--state-dir",
+        &state_dir_arg,
+        "tracking",
+        "checkpoint",
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--post",
+        "state",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+        "--issue",
+        "144",
+        "--live",
+    ]);
+    assert_eq!(out.code, 1, "stdout={} stderr={}", out.stdout, out.stderr);
+
+    let parsed = json_stdout(&out);
+    assert_eq!(parsed["status"], "error");
+    assert_eq!(parsed["error"]["code"], "plan-issue-lifecycle-lock-busy");
+    let message = parsed["error"]["message"].as_str().expect("message");
+    assert!(message.contains("issue=144"), "{message}");
+    assert!(message.contains("profile=tracking"), "{message}");
 }
 
 #[test]

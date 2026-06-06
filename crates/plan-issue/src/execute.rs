@@ -1420,11 +1420,12 @@ fn run_record_post(
     }
 
     let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
-    let adapter = crate::provider::select_adapter(&repo_info, force);
-    let repo = repo_info.slug;
     let issue_number = parse_issue_reference(&args.issue)?;
     let comment_path = write_temp_markdown("record-post-comment", &body)
         .map_err(|err| CommandError::runtime("record-post-comment-write-failed", err))?;
+    let _lifecycle_lock = crate::lifecycle_lock::acquire(&repo_info, issue_number, args.profile)?;
+    let adapter = crate::provider::select_adapter(&repo_info, force);
+    let repo = repo_info.slug;
     let url = adapter
         .comment_issue(&repo, issue_number, &comment_path)
         .map_err(|err| CommandError::runtime("record-post-comment-post-failed", err))?;
@@ -2885,6 +2886,9 @@ fn post_checkpoint_live(
     // and re-reads them through `tracking close-ready`; this hop only
     // surfaces the post-attempt shape so the probe can assert it.
     if args.fixture.is_some() {
+        let fixture_repo = checkpoint_fixture_lock_repo(run);
+        let _lifecycle_lock =
+            crate::lifecycle_lock::acquire(&fixture_repo, issue_number, args.profile)?;
         let posted: Vec<Value> = rendered
             .iter()
             .map(|entry| {
@@ -2924,6 +2928,7 @@ fn post_checkpoint_live(
         .or(repo_override)
         .or((!run.repo.is_empty()).then_some(run.repo.as_str()));
     let repo_info = resolve_repo_info_for_live(binary, provider_repo_arg)?;
+    let _lifecycle_lock = crate::lifecycle_lock::acquire(&repo_info, issue_number, args.profile)?;
     let adapter = crate::provider::select_adapter(&repo_info, force);
     let issue_url = repo_info.issue_url(issue_number);
     let repo = repo_info.slug.clone();
@@ -2986,6 +2991,21 @@ fn post_checkpoint_live(
         repair_dashboard_result,
         mode: "live",
     })
+}
+
+fn checkpoint_fixture_lock_repo(
+    run: &crate::tracking::run_state::ExecutionRun,
+) -> crate::provider::Repo {
+    let slug = if run.repo.trim().is_empty() {
+        "fixture".to_string()
+    } else {
+        run.repo.clone()
+    };
+    crate::provider::Repo {
+        provider: crate::provider::Provider::Local,
+        slug,
+        host: None,
+    }
 }
 
 /// Post-checkpoint dashboard repair. Mirrors the live branch of
