@@ -46,6 +46,68 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(plugin)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_zsh-kit__subcmd__plugin_commands" \
+"*::: :->plugin" \
+&& ret=0
+
+    case $state in
+    (plugin)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:zsh-kit-plugin-command-$line[1]:"
+        case $line[1] in
+            (fetch)
+_arguments "${_arguments_options[@]}" : \
+'--entry=[Raw config/plugins.list entry to fetch]:ENTRY:_default' \
+'--plugins-dir=[Plugin base directory. Defaults to \$ZSH_PLUGINS_DIR or \$ZDOTDIR/plugins]:PATH:_files -/' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--dry-run[Print intended actions without cloning, deleting, or updating submodules]' \
+'--force[Delete an existing plugin directory before cloning]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(update)
+_arguments "${_arguments_options[@]}" : \
+'--plugins-dir=[Plugin base directory. Defaults to \$ZSH_PLUGINS_DIR or \$ZDOTDIR/plugins]:PATH:_files -/' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--dry-run[Print intended git pull commands without mutating repositories]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(maybe-update)
+_arguments "${_arguments_options[@]}" : \
+'--plugins-dir=[Plugin base directory. Defaults to \$ZSH_PLUGINS_DIR or \$ZDOTDIR/plugins]:PATH:_files -/' \
+'--timestamp-file=[Timestamp file used to track the last auto-update]:PATH:_files' \
+'--interval-days=[Auto-update interval in whole days]:DAYS:_default' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--dry-run[Print intended git pull commands without mutating repositories]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--timestamp-file=[Timestamp file used to track the last auto-update]:PATH:_files' \
+'--interval-days=[Auto-update interval in whole days]:DAYS:_default' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -62,6 +124,7 @@ esac
 _zsh-kit_commands() {
     local commands; commands=(
 'setup:Clone/update a Zsh repository and dispatch its setup hook' \
+'plugin:Manage zsh-kit plugin fetch/update helpers' \
 'completion:Print shell completion script' \
     )
     _describe -t commands 'zsh-kit commands' commands "$@"
@@ -70,6 +133,36 @@ _zsh-kit_commands() {
 _zsh-kit__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'zsh-kit completion commands' commands "$@"
+}
+(( $+functions[_zsh-kit__subcmd__plugin_commands] )) ||
+_zsh-kit__subcmd__plugin_commands() {
+    local commands; commands=(
+'fetch:Ensure one plugins.list entry exists under the plugin directory' \
+'update:Fast-forward all git plugins under the plugin directory' \
+'maybe-update:Run update when the timestamp is older than the configured interval' \
+'status:Print plugin auto-update status' \
+    )
+    _describe -t commands 'zsh-kit plugin commands' commands "$@"
+}
+(( $+functions[_zsh-kit__subcmd__plugin__subcmd__fetch_commands] )) ||
+_zsh-kit__subcmd__plugin__subcmd__fetch_commands() {
+    local commands; commands=()
+    _describe -t commands 'zsh-kit plugin fetch commands' commands "$@"
+}
+(( $+functions[_zsh-kit__subcmd__plugin__subcmd__maybe-update_commands] )) ||
+_zsh-kit__subcmd__plugin__subcmd__maybe-update_commands() {
+    local commands; commands=()
+    _describe -t commands 'zsh-kit plugin maybe-update commands' commands "$@"
+}
+(( $+functions[_zsh-kit__subcmd__plugin__subcmd__status_commands] )) ||
+_zsh-kit__subcmd__plugin__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'zsh-kit plugin status commands' commands "$@"
+}
+(( $+functions[_zsh-kit__subcmd__plugin__subcmd__update_commands] )) ||
+_zsh-kit__subcmd__plugin__subcmd__update_commands() {
+    local commands; commands=()
+    _describe -t commands 'zsh-kit plugin update commands' commands "$@"
 }
 (( $+functions[_zsh-kit__subcmd__setup_commands] )) ||
 _zsh-kit__subcmd__setup_commands() {

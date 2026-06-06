@@ -1,5 +1,6 @@
 mod cli;
 mod completion;
+mod plugin;
 
 use std::env;
 use std::ffi::OsString;
@@ -59,6 +60,7 @@ where
 
     match cli.command {
         Command::Setup(args) => run_setup(args),
+        Command::Plugin(args) => plugin::run(args),
         Command::Completion(args) => completion::run(args.shell),
     }
 }

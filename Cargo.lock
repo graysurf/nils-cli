@@ -2381,6 +2381,7 @@ dependencies = [
 name = "nils-zsh-kit"
 version = "1.0.11"
 dependencies = [
+ "chrono",
  "clap",
  "clap_complete",
  "nils-build-info",

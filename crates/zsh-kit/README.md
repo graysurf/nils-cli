@@ -9,6 +9,10 @@ behavior stays in the target repository hook.
 
 ```text
 zsh-kit setup --repo <url-or-path> (--dry-run | --apply) [options]
+zsh-kit plugin fetch --entry <plugins.list-entry> [options]
+zsh-kit plugin update [options]
+zsh-kit plugin maybe-update [options]
+zsh-kit plugin status [options]
 zsh-kit completion <bash|zsh>
 zsh-kit -V | --version
 ```
@@ -110,3 +114,31 @@ Exit codes follow the workspace contract:
 - `64`: command-line usage error.
 - `65`: invalid input data.
 - `69`: required resource unavailable.
+
+## `plugin`
+
+`zsh-kit plugin` owns the generic Git-backed plugin fetch/update/status behavior
+that can run outside the current shell. The zsh-kit repository still owns shell
+startup glue: reading `plugins.list`, sourcing plugin files, mutating `fpath`,
+and plugin-specific hooks.
+
+Commands:
+
+```text
+zsh-kit plugin fetch --entry <plugins.list-entry> [--plugins-dir <path>] [--dry-run] [--force]
+zsh-kit plugin update [--plugins-dir <path>] [--dry-run]
+zsh-kit plugin maybe-update [--plugins-dir <path>] [--timestamp-file <path>] [--interval-days <days>] [--dry-run]
+zsh-kit plugin status [--timestamp-file <path>] [--interval-days <days>]
+```
+
+Defaults:
+
+- `--plugins-dir`: `$ZSH_PLUGINS_DIR`, then `$ZDOTDIR/plugins`, then
+  `$HOME/.config/zsh/plugins`.
+- `--timestamp-file`: `$PLUGIN_UPDATE_FILE`, then
+  `$ZSH_CACHE_DIR/plugin.timestamp`, then `$HOME/.cache/zsh/plugin.timestamp`.
+- `--interval-days`: `$PLUGIN_UPDATE_INTERVAL_DAYS`, then `7`.
+
+All plugin subcommands support `--format <text|json>`. JSON success envelopes
+use schema `cli.zsh-kit.plugin.v1`; failures use
+`cli.zsh-kit.plugin.error.v1`.
