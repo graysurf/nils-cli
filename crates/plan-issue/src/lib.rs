@@ -6,6 +6,7 @@ mod execute;
 mod forge_cli_adapter;
 mod github;
 pub mod issue_body;
+pub mod lifecycle_lock;
 pub mod lifecycle_record;
 pub mod lifecycle_vnext;
 pub mod output;
