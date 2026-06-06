@@ -174,6 +174,40 @@ pub(crate) fn build_completion_command() -> Command {
                 .arg(query_arg()),
         )
         .subcommand(
+            Command::new("kill-process")
+                .about("Kill one or more process IDs")
+                .arg(
+                    Arg::new("force")
+                        .short('9')
+                        .long("force")
+                        .help("Use SIGKILL instead of SIGTERM")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("pid")
+                        .value_name("pid")
+                        .num_args(1..)
+                        .allow_hyphen_values(true),
+                ),
+        )
+        .subcommand(
+            Command::new("kill-port")
+                .about("Kill process owners for listening ports")
+                .arg(
+                    Arg::new("force")
+                        .short('9')
+                        .long("force")
+                        .help("Use SIGKILL instead of SIGTERM")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("port")
+                        .value_name("port")
+                        .num_args(1..)
+                        .allow_hyphen_values(true),
+                ),
+        )
+        .subcommand(
             Command::new("history")
                 .about("Search and execute command history")
                 .arg(query_arg()),

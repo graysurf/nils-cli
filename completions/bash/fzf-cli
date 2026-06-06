@@ -58,6 +58,12 @@ _fzf-cli() {
             fzf__cli,history)
                 cmd="fzf__cli__history"
                 ;;
+            fzf__cli,kill-port)
+                cmd="fzf__cli__kill__port"
+                ;;
+            fzf__cli,kill-process)
+                cmd="fzf__cli__kill__process"
+                ;;
             fzf__cli,open-changed-files)
                 cmd="fzf__cli__open__changed__files"
                 ;;
@@ -74,7 +80,7 @@ _fzf-cli() {
 
     case "${cmd}" in
         fzf__cli)
-            opts="-h -V --help --version file directory git-status git-commit git-checkout git-branch git-tag process port history env alias function def open-changed-files completion help"
+            opts="-h -V --help --version file directory git-status git-commit git-checkout git-branch git-tag process port kill-process kill-port history env alias function def open-changed-files completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -271,6 +277,34 @@ _fzf-cli() {
             ;;
         fzf__cli__history)
             opts="-h --help [query]..."
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        fzf__cli__kill__port)
+            opts="-9 -h --force --help [port]..."
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        fzf__cli__kill__process)
+            opts="-9 -h --force --help [pid]..."
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

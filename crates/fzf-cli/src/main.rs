@@ -13,6 +13,7 @@ mod git_status;
 mod git_tag;
 mod history;
 mod kill;
+mod kill_direct;
 mod open;
 mod open_changed_files;
 mod port;

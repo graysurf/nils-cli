@@ -5,7 +5,7 @@ use std::ffi::OsString;
 
 use crate::{
     completion, defs, directory, file, git_branch, git_checkout, git_commit, git_status, git_tag,
-    history, open_changed_files, port, process, util,
+    history, kill_direct, open_changed_files, port, process, util,
 };
 
 #[derive(Debug, Parser)]
@@ -48,6 +48,10 @@ enum Command {
     Process(RawArgs),
     #[command(about = "Browse listening ports and owners")]
     Port(RawArgs),
+    #[command(name = "kill-process", about = "Kill one or more process IDs")]
+    KillProcess(RawArgs),
+    #[command(name = "kill-port", about = "Kill process owners for listening ports")]
+    KillPort(RawArgs),
     #[command(about = "Search and execute command history")]
     History(RawArgs),
     #[command(about = "Browse environment variables")]
@@ -97,6 +101,12 @@ where
         Some(Command::GitTag(raw)) => run_subcommand("git-tag", raw, git_tag::run),
         Some(Command::Process(raw)) => run_subcommand("process", raw, process::run),
         Some(Command::Port(raw)) => run_subcommand("port", raw, port::run),
+        Some(Command::KillProcess(raw)) => {
+            run_subcommand("kill-process", raw, kill_direct::run_kill_process)
+        }
+        Some(Command::KillPort(raw)) => {
+            run_subcommand("kill-port", raw, kill_direct::run_kill_port)
+        }
         Some(Command::History(raw)) => run_subcommand("history", raw, history::run),
         Some(Command::Env(raw)) => run_subcommand("env", raw, defs::run_env),
         Some(Command::Alias(raw)) => run_subcommand("alias", raw, defs::run_alias),

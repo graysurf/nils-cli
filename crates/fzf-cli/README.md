@@ -21,6 +21,8 @@ Commands:
   git-tag           Browse and checkout tags interactively
   process           Browse and kill running processes (confirm before kill)
   port              Browse listening ports and owners (confirm before kill)
+  kill-process      Kill one or more process IDs without launching fzf
+  kill-port         Kill process owners for listening ports without launching fzf
   history           Search and execute command history
   env               Browse environment variables
   alias             Browse shell aliases
@@ -82,6 +84,17 @@ Help:
   PIDs (confirm before kill). Uses `lsof` when available; falls back to `netstat` (no PID column
   in the fallback view).
 
+### kill-process
+
+- `kill-process [-9|--force] <pid> [pid...]`: Kill one or more explicit PIDs without opening
+  `fzf`. This is the native backend for direct shell aliases such as `kill-process` / `kpid`.
+
+### kill-port
+
+- `kill-port [-9|--force] <port> [port...]`: Resolve listening TCP/UDP owners with `lsof -t`
+  and kill the owning PIDs without opening `fzf`. This is the native backend for direct shell
+  aliases such as `kill-port` / `kp`.
+
 ### history
 
 - `history [query...]`: Search shell history and print the selected command to stdout.
@@ -138,7 +151,8 @@ Help:
 - `git` is required for `git-*` commands.
 - `bat` is required for the `file` preview and is the preferred `directory` preview (the
   `directory` picker degrades to `sed` when `bat` is missing).
-- `lsof` is the preferred backend for `port`; `netstat` is the fallback when `lsof` is missing.
+- `lsof` is the preferred backend for `port` and is required for `kill-port`; `netstat` is the
+  fallback for the interactive `port` view when `lsof` is missing.
 - `code` is used for `--vscode` (and the `FZF_FILE_OPEN_WITH=vscode` default) and
   `open-changed-files`; picker commands fall back to `vi` if `code` is unavailable or fails, while
   `open-changed-files` no-ops cleanly.

@@ -299,6 +299,141 @@ echo "$@" >> "${KILL_LOG:?}"
 }
 
 #[test]
+fn kill_process_direct_calls_kill_without_fzf() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stub = common::make_stub_dir();
+    common::write_exe(
+        stub.path(),
+        "kill",
+        r#"#!/bin/bash
+set -euo pipefail
+echo "$@" >> "${KILL_LOG:?}"
+"#,
+    );
+
+    let kill_log = dir.path().join("kill.log");
+    fs::write(&kill_log, "").unwrap();
+    let kill_log_s = kill_log.to_string_lossy().to_string();
+    let envs = [("KILL_LOG", kill_log_s.as_str())];
+
+    let out = common::run_fzf_cli_with_stub_only_path(
+        dir.path(),
+        stub.path(),
+        &["kill-process", "-9", "123", "456"],
+        &envs,
+        None,
+    );
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stdout.contains("SIGKILL"),
+        "expected SIGKILL output, got: {}",
+        out.stdout
+    );
+    let log = fs::read_to_string(&kill_log).unwrap();
+    assert!(log.contains("-9 123 456"), "kill log mismatch: {log}");
+}
+
+#[test]
+fn kill_process_direct_rejects_invalid_pid() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let out = common::run_fzf_cli(dir.path(), &["kill-process", "abc"], &[], None);
+
+    assert_eq!(out.code, 64);
+    assert!(
+        out.stderr.contains("invalid pid: abc"),
+        "missing invalid pid error: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn kill_port_direct_resolves_tcp_and_udp_pids() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stub = common::make_stub_dir();
+    common::write_exe(
+        stub.path(),
+        "lsof",
+        r#"#!/bin/bash
+set -euo pipefail
+case "$*" in
+  *"-iTCP:1234"*) echo 111 ;;
+  *"-iUDP:1234"*) echo 222 ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+    common::write_exe(
+        stub.path(),
+        "kill",
+        r#"#!/bin/bash
+set -euo pipefail
+echo "$@" >> "${KILL_LOG:?}"
+"#,
+    );
+
+    let kill_log = dir.path().join("kill.log");
+    fs::write(&kill_log, "").unwrap();
+    let kill_log_s = kill_log.to_string_lossy().to_string();
+    let envs = [("KILL_LOG", kill_log_s.as_str())];
+
+    let out = common::run_fzf_cli_with_stub_only_path(
+        dir.path(),
+        stub.path(),
+        &["kill-port", "1234"],
+        &envs,
+        None,
+    );
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let log = fs::read_to_string(&kill_log).unwrap();
+    assert!(log.contains("111 222"), "kill log missing pids: {log}");
+}
+
+#[test]
+fn kill_port_direct_no_pids_is_noop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stub = common::make_stub_dir();
+    common::write_exe(
+        stub.path(),
+        "lsof",
+        r#"#!/bin/bash
+exit 1
+"#,
+    );
+    common::write_exe(
+        stub.path(),
+        "kill",
+        r#"#!/bin/bash
+set -euo pipefail
+echo "$@" >> "${KILL_LOG:?}"
+"#,
+    );
+
+    let kill_log = dir.path().join("kill.log");
+    fs::write(&kill_log, "").unwrap();
+    let kill_log_s = kill_log.to_string_lossy().to_string();
+    let envs = [("KILL_LOG", kill_log_s.as_str())];
+
+    let out = common::run_fzf_cli_with_stub_only_path(
+        dir.path(),
+        stub.path(),
+        &["kill-port", "1234"],
+        &envs,
+        None,
+    );
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stdout.contains("No process found on port(s): 1234"),
+        "expected no-op message, got: {}",
+        out.stdout
+    );
+    let log = fs::read_to_string(&kill_log).unwrap();
+    assert!(log.trim().is_empty(), "kill should not run, got: {log}");
+}
+
+#[test]
 fn git_commands_outside_repo_abort() {
     let dir = tempfile::TempDir::new().unwrap();
     for cmd in [

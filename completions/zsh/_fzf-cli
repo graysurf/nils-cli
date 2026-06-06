@@ -104,6 +104,24 @@ _arguments "${_arguments_options[@]}" : \
 '*::query:_default' \
 && ret=0
 ;;
+(kill-process)
+_arguments "${_arguments_options[@]}" : \
+'-9[Use SIGKILL instead of SIGTERM]' \
+'--force[Use SIGKILL instead of SIGTERM]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::pid:_default' \
+&& ret=0
+;;
+(kill-port)
+_arguments "${_arguments_options[@]}" : \
+'-9[Use SIGKILL instead of SIGTERM]' \
+'--force[Use SIGKILL instead of SIGTERM]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::port:_default' \
+&& ret=0
+;;
 (history)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -183,6 +201,8 @@ _fzf-cli_commands() {
 'git-tag:Browse and checkout tags interactively' \
 'process:Browse and kill running processes' \
 'port:Browse listening ports and owners' \
+'kill-process:Kill one or more process IDs' \
+'kill-port:Kill process owners for listening ports' \
 'history:Search and execute command history' \
 'env:Browse environment variables' \
 'alias:Browse shell aliases' \
@@ -263,6 +283,16 @@ _fzf-cli__subcmd__help_commands() {
 _fzf-cli__subcmd__history_commands() {
     local commands; commands=()
     _describe -t commands 'fzf-cli history commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__kill-port_commands] )) ||
+_fzf-cli__subcmd__kill-port_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli kill-port commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__kill-process_commands] )) ||
+_fzf-cli__subcmd__kill-process_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli kill-process commands' commands "$@"
 }
 (( $+functions[_fzf-cli__subcmd__open-changed-files_commands] )) ||
 _fzf-cli__subcmd__open-changed-files_commands() {
