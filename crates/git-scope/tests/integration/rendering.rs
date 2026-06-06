@@ -19,7 +19,7 @@ fn no_color_outputs_no_ansi() {
 }
 
 #[test]
-fn tree_missing_emits_warning() {
+fn tree_renders_without_tree_on_path() {
     let repo = common::init_repo();
     let root = repo.path();
 
@@ -38,17 +38,32 @@ fn tree_missing_emits_warning() {
     let output = common::run_git_scope(
         root,
         &["staged"],
-        &[("PATH", temp_path.path().to_str().unwrap())],
+        &[
+            ("NO_COLOR", "1"),
+            ("PATH", temp_path.path().to_str().unwrap()),
+        ],
     );
 
     assert!(
-        output.contains("tree is not installed"),
-        "tree missing warning not found: {output}"
+        output.contains("📂 Directory tree:"),
+        "tree section not found: {output}"
+    );
+    assert!(
+        output.contains("└── file.txt"),
+        "built-in tree entry not found: {output}"
+    );
+    assert!(
+        output.contains("1 directory, 1 file"),
+        "tree summary not found: {output}"
+    );
+    assert!(
+        !output.contains("tree is not installed"),
+        "external tree warning should not be emitted: {output}"
     );
 }
 
 #[test]
-fn tree_fromfile_unsupported_emits_warning() {
+fn failing_tree_binary_on_path_is_not_invoked() {
     let repo = common::init_repo();
     let root = repo.path();
 
@@ -67,7 +82,7 @@ fn tree_fromfile_unsupported_emits_warning() {
     let tree_path = temp_path.path().join("tree");
     fs::write(
         &tree_path,
-        "#!/usr/bin/env bash\nif [[ \"$1\" == \"--version\" ]]; then\n  exit 0\nfi\nif [[ \"$1\" == \"--fromfile\" ]]; then\n  exit 1\nfi\nexit 0\n",
+        "#!/usr/bin/env bash\necho 'external tree should not run' >&2\nexit 1\n",
     )
     .unwrap();
     let mut perms = fs::metadata(&tree_path).unwrap().permissions();
@@ -77,11 +92,18 @@ fn tree_fromfile_unsupported_emits_warning() {
     let output = common::run_git_scope(
         root,
         &["staged"],
-        &[("PATH", temp_path.path().to_str().unwrap())],
+        &[
+            ("NO_COLOR", "1"),
+            ("PATH", temp_path.path().to_str().unwrap()),
+        ],
     );
 
     assert!(
-        output.contains("tree does not support --fromfile"),
-        "tree unsupported warning not found: {output}"
+        output.contains("└── file.txt"),
+        "built-in tree entry not found: {output}"
+    );
+    assert!(
+        !output.contains("tree does not support --fromfile"),
+        "external tree warning should not be emitted: {output}"
     );
 }

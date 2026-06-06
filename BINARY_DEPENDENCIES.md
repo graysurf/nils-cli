@@ -46,7 +46,6 @@ in `crates/*/src`.
 
 | Tool | Behavior Impact | Install (brew/linuxbrew) |
 |---|---|---|
-| `tree` | Enables directory tree rendering in `git-scope` | `brew install tree` |
 | `direnv` | Enables `agent-run exec` to activate allowed project `.envrc` / `.env` files; required only when a project env file applies and `--direnv` is not `off` | `brew install direnv` |
 | `file` | MIME-based binary detection in `git-scope` and `git-cli commit context` | Usually preinstalled |
 | `lsof` | Preferred backend for `fzf-cli port` (fallback: `netstat`) | `brew install lsof` |
@@ -134,7 +133,7 @@ cargo run -p agent-docs -- preflight --intent project-dev --format json \
 ### 6.1 Base contributor profile
 
 ```bash
-brew install git gh glab fzf tree webp ffmpeg bat zsh python bash-completion rustup-init im-select
+brew install git gh glab fzf webp ffmpeg bat zsh python bash-completion rustup-init im-select
 ```
 
 ### 6.2 Linux extra profile (audio/clipboard/network ergonomics)
@@ -158,7 +157,7 @@ eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 ## 8. Quick Environment Verification
 
 ```bash
-for c in git gh glab fzf grpcurl tree file ffmpeg bat im-select curl; do
+for c in git gh glab fzf grpcurl file ffmpeg bat im-select curl; do
   if command -v "$c" >/dev/null 2>&1; then
     echo "[OK]   $c -> $(command -v "$c")"
   else

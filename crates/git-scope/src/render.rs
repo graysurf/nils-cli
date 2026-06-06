@@ -1,11 +1,9 @@
 use crate::change::parse_name_status_lines;
 use crate::print::{HeadFallback, PrintSource, emit_file};
 use crate::progress::ProgressRunner;
-use crate::tree::{TREE_MISSING_WARNING, TREE_UNSUPPORTED_WARNING, tree_support};
+use crate::tree::render_path_tree;
 use anyhow::Result;
-use nils_common::shell::{AnsiStripMode, strip_ansi as strip_ansi_impl};
 use std::collections::BTreeSet;
-use std::process::Command;
 
 #[derive(Debug, Clone, Copy)]
 pub enum PrintMode {
@@ -178,55 +176,12 @@ fn render_tree(files: &[String], no_color: bool) -> Result<()> {
     println!();
     println!("📂 Directory tree:");
 
-    let support = tree_support();
-    if !support.is_installed || !support.supports_fromfile {
-        if let Some(warning) = support.warning {
-            println!("{warning}");
-        } else if !support.is_installed {
-            println!("{TREE_MISSING_WARNING}");
-        } else {
-            println!("{TREE_UNSUPPORTED_WARNING}");
-        }
-        return Ok(());
+    let rendered = render_path_tree(files, no_color);
+    for line in rendered.lines() {
+        println!("{line}");
     }
-
-    let tree_args = build_tree_args(no_color);
-
-    let tree_input = expand_tree_paths(files);
-    let mut cmd = Command::new("tree");
-    cmd.args(&tree_args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-    if let Err(err) = write_tree_input(child.stdin.take(), &tree_input) {
-        let _ = child.wait();
-        println!("⚠️  Failed to stream paths to tree --fromfile ({err}). Skipping directory tree.");
-        return Ok(());
-    }
-
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        println!(
-            "⚠️  tree exited with status {}. Skipping directory tree output.",
-            output.status
-        );
-        return Ok(());
-    }
-
-    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-    if no_color {
-        text = strip_ansi(&text);
-    }
-    print!("{text}");
-    Ok(())
-}
-
-fn write_tree_input<W: std::io::Write>(stdin: Option<W>, tree_input: &[String]) -> Result<()> {
-    let mut stdin = stdin.ok_or_else(|| anyhow::anyhow!("tree stdin unavailable"))?;
-    for line in tree_input {
-        writeln!(stdin, "{line}")?;
-    }
+    println!();
+    println!("{}", rendered.summary());
     Ok(())
 }
 
@@ -242,44 +197,9 @@ pub fn render_tree_for_commit(files: &[String], no_color: bool) -> Result<()> {
     render_tree(files, no_color)
 }
 
-fn build_tree_args(no_color: bool) -> Vec<&'static str> {
-    // `-a` is required even when callers feed paths via stdin: `tree --fromfile`
-    // still applies its hidden-name filter on each node, so dot-prefixed paths
-    // (e.g. `.agents/`, `.github/`) are silently dropped without it.
-    let mut args = vec!["--fromfile", "-a"];
-    if !no_color {
-        args.push("-C");
-    }
-    args
-}
-
-fn expand_tree_paths(files: &[String]) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    for file in files {
-        let parts: Vec<&str> = file.split('/').collect();
-        if parts.is_empty() {
-            continue;
-        }
-        for i in 1..=parts.len() {
-            let path = parts[..i].join("/");
-            if !path.is_empty() {
-                set.insert(path);
-            }
-        }
-    }
-    set.into_iter().collect()
-}
-
-fn strip_ansi(input: &str) -> String {
-    strip_ansi_impl(input, AnsiStripMode::CsiSgrOnly).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_tree_args, color_reset_for_commit, expand_tree_paths, kind_color_for_commit,
-        strip_ansi, write_tree_input,
-    };
+    use super::{color_reset_for_commit, kind_color_for_commit};
 
     #[test]
     fn no_color_mode_returns_empty_color_sequences() {
@@ -295,77 +215,5 @@ mod tests {
         assert_eq!(kind_color_for_commit("M", false), "\x1b[38;2;135;175;215m");
         assert_eq!(kind_color_for_commit("D", false), "\x1b[38;2;135;95;95m");
         assert_eq!(color_reset_for_commit(false), "\x1b[0m");
-    }
-
-    #[test]
-    fn strip_ansi_removes_m_terminated_sequences() {
-        let input = "\x1b[31mred\x1b[0m plain \x1b[38;5;110mblue\x1b[0m";
-        assert_eq!(strip_ansi(input), "red plain blue");
-    }
-
-    #[test]
-    fn write_tree_input_errors_when_stdin_is_missing() {
-        let tree_input = vec!["src/main.rs".to_string()];
-        let err = write_tree_input::<Vec<u8>>(None, &tree_input).expect_err("missing stdin");
-        assert_eq!(err.to_string(), "tree stdin unavailable");
-    }
-
-    #[test]
-    fn write_tree_input_uses_newline_delimited_paths() {
-        let tree_input = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
-        let mut sink = Vec::new();
-        write_tree_input(Some(&mut sink), &tree_input).expect("write tree input");
-        assert_eq!(
-            String::from_utf8(sink).expect("utf8"),
-            "src/main.rs\nsrc/lib.rs\n"
-        );
-    }
-
-    #[test]
-    fn build_tree_args_always_includes_dash_a_to_show_dot_paths() {
-        // Regression: `tree --fromfile` would silently drop dot-prefixed paths
-        // (e.g. `.agents/...`) from the rendered tree without `-a`.
-        assert!(build_tree_args(true).contains(&"-a"));
-        assert!(build_tree_args(false).contains(&"-a"));
-    }
-
-    #[test]
-    fn build_tree_args_toggles_color_flag() {
-        assert!(!build_tree_args(true).contains(&"-C"));
-        assert!(build_tree_args(false).contains(&"-C"));
-    }
-
-    #[test]
-    fn expand_tree_paths_preserves_dot_prefixed_segments() {
-        let files = vec![
-            ".agents/skills/foo/SKILL.md".to_string(),
-            ".github/workflows/ci.yml".to_string(),
-            "docs/plans/plan.md".to_string(),
-        ];
-        let paths = expand_tree_paths(&files);
-        assert!(paths.contains(&".agents".to_string()));
-        assert!(paths.contains(&".agents/skills".to_string()));
-        assert!(paths.contains(&".agents/skills/foo".to_string()));
-        assert!(paths.contains(&".agents/skills/foo/SKILL.md".to_string()));
-        assert!(paths.contains(&".github/workflows/ci.yml".to_string()));
-        assert!(paths.contains(&"docs/plans/plan.md".to_string()));
-    }
-
-    #[test]
-    fn expand_tree_paths_deduplicates_and_sorts_paths() {
-        let files = vec![
-            "src/lib.rs".to_string(),
-            "src/main.rs".to_string(),
-            "README.md".to_string(),
-        ];
-        assert_eq!(
-            expand_tree_paths(&files),
-            vec![
-                "README.md".to_string(),
-                "src".to_string(),
-                "src/lib.rs".to_string(),
-                "src/main.rs".to_string(),
-            ]
-        );
     }
 }
