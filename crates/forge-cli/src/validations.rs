@@ -18,6 +18,7 @@ use std::path::Path;
 use std::process::Command;
 
 use nils_common::cli_contract::schema_version_for;
+use nils_common::provider_payload;
 use serde::Serialize;
 
 use crate::cli::BINARY;
@@ -319,165 +320,24 @@ pub fn body_sections(body: &str, headings: &BodyHeadings) -> Result<(), ForgeErr
     }
 }
 
-/// Literal path prefixes that are portable container / CI-runner roots, not
-/// user-specific home paths. Mirrors the allowlist in the repo-side
-/// `portable-paths-scan.py` hook, plus `/home/runner` for pasted CI logs.
-const LOCAL_PATH_ALLOWLIST: &[&str] = &["/home/agent", "/home/linuxbrew", "/home/runner"];
-
-/// The two machine-local home roots the rule scans for. ASCII-only, so byte
-/// offsets from `str::match_indices` always land on char boundaries.
-const LOCAL_PATH_ROOTS: &[&str] = &["/Users/", "/home/"];
-
-/// Closing delimiters (whitespace is handled separately) that terminate a path
-/// tail. Mirrors the hook's `[^\s`'"<>)\]}]` tail exclusion set.
-const LOCAL_PATH_DELIMITERS: &[char] = &['`', '\'', '"', '<', '>', ')', ']', '}'];
-
-/// Trailing punctuation stripped from a matched path so a path ending a
-/// sentence does not capture the period. Mirrors the hook's
-/// `TRAILING_PUNCTUATION`.
-const LOCAL_PATH_TRAILING_PUNCT: &[char] = &['.', ',', ';', ':', ')', ']', '}', '\'', '"', '`'];
-
-/// Cap on enumerated hits in the error `detail`, matching the hook's
-/// `MAX_FORMATTED_HITS` so a pathological body cannot produce an unbounded
-/// message.
-const LOCAL_PATH_MAX_HITS: usize = 20;
-
-/// Env var that disables the local-path scan after a verified false positive.
-/// Deliberately distinct from the file-write hook's `SKIP_PORTABLE_PATH_SCAN`
-/// so bypassing one egress layer never silently disables the other.
-pub const ALLOW_LOCAL_PATH_ENV: &str = "FORGE_CLI_ALLOW_LOCAL_PATH";
-
-/// One machine-local home path found in posted text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalPathHit {
-    /// 1-based line number within the scanned text.
-    pub line: usize,
-    /// The offending path with trailing sentence punctuation stripped.
-    pub sample: String,
-    /// The `$HOME`-relative replacement suggested in the error detail.
-    pub suggestion: String,
-}
-
-/// Scan `text` for machine-local home paths (`/Users/<owner>/…`,
-/// `/home/<owner>/…`). Pure — no env gate and no I/O — so every detection branch
-/// is unit-testable. The literal allowlist still applies here: an allowlisted
-/// container path is never a hit regardless of the escape hatch.
-fn scan_local_paths(text: &str) -> Vec<LocalPathHit> {
-    let mut found: Vec<(usize, usize, LocalPathHit)> = Vec::new();
-    for (idx, line) in text.lines().enumerate() {
-        let line_no = idx + 1;
-        for root in LOCAL_PATH_ROOTS {
-            for (start, _) in line.match_indices(root) {
-                let owner_start = start + root.len();
-                let owner_len: usize = line[owner_start..]
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-                    .map(char::len_utf8)
-                    .sum();
-                if owner_len == 0 {
-                    // A bare `/Users/` or `/home/` with no owner segment is not
-                    // a user home path.
-                    continue;
-                }
-                // The tail is only part of the path when an actual `/` follows
-                // the owner segment, matching the hook's optional `/…` group.
-                let tail_start = owner_start + owner_len;
-                let after_owner = &line[tail_start..];
-                let tail_len: usize = if after_owner.starts_with('/') {
-                    after_owner
-                        .chars()
-                        .take_while(|c| !c.is_whitespace() && !LOCAL_PATH_DELIMITERS.contains(c))
-                        .map(char::len_utf8)
-                        .sum()
-                } else {
-                    0
-                };
-                let matched = &line[start..tail_start + tail_len];
-                let sample = matched.trim_end_matches(LOCAL_PATH_TRAILING_PUNCT);
-                if sample.is_empty() || is_allowed_local_path(sample) {
-                    continue;
-                }
-                let prefix_len = root.len() + owner_len;
-                let tail = sample.get(prefix_len..).unwrap_or("");
-                found.push((
-                    line_no,
-                    start,
-                    LocalPathHit {
-                        line: line_no,
-                        sample: sample.to_string(),
-                        suggestion: format!("$HOME{tail}"),
-                    },
-                ));
-            }
-        }
-    }
-    // Report left-to-right, top-to-bottom; collapse a path repeated on one line
-    // to a single hit so the detail stays signal-dense.
-    found.sort_by_key(|(line, start, _)| (*line, *start));
-    let mut seen = std::collections::HashSet::new();
-    found
-        .into_iter()
-        .filter(|(_, _, hit)| seen.insert((hit.line, hit.sample.clone())))
-        .map(|(_, _, hit)| hit)
-        .collect()
-}
-
-fn is_allowed_local_path(sample: &str) -> bool {
-    LOCAL_PATH_ALLOWLIST
-        .iter()
-        .any(|prefix| sample == *prefix || sample.starts_with(&format!("{prefix}/")))
-}
-
-fn local_path_scan_disabled() -> bool {
-    matches!(std::env::var(ALLOW_LOCAL_PATH_ENV), Ok(v) if v == "1")
-}
-
-fn render_local_path_detail(hits: &[LocalPathHit]) -> String {
-    let mut lines: Vec<String> = hits
-        .iter()
-        .take(LOCAL_PATH_MAX_HITS)
-        .map(|hit| {
-            format!(
-                "line {line}: {sample} -> use {suggestion}",
-                line = hit.line,
-                sample = hit.sample,
-                suggestion = hit.suggestion,
-            )
-        })
-        .collect();
-    let extra = hits.len().saturating_sub(LOCAL_PATH_MAX_HITS);
-    if extra > 0 {
-        lines.push(format!("... {extra} more local path(s) omitted"));
-    }
-    lines.push(format!(
-        "set {ALLOW_LOCAL_PATH_ENV}=1 to bypass after verifying a false positive"
-    ));
-    lines.join("\n")
-}
-
 /// Rule 11 — posted text (title / body / comment) MUST NOT embed a machine-local
 /// home path (`/Users/<owner>/…`, `/home/<owner>/…`). This mirrors the repo-side
 /// `portable-paths-scan.py` file-write hook so the forge egress path enforces
 /// the same portability rule the hook already enforces on disk. `field` names
-/// the offending input (`title` / `body` / `comment`) in the message; the
-/// `detail` enumerates each offending line plus its `$HOME`-relative fix. Set
+/// the offending input (`title` / `body` / `comment`) in the message without
+/// echoing the personal path; the `detail` enumerates each offending line plus
+/// its `$HOME`-relative fix. Set
 /// `FORGE_CLI_ALLOW_LOCAL_PATH=1` to bypass a verified false positive.
 pub fn no_local_path(text: &str, field: &str) -> Result<(), ForgeError> {
-    if local_path_scan_disabled() {
-        return Ok(());
-    }
-    let hits = scan_local_paths(text);
-    if hits.is_empty() {
-        return Ok(());
-    }
+    let err = match provider_payload::validate_no_local_paths(text, field) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
     Err(ForgeError::validation(
         schema(),
-        "local_path_present",
-        format!(
-            "{field} contains {n} machine-local home path(s); use $HOME-relative paths",
-            n = hits.len()
-        ),
-        Some(render_local_path_detail(&hits)),
+        provider_payload::LOCAL_PATH_ERROR_KIND,
+        err.message(),
+        Some(err.detail()),
     ))
 }
 
@@ -757,6 +617,9 @@ fn run_git_capture(workdir: &Path, args: &[&str]) -> Result<String, ForgeError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nils_common::provider_payload::{
+        LOCAL_PATH_MAX_HITS, LocalPathHit, render_local_path_detail, scan_local_paths,
+    };
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -1150,7 +1013,7 @@ mod tests {
         let err = no_local_path("clone into /Users/terry/Project/x", "body").expect_err("macos");
         assert_eq!(err.kind(), "local_path_present");
         let detail = err.detail().expect("detail present");
-        assert!(detail.contains("/Users/terry/Project/x"), "{detail}");
+        assert!(!detail.contains("/Users/terry"), "{detail}");
         assert!(detail.contains("use $HOME/Project/x"), "{detail}");
     }
 

@@ -6,7 +6,10 @@
 //! *before* any provider call — the egress path the repo-side
 //! `portable-paths-scan.py` file hook never covers.
 
+use std::fs;
+
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 
 use super::support::{StubEnv, parse_envelope, run_forge_cli};
 
@@ -42,8 +45,44 @@ fn issue_comment_with_macos_home_path_exits_data_65() {
     let detail = env["error"]["details"]["detail"]
         .as_str()
         .expect("detail string");
-    assert!(detail.contains("/Users/dev/Project/secret"), "{detail}");
+    assert!(!detail.contains("/Users/dev"), "{detail}");
     assert!(detail.contains("use $HOME/Project/secret"), "{detail}");
+}
+
+#[test]
+fn issue_comment_with_local_path_body_file_exits_data_65_without_echoing_path() {
+    let tmp = TempDir::new().expect("tmp");
+    let body_file = tmp.path().join("body.md");
+    fs::write(
+        &body_file,
+        "Rendered summary points at /Users/dev/Project/private/out.md",
+    )
+    .expect("write body");
+    let body_file_s = body_file.to_string_lossy().to_string();
+
+    let stub = StubEnv::new().gh_stub(NEVER_RUN);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "issue",
+            "comment",
+            "1",
+            "--body-file",
+            &body_file_s,
+        ],
+    );
+    assert_eq!(out.code, DATA, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "local_path_present");
+    let detail = env["error"]["details"]["detail"]
+        .as_str()
+        .expect("detail string");
+    assert!(detail.contains("$HOME/Project/private/out.md"), "{detail}");
+    assert!(!detail.contains("/Users/dev"), "{detail}");
 }
 
 #[test]
@@ -94,6 +133,7 @@ fn text_format_surfaces_kind_and_home_fix_on_stderr() {
     );
     assert_eq!(out.code, DATA);
     assert!(out.stderr.contains("local_path_present"), "{}", out.stderr);
+    assert!(!out.stderr.contains("/Users/dev"), "{}", out.stderr);
     assert!(out.stderr.contains("use $HOME/notes"), "{}", out.stderr);
 }
 

@@ -30,6 +30,7 @@ pub mod fs;
 pub mod git;
 pub mod markdown;
 pub mod process;
+pub mod provider_payload;
 pub mod provider_runtime;
 pub mod rate_limits_ansi;
 pub mod redact;

@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-use nils_common::markdown;
 use nils_common::process as common_process;
+use nils_common::{markdown, provider_payload};
 use serde_json::Value;
 
 use crate::commands::plan::CloseReason;
@@ -186,14 +186,14 @@ impl GhCliAdapter {
             .map_err(|err| format!("failed to parse gh JSON for {context}: {err}"))
     }
 
-    fn guard_markdown_payload(&self, payload: &str, context: &str) -> Result<(), String> {
-        if self.force {
-            return Ok(());
+    fn guard_provider_payload(&self, payload: &str, source: &str) -> Result<(), String> {
+        if !self.force {
+            markdown::validate_markdown_payload(payload).map_err(|err| {
+                format!("{source} write rejected: {err}. Replace escaped controls or re-run with --force.")
+            })?;
         }
 
-        markdown::validate_markdown_payload(payload).map_err(|err| {
-            format!("{context}: {err}. Replace escaped controls or re-run with --force.")
-        })
+        provider_payload::validate_no_local_paths(payload, source).map_err(|err| err.to_string())
     }
 
     /// Resolve the required-check rollup for `repo#pr` via
@@ -329,19 +329,15 @@ impl GhCliAdapter {
         )
     }
 
-    fn guard_markdown_file(&self, path: &Path, context: &str) -> Result<(), String> {
-        if self.force {
-            return Ok(());
-        }
-
+    fn guard_provider_file(&self, path: &Path, source: &str) -> Result<(), String> {
         let payload = fs::read_to_string(path).map_err(|err| {
             format!(
-                "{context}: failed to read markdown payload {}: {err}",
+                "{source}: failed to read provider payload {}: {err}",
                 path.display()
             )
         })?;
 
-        self.guard_markdown_payload(&payload, context)
+        self.guard_provider_payload(&payload, source)
     }
 }
 
@@ -433,7 +429,8 @@ impl ProviderAdapter for GhCliAdapter {
         body_file: &Path,
         labels: &[String],
     ) -> Result<(u64, String), String> {
-        self.guard_markdown_file(body_file, "github issue create body write rejected")?;
+        self.guard_provider_payload(title, "github issue title")?;
+        self.guard_provider_file(body_file, "github issue create body")?;
 
         let mut args = vec![
             "issue".to_string(),
@@ -462,7 +459,7 @@ impl ProviderAdapter for GhCliAdapter {
     }
 
     fn edit_issue_body(&self, repo: &str, issue: u64, body_file: &Path) -> Result<(), String> {
-        self.guard_markdown_file(body_file, "github issue body update rejected")?;
+        self.guard_provider_file(body_file, "github issue body update")?;
 
         let args = vec![
             "issue".to_string(),
@@ -477,7 +474,7 @@ impl ProviderAdapter for GhCliAdapter {
     }
 
     fn comment_issue(&self, repo: &str, issue: u64, body_file: &Path) -> Result<String, String> {
-        self.guard_markdown_file(body_file, "github issue comment write rejected")?;
+        self.guard_provider_file(body_file, "github issue comment body")?;
 
         let args = vec![
             "issue".to_string(),
@@ -565,7 +562,7 @@ impl ProviderAdapter for GhCliAdapter {
         if let Some(comment) = close_comment {
             let trimmed = comment.trim();
             if !trimmed.is_empty() {
-                self.guard_markdown_payload(trimmed, "github issue close comment write rejected")?;
+                self.guard_provider_payload(trimmed, "github issue close comment")?;
                 args.push("--comment".to_string());
                 args.push(trimmed.to_string());
             }
@@ -939,6 +936,76 @@ esac
             .create_issue("sympoies/nils-cli", "title", &escaped_file, &[])
             .expect("force mode bypasses markdown guard");
         assert_eq!(forced.0, 217);
+    }
+
+    #[test]
+    fn gh_adapter_provider_payload_guard_rejects_local_paths_without_running_gh() {
+        let tmp = TempDir::new().expect("tempdir");
+        let body_file = tmp.path().join("body.md");
+        fs::write(
+            &body_file,
+            "rendered comment includes /Users/dev/Project/private/out.md",
+        )
+        .expect("write body");
+
+        let adapter = GhCliAdapter::new(false);
+        let comment_err = adapter
+            .comment_issue("sympoies/nils-cli", 217, &body_file)
+            .expect_err("local-path body should fail");
+        assert!(
+            comment_err.contains("github issue comment body contains 1 machine-local"),
+            "{comment_err}"
+        );
+        assert!(
+            comment_err.contains("$HOME/Project/private/out.md"),
+            "{comment_err}"
+        );
+        assert!(!comment_err.contains("/Users/dev"), "{comment_err}");
+
+        let title_err = adapter
+            .create_issue(
+                "sympoies/nils-cli",
+                "broken under /home/alice/work",
+                &body_file,
+                &[],
+            )
+            .expect_err("local-path title should fail");
+        assert!(
+            title_err.contains("github issue title contains"),
+            "{title_err}"
+        );
+        assert!(title_err.contains("$HOME/work"), "{title_err}");
+        assert!(!title_err.contains("/home/alice"), "{title_err}");
+
+        let close_err = adapter
+            .close_issue(
+                "sympoies/nils-cli",
+                217,
+                CloseReason::Completed,
+                Some("final evidence at /Users/dev/state/out.md"),
+            )
+            .expect_err("local-path close comment should fail");
+        assert!(
+            close_err.contains("github issue close comment contains"),
+            "{close_err}"
+        );
+        assert!(close_err.contains("$HOME/state/out.md"), "{close_err}");
+        assert!(!close_err.contains("/Users/dev"), "{close_err}");
+    }
+
+    #[test]
+    fn gh_adapter_force_does_not_bypass_provider_payload_privacy_gate() {
+        let tmp = TempDir::new().expect("tempdir");
+        let body_file = tmp.path().join("body.md");
+        fs::write(&body_file, "payload references /Users/dev/private").expect("write body");
+
+        let force = GhCliAdapter::new(true);
+        let err = force
+            .comment_issue("sympoies/nils-cli", 217, &body_file)
+            .expect_err("force must not bypass privacy gate");
+        assert!(err.contains("machine-local home path"), "{err}");
+        assert!(err.contains("$HOME/private"), "{err}");
+        assert!(!err.contains("/Users/dev"), "{err}");
     }
 
     #[test]

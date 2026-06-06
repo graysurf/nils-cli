@@ -28,6 +28,8 @@ In scope:
   `record repair-dashboard`, and `record close` that perform provider issue
   mutations (create, comment, edit, close) without composing `forge-cli` at
   the skill level.
+- Final provider-bound payload validation for live write paths, after comment
+  or dashboard rendering and before the GitHub or GitLab mutation.
 - Strict closeout gate with provider-verified linked PR evidence.
 - Deterministic fixture mode for tests.
 
@@ -315,6 +317,7 @@ High-level append-only comment command for `state`, `session`, `validation`,
 - Validates the supplied payload against the selected lifecycle role schema
   before rendering or posting, so invalid state/review/validation values cannot
   become durable comments that later degrade dashboards to `pending`.
+- Validates the final rendered comment body before provider mutation.
 - Posts to the provider issue and returns the comment URL.
 - Supports `--dry-run` and `--fixture` modes.
 - `--kind closeout` is callable directly only when `record close` is not
@@ -355,6 +358,7 @@ unaffected.
   state payload (no caller-supplied URL flags required).
 - Live mode edits the issue body. Local mode prints or writes the rendered
   dashboard.
+- Validates the final rendered dashboard before provider mutation.
 - A complete record renders `## Final Dashboard`; otherwise `## Current
   Dashboard`.
 - Fails through audit when the latest lifecycle payload cannot be parsed,
@@ -375,6 +379,12 @@ Strict, single-command closeout:
 4. Renders and posts the `closeout` comment with structured payload.
 5. Renders and edits the `## Final Dashboard` issue body.
 6. Closes the provider issue.
+
+Provider-bound validation rejects machine-local home paths (`/Users/<owner>/...`
+or `/home/<owner>/...`) in live write payloads. Diagnostics identify the unsafe
+payload source and line, suggest a `$HOME`-relative replacement, and do not echo
+the original personal path. The privacy gate runs even when `--force` is set;
+`--force` only bypasses the escaped-control markdown payload guard.
 
 `record close` removes all `--require-*` flags. The strict gate is
 non-optional. Inputs are limited to:

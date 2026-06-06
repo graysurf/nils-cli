@@ -40,7 +40,7 @@ validations_catalog:
     error_kind: title_too_long
     exit: DATA
   no_local_path:
-    rule: "posted title/body/comment text must not embed a machine-local home path (/Users/<owner>/... or /home/<owner>/...); allowlist /home/agent, /home/linuxbrew, /home/runner; bypass with FORGE_CLI_ALLOW_LOCAL_PATH=1"
+    rule: "posted title/body/comment text must not embed a machine-local home path (/Users/<owner>/... or /home/<owner>/...); diagnostics name the source and line with a $HOME-relative fix without echoing the original path; allowlist /home/agent, /home/linuxbrew, /home/runner; bypass with FORGE_CLI_ALLOW_LOCAL_PATH=1"
     error_kind: local_path_present
     exit: DATA
   worktree_clean:

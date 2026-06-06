@@ -61,7 +61,8 @@ Shell wrapper scripts are deprecated for this crate path. Use `plan-issue` / `pl
 
 - `--repo <owner/repo>`: pass-through repo target for GitHub operations.
 - `--dry-run`: print write actions without mutating GitHub state.
-- `-f, --force`: bypass markdown payload guard for body/comment writes.
+- `-f, --force`: bypass markdown payload guard for body/comment writes. This
+  does not bypass provider-bound local-path privacy validation.
 - `--json` or `--format json`: machine-readable contract output.
 - `--format text`: human-readable output.
 
