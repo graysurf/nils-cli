@@ -14,6 +14,7 @@ mod git_tag;
 mod history;
 mod kill;
 mod open;
+mod open_changed_files;
 mod port;
 mod process;
 mod util;

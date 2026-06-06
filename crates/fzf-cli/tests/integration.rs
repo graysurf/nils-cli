@@ -17,3 +17,5 @@ mod git_commit;
 mod help_and_dispatch;
 #[path = "integration/open_and_file.rs"]
 mod open_and_file;
+#[path = "integration/open_changed_files.rs"]
+mod open_changed_files;

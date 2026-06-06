@@ -53,13 +53,12 @@ in `crates/*/src`.
 | `netstat` | Fallback backend for `fzf-cli port` when `lsof` is missing | Usually preinstalled |
 | `bat` | Syntax-highlighted previews in `fzf-cli file` / `directory` (invoked via fzf preview shell) | `brew install bat` |
 | `vi` | Default editor for `fzf-cli` open / `git-commit` flows (override via `FZF_FILE_OPEN_WITH`) | Usually preinstalled |
-| `code` | VS Code open mode for `fzf-cli` (`--vscode`) and `git-commit --vscode` | macOS: `brew install --cask visual-studio-code` |
+| `code` | VS Code open mode for `fzf-cli` (`--vscode`), `git-commit --vscode`, and `open-changed-files` | macOS: `brew install --cask visual-studio-code` |
 | `pbcopy` / `wl-copy` / `xclip` / `xsel` | Clipboard integration via `nils-common::clipboard` (used by `git-cli commit context`, `fzf-cli` block preview) | Linux: `brew install wl-clipboard xclip xsel` |
 | `cwebp` | WebP encode path for `screen-record` macOS WebP screenshot fallback | `brew install webp` |
 | `pactl` | Linux audio source discovery for `screen-record --audio ...` | `brew install pulseaudio` |
 | `xdg-desktop-portal` + backend + PipeWire | Wayland portal capture path (`screen-record --portal`) | Prefer distro packages |
 | `open` | macOS `open` invocation for `screen-record` permission prompts | Preinstalled on macOS |
-| `open-changed-files` | Optional helper used by `fzf-cli git-commit` to launch changed files | Project-specific optional tool |
 | `hs` (Hammerspoon CLI) | Preferred AX backend path for `macos-agent ax *` (fallback to JXA when unavailable) | `brew install --cask hammerspoon` |
 | `cliclick` | Probed by `macos-agent` preflight as an alternate input backend | `brew install cliclick` |
 | `im-select` | Required by `macos-agent input-source *` and macOS real E2E keyboard/input-source setup | `brew install im-select` |

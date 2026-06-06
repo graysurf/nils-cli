@@ -1,113 +1,287 @@
-#compdef fzf-cli fx fxf fxd fxgs fxgc fxgco fxgb fxgt fxp fxpo fxh fxenv fxal fxfn fxdef
+#compdef fzf-cli
 
-_nils_cli_fzf_cli_source_common_zsh() {
-  (( $+functions[_nils_cli_completion_common_load_generated_zsh] )) && return 0
-
-  local source_file="${functions_source[_fzf-cli]-}"
-  local helper_path=''
-
-  if [[ -n "$source_file" && -r "$source_file" ]]; then
-    helper_path="${source_file:h}/_completion-adapter-common.zsh"
-    if [[ -r "$helper_path" ]]; then
-      source "$helper_path" || return 1
-      (( $+functions[_nils_cli_completion_common_load_generated_zsh] )) && return 0
-    fi
-  fi
-
-  local dir=''
-  for dir in "${fpath[@]}"; do
-    helper_path="${dir}/_completion-adapter-common.zsh"
-    if [[ -r "$helper_path" ]]; then
-      source "$helper_path" || return 1
-      (( $+functions[_nils_cli_completion_common_load_generated_zsh] )) && return 0
-    fi
-  done
-
-  return 1
-}
-
-typeset -gi _NILS_FZF_CLI_ZSH_GENERATED_STATE=0
-
-_nils_cli_fzf_cli_load_generated_zsh() {
-  _nils_cli_fzf_cli_source_common_zsh || return 1
-
-  _nils_cli_completion_common_load_generated_zsh \
-    "_NILS_FZF_CLI_ZSH_GENERATED_STATE" \
-    "_nils_cli_fzf_cli_generated" \
-    "fzf-cli" \
-    "_fzf-cli" \
-    '^if \[ "\$funcstack\[1\]" = "_nils_cli_fzf_cli_generated" \]; then$' \
-    '^fi$'
-}
-
-_nils_cli_fzf_cli_apply_alias_rewrite_zsh() {
-  local invoked_as="${words[1]-}"
-  local -a inject=()
-
-  case "$invoked_as" in
-    fxf) inject=(file) ;;
-    fxd) inject=(directory) ;;
-    fxgs) inject=(git-status) ;;
-    fxgc) inject=(git-commit) ;;
-    fxgco) inject=(git-checkout) ;;
-    fxgb) inject=(git-branch) ;;
-    fxgt) inject=(git-tag) ;;
-    fxp) inject=(process) ;;
-    fxpo) inject=(port) ;;
-    fxh) inject=(history) ;;
-    fxenv) inject=(env) ;;
-    fxal) inject=(alias) ;;
-    fxfn) inject=(function) ;;
-    fxdef) inject=(def) ;;
-  esac
-
-  if [[ "$invoked_as" != "fzf-cli" ]]; then
-    local -a rewritten_words=('fzf-cli')
-    local token=''
-    local -i idx=2
-
-    for token in "${inject[@]}"; do
-      rewritten_words+=("$token")
-    done
-
-    while (( idx <= ${#words[@]} )); do
-      rewritten_words+=("${words[idx]}")
-      (( idx++ ))
-    done
-
-    words=("${rewritten_words[@]}")
-    (( CURRENT += ${#inject[@]} ))
-  fi
-}
+autoload -U is-at-least
 
 _fzf-cli() {
-  emulate -L zsh -o extendedglob
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
 
-  local -i saved_current="$CURRENT"
-  local -a saved_words=("${words[@]}")
-
-  if ! _nils_cli_fzf_cli_load_generated_zsh; then
-    words=("${saved_words[@]}")
-    CURRENT="$saved_current"
-    if (( $+functions[_nils_cli_completion_common_fail_closed_zsh] )); then
-      _nils_cli_completion_common_fail_closed_zsh
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
     fi
-    return 1
-  fi
 
-  _nils_cli_fzf_cli_apply_alias_rewrite_zsh
-  _nils_cli_fzf_cli_generated
-  local rc=$?
-
-  words=("${saved_words[@]}")
-  CURRENT="$saved_current"
-  return $rc
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_fzf-cli_commands" \
+"*::: :->fzf-cli" \
+&& ret=0
+    case $state in
+    (fzf-cli)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:fzf-cli-command-$line[1]:"
+        case $line[1] in
+            (file)
+_arguments "${_arguments_options[@]}" : \
+'--vi[Open selection with vi]' \
+'--vscode[Open selection with VS Code]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(directory)
+_arguments "${_arguments_options[@]}" : \
+'--vi[Open selection with vi]' \
+'--vscode[Open selection with VS Code]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(git-status)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(git-commit)
+_arguments "${_arguments_options[@]}" : \
+'--snapshot[Preview file snapshots from selected commit]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(git-checkout)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(git-branch)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(git-tag)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(process)
+_arguments "${_arguments_options[@]}" : \
+'-k[Kill selected process]' \
+'--kill[Kill selected process]' \
+'-9[Use SIGKILL when killing]' \
+'--force[Use SIGKILL when killing]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(port)
+_arguments "${_arguments_options[@]}" : \
+'-k[Kill owner process for selected port]' \
+'--kill[Kill owner process for selected port]' \
+'-9[Use SIGKILL when killing]' \
+'--force[Use SIGKILL when killing]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(history)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(env)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(alias)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(function)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(def)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::query:_default' \
+&& ret=0
+;;
+(open-changed-files)
+_arguments "${_arguments_options[@]}" : \
+'--workspace-mode=[Workspace grouping mode]:mode:(pwd git)' \
+'--max-files=[Max files to open]:N:_default' \
+'--list[Open explicit file paths]' \
+'--git[Open staged, unstaged, and untracked files]' \
+'--dry-run[Print planned code invocations]' \
+'-v[Explain no-op behavior and ignored paths]' \
+'--verbose[Explain no-op behavior and ignored paths]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::files:_default' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell:(bash zsh)' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 }
 
-if _nils_cli_fzf_cli_source_common_zsh; then
-  _nils_cli_completion_common_register_zsh _fzf-cli \
-    fzf-cli fx fxf fxd fxgs fxgc fxgco fxgb fxgt fxp fxpo fxh fxenv fxal fxfn fxdef
+(( $+functions[_fzf-cli_commands] )) ||
+_fzf-cli_commands() {
+    local commands; commands=(
+'file:Search and preview text files' \
+'directory:Search directories and cd into selection' \
+'git-status:Interactive git status viewer' \
+'git-commit:Browse commits and open changed files in editor' \
+'git-checkout:Pick and checkout a previous commit' \
+'git-branch:Browse and checkout branches interactively' \
+'git-tag:Browse and checkout tags interactively' \
+'process:Browse and kill running processes' \
+'port:Browse listening ports and owners' \
+'history:Search and execute command history' \
+'env:Browse environment variables' \
+'alias:Browse shell aliases' \
+'function:Browse defined shell functions' \
+'def:Browse all definitions (env, alias, functions)' \
+'open-changed-files:Open changed files in VS Code' \
+'completion:Export shell completion script' \
+'help:Display help message for fzf-cli' \
+    )
+    _describe -t commands 'fzf-cli commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__alias_commands] )) ||
+_fzf-cli__subcmd__alias_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli alias commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__completion_commands] )) ||
+_fzf-cli__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli completion commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__def_commands] )) ||
+_fzf-cli__subcmd__def_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli def commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__directory_commands] )) ||
+_fzf-cli__subcmd__directory_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli directory commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__env_commands] )) ||
+_fzf-cli__subcmd__env_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli env commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__file_commands] )) ||
+_fzf-cli__subcmd__file_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli file commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__function_commands] )) ||
+_fzf-cli__subcmd__function_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli function commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__git-branch_commands] )) ||
+_fzf-cli__subcmd__git-branch_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli git-branch commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__git-checkout_commands] )) ||
+_fzf-cli__subcmd__git-checkout_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli git-checkout commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__git-commit_commands] )) ||
+_fzf-cli__subcmd__git-commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli git-commit commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__git-status_commands] )) ||
+_fzf-cli__subcmd__git-status_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli git-status commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__git-tag_commands] )) ||
+_fzf-cli__subcmd__git-tag_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli git-tag commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__help_commands] )) ||
+_fzf-cli__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli help commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__history_commands] )) ||
+_fzf-cli__subcmd__history_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli history commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__open-changed-files_commands] )) ||
+_fzf-cli__subcmd__open-changed-files_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli open-changed-files commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__port_commands] )) ||
+_fzf-cli__subcmd__port_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli port commands' commands "$@"
+}
+(( $+functions[_fzf-cli__subcmd__process_commands] )) ||
+_fzf-cli__subcmd__process_commands() {
+    local commands; commands=()
+    _describe -t commands 'fzf-cli process commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_fzf-cli" ]; then
+    _fzf-cli "$@"
 else
-  compdef _fzf-cli \
-    fzf-cli fx fxf fxd fxgs fxgc fxgco fxgb fxgt fxp fxpo fxh fxenv fxal fxfn fxdef
+    compdef _fzf-cli fzf-cli
 fi

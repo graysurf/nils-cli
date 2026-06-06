@@ -199,6 +199,54 @@ pub(crate) fn build_completion_command() -> Command {
                 .arg(query_arg()),
         )
         .subcommand(
+            Command::new("open-changed-files")
+                .about("Open changed files in VS Code")
+                .arg(
+                    Arg::new("list")
+                        .long("list")
+                        .help("Open explicit file paths")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("git")
+                        .long("git")
+                        .help("Open staged, unstaged, and untracked files")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("workspace-mode")
+                        .long("workspace-mode")
+                        .value_name("mode")
+                        .help("Workspace grouping mode")
+                        .value_parser(["pwd", "git"]),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .help("Print planned code invocations")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("verbose")
+                        .short('v')
+                        .long("verbose")
+                        .help("Explain no-op behavior and ignored paths")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("max-files")
+                        .long("max-files")
+                        .value_name("N")
+                        .help("Max files to open"),
+                )
+                .arg(
+                    Arg::new("files")
+                        .value_name("files")
+                        .num_args(0..)
+                        .allow_hyphen_values(true),
+                ),
+        )
+        .subcommand(
             Command::new("completion")
                 .about("Export shell completion script")
                 .arg(

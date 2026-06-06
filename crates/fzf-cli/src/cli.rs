@@ -5,7 +5,7 @@ use std::ffi::OsString;
 
 use crate::{
     completion, defs, directory, file, git_branch, git_checkout, git_commit, git_status, git_tag,
-    history, port, process, util,
+    history, open_changed_files, port, process, util,
 };
 
 #[derive(Debug, Parser)]
@@ -58,6 +58,8 @@ enum Command {
     Function(RawArgs),
     #[command(about = "Browse all definitions (env, alias, functions)")]
     Def(RawArgs),
+    #[command(name = "open-changed-files", about = "Open changed files in VS Code")]
+    OpenChangedFiles(RawArgs),
     #[command(about = "Export shell completion script")]
     Completion(RawArgs),
     #[command(about = "Display help message for fzf-cli")]
@@ -100,6 +102,9 @@ where
         Some(Command::Alias(raw)) => run_subcommand("alias", raw, defs::run_alias),
         Some(Command::Function(raw)) => run_subcommand("function", raw, defs::run_function),
         Some(Command::Def(raw)) => run_subcommand("def", raw, defs::run_def),
+        Some(Command::OpenChangedFiles(raw)) => {
+            run_subcommand("open-changed-files", raw, open_changed_files::run)
+        }
         Some(Command::Completion(raw)) => completion::run(&raw.args),
         Some(Command::Help) | None => print_help_stdout(),
     }
