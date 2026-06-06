@@ -1968,6 +1968,24 @@ name = "nils-build-info"
 version = "1.0.11"
 
 [[package]]
+name = "nils-claude-cli"
+version = "1.0.11"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "nils-build-info",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-cli-template"
 version = "1.0.11"
 dependencies = [
@@ -2016,6 +2034,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "nils-docker-tools"
+version = "1.0.11"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "nils-build-info",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "shell-words",
+ "tempfile",
 ]
 
 [[package]]
@@ -2213,6 +2245,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-opencode-cli"
+version = "1.0.11"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "nils-build-info",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-plan-archive"
 version = "1.0.11"
 dependencies = [
@@ -2349,6 +2394,7 @@ dependencies = [
 name = "nils-zsh-kit"
 version = "1.0.11"
 dependencies = [
+ "chrono",
  "clap",
  "clap_complete",
  "nils-build-info",

@@ -15,7 +15,10 @@ nils-memo
 nils-screen-record
 nils-api-testing-core
 nils-cli-template
+nils-claude-cli
 nils-codex-cli
+nils-opencode-cli
+nils-docker-tools
 nils-gemini-cli
 nils-fzf-cli
 nils-git-lock

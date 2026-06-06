@@ -1,0 +1,83 @@
+use anyhow::{Context, Result};
+use nils_common::env as shared_env;
+use nils_common::fs as shared_fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+const CACHE_FILE_NAME: &str = "usage.json";
+
+pub fn cache_file() -> Option<PathBuf> {
+    let dir = cache_dir()?;
+    Some(dir.join(CACHE_FILE_NAME))
+}
+
+pub fn read_cache_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+pub fn write_cache_file(path: &Path, body: &str) -> Result<()> {
+    shared_fs::write_atomic(path, body.as_bytes(), shared_fs::SECRET_FILE_MODE)
+        .with_context(|| format!("failed to write cache: {}", path.display()))
+}
+
+pub fn cache_stale(path: &Path, ttl_seconds: u64) -> bool {
+    if ttl_seconds == 0 {
+        return true;
+    }
+    let modified = match std::fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    let age = match SystemTime::now().duration_since(modified) {
+        Ok(value) => value,
+        Err(_) => Duration::from_secs(0),
+    };
+    age.as_secs() >= ttl_seconds
+}
+
+fn cache_dir() -> Option<PathBuf> {
+    if let Some(value) = shared_env::env_non_empty("CLAUDE_PROMPT_SEGMENT_CACHE_DIR") {
+        return Some(PathBuf::from(value));
+    }
+
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if cfg!(target_os = "macos") {
+        Some(
+            home.join("Library")
+                .join("Caches")
+                .join("claude-prompt-segment"),
+        )
+    } else if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
+        Some(xdg.join("claude-prompt-segment"))
+    } else {
+        Some(home.join(".cache").join("claude-prompt-segment"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_stale;
+    use std::fs::File;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn cache_stale_treats_zero_ttl_as_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("usage.json");
+        std::fs::write(&path, "{}").expect("write");
+        assert!(cache_stale(&path, 0));
+    }
+
+    #[test]
+    fn cache_stale_uses_file_mtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("usage.json");
+        std::fs::write(&path, "{}").expect("write");
+        let file = File::options().write(true).open(&path).expect("open");
+        file.set_modified(SystemTime::now() - Duration::from_secs(120))
+            .expect("set modified");
+
+        assert!(cache_stale(&path, 60));
+        assert!(!cache_stale(&path, 180));
+    }
+}

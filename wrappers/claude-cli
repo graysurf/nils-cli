@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bin_name="claude-cli"
+crate_name="nils-claude-cli"
+args=("$@")
+
+self_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+self_path="$self_dir/$(basename -- "${BASH_SOURCE[0]}")"
+
+mode="${NILS_WRAPPER_MODE:-auto}"
+install_prefix="${NILS_WRAPPER_INSTALL_PREFIX:-$HOME/.local/nils-cli}"
+
+if [[ "$install_prefix" == "~" ]]; then
+  install_prefix="$HOME"
+elif [[ "$install_prefix" == "~/"* ]]; then
+  install_prefix="$HOME/${install_prefix#~/}"
+fi
+
+if [[ "$mode" != "auto" && "$mode" != "debug" && "$mode" != "installed" ]]; then
+  echo "${bin_name}: invalid NILS_WRAPPER_MODE='${mode}' (expected: auto|debug|installed)" >&2
+  exit 64
+fi
+
+emit_status() {
+  if [[ "${NILS_WRAPPER_STATUS_HINTS:-1}" == "0" ]]; then
+    return 0
+  fi
+
+  echo "$*" >&2
+}
+
+is_self_candidate() {
+  local candidate="$1"
+  [[ -n "$candidate" && -e "$candidate" && "$candidate" -ef "$self_path" ]]
+}
+
+resolve_installed() {
+  local candidate=""
+
+  candidate="${install_prefix}/${bin_name}"
+  if [[ -x "$candidate" ]] && ! is_self_candidate "$candidate"; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  candidate="$(command -v "$bin_name" 2>/dev/null || true)"
+  if [[ -n "$candidate" && -x "$candidate" ]] && ! is_self_candidate "$candidate"; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
+run_debug() {
+  if command -v cargo >/dev/null 2>&1; then
+    emit_status "${bin_name}: exec=cargo mode=${mode} crate=${crate_name} (cargo -q: build may stay silent while compiling)"
+    exec cargo run -q -p "$crate_name" -- "${args[@]}"
+  fi
+
+  echo "${bin_name}: cargo not found (required when NILS_WRAPPER_MODE=debug)" >&2
+  exit 1
+}
+
+run_installed() {
+  local installed=""
+  if installed="$(resolve_installed)"; then
+    emit_status "${bin_name}: exec=installed mode=${mode} path=${installed}"
+    exec "$installed" "${args[@]}"
+  fi
+
+  echo "${bin_name}: installed binary not found (NILS_WRAPPER_MODE=installed)" >&2
+  echo "${bin_name}: expected ${install_prefix}/${bin_name} or a PATH entry" >&2
+  exit 1
+}
+
+case "$mode" in
+  debug)
+    run_debug
+    ;;
+  installed)
+    run_installed
+    ;;
+esac
+
+installed=""
+if installed="$(resolve_installed)"; then
+  emit_status "${bin_name}: exec=installed mode=${mode} path=${installed}"
+  exec "$installed" "${args[@]}"
+fi
+
+if command -v cargo >/dev/null 2>&1; then
+  emit_status "${bin_name}: exec=cargo mode=${mode} crate=${crate_name} (cargo -q: build may stay silent while compiling)"
+  exec cargo run -q -p "$crate_name" -- "${args[@]}"
+fi
+
+echo "${bin_name}: binary not found (install via cargo install or build the workspace)" >&2
+exit 1

@@ -5,7 +5,7 @@ use std::ffi::OsString;
 
 use crate::{
     completion, defs, directory, file, git_branch, git_checkout, git_commit, git_status, git_tag,
-    history, port, process, util,
+    history, kill_direct, open_changed_files, port, process, util,
 };
 
 #[derive(Debug, Parser)]
@@ -48,6 +48,10 @@ enum Command {
     Process(RawArgs),
     #[command(about = "Browse listening ports and owners")]
     Port(RawArgs),
+    #[command(name = "kill-process", about = "Kill one or more process IDs")]
+    KillProcess(RawArgs),
+    #[command(name = "kill-port", about = "Kill process owners for listening ports")]
+    KillPort(RawArgs),
     #[command(about = "Search and execute command history")]
     History(RawArgs),
     #[command(about = "Browse environment variables")]
@@ -58,6 +62,8 @@ enum Command {
     Function(RawArgs),
     #[command(about = "Browse all definitions (env, alias, functions)")]
     Def(RawArgs),
+    #[command(name = "open-changed-files", about = "Open changed files in VS Code")]
+    OpenChangedFiles(RawArgs),
     #[command(about = "Export shell completion script")]
     Completion(RawArgs),
     #[command(about = "Display help message for fzf-cli")]
@@ -95,11 +101,20 @@ where
         Some(Command::GitTag(raw)) => run_subcommand("git-tag", raw, git_tag::run),
         Some(Command::Process(raw)) => run_subcommand("process", raw, process::run),
         Some(Command::Port(raw)) => run_subcommand("port", raw, port::run),
+        Some(Command::KillProcess(raw)) => {
+            run_subcommand("kill-process", raw, kill_direct::run_kill_process)
+        }
+        Some(Command::KillPort(raw)) => {
+            run_subcommand("kill-port", raw, kill_direct::run_kill_port)
+        }
         Some(Command::History(raw)) => run_subcommand("history", raw, history::run),
         Some(Command::Env(raw)) => run_subcommand("env", raw, defs::run_env),
         Some(Command::Alias(raw)) => run_subcommand("alias", raw, defs::run_alias),
         Some(Command::Function(raw)) => run_subcommand("function", raw, defs::run_function),
         Some(Command::Def(raw)) => run_subcommand("def", raw, defs::run_def),
+        Some(Command::OpenChangedFiles(raw)) => {
+            run_subcommand("open-changed-files", raw, open_changed_files::run)
+        }
         Some(Command::Completion(raw)) => completion::run(&raw.args),
         Some(Command::Help) | None => print_help_stdout(),
     }

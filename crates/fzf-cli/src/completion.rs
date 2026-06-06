@@ -174,6 +174,40 @@ pub(crate) fn build_completion_command() -> Command {
                 .arg(query_arg()),
         )
         .subcommand(
+            Command::new("kill-process")
+                .about("Kill one or more process IDs")
+                .arg(
+                    Arg::new("force")
+                        .short('9')
+                        .long("force")
+                        .help("Use SIGKILL instead of SIGTERM")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("pid")
+                        .value_name("pid")
+                        .num_args(1..)
+                        .allow_hyphen_values(true),
+                ),
+        )
+        .subcommand(
+            Command::new("kill-port")
+                .about("Kill process owners for listening ports")
+                .arg(
+                    Arg::new("force")
+                        .short('9')
+                        .long("force")
+                        .help("Use SIGKILL instead of SIGTERM")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("port")
+                        .value_name("port")
+                        .num_args(1..)
+                        .allow_hyphen_values(true),
+                ),
+        )
+        .subcommand(
             Command::new("history")
                 .about("Search and execute command history")
                 .arg(query_arg()),
@@ -197,6 +231,54 @@ pub(crate) fn build_completion_command() -> Command {
             Command::new("def")
                 .about("Browse all definitions (env, alias, functions)")
                 .arg(query_arg()),
+        )
+        .subcommand(
+            Command::new("open-changed-files")
+                .about("Open changed files in VS Code")
+                .arg(
+                    Arg::new("list")
+                        .long("list")
+                        .help("Open explicit file paths")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("git")
+                        .long("git")
+                        .help("Open staged, unstaged, and untracked files")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("workspace-mode")
+                        .long("workspace-mode")
+                        .value_name("mode")
+                        .help("Workspace grouping mode")
+                        .value_parser(["pwd", "git"]),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .help("Print planned code invocations")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("verbose")
+                        .short('v')
+                        .long("verbose")
+                        .help("Explain no-op behavior and ignored paths")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("max-files")
+                        .long("max-files")
+                        .value_name("N")
+                        .help("Max files to open"),
+                )
+                .arg(
+                    Arg::new("files")
+                        .value_name("files")
+                        .num_args(0..)
+                        .allow_hyphen_values(true),
+                ),
         )
         .subcommand(
             Command::new("completion")

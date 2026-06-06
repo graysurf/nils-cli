@@ -53,6 +53,11 @@ fn subcommand_help_prints_declared_flags() {
         ("process", "--force"),
         ("port", "--kill"),
         ("port", "--force"),
+        ("kill-process", "--force"),
+        ("kill-port", "--force"),
+        ("open-changed-files", "--git"),
+        ("open-changed-files", "--workspace-mode"),
+        ("open-changed-files", "--max-files"),
     ];
 
     for (command, flag) in cases {

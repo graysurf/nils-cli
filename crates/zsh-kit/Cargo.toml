@@ -12,6 +12,7 @@ name = "zsh-kit"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 nils-build-info = { version = "1.0.11", path = "../nils-build-info" }

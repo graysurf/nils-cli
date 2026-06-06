@@ -1,4 +1,4 @@
-use crate::{confirm, fzf, git_commit_select, open, util};
+use crate::{confirm, fzf, git_commit_select, open, open_changed_files, util};
 use nils_common::git as common_git;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -298,44 +298,17 @@ fn parse_file_path_from_line(line: &str) -> String {
         .to_string()
 }
 
-fn open_many(open_with: open::OpenWith, repo_root: &Path, files: &[PathBuf]) -> i32 {
+fn open_many(open_with: open::OpenWith, _repo_root: &Path, files: &[PathBuf]) -> i32 {
     match open_with {
         open::OpenWith::Vscode => {
-            if util::cmd_exists("open-changed-files") {
-                let mut cmd = Command::new("open-changed-files");
-                cmd.arg("--list")
-                    .arg("--workspace-mode")
-                    .arg("git")
-                    .arg("--max-files")
-                    .arg(files.len().to_string())
-                    .arg("--");
-                for f in files {
-                    cmd.arg(f);
-                }
-                let status = cmd
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status();
-                return status.ok().and_then(|s| s.code()).unwrap_or(1);
-            }
-
-            if !util::cmd_exists("code") {
-                eprintln!("❌ 'code' not found");
-                return 127;
-            }
-
-            let mut cmd = Command::new("code");
-            cmd.arg("--new-window").arg("--").arg(repo_root);
-            for f in files {
-                cmd.arg(f);
-            }
-            let status = cmd
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status();
-            status.ok().and_then(|s| s.code()).unwrap_or(1)
+            let max_files = files.len().max(1);
+            open_changed_files::open_vscode_files(
+                files.to_vec(),
+                open_changed_files::WorkspaceMode::Git,
+                max_files,
+                false,
+                false,
+            )
         }
         open::OpenWith::Vi => {
             let mut cmd = Command::new("vi");

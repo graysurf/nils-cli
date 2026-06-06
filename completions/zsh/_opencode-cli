@@ -1,0 +1,320 @@
+#compdef opencode-cli
+
+autoload -U is-at-least
+
+_opencode-cli() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_opencode-cli_commands" \
+"*::: :->opencode-cli" \
+&& ret=0
+    case $state in
+    (opencode-cli)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:opencode-cli-command-$line[1]:"
+        case $line[1] in
+            (agent)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_opencode-cli__subcmd__agent_commands" \
+"*::: :->agent" \
+&& ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:opencode-cli-agent-command-$line[1]:"
+        case $line[1] in
+            (prompt)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::prompt:_default' \
+&& ret=0
+;;
+(advice)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::question:_default' \
+&& ret=0
+;;
+(knowledge)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::concept:_default' \
+&& ret=0
+;;
+(commit)
+_arguments "${_arguments_options[@]}" : \
+'-p[Push after committing]' \
+'--push[Push after committing]' \
+'-a[Autostage changes before committing]' \
+'--auto-stage[Autostage changes before committing]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::extra -- Extra prompt text:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_opencode-cli__subcmd__agent__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:opencode-cli-agent-help-command-$line[1]:"
+        case $line[1] in
+            (prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(advice)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(knowledge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(commit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_opencode-cli__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:opencode-cli-help-command-$line[1]:"
+        case $line[1] in
+            (agent)
+_arguments "${_arguments_options[@]}" : \
+":: :_opencode-cli__subcmd__help__subcmd__agent_commands" \
+"*::: :->agent" \
+&& ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:opencode-cli-help-agent-command-$line[1]:"
+        case $line[1] in
+            (prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(advice)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(knowledge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(commit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_opencode-cli_commands] )) ||
+_opencode-cli_commands() {
+    local commands; commands=(
+'agent:Agent command group' \
+'completion:Export shell completion script' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'opencode-cli commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent_commands] )) ||
+_opencode-cli__subcmd__agent_commands() {
+    local commands; commands=(
+'prompt:Run a raw prompt' \
+'advice:Get actionable engineering advice' \
+'knowledge:Get an explanation for a concept' \
+'commit:Run the semantic-commit workflow' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'opencode-cli agent commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__advice_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__advice_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli agent advice commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__commit_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli agent commit commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__help_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__help_commands() {
+    local commands; commands=(
+'prompt:Run a raw prompt' \
+'advice:Get actionable engineering advice' \
+'knowledge:Get an explanation for a concept' \
+'commit:Run the semantic-commit workflow' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'opencode-cli agent help commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__help__subcmd__advice_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__help__subcmd__advice_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli agent help advice commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__help__subcmd__commit_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__help__subcmd__commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli agent help commit commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__help__subcmd__help_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli agent help help commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__help__subcmd__knowledge_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__help__subcmd__knowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli agent help knowledge commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__help__subcmd__prompt_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__help__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli agent help prompt commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__knowledge_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__knowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli agent knowledge commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__agent__subcmd__prompt_commands] )) ||
+_opencode-cli__subcmd__agent__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli agent prompt commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__completion_commands] )) ||
+_opencode-cli__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli completion commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__help_commands] )) ||
+_opencode-cli__subcmd__help_commands() {
+    local commands; commands=(
+'agent:Agent command group' \
+'completion:Export shell completion script' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'opencode-cli help commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__help__subcmd__agent_commands] )) ||
+_opencode-cli__subcmd__help__subcmd__agent_commands() {
+    local commands; commands=(
+'prompt:Run a raw prompt' \
+'advice:Get actionable engineering advice' \
+'knowledge:Get an explanation for a concept' \
+'commit:Run the semantic-commit workflow' \
+    )
+    _describe -t commands 'opencode-cli help agent commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__help__subcmd__agent__subcmd__advice_commands] )) ||
+_opencode-cli__subcmd__help__subcmd__agent__subcmd__advice_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli help agent advice commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__help__subcmd__agent__subcmd__commit_commands] )) ||
+_opencode-cli__subcmd__help__subcmd__agent__subcmd__commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli help agent commit commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__help__subcmd__agent__subcmd__knowledge_commands] )) ||
+_opencode-cli__subcmd__help__subcmd__agent__subcmd__knowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli help agent knowledge commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__help__subcmd__agent__subcmd__prompt_commands] )) ||
+_opencode-cli__subcmd__help__subcmd__agent__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli help agent prompt commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__help__subcmd__completion_commands] )) ||
+_opencode-cli__subcmd__help__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli help completion commands' commands "$@"
+}
+(( $+functions[_opencode-cli__subcmd__help__subcmd__help_commands] )) ||
+_opencode-cli__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'opencode-cli help help commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_opencode-cli" ]; then
+    _opencode-cli "$@"
+else
+    compdef _opencode-cli opencode-cli
+fi

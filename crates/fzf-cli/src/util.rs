@@ -40,6 +40,10 @@ pub fn cmd_exists(cmd: &str) -> bool {
     common_process::cmd_exists(cmd)
 }
 
+pub fn find_in_path(cmd: &str) -> Option<PathBuf> {
+    common_process::find_in_path(cmd)
+}
+
 pub fn run_capture(cmd: &str, args: &[&str]) -> Result<String> {
     let output = run_checked_output(cmd, args)?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())

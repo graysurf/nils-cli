@@ -11,7 +11,7 @@ use nils_common::cli_contract::OutputFormat;
     about = "Bootstrap an operator-supplied Zsh repository at runtime.",
     long_about = "Clone or update an operator-supplied Zsh repository, validate its setup hook, optionally write a ZDOTDIR bootstrap, and dispatch shell-specific setup back to the repository.",
     disable_help_subcommand = true,
-    after_help = "EXAMPLES:\n  zsh-kit setup --repo https://github.com/example/zsh-config.git --dry-run\n  zsh-kit setup --repo git@github.com:example/zsh-config.git --dest ~/.config/zsh --apply\n  zsh-kit setup --repo ./fixtures/zsh --dry-run --format json\n  zsh-kit completion zsh\n\nENVIRONMENT:\n  HOME      Used for the default destination and .zshenv path.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data\n  69  required resource unavailable"
+    after_help = "EXAMPLES:\n  zsh-kit setup --repo https://github.com/example/zsh-config.git --dry-run\n  zsh-kit setup --repo git@github.com:example/zsh-config.git --dest ~/.config/zsh --apply\n  zsh-kit plugin fetch --entry 'zsh-abbr::zsh-abbr.plugin.zsh::git=https://github.com/olets/zsh-abbr.git'\n  zsh-kit plugin status\n  zsh-kit completion zsh\n\nENVIRONMENT:\n  HOME                    Used for default destination and fallback paths.\n  ZSH_PLUGINS_DIR         Default plugin directory for plugin commands.\n  ZDOTDIR                 Fallback root used to derive the plugin directory.\n  ZSH_CACHE_DIR           Default cache directory for plugin timestamp state.\n  PLUGIN_UPDATE_FILE      Default plugin timestamp file.\n  PLUGIN_UPDATE_INTERVAL_DAYS  Default plugin auto-update interval.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data\n  69  required resource unavailable"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -22,6 +22,8 @@ pub struct Cli {
 pub enum Command {
     /// Clone/update a Zsh repository and dispatch its setup hook.
     Setup(SetupArgs),
+    /// Manage zsh-kit plugin fetch/update helpers.
+    Plugin(PluginArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
 }
@@ -84,6 +86,100 @@ pub struct CompletionArgs {
     /// Shell to generate completion script for.
     #[arg(value_enum)]
     pub shell: crate::completion::CompletionShell,
+}
+
+#[derive(Debug, Args)]
+pub struct PluginArgs {
+    #[command(subcommand)]
+    pub command: PluginCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginCommand {
+    /// Ensure one plugins.list entry exists under the plugin directory.
+    Fetch(PluginFetchArgs),
+    /// Fast-forward all git plugins under the plugin directory.
+    Update(PluginUpdateArgs),
+    /// Run update when the timestamp is older than the configured interval.
+    MaybeUpdate(PluginMaybeUpdateArgs),
+    /// Print plugin auto-update status.
+    Status(PluginStatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PluginFetchArgs {
+    /// Raw config/plugins.list entry to fetch.
+    #[arg(long, value_name = "ENTRY")]
+    pub entry: String,
+
+    /// Plugin base directory. Defaults to $ZSH_PLUGINS_DIR or $ZDOTDIR/plugins.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::DirPath)]
+    pub plugins_dir: Option<PathBuf>,
+
+    /// Print intended actions without cloning, deleting, or updating submodules.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Delete an existing plugin directory before cloning.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct PluginUpdateArgs {
+    /// Plugin base directory. Defaults to $ZSH_PLUGINS_DIR or $ZDOTDIR/plugins.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::DirPath)]
+    pub plugins_dir: Option<PathBuf>,
+
+    /// Print intended git pull commands without mutating repositories.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct PluginMaybeUpdateArgs {
+    /// Plugin base directory. Defaults to $ZSH_PLUGINS_DIR or $ZDOTDIR/plugins.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::DirPath)]
+    pub plugins_dir: Option<PathBuf>,
+
+    /// Timestamp file used to track the last auto-update.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub timestamp_file: Option<PathBuf>,
+
+    /// Auto-update interval in whole days.
+    #[arg(long, value_name = "DAYS")]
+    pub interval_days: Option<u64>,
+
+    /// Print intended git pull commands without mutating repositories.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct PluginStatusArgs {
+    /// Timestamp file used to track the last auto-update.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub timestamp_file: Option<PathBuf>,
+
+    /// Auto-update interval in whole days.
+    #[arg(long, value_name = "DAYS")]
+    pub interval_days: Option<u64>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, serde::Serialize)]

@@ -16,13 +16,16 @@ These tools are required for common command paths. Each row is anchored to at le
 
 | Tool | Used By | Requirement Level | Install (brew/linuxbrew) |
 |---|---|---|---|
-| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `codex-cli`, `gemini-cli`, `fzf-cli git-*`, `heuristic-inbox deliver` | Required | `brew install git` |
+| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `codex-cli`, `gemini-cli`, `opencode-cli`, `fzf-cli git-*`, `zsh-kit setup`, `zsh-kit plugin *`, `heuristic-inbox deliver` | Required | `brew install git` |
 | `fzf` | `fzf-cli` interactive commands | Required (for `fzf-cli`) | `brew install fzf` |
 | `grpcurl` | `api-grpc` unary backend (via `api-testing-core::grpc::runner`); overridable with `GRPCURL_BIN` | Required (for `api-grpc call` / suite gRPC cases) | `brew install grpcurl` |
 | `ffmpeg` | `screen-record` on Linux (X11 + Wayland portal capture, audio mux) | Required on Linux | `brew install ffmpeg` |
 | `codex` | `codex-cli auth login` and `codex-cli agent *` flows | Required for `codex-cli` runtime | Install from official Codex distribution |
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
+| `opencode` | `opencode-cli agent *` flows | Required for `opencode-cli` runtime | Install from official OpenCode distribution |
 | `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
+| `security` | `claude-cli prompt-segment` Keychain credential lookup | Required on macOS unless `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` / `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` is supplied | Preinstalled on macOS |
+| `docker` | `docker-tools container *`, `docker-tools run *`, and Docker Compose v2 resolution for `docker-tools compose down` | Required for `docker-tools` Docker-backed commands | `brew install docker` |
 | `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
 | `gh` | `git-cli open *` GitHub helpers, `plan-issue` GitHub I/O, `forge-cli` GitHub backend | Required for GitHub-facing flows | `brew install gh` |
 | `glab` | `forge-cli` GitLab backend and GitLab inbox reads | Required for GitLab-facing `forge-cli` flows | `brew install glab` |
@@ -48,21 +51,21 @@ in `crates/*/src`.
 |---|---|---|
 | `direnv` | Enables `agent-run exec` to activate allowed project `.envrc` / `.env` files; required only when a project env file applies and `--direnv` is not `off` | `brew install direnv` |
 | `file` | MIME-based binary detection in `git-scope` and `git-cli commit context` | Usually preinstalled |
-| `lsof` | Preferred backend for `fzf-cli port` (fallback: `netstat`) | `brew install lsof` |
+| `lsof` | Preferred backend for `fzf-cli port` (fallback: `netstat`); required for `fzf-cli kill-port` | `brew install lsof` |
 | `netstat` | Fallback backend for `fzf-cli port` when `lsof` is missing | Usually preinstalled |
 | `bat` | Syntax-highlighted previews in `fzf-cli file` / `directory` (invoked via fzf preview shell) | `brew install bat` |
 | `vi` | Default editor for `fzf-cli` open / `git-commit` flows (override via `FZF_FILE_OPEN_WITH`) | Usually preinstalled |
-| `code` | VS Code open mode for `fzf-cli` (`--vscode`) and `git-commit --vscode` | macOS: `brew install --cask visual-studio-code` |
+| `code` | VS Code open mode for `fzf-cli` (`--vscode`), `git-commit --vscode`, and `open-changed-files` | macOS: `brew install --cask visual-studio-code` |
 | `pbcopy` / `wl-copy` / `xclip` / `xsel` | Clipboard integration via `nils-common::clipboard` (used by `git-cli commit context`, `fzf-cli` block preview) | Linux: `brew install wl-clipboard xclip xsel` |
 | `cwebp` | WebP encode path for `screen-record` macOS WebP screenshot fallback | `brew install webp` |
 | `pactl` | Linux audio source discovery for `screen-record --audio ...` | `brew install pulseaudio` |
 | `xdg-desktop-portal` + backend + PipeWire | Wayland portal capture path (`screen-record --portal`) | Prefer distro packages |
 | `open` | macOS `open` invocation for `screen-record` permission prompts | Preinstalled on macOS |
-| `open-changed-files` | Optional helper used by `fzf-cli git-commit` to launch changed files | Project-specific optional tool |
 | `hs` (Hammerspoon CLI) | Preferred AX backend path for `macos-agent ax *` (fallback to JXA when unavailable) | `brew install --cask hammerspoon` |
 | `cliclick` | Probed by `macos-agent` preflight as an alternate input backend | `brew install cliclick` |
 | `im-select` | Required by `macos-agent input-source *` and macOS real E2E keyboard/input-source setup | `brew install im-select` |
 | `openvpn` | Optional `forge-cli inbox --gitlab-vpn-check openvpn` readiness dependency probe; `forge-cli` never starts or stops VPN | `brew install openvpn` |
+| `docker-compose` | Fallback backend for `docker-tools compose down` when Docker Compose v2 is unavailable | `brew install docker-compose` |
 
 ## 3. Development and Validation Toolchain
 

@@ -26,7 +26,7 @@ Completion obligations for those binaries are tracked in
 | Forge automation | `forge-cli` | Drive PR/MR + Issue lifecycle and repository label catalog maintenance on GitHub (via `gh`) or GitLab (via `glab`) through a single provider-neutral surface; covers create / view / edit / comment / ready / merge / close, label list / audit / ensure, CI wait-checks, and the `pr deliver` macro. |
 | Agent policy and evidence | `agent-runtime`, `agent-docs`, `agent-memory`, `agent-out`, `agent-scope-lock`, `agent-run`, `test-first-evidence`, `web-evidence`, `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `review-specialists`, `skill-usage` | Render/install/audit runtime-kit surfaces, resolve agent policy docs, manage local agent memory stores, run project commands through explicit env handling, allocate artifact paths, enforce edit scope, inspect repo retrospectives, merge specialist review evidence, or persist deterministic workflow evidence. |
 | Planning and delivery | `plan-tooling`, `plan-issue`, `plan-issue-local`, `semantic-commit` | Validate/split implementation plans, orchestrate issue delivery, rehearse local plan flows, or run validated commit workflows. |
-| Provider lanes | `codex-cli`, `gemini-cli` | Run provider-specific diagnostics, auth checks, and workflow adapters. |
+| Provider lanes | `codex-cli`, `gemini-cli`, `opencode-cli` | Run provider-specific diagnostics, auth checks, and workflow adapters. |
 | Markdown rendering | `md-render` | Render `.md.tera` templates from JSON view data through the shared `nils-markdown` engine. |
 | Desktop, media, and local utilities | `macos-agent`, `screen-record`, `image-processing`, `fzf-cli`, `memo`, `zsh-kit` | Automate local desktop tasks, capture media, convert images, use interactive shell helpers, record/search local memos, or bootstrap an operator-supplied Zsh repository at runtime. |
 | Development-only/internal | `cli-template` | Validate packaging and new-crate patterns; excluded from user-facing completion obligations. |
@@ -101,6 +101,8 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
   with adapters over `nils-common::provider_runtime`.
 - [crates/gemini-cli](crates/gemini-cli): Provider-specific CLI lane for Gemini workflows, with adapters over
   `nils-common::provider_runtime`.
+- [crates/opencode-cli](crates/opencode-cli): Provider-specific CLI lane for OpenCode prompt and semantic-commit helpers migrated from
+  zsh-kit.
 - [crates/semantic-commit](crates/semantic-commit): Helper CLI for staged context, Semantic Commit validation, commit amend, and cleanup commit workflows.
 - [crates/plan-tooling](crates/plan-tooling): Plan Format v1 tooling CLI (`to-json`, `validate`, `batches`, `artifact-audit`,
   `split-prs`, `scaffold`, `completion`), with bundle validation, advisory durable-artifact classification, deterministic/auto grouping

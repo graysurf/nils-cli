@@ -1,0 +1,27 @@
+[package]
+name = "nils-opencode-cli"
+version = "1.0.11"
+edition.workspace = true
+license.workspace = true
+
+description = "CLI crate for nils-opencode-cli in the nils-cli workspace."
+repository = "https://github.com/sympoies/nils-cli"
+
+[lib]
+name = "opencode_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "opencode-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+clap_complete = { workspace = true }
+nils-build-info = { version = "1.0.11", path = "../nils-build-info" }
+nils-common = { version = "1.0.11", path = "../nils-common", package = "nils-common" }
+
+[dev-dependencies]
+nils-test-support = { version = "1.0.11", path = "../nils-test-support" }
+pretty_assertions = { workspace = true }
+tempfile = "3"
