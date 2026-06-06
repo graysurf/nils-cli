@@ -2245,6 +2245,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-opencode-cli"
+version = "1.0.10"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "nils-build-info",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-plan-archive"
 version = "1.0.11"
 dependencies = [

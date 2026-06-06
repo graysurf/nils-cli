@@ -16,12 +16,13 @@ These tools are required for common command paths. Each row is anchored to at le
 
 | Tool | Used By | Requirement Level | Install (brew/linuxbrew) |
 |---|---|---|---|
-| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `codex-cli`, `gemini-cli`, `fzf-cli git-*`, `zsh-kit setup`, `zsh-kit plugin *`, `heuristic-inbox deliver` | Required | `brew install git` |
+| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `codex-cli`, `gemini-cli`, `opencode-cli`, `fzf-cli git-*`, `zsh-kit setup`, `zsh-kit plugin *`, `heuristic-inbox deliver` | Required | `brew install git` |
 | `fzf` | `fzf-cli` interactive commands | Required (for `fzf-cli`) | `brew install fzf` |
 | `grpcurl` | `api-grpc` unary backend (via `api-testing-core::grpc::runner`); overridable with `GRPCURL_BIN` | Required (for `api-grpc call` / suite gRPC cases) | `brew install grpcurl` |
 | `ffmpeg` | `screen-record` on Linux (X11 + Wayland portal capture, audio mux) | Required on Linux | `brew install ffmpeg` |
 | `codex` | `codex-cli auth login` and `codex-cli agent *` flows | Required for `codex-cli` runtime | Install from official Codex distribution |
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
+| `opencode` | `opencode-cli agent *` flows | Required for `opencode-cli` runtime | Install from official OpenCode distribution |
 | `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
 | `security` | `claude-cli prompt-segment` Keychain credential lookup | Required on macOS unless `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` / `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` is supplied | Preinstalled on macOS |
 | `docker` | `docker-tools container *`, `docker-tools run *`, and Docker Compose v2 resolution for `docker-tools compose down` | Required for `docker-tools` Docker-backed commands | `brew install docker` |

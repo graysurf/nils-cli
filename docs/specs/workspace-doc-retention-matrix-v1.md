@@ -99,6 +99,7 @@ Top-level crate READMEs (one per workspace member, 25 total):
 - `crates/codex-cli/README.md`
 - `crates/fzf-cli/README.md`
 - `crates/gemini-cli/README.md`
+- `crates/opencode-cli/README.md`
 - `crates/git-cli/README.md`
 - `crates/git-lock/README.md`
 - `crates/git-scope/README.md`
@@ -127,6 +128,7 @@ Crate `docs/README.md` index files (one per workspace member, 25 total):
 - `crates/codex-cli/docs/README.md`
 - `crates/fzf-cli/docs/README.md`
 - `crates/gemini-cli/docs/README.md`
+- `crates/opencode-cli/docs/README.md`
 - `crates/git-cli/docs/README.md`
 - `crates/git-lock/docs/README.md`
 - `crates/git-scope/docs/README.md`
