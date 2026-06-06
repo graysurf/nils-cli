@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `dde5f5485f9b298fd3cb4edc3a84f34164de8ff07830ba804660891637d7df8e`
+- Cargo.lock SHA256: `3eb1ad29ed615d204a552473f1810817eb081a98043474463defa1a5bacf8069`
 - Third-party crates (`source != null`): 460
 - Workspace crates (`source == null`, excluded below): 39
 
