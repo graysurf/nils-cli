@@ -1969,7 +1969,7 @@ version = "1.0.11"
 
 [[package]]
 name = "nils-claude-cli"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "nils-docker-tools"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2246,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "nils-opencode-cli"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "clap",
  "clap_complete",
