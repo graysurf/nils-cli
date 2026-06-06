@@ -131,7 +131,7 @@ fn prompt_segment_is_enabled_returns_one_when_credentials_are_missing() {
 }
 
 #[test]
-fn prompt_segment_renders_fresh_legacy_cache_without_credentials() {
+fn prompt_segment_renders_fresh_cached_usage_without_credentials() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_cache(tmp.path(), &usage_json(23.2, 44.1));
 
