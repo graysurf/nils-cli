@@ -17,6 +17,12 @@ versioning.
   dual namespace and no contract alias; consumers must read the
   `plan-issue.*` schema. The `plan-issue` and `plan-issue-local` binaries are
   unchanged. Part of the workspace 1.0.0 naming-convention milestone.
+- `tracking run update` can now capture richer review evidence through
+  repeatable `--review-lens`, `--review-outcome-comment`, and
+  `--review-findings-file`. `tracking checkpoint --post review` carries that
+  context into the review payload and visible comment, and visible lint now
+  rejects ambiguous approve-only review comments with no lenses, outcome
+  evidence, or finding rows.
 
 ### Added (Plan-Issue vNext)
 

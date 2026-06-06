@@ -573,6 +573,131 @@ fn tracking_checkpoint_blocks_review_role_without_decision() {
 }
 
 #[test]
+fn tracking_checkpoint_dry_run_renders_rich_review_evidence() {
+    let fixture = write_fixture(&[
+        (
+            "source",
+            json!({"path": "p", "commit": "c"}),
+            "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:00Z",
+        ),
+        (
+            "plan",
+            json!({"path": "p", "commit": "c"}),
+            "## Plan Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:01Z",
+        ),
+    ]);
+    let tmp = TempDir::new().expect("tmp");
+    let rs_path = tmp.path().join("run-state.json");
+    let rendered_dir = tmp.path().join("rendered-out");
+    let body = json!({
+        "schema": "plan-issue.execution-run.v1",
+        "run_id": "run-1",
+        "repo": "owner/repo",
+        "issue": 123,
+        "profile": "tracking",
+        "phase": "ready_for_close",
+        "created_at": "2026-05-26T00:00:00Z",
+        "updated_at": "2026-05-26T01:00:00Z",
+        "review": {
+            "decision": "approve",
+            "lenses": ["testing", "maintainability"],
+            "evidence": "https://example.test/review",
+            "findings": [
+                {
+                    "id": "F1",
+                    "severity": "minor",
+                    "disposition": "fixed",
+                    "summary": "Review context renders visibly"
+                }
+            ]
+        }
+    });
+    fs::write(&rs_path, body.to_string()).expect("run-state");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "checkpoint",
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--post",
+        "review",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+        "--expect-visible",
+        "--rendered-out",
+        rendered_dir.to_str().expect("rendered out"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let body = fs::read_to_string(rendered_dir.join("review-comment.md")).expect("rendered review");
+    assert!(body.contains("- Decision: approve"));
+    assert!(body.contains("- Lenses: testing, maintainability"));
+    assert!(body.contains("- Outcome comment: https://example.test/review"));
+    assert!(body.contains("| F1 | minor | fixed | Review context renders visibly |"));
+}
+
+#[test]
+fn tracking_checkpoint_dry_run_ignores_prior_review_disposition_hint() {
+    let fixture = write_fixture(&[
+        (
+            "source",
+            json!({"path": "p", "commit": "c"}),
+            "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:00Z",
+        ),
+        (
+            "plan",
+            json!({"path": "p", "commit": "c"}),
+            "## Plan Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:01Z",
+        ),
+    ]);
+    let tmp = TempDir::new().expect("tmp");
+    let rs_path = tmp.path().join("run-state.json");
+    let rendered_dir = tmp.path().join("rendered-out");
+    let body = json!({
+        "schema": "plan-issue.execution-run.v1",
+        "run_id": "run-1",
+        "repo": "owner/repo",
+        "issue": 123,
+        "profile": "tracking",
+        "phase": "ready_for_close",
+        "created_at": "2026-05-26T00:00:00Z",
+        "updated_at": "2026-05-26T01:00:00Z",
+        "review": {
+            "decision": "approve",
+            "lenses": ["testing"],
+            "findings_disposition": ["prior finding fixed"]
+        }
+    });
+    fs::write(&rs_path, body.to_string()).expect("run-state");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "checkpoint",
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--post",
+        "review",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+        "--expect-visible",
+        "--rendered-out",
+        rendered_dir.to_str().expect("rendered out"),
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let body = fs::read_to_string(rendered_dir.join("review-comment.md")).expect("rendered review");
+    assert!(body.contains("- Decision: approve"));
+    assert!(body.contains("- Lenses: testing"));
+    assert!(!body.contains("| prior finding fixed |"));
+}
+
+#[test]
 fn tracking_checkpoint_dry_run_writes_rendered_bodies_under_run_dir() {
     let fixture = write_fixture(&[
         (

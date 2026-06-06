@@ -181,6 +181,72 @@ fn tracking_run_update_changes_phase_and_appends_event() {
 }
 
 #[test]
+fn tracking_run_update_records_rich_review_evidence() {
+    let tmp = TempDir::new().expect("tmp");
+    let run_state_path = tmp.path().join("run-state.json");
+    let findings_path = tmp.path().join("review-findings.json");
+    fs::write(
+        &findings_path,
+        r#"[{"id":"F1","severity":"minor","disposition":"fixed","summary":"Review context renders visibly"}]"#,
+    )
+    .expect("findings");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "run",
+        "init",
+        "--provider-repo",
+        "owner/repo",
+        "--issue",
+        "123",
+        "--now",
+        "2026-05-26T00:00:00Z",
+        "--run-id",
+        "run-review",
+        "--out",
+        run_state_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "init stderr: {}", out.stderr);
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "run",
+        "update",
+        "--run-state",
+        run_state_path.to_str().expect("path"),
+        "--review-decision",
+        "approve",
+        "--review-lens",
+        "testing",
+        "--review-lens",
+        "maintainability",
+        "--review-outcome-comment",
+        "https://example.test/review",
+        "--review-findings-file",
+        findings_path.to_str().expect("findings"),
+        "--now",
+        "2026-05-26T00:02:00Z",
+    ]);
+    assert_eq!(out.code, 0, "update stderr: {}", out.stderr);
+
+    let run = run_state::read_run_state(&run_state_path).expect("read");
+    let review = run.review.expect("review summary");
+    assert_eq!(review.decision, "approve");
+    assert_eq!(review.lenses, vec!["testing", "maintainability"]);
+    assert_eq!(
+        review.evidence.as_deref(),
+        Some("https://example.test/review")
+    );
+    assert_eq!(review.findings.len(), 1);
+    assert_eq!(review.findings[0].id, "F1");
+    assert_eq!(review.findings[0].disposition, "fixed");
+}
+
+#[test]
 fn tracking_run_update_rejects_invalid_run_state() {
     let tmp = TempDir::new().expect("tmp");
     let run_state_path = tmp.path().join("run-state.json");

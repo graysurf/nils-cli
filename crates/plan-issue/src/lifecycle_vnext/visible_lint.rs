@@ -42,6 +42,7 @@ pub mod codes {
 
     // Review.
     pub const REVIEW_MISSING_DECISION: &str = "review-missing-decision";
+    pub const REVIEW_MISSING_CONTEXT: &str = "review-missing-context";
     pub const REVIEW_MISSING_DISPOSITION: &str = "review-missing-disposition";
 
     // Closeout.
@@ -243,6 +244,16 @@ fn check_review(body: &str, hints: LintHints, report: &mut VisibleReport) {
             "review body must contain a `- Decision:` line with approve|request-changes|comments-only",
         ));
     }
+    if decision_present
+        && !body_contains_review_context(body)
+        && !body_contains_review_disposition_row(body)
+    {
+        report.push(VisibleFinding::new(
+            PayloadRole::Review,
+            codes::REVIEW_MISSING_CONTEXT,
+            "review body must include lenses, outcome evidence, finding rows, or an explicit review context marker",
+        ));
+    }
     if hints.review_has_findings && !body_contains_review_disposition_row(body) {
         report.push(VisibleFinding::new(
             PayloadRole::Review,
@@ -369,6 +380,21 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
             return false;
         }
         dispositions.iter().any(|d| trimmed.contains(d))
+    })
+}
+
+fn body_contains_review_context(body: &str) -> bool {
+    ["- Lenses:", "- Outcome comment:"]
+        .iter()
+        .any(|prefix| body_contains_non_empty_line_value(body, prefix))
+}
+
+fn body_contains_non_empty_line_value(body: &str, prefix: &str) -> bool {
+    body.lines().any(|line| {
+        line.trim()
+            .strip_prefix(prefix)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
     })
 }
 

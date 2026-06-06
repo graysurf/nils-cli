@@ -2422,16 +2422,40 @@ fn run_tracking_run_update(
         run.validation = Some(summary);
         changes.push("validation");
     }
-    if let Some(decision) = &args.review_decision {
-        let mut review =
-            run.review
-                .clone()
-                .unwrap_or_else(|| crate::tracking::run_state::ReviewSummary {
-                    decision: decision.clone(),
-                    findings_disposition: Vec::new(),
-                    evidence: None,
-                });
-        review.decision = decision.clone();
+    if args.review_decision.is_some()
+        || !args.review_lens.is_empty()
+        || args.review_outcome_comment.is_some()
+        || args.review_findings_file.is_some()
+    {
+        let mut review = if let Some(existing) = run.review.clone() {
+            existing
+        } else {
+            let decision = args.review_decision.clone().ok_or_else(|| {
+                CommandError::usage(
+                    "tracking-run-update-review-decision-required",
+                    "record --review-decision before adding review lenses, findings, or outcome evidence",
+                )
+            })?;
+            crate::tracking::run_state::ReviewSummary {
+                decision,
+                lenses: Vec::new(),
+                findings: Vec::new(),
+                findings_disposition: Vec::new(),
+                evidence: None,
+            }
+        };
+        if let Some(decision) = &args.review_decision {
+            review.decision = decision.clone();
+        }
+        if !args.review_lens.is_empty() {
+            review.lenses = args.review_lens.clone();
+        }
+        if let Some(outcome) = &args.review_outcome_comment {
+            review.evidence = Some(outcome.clone());
+        }
+        if let Some(findings_file) = &args.review_findings_file {
+            review.findings = read_review_findings_file(findings_file)?;
+        }
         run.review = Some(review);
         changes.push("review");
     }
@@ -2467,6 +2491,37 @@ fn run_tracking_run_update(
         "changed": changes,
         "updated_at": run.updated_at,
     }))
+}
+
+fn read_review_findings_file(
+    path: &Path,
+) -> Result<Vec<crate::tracking::run_state::ReviewFindingSummary>, CommandError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        CommandError::runtime(
+            "tracking-run-update-review-findings-read-failed",
+            err.to_string(),
+        )
+    })?;
+    let findings: Vec<crate::tracking::run_state::ReviewFindingSummary> =
+        serde_json::from_str(&raw).map_err(|err| {
+            CommandError::usage(
+                "tracking-run-update-review-findings-parse-failed",
+                err.to_string(),
+            )
+        })?;
+    for finding in &findings {
+        if finding.id.trim().is_empty()
+            || finding.severity.trim().is_empty()
+            || finding.disposition.trim().is_empty()
+            || finding.summary.trim().is_empty()
+        {
+            return Err(CommandError::usage(
+                "tracking-run-update-review-findings-empty-field",
+                "review finding rows require non-empty id, severity, disposition, and summary",
+            ));
+        }
+    }
+    Ok(findings)
 }
 
 fn run_tracking_checkpoint(
@@ -3387,10 +3442,10 @@ fn synthesize_validation_payload(run: &crate::tracking::run_state::ExecutionRun)
 fn synthesize_review_payload(run: &crate::tracking::run_state::ExecutionRun) -> Option<Value> {
     let review = run.review.as_ref()?;
     Some(json!({
-        "decision": review.decision,
-        "lenses": [],
-        "findings": [],
-        "outcome_comment_url": review.evidence,
+        "decision": review.decision.clone(),
+        "lenses": review.lenses.clone(),
+        "findings": review.findings.clone(),
+        "outcome_comment_url": review.evidence.clone(),
     }))
 }
 
@@ -3407,6 +3462,13 @@ fn checkpoint_lint_hints(
             crate::tracking::run_state::RunPhase::ReadyForClose
                 | crate::tracking::run_state::RunPhase::Closed
         );
+    }
+    if matches!(role, PayloadRole::Review) {
+        hints.review_has_findings = run
+            .review
+            .as_ref()
+            .map(|review| !review.findings.is_empty())
+            .unwrap_or(false);
     }
     hints
 }
