@@ -3467,7 +3467,7 @@ fn checkpoint_lint_hints(
         hints.review_has_findings = run
             .review
             .as_ref()
-            .map(|review| !review.findings.is_empty() || !review.findings_disposition.is_empty())
+            .map(|review| !review.findings.is_empty())
             .unwrap_or(false);
     }
     hints
