@@ -15,6 +15,7 @@ nils-memo
 nils-screen-record
 nils-api-testing-core
 nils-cli-template
+nils-claude-cli
 nils-codex-cli
 nils-gemini-cli
 nils-fzf-cli

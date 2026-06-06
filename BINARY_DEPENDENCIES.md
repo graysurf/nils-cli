@@ -23,6 +23,7 @@ These tools are required for common command paths. Each row is anchored to at le
 | `codex` | `codex-cli auth login` and `codex-cli agent *` flows | Required for `codex-cli` runtime | Install from official Codex distribution |
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
 | `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
+| `security` | `claude-cli prompt-segment` Keychain credential lookup | Required on macOS unless `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` / `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` is supplied | Preinstalled on macOS |
 | `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
 | `gh` | `git-cli open *` GitHub helpers, `plan-issue` GitHub I/O, `forge-cli` GitHub backend | Required for GitHub-facing flows | `brew install gh` |
 | `glab` | `forge-cli` GitLab backend and GitLab inbox reads | Required for GitLab-facing `forge-cli` flows | `brew install glab` |

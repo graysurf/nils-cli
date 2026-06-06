@@ -9,6 +9,7 @@ members = [
   "crates/agent-runtime",
   "crates/agent-memory",
   "crates/memo",
+  "crates/claude-cli",
   "crates/codex-cli",
   "crates/fzf-cli",
   "crates/git-scope", "crates/git-summary", "crates/git-lock", "crates/git-cli",

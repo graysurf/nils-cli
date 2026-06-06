@@ -1968,6 +1968,24 @@ name = "nils-build-info"
 version = "1.0.11"
 
 [[package]]
+name = "nils-claude-cli"
+version = "1.0.10"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "nils-build-info",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-cli-template"
 version = "1.0.11"
 dependencies = [
