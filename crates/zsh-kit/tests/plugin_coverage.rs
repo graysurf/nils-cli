@@ -530,3 +530,195 @@ fn fetch_invalid_entry_text_format_writes_error_to_stderr() {
         output.stderr_text()
     );
 }
+
+// ---- timestamp / interval resolution ----
+
+#[test]
+fn timestamp_file_resolves_from_plugin_update_file_env() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ts = temp.path().join("explicit.timestamp");
+
+    let output = run_plugin(
+        &["plugin", "status", "--format", "json"],
+        temp.path(),
+        &[("PLUGIN_UPDATE_FILE", &ts.to_string_lossy())],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        json(&output)["data"]["timestamp_file"].as_str().unwrap(),
+        ts.to_string_lossy()
+    );
+}
+
+#[test]
+fn timestamp_file_falls_back_to_home_cache_dir() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    // No timestamp env at all -> HOME/.cache/zsh/plugin.timestamp.
+    let output = run_plugin(&["plugin", "status", "--format", "json"], temp.path(), &[]);
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        json(&output)["data"]["timestamp_file"].as_str().unwrap(),
+        temp.path()
+            .join(".cache/zsh/plugin.timestamp")
+            .to_string_lossy()
+    );
+}
+
+#[test]
+fn timestamp_file_is_required_without_env_or_home() {
+    let options = CmdOptions::new().with_env_remove_many(&[
+        "HOME",
+        "PLUGIN_UPDATE_FILE",
+        "ZSH_CACHE_DIR",
+        "ZDOTDIR",
+    ]);
+    let output = run_resolved(
+        "zsh-kit",
+        &["plugin", "status", "--format", "json"],
+        &options,
+    );
+
+    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+    assert_eq!(json(&output)["error"]["code"], "timestamp-file-not-set");
+}
+
+#[test]
+fn invalid_interval_env_is_rejected() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ts = temp.path().join("plugin.timestamp");
+
+    let output = run_plugin(
+        &[
+            "plugin",
+            "status",
+            "--timestamp-file",
+            &ts.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+        temp.path(),
+        &[("PLUGIN_UPDATE_INTERVAL_DAYS", "not-a-number")],
+    );
+
+    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+    assert_eq!(json(&output)["error"]["code"], "invalid-interval-days");
+}
+
+#[test]
+fn plugins_dir_tilde_is_expanded_against_home() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let output = run_plugin(
+        &[
+            "plugin",
+            "update",
+            "--plugins-dir",
+            "~/plugins",
+            "--format",
+            "json",
+        ],
+        temp.path(),
+        &[],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        json(&output)["data"]["plugins_dir"].as_str().unwrap(),
+        temp.path().join("plugins").to_string_lossy()
+    );
+}
+
+#[test]
+fn status_uses_real_clock_when_no_epoch_override() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ts = temp.path().join("plugin.timestamp");
+    // A far-past timestamp; with the real clock this is well past any interval.
+    fs::write(&ts, "1700000000\n").expect("timestamp");
+
+    // No ZSH_KIT_PLUGIN_NOW_EPOCH -> exercises the SystemTime::now path.
+    let output = run_plugin(
+        &[
+            "plugin",
+            "status",
+            "--timestamp-file",
+            &ts.to_string_lossy(),
+            "--interval-days",
+            "7",
+            "--format",
+            "json",
+        ],
+        temp.path(),
+        &[],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(json(&output)["data"]["update_due"], true);
+}
+
+// ---- fetch failure / force re-clone ----
+
+#[test]
+fn fetch_reports_clone_failure_for_unreachable_source() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let plugins_dir = temp.path().join("plugins");
+    let missing = temp.path().join("no-such-repo.git");
+
+    let output = run_plugin(
+        &[
+            "plugin",
+            "fetch",
+            "--entry",
+            &format!("demo::git={}", missing.to_string_lossy()),
+            "--plugins-dir",
+            &plugins_dir.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+        temp.path(),
+        &[],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    assert_eq!(json(&output)["ok"], false);
+    assert_eq!(json(&output)["error"]["code"], "git-command-failed");
+    assert!(!plugins_dir.join("demo").exists());
+}
+
+#[test]
+fn fetch_force_reclones_over_existing_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("source");
+    fixture_plugin_repo(&source);
+    let plugins_dir = temp.path().join("plugins");
+    // Pre-existing stale (non-git) directory that --force must remove.
+    fs::create_dir_all(plugins_dir.join("demo")).expect("stale dir");
+    fs::write(plugins_dir.join("demo/stale.txt"), "stale\n").expect("stale file");
+
+    let output = run_plugin(
+        &[
+            "plugin",
+            "fetch",
+            "--entry",
+            &format!("demo::git={}", source.to_string_lossy()),
+            "--plugins-dir",
+            &plugins_dir.to_string_lossy(),
+            "--force",
+            "--format",
+            "json",
+        ],
+        temp.path(),
+        &[],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert!(
+        plugins_dir.join("demo/.git").is_dir(),
+        "should re-clone a real repo"
+    );
+    assert!(
+        !plugins_dir.join("demo/stale.txt").exists(),
+        "force must remove the stale directory before cloning"
+    );
+}
