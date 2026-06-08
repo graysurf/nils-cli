@@ -1,25 +1,28 @@
 //! `activity` command group.
 //!
-//! The command group is provider-shaped from the start: GitHub is the v1
-//! implementation target, while GitLab and Local return explicit
-//! `provider_unsupported` errors until their backend mappings exist.
+//! Personal activity commands are GitHub-only in v1. The repo-scoped `feed`
+//! command has explicit GitHub and GitLab mappings and keeps provider-specific
+//! event vocabulary in `provider_event_type` and `details`.
 
 use std::ffi::OsString;
 
+use chrono::{DateTime, NaiveDate, Utc};
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, ProcessRunner};
 use crate::cli::{
-    ActivityCommand, ActivityCommitsArgs, ActivityEventsArgs, ActivitySummaryArgs, BINARY,
-    GlobalFlags,
+    ActivityCommand, ActivityCommitsArgs, ActivityEventsArgs, ActivityFeedArgs,
+    ActivitySummaryArgs, BINARY, GlobalFlags,
 };
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
+use crate::ops::gitlab_api;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 
 const COMMITS_SCHEMA: &str = "activity.commits";
 const EVENTS_SCHEMA: &str = "activity.events";
+const FEED_SCHEMA: &str = "activity.feed";
 const SUMMARY_SCHEMA: &str = "activity.summary";
 const SCHEMA_VERSION: u32 = 1;
 const GITHUB_PAGE_LIMIT: u32 = 100;
@@ -98,6 +101,39 @@ pub struct ActivityEvent {
     pub url: Option<String>,
 }
 
+/// Normalized payload for `cli.forge-cli.activity.feed.v1`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ActivityFeedPayload {
+    pub provider: &'static str,
+    pub host: String,
+    pub repo: String,
+    pub since: Option<String>,
+    pub limit: u32,
+    pub item_count: usize,
+    pub limited: bool,
+    pub items: Vec<ActivityFeedItem>,
+}
+
+/// One repository/project-scoped activity row.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ActivityFeedItem {
+    pub id: String,
+    pub external_id: String,
+    pub provider_event_type: Option<String>,
+    pub kind: String,
+    pub action: String,
+    pub repo: String,
+    pub target_kind: Option<String>,
+    pub target_ref: Option<String>,
+    pub target_iid: Option<u64>,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub actor: Option<String>,
+    pub occurred_at: String,
+    pub summary: Option<String>,
+    pub details: Option<serde_json::Value>,
+}
+
 /// Normalized payload for `cli.forge-cli.activity.summary.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ActivitySummaryPayload {
@@ -140,25 +176,46 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         global.provider_hint(),
         &global.remote,
         global.repo.as_deref(),
-        remote_url_lookup,
+        &remote_url_lookup,
     )?;
     match ctx.provider {
-        Provider::GitHub => run_github(runner, global, &ctx, command, format),
-        Provider::GitLab | Provider::Local => Err(provider_unsupported(&ctx, &command)),
+        Provider::GitHub => run_github(runner, global, &ctx, command, format, &remote_url_lookup),
+        Provider::GitLab => run_gitlab(runner, global, &ctx, command, format, &remote_url_lookup),
+        Provider::Local => Err(provider_unsupported(&ctx, &command)),
     }
 }
 
-fn run_github<R: BackendRunner>(
+fn run_github<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     runner: &R,
     global: &GlobalFlags,
     ctx: &ProviderContext,
     command: ActivityCommand,
     format: OutputFormat,
+    remote_url_lookup: &F,
 ) -> Result<i32, ForgeError> {
     match command {
         ActivityCommand::Commits(args) => run_github_commits(runner, global, ctx, args, format),
         ActivityCommand::Events(args) => run_github_events(runner, global, ctx, args, format),
+        ActivityCommand::Feed(args) => {
+            run_github_feed(runner, global, ctx, args, format, remote_url_lookup)
+        }
         ActivityCommand::Summary(args) => run_github_summary(runner, global, ctx, args, format),
+    }
+}
+
+fn run_gitlab<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    ctx: &ProviderContext,
+    command: ActivityCommand,
+    format: OutputFormat,
+    remote_url_lookup: &F,
+) -> Result<i32, ForgeError> {
+    match command {
+        ActivityCommand::Feed(args) => {
+            run_gitlab_feed(runner, global, ctx, args, format, remote_url_lookup)
+        }
+        _ => Err(provider_unsupported(ctx, &command)),
     }
 }
 
@@ -229,6 +286,70 @@ fn run_github_events<R: BackendRunner>(
         payload,
         format,
         render_events_text,
+    ))
+}
+
+fn run_github_feed<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    ctx: &ProviderContext,
+    args: ActivityFeedArgs,
+    format: OutputFormat,
+    remote_url_lookup: &F,
+) -> Result<i32, ForgeError> {
+    let limit = limit_for_provider(args.limit);
+    validate_feed_since(args.since.as_deref())?;
+    let repo = resolve_repo_slug(ctx, &global.remote, remote_url_lookup)?;
+    let calls = build_github_feed_calls(ctx, &repo, args.since.as_deref(), limit);
+    if global.dry_run {
+        return Ok(emit_activity_dry_run(
+            schema_ok(FEED_SCHEMA),
+            ctx,
+            calls,
+            format,
+        ));
+    }
+
+    let commits = runner.run(&calls[0])?;
+    let repo_activity = runner.run(&calls[1])?;
+    let payload = parse_github_feed_output(&commits, &repo_activity, repo, args.since, limit, ctx)?;
+    Ok(emit_success(
+        schema_ok(FEED_SCHEMA),
+        payload,
+        format,
+        render_feed_text,
+    ))
+}
+
+fn run_gitlab_feed<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    ctx: &ProviderContext,
+    args: ActivityFeedArgs,
+    format: OutputFormat,
+    remote_url_lookup: &F,
+) -> Result<i32, ForgeError> {
+    let limit = limit_for_provider(args.limit);
+    validate_feed_since(args.since.as_deref())?;
+    let repo = resolve_repo_slug(ctx, &global.remote, remote_url_lookup)?;
+    let calls = build_gitlab_feed_calls(ctx, &repo, args.since.as_deref(), limit);
+    if global.dry_run {
+        return Ok(emit_activity_dry_run(
+            schema_ok(FEED_SCHEMA),
+            ctx,
+            calls,
+            format,
+        ));
+    }
+
+    let commits = runner.run(&calls[0])?;
+    let events = runner.run(&calls[1])?;
+    let payload = parse_gitlab_feed_output(&commits, &events, repo, args.since, limit, ctx)?;
+    Ok(emit_success(
+        schema_ok(FEED_SCHEMA),
+        payload,
+        format,
+        render_feed_text,
     ))
 }
 
@@ -328,6 +449,81 @@ fn build_github_events_call(
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
+fn build_github_feed_calls(
+    ctx: &ProviderContext,
+    repo: &str,
+    since: Option<&str>,
+    limit: u32,
+) -> Vec<BackendCall> {
+    let mut commits = vec![
+        OsString::from("api"),
+        OsString::from(format!("repos/{repo}/commits")),
+    ];
+    push_github_hostname(ctx, &mut commits);
+    commits.extend([
+        OsString::from("--method"),
+        OsString::from("GET"),
+        OsString::from("-f"),
+        OsString::from(format!("per_page={limit}")),
+    ]);
+    if let Some(since) = since.filter(|s| !s.trim().is_empty()) {
+        commits.push(OsString::from("-f"));
+        commits.push(OsString::from(format!("since={}", since.trim())));
+    }
+
+    let mut repo_activity = vec![
+        OsString::from("api"),
+        OsString::from(format!("repos/{repo}/activity")),
+    ];
+    push_github_hostname(ctx, &mut repo_activity);
+    repo_activity.extend([
+        OsString::from("--method"),
+        OsString::from("GET"),
+        OsString::from("-f"),
+        OsString::from(format!("per_page={limit}")),
+        OsString::from("-f"),
+        OsString::from(format!(
+            "time_period={}",
+            if since.is_some() { "year" } else { "quarter" }
+        )),
+    ]);
+
+    vec![
+        BackendCall::new(BackendProgram::Gh, commits),
+        BackendCall::new(BackendProgram::Gh, repo_activity),
+    ]
+}
+
+fn build_gitlab_feed_calls(
+    ctx: &ProviderContext,
+    repo: &str,
+    since: Option<&str>,
+    limit: u32,
+) -> Vec<BackendCall> {
+    let project = gitlab_api::encode_project_path(repo);
+    let since_query = since
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!("&since={}", gitlab_api::encode_query_value(s.trim())))
+        .unwrap_or_default();
+    let events_after = since
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let date = s.trim().split('T').next().unwrap_or(s.trim());
+            format!("&after={}", gitlab_api::encode_query_value(date))
+        })
+        .unwrap_or_default();
+    vec![
+        gitlab_api::api_call(
+            &ctx.host,
+            format!("projects/{project}/repository/commits?per_page={limit}{since_query}"),
+        ),
+        gitlab_api::api_call(
+            &ctx.host,
+            format!("projects/{project}/events?per_page={limit}&sort=desc{events_after}"),
+        ),
+    ]
+}
+
 fn build_github_summary_call(
     ctx: &ProviderContext,
     user: &str,
@@ -414,6 +610,27 @@ fn normalize_graphql_since(since: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn resolve_repo_slug<F: Fn(&str) -> Option<String>>(
+    ctx: &ProviderContext,
+    remote: &str,
+    lookup: &F,
+) -> Result<String, ForgeError> {
+    if let Some(slug) = ctx.repo.clone() {
+        return Ok(slug);
+    }
+    if let Some(url) = lookup(remote)
+        && let Some(parsed) = nils_common::git::parse_git_remote_url(&url)
+    {
+        return Ok(parsed.path);
+    }
+    Err(ForgeError::validation(
+        schema_err(),
+        "repo_required",
+        "activity feed is single-repo scoped: pass --repo owner/name or run inside a repo with a recognised forge remote",
+        None,
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -606,6 +823,386 @@ fn event_summary(event_type: &str, raw: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn parse_github_feed_output(
+    commits_output: &BackendSuccess,
+    repo_activity_output: &BackendSuccess,
+    repo: String,
+    since: Option<String>,
+    limit: u32,
+    ctx: &ProviderContext,
+) -> Result<ActivityFeedPayload, ForgeError> {
+    let commits = parse_feed_array(commits_output, "GitHub activity feed commits")?;
+    let repo_activity = parse_feed_array(
+        repo_activity_output,
+        "GitHub activity feed repository activity",
+    )?;
+    let mut items = Vec::with_capacity(commits.len() + repo_activity.len());
+    for raw in commits {
+        items.push(parse_github_feed_commit(&raw, &repo, ctx)?);
+    }
+    for raw in repo_activity {
+        items.push(parse_github_repo_activity(&raw, &repo, ctx)?);
+    }
+    filter_feed_since(&mut items, since.as_deref())?;
+    let limited = truncate_feed_items(&mut items, limit)?;
+    let item_count = items.len();
+    Ok(ActivityFeedPayload {
+        provider: ctx.provider.as_str(),
+        host: ctx.host.clone(),
+        repo,
+        since,
+        limit,
+        item_count,
+        limited,
+        items,
+    })
+}
+
+fn parse_gitlab_feed_output(
+    commits_output: &BackendSuccess,
+    events_output: &BackendSuccess,
+    repo: String,
+    since: Option<String>,
+    limit: u32,
+    ctx: &ProviderContext,
+) -> Result<ActivityFeedPayload, ForgeError> {
+    let commits = parse_feed_array(commits_output, "GitLab activity feed commits")?;
+    let events = parse_feed_array(events_output, "GitLab activity feed events")?;
+    let mut items = Vec::with_capacity(commits.len() + events.len());
+    for raw in commits {
+        items.push(parse_gitlab_feed_commit(&raw, &repo, ctx)?);
+    }
+    for raw in events {
+        items.push(parse_gitlab_project_event(&raw, &repo, ctx)?);
+    }
+    filter_feed_since(&mut items, since.as_deref())?;
+    let limited = truncate_feed_items(&mut items, limit)?;
+    let item_count = items.len();
+    Ok(ActivityFeedPayload {
+        provider: ctx.provider.as_str(),
+        host: ctx.host.clone(),
+        repo,
+        since,
+        limit,
+        item_count,
+        limited,
+        items,
+    })
+}
+
+fn parse_feed_array(
+    output: &BackendSuccess,
+    label: &'static str,
+) -> Result<Vec<serde_json::Value>, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            format!("{label} JSON is invalid"),
+            Some(e.to_string()),
+        )
+    })?;
+    value.as_array().cloned().ok_or_else(|| {
+        ForgeError::software(
+            schema_err(),
+            format!("{label} JSON is not an array"),
+            Some(format!("got: {value}")),
+        )
+    })
+}
+
+fn parse_github_feed_commit(
+    raw: &serde_json::Value,
+    repo: &str,
+    ctx: &ProviderContext,
+) -> Result<ActivityFeedItem, ForgeError> {
+    let commit = raw.get("commit").unwrap_or(raw);
+    let sha = required_feed_str(raw, "sha", "GitHub")?;
+    let occurred_at = nested_str(commit, "committer", "date")
+        .or_else(|| nested_str(commit, "author", "date"))
+        .ok_or_else(|| missing_feed("GitHub", "commit.committer.date"))?;
+    let title = first_line(
+        commit
+            .get("message")
+            .or_else(|| raw.get("message"))
+            .and_then(|v| v.as_str()),
+    );
+    let actor = raw
+        .pointer("/author/login")
+        .or_else(|| commit.pointer("/author/name"))
+        .or_else(|| commit.pointer("/committer/name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let url = raw
+        .get("html_url")
+        .or_else(|| raw.get("web_url"))
+        .or_else(|| raw.get("url"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let external_id = format!("commit:{repo}:{sha}");
+    Ok(ActivityFeedItem {
+        id: activity_id(ctx, &external_id),
+        external_id,
+        provider_event_type: Some("commit".to_string()),
+        kind: "commit".to_string(),
+        action: "committed".to_string(),
+        repo: repo.to_string(),
+        target_kind: Some("commit".to_string()),
+        target_ref: Some(sha.clone()),
+        target_iid: None,
+        title: title.clone(),
+        url,
+        actor,
+        occurred_at,
+        summary: Some(format!("Committed {} in {repo}", short_sha(&sha))),
+        details: Some(serde_json::json!({
+            "sha": sha,
+            "message": title,
+        })),
+    })
+}
+
+fn parse_github_repo_activity(
+    raw: &serde_json::Value,
+    repo: &str,
+    ctx: &ProviderContext,
+) -> Result<ActivityFeedItem, ForgeError> {
+    let occurred_at = required_feed_str(raw, "pushed_at", "GitHub")?;
+    let raw_ref = optional_str(raw, "ref");
+    let push_type = optional_str(raw, "push_type").unwrap_or_else(|| "push".to_string());
+    let target_kind = github_ref_kind(raw_ref.as_deref()).to_string();
+    let action = map_github_repo_activity_action(&push_type).to_string();
+    let kind = if target_kind == "ref" {
+        "repository".to_string()
+    } else {
+        target_kind.clone()
+    };
+    let title = raw_ref.as_deref().and_then(short_ref_owned);
+    let actor = raw
+        .pointer("/pusher/login")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let before = optional_str(raw, "before");
+    let after = optional_str(raw, "after");
+    let external_id = format!(
+        "repo-activity:{repo}:{push_type}:{}:{}:{}:{occurred_at}",
+        raw_ref.as_deref().unwrap_or(""),
+        before.as_deref().unwrap_or(""),
+        after.as_deref().unwrap_or(""),
+    );
+    Ok(ActivityFeedItem {
+        id: activity_id(ctx, &external_id),
+        external_id,
+        provider_event_type: Some(push_type.clone()),
+        kind,
+        action: action.clone(),
+        repo: repo.to_string(),
+        target_kind: Some(target_kind),
+        target_ref: raw_ref.clone(),
+        target_iid: None,
+        title,
+        url: None,
+        actor,
+        occurred_at,
+        summary: Some(github_repo_activity_summary(
+            &action,
+            raw_ref.as_deref(),
+            repo,
+        )),
+        details: Some(serde_json::json!({
+            "ref": raw_ref,
+            "before": before,
+            "after": after,
+            "push_type": push_type,
+        })),
+    })
+}
+
+fn parse_gitlab_feed_commit(
+    raw: &serde_json::Value,
+    repo: &str,
+    ctx: &ProviderContext,
+) -> Result<ActivityFeedItem, ForgeError> {
+    let sha = required_feed_str(raw, "id", "GitLab")?;
+    let occurred_at = optional_str(raw, "committed_date")
+        .or_else(|| optional_str(raw, "created_at"))
+        .or_else(|| optional_str(raw, "authored_date"))
+        .ok_or_else(|| missing_feed("GitLab", "committed_date"))?;
+    let title = first_line(
+        raw.get("title")
+            .or_else(|| raw.get("message"))
+            .and_then(|v| v.as_str()),
+    );
+    let actor = optional_str(raw, "author_name").or_else(|| optional_str(raw, "committer_name"));
+    let external_id = format!("commit:{repo}:{sha}");
+    Ok(ActivityFeedItem {
+        id: activity_id(ctx, &external_id),
+        external_id,
+        provider_event_type: Some("commit".to_string()),
+        kind: "commit".to_string(),
+        action: "committed".to_string(),
+        repo: repo.to_string(),
+        target_kind: Some("commit".to_string()),
+        target_ref: Some(sha.clone()),
+        target_iid: None,
+        title: title.clone(),
+        url: optional_str(raw, "web_url"),
+        actor,
+        occurred_at,
+        summary: Some(format!("Committed {} in {repo}", short_sha(&sha))),
+        details: Some(serde_json::json!({
+            "sha": sha,
+            "message": title,
+        })),
+    })
+}
+
+fn parse_gitlab_project_event(
+    raw: &serde_json::Value,
+    repo: &str,
+    ctx: &ProviderContext,
+) -> Result<ActivityFeedItem, ForgeError> {
+    let event_id = required_feed_value_string(raw, "id", "GitLab")?;
+    let occurred_at = required_feed_str(raw, "created_at", "GitLab")?;
+    let action_name = optional_str(raw, "action_name").unwrap_or_else(|| "updated".to_string());
+    let data = raw.get("push_data").or_else(|| raw.get("data"));
+    let target_type = optional_str(raw, "target_type");
+    let kind = map_gitlab_event_target_kind(target_type.as_deref(), &action_name, data);
+    let action = map_gitlab_event_action(&action_name);
+    let title = optional_str(raw, "target_title")
+        .or_else(|| data.and_then(|d| optional_str(d, "commit_title")))
+        .or_else(|| data.and_then(|d| optional_str(d, "ref")));
+    let target_ref = data.and_then(|d| optional_str(d, "ref"));
+    let actor = optional_str(raw, "author_username").or_else(|| {
+        raw.pointer("/author/username")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
+    let external_id = format!("event:{repo}:{event_id}");
+    Ok(ActivityFeedItem {
+        id: activity_id(ctx, &external_id),
+        external_id,
+        provider_event_type: Some(action_name.clone()),
+        kind: kind.clone(),
+        action: action.clone(),
+        repo: repo.to_string(),
+        target_kind: Some(kind.clone()),
+        target_ref: target_ref.clone(),
+        target_iid: raw.get("target_iid").and_then(|v| v.as_u64()),
+        title: title.clone(),
+        url: None,
+        actor,
+        occurred_at,
+        summary: Some(gitlab_event_summary(&action, &kind, title.as_deref(), repo)),
+        details: Some(serde_json::json!({
+            "action_name": action_name,
+            "target_type": target_type,
+            "ref": target_ref,
+            "commit_from": data.and_then(|d| optional_str(d, "commit_from")),
+            "commit_to": data.and_then(|d| optional_str(d, "commit_to")),
+        })),
+    })
+}
+
+fn truncate_feed_items(items: &mut Vec<ActivityFeedItem>, limit: u32) -> Result<bool, ForgeError> {
+    let mut keyed = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        let occurred_at = parse_feed_timestamp(&item.occurred_at, "activity feed occurred_at")?;
+        keyed.push((occurred_at, item));
+    }
+    keyed.sort_by(|(occurred_at_a, item_a), (occurred_at_b, item_b)| {
+        occurred_at_b
+            .cmp(occurred_at_a)
+            .then_with(|| item_b.id.cmp(&item_a.id))
+    });
+    let limited = reached_limit(keyed.len(), limit);
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    keyed.truncate(limit);
+    *items = keyed.into_iter().map(|(_, item)| item).collect();
+    Ok(limited)
+}
+
+fn filter_feed_since(
+    items: &mut Vec<ActivityFeedItem>,
+    since: Option<&str>,
+) -> Result<(), ForgeError> {
+    let Some(threshold) = since
+        .filter(|value| !value.trim().is_empty())
+        .map(parse_since_threshold)
+        .transpose()?
+    else {
+        return Ok(());
+    };
+    let mut filtered = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        let occurred_at = parse_feed_timestamp(&item.occurred_at, "activity feed occurred_at")?;
+        if occurred_at >= threshold {
+            filtered.push(item);
+        }
+    }
+    *items = filtered;
+    Ok(())
+}
+
+fn validate_feed_since(since: Option<&str>) -> Result<(), ForgeError> {
+    if let Some(since) = since.filter(|value| !value.trim().is_empty()) {
+        parse_since_threshold(since)?;
+    }
+    Ok(())
+}
+
+fn parse_since_threshold(raw: &str) -> Result<DateTime<Utc>, ForgeError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_since(raw, "value is empty"));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let Some(start_of_day) = date.and_hms_opt(0, 0, 0) else {
+            return Err(invalid_since(raw, "date is outside the supported range"));
+        };
+        return Ok(start_of_day.and_utc());
+    }
+    parse_feed_timestamp(trimmed, "activity feed --since").map_err(|err| {
+        invalid_since(
+            raw,
+            &format!("expected YYYY-MM-DD or RFC3339 datetime ({err})"),
+        )
+    })
+}
+
+fn parse_feed_timestamp(raw: &str, label: &'static str) -> Result<DateTime<Utc>, ForgeError> {
+    let trimmed = raw.trim();
+    let candidate = if datetime_lacks_timezone(trimmed) {
+        format!("{trimmed}Z")
+    } else {
+        trimmed.to_string()
+    };
+    DateTime::parse_from_rfc3339(&candidate)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            ForgeError::software(
+                schema_err(),
+                format!("invalid {label} timestamp"),
+                Some(format!("value={raw}; {e}")),
+            )
+        })
+}
+
+fn datetime_lacks_timezone(raw: &str) -> bool {
+    let Some((_, time)) = raw.split_once('T') else {
+        return false;
+    };
+    !time.ends_with('Z') && !time.contains('+') && !time.contains('-')
+}
+
+fn invalid_since(raw: &str, detail: &str) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "invalid_since",
+        "activity feed --since must be a YYYY-MM-DD date or RFC3339 datetime",
+        Some(format!("value={raw}; {detail}")),
+    )
+}
+
 fn parse_summary_output(
     output: &BackendSuccess,
     user: String,
@@ -694,6 +1291,164 @@ fn missing(key: &str) -> ForgeError {
     )
 }
 
+fn required_feed_str(
+    raw: &serde_json::Value,
+    key: &str,
+    provider: &'static str,
+) -> Result<String, ForgeError> {
+    optional_str(raw, key).ok_or_else(|| missing_feed(provider, key))
+}
+
+fn required_feed_value_string(
+    raw: &serde_json::Value,
+    key: &str,
+    provider: &'static str,
+) -> Result<String, ForgeError> {
+    raw.get(key)
+        .and_then(value_to_string)
+        .ok_or_else(|| missing_feed(provider, key))
+}
+
+fn missing_feed(provider: &'static str, key: &str) -> ForgeError {
+    ForgeError::software(
+        schema_err(),
+        format!("missing required field '{key}' in {provider} activity feed output"),
+        None,
+    )
+}
+
+fn optional_str(raw: &serde_json::Value, key: &str) -> Option<String> {
+    raw.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+fn value_to_string(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return (!s.is_empty()).then(|| s.to_string());
+    }
+    if let Some(n) = value.as_u64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = value.as_i64() {
+        return Some(n.to_string());
+    }
+    None
+}
+
+fn nested_str(raw: &serde_json::Value, parent: &str, key: &str) -> Option<String> {
+    raw.get(parent)
+        .and_then(|value| value.get(key))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+fn activity_id(ctx: &ProviderContext, external_id: &str) -> String {
+    format!("{}:{}|{}", ctx.provider.as_str(), ctx.host, external_id)
+}
+
+fn first_line(value: Option<&str>) -> Option<String> {
+    value
+        .and_then(|s| s.split('\n').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn short_ref_owned(raw: &str) -> Option<String> {
+    let s = raw
+        .strip_prefix("refs/heads/")
+        .or_else(|| raw.strip_prefix("refs/tags/"))
+        .unwrap_or(raw)
+        .trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+fn github_ref_kind(raw_ref: Option<&str>) -> &'static str {
+    let Some(raw_ref) = raw_ref else {
+        return "ref";
+    };
+    if raw_ref.starts_with("refs/tags/") {
+        "tag"
+    } else if raw_ref.starts_with("refs/heads/") {
+        "branch"
+    } else {
+        "ref"
+    }
+}
+
+fn map_github_repo_activity_action(push_type: &str) -> &'static str {
+    match push_type {
+        "force_push" => "force_pushed",
+        "branch_creation" => "created",
+        "branch_deletion" => "deleted",
+        "pr_merge" | "merge_queue_merge" => "merged",
+        _ => "pushed",
+    }
+}
+
+fn github_repo_activity_summary(action: &str, raw_ref: Option<&str>, repo: &str) -> String {
+    let target = raw_ref
+        .and_then(short_ref_owned)
+        .unwrap_or_else(|| "repository".to_string());
+    match action {
+        "created" => format!("Created {target} in {repo}"),
+        "deleted" => format!("Deleted {target} in {repo}"),
+        "force_pushed" => format!("Force-pushed {target} in {repo}"),
+        "merged" => format!("Merged into {target} in {repo}"),
+        _ => format!("Pushed {target} in {repo}"),
+    }
+}
+
+fn map_gitlab_event_action(action: &str) -> String {
+    let s = action.to_ascii_lowercase();
+    match s.as_str() {
+        "commented on" => "commented".to_string(),
+        "pushed to" | "pushed" => "pushed".to_string(),
+        "pushed new" => "created".to_string(),
+        "deleted" => "deleted".to_string(),
+        "opened" => "opened".to_string(),
+        "closed" => "closed".to_string(),
+        "merged" => "merged".to_string(),
+        "reopened" => "reopened".to_string(),
+        _ => {
+            let normalized = s.split_whitespace().collect::<Vec<_>>().join("_");
+            if normalized.is_empty() {
+                "updated".to_string()
+            } else {
+                normalized
+            }
+        }
+    }
+}
+
+fn map_gitlab_event_target_kind(
+    target_type: Option<&str>,
+    action: &str,
+    data: Option<&serde_json::Value>,
+) -> String {
+    match target_type {
+        Some("Issue") | Some("issue") => return "issue".to_string(),
+        Some("MergeRequest") | Some("merge_request") => return "change_request".to_string(),
+        Some("Note") | Some("note") => return "comment".to_string(),
+        _ => {}
+    }
+    if data.and_then(|d| d.get("ref")).is_some() {
+        return "push".to_string();
+    }
+    if action.to_ascii_lowercase().contains("push") {
+        return "push".to_string();
+    }
+    "repository".to_string()
+}
+
+fn gitlab_event_summary(action: &str, kind: &str, title: Option<&str>, repo: &str) -> String {
+    let target = title.filter(|s| !s.trim().is_empty()).unwrap_or(kind);
+    format!("{} {target} in {repo}", action.replace('_', " "))
+}
+
 fn render_commits_text(payload: &ActivityCommitsPayload) {
     println!(
         "{provider}@{host} {user} commits: {count} result(s){since}{limited}",
@@ -738,6 +1493,33 @@ fn render_events_text(payload: &ActivityEventsPayload) {
             kind = item.event_type,
             visibility = event_visibility(item.public),
             summary = one_line(item.summary.as_deref().unwrap_or("")),
+        );
+    }
+}
+
+fn render_feed_text(payload: &ActivityFeedPayload) {
+    println!(
+        "{provider}@{host} {repo} feed: {count} result(s){since}{limited}",
+        provider = payload.provider,
+        host = payload.host,
+        repo = payload.repo,
+        count = payload.item_count,
+        since = since_suffix(payload.since.as_deref()),
+        limited = limited_suffix(payload.limited),
+    );
+    for item in &payload.items {
+        println!(
+            "{time} {repo} {action} {kind} {summary}",
+            time = item.occurred_at,
+            repo = item.repo,
+            action = item.action,
+            kind = item.kind,
+            summary = one_line(
+                item.summary
+                    .as_deref()
+                    .or(item.title.as_deref())
+                    .unwrap_or("")
+            ),
         );
     }
 }
@@ -794,11 +1576,19 @@ fn command_name(command: &ActivityCommand) -> &'static str {
     match command {
         ActivityCommand::Commits(_) => "commits",
         ActivityCommand::Events(_) => "events",
+        ActivityCommand::Feed(_) => "feed",
         ActivityCommand::Summary(_) => "summary",
     }
 }
 
 fn provider_unsupported(ctx: &ProviderContext, command: &ActivityCommand) -> ForgeError {
+    if matches!(command, ActivityCommand::Feed(_)) {
+        return ForgeError::provider_unsupported(
+            schema_err(),
+            "activity feed is unsupported for this provider",
+            Some(format!("provider={}", ctx.provider.as_str())),
+        );
+    }
     ForgeError::provider_unsupported(
         schema_err(),
         format!("activity {} is GitHub-only in v1", command_name(command)),

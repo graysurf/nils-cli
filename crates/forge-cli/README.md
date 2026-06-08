@@ -77,6 +77,21 @@ forge-cli inbox list --format json --cache-fallback --cache-max-age 30m
 Cached fallback items are marked with `stale` metadata and the provider row
 remains `ok=false`, so consumers can distinguish stale context from live data.
 
+## Activity discovery
+
+Personal activity commands (`activity commits`, `activity events`, and
+`activity summary`) report GitHub user activity. `activity feed` is
+repository/project-scoped and supports GitHub plus GitLab:
+
+```sh
+forge-cli --provider github --repo owner/name activity feed --since 2026-06-01 --format json
+forge-cli --provider gitlab --repo group/project activity feed --since 2026-06-01 --format json
+```
+
+Feed rows expose common `kind` / `action` fields for scanning and keep
+provider-native semantics in `provider_event_type` plus `details`, so GitHub
+and GitLab event differences are preserved instead of flattened.
+
 ### Reason filter (`--kind`) vs item-type filter (`--item-type`)
 
 `--kind` selects inbox *reasons* — why an item should appear (`review`,

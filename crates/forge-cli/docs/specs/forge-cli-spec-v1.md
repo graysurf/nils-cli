@@ -48,8 +48,11 @@ In scope (v1):
 - Personal work discovery: `inbox list`, `inbox status`, and
   `inbox next` across GitHub and GitLab.
 - Personal activity discovery: `activity commits`, `activity events`, and
-  `activity summary`. v1 ships GitHub only, with GitLab and local backends kept
-  as explicit provider seams for later expansion.
+  `activity summary`. These v1 personal commands ship GitHub only, with GitLab
+  and local backends kept as explicit provider seams for later expansion.
+- Repository/project activity discovery: `activity feed` across GitHub and
+  GitLab. It normalizes commit and repository/project event surfaces while
+  preserving provider-specific event vocabulary.
 - PR/MR lifecycle: `create`, `view`, `list`, `edit`, `comment`,
   `ready`, `merge`, `close`.
 - PR/MR checks: `pr checks` (one-shot snapshot) and `pr wait-checks`
@@ -99,36 +102,37 @@ value (REST passthrough = same as `gh api` + rename).
 
 Parity matrix (v1):
 
-| forge-cli op          | github backend                                                  | gitlab backend                                              | Parity                               |
-| --------------------- | --------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------ |
-| `pr create`           | `gh pr create --draft`                                          | `glab mr create --draft`                                    | exact                                |
-| `pr view <id>`        | `gh pr view <id> --json …`                                      | `glab mr view <id> -F json`                                 | exact                                |
-| `pr list`             | `gh pr list --json …`                                           | `glab mr list -F json`                                      | exact                                |
-| `pr edit <id>`        | `gh pr edit <id> …`                                             | `glab mr update <id> …`                                     | exact                                |
-| `pr comment <id>`     | `gh pr comment <id> --body …`                                   | `glab mr note <id> --message …`                             | exact                                |
-| `pr ready <id>`       | `gh pr ready <id>`                                              | `glab mr update <id> --ready`                               | exact                                |
-| `pr merge <id>`       | `gh pr merge <id> --squash --delete-branch`                     | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg) |
-| `pr close <id>`       | `gh pr close <id>`                                              | `glab mr close <id>`                                        | exact                                |
-| `pr checks <id>`      | `gh pr checks <id> --json …` plus `--required` for gating       | `glab mr view -F json` + `glab api .../pipelines/<id>/jobs` | emulated on GitLab                   |
-| `pr wait-checks <id>` | poll `gh pr checks` / `gh pr checks --required`                 | poll structured MR pipeline/jobs snapshot                   | emulated; same envelope              |
-| `issue create`        | `gh issue create …`                                             | `glab issue create …`                                       | exact                                |
-| `issue view <id>`     | `gh issue view <id> --json …`                                   | `glab issue view <id> -F json`                              | exact                                |
-| `issue edit <id>`     | `gh issue edit <id> …`                                          | `glab issue update <id> …`                                  | exact                                |
-| `issue comment <id>`  | `gh issue comment <id> --body …`                                | `glab issue note <id> --message …`                          | exact                                |
-| `issue close <id>`    | `gh issue close <id>`                                           | `glab issue close <id>`                                     | exact                                |
-| `issue reopen <id>`   | `gh issue reopen <id>`                                          | `glab issue reopen <id>`                                    | exact                                |
-| `label list`          | `gh label list --json …`                                        | `glab label list --output json`                             | exact                                |
-| `label audit`         | read labels, compare with caller catalog                        | same                                                        | exact                                |
-| `label ensure`        | `gh label create/edit`                                          | `glab label create/edit`                                    | exact (no delete/rename by default)  |
-| `auth status`         | `gh auth status`                                                | `glab auth status`                                          | exact (text → typed)                 |
-| `repo view`           | `gh repo view --json …`                                         | `glab repo view -F json`                                    | exact                                |
-| `inbox list`          | `gh search prs/issues --json …`                                 | `glab api --hostname <host> …`                              | normalized aggregation               |
-| `inbox status`        | same provider reads as `inbox list`                             | same provider reads as `inbox list`                         | bounded counts                       |
-| `inbox next`          | same provider reads as `inbox list`                             | same provider reads as `inbox list`                         | ranked bounded subset                |
-| `activity commits`    | `gh api search/commits`                                         | unsupported in v1                                           | GitHub-only seam                     |
-| `activity events`     | `gh api users/<login>/events[/public]`                          | unsupported in v1                                           | GitHub-only seam                     |
-| `activity summary`    | `gh api graphql` contribution query                             | unsupported in v1                                           | GitHub-only seam                     |
-| `pr deliver`          | macro: `pr create` → `pr wait-checks` → `pr ready` → `pr merge` | same composition with gitlab atoms                          | exact (same macro logic on both)     |
+| forge-cli op          | github backend                                                   | gitlab backend                                              | Parity                               |
+| --------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------ |
+| `pr create`           | `gh pr create --draft`                                           | `glab mr create --draft`                                    | exact                                |
+| `pr view <id>`        | `gh pr view <id> --json …`                                       | `glab mr view <id> -F json`                                 | exact                                |
+| `pr list`             | `gh pr list --json …`                                            | `glab mr list -F json`                                      | exact                                |
+| `pr edit <id>`        | `gh pr edit <id> …`                                              | `glab mr update <id> …`                                     | exact                                |
+| `pr comment <id>`     | `gh pr comment <id> --body …`                                    | `glab mr note <id> --message …`                             | exact                                |
+| `pr ready <id>`       | `gh pr ready <id>`                                               | `glab mr update <id> --ready`                               | exact                                |
+| `pr merge <id>`       | `gh pr merge <id> --squash --delete-branch`                      | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg) |
+| `pr close <id>`       | `gh pr close <id>`                                               | `glab mr close <id>`                                        | exact                                |
+| `pr checks <id>`      | `gh pr checks <id> --json …` plus `--required` for gating        | `glab mr view -F json` + `glab api .../pipelines/<id>/jobs` | emulated on GitLab                   |
+| `pr wait-checks <id>` | poll `gh pr checks` / `gh pr checks --required`                  | poll structured MR pipeline/jobs snapshot                   | emulated; same envelope              |
+| `issue create`        | `gh issue create …`                                              | `glab issue create …`                                       | exact                                |
+| `issue view <id>`     | `gh issue view <id> --json …`                                    | `glab issue view <id> -F json`                              | exact                                |
+| `issue edit <id>`     | `gh issue edit <id> …`                                           | `glab issue update <id> …`                                  | exact                                |
+| `issue comment <id>`  | `gh issue comment <id> --body …`                                 | `glab issue note <id> --message …`                          | exact                                |
+| `issue close <id>`    | `gh issue close <id>`                                            | `glab issue close <id>`                                     | exact                                |
+| `issue reopen <id>`   | `gh issue reopen <id>`                                           | `glab issue reopen <id>`                                    | exact                                |
+| `label list`          | `gh label list --json …`                                         | `glab label list --output json`                             | exact                                |
+| `label audit`         | read labels, compare with caller catalog                         | same                                                        | exact                                |
+| `label ensure`        | `gh label create/edit`                                           | `glab label create/edit`                                    | exact (no delete/rename by default)  |
+| `auth status`         | `gh auth status`                                                 | `glab auth status`                                          | exact (text → typed)                 |
+| `repo view`           | `gh repo view --json …`                                          | `glab repo view -F json`                                    | exact                                |
+| `inbox list`          | `gh search prs/issues --json …`                                  | `glab api --hostname <host> …`                              | normalized aggregation               |
+| `inbox status`        | same provider reads as `inbox list`                              | same provider reads as `inbox list`                         | bounded counts                       |
+| `inbox next`          | same provider reads as `inbox list`                              | same provider reads as `inbox list`                         | ranked bounded subset                |
+| `activity commits`    | `gh api search/commits`                                          | unsupported in v1                                           | GitHub-only seam                     |
+| `activity events`     | `gh api users/<login>/events[/public]`                           | unsupported in v1                                           | GitHub-only seam                     |
+| `activity feed`       | `gh api repos/<owner>/<repo>/commits` + repository activity REST | `glab api projects/:id/repository/commits` + project events | normalized open vocabulary           |
+| `activity summary`    | `gh api graphql` contribution query                              | unsupported in v1                                           | GitHub-only seam                     |
+| `pr deliver`          | macro: `pr create` → `pr wait-checks` → `pr ready` → `pr merge`  | same composition with gitlab atoms                          | exact (same macro logic on both)     |
 
 "emulated" means the backend's native command differs in shape, but
 `forge-cli` normalises both into the same `cli.forge-cli.pr.checks.v1`
@@ -139,7 +143,7 @@ GitLab capability status:
 - Supported with stable JSON/API: PR/MR create, view, list, edit, comment,
   ready, close, checks, wait-checks, merge, deliver; issue create/view/edit,
   comment, close, reopen; label list/audit/ensure; auth status; repo view;
-  inbox list/status/next.
+  inbox list/status/next; activity feed.
 - Intentionally unsupported in v1: GitLab `activity commits`,
   `activity events`, `activity summary`, and `search` operations.
 - Fragile fallback: branch-only `pr checks <branch>` / `pr wait-checks
@@ -266,10 +270,14 @@ Activity-local flags:
 - `forge-cli activity events --user <login|@me> --public-only --limit <n>`
   lists recent user events. Without `--public-only`, `@me` can use the
   authenticated user's event endpoint.
+- `forge-cli --repo <owner/name|group/project> activity feed
+  --since <date-or-datetime> --limit <n>` lists recent repository/project
+  activity. GitHub reads commits plus repository activity; GitLab reads
+  commits plus project events.
 - `forge-cli activity summary --user <login|@me> --since <date-or-datetime>
   --limit <n>` summarizes commit contributions by repository.
-- Activity limits are effective provider page sizes and are clamped to GitHub's
-  v1 per-page maximum of `100`.
+- Activity limits are effective provider page sizes and are clamped to the v1
+  per-page maximum of `100`.
 - `@me` resolves through `gh api user`; `--dry-run` includes both the identity
   lookup and the data query under `data.plans[]`.
 
@@ -497,9 +505,10 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 
 ## Activity output contract
 
-`activity` is read-only and reports recent personal GitHub activity through the
-same workspace envelope used by the parity ops. GitLab and local providers
-return `provider_unsupported` in v1.
+`activity` is read-only and reports recent activity through the same workspace
+envelope used by the parity ops. Personal commands remain GitHub-only in v1;
+`activity feed` is repo/project-scoped and supports GitHub and GitLab. Local
+providers return `provider_unsupported`.
 
 - `activity commits` emits `cli.forge-cli.activity.commits.v1` with
   `data.provider`, `data.host`, `data.user`, `data.since`, `data.limit`,
@@ -512,6 +521,18 @@ return `provider_unsupported` in v1.
   `data.items[]`.
 - Event items include `id`, `event_type`, `repo`, `actor`, `public`,
   `created_at`, `summary`, and `url`.
+- `activity feed` emits `cli.forge-cli.activity.feed.v1` with
+  `data.provider`, `data.host`, `data.repo`, `data.since`, `data.limit`,
+  `data.item_count`, `data.limited`, and normalized `data.items[]`.
+- Feed items include `id`, `external_id`, `provider_event_type`, `kind`,
+  `action`, `repo`, `target_kind`, `target_ref`, `target_iid`, `title`, `url`,
+  `actor`, `occurred_at`, `summary`, and `details`.
+- Feed `kind` and `action` are open vocabulary. Consumers may group common
+  values such as `commit` / `committed`, `branch` / `pushed`, and
+  `change_request` / `merged`, but unknown provider events stay represented
+  instead of being rejected. The provider-native event name is retained in
+  `provider_event_type`; provider-specific fields such as refs, commit ranges,
+  and GitLab target types live under `details`.
 - `activity summary` emits `cli.forge-cli.activity.summary.v1` with
   `data.provider`, `data.host`, `data.user`, `data.since`, `data.limit`,
   `data.total_commit_contributions`, `data.repository_count`,
