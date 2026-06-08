@@ -3,25 +3,29 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: planned; tracking issue pending.
+- Status: in-progress; tracking issue open.
 - Target scope: `forge-cli` GitLab provider capability audit and MR delivery
   reliability improvements in `sympoies/nils-cli`.
 - Execution window: Sprint 1 (capability audit and backend contract) -> Sprint
   2 (GitLab checks/wait/merge hardening) -> Sprint 3 (docs, PR delivery, and
   release/runtime follow-up if needed), serial.
-- Current task: open the tracking issue from this bundle.
+- Current task: Sprint 1 ready.
 - Next task: Sprint 1 Task 1.1 - audit the GitLab provider surface.
 - Last updated: 2026-06-08
-- Branch/commit/PR: pending.
+- Branch/commit/PR: initial tracker bundle committed as
+  `0d726ede9d97edef1d33af968265d03854a1ddc3`; implementation branch pending.
 - Source document:
   `docs/plans/2026-06-08-forge-cli-gitlab-capabilities/forge-cli-gitlab-capabilities-discussion-source.md`
 - Plan document:
   `docs/plans/2026-06-08-forge-cli-gitlab-capabilities/forge-cli-gitlab-capabilities-plan.md`
 - Direct source-doc execution waiver: not applicable.
-- Tracking issue: pending.
-- Source snapshot: pending.
-- Plan snapshot: pending.
-- Initial state snapshot: pending.
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/797>
+- Source snapshot:
+  <https://github.com/sympoies/nils-cli/issues/797#issuecomment-4647307059>
+- Plan snapshot:
+  <https://github.com/sympoies/nils-cli/issues/797#issuecomment-4647307448>
+- Initial state snapshot:
+  <https://github.com/sympoies/nils-cli/issues/797#issuecomment-4647307696>
 
 ## Validation Plan
 
@@ -63,6 +67,6 @@
 | `plan-tooling validate --file docs/plans/2026-06-08-forge-cli-gitlab-capabilities/forge-cli-gitlab-capabilities-plan.md --format text --explain` | pass | Plan-source bundle validated with zero errors. | local |
 | `bash scripts/ci/plan-bundle-validate.sh --strict --file docs/plans/2026-06-08-forge-cli-gitlab-capabilities/forge-cli-gitlab-capabilities-plan.md` | pass | Repository strict plan-bundle validation passed for the new bundle. | local |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Docs placement, hygiene, markdown lint, plan-bundle validation, CLI output contract lint, and forge-cli fixture lint passed. | local |
-| `plan-issue --repo sympoies/nils-cli --format json --dry-run record open --profile tracking --bundle docs/plans/2026-06-08-forge-cli-gitlab-capabilities ...` | pending | Preview issue body, labels, and lifecycle comments before live create. | local |
-| `plan-issue --repo sympoies/nils-cli --format json record open --profile tracking --bundle docs/plans/2026-06-08-forge-cli-gitlab-capabilities ...` | pending | Open tracker issue and write provider URLs back to this state file. | provider |
+| `plan-issue --repo sympoies/nils-cli --format json --dry-run record open --profile tracking --bundle docs/plans/2026-06-08-forge-cli-gitlab-capabilities ...` | pass | Dry-run rendered the intended GitHub issue body, labels, and source/plan/state lifecycle comments. | local |
+| `plan-issue --repo sympoies/nils-cli --format json record open --profile tracking --bundle docs/plans/2026-06-08-forge-cli-gitlab-capabilities ...` | pass | Opened tracker issue #797 and posted source, plan, and initial state lifecycle comments. | <https://github.com/sympoies/nils-cli/issues/797> |
 | `plan-issue --format json record audit --profile tracking --expect-visible ...` | pending | Confirm source, plan, and state records are provider-visible and lint-clean. | local/provider |
