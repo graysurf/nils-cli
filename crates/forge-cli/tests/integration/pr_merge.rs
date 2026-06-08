@@ -6,6 +6,7 @@
 //! and the per-repo `.forge-cli.toml` precedence end-to-end.
 
 use std::fs;
+use std::process::Command;
 
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -13,6 +14,146 @@ use tempfile::TempDir;
 use super::support::{StubEnv, parse_envelope, run_forge_cli_in};
 
 const FORBIDDEN_STUB: &str = "#!/bin/sh\necho 'should not run during dry-run' >&2\nexit 99\n";
+
+fn make_gitlab_repo() -> TempDir {
+    let tempdir = TempDir::new().expect("tempdir");
+    let repo = tempdir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("git spawn");
+        if !out.status.success() {
+            panic!(
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        out
+    };
+
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Tester"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    fs::write(repo.join("README.md"), "init\n").expect("readme");
+    git(&["add", "README.md"]);
+    git(&["commit", "-q", "-m", "initial"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://gitlab.example.com/group/project.git",
+    ]);
+    tempdir
+}
+
+fn gitlab_merge_api_stub(stub: &StubEnv) -> String {
+    let sentinel = stub.tempdir.path().join("merged");
+    let args_log = stub.tempdir.path().join("merge-args");
+    format!(
+        r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "repo view")
+    cat <<'EOF'
+{{
+  "namespace": {{ "full_path": "group" }},
+  "path": "project",
+  "web_url": "https://gitlab.example.com/group/project",
+  "default_branch": "main",
+  "merge_method": "merge",
+  "squash_option": "default_on"
+}}
+EOF
+    ;;
+  "mr view")
+    if [ -e {sentinel} ]; then
+      cat <<'EOF'
+{{
+  "iid": 7,
+  "web_url": "https://gitlab.example.com/group/project/-/merge_requests/7",
+  "state": "merged",
+  "draft": false,
+  "title": "feat: sample",
+  "source_branch": "feat/sample",
+  "target_branch": "main",
+  "merge_status": "can_be_merged",
+  "sha": "abc123",
+  "merge_commit_sha": "def456",
+  "labels": [],
+  "head_pipeline": {{ "id": 99, "status": "success", "web_url": "https://gitlab.example.com/group/project/-/pipelines/99" }}
+}}
+EOF
+    else
+      cat <<'EOF'
+{{
+  "iid": 7,
+  "web_url": "https://gitlab.example.com/group/project/-/merge_requests/7",
+  "state": "opened",
+  "draft": false,
+  "title": "feat: sample",
+  "source_branch": "feat/sample",
+  "target_branch": "main",
+  "merge_status": "can_be_merged",
+  "sha": "abc123",
+  "merge_commit_sha": null,
+  "labels": [],
+  "head_pipeline": {{ "id": 99, "status": "success", "web_url": "https://gitlab.example.com/group/project/-/pipelines/99" }}
+}}
+EOF
+    fi
+    ;;
+  "api --hostname")
+    case "$*" in
+      *"projects/group%2Fproject/pipelines/99/jobs?per_page=100"*)
+        cat <<'EOF'
+[
+  {{
+    "name": "build",
+    "stage": "test",
+    "status": "success",
+    "allow_failure": false,
+    "web_url": "https://gitlab.example.com/group/project/-/jobs/1"
+  }}
+]
+EOF
+        ;;
+      *)
+        echo "stub: unexpected api args: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  "api --method")
+    printf '%s\n' "$*" > {args_log}
+    case "$*" in
+      *"PUT"*"--hostname gitlab.example.com"*"projects/group%2Fproject/merge_requests/7/merge"*"squash=true"*"should_remove_source_branch=true"*"sha=abc123"*)
+        touch {sentinel}
+        cat <<'EOF'
+{{ "state": "merged", "merge_commit_sha": "def456" }}
+EOF
+        ;;
+      *)
+        echo "stub: unexpected merge api args: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  *)
+    echo "stub: unexpected glab args: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+        sentinel = sentinel.display(),
+        args_log = args_log.display(),
+    )
+}
 
 #[test]
 fn pr_merge_dry_run_renders_squash_plan_with_delete_branch() {
@@ -143,4 +284,43 @@ fn pr_merge_keep_branch_conflicts_with_config_delete_branch_true() {
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["ok"], false);
     assert_eq!(env["error"]["code"], "keep_branch_conflict");
+}
+
+#[test]
+fn pr_merge_gitlab_uses_api_merge_after_required_checks_pass() {
+    let tempdir = make_gitlab_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let args_log = stub.tempdir.path().join("merge-args");
+    let body = gitlab_merge_api_stub(&stub);
+    let stub = stub.glab_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.pr.merge.v1");
+    assert_eq!(env["data"]["provider"], "gitlab");
+    assert_eq!(env["data"]["merge_sha"], "def456");
+
+    let args = fs::read_to_string(args_log).expect("merge args log");
+    assert!(args.contains("--method PUT"), "{args}");
+    assert!(args.contains("--hostname gitlab.example.com"), "{args}");
+    assert!(
+        args.contains("projects/group%2Fproject/merge_requests/7/merge"),
+        "{args}"
+    );
+    assert!(args.contains("sha=abc123"), "{args}");
 }

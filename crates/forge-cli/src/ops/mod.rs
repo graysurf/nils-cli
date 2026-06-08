@@ -4,6 +4,7 @@
 
 pub mod activity;
 pub mod auth_status;
+pub mod gitlab_api;
 pub mod inbox;
 pub mod issue_close;
 pub mod issue_comment;

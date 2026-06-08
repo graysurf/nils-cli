@@ -45,13 +45,13 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | pending | Audit the GitLab provider surface | pending | Map supported, unsupported, and fragile GitLab surfaces across `forge-cli`. |
-| 1.2 | pending | Choose and test the GitLab structured backend contract | pending | Decide API abstraction shape and cover host/project/auth/redaction behavior. |
-| 2.1 | pending | Harden GitLab checks and wait-checks | pending | Avoid unsupported `glab` minor blockers when API status data is available. |
-| 2.2 | pending | Harden GitLab merge and post-merge verification | pending | Preserve safety gates and stable merge SHA extraction. |
-| 2.3 | pending | Normalize diagnostics and version preflight behavior | pending | Keep `glab_version_unsupported` only where the parser path is truly required. |
-| 3.1 | pending | Update documentation and dependency guidance | pending | Document capability matrix, API fallback, and `glab` dependency boundaries. |
-| 3.2 | pending | Validate and deliver the nils-cli PR | pending | Run local-fast, provider checks, and optional sandbox smoke. |
+| 1.1 | done | Audit the GitLab provider surface | pending; tracking run update: Sprint 1 Task 1.1 selected; documented GitLab capability matrix in crates/forge-cli/docs/specs/forge-cli-spec-v1.md; cargo test -p nils-forge-cli cli; cargo test -p nils-forge-cli parity | GitLab supported, unsupported, and fragile fallback surfaces are documented. |
+| 1.2 | done | Choose and test the GitLab structured backend contract | pending; added crates/forge-cli/src/ops/gitlab_api.rs; cargo test -p nils-forge-cli conformance; cargo test -p nils-forge-cli pr_checks_gitlab | Structured GitLab API calls are centralized through ops::gitlab_api and covered by API-backed checks tests. |
+| 2.1 | done | Harden GitLab checks and wait-checks | pending; API-backed GitLab checks and wait-checks implemented; cargo test -p nils-forge-cli pr_checks_gitlab; cargo test -p nils-forge-cli pr_wait_checks | Numeric MR checks/wait use MR pipeline jobs API and no longer depend on glab version text parser when project context is available. |
+| 2.2 | done | Harden GitLab merge and post-merge verification | pending; GitLab merge mutation switched to glab api PUT after existing gates; cargo test -p nils-forge-cli pr_merge; cargo test -p nils-forge-cli pr_deliver_chain; cargo test -p nils-forge-cli required_check_gate | GitLab merge preserves gate order, source branch cleanup intent, merge SHA readback, and head SHA protection. |
+| 2.3 | done | Normalize diagnostics and version preflight behavior | pending; glab_version_unsupported narrowed to branch-only text parser fallback; cargo test -p nils-forge-cli validations; cargo test -p nils-forge-cli exit_codes_full | API-backed numeric MR paths do not call the version guard; retained fallback error explains scope and API availability. |
+| 3.1 | done | Update documentation and dependency guidance | pending; updated crates/forge-cli/README.md, crates/forge-cli/docs/specs/forge-cli-spec-v1.md, and BINARY_DEPENDENCIES.md | Docs describe capability matrix, API fallback behavior, glab dependency boundary, and diagnostics scope. |
+| 3.2 | in-progress | Validate and deliver the nils-cli PR | pending; targeted forge-cli validation passed; preparing repository local-fast gate; bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast passed | Final validation passed; PR delivery in progress. |
 | 3.3 | pending | Release and runtime-surface follow-up | pending | Release/sync only if the operator needs the improved binary in runtime surfaces. |
 
 ## Session Log

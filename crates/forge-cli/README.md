@@ -181,3 +181,21 @@ Starting with `nils-cli` `0.17.0`, GitHub `pr checks` calls request only the
 `gh pr checks --required` snapshot instead of the removed `isRequired` JSON
 field, so `pr checks`, `pr wait-checks`, `pr merge`, and `pr deliver` share the
 same compatibility path.
+
+## GitLab MR delivery compatibility
+
+GitLab MR delivery uses structured API data where `glab` subcommands expose
+stable API access but not stable text output:
+
+- `pr checks <iid>` and `pr wait-checks <iid>` read `glab mr view -F json`,
+  then `glab api --hostname <host> projects/<project>/pipelines/<id>/jobs` for
+  job rows. This path is not blocked by `glab --version` parser ranges.
+- Branch-only check snapshots without a repo/project path still use the
+  `glab ci status -b <branch>` text-parser fallback and keep the `glab`
+  version guard.
+- `pr merge <iid>` keeps the existing clean-worktree, draft, default-branch,
+  merge-method, branch-cleanup, and required-check gates, then performs the
+  GitLab mutation through `glab api --method PUT .../merge` with the MR head
+  `sha` when available.
+- `pr deliver` inherits the same GitLab checks/wait/merge atoms; there is no
+  separate GitLab macro.

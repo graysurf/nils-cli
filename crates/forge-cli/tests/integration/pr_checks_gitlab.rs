@@ -1,10 +1,9 @@
 //! End-to-end `pr checks` integration tests against a stubbed `glab`.
 //!
-//! Each test wires `FORGE_CLI_GLAB_BIN` at a dispatching shell stub that
-//! mocks `glab --version` (version probe) and `glab ci status -b <branch>`
-//! (text status). Numeric ids resolve through `glab mr view <id> -F json`.
-//! Out-of-range versions short-circuit with `UNAVAILABLE 69` and
-//! `error.kind = "glab_version_unsupported"` per spec.
+//! Most tests wire `FORGE_CLI_GLAB_BIN` at a dispatching shell stub that mocks
+//! the `glab --version` + `glab ci status -b <branch>` text-parser fallback.
+//! Numeric MR tests also cover the structured `glab api` path, which must not
+//! be blocked by glab text-output minor-version drift.
 
 use pretty_assertions::assert_eq;
 
@@ -86,6 +85,67 @@ fn run_checks(
     (out.code, env)
 }
 
+fn glab_api_jobs_stub() -> String {
+    r#"#!/bin/sh
+set -e
+case "$1" in
+  "--version")
+    echo "version probe should not run for API-backed checks" >&2
+    exit 99
+    ;;
+  "mr")
+    if [ "$2" = "view" ]; then
+      cat <<'EOF'
+{
+  "iid": 42,
+  "web_url": "https://gitlab.com/group/project/-/merge_requests/42",
+  "source_branch": "feat/sample",
+  "target_branch": "main",
+  "sha": "abc123",
+  "head_pipeline": {
+    "id": 99,
+    "status": "success",
+    "web_url": "https://gitlab.com/group/project/-/pipelines/99"
+  }
+}
+EOF
+      exit 0
+    fi
+    ;;
+  "api")
+    case "$*" in
+      *"projects/group%2Fproject/pipelines/99/jobs?per_page=100"*)
+        cat <<'EOF'
+[
+  {
+    "name": "build",
+    "stage": "test",
+    "status": "success",
+    "allow_failure": false,
+    "web_url": "https://gitlab.com/group/project/-/jobs/1",
+    "started_at": "2026-06-08T09:00:00Z",
+    "finished_at": "2026-06-08T09:01:00Z"
+  },
+  {
+    "name": "allowed-failure",
+    "stage": "test",
+    "status": "failed",
+    "allow_failure": true,
+    "web_url": "https://gitlab.com/group/project/-/jobs/2"
+  }
+]
+EOF
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+echo "stub: unexpected glab args: $*" >&2
+exit 99
+"#
+    .to_string()
+}
+
 #[test]
 fn pr_checks_glab_all_success_emits_success_state() {
     let (code, env) = run_checks(VERSION_OK, ALL_SUCCESS, "feat/sample", &[]);
@@ -147,6 +207,30 @@ fn pr_checks_glab_numeric_id_resolves_through_mr_view() {
     let (code, env) = run_checks(VERSION_OK, ALL_SUCCESS, "42", &[]);
     assert_eq!(code, 0);
     assert_eq!(env["data"]["state"], "success");
+}
+
+#[test]
+fn pr_checks_gitlab_api_jobs_do_not_probe_glab_version() {
+    let stub = StubEnv::new().glab_stub(&glab_api_jobs_stub());
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "42",
+        ],
+    );
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(out.code, 0, "stderr={}\nenv={env:?}", out.stderr);
+    assert_eq!(env["data"]["state"], "success");
+    assert_eq!(env["data"]["required_count"], 1);
+    assert_eq!(env["data"]["success_count"], 1);
+    assert_eq!(env["data"]["checks"].as_array().unwrap().len(), 2);
+    assert_eq!(env["data"]["checks"][1]["required"], false);
 }
 
 fn glab_stub_no_pipeline(version: &str) -> String {
