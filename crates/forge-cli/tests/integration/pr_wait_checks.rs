@@ -202,3 +202,80 @@ fn pr_wait_checks_dry_run_renders_plan_envelope_without_calling_backend() {
     assert_eq!(timeout_ms, 60_000);
     assert_eq!(interval_ms, 5_000);
 }
+
+#[test]
+fn pr_wait_checks_gitlab_api_succeeds_without_version_probe() {
+    let stub = StubEnv::new().glab_stub(
+        r#"#!/bin/sh
+set -e
+case "$1" in
+  "--version")
+    echo "version probe should not run for API-backed wait-checks" >&2
+    exit 99
+    ;;
+  "mr")
+    if [ "$2" = "view" ]; then
+      cat <<'EOF'
+{
+  "iid": 42,
+  "web_url": "https://gitlab.com/group/project/-/merge_requests/42",
+  "source_branch": "feat/sample",
+  "target_branch": "main",
+  "sha": "abc123",
+  "head_pipeline": {
+    "id": 99,
+    "status": "success",
+    "web_url": "https://gitlab.com/group/project/-/pipelines/99"
+  }
+}
+EOF
+      exit 0
+    fi
+    ;;
+  "api")
+    case "$*" in
+      *"projects/group%2Fproject/pipelines/99/jobs?per_page=100"*)
+        cat <<'EOF'
+[
+  {
+    "name": "build",
+    "stage": "test",
+    "status": "success",
+    "allow_failure": false,
+    "web_url": "https://gitlab.com/group/project/-/jobs/1"
+  }
+]
+EOF
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+echo "stub: unexpected glab args: $*" >&2
+exit 99
+"#,
+    );
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "pr",
+            "wait-checks",
+            "42",
+            "--interval",
+            "10ms",
+            "--timeout",
+            "1s",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.pr.checks.v1");
+    assert_eq!(env["data"]["provider"], "gitlab");
+    assert_eq!(env["data"]["state"], "success");
+    assert_eq!(env["data"]["required_count"], 1);
+}

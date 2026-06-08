@@ -1,18 +1,17 @@
-//! GitLab branch of `pr checks` (Task 3.2).
+//! GitLab branch of `pr checks`.
 //!
-//! Spec: `glab` exposes no `--json` flag for pipeline status on the currently
-//! installed minor, so we pin the parser to that exact minor. At op startup we
-//! call `glab --version`, parse the minor (e.g. `glab 1.45.0`); outside the
-//! pinned support range we fail-fast with `UNAVAILABLE 69` and
-//! `error.kind = "glab_version_unsupported"`. Inside, we parse the text
-//! output of `glab ci status -b <branch>` into the same canonical
-//! [`crate::ops::pr_checks::PrChecksPayload`] used by GitHub.
+//! Numeric MR checks prefer structured GitLab API data through `glab api`:
+//! `mr view -F json` provides the MR URL + head pipeline, then the jobs API
+//! provides individual job rows. Branch-only calls without a repo/project path
+//! keep the older `glab ci status -b <branch>` text fallback. The fallback is
+//! still version-pinned because it parses human output.
 
 use std::ffi::OsString;
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess};
 use crate::error::ForgeError;
 use crate::glab_version::{ensure_supported, parse_version_line};
+use crate::ops::gitlab_api;
 use crate::ops::pr_checks::{
     CheckItem, CheckState, PrChecksPayload, aggregate, missing, schema_err,
 };
@@ -51,6 +50,17 @@ pub fn snapshot<R: BackendRunner>(
     ctx: &ProviderContext,
     args: &crate::cli::PrChecksArgs,
 ) -> Result<PrChecksPayload, ForgeError> {
+    if let Some(payload) = snapshot_via_api(runner, ctx, args)? {
+        return Ok(payload);
+    }
+    snapshot_via_text(runner, ctx, args)
+}
+
+fn snapshot_via_text<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    args: &crate::cli::PrChecksArgs,
+) -> Result<PrChecksPayload, ForgeError> {
     probe_version(runner)?;
     let branch = resolve_branch(runner, ctx, &args.id)?;
     let call = build_status_call(ctx, &branch);
@@ -78,6 +88,203 @@ pub fn snapshot<R: BackendRunner>(
     parse_status_text(ctx, &output, args.required_only)
 }
 
+fn snapshot_via_api<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    args: &crate::cli::PrChecksArgs,
+) -> Result<Option<PrChecksPayload>, ForgeError> {
+    if args.id.chars().all(|c| c.is_ascii_digit()) {
+        let mr = fetch_mr_view_json(runner, ctx, &args.id)?;
+        return Ok(snapshot_from_mr_json(runner, ctx, &mr, args.required_only));
+    }
+
+    let Some(project) = gitlab_api::project_path_from_ctx(ctx) else {
+        return Ok(None);
+    };
+    let encoded_project = gitlab_api::encode_project_path(project);
+    let branch = gitlab_api::encode_query_value(&args.id);
+    let path = format!(
+        "projects/{encoded_project}/merge_requests?state=opened&source_branch={branch}&per_page=1"
+    );
+    let out = runner.run(&gitlab_api::api_call(&ctx.host, path))?;
+    let value: serde_json::Value = serde_json::from_str(out.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "GitLab merge request API JSON is invalid",
+            Some(e.to_string()),
+        )
+    })?;
+    let Some(iid) = value
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|mr| mr.get("iid"))
+        .and_then(|v| v.as_u64())
+    else {
+        return Ok(None);
+    };
+    let path = format!("projects/{encoded_project}/merge_requests/{iid}");
+    let out = runner.run(&gitlab_api::api_call(&ctx.host, path))?;
+    let mr: serde_json::Value = serde_json::from_str(out.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "GitLab merge request API JSON is invalid",
+            Some(e.to_string()),
+        )
+    })?;
+    Ok(snapshot_from_mr_json(runner, ctx, &mr, args.required_only))
+}
+
+fn fetch_mr_view_json<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    id: &str,
+) -> Result<serde_json::Value, ForgeError> {
+    let mut argv: Vec<OsString> = vec![
+        OsString::from("mr"),
+        OsString::from("view"),
+        OsString::from(id),
+        OsString::from("-F"),
+        OsString::from("json"),
+    ];
+    ctx.push_repo_override(&mut argv);
+    let out = runner.run(&BackendCall::new(BackendProgram::Glab, argv))?;
+    serde_json::from_str(out.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "glab mr view JSON is invalid",
+            Some(e.to_string()),
+        )
+    })
+}
+
+fn snapshot_from_mr_json<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    mr: &serde_json::Value,
+    required_only: bool,
+) -> Option<PrChecksPayload> {
+    let (host, project) = gitlab_target(ctx, mr)?;
+    let pipeline = mr
+        .get("head_pipeline")
+        .filter(|v| !v.is_null())
+        .or_else(|| mr.get("pipeline").filter(|v| !v.is_null()));
+    let Some(pipeline) = pipeline else {
+        return Some(aggregate(ctx, Vec::new(), required_only, None));
+    };
+
+    if let Some(pipeline_id) = pipeline.get("id").and_then(|v| v.as_u64()) {
+        let encoded_project = gitlab_api::encode_project_path(&project);
+        let path = format!("projects/{encoded_project}/pipelines/{pipeline_id}/jobs?per_page=100");
+        match runner.run(&gitlab_api::api_call(&host, path)) {
+            Ok(out) => match parse_jobs_json(&out) {
+                Ok(jobs) if !jobs.is_empty() => {
+                    return Some(aggregate(ctx, jobs, required_only, None));
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            },
+            Err(ForgeError::BackendUnavailable { .. }) => return None,
+            Err(_) => {}
+        }
+    }
+
+    let checks = pipeline_check_item(pipeline).into_iter().collect();
+    Some(aggregate(ctx, checks, required_only, None))
+}
+
+fn gitlab_target(ctx: &ProviderContext, mr: &serde_json::Value) -> Option<(String, String)> {
+    if let Some(url) = mr.get("web_url").and_then(|v| v.as_str()) {
+        let host = gitlab_api::host_from_url(url)?;
+        let project = gitlab_api::project_path_from_mr_url(url)?;
+        return Some((host, project));
+    }
+    let project = gitlab_api::project_path_from_ctx(ctx)?.to_string();
+    Some((ctx.host.clone(), project))
+}
+
+fn parse_jobs_json(output: &BackendSuccess) -> Result<Vec<CheckItem>, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "GitLab jobs API JSON is invalid",
+            Some(e.to_string()),
+        )
+    })?;
+    let arr = value.as_array().ok_or_else(|| {
+        ForgeError::software(schema_err(), "GitLab jobs API JSON is not an array", None)
+    })?;
+    let mut checks = Vec::new();
+    for job in arr {
+        let Some(status) = job.get("status").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(state) = match_status(status) else {
+            continue;
+        };
+        let name = job
+            .get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| job.get("stage").and_then(|v| v.as_str()))
+            .unwrap_or("job")
+            .to_string();
+        let required = !job
+            .get("allow_failure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        checks.push(CheckItem {
+            name,
+            state: state.as_str(),
+            url: job
+                .get("web_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            conclusion: Some(canonical_status(state)),
+            workflow: job
+                .get("stage")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            required,
+            started_at: job
+                .get("started_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            completed_at: job
+                .get("finished_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        });
+    }
+    Ok(checks)
+}
+
+fn pipeline_check_item(pipeline: &serde_json::Value) -> Option<CheckItem> {
+    let status = pipeline.get("status").and_then(|v| v.as_str())?;
+    let state = match_status(status)?;
+    Some(CheckItem {
+        name: pipeline
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pipeline")
+            .to_string(),
+        state: state.as_str(),
+        url: pipeline
+            .get("web_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        conclusion: Some(canonical_status(state)),
+        workflow: Some("pipeline".to_string()),
+        required: true,
+        started_at: pipeline
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        completed_at: pipeline
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
 /// Verify the installed `glab` is inside the pinned support range. Returns
 /// the parsed minor on success; on out-of-range, returns the typed
 /// `glab_version_unsupported` error.
@@ -96,8 +303,10 @@ pub fn probe_version<R: BackendRunner>(runner: &R) -> Result<(u32, u32, u32), Fo
         ForgeError::unavailable(
             schema_err(),
             "glab_version_unsupported",
-            "installed glab is outside the supported minor range",
-            Some(hint),
+            "installed glab is outside the supported minor range for the branch-only GitLab CI text parser",
+            Some(format!(
+                "{hint} Numeric MR checks use structured GitLab API data when project context is available."
+            )),
         )
     })?;
     Ok(parsed)
@@ -257,7 +466,7 @@ fn match_status(tok: &str) -> Option<CheckState> {
         "canceled" | "cancelled" => Some(CheckState::Cancelled),
         "skipped" => Some(CheckState::Skipped),
         "manual" => Some(CheckState::Neutral),
-        "running" | "pending" | "created" | "scheduled" | "waiting_for_resource" => {
+        "running" | "pending" | "created" | "scheduled" | "preparing" | "waiting_for_resource" => {
             Some(CheckState::Pending)
         }
         _ => None,

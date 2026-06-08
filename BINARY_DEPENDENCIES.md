@@ -28,7 +28,7 @@ These tools are required for common command paths. Each row is anchored to at le
 | `docker` | `docker-tools container *`, `docker-tools run *`, and Docker Compose v2 resolution for `docker-tools compose down` | Required for `docker-tools` Docker-backed commands | `brew install docker` |
 | `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
 | `gh` | `git-cli open *` GitHub helpers, `plan-issue` GitHub I/O, `forge-cli` GitHub backend | Required for GitHub-facing flows | `brew install gh` |
-| `glab` | `forge-cli` GitLab backend and GitLab inbox reads | Required for GitLab-facing `forge-cli` flows | `brew install glab` |
+| `glab` | `forge-cli` GitLab backend, including `glab api` for MR checks/wait/merge and inbox reads | Required for GitLab-facing `forge-cli` flows | `brew install glab` |
 
 ### 1.1 `image-processing` runtime policy
 

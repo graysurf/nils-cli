@@ -32,6 +32,7 @@ use crate::cli::{BINARY, GlobalFlags, PrMergeArgs};
 use crate::config::{ForgeConfig, MergeMethod};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
+use crate::ops::gitlab_api;
 use crate::ops::pr_view;
 use crate::ops::repo_view::{self, RepoViewPayload};
 use crate::ops::required_check_gate::ensure_required_checks_green;
@@ -97,7 +98,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     let delete_branch = if args.keep_branch { false } else { cfg_delete };
 
     if global.dry_run {
-        let call = build_merge_call(&ctx, args.id, method, delete_branch);
+        let call = build_dry_run_merge_call(&ctx, args.id, method, delete_branch);
         let payload = DryRunPayload::new(ctx.provider, &call);
         return Ok(emit_success(
             schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
@@ -185,7 +186,7 @@ fn run_lockdown_chain<R: BackendRunner>(
     ensure_required_checks_green(runner, global, ctx, &args.id.to_string())?;
 
     // All gates clear — invoke the backend.
-    let merge_call = build_merge_call(ctx, args.id, method, delete_branch);
+    let merge_call = build_live_merge_call(ctx, args.id, &pr, method, delete_branch)?;
     invoke_merge_with_idempotency_check(runner, ctx, args.id, &merge_call)?;
 
     // Post-merge re-fetch for merge_sha.
@@ -249,6 +250,70 @@ pub fn build_merge_call(
     BackendCall::new(program, argv)
 }
 
+fn build_dry_run_merge_call(
+    ctx: &ProviderContext,
+    id: u64,
+    method: MergeMethod,
+    delete_branch: bool,
+) -> BackendCall {
+    if matches!(ctx.provider, Provider::GitLab)
+        && let Some(project) = gitlab_api::project_path_from_ctx(ctx)
+    {
+        return build_gitlab_api_merge_call(&ctx.host, project, id, method, delete_branch, None);
+    }
+    build_merge_call(ctx, id, method, delete_branch)
+}
+
+fn build_live_merge_call(
+    ctx: &ProviderContext,
+    id: u64,
+    pr: &PrView,
+    method: MergeMethod,
+    delete_branch: bool,
+) -> Result<BackendCall, ForgeError> {
+    if !matches!(ctx.provider, Provider::GitLab) {
+        return Ok(build_merge_call(ctx, id, method, delete_branch));
+    }
+    let host = gitlab_api::host_from_url(&pr.url).unwrap_or_else(|| ctx.host.clone());
+    let project = gitlab_api::project_path_from_mr_url(&pr.url)
+        .or_else(|| gitlab_api::project_path_from_ctx(ctx).map(str::to_string))
+        .ok_or_else(|| {
+            ForgeError::software(
+                schema_err(),
+                "unable to derive GitLab project path for merge API",
+                Some(format!("url={}", pr.url)),
+            )
+        })?;
+    Ok(build_gitlab_api_merge_call(
+        &host,
+        &project,
+        id,
+        method,
+        delete_branch,
+        pr.head_sha.as_deref(),
+    ))
+}
+
+fn build_gitlab_api_merge_call(
+    host: &str,
+    project: &str,
+    id: u64,
+    method: MergeMethod,
+    delete_branch: bool,
+    head_sha: Option<&str>,
+) -> BackendCall {
+    let encoded_project = gitlab_api::encode_project_path(project);
+    let path = format!("projects/{encoded_project}/merge_requests/{id}/merge");
+    let mut fields = vec![
+        ("squash", matches!(method, MergeMethod::Squash).to_string()),
+        ("should_remove_source_branch", delete_branch.to_string()),
+    ];
+    if let Some(sha) = head_sha.filter(|sha| !sha.is_empty()) {
+        fields.push(("sha", sha.to_string()));
+    }
+    gitlab_api::api_call_with_method_fields(host, "PUT", path, &fields)
+}
+
 fn fetch_pr_view<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -257,6 +322,7 @@ fn fetch_pr_view<R: BackendRunner>(
     let call = pr_view_call(ctx, id);
     let output = runner.run(&call)?;
     let payload = pr_view::parse_view_output(ctx, &output)?;
+    let head_sha = extract_head_sha(ctx, &output);
     Ok(PrView {
         number: payload.number,
         url: payload.url,
@@ -264,6 +330,7 @@ fn fetch_pr_view<R: BackendRunner>(
         base: payload.base,
         head: payload.head,
         state: payload.state.to_string(),
+        head_sha,
     })
 }
 
@@ -393,6 +460,24 @@ fn extract_merge_sha(ctx: &ProviderContext, output: &BackendSuccess) -> Result<S
     })
 }
 
+fn extract_head_sha(ctx: &ProviderContext, output: &BackendSuccess) -> Option<String> {
+    if !matches!(ctx.provider, Provider::GitLab) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).ok()?;
+    value
+        .get("sha")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            value
+                .get("diff_refs")
+                .and_then(|v| v.get("head_sha"))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
 fn enforce_keep_branch_conflict(keep_branch: bool, cfg: &ForgeConfig) -> Result<(), ForgeError> {
     // Conflict surfaces when the user asks to keep the source branch AND the
     // repo config explicitly opts into branch deletion. The implicit default
@@ -471,6 +556,7 @@ struct PrView {
     base: String,
     head: String,
     state: String,
+    head_sha: Option<String>,
 }
 
 #[cfg(test)]
@@ -523,6 +609,28 @@ mod tests {
         assert_eq!(plan[1..3], ["mr".to_string(), "merge".to_string()]);
         assert!(plan.iter().any(|s| s == "--squash"));
         assert!(plan.iter().any(|s| s == "--remove-source-branch"));
+    }
+
+    #[test]
+    fn gitlab_api_merge_call_uses_put_endpoint_and_head_sha() {
+        let call = build_gitlab_api_merge_call(
+            "gitlab.example.com",
+            "group/sub/project",
+            9,
+            MergeMethod::Squash,
+            true,
+            Some("abc123"),
+        );
+        let plan = call.plan_argv();
+        assert!(plan.iter().any(|s| s == "--method"));
+        assert!(plan.iter().any(|s| s == "PUT"));
+        assert!(
+            plan.iter()
+                .any(|s| s == "projects/group%2Fsub%2Fproject/merge_requests/9/merge")
+        );
+        assert!(plan.iter().any(|s| s == "squash=true"));
+        assert!(plan.iter().any(|s| s == "should_remove_source_branch=true"));
+        assert!(plan.iter().any(|s| s == "sha=abc123"));
     }
 
     #[test]

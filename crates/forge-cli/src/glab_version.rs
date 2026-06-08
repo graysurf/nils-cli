@@ -1,11 +1,9 @@
 //! `glab --version` parser and pinned-minor support range.
 //!
-//! Spec / plan §Sprint 3 Task 3.2: `glab` has no JSON output for pipeline
-//! status, so the text parser is pinned to one specific minor. At startup of
-//! any GitLab check op, we call `glab --version`, parse the trio
-//! `(major, minor, patch)`, and reject any install outside the pinned range
-//! with `UNAVAILABLE 69` + `error.kind = "glab_version_unsupported"` plus a
-//! "please upgrade/downgrade glab" hint.
+//! Spec / plan §Sprint 3 Task 3.2: the branch-only `glab ci status` fallback
+//! has no JSON output for pipeline status, so that text parser is pinned to one
+//! specific minor. API-backed numeric MR checks/wait-checks do not call this
+//! guard.
 //!
 //! The pin is `SUPPORTED_MAJOR.SUPPORTED_MINOR.x` — single minor only.
 //! When `glab` ships a new minor that breaks the text parser, bumping these
