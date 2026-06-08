@@ -3,7 +3,7 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: in-progress; tracking issue open.
+- Status: complete; tracking issue closed
 - Target scope: `forge-cli` GitLab provider capability audit and MR delivery
   reliability improvements in `sympoies/nils-cli`.
 - Execution window: Sprint 1 (capability audit and backend contract) -> Sprint
@@ -12,8 +12,9 @@
 - Current task: Sprint 1 ready.
 - Next task: Sprint 1 Task 1.1 - audit the GitLab provider surface.
 - Last updated: 2026-06-08
-- Branch/commit/PR: initial tracker bundle committed as
-  `0d726ede9d97edef1d33af968265d03854a1ddc3`; implementation branch pending.
+- Branch/commit/PR:
+  [sympoies/nils-cli#798](https://github.com/sympoies/nils-cli/pull/798)
+  merged.
 - Source document:
   `docs/plans/2026-06-08-forge-cli-gitlab-capabilities/forge-cli-gitlab-capabilities-discussion-source.md`
 - Plan document:
@@ -51,8 +52,8 @@
 | 2.2 | done | Harden GitLab merge and post-merge verification | pending; GitLab merge mutation switched to glab api PUT after existing gates; cargo test -p nils-forge-cli pr_merge; cargo test -p nils-forge-cli pr_deliver_chain; cargo test -p nils-forge-cli required_check_gate | GitLab merge preserves gate order, source branch cleanup intent, merge SHA readback, and head SHA protection. |
 | 2.3 | done | Normalize diagnostics and version preflight behavior | pending; glab_version_unsupported narrowed to branch-only text parser fallback; cargo test -p nils-forge-cli validations; cargo test -p nils-forge-cli exit_codes_full | API-backed numeric MR paths do not call the version guard; retained fallback error explains scope and API availability. |
 | 3.1 | done | Update documentation and dependency guidance | pending; updated crates/forge-cli/README.md, crates/forge-cli/docs/specs/forge-cli-spec-v1.md, and BINARY_DEPENDENCIES.md | Docs describe capability matrix, API fallback behavior, glab dependency boundary, and diagnostics scope. |
-| 3.2 | in-progress | Validate and deliver the nils-cli PR | pending; targeted forge-cli validation passed; preparing repository local-fast gate; bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast passed | Final validation passed; PR delivery in progress. |
-| 3.3 | pending | Release and runtime-surface follow-up | pending | Release/sync only if the operator needs the improved binary in runtime surfaces. |
+| 3.2 | done | Validate and deliver the nils-cli PR | pending; targeted forge-cli validation passed; preparing repository local-fast gate; bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast passed; PR sympoies/nils-cli#798 merged; provider delivery returned merge sha 4c3ad686393f2787c7b9734669e93e4c819a6f9d | Final validation and PR delivery completed. |
+| 3.3 | done | Release and runtime-surface follow-up | pending; No immediate release or runtime-surface install requested after PR sympoies/nils-cli#798; follow-up remains available through normal release flow; Release/runtime follow-up decision completed: no immediate release or runtime install requested for this run | Conditional release/runtime follow-up evaluated; no action needed for this delivery. |
 
 ## Session Log
 
