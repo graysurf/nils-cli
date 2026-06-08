@@ -730,6 +730,8 @@ pub enum ActivityCommand {
     Commits(ActivityCommitsArgs),
     /// List recent GitHub user activity events.
     Events(ActivityEventsArgs),
+    /// List recent repository/project activity.
+    Feed(ActivityFeedArgs),
     /// Summarize GitHub commit contributions by repository.
     Summary(ActivitySummaryArgs),
 }
@@ -760,6 +762,17 @@ pub struct ActivityEventsArgs {
     /// Use the public-events endpoint even for @me.
     #[arg(long = "public-only", action = ArgAction::SetTrue)]
     pub public_only: bool,
+}
+
+/// `activity feed` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct ActivityFeedArgs {
+    /// Only include activity at or after this date/datetime.
+    #[arg(long, value_name = "DATE_OR_DATETIME")]
+    pub since: Option<String>,
+    /// Cap the number of returned activity records (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub limit: u32,
 }
 
 /// `activity summary` arguments.
@@ -1460,7 +1473,7 @@ mod tests {
 
     #[test]
     fn lists_every_activity_v1_subcommand() {
-        for sub in ["commits", "events", "summary"] {
+        for sub in ["commits", "events", "feed", "summary"] {
             let result = parse(&["activity", sub]);
             assert!(
                 result.is_ok(),
@@ -1506,6 +1519,21 @@ mod tests {
                 assert!(args.public_only);
             }
             other => panic!("expected activity events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activity_feed_parses_since_and_limit() {
+        let cli =
+            parse(&["activity", "feed", "--since", "2026-06-01", "--limit", "9"]).expect("parse");
+        match cli.command {
+            Some(Command::Activity(ActivityArgs {
+                command: Some(ActivityCommand::Feed(args)),
+            })) => {
+                assert_eq!(args.since.as_deref(), Some("2026-06-01"));
+                assert_eq!(args.limit, 9);
+            }
+            other => panic!("expected activity feed, got {other:?}"),
         }
     }
 

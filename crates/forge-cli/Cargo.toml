@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 nils-build-info = { version = "1.0.14", path = "../nils-build-info" }
 libc = "0.2"
 nils-common = { version = "1.0.14", path = "../nils-common", package = "nils-common" }

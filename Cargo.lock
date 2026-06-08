@@ -2054,6 +2054,7 @@ dependencies = [
 name = "nils-forge-cli"
 version = "1.0.14"
 dependencies = [
+ "chrono",
  "clap",
  "clap_complete",
  "libc",

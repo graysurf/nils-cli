@@ -37,7 +37,7 @@ fn activity_cli_help_lists_every_v1_subcommand() {
     let stub = StubEnv::new();
     let out = run_forge_cli(&stub, &["activity", "--help"]);
     assert_eq!(out.code, 0);
-    for sub in ["commits", "events", "summary"] {
+    for sub in ["commits", "events", "feed", "summary"] {
         assert!(
             out.stdout.contains(sub),
             "activity --help missing {sub}: stdout={}",
