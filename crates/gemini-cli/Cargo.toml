@@ -1,6 +1,6 @@
 [package]
 name = "nils-gemini-cli"
-version = "1.0.13"
+version = "1.0.14"
 edition.workspace = true
 license.workspace = true
 
@@ -19,11 +19,11 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.0.13", path = "../nils-build-info" }
+nils-build-info = { version = "1.0.14", path = "../nils-build-info" }
 serde_json = { workspace = true }
-nils-common = { version = "1.0.13", path = "../nils-common", package = "nils-common" }
+nils-common = { version = "1.0.14", path = "../nils-common", package = "nils-common" }
 
 [dev-dependencies]
-nils-test-support = { version = "1.0.13", path = "../nils-test-support" }
+nils-test-support = { version = "1.0.14", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
