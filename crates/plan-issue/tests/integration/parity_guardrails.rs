@@ -2,16 +2,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 use tempfile::TempDir;
 
 use crate::common;
 const DUCK_PLAN: &str = "crates/plan-tooling/tests/fixtures/split_prs/duck-plan.md";
 const SHELL_PARITY_DIR: &str = "tests/fixtures/shell_parity";
-
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
 
 fn shell_fixture(name: &str) -> String {
     let path = PathBuf::from(SHELL_PARITY_DIR).join(name);
@@ -30,7 +25,7 @@ fn normalize_shell_text(text: &str, state_dir: &str) -> String {
 #[test]
 fn parity_shell_help_surface_tracks_current_command_contract() {
     let out = common::run_plan_issue_local(&["--help"]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
     for token in [
         "Commands:",
@@ -51,9 +46,9 @@ fn parity_shell_help_surface_tracks_current_command_contract() {
         "completion            Export shell completion script",
     ] {
         assert!(
-            out.stdout.contains(token),
+            out.stdout_text().contains(token),
             "help output missing token `{token}`\n{}",
-            out.stdout
+            out.stdout_text()
         );
     }
 
@@ -66,9 +61,9 @@ fn parity_shell_help_surface_tracks_current_command_contract() {
         "Bypass markdown payload guard for GitHub body/comment writes",
     ] {
         assert!(
-            out.stdout.contains(token),
+            out.stdout_text().contains(token),
             "help output missing token `{token}`\n{}",
-            out.stdout
+            out.stdout_text()
         );
     }
 }
@@ -76,24 +71,24 @@ fn parity_shell_help_surface_tracks_current_command_contract() {
 #[test]
 fn parity_shell_completion_scripts_emit_expected_headers() {
     let bash_out = common::run_plan_issue(&["completion", "bash"]);
-    assert_eq!(bash_out.code, 0, "stderr: {}", bash_out.stderr);
+    assert_eq!(bash_out.code, 0, "stderr: {}", bash_out.stderr_text());
     assert!(
-        bash_out.stdout.contains("complete -F"),
+        bash_out.stdout_text().contains("complete -F"),
         "{}",
-        bash_out.stdout
+        bash_out.stdout_text()
     );
     assert!(
-        bash_out.stdout.contains("plan-issue"),
+        bash_out.stdout_text().contains("plan-issue"),
         "{}",
-        bash_out.stdout
+        bash_out.stdout_text()
     );
 
     let zsh_out = common::run_plan_issue_local(&["completion", "zsh"]);
-    assert_eq!(zsh_out.code, 0, "stderr: {}", zsh_out.stderr);
+    assert_eq!(zsh_out.code, 0, "stderr: {}", zsh_out.stderr_text());
     assert!(
-        zsh_out.stdout.contains("#compdef plan-issue-local"),
+        zsh_out.stdout_text().contains("#compdef plan-issue-local"),
         "{}",
-        zsh_out.stdout
+        zsh_out.stdout_text()
     );
 }
 
@@ -119,9 +114,9 @@ fn parity_shell_multi_sprint_guide_matches_shell_fixture_after_normalization() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     let actual = payload["payload"]["result"]["guide"]
         .as_str()
         .unwrap_or_default()
@@ -137,9 +132,9 @@ fn parity_shell_multi_sprint_guide_matches_shell_fixture_after_normalization() {
 #[test]
 fn command_guardrails_local_issue_path_error_contains_subcommand_specific_guidance() {
     let out = common::run_plan_issue_local(&["--format", "json", "status-plan", "--issue", "217"]);
-    assert_eq!(out.code, 64, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 64, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "live-command-unavailable");
 
@@ -185,9 +180,9 @@ fn parity_shell_start_comment_template_matches_shell_fixture() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     let comment_path = payload["payload"]["result"]["comment_path"]
         .as_str()
         .expect("comment path");
@@ -212,8 +207,8 @@ fn command_guardrails_close_plan_requires_body_file_in_dry_run_mode() {
         "https://github.com/sympoies/nils-cli/issues/217#issuecomment-5000000001",
     ]);
 
-    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "missing-body-file");
     assert_eq!(
@@ -241,8 +236,8 @@ fn command_guardrails_close_plan_rejects_body_file_without_dry_run() {
         "https://github.com/sympoies/nils-cli/issues/217#issuecomment-5000000002",
     ]);
 
-    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "conflicting-issue-source");
     assert_eq!(
@@ -269,8 +264,8 @@ fn command_guardrails_close_plan_requires_github_comment_url_format() {
         "https://example.com/not-github-comment",
     ]);
 
-    assert_eq!(out.code, 64, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 64, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "invalid-approval-comment-url");
     assert_eq!(
@@ -293,8 +288,8 @@ fn command_guardrails_multi_sprint_guide_rejects_reverse_range() {
         "1",
     ]);
 
-    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "invalid-sprint-range");
     assert_eq!(
@@ -317,9 +312,9 @@ fn json_contract_multi_sprint_guide_success_envelope_is_stable() {
         "--to-sprint",
         "2",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     assert_eq!(
         payload["schema_version"],
         "plan-issue.multi.sprint.guide.v1"
@@ -336,14 +331,14 @@ fn json_contract_multi_sprint_guide_success_envelope_is_stable() {
             .as_str()
             .is_some_and(|guide| guide.contains("MULTI_SPRINT_GUIDE_BEGIN")),
         "{}",
-        out.stdout
+        out.stdout_text()
     );
     assert!(
         payload["payload"]["result"]["guide"]
             .as_str()
             .is_some_and(|guide| guide.contains("MODE=DRY_RUN_LIVE_BINARY")),
         "{}",
-        out.stdout
+        out.stdout_text()
     );
 }
 
@@ -359,14 +354,18 @@ fn json_contract_guardrail_error_envelope_is_stable() {
         "--approved-comment-url",
         "https://github.com/sympoies/nils-cli/issues/217#issuecomment-5000000003",
     ]);
-    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     assert_eq!(payload["schema_version"], "plan-issue.close.plan.v1");
     assert_eq!(payload["command"], "close-plan");
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "missing-body-file");
-    assert!(payload["error"]["message"].is_string(), "{}", out.stdout);
+    assert!(
+        payload["error"]["message"].is_string(),
+        "{}",
+        out.stdout_text()
+    );
 }
 
 #[test]
@@ -382,9 +381,9 @@ fn json_contract_local_binary_success_envelope_is_stable() {
         "--pr-grouping",
         "per-sprint",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     assert_eq!(payload["command"], "build-task-spec");
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["payload"]["binary"], "plan-issue-local");

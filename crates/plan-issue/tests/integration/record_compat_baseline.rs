@@ -22,10 +22,6 @@ use plan_issue::tracking;
 
 use crate::common;
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 fn v2_comment_body(role: &str, profile: &str, data: Value) -> String {
     let envelope = json!({
         "schema": PAYLOAD_SCHEMA_V2,
@@ -53,14 +49,15 @@ fn record_subcommand_help_keeps_released_command_surface() {
     ] {
         let out = common::run_plan_issue(&["record", sub, "--help"]);
         assert_eq!(
-            out.code, 0,
+            out.code,
+            0,
             "record {sub} --help should exit success; stderr: {}",
-            out.stderr
+            out.stderr_text()
         );
         assert!(
-            out.stdout.contains(sub),
+            out.stdout_text().contains(sub),
             "record {sub} --help stdout missing subcommand name: {}",
-            out.stdout
+            out.stdout_text()
         );
     }
 }
@@ -75,27 +72,29 @@ fn lifecycle_reader_help_declares_no_old_state_payload_contract() {
     ] {
         let out = common::run_plan_issue(args);
         assert_eq!(
-            out.code, 0,
+            out.code,
+            0,
             "help should exit success for {:?}; stderr: {}",
-            args, out.stderr
+            args,
+            out.stderr_text()
         );
         assert!(
-            out.stdout.contains("active payload contract"),
+            out.stdout_text().contains("active payload contract"),
             "help should name the active payload contract for {:?}: {}",
             args,
-            out.stdout
+            out.stdout_text()
         );
         assert!(
-            out.stdout.contains("one-off migration/repair"),
+            out.stdout_text().contains("one-off migration/repair"),
             "help should route old state payloads to one-off migration/repair for {:?}: {}",
             args,
-            out.stdout
+            out.stdout_text()
         );
         assert!(
-            out.stdout.contains("no long-term v2 reader"),
+            out.stdout_text().contains("no long-term v2 reader"),
             "help should reject long-term v2 reader scope for {:?}: {}",
             args,
-            out.stdout
+            out.stdout_text()
         );
     }
 }
@@ -167,8 +166,8 @@ fn record_audit_success_envelope_shape_is_stable() {
         comments.to_str().expect("comments"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let envelope = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let envelope = out.stdout_json();
     assert_eq!(
         envelope["schema_version"], "plan-issue.record.audit.v2",
         "schema_version drift; full envelope: {envelope}"
@@ -188,9 +187,10 @@ fn record_audit_success_envelope_shape_is_stable() {
 fn record_audit_failure_returns_usage_exit_for_missing_arg() {
     let out = common::run_plan_issue(&["--format", "json", "record", "audit"]);
     assert_eq!(
-        out.code, 64,
+        out.code,
+        64,
         "record audit without args should exit USAGE (64); stderr: {}",
-        out.stderr
+        out.stderr_text()
     );
 }
 
@@ -216,7 +216,7 @@ fn record_audit_runtime_failure_envelope_is_stable() {
     ]);
 
     assert_ne!(out.code, 0, "missing fixture must not silently succeed");
-    let envelope = json_stdout(&out);
+    let envelope = out.stdout_json();
     assert_eq!(envelope["schema_version"], "plan-issue.record.audit.v2");
     assert_eq!(envelope["command"], "record.audit");
     assert_eq!(envelope["status"], "error");
@@ -272,9 +272,10 @@ fn tracking_run_state_schema_constants_are_stable() {
 fn plan_issue_local_keeps_record_subcommand_help() {
     let out = common::run_plan_issue_local(&["record", "--help"]);
     assert_eq!(
-        out.code, 0,
+        out.code,
+        0,
         "plan-issue-local record --help should exit success; stderr: {}",
-        out.stderr
+        out.stderr_text()
     );
     for sub in [
         "open",
@@ -285,9 +286,9 @@ fn plan_issue_local_keeps_record_subcommand_help() {
         "audit",
     ] {
         assert!(
-            out.stdout.contains(sub),
+            out.stdout_text().contains(sub),
             "plan-issue-local record --help missing `{sub}`: {}",
-            out.stdout
+            out.stdout_text()
         );
     }
 }

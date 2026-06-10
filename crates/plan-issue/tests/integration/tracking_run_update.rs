@@ -6,16 +6,11 @@
 use std::fs;
 
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 use tempfile::TempDir;
 
 use plan_issue::tracking::run_state::{self, RUN_STATE_SCHEMA};
 
 use crate::common;
-
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
 
 #[test]
 fn tracking_run_update_init_writes_run_state_and_events() {
@@ -43,8 +38,8 @@ fn tracking_run_update_init_writes_run_state_and_events() {
         "--out",
         run_state_path.to_str().expect("path"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let envelope = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let envelope = out.stdout_json();
     assert_eq!(envelope["command"], "tracking.run.init");
     let result = &envelope["payload"]["result"];
     assert_eq!(result["run_id"], "run-test");
@@ -81,7 +76,7 @@ fn tracking_run_init_defaults_now_to_wallclock_when_now_omitted() {
         "--out",
         run_state_path.to_str().expect("path"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
     let run = run_state::read_run_state(&run_state_path).expect("read");
     assert_ne!(
@@ -96,7 +91,7 @@ fn tracking_run_init_defaults_now_to_wallclock_when_now_omitted() {
         run.created_at
     );
 
-    let envelope = json_stdout(&out);
+    let envelope = out.stdout_json();
     let run_id = envelope["payload"]["result"]["run_id"]
         .as_str()
         .expect("run_id");
@@ -130,7 +125,7 @@ fn tracking_run_update_changes_phase_and_appends_event() {
         "--out",
         run_state_path.to_str().expect("path"),
     ]);
-    assert_eq!(out.code, 0, "init stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "init stderr: {}", out.stderr_text());
 
     // Update phase + validation.
     let out = common::run_plan_issue(&[
@@ -154,8 +149,8 @@ fn tracking_run_update_changes_phase_and_appends_event() {
         "--now",
         "2026-05-26T00:01:00Z",
     ]);
-    assert_eq!(out.code, 0, "update stderr: {}", out.stderr);
-    let envelope = json_stdout(&out);
+    assert_eq!(out.code, 0, "update stderr: {}", out.stderr_text());
+    let envelope = out.stdout_json();
     let result = &envelope["payload"]["result"];
     assert_eq!(result["phase"], "validating");
     let changed: Vec<&str> = result["changed"]
@@ -208,7 +203,7 @@ fn tracking_run_update_records_rich_review_evidence() {
         "--out",
         run_state_path.to_str().expect("path"),
     ]);
-    assert_eq!(out.code, 0, "init stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "init stderr: {}", out.stderr_text());
 
     let out = common::run_plan_issue(&[
         "--format",
@@ -231,7 +226,7 @@ fn tracking_run_update_records_rich_review_evidence() {
         "--now",
         "2026-05-26T00:02:00Z",
     ]);
-    assert_eq!(out.code, 0, "update stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "update stderr: {}", out.stderr_text());
 
     let run = run_state::read_run_state(&run_state_path).expect("read");
     let review = run.review.expect("review summary");
@@ -264,7 +259,7 @@ fn tracking_run_update_rejects_invalid_run_state() {
         "validating",
     ]);
     assert_ne!(out.code, 0, "should fail");
-    let envelope = json_stdout(&out);
+    let envelope = out.stdout_json();
     assert_eq!(envelope["error"]["code"], "tracking-run-update-read-failed");
 }
 
@@ -272,6 +267,6 @@ fn tracking_run_update_rejects_invalid_run_state() {
 fn tracking_run_update_help_lists_run_init_and_update() {
     let out = common::run_plan_issue(&["tracking", "run", "--help"]);
     assert_eq!(out.code, 0);
-    assert!(out.stdout.contains("init"));
-    assert!(out.stdout.contains("update"));
+    assert!(out.stdout_text().contains("init"));
+    assert!(out.stdout_text().contains("update"));
 }

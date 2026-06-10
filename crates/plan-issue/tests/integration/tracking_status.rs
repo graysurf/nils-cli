@@ -49,10 +49,6 @@ fn write_fixture(
     tmp
 }
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 #[test]
 fn tracking_status_emits_stable_envelope_for_fixture_input() {
     let fixture = write_fixture(&[
@@ -86,8 +82,8 @@ fn tracking_status_emits_stable_envelope_for_fixture_input() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let envelope = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let envelope = out.stdout_json();
     assert_eq!(envelope["schema_version"], "plan-issue.tracking.status.v1");
     assert_eq!(envelope["command"], "tracking.status");
     assert_eq!(envelope["status"], "ok");
@@ -137,8 +133,8 @@ fn tracking_status_blocked_state_recommends_resolve_blocker() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert_eq!(result["fsm_state"], "RECORD_BLOCKED");
     assert_eq!(result["recommended_action"], "resolve_blocker");
     assert!(result["blocked_reason"].is_string());
@@ -185,8 +181,8 @@ fn tracking_status_reports_stale_run_state_when_issue_closed() {
         "--run-state",
         run_state_path.to_str().expect("run-state"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert_eq!(result["fsm_state"], "RECORD_CLOSED");
     let warnings: Vec<&str> = result["warnings"]
         .as_array()
@@ -248,8 +244,8 @@ fn tracking_status_ready_for_close_emits_run_close_ready() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert_eq!(result["fsm_state"], "RECORD_READY_FOR_CLOSE");
     assert_eq!(result["recommended_action"], "run_close_ready");
     assert!(
@@ -277,8 +273,8 @@ fn tracking_status_expect_visible_flows_through_to_visible_lint() {
         fixture.path().to_str().expect("fixture"),
         "--expect-visible",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert!(result["visible"].is_object(), "visible missing: {result}");
     assert_eq!(result["visible"]["overall_pass"], false);
     let codes: Vec<&str> = result["visible"]["codes"]
@@ -296,10 +292,10 @@ fn tracking_status_expect_visible_flows_through_to_visible_lint() {
 #[test]
 fn tracking_status_help_lists_status_subcommand() {
     let out = common::run_plan_issue(&["tracking", "--help"]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(
-        out.stdout.contains("status"),
+        out.stdout_text().contains("status"),
         "missing status: {}",
-        out.stdout
+        out.stdout_text()
     );
 }

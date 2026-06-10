@@ -18,10 +18,6 @@ use plan_issue::lifecycle_record::{self, SnapshotData};
 
 use crate::common;
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 fn snapshot_comment(kind: LifecycleCommentKind, path: &str, commit: &str, content: &str) -> String {
     let snapshot = SnapshotData {
         path: path.to_string(),
@@ -94,7 +90,7 @@ fn record_restore_round_trips_source_and_plan() {
         "--out",
         out.to_str().unwrap(),
     ]);
-    assert_eq!(result.code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.code, 0, "stderr: {}", result.stderr_text());
 
     let restored_source =
         fs::read_to_string(out.join("docs/plans/foo/foo-discussion-source.md")).expect("source");
@@ -105,7 +101,7 @@ fn record_restore_round_trips_source_and_plan() {
     );
     assert_eq!(restored_plan, plan_content, "plan round-trips verbatim");
 
-    let envelope = json_stdout(&result);
+    let envelope = result.stdout_json();
     let restored = envelope["payload"]["result"]["restored"]
         .as_array()
         .expect("restored array");
@@ -157,7 +153,7 @@ fn record_restore_preserves_nested_details_in_content() {
         "--out",
         out.to_str().unwrap(),
     ]);
-    assert_eq!(result.code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.code, 0, "stderr: {}", result.stderr_text());
 
     let restored =
         fs::read_to_string(out.join("docs/plans/foo/foo-discussion-source.md")).expect("source");
@@ -209,13 +205,13 @@ fn record_restore_selects_latest_snapshot_per_role() {
         "--out",
         out.to_str().unwrap(),
     ]);
-    assert_eq!(result.code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.code, 0, "stderr: {}", result.stderr_text());
 
     let restored =
         fs::read_to_string(out.join("docs/plans/foo/foo-discussion-source.md")).expect("source");
     assert_eq!(restored, "NEW CONTENT\n", "latest source snapshot wins");
 
-    let envelope = json_stdout(&result);
+    let envelope = result.stdout_json();
     let source_commit = envelope["payload"]["result"]["restored"]
         .as_array()
         .unwrap()
@@ -253,12 +249,12 @@ fn record_restore_errors_on_missing_required_role() {
         out.to_str().unwrap(),
     ]);
     assert_ne!(result.code, 0, "missing role must fail");
-    let combined = format!("{}{}", result.stdout, result.stderr);
+    let combined = format!("{}{}", result.stdout_text(), result.stderr_text());
     assert!(
         combined.contains("record-restore-missing-role") && combined.contains("plan"),
         "expected missing-role error naming plan: stdout={} stderr={}",
-        result.stdout,
-        result.stderr
+        result.stdout_text(),
+        result.stderr_text()
     );
     assert!(
         !out.join("docs/plans/foo/foo-discussion-source.md").exists(),
@@ -308,7 +304,7 @@ fn record_restore_refuses_overwrite_without_force() {
         out.to_str().unwrap(),
     ]);
     assert_ne!(refused.code, 0, "overwrite must be refused without --force");
-    let combined = format!("{}{}", refused.stdout, refused.stderr);
+    let combined = format!("{}{}", refused.stdout_text(), refused.stderr_text());
     assert!(
         combined.contains("record-restore-would-overwrite"),
         "expected would-overwrite error: {combined}"
@@ -331,7 +327,7 @@ fn record_restore_refuses_overwrite_without_force() {
         "--out",
         out.to_str().unwrap(),
     ]);
-    assert_eq!(forced.code, 0, "stderr: {}", forced.stderr);
+    assert_eq!(forced.code, 0, "stderr: {}", forced.stderr_text());
     assert_eq!(
         fs::read_to_string(&existing).unwrap(),
         "RESTORED PLAN\n",
@@ -342,15 +338,15 @@ fn record_restore_refuses_overwrite_without_force() {
 #[test]
 fn record_restore_help_mentions_out_and_offline_inputs() {
     let out = common::run_plan_issue(&["record", "restore", "--help"]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(
-        out.stdout.contains("--out"),
+        out.stdout_text().contains("--out"),
         "help missing --out: {}",
-        out.stdout
+        out.stdout_text()
     );
     assert!(
-        out.stdout.contains("--comments-json"),
+        out.stdout_text().contains("--comments-json"),
         "help missing --comments-json: {}",
-        out.stdout
+        out.stdout_text()
     );
 }

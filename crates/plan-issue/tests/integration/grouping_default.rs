@@ -4,14 +4,9 @@
 use std::fs;
 
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 use tempfile::TempDir;
 
 use crate::common;
-
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
 
 /// Plan declares `PR grouping intent: per-sprint` for sprint 1 — start-sprint
 /// invoked without any grouping flag should infer `--strategy=auto` and
@@ -73,16 +68,16 @@ Plan that declares per-sprint pr-grouping intent so plan-issue can default
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(
-        out.stderr.contains(
+        out.stderr_text().contains(
             "inferred --strategy=auto; --default-pr-grouping=per-sprint from plan sprint S1"
         ),
         "stderr should contain the inferred-defaults hint: {:?}",
-        out.stderr
+        out.stderr_text()
     );
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     assert_eq!(
         payload["payload"]["result"]["inferred_grouping_defaults"], "auto/per-sprint",
         "result should record the inferred grouping defaults"
@@ -175,15 +170,15 @@ auto/group without explicit flags and produce a single combined PR group.
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(
-        out.stderr
+        out.stderr_text()
             .contains("inferred --strategy=auto; --default-pr-grouping=group from plan sprint S2"),
         "stderr should contain the inferred-defaults hint: {:?}",
-        out.stderr
+        out.stderr_text()
     );
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     let pr_groups = payload["payload"]["result"]["pr_groups"]
         .as_array()
         .expect("pr_groups");
@@ -258,14 +253,14 @@ Plan declares `group` intent for sprint 1 but the operator passes
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(
-        !out.stderr.contains("inferred --strategy"),
+        !out.stderr_text().contains("inferred --strategy"),
         "no inference hint expected when CLI overrides: {:?}",
-        out.stderr
+        out.stderr_text()
     );
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     assert!(
         payload["payload"]["result"]["inferred_grouping_defaults"].is_null(),
         "result.inferred_grouping_defaults must be null when CLI flags override: {}",
@@ -332,11 +327,11 @@ infer; the existing validation should still demand `--pr-grouping`.
         out.code, 1,
         "expected failure when plan is silent and CLI passes no flags"
     );
-    let combined = format!("{}{}", out.stdout, out.stderr);
+    let combined = format!("{}{}", out.stdout_text(), out.stderr_text());
     assert!(
         combined.contains("--strategy deterministic requires --pr-grouping"),
         "should still surface the standard grouping requirement; stdout={} stderr={}",
-        out.stdout,
-        out.stderr
+        out.stdout_text(),
+        out.stderr_text()
     );
 }

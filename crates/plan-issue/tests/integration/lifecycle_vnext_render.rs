@@ -26,10 +26,6 @@ use plan_issue::lifecycle_vnext::visible_lint::{LintHints, lint_visible};
 
 use crate::common;
 
-fn json_stdout(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("json stdout")
-}
-
 fn write_payload(dir: &Path, name: &str, data: Value) -> std::path::PathBuf {
     let path = dir.join(name);
     fs::write(&path, data.to_string()).expect("write payload");
@@ -81,8 +77,8 @@ fn post_dry_run(kind: &str, payload_path: &Path, extra: &[&str]) -> Value {
     ];
     args.extend_from_slice(extra);
     let out = common::run_plan_issue_local(&args);
-    assert_eq!(out.code, 0, "kind {kind} stderr: {}", out.stderr);
-    json_stdout(&out.stdout)
+    assert_eq!(out.code, 0, "kind {kind} stderr: {}", out.stderr_text());
+    out.stdout_json()
 }
 
 #[test]
@@ -289,7 +285,7 @@ fn lifecycle_vnext_render_source_and_plan_via_record_attach() {
         &CmdOptions::new().with_cwd(repo.path()),
     );
     assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
-    let parsed = json_stdout(&out.stdout_text());
+    let parsed = out.stdout_json();
     let comments = &parsed["payload"]["result"]["preview"]["comments"];
 
     for (role_name, role_id) in [("source", PayloadRole::Source), ("plan", PayloadRole::Plan)] {

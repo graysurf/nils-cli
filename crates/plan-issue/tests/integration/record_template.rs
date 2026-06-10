@@ -12,18 +12,14 @@ use serde_json::Value;
 
 use crate::common;
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 #[test]
 fn record_template_help_lists_template_under_record() {
     let out = common::run_plan_issue(&["record", "--help"]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(
-        out.stdout.contains("template"),
+        out.stdout_text().contains("template"),
         "record --help missing template subcommand: {}",
-        out.stdout
+        out.stdout_text()
     );
 }
 
@@ -50,8 +46,8 @@ fn record_template_markdown_renders_every_role() {
             "--shape",
             "markdown",
         ]);
-        assert_eq!(out.code, 0, "role {role} stderr: {}", out.stderr);
-        let envelope = json_stdout(&out);
+        assert_eq!(out.code, 0, "role {role} stderr: {}", out.stderr_text());
+        let envelope = out.stdout_json();
         let template = envelope["payload"]["result"]["template"]
             .as_str()
             .unwrap_or_default()
@@ -95,8 +91,8 @@ fn record_template_json_renders_every_role() {
             "--shape",
             "json",
         ]);
-        assert_eq!(out.code, 0, "role {role} stderr: {}", out.stderr);
-        let envelope = json_stdout(&out);
+        assert_eq!(out.code, 0, "role {role} stderr: {}", out.stderr_text());
+        let envelope = out.stdout_json();
         let template = envelope["payload"]["result"]["template"]
             .as_str()
             .unwrap_or_default();
@@ -114,7 +110,7 @@ fn record_template_state_markdown_includes_task_ledger() {
         "--format", "json", "record", "template", "--kind", "state", "--shape", "markdown",
     ]);
     assert_eq!(out.code, 0);
-    let envelope = json_stdout(&out);
+    let envelope = out.stdout_json();
     let template = envelope["payload"]["result"]["template"]
         .as_str()
         .unwrap_or_default();
@@ -137,7 +133,7 @@ fn record_template_envelope_shape_is_stable() {
         "markdown",
     ]);
     assert_eq!(out.code, 0);
-    let envelope = json_stdout(&out);
+    let envelope = out.stdout_json();
     assert_eq!(envelope["schema_version"], "plan-issue.record.template.v2");
     assert_eq!(envelope["command"], "record.template");
     assert_eq!(envelope["status"], "ok");
@@ -171,8 +167,13 @@ fn record_template_dispatch_profile_renders_for_every_role() {
             "--shape",
             "markdown",
         ]);
-        assert_eq!(out.code, 0, "dispatch role {role} stderr: {}", out.stderr);
-        let envelope = json_stdout(&out);
+        assert_eq!(
+            out.code,
+            0,
+            "dispatch role {role} stderr: {}",
+            out.stderr_text()
+        );
+        let envelope = out.stdout_json();
         let template = envelope["payload"]["result"]["template"]
             .as_str()
             .unwrap_or_default();

@@ -28,10 +28,6 @@ fn v2_comment_body(role: &str, profile: &str, data: Value) -> String {
     )
 }
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 #[test]
 fn lifecycle_record_audit_returns_typed_v2_evidence_and_ignores_v1_markers() {
     let tmp = TempDir::new().expect("tmp");
@@ -90,8 +86,8 @@ fn lifecycle_record_audit_returns_typed_v2_evidence_and_ignores_v1_markers() {
         comments.to_str().expect("comments path"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let audit = &payload["payload"]["result"]["audit"];
     assert_eq!(audit["recognized_count"], 3);
     assert_eq!(
@@ -287,8 +283,8 @@ fn lifecycle_record_audit_latest_marker_per_role_wins_by_timestamp() {
         "--comments-json",
         comments_path.to_str().expect("path"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let audit = &payload["payload"]["result"]["audit"];
     assert_eq!(audit["evidence"]["state"]["status"], "complete");
     assert_eq!(
@@ -323,8 +319,8 @@ fn lifecycle_record_audit_reports_stable_missing_required_codes() {
         "--comments-json",
         comments_path.to_str().expect("path"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let audit = &payload["payload"]["result"]["audit"];
     let missing = audit["missing_required"]
         .as_array()

@@ -9,10 +9,6 @@ use crate::common;
 const PLAN_PATH: &str =
     "crates/plan-issue/tests/fixtures/plans/plan-issue-rust-cli-full-delivery-plan.md";
 
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
-
 fn result_path(payload: &Value, key: &str) -> String {
     payload["payload"]["result"][key]
         .as_str()
@@ -43,7 +39,7 @@ fn render_issue_body_for_local_plan(tmp: &TempDir, state_dir: &str) -> String {
         ],
         &[("PLAN_ISSUE_HOME", state_dir)],
     );
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     issue_body_s
 }
 
@@ -73,8 +69,8 @@ fn task_spec_generation_build_task_spec_writes_grouped_rows() {
         &out_path_s,
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["command"], "build-task-spec");
     assert_eq!(payload["status"], "ok");
 
@@ -119,7 +115,7 @@ fn task_spec_generation_creates_missing_output_directory() {
         &out_path_s,
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     let rendered = fs::read_to_string(&out_path).expect("read task-spec");
     assert!(
         rendered.starts_with("# task_id\tsummary\tbranch\tworktree\towner\tnotes\tpr_group\n"),
@@ -151,8 +147,8 @@ fn strategy_auto_partial_mapping_allows_unmapped_rows() {
         &out_path_s,
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["command"], "build-task-spec");
     assert_eq!(payload["status"], "ok");
 
@@ -219,7 +215,7 @@ fn render_issue_body_start_plan_writes_issue_body_artifact() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     let rendered = fs::read_to_string(&issue_body).expect("read issue body");
     assert!(
         rendered.starts_with("# Plan: Rust Plan-Issue CLI Full Delivery\n\n## Overview\n"),
@@ -293,7 +289,7 @@ fn render_issue_body_start_plan_creates_missing_issue_body_directory() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     let rendered = fs::read_to_string(&issue_body).expect("read issue body");
     assert!(rendered.contains("## Task Decomposition"), "{rendered}");
 }
@@ -319,8 +315,8 @@ fn local_start_plan_returns_deterministic_issue_placeholder() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["command"], "start-plan");
     assert_eq!(payload["payload"]["binary"], "plan-issue-local");
     assert_eq!(payload["payload"]["result"]["issue_number"], 999);
@@ -378,7 +374,7 @@ fn render_issue_body_start_plan_falls_back_when_preface_sections_missing() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     let rendered = fs::read_to_string(&issue_body).expect("read issue body");
     assert!(
         rendered.starts_with("# Plan: Minimal fallback"),
@@ -439,7 +435,7 @@ fn task_decomposition_writer_and_parser_use_one_sanitized_schema() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(start_out.code, 0, "stderr: {}", start_out.stderr);
+    assert_eq!(start_out.code, 0, "stderr: {}", start_out.stderr_text());
 
     let rendered = fs::read_to_string(&issue_body).expect("read issue body");
     assert!(
@@ -455,8 +451,8 @@ fn task_decomposition_writer_and_parser_use_one_sanitized_schema() {
         "--body-file",
         &issue_body_s,
     ]);
-    assert_eq!(status_out.code, 0, "stderr: {}", status_out.stderr);
-    let payload = parse_json(&status_out.stdout);
+    assert_eq!(status_out.code, 0, "stderr: {}", status_out.stderr_text());
+    let payload = status_out.stdout_json();
     assert_eq!(payload["command"], "status-plan");
     assert_eq!(payload["payload"]["result"]["task_count"], 1);
 }
@@ -497,8 +493,8 @@ fn render_issue_body_start_sprint_writes_start_comment_with_modes() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let comment_path = result_path(&payload, "comment_path");
     let comment = fs::read_to_string(&comment_path).expect("read sprint comment");
     assert!(comment.contains("## Sprint 3 Start"), "{comment}");
@@ -562,8 +558,8 @@ fn render_issue_body_start_sprint_group_auto_single_pr_lane_uses_per_sprint_mode
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let comment_path = result_path(&payload, "comment_path");
     let comment = fs::read_to_string(&comment_path).expect("read sprint comment");
     assert!(
@@ -638,8 +634,8 @@ fn render_issue_body_start_sprint_group_deterministic_single_pr_lane_uses_per_sp
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let comment_path = result_path(&payload, "comment_path");
     let comment = fs::read_to_string(&comment_path).expect("read sprint comment");
     assert!(
@@ -706,8 +702,8 @@ fn start_sprint_rejects_deterministic_grouping_mismatch_with_plan_metadata() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "task-spec-generation-failed");
     assert!(
@@ -715,7 +711,7 @@ fn start_sprint_rejects_deterministic_grouping_mismatch_with_plan_metadata() {
             .as_str()
             .is_some_and(|value| value.contains("plan metadata/CLI grouping mismatch")),
         "{}",
-        out.stdout
+        out.stdout_text()
     );
 }
 
@@ -776,12 +772,12 @@ fn write_subagent_prompts_groups_tasks_by_runtime_lane() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let prompt_files = payload["payload"]["result"]["subagent_prompt_files"]
         .as_array()
         .expect("prompt files");
-    assert_eq!(prompt_files.len(), 2, "{}", out.stdout);
+    assert_eq!(prompt_files.len(), 2, "{}", out.stdout_text());
 
     let prompt_path = prompt_files[0].as_str().expect("prompt path");
     assert!(prompt_path.ends_with("/S1T1.md"), "{prompt_path}");
@@ -813,8 +809,13 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
-    let start_plan_json = parse_json(&start_plan_out.stdout);
+    assert_eq!(
+        start_plan_out.code,
+        0,
+        "stderr: {}",
+        start_plan_out.stderr_text()
+    );
+    let start_plan_json = start_plan_out.stdout_json();
     let issue_body_path = result_path(&start_plan_json, "issue_body_path");
     assert!(std::path::Path::new(&issue_body_path).is_file());
 
@@ -836,11 +837,12 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(
-        start_sprint_out.code, 0,
+        start_sprint_out.code,
+        0,
         "stderr: {}",
-        start_sprint_out.stderr
+        start_sprint_out.stderr_text()
     );
-    let start_sprint_json = parse_json(&start_sprint_out.stdout);
+    let start_sprint_json = start_sprint_out.stdout_json();
     let start_comment_path = result_path(&start_sprint_json, "comment_path");
     assert!(std::path::Path::new(&start_comment_path).is_file());
 
@@ -864,11 +866,12 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(
-        ready_sprint_out.code, 0,
+        ready_sprint_out.code,
+        0,
         "stderr: {}",
-        ready_sprint_out.stderr
+        ready_sprint_out.stderr_text()
     );
-    let ready_sprint_json = parse_json(&ready_sprint_out.stdout);
+    let ready_sprint_json = ready_sprint_out.stdout_json();
     let ready_comment_path = result_path(&ready_sprint_json, "comment_path");
     assert!(std::path::Path::new(&ready_comment_path).is_file());
 
@@ -892,11 +895,12 @@ fn local_flow_plan_issue_local_dry_run_end_to_end_generates_artifacts() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(
-        accept_sprint_out.code, 0,
+        accept_sprint_out.code,
+        0,
         "stderr: {}",
-        accept_sprint_out.stderr
+        accept_sprint_out.stderr_text()
     );
-    let accept_sprint_json = parse_json(&accept_sprint_out.stdout);
+    let accept_sprint_json = accept_sprint_out.stdout_json();
     let accepted_comment_path = result_path(&accept_sprint_json, "comment_path");
     let accepted_comment =
         fs::read_to_string(&accepted_comment_path).expect("read accepted comment");
@@ -931,8 +935,8 @@ fn local_flow_status_plan_body_file_reports_counts_and_comment_preview() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let result = &payload["payload"]["result"];
     assert_eq!(payload["command"], "status-plan");
     assert_eq!(payload["status"], "ok");
@@ -941,7 +945,7 @@ fn local_flow_status_plan_body_file_reports_counts_and_comment_preview() {
             .as_str()
             .is_some_and(|source| source.starts_with("body-file:")),
         "{}",
-        out.stdout
+        out.stdout_text()
     );
     assert!(result["task_count"].as_u64().unwrap_or_default() > 0);
     assert!(
@@ -956,7 +960,7 @@ fn local_flow_status_plan_body_file_reports_counts_and_comment_preview() {
             .as_str()
             .is_some_and(|preview| preview.contains("## Plan Status Snapshot")),
         "{}",
-        out.stdout
+        out.stdout_text()
     );
 }
 
@@ -986,8 +990,8 @@ fn local_flow_ready_plan_body_file_accepts_summary_file_without_comment() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let result = &payload["payload"]["result"];
     assert_eq!(payload["command"], "ready-plan");
     assert_eq!(payload["status"], "ok");
@@ -1023,8 +1027,8 @@ fn local_flow_ready_plan_missing_summary_file_returns_error() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
 
-    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["command"], "ready-plan");
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "summary-read-failed");
@@ -1033,6 +1037,6 @@ fn local_flow_ready_plan_missing_summary_file_returns_error() {
             .as_str()
             .is_some_and(|msg| msg.contains("failed to read summary file")),
         "{}",
-        out.stdout
+        out.stdout_text()
     );
 }

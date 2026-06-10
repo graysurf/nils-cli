@@ -29,10 +29,6 @@ fn v2_comment_body(role: &str, profile: &str, data: Value) -> String {
     )
 }
 
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout is valid JSON")
-}
-
 fn live_record_gh_stub() -> &'static str {
     r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -85,14 +81,26 @@ fn assert_comment_visible_prefix(body: &str, expected: &str) {
     );
 }
 
-fn assert_provider_payload_privacy_error(out: &common::CmdOut, code: &str, home_suggestion: &str) {
-    assert_eq!(out.code, 1, "stdout={} stderr={}", out.stdout, out.stderr);
-    let parsed = parse_json(&out.stdout);
+fn assert_provider_payload_privacy_error(
+    out: &nils_test_support::cmd::CmdOutput,
+    code: &str,
+    home_suggestion: &str,
+) {
+    assert_eq!(
+        out.code,
+        1,
+        "stdout={} stderr={}",
+        out.stdout_text(),
+        out.stderr_text()
+    );
+    let parsed = out.stdout_json();
     assert_eq!(parsed["status"], "error");
     assert_eq!(
-        parsed["error"]["code"], code,
+        parsed["error"]["code"],
+        code,
         "stdout={} stderr={}",
-        out.stdout, out.stderr
+        out.stdout_text(),
+        out.stderr_text()
     );
     let message = parsed["error"]["message"].as_str().expect("message");
     assert!(
@@ -151,8 +159,8 @@ fn audit_single_comment_body(body: &str) -> Value {
         "--profile",
         "tracking",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    parse_json(&out.stdout)["payload"]["result"]["audit"].clone()
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    out.stdout_json()["payload"]["result"]["audit"].clone()
 }
 
 #[test]
@@ -186,8 +194,8 @@ fn record_post_state_with_payload_file_renders_v2_marker_in_dry_run() {
         payload.to_str().expect("payload str"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let result = &parsed["payload"]["result"];
     assert_eq!(result["operation"], "record.post");
     assert_eq!(result["kind"], "state");
@@ -247,8 +255,8 @@ fn record_post_state_summary_file_is_rendered_in_dry_run() {
         summary.to_str().expect("summary str"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let body = parsed["payload"]["result"]["comment_body"]
         .as_str()
         .expect("comment body");
@@ -363,8 +371,8 @@ fn record_post_state_execution_state_file_collapses_non_final_in_dry_run() {
         execution_state.to_str().expect("execution state str"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let body = parsed["payload"]["result"]["comment_body"]
         .as_str()
         .expect("comment body");
@@ -438,8 +446,8 @@ fn record_post_state_execution_state_file_expands_final_in_dry_run() {
         execution_state.to_str().expect("execution state str"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let body = parsed["payload"]["result"]["comment_body"]
         .as_str()
         .expect("comment body");
@@ -499,8 +507,8 @@ fn record_post_state_execution_state_file_preserves_execution_metadata_fields() 
         execution_state.to_str().expect("execution state str"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let body = parsed["payload"]["result"]["comment_body"]
         .as_str()
         .expect("comment body");
@@ -559,10 +567,10 @@ fn record_post_execution_state_file_requires_state_kind_and_task_ledger() {
     assert_ne!(wrong_kind.code, 0);
     assert!(
         wrong_kind
-            .stdout
+            .stdout_text()
             .contains("record-post-execution-state-file-kind-invalid"),
         "{}",
-        wrong_kind.stdout
+        wrong_kind.stdout_text()
     );
 
     let state_payload = tmp.path().join("state.json");
@@ -595,10 +603,10 @@ fn record_post_execution_state_file_requires_state_kind_and_task_ledger() {
     assert_ne!(missing_ledger.code, 0);
     assert!(
         missing_ledger
-            .stdout
+            .stdout_text()
             .contains("record-post-execution-state-task-ledger-missing"),
         "{}",
-        missing_ledger.stdout
+        missing_ledger.stdout_text()
     );
 }
 
@@ -641,11 +649,14 @@ fn record_post_state_rejects_payload_that_cannot_drive_dashboard() {
 
     assert_ne!(out.code, 0, "invalid state payload must fail");
     assert!(
-        out.stderr.contains("record-post-payload-schema-invalid")
-            || out.stdout.contains("record-post-payload-schema-invalid"),
+        out.stderr_text()
+            .contains("record-post-payload-schema-invalid")
+            || out
+                .stdout_text()
+                .contains("record-post-payload-schema-invalid"),
         "expected schema-invalid error: stdout={} stderr={}",
-        out.stdout,
-        out.stderr
+        out.stdout_text(),
+        out.stderr_text()
     );
 }
 
@@ -657,10 +668,11 @@ fn record_post_rejects_source_plan_and_closeout_kinds() {
         ]);
         assert_ne!(out.code, 0, "kind {kind} should be rejected");
         assert!(
-            out.stderr.contains("record-post-") || out.stdout.contains("record-post-"),
+            out.stderr_text().contains("record-post-")
+                || out.stdout_text().contains("record-post-"),
             "expected record-post error for kind {kind}: stdout={} stderr={}",
-            out.stdout,
-            out.stderr
+            out.stdout_text(),
+            out.stderr_text()
         );
     }
 }
@@ -717,10 +729,11 @@ fn record_repair_dashboard_rejects_malformed_state_payload_instead_of_pending() 
 
     assert_ne!(out.code, 0, "malformed state payload must fail repair");
     assert!(
-        out.stderr.contains("malformed payload") || out.stdout.contains("malformed payload"),
+        out.stderr_text().contains("malformed payload")
+            || out.stdout_text().contains("malformed payload"),
         "expected malformed payload error: stdout={} stderr={}",
-        out.stdout,
-        out.stderr
+        out.stdout_text(),
+        out.stderr_text()
     );
 }
 
@@ -785,8 +798,8 @@ fn record_repair_dashboard_allows_new_valid_state_to_supersede_old_malformed_sta
         comments_path.to_str().expect("comments path"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let dashboard = parsed["payload"]["result"]["dashboard_markdown"]
         .as_str()
         .expect("dashboard markdown");
@@ -860,8 +873,8 @@ fn record_repair_dashboard_renders_canonical_dashboard_from_body_and_comments() 
         comments_path.to_str().expect("comments path"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let dashboard = parsed["payload"]["result"]["dashboard_markdown"]
         .as_str()
         .expect("dashboard markdown");
@@ -989,8 +1002,8 @@ fn record_repair_dashboard_out_writes_local_dashboard_file() {
         out_path.to_str().expect("out path"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let result = &parsed["payload"]["result"];
     assert_eq!(result["mode"], "local");
     assert_eq!(
@@ -1009,11 +1022,11 @@ fn record_close_requires_non_empty_approval() {
         common::run_plan_issue_local(&["--format", "json", "record", "close", "--issue", "9"]);
     assert_ne!(out.code, 0, "missing --approval should fail");
     assert!(
-        out.stderr.contains("record-close-missing-approval")
-            || out.stdout.contains("record-close-missing-approval"),
+        out.stderr_text().contains("record-close-missing-approval")
+            || out.stdout_text().contains("record-close-missing-approval"),
         "stderr: {} stdout: {}",
-        out.stderr,
-        out.stdout
+        out.stderr_text(),
+        out.stdout_text()
     );
 }
 
@@ -1143,7 +1156,7 @@ fn record_close_body_file_mode_blocks_unresolved_linked_pr() {
     ]);
 
     assert_ne!(out.code, 0, "missing provider PR evidence should block");
-    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    let joined = format!("{}\n{}", out.stderr_text(), out.stdout_text());
     assert!(
         joined.contains("linked-pr-not-merged"),
         "expected linked-pr-not-merged without PR evidence: {joined}"
@@ -1185,8 +1198,8 @@ fn record_close_fixture_passes_strict_gate_with_complete_v2_evidence() {
         fixture.to_str().expect("fixture path"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let result = &parsed["payload"]["result"];
     assert_eq!(result["operation"], "record.close");
     assert_eq!(result["mode"], "fixture");
@@ -1258,7 +1271,7 @@ fn record_close_fixture_blocks_when_session_comment_missing() {
     ]);
 
     assert_ne!(out.code, 0, "missing session must block closeout");
-    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    let joined = format!("{}\n{}", out.stderr_text(), out.stdout_text());
     assert!(
         joined.contains("session-missing"),
         "expected session-missing, got: {joined}"
@@ -1301,7 +1314,7 @@ fn record_close_fixture_blocks_when_linked_pr_not_merged() {
     ]);
 
     assert_ne!(out.code, 0, "unmerged PR should block strict gate");
-    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    let joined = format!("{}\n{}", out.stderr_text(), out.stdout_text());
     assert!(
         joined.contains("linked-pr-not-merged"),
         "expected linked-pr-not-merged code, got: {joined}"
@@ -1356,7 +1369,7 @@ fn record_close_fixture_blocks_when_review_request_changes() {
         fixture.to_str().expect("fixture path"),
     ]);
     assert_ne!(out.code, 0);
-    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    let joined = format!("{}\n{}", out.stderr_text(), out.stdout_text());
     assert!(
         joined.contains("review-rejected"),
         "expected review-rejected: {joined}"
@@ -1403,8 +1416,8 @@ fn record_close_fixture_passes_with_non_required_failure_when_zero_required() {
         fixture.to_str().expect("fixture path"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let result = &parsed["payload"]["result"];
     assert_eq!(result["operation"], "record.close");
     let preview = &result["preview"];
@@ -1474,7 +1487,7 @@ fn record_close_fixture_passes_with_non_required_failure_when_required_pass() {
         fixture.to_str().expect("fixture path"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 }
 
 #[test]
@@ -1515,7 +1528,7 @@ fn record_close_fixture_blocks_with_linked_pr_checks_failed_when_required_fail()
     ]);
 
     assert_ne!(out.code, 0, "required-check failure must block");
-    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    let joined = format!("{}\n{}", out.stderr_text(), out.stdout_text());
     assert!(
         joined.contains("linked-pr-checks-failed"),
         "expected linked-pr-checks-failed: {joined}"
@@ -1567,7 +1580,8 @@ fn record_close_fixture_override_passes_when_required_unknown_aggregate_fails() 
     ]);
     assert_ne!(blocked.code, 0, "conservative block expected");
     assert!(
-        format!("{}\n{}", blocked.stderr, blocked.stdout).contains("linked-pr-checks-failed"),
+        format!("{}\n{}", blocked.stderr_text(), blocked.stdout_text())
+            .contains("linked-pr-checks-failed"),
         "expected linked-pr-checks-failed under unknown required state"
     );
 
@@ -1590,8 +1604,13 @@ fn record_close_fixture_override_passes_when_required_unknown_aggregate_fails() 
         fixture.to_str().expect("fixture path"),
     ]);
 
-    assert_eq!(out.code, 0, "override should unblock: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(
+        out.code,
+        0,
+        "override should unblock: {}",
+        out.stderr_text()
+    );
+    let parsed = out.stdout_json();
     let body = parsed["payload"]["result"]["preview"]["closeout_comment_body"]
         .as_str()
         .expect("closeout body")
@@ -1668,7 +1687,7 @@ fn record_close_fixture_blocks_when_state_not_complete() {
         fixture.to_str().expect("fixture path"),
     ]);
     assert_ne!(out.code, 0);
-    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    let joined = format!("{}\n{}", out.stderr_text(), out.stdout_text());
     assert!(
         joined.contains("state-not-complete"),
         "expected state-not-complete: {joined}"
@@ -1725,8 +1744,8 @@ fn record_open_fixture_mode_returns_v2_evidence_urls() {
         "--title",
         "Sample Plan",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let result = &parsed["payload"]["result"];
     assert_eq!(result["operation"], "record.open");
     assert_eq!(result["mode"], "fixture");
@@ -1773,8 +1792,8 @@ fn record_post_state_fixture_returns_rendered_body_without_provider_call() {
         "--fixture",
         fixture.to_str().expect("fixture path"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let result = &parsed["payload"]["result"];
     assert_eq!(result["mode"], "fixture");
     assert_eq!(result["kind"], "state");
@@ -2223,8 +2242,8 @@ fn agent_runtime_kit_lifecycle_fixture_passes_strict_v2_closeout_end_to_end() {
         fixture.to_str().expect("fixture path"),
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let result = &parsed["payload"]["result"];
     assert_eq!(result["operation"], "record.close");
     assert_eq!(result["mode"], "fixture");
@@ -2453,8 +2472,8 @@ fn record_post_dry_run_includes_label_mutations() {
         "--remove-label",
         "state::in-progress",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let result = &parsed["payload"]["result"];
     assert_eq!(result["mode"], "dry-run");
     assert_eq!(result["labels"]["add"][0], "state::blocked");
@@ -2509,8 +2528,14 @@ fn record_post_live_refuses_when_lifecycle_lock_is_busy() {
         live_record_options(stub.path(), &[]),
     );
 
-    assert_eq!(out.code, 1, "stdout={} stderr={}", out.stdout, out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(
+        out.code,
+        1,
+        "stdout={} stderr={}",
+        out.stdout_text(),
+        out.stderr_text()
+    );
+    let parsed = out.stdout_json();
     assert_eq!(parsed["status"], "error");
     assert_eq!(parsed["error"]["code"], "plan-issue-lifecycle-lock-busy");
     let message = parsed["error"]["message"].as_str().expect("message");
@@ -2543,8 +2568,8 @@ fn record_close_fixture_includes_label_mutations() {
         "--remove-label",
         "state::in-progress",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let parsed = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
     let labels = &parsed["payload"]["result"]["preview"]["labels"];
     assert_eq!(labels["add"][0], "state::closed");
     assert_eq!(labels["remove"][0], "state::in-progress");
@@ -2582,7 +2607,7 @@ fn record_post_rejects_conflicting_label_mutations() {
         "state::needs-triage",
     ]);
     assert_ne!(out.code, 0, "conflicting label mutation should fail");
-    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    let joined = format!("{}\n{}", out.stderr_text(), out.stdout_text());
     assert!(
         joined.contains("record-label-mutation-conflict"),
         "expected record-label-mutation-conflict code, got: {joined}"
@@ -2613,7 +2638,7 @@ fn record_close_rejects_conflicting_label_mutations() {
         "state::closed",
     ]);
     assert_ne!(out.code, 0, "conflicting label mutation should fail");
-    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    let joined = format!("{}\n{}", out.stderr_text(), out.stdout_text());
     assert!(
         joined.contains("record-label-mutation-conflict"),
         "expected record-label-mutation-conflict code, got: {joined}"
@@ -2659,7 +2684,7 @@ fn agent_runtime_kit_lifecycle_fixture_blocks_when_pr_unmerged() {
     ]);
 
     assert_ne!(out.code, 0, "unmerged PR should block strict closeout");
-    let joined = format!("{}\n{}", out.stderr, out.stdout);
+    let joined = format!("{}\n{}", out.stderr_text(), out.stdout_text());
     assert!(
         joined.contains("linked-pr-not-merged"),
         "expected linked-pr-not-merged code, got: {joined}"

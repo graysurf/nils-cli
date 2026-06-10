@@ -13,10 +13,6 @@ use plan_issue::lifecycle_record::PAYLOAD_SCHEMA_V2;
 
 use crate::common;
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 fn v2_comment(role: &str, profile: &str, data: Value, visible: &str) -> String {
     let envelope = json!({
         "schema": PAYLOAD_SCHEMA_V2,
@@ -72,8 +68,8 @@ fn record_audit_default_does_not_emit_visible_block() {
         "--comments-json",
         comments.to_str().expect("comments"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let envelope = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let envelope = out.stdout_json();
     assert!(
         envelope["payload"]["result"]["visible"].is_null(),
         "default audit must not emit visible block: {envelope}"
@@ -114,8 +110,8 @@ fn record_audit_expect_visible_passes_for_complete_evidence() {
         "--expect-visible",
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let envelope = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let envelope = out.stdout_json();
     let visible = &envelope["payload"]["result"]["visible"];
     assert_eq!(visible["expect_visible"], true, "{envelope}");
     assert_eq!(visible["overall_pass"], true, "{envelope}");
@@ -161,8 +157,8 @@ fn record_audit_expect_visible_blocks_missing_task_ledger() {
         "--expect-visible",
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let envelope = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let envelope = out.stdout_json();
     let visible = &envelope["payload"]["result"]["visible"];
     assert_eq!(visible["overall_pass"], false, "{envelope}");
     let codes: Vec<&str> = visible["codes"]
@@ -197,8 +193,8 @@ fn record_audit_expect_visible_blocks_profile_only_session() {
         "--expect-visible",
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let envelope = json_stdout(&out);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let envelope = out.stdout_json();
     let visible = &envelope["payload"]["result"]["visible"];
     let codes: Vec<&str> = visible["codes"]
         .as_array()
@@ -217,10 +213,10 @@ fn record_audit_expect_visible_blocks_profile_only_session() {
 #[test]
 fn record_audit_expect_visible_help_mentions_flag() {
     let out = common::run_plan_issue(&["record", "audit", "--help"]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(
-        out.stdout.contains("--expect-visible"),
+        out.stdout_text().contains("--expect-visible"),
         "help missing --expect-visible flag: {}",
-        out.stdout
+        out.stdout_text()
     );
 }

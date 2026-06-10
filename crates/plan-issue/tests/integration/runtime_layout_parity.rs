@@ -14,10 +14,6 @@ const FIXTURE_REPO: &str = "graysurf/runtime-layout-fixture";
 const FIXTURE_REPO_SLUG: &str = "graysurf__runtime-layout-fixture";
 const PLACEHOLDER_ISSUE: u64 = 999;
 
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
-
 fn relativize(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .map(|stripped| stripped.to_string_lossy().to_string())
@@ -69,7 +65,12 @@ fn runtime_layout_parity() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
+    assert_eq!(
+        start_plan_out.code,
+        0,
+        "stderr: {}",
+        start_plan_out.stderr_text()
+    );
 
     let start_sprint_out = common::run_plan_issue_local_with_env(
         &[
@@ -92,9 +93,10 @@ fn runtime_layout_parity() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(
-        start_sprint_out.code, 0,
+        start_sprint_out.code,
+        0,
         "stderr: {}",
-        start_sprint_out.stderr
+        start_sprint_out.stderr_text()
     );
 
     let runtime_root = state_dir
@@ -206,8 +208,8 @@ fn runtime_layout_parity() {
         ]
     );
 
-    let plan_payload = parse_json(&start_plan_out.stdout);
-    let sprint_payload = parse_json(&start_sprint_out.stdout);
+    let plan_payload = start_plan_out.stdout_json();
+    let sprint_payload = start_sprint_out.stdout_json();
     assert_eq!(
         plan_payload["payload"]["result"]["issue_number"], 999,
         "plan-issue-local placeholder issue"

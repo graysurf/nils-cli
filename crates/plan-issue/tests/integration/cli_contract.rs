@@ -14,7 +14,7 @@ use crate::common;
 #[test]
 fn cli_help_lists_full_surface_for_live_and_local_bins() {
     let live = common::run_plan_issue(&["--help"]);
-    assert_eq!(live.code, 0, "stderr: {}", live.stderr);
+    assert_eq!(live.code, 0, "stderr: {}", live.stderr_text());
 
     for token in [
         "build-task-spec",
@@ -37,30 +37,40 @@ fn cli_help_lists_full_surface_for_live_and_local_bins() {
         "plan-issue-local",
     ] {
         assert!(
-            live.stdout.contains(token),
+            live.stdout_text().contains(token),
             "help output missing token `{token}`\n{}",
-            live.stdout
+            live.stdout_text()
         );
     }
 
     let local = common::run_plan_issue_local(&["--help"]);
-    assert_eq!(local.code, 0, "stderr: {}", local.stderr);
+    assert_eq!(local.code, 0, "stderr: {}", local.stderr_text());
     assert!(
-        local.stdout.contains("plan-issue-local"),
+        local.stdout_text().contains("plan-issue-local"),
         "{}",
-        local.stdout
+        local.stdout_text()
     );
-    assert!(local.stdout.contains("USAGE PATHS"), "{}", local.stdout);
     assert!(
-        local.stdout.contains("UNSUPPORTED IN PLAN-ISSUE-LOCAL"),
+        local.stdout_text().contains("USAGE PATHS"),
         "{}",
-        local.stdout
+        local.stdout_text()
     );
-    assert!(local.stdout.contains("USE INSTEAD"), "{}", local.stdout);
     assert!(
-        local.stdout.contains("plan-issue <command>"),
+        local
+            .stdout_text()
+            .contains("UNSUPPORTED IN PLAN-ISSUE-LOCAL"),
         "{}",
-        local.stdout
+        local.stdout_text()
+    );
+    assert!(
+        local.stdout_text().contains("USE INSTEAD"),
+        "{}",
+        local.stdout_text()
+    );
+    assert!(
+        local.stdout_text().contains("plan-issue <command>"),
+        "{}",
+        local.stdout_text()
     );
 }
 

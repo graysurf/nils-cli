@@ -5,15 +5,10 @@
 
 #![cfg(feature = "bin-cli")]
 
-use std::process::Command;
-
 use nils_markdown::Engine;
+use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use serde_json::json;
 use tempfile::TempDir;
-
-fn binary_path() -> std::path::PathBuf {
-    nils_test_support::bin::resolve("md-render")
-}
 
 fn write_fixture(
     tmp: &TempDir,
@@ -28,16 +23,8 @@ fn write_fixture(
     (template_path, data_path)
 }
 
-fn run_md_render(args: &[&str]) -> std::process::Output {
-    Command::new(binary_path())
-        .args(args)
-        .output()
-        .expect("md-render binary runs")
-}
-
-fn json_stdout(output: &std::process::Output) -> serde_json::Value {
-    let stdout = String::from_utf8(output.stdout.clone()).expect("stdout is UTF-8");
-    serde_json::from_str(stdout.trim()).expect("stdout is a JSON envelope")
+fn run_md_render(args: &[&str]) -> CmdOutput {
+    run_resolved("md-render", args, &CmdOptions::new())
 }
 
 #[test]
@@ -56,22 +43,20 @@ fn md_render_text_envelope_writes_rendered_template_to_stdout() {
     )
     .expect("write data");
 
-    let output = Command::new(binary_path())
-        .args([
-            "--template",
-            template_path.to_str().unwrap(),
-            "--data",
-            data_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("md-render binary runs");
-    assert!(
-        output.status.success(),
+    let output = run_md_render(&[
+        "--template",
+        template_path.to_str().unwrap(),
+        "--data",
+        data_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        output.code,
+        0,
         "md-render exited non-zero: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
+        output.stderr_text()
     );
 
-    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stdout = output.stdout_text();
     let mut engine = Engine::builder().build();
     engine
         .register_template(
@@ -100,22 +85,17 @@ fn md_render_json_envelope_wraps_body_in_render_v1_envelope() {
     )
     .expect("write data");
 
-    let output = Command::new(binary_path())
-        .args([
-            "--format",
-            "json",
-            "--template",
-            template_path.to_str().unwrap(),
-            "--data",
-            data_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("md-render binary runs");
-    assert!(output.status.success(), "md-render exited non-zero");
+    let output = run_md_render(&[
+        "--format",
+        "json",
+        "--template",
+        template_path.to_str().unwrap(),
+        "--data",
+        data_path.to_str().unwrap(),
+    ]);
+    assert_eq!(output.code, 0, "md-render exited non-zero");
 
-    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    let envelope: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout is a JSON envelope");
+    let envelope = output.stdout_json();
     assert_eq!(envelope["schema_version"], "cli.md-render.render.v1");
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["data"]["template"], "greeting");
@@ -141,8 +121,8 @@ fn md_render_render_subcommand_accepts_explicit_format_equals_json() {
         data_path.to_str().unwrap(),
     ]);
 
-    assert!(output.status.success(), "md-render exited non-zero");
-    let envelope = json_stdout(&output);
+    assert_eq!(output.code, 0, "md-render exited non-zero");
+    let envelope = output.stdout_json();
     assert_eq!(envelope["schema_version"], "cli.md-render.render.v1");
     assert_eq!(envelope["data"]["template"], "explicit");
     assert_eq!(envelope["data"]["body"], "hello Ada");
@@ -151,15 +131,15 @@ fn md_render_render_subcommand_accepts_explicit_format_equals_json() {
 #[test]
 fn md_render_completion_exports_bash_and_zsh_scripts() {
     let bash = run_md_render(&["completion", "bash"]);
-    assert!(bash.status.success(), "bash completion failed");
-    let bash_stdout = String::from_utf8(bash.stdout).expect("bash stdout is UTF-8");
+    assert_eq!(bash.code, 0, "bash completion failed");
+    let bash_stdout = bash.stdout_text();
     assert!(bash_stdout.contains("complete -o nospace -F _md-render"));
     assert!(bash_stdout.contains("md-render"));
     assert!(bash_stdout.contains("render"));
 
     let zsh = run_md_render(&["completion", "zsh"]);
-    assert!(zsh.status.success(), "zsh completion failed");
-    let zsh_stdout = String::from_utf8(zsh.stdout).expect("zsh stdout is UTF-8");
+    assert_eq!(zsh.code, 0, "zsh completion failed");
+    let zsh_stdout = zsh.stdout_text();
     assert!(zsh_stdout.contains("#compdef md-render"));
     assert!(zsh_stdout.contains("completion"));
 }
@@ -168,8 +148,8 @@ fn md_render_completion_exports_bash_and_zsh_scripts() {
 fn md_render_unknown_subcommand_honors_json_format_detection() {
     let output = run_md_render(&["--format=json", "nope"]);
 
-    assert!(!output.status.success(), "unknown subcommand should fail");
-    let envelope = json_stdout(&output);
+    assert_ne!(output.code, 0, "unknown subcommand should fail");
+    let envelope = output.stdout_json();
     assert_eq!(envelope["ok"], false);
     assert_eq!(envelope["error"]["code"], "unknown-subcommand");
 }
@@ -187,8 +167,8 @@ fn md_render_missing_data_argument_returns_json_contract_error() {
         template_path.to_str().unwrap(),
     ]);
 
-    assert!(!output.status.success(), "missing data should fail");
-    let envelope = json_stdout(&output);
+    assert_ne!(output.code, 0, "missing data should fail");
+    let envelope = output.stdout_json();
     assert_eq!(envelope["error"]["code"], "missing-argument");
     assert!(
         envelope["error"]["message"]
@@ -215,11 +195,8 @@ fn md_render_invalid_template_stem_is_reported_before_reading_files() {
         data_path.to_str().unwrap(),
     ]);
 
-    assert!(
-        !output.status.success(),
-        "invalid template stem should fail"
-    );
-    let envelope = json_stdout(&output);
+    assert_ne!(output.code, 0, "invalid template stem should fail");
+    let envelope = output.stdout_json();
     assert_eq!(envelope["error"]["code"], "invalid-template-path");
 }
 
@@ -240,7 +217,7 @@ fn md_render_file_and_json_errors_keep_stable_error_codes() {
         data_path.to_str().unwrap(),
     ]);
     assert_eq!(
-        json_stdout(&missing_template)["error"]["code"],
+        missing_template.stdout_json()["error"]["code"],
         "template-read-failed"
     );
 
@@ -253,7 +230,7 @@ fn md_render_file_and_json_errors_keep_stable_error_codes() {
         tmp.path().join("missing.json").to_str().unwrap(),
     ]);
     assert_eq!(
-        json_stdout(&missing_data)["error"]["code"],
+        missing_data.stdout_json()["error"]["code"],
         "data-read-failed"
     );
 
@@ -265,7 +242,7 @@ fn md_render_file_and_json_errors_keep_stable_error_codes() {
         "--data",
         data_path.to_str().unwrap(),
     ]);
-    assert_eq!(json_stdout(&bad_json)["error"]["code"], "data-parse-failed");
+    assert_eq!(bad_json.stdout_json()["error"]["code"], "data-parse-failed");
 }
 
 #[test]
@@ -285,7 +262,7 @@ fn md_render_template_register_and_render_errors_are_distinct() {
         data_path.to_str().unwrap(),
     ]);
     assert_eq!(
-        json_stdout(&register_error)["error"]["code"],
+        register_error.stdout_json()["error"]["code"],
         "template-register-failed"
     );
 
@@ -300,7 +277,7 @@ fn md_render_template_register_and_render_errors_are_distinct() {
         data_path.to_str().unwrap(),
     ]);
     assert_eq!(
-        json_stdout(&render_error)["error"]["code"],
+        render_error.stdout_json()["error"]["code"],
         "template-render-failed"
     );
 }
@@ -311,13 +288,8 @@ fn md_render_missing_template_argument_returns_usage_error() {
     let data_path = tmp.path().join("data.json");
     std::fs::write(&data_path, "{}").expect("write data");
 
-    let output = Command::new(binary_path())
-        .args(["--format", "json", "--data", data_path.to_str().unwrap()])
-        .output()
-        .expect("md-render binary runs");
-    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    let envelope: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout is a JSON envelope");
+    let output = run_md_render(&["--format", "json", "--data", data_path.to_str().unwrap()]);
+    let envelope = output.stdout_json();
     assert_eq!(envelope["ok"], false);
     assert_eq!(envelope["error"]["code"], "missing-argument");
 }
