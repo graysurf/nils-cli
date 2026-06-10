@@ -221,3 +221,176 @@ fn pr_body_render_generic_kinds_emit_forge_compatible_body() {
         assert!(!stdout.contains("## Problem"), "kind={kind}: {stdout}");
     }
 }
+
+#[test]
+fn pr_body_render_non_bug_kinds_render_optional_issues_section() {
+    for kind in ["feature", "chore", "docs", "ci", "refactor"] {
+        let fixture = Fixture::new();
+        let summary = fixture.write("summary.md", "Migrates the test harness.\n");
+        let issues = fixture.write("issues.md", "Refs #804\n");
+        let test_first = fixture.write(
+            "test-first.md",
+            "- Change classification: refactor\n- Waiver reason: mechanical change\n",
+        );
+        let test_plan = fixture.write(
+            "test-plan.md",
+            "- cargo test -p nils-agent-runtime (pass)\n",
+        );
+
+        let changes: String;
+        let mut args = vec![
+            "pr-body",
+            "render",
+            "--kind",
+            kind,
+            "--summary-file",
+            &summary,
+            "--issues-file",
+            &issues,
+            "--test-first-file",
+            &test_first,
+            "--test-plan-file",
+            &test_plan,
+        ];
+        if kind == "feature" {
+            changes = fixture.write("changes.md", "- Add helper.\n");
+            args.extend_from_slice(&["--changes-file", &changes]);
+        }
+
+        let output = run(&args);
+
+        assert_eq!(
+            output.code,
+            0,
+            "kind={kind} stderr={}",
+            output.stderr_text()
+        );
+        let stdout = output.stdout_text();
+        assert!(
+            stdout.contains("## Issues\n\nRefs #804"),
+            "kind={kind}: {stdout}"
+        );
+        assert!(!stdout.contains("## Issues Found"), "kind={kind}: {stdout}");
+        let issues_at = stdout.find("## Issues").expect("issues heading");
+        let test_first_at = stdout.find("## Test-First Evidence").expect("test-first");
+        assert!(issues_at < test_first_at, "kind={kind}: {stdout}");
+    }
+}
+
+#[test]
+fn pr_body_render_generic_kinds_still_omit_issues_when_not_provided() {
+    let fixture = Fixture::new();
+    let summary = fixture.write("summary.md", "Bumps the pinned toolchain.\n");
+    let test_first = fixture.write("test-first.md", "- Waiver reason: mechanical change\n");
+    let test_plan = fixture.write("test-plan.md", "- cargo test (pass)\n");
+
+    let output = run(&[
+        "pr-body",
+        "render",
+        "--kind",
+        "refactor",
+        "--summary-file",
+        &summary,
+        "--test-first-file",
+        &test_first,
+        "--test-plan-file",
+        &test_plan,
+    ]);
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert!(!output.stdout_text().contains("## Issues"));
+}
+
+#[test]
+fn pr_body_render_rejects_kind_specific_files_for_wrong_kind() {
+    // `clap` only enforces the required direction; a kind-specific file
+    // passed with a non-owning kind must hard-error instead of being
+    // silently dropped from the rendered body.
+    let cases: &[(&str, &str, &str)] = &[
+        ("refactor", "--changes-file", "feature"),
+        ("feature", "--problem-file", "bug"),
+        ("chore", "--reproduction-file", "bug"),
+        ("docs", "--fix-approach-file", "bug"),
+    ];
+    for (kind, flag, owner_kind) in cases {
+        let fixture = Fixture::new();
+        let summary = fixture.write("summary.md", "Some summary.\n");
+        let test_first = fixture.write("test-first.md", "- Waiver reason: N/A\n");
+        let test_plan = fixture.write("test-plan.md", "- cargo test (pass)\n");
+        let stray = fixture.write("stray.md", "- Stray content.\n");
+
+        let changes: String;
+        let mut args = vec![
+            "pr-body",
+            "render",
+            "--kind",
+            kind,
+            "--summary-file",
+            &summary,
+            "--test-first-file",
+            &test_first,
+            "--test-plan-file",
+            &test_plan,
+            flag,
+            &stray,
+        ];
+        if *kind == "feature" {
+            changes = fixture.write("changes.md", "- Add helper.\n");
+            args.extend_from_slice(&["--changes-file", &changes]);
+        }
+
+        let output = run(&args);
+
+        assert_eq!(output.code, 2, "kind={kind} flag={flag}");
+        let stderr = output.stderr_text();
+        assert!(
+            stderr.contains(&format!("{flag} is only rendered by --kind {owner_kind}")),
+            "kind={kind} flag={flag}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn pr_body_render_bug_rejects_feature_changes_file() {
+    let fixture = Fixture::new();
+    let summary = fixture.write("summary.md", "Fixes a renderer gap.\n");
+    let problem = fixture.write("problem.md", "- Expected: x\n- Actual: y\n");
+    let reproduction = fixture.write("reproduction.md", "1. Render.\n");
+    let issues = fixture.write("issues.md", "Refs #1\n");
+    let fix_approach = fixture.write("fix-approach.md", "- Render it.\n");
+    let test_first = fixture.write("test-first.md", "- Failing test first.\n");
+    let test_plan = fixture.write("test-plan.md", "- cargo test (pass)\n");
+    let changes = fixture.write("changes.md", "- Stray feature section.\n");
+
+    let output = run(&[
+        "pr-body",
+        "render",
+        "--kind",
+        "bug",
+        "--summary-file",
+        &summary,
+        "--problem-file",
+        &problem,
+        "--reproduction-file",
+        &reproduction,
+        "--issues-file",
+        &issues,
+        "--fix-approach-file",
+        &fix_approach,
+        "--test-first-file",
+        &test_first,
+        "--test-plan-file",
+        &test_plan,
+        "--changes-file",
+        &changes,
+    ]);
+
+    assert_eq!(output.code, 2);
+    assert!(
+        output
+            .stderr_text()
+            .contains("--changes-file is only rendered by --kind feature"),
+        "{}",
+        output.stderr_text()
+    );
+}

@@ -122,6 +122,13 @@ agent-runtime pr-body render \
 The rendered body always uses `## Summary` and `## Test plan` so it satisfies
 the body-section gate enforced by `forge-cli`.
 
+`--issues-file` is required for `bug` (rendered as `## Issues Found`) and
+optional for every other kind, where it renders an `## Issues` references
+section (for example `Refs #804`) right after `## Summary`. The remaining
+kind-specific files are rejected when passed with a non-owning kind
+(`--changes-file` is feature-only; `--problem-file`, `--reproduction-file`,
+and `--fix-approach-file` are bug-only) instead of being silently dropped.
+
 ## Docs
 
 - [Docs index](docs/README.md)

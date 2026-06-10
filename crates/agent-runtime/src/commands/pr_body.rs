@@ -21,26 +21,28 @@ pub enum PrBodyCommand {
 pub struct PrBodyRenderArgs {
     /// Body kind. `feature` and `bug` render their dedicated templates;
     /// `chore`, `docs`, `ci`, and `refactor` render a generic
-    /// Summary / Test-First / Test plan / Risk skeleton. The set matches the
-    /// six kinds `forge-cli pr deliver --kind` accepts.
+    /// Summary / Issues (optional) / Test-First / Test plan / Risk skeleton.
+    /// The set matches the six kinds `forge-cli pr deliver --kind` accepts.
     #[arg(long, value_enum)]
     pub kind: PrBodyKind,
     /// One-paragraph summary of the change and scope.
     #[arg(long)]
     pub summary_file: PathBuf,
-    /// Feature-only list of key changes.
+    /// Feature-only list of key changes. Rejected for other kinds.
     #[arg(long, required_if_eq("kind", "feature"))]
     pub changes_file: Option<PathBuf>,
-    /// Bug-only expected/actual/impact section.
+    /// Bug-only expected/actual/impact section. Rejected for other kinds.
     #[arg(long, required_if_eq("kind", "bug"))]
     pub problem_file: Option<PathBuf>,
-    /// Bug-only reproduction steps.
+    /// Bug-only reproduction steps. Rejected for other kinds.
     #[arg(long, required_if_eq("kind", "bug"))]
     pub reproduction_file: Option<PathBuf>,
-    /// Bug-only issue table or issue list.
+    /// Issue table or issue references (for example `Refs #N`). Required for
+    /// `bug` (rendered as `## Issues Found`); optional for every other kind
+    /// (rendered as `## Issues` right after `## Summary`).
     #[arg(long, required_if_eq("kind", "bug"))]
     pub issues_file: Option<PathBuf>,
-    /// Bug-only fix approach summary.
+    /// Bug-only fix approach summary. Rejected for other kinds.
     #[arg(long, required_if_eq("kind", "bug"))]
     pub fix_approach_file: Option<PathBuf>,
     /// Test-first evidence, including the waiver when a failing test was not practical.
@@ -75,12 +77,18 @@ pub fn run(args: PrBodyArgs) -> anyhow::Result<u8> {
 }
 
 fn render(args: PrBodyRenderArgs) -> anyhow::Result<u8> {
+    reject_kind_mismatched_files(&args)?;
+
     let summary = read_required("summary", &args.summary_file)?;
     let test_first = read_required("test-first", &args.test_first_file)?;
     let test_plan = read_required("test-plan", &args.test_plan_file)?;
     let risk = match args.risk_file.as_deref() {
         Some(path) => read_required("risk", path)?,
         None => DEFAULT_RISK_NOTES.to_string(),
+    };
+    let optional_issues = match (args.kind, args.issues_file.as_deref()) {
+        (PrBodyKind::Bug, _) | (_, None) => None,
+        (_, Some(path)) => Some(read_required("issues", path)?),
     };
 
     let body = match args.kind {
@@ -89,7 +97,14 @@ fn render(args: PrBodyRenderArgs) -> anyhow::Result<u8> {
                 "changes",
                 required_path("changes", args.changes_file.as_deref())?,
             )?;
-            render_feature(&summary, &changes, &test_first, &test_plan, &risk)
+            render_feature(
+                &summary,
+                optional_issues.as_deref(),
+                &changes,
+                &test_first,
+                &test_plan,
+                &risk,
+            )
         }
         PrBodyKind::Bug => {
             let problem = read_required(
@@ -120,13 +135,53 @@ fn render(args: PrBodyRenderArgs) -> anyhow::Result<u8> {
             )
         }
         PrBodyKind::Chore | PrBodyKind::Docs | PrBodyKind::Ci | PrBodyKind::Refactor => {
-            render_generic(&summary, &test_first, &test_plan, &risk)
+            render_generic(
+                &summary,
+                optional_issues.as_deref(),
+                &test_first,
+                &test_plan,
+                &risk,
+            )
         }
     };
 
     validate_forge_sections(&body)?;
     write_output(args.out.as_deref(), &body)?;
     Ok(0)
+}
+
+/// `clap` only enforces the required direction (`required_if_eq`); a
+/// kind-specific file passed with a non-owning kind would otherwise be
+/// accepted and silently dropped from the rendered body.
+fn reject_kind_mismatched_files(args: &PrBodyRenderArgs) -> anyhow::Result<()> {
+    let mismatches = [
+        (
+            args.changes_file.is_some() && args.kind != PrBodyKind::Feature,
+            "changes",
+            "feature",
+        ),
+        (
+            args.problem_file.is_some() && args.kind != PrBodyKind::Bug,
+            "problem",
+            "bug",
+        ),
+        (
+            args.reproduction_file.is_some() && args.kind != PrBodyKind::Bug,
+            "reproduction",
+            "bug",
+        ),
+        (
+            args.fix_approach_file.is_some() && args.kind != PrBodyKind::Bug,
+            "fix-approach",
+            "bug",
+        ),
+    ];
+    for (mismatched, label, owner) in mismatches {
+        if mismatched {
+            anyhow::bail!("--{label}-file is only rendered by --kind {owner}");
+        }
+    }
+    Ok(())
 }
 
 fn read_required(label: &str, path: &Path) -> anyhow::Result<String> {
@@ -146,24 +201,42 @@ fn required_path<'a>(label: &str, path: Option<&'a Path>) -> anyhow::Result<&'a 
 
 fn render_feature(
     summary: &str,
+    issues: Option<&str>,
     changes: &str,
     test_first: &str,
     test_plan: &str,
     risk: &str,
 ) -> String {
+    let issues = issues_section(issues);
     format!(
-        "## Summary\n\n{summary}\n\n## Changes\n\n{changes}\n\n## Test-First Evidence\n\n{test_first}\n\n## Test plan\n\n{test_plan}\n\n## Risk / Notes\n\n{risk}\n"
+        "## Summary\n\n{summary}\n\n{issues}## Changes\n\n{changes}\n\n## Test-First Evidence\n\n{test_first}\n\n## Test plan\n\n{test_plan}\n\n## Risk / Notes\n\n{risk}\n"
     )
 }
 
 /// Generic skeleton for kinds without a dedicated template
 /// (`chore` / `docs` / `ci` / `refactor`). Emits the forge-cli-required
 /// `## Summary` and `## Test plan` sections plus test-first evidence and
-/// risk notes, with no kind-specific sections.
-fn render_generic(summary: &str, test_first: &str, test_plan: &str, risk: &str) -> String {
+/// risk notes, with an optional `## Issues` references section.
+fn render_generic(
+    summary: &str,
+    issues: Option<&str>,
+    test_first: &str,
+    test_plan: &str,
+    risk: &str,
+) -> String {
+    let issues = issues_section(issues);
     format!(
-        "## Summary\n\n{summary}\n\n## Test-First Evidence\n\n{test_first}\n\n## Test plan\n\n{test_plan}\n\n## Risk / Notes\n\n{risk}\n"
+        "## Summary\n\n{summary}\n\n{issues}## Test-First Evidence\n\n{test_first}\n\n## Test plan\n\n{test_plan}\n\n## Risk / Notes\n\n{risk}\n"
     )
+}
+
+/// Optional `## Issues` references block for non-bug kinds, placed right
+/// after `## Summary`. The bug template keeps its own `## Issues Found`
+/// section instead.
+fn issues_section(issues: Option<&str>) -> String {
+    issues
+        .map(|issues| format!("## Issues\n\n{issues}\n\n"))
+        .unwrap_or_default()
 }
 
 #[allow(clippy::too_many_arguments)]
