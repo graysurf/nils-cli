@@ -1,41 +1,10 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
+use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
+use nils_test_support::git::{git, init_repo_main};
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-
-#[derive(Debug)]
-struct CmdOutput {
-    code: i32,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-impl CmdOutput {
-    fn stdout_text(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).to_string()
-    }
-
-    fn stderr_text(&self) -> String {
-        String::from_utf8_lossy(&self.stderr).to_string()
-    }
-}
-
-fn agent_out_bin() -> std::path::PathBuf {
-    for key in ["CARGO_BIN_EXE_agent-out", "CARGO_BIN_EXE_agent_out"] {
-        if let Ok(path) = std::env::var(key) {
-            return path.into();
-        }
-    }
-
-    let exe = std::env::current_exe().expect("current exe");
-    let target_dir = exe
-        .parent()
-        .and_then(|path| path.parent())
-        .expect("target dir");
-    target_dir.join(format!("agent-out{}", std::env::consts::EXE_SUFFIX))
-}
 
 fn run(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
     run_with_env_remove(dir, args, envs, &[])
@@ -47,44 +16,11 @@ fn run_with_env_remove(
     envs: &[(&str, &str)],
     remove_envs: &[&str],
 ) -> CmdOutput {
-    let mut command = Command::new(agent_out_bin());
-    command.args(args).current_dir(dir);
-    for key in remove_envs {
-        command.env_remove(key);
-    }
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let output = command.output().expect("agent-out command");
-    CmdOutput {
-        code: output.status.code().unwrap_or(1),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    }
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("git command");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}{}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    );
-}
-
-fn init_repo() -> tempfile::TempDir {
-    let repo = tempfile::TempDir::new().expect("tempdir");
-    git(repo.path(), &["init", "-q"]);
-    git(repo.path(), &["checkout", "-q", "-B", "main"]);
-    git(repo.path(), &["config", "user.email", "test@example.com"]);
-    git(repo.path(), &["config", "user.name", "Test User"]);
-    git(repo.path(), &["config", "commit.gpgsign", "false"]);
-    repo
+    let options = CmdOptions::new()
+        .with_cwd(dir)
+        .with_env_remove_many(remove_envs)
+        .with_envs(envs);
+    run_resolved("agent-out", args, &options)
 }
 
 fn json_stdout(output: &CmdOutput) -> Value {
@@ -95,7 +31,7 @@ fn json_stdout(output: &CmdOutput) -> Value {
 fn project_outputs_path_without_creating_directory_by_default() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let agent_home = tmp.path().join("agent-home");
-    let repo = init_repo();
+    let repo = init_repo_main();
     git(
         repo.path(),
         &[

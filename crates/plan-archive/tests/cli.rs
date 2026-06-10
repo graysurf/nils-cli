@@ -6,70 +6,22 @@
 //! behavior covered as shipped.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
+use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 
-#[derive(Debug)]
-struct CmdOutput {
-    code: i32,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-impl CmdOutput {
-    fn stdout_text(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).to_string()
-    }
-
-    fn stderr_text(&self) -> String {
-        String::from_utf8_lossy(&self.stderr).to_string()
-    }
-}
-
-fn plan_archive_bin() -> PathBuf {
-    nils_test_support::bin::resolve("plan-archive")
-}
-
 fn run(args: &[&str]) -> CmdOutput {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let output = Command::new(plan_archive_bin())
-        .args(args)
-        .current_dir(tmp.path())
-        .output()
-        .expect("plan-archive command");
-    CmdOutput {
-        code: output.status.code().unwrap_or(1),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    }
+    let options = CmdOptions::new().with_cwd(tmp.path());
+    run_resolved("plan-archive", args, &options)
 }
 
 fn run_with_stdin(args: &[&str], stdin: &str) -> CmdOutput {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut child = Command::new(plan_archive_bin())
-        .args(args)
-        .current_dir(tmp.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("plan-archive command");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(stdin.as_bytes())
-        .expect("write stdin");
-    let output = child.wait_with_output().expect("wait");
-    CmdOutput {
-        code: output.status.code().unwrap_or(1),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    }
+    let options = CmdOptions::new().with_cwd(tmp.path()).with_stdin_str(stdin);
+    run_resolved("plan-archive", args, &options)
 }
 
 fn fixture(rel: &str) -> String {

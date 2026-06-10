@@ -1,55 +1,15 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
+use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use pretty_assertions::assert_eq;
 
-#[derive(Debug)]
-struct CmdOutput {
-    code: i32,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-impl CmdOutput {
-    fn stdout_text(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).to_string()
-    }
-
-    fn stderr_text(&self) -> String {
-        String::from_utf8_lossy(&self.stderr).to_string()
-    }
-}
-
-fn agent_memory_bin() -> std::path::PathBuf {
-    for key in ["CARGO_BIN_EXE_agent-memory", "CARGO_BIN_EXE_agent_memory"] {
-        if let Ok(path) = std::env::var(key) {
-            return path.into();
-        }
-    }
-
-    let exe = std::env::current_exe().expect("current exe");
-    let target_dir = exe
-        .parent()
-        .and_then(|path| path.parent())
-        .expect("target dir");
-    target_dir.join(format!("agent-memory{}", std::env::consts::EXE_SUFFIX))
-}
-
 fn run(root: &Path, args: &[&str]) -> CmdOutput {
-    let output = Command::new(agent_memory_bin())
-        .args(args)
-        .env("AGENT_MEMORY_HOME", root)
-        .env("HOME", root.join("home"))
-        .env_remove("XDG_CONFIG_HOME")
-        .output()
-        .expect("agent-memory command");
-
-    CmdOutput {
-        code: output.status.code().unwrap_or(1),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    }
+    let options = CmdOptions::new()
+        .with_env("AGENT_MEMORY_HOME", &root.to_string_lossy())
+        .with_env("HOME", &root.join("home").to_string_lossy())
+        .with_env_remove("XDG_CONFIG_HOME");
+    run_resolved("agent-memory", args, &options)
 }
 
 #[test]
