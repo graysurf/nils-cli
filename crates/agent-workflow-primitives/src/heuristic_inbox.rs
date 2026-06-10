@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum, ValueHint};
+use nils_common::fs::home_dir;
 use nils_common::process;
 use nils_markdown::Engine;
 use nils_term::prompt::{self, PromptError, PromptOptions};
@@ -288,10 +289,6 @@ fn today_utc() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
 }
 
 fn normalize_home_paths(text: &str) -> String {
