@@ -16,24 +16,24 @@ fn output_json_contract_success_envelope_contains_version_status_and_payload() {
         "per-sprint",
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(
-        out.stderr.trim().is_empty(),
+        out.stderr_text().trim().is_empty(),
         "stderr should be empty: {}",
-        out.stderr
+        out.stderr_text()
     );
 
-    let payload: Value = serde_json::from_str(&out.stdout).expect("stdout should be JSON");
+    let payload: Value = serde_json::from_str(&out.stdout_text()).expect("stdout should be JSON");
     assert!(
         payload["schema_version"]
             .as_str()
             .is_some_and(|value| value.starts_with("plan-issue.")),
         "{}",
-        out.stdout
+        out.stdout_text()
     );
     assert_eq!(payload["command"], "build-task-spec");
     assert_eq!(payload["status"], "ok");
-    assert!(payload["payload"].is_object(), "{}", out.stdout);
+    assert!(payload["payload"].is_object(), "{}", out.stdout_text());
     assert_eq!(payload["payload"]["execution_mode"], "live");
     assert_eq!(payload["payload"]["arguments"]["sprint"], 2);
 }
@@ -54,7 +54,7 @@ fn output_json_contract_error_envelope_contains_code_and_message() {
 
     assert_eq!(out.code, 1);
 
-    let payload: Value = serde_json::from_str(&out.stdout).expect("stdout should be JSON");
+    let payload: Value = serde_json::from_str(&out.stdout_text()).expect("stdout should be JSON");
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "invalid-pr-grouping");
     assert!(
@@ -62,7 +62,7 @@ fn output_json_contract_error_envelope_contains_code_and_message() {
             .as_str()
             .is_some_and(|value| value.contains("with --strategy deterministic")),
         "{}",
-        out.stdout
+        out.stdout_text()
     );
 }
 
@@ -76,15 +76,16 @@ fn output_text_contract_success_output_is_deterministic() {
         "per-sprint",
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(
-        out.stderr.trim().is_empty(),
+        out.stderr_text().trim().is_empty(),
         "stderr should be empty: {}",
-        out.stderr
+        out.stderr_text()
     );
 
-    let lines: Vec<&str> = out.stdout.lines().collect();
-    assert_eq!(lines.len(), 4, "unexpected output: {}", out.stdout);
+    let stdout = out.stdout_text();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "unexpected output: {stdout}");
     assert_eq!(
         lines[0],
         "schema_version: plan-issue.build.plan.task.spec.v1"
@@ -106,13 +107,14 @@ fn output_text_contract_error_output_is_deterministic() {
 
     assert_eq!(out.code, 1);
     assert!(
-        out.stdout.trim().is_empty(),
+        out.stdout_text().trim().is_empty(),
         "stdout should be empty: {}",
-        out.stdout
+        out.stdout_text()
     );
 
-    let lines: Vec<&str> = out.stderr.lines().collect();
-    assert_eq!(lines.len(), 5, "unexpected stderr: {}", out.stderr);
+    let stderr = out.stderr_text();
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 5, "unexpected stderr: {stderr}");
     assert_eq!(
         lines[0],
         "schema_version: plan-issue.build.plan.task.spec.v1"

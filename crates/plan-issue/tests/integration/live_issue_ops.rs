@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use pretty_assertions::assert_eq;
-use serde_json::{Value, json};
+use serde_json::json;
 use tempfile::TempDir;
 
 use nils_test_support::StubBinDir;
@@ -11,10 +11,6 @@ use nils_test_support::cmd::CmdOptions;
 use crate::common;
 const PLAN_PATH: &str =
     "crates/plan-issue/tests/fixtures/plans/plan-issue-rust-cli-full-delivery-plan.md";
-
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
 
 fn gh_stub_script() -> &'static str {
     r#"#!/usr/bin/env bash
@@ -206,8 +202,8 @@ fn github_adapter_live_commands_use_gh_backend_for_issue_and_pr_state() {
         ),
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["command"], "accept-sprint");
     assert_eq!(payload["status"], "ok");
 
@@ -257,8 +253,8 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
         ),
     );
 
-    assert_eq!(ready_out.code, 0, "stderr: {}", ready_out.stderr);
-    let ready_payload = parse_json(&ready_out.stdout);
+    assert_eq!(ready_out.code, 0, "stderr: {}", ready_out.stderr_text());
+    let ready_payload = ready_out.stdout_json();
     assert_eq!(ready_payload["command"], "ready-plan");
     assert_eq!(
         ready_payload["payload"]["result"]["label_update_applied"],
@@ -292,8 +288,8 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
         ),
     );
 
-    assert_eq!(close_out.code, 0, "stderr: {}", close_out.stderr);
-    let close_payload = parse_json(&close_out.stdout);
+    assert_eq!(close_out.code, 0, "stderr: {}", close_out.stderr_text());
+    let close_payload = close_out.stdout_json();
     assert_eq!(close_payload["command"], "close-plan");
     assert_eq!(close_payload["payload"]["result"]["issue_closed"], false);
 
@@ -351,8 +347,8 @@ fn live_ready_plan_label_update_flag_applies_review_label() {
         ),
     );
 
-    assert_eq!(ready_out.code, 0, "stderr: {}", ready_out.stderr);
-    let payload = parse_json(&ready_out.stdout);
+    assert_eq!(ready_out.code, 0, "stderr: {}", ready_out.stderr_text());
+    let payload = ready_out.stdout_json();
     assert_eq!(payload["command"], "ready-plan");
     assert_eq!(payload["payload"]["result"]["label_update_requested"], true);
     assert_eq!(payload["payload"]["result"]["label_update_applied"], true);
@@ -406,8 +402,8 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
         ),
     );
 
-    assert_eq!(start_out.code, 0, "stderr: {}", start_out.stderr);
-    let start_payload = parse_json(&start_out.stdout);
+    assert_eq!(start_out.code, 0, "stderr: {}", start_out.stderr_text());
+    let start_payload = start_out.stdout_json();
     assert_eq!(start_payload["command"], "start-sprint");
     assert_eq!(start_payload["payload"]["result"]["synced_issue_rows"], 3);
     assert_eq!(
@@ -458,7 +454,7 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
         ),
     );
 
-    assert_eq!(ready_out.code, 0, "stderr: {}", ready_out.stderr);
+    assert_eq!(ready_out.code, 0, "stderr: {}", ready_out.stderr_text());
 
     let accept_capture = tmp.path().join("accept-sprint-body.md");
     let accept_capture_s = accept_capture.to_string_lossy().to_string();
@@ -494,7 +490,7 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
         ),
     );
 
-    assert_eq!(accept_out.code, 0, "stderr: {}", accept_out.stderr);
+    assert_eq!(accept_out.code, 0, "stderr: {}", accept_out.stderr_text());
     let accept_body = fs::read_to_string(&accept_capture).expect("captured accept body");
     assert!(
         accept_body.contains("## Overview"),
@@ -515,8 +511,8 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
         "--to-sprint",
         "4",
     ]);
-    assert_eq!(guide_out.code, 0, "stderr: {}", guide_out.stderr);
-    let guide_payload = parse_json(&guide_out.stdout);
+    assert_eq!(guide_out.code, 0, "stderr: {}", guide_out.stderr_text());
+    let guide_payload = guide_out.stdout_json();
     let guide_text = guide_payload["payload"]["result"]["guide"]
         .as_str()
         .unwrap_or_default();
@@ -568,8 +564,8 @@ fn github_adapter_rejects_literal_escaped_newline_without_force() {
         ),
     );
 
-    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "github-comment-failed");
 
@@ -630,13 +626,14 @@ fn github_adapter_force_flag_allows_literal_escaped_newline() {
         ),
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["status"], "ok");
     assert_eq!(
-        payload["payload"]["result"]["comment_posted"], true,
+        payload["payload"]["result"]["comment_posted"],
+        true,
         "{}",
-        out.stdout
+        out.stdout_text()
     );
 
     let log = fs::read_to_string(&log_path).expect("read log");

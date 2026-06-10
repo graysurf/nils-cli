@@ -27,10 +27,6 @@ struct SpecRow {
     pr_group: String,
 }
 
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
-
 fn result_path(payload: &Value, key: &str) -> String {
     payload["payload"]["result"][key]
         .as_str()
@@ -251,7 +247,12 @@ fn start_plan_dry_run_writes_runtime_truth_task_decomposition_metadata() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
+    assert_eq!(
+        start_plan_out.code,
+        0,
+        "stderr: {}",
+        start_plan_out.stderr_text()
+    );
 
     let issue_body = fs::read_to_string(&plan_issue_body).expect("read issue body");
     let issue_rows = parse_task_decomposition_rows(&issue_body);
@@ -294,12 +295,13 @@ fn start_plan_dry_run_writes_runtime_truth_task_decomposition_metadata() {
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
     assert_eq!(
-        start_sprint_out.code, 0,
+        start_sprint_out.code,
+        0,
         "stderr: {}",
-        start_sprint_out.stderr
+        start_sprint_out.stderr_text()
     );
 
-    let sprint_payload = parse_json(&start_sprint_out.stdout);
+    let sprint_payload = start_sprint_out.stdout_json();
     let comment_path = result_path(&sprint_payload, "comment_path");
     let comment = fs::read_to_string(&comment_path).expect("read sprint comment");
     assert!(
@@ -340,7 +342,7 @@ fn start_plan_dry_run_writes_runtime_truth_task_decomposition_metadata() {
     let prompt_files = sprint_payload["payload"]["result"]["subagent_prompt_files"]
         .as_array()
         .expect("subagent prompt files");
-    assert_eq!(prompt_files.len(), 2, "{}", start_sprint_out.stdout);
+    assert_eq!(prompt_files.len(), 2, "{}", start_sprint_out.stdout_text());
     let lane_prompt_path = prompt_files
         .iter()
         .filter_map(|value| value.as_str())
@@ -472,7 +474,12 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
+    assert_eq!(
+        start_plan_out.code,
+        0,
+        "stderr: {}",
+        start_plan_out.stderr_text()
+    );
 
     let issue_body = fs::read_to_string(&plan_issue_body).expect("read issue body");
     let body_json = json!({ "body": issue_body.clone() }).to_string();
@@ -516,9 +523,11 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
         ),
     );
     assert_eq!(
-        start_out.code, 0,
+        start_out.code,
+        0,
         "stdout:\n{}\nstderr:\n{}",
-        start_out.stdout, start_out.stderr
+        start_out.stdout_text(),
+        start_out.stderr_text()
     );
 
     let issue_rows = parse_task_decomposition_rows(&issue_body);
@@ -533,11 +542,11 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
         assert_eq!(spec_row.notes, issue_row.notes);
     }
 
-    let payload = parse_json(&start_out.stdout);
+    let payload = start_out.stdout_json();
     let prompt_files = payload["payload"]["result"]["subagent_prompt_files"]
         .as_array()
         .expect("prompt files");
-    assert_eq!(prompt_files.len(), 2, "{}", start_out.stdout);
+    assert_eq!(prompt_files.len(), 2, "{}", start_out.stdout_text());
 
     let prompt_path = prompt_files[0].as_str().expect("prompt path");
     assert!(prompt_path.ends_with("/S1T1.md"), "{prompt_path}");
@@ -579,11 +588,13 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
         ),
     );
     assert_eq!(
-        drift_out.code, 1,
+        drift_out.code,
+        1,
         "stdout={} stderr={}",
-        drift_out.stdout, drift_out.stderr
+        drift_out.stdout_text(),
+        drift_out.stderr_text()
     );
-    let drift_payload = parse_json(&drift_out.stdout);
+    let drift_payload = drift_out.stdout_json();
     assert_eq!(drift_payload["status"], "error");
     assert_eq!(drift_payload["error"]["code"], "task-sync-drift-detected");
 

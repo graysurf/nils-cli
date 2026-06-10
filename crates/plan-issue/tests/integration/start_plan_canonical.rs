@@ -1,7 +1,6 @@
 use std::fs;
 
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 use tempfile::TempDir;
 
 use crate::common;
@@ -9,11 +8,7 @@ use crate::common;
 const PLAN_PATH: &str =
     "crates/plan-issue/tests/fixtures/plans/plan-issue-rust-cli-full-delivery-plan.md";
 
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
-
-fn run_local_start_plan(state_dir: &str, repo: &str) -> common::CmdOut {
+fn run_local_start_plan(state_dir: &str, repo: &str) -> nils_test_support::cmd::CmdOutput {
     common::run_plan_issue_local_with_env(
         &[
             "--format",
@@ -39,9 +34,9 @@ fn start_plan_emits_canonical_artifacts() {
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let out = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     let result = &payload["payload"]["result"];
     let issue_root = result["issue_root"].as_str().expect("issue_root in result");
     let expected_issue_root = state_dir
@@ -114,9 +109,9 @@ fn start_plan_writes_plan_branch_ref() {
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let out = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     let plan_branch_ref_path = payload["payload"]["result"]["plan_branch_ref_path"]
         .as_str()
         .expect("plan_branch_ref_path in result");
@@ -149,9 +144,9 @@ fn start_plan_local_uses_placeholder_issue() {
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let out = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     let result = &payload["payload"]["result"];
     assert_eq!(result["issue_number"], 999);
     let issue_root = result["issue_root"].as_str().expect("issue_root in result");
@@ -174,8 +169,8 @@ fn status_plan_emits_repo_slug_and_v2_schema_version() {
     // First run start-plan to produce an issue body we can feed into
     // status-plan.
     let start = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
-    assert_eq!(start.code, 0, "start-plan stderr: {}", start.stderr);
-    let start_payload = parse_json(&start.stdout);
+    assert_eq!(start.code, 0, "start-plan stderr: {}", start.stderr_text());
+    let start_payload = start.stdout_json();
     let issue_body_path = start_payload["payload"]["result"]["issue_body_path"]
         .as_str()
         .expect("issue_body_path")
@@ -194,9 +189,14 @@ fn status_plan_emits_repo_slug_and_v2_schema_version() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(status.code, 0, "status-plan stderr: {}", status.stderr);
+    assert_eq!(
+        status.code,
+        0,
+        "status-plan stderr: {}",
+        status.stderr_text()
+    );
 
-    let payload = parse_json(&status.stdout);
+    let payload = status.stdout_json();
     assert_eq!(
         payload["schema_version"], "plan-issue.status.plan.v2",
         "schema_version should bump to v2"
@@ -217,13 +217,14 @@ fn start_plan_emits_repo_slug_and_v2_schema_version() {
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
     let out = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     assert_eq!(
-        payload["schema_version"], "plan-issue.start.plan.v2",
+        payload["schema_version"],
+        "plan-issue.start.plan.v2",
         "schema_version should bump to v2: {}",
-        out.stdout
+        out.stdout_text()
     );
     let result = &payload["payload"]["result"];
     assert_eq!(
@@ -233,8 +234,8 @@ fn start_plan_emits_repo_slug_and_v2_schema_version() {
 
     // Round-trip: a second run produces an identical repo_slug.
     let out2 = run_local_start_plan(&state_dir_s, "graysurf/plan-issue-smoke");
-    assert_eq!(out2.code, 0, "stderr: {}", out2.stderr);
-    let payload2 = parse_json(&out2.stdout);
+    assert_eq!(out2.code, 0, "stderr: {}", out2.stderr_text());
+    let payload2 = out2.stdout_json();
     assert_eq!(
         payload2["payload"]["result"]["repo_slug"], result["repo_slug"],
         "repo_slug must round-trip identically across runs"

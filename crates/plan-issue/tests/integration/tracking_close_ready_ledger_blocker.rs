@@ -10,10 +10,6 @@ use plan_issue::lifecycle_record::PAYLOAD_SCHEMA_V2;
 
 use crate::common;
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 fn v2_comment(role: &str, profile: &str, data: Value, visible: &str) -> String {
     let envelope = json!({
         "schema": PAYLOAD_SCHEMA_V2,
@@ -147,8 +143,8 @@ fn close_ready_emits_ledger_rows_pending_when_phase_ready_and_rows_pending() {
         "--approval",
         "approver",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let blockers = result["blockers"].as_array().expect("blockers");
     let ledger_blockers: Vec<&Value> = blockers
         .iter()
@@ -192,8 +188,8 @@ fn close_ready_no_ledger_blocker_when_all_rows_done() {
         "--approval",
         "approver",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let codes: Vec<&str> = result["blockers"]
         .as_array()
         .unwrap()
@@ -224,8 +220,8 @@ fn close_ready_silent_skips_when_bundle_absent() {
         "--approval",
         "approver",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let codes: Vec<&str> = result["blockers"]
         .as_array()
         .unwrap()
@@ -260,8 +256,8 @@ fn close_ready_no_ledger_blocker_when_phase_implementing() {
         "--approval",
         "approver",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let codes: Vec<&str> = result["blockers"]
         .as_array()
         .unwrap()

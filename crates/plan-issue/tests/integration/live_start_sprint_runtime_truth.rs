@@ -26,10 +26,6 @@ struct SpecRow {
     notes: String,
 }
 
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
-
 fn result_path(payload: &Value, key: &str) -> String {
     payload["payload"]["result"][key]
         .as_str()
@@ -250,7 +246,12 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
+    assert_eq!(
+        start_plan_out.code,
+        0,
+        "stderr: {}",
+        start_plan_out.stderr_text()
+    );
 
     let issue_body = fs::read_to_string(&plan_issue_body).expect("read issue body");
     let body_json = json!({ "body": issue_body.clone() }).to_string();
@@ -293,11 +294,13 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
     );
 
     assert_eq!(
-        out.code, 0,
+        out.code,
+        0,
         "stdout:\n{}\nstderr:\n{}",
-        out.stdout, out.stderr
+        out.stdout_text(),
+        out.stderr_text()
     );
-    let payload = parse_json(&out.stdout);
+    let payload = out.stdout_json();
     assert_eq!(payload["command"], "start-sprint");
     assert_eq!(payload["payload"]["result"]["synced_issue_rows"], 2);
     assert_eq!(
@@ -333,7 +336,7 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
     let prompt_files = payload["payload"]["result"]["subagent_prompt_files"]
         .as_array()
         .expect("subagent prompt files");
-    assert_eq!(prompt_files.len(), 2, "{}", out.stdout);
+    assert_eq!(prompt_files.len(), 2, "{}", out.stdout_text());
     let prompt_path = prompt_files[0].as_str().expect("prompt path");
     assert!(prompt_path.ends_with("/S1T1.md"), "{prompt_path}");
     let prompt = fs::read_to_string(prompt_path).expect("read prompt");

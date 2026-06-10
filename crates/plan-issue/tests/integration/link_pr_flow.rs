@@ -1,14 +1,9 @@
 use std::fs;
 
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 use tempfile::TempDir;
 
 use crate::common;
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be JSON")
-}
-
 fn issue_body_with_rows(rows: &[&str]) -> String {
     let mut out = vec![
         "# Example Plan".to_string(),
@@ -61,8 +56,8 @@ fn link_pr_body_file_task_target_syncs_all_rows_in_per_sprint_lane() {
         "https://github.com/sympoies/nils-cli/pull/221",
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let result = &payload["payload"]["result"];
     assert_eq!(payload["command"], "link-pr");
     assert_eq!(payload["status"], "ok");
@@ -107,8 +102,8 @@ fn link_pr_body_file_sprint_pr_group_updates_only_selected_shared_lane() {
         "333",
     ]);
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let result = &payload["payload"]["result"];
     assert_eq!(result["target"], "sprint:S4/pr-group:core");
     assert_eq!(result["rows_changed"], 2);
@@ -147,8 +142,8 @@ fn link_pr_body_file_sprint_target_rejects_ambiguous_multi_lane_scope() {
         "#444",
     ]);
 
-    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     assert_eq!(payload["command"], "link-pr");
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "link-pr-target-invalid");
@@ -157,6 +152,6 @@ fn link_pr_body_file_sprint_target_rejects_ambiguous_multi_lane_scope() {
             .as_str()
             .is_some_and(|msg| msg.contains("ambiguous") && msg.contains("--pr-group")),
         "{}",
-        out.stdout
+        out.stdout_text()
     );
 }

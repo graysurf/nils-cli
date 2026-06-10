@@ -23,10 +23,6 @@ use plan_issue::lifecycle_record::PAYLOAD_SCHEMA_V2;
 
 use crate::common;
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 fn v2_comment(role: &str, profile: &str, data: Value, visible: &str) -> String {
     let envelope = json!({
         "schema": PAYLOAD_SCHEMA_V2,
@@ -135,9 +131,9 @@ fn tracking_checkpoint_live_fixture_returns_posted_state_role_with_synthesized_u
         "144",
         "--live",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert_eq!(result["mode"], "fixture");
     // The retired refusal code must not surface on the live path.
     let blocked_codes: Vec<&str> = result["blocked"]
@@ -195,9 +191,15 @@ fn tracking_checkpoint_live_fixture_refuses_when_lifecycle_lock_is_busy() {
         "144",
         "--live",
     ]);
-    assert_eq!(out.code, 1, "stdout={} stderr={}", out.stdout, out.stderr);
+    assert_eq!(
+        out.code,
+        1,
+        "stdout={} stderr={}",
+        out.stdout_text(),
+        out.stderr_text()
+    );
 
-    let parsed = json_stdout(&out);
+    let parsed = out.stdout_json();
     assert_eq!(parsed["status"], "error");
     assert_eq!(parsed["error"]["code"], "plan-issue-lifecycle-lock-busy");
     let message = parsed["error"]["message"].as_str().expect("message");
@@ -227,9 +229,9 @@ fn tracking_checkpoint_live_fixture_posts_state_and_review_in_declaration_order(
         "144",
         "--live",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert_eq!(result["mode"], "fixture");
 
     let posted = result["posted"].as_array().expect("posted array");
@@ -278,9 +280,9 @@ fn tracking_checkpoint_live_fixture_repair_dashboard_returns_fixture_repair_resu
         "--live",
         "--repair-dashboard",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
 
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    let result = out.stdout_json()["payload"]["result"].clone();
     let repair = &result["repair_dashboard_result"];
     assert_eq!(repair["operation"], "record.repair-dashboard");
     assert_eq!(repair["mode"], "fixture");
@@ -338,8 +340,8 @@ fn tracking_checkpoint_live_visible_completeness_failure_short_circuits_before_p
         "1",
         "--live",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     // Either visible completeness fails (preferred) or the role renders
     // without lint failure but `posted` stays empty under the
     // empty-rendered guard. Both branches must avoid emitting the retired
@@ -381,8 +383,8 @@ fn tracking_checkpoint_live_inherits_issue_from_run_state() {
         fixture.path().to_str().expect("fixture"),
         "--live", // no --issue: must be inherited from run-state
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let blocked_codes: Vec<&str> = result["blocked"]
         .as_array()
         .unwrap()
@@ -442,8 +444,8 @@ fn tracking_checkpoint_live_missing_issue_blocks_when_run_state_has_none() {
         fixture.path().to_str().expect("fixture"),
         "--live", // no --issue and run-state issue is the 0 sentinel
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let blocked_codes: Vec<&str> = result["blocked"]
         .as_array()
         .unwrap()

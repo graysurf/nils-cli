@@ -10,10 +10,6 @@ use crate::common;
 const PLAN_PATH: &str =
     "crates/plan-issue/tests/fixtures/plans/plan-issue-rust-cli-full-delivery-plan.md";
 
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
-
 struct StartSprintRun {
     payload: Value,
     sprint_root: PathBuf,
@@ -48,8 +44,8 @@ fn run_local_start_sprint(
         ],
         &[("PLAN_ISSUE_HOME", state_dir)],
     );
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let sprint_root = PathBuf::from(
         payload["payload"]["result"]["sprint_root"]
             .as_str()

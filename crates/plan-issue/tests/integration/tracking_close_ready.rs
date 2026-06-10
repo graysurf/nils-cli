@@ -10,10 +10,6 @@ use plan_issue::lifecycle_record::PAYLOAD_SCHEMA_V2;
 
 use crate::common;
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 fn v2_comment(role: &str, profile: &str, data: Value, visible: &str) -> String {
     let envelope = json!({
         "schema": PAYLOAD_SCHEMA_V2,
@@ -108,8 +104,8 @@ fn tracking_close_ready_reports_ready_for_complete_fixture() {
         "--approval",
         "https://example.com/approval",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert_eq!(result["fsm_state"], "RECORD_READY_FOR_CLOSE");
     let blockers: Vec<&str> = result["blockers"]
         .as_array()
@@ -161,8 +157,8 @@ fn tracking_close_ready_blocks_when_missing_validation() {
         "--approval",
         "approver",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert_eq!(result["ready"], false);
     let codes: Vec<&str> = result["blockers"]
         .as_array()
@@ -188,8 +184,8 @@ fn tracking_close_ready_collects_linked_prs_from_state_and_flag() {
         "--linked-pr",
         "owner/repo#999",
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let linked: Vec<&str> = result["linked_prs"]
         .as_array()
         .unwrap()
@@ -216,7 +212,7 @@ fn tracking_close_ready_is_non_mutating() {
         "approver",
     ]);
     assert_eq!(out.code, 0);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert!(result.get("posted").is_none());
     assert!(result.get("dashboard_repaired").is_none());
 }
@@ -224,8 +220,8 @@ fn tracking_close_ready_is_non_mutating() {
 #[test]
 fn tracking_close_ready_help_lists_required_args() {
     let out = common::run_plan_issue(&["tracking", "close-ready", "--help"]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    assert!(out.stdout.contains("--linked-pr"));
-    assert!(out.stdout.contains("--approval"));
-    assert!(out.stdout.contains("--expect-visible"));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    assert!(out.stdout_text().contains("--linked-pr"));
+    assert!(out.stdout_text().contains("--approval"));
+    assert!(out.stdout_text().contains("--expect-visible"));
 }

@@ -10,10 +10,6 @@ use plan_issue::lifecycle_record::PAYLOAD_SCHEMA_V2;
 
 use crate::common;
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 fn v2_comment(role: &str, profile: &str, data: Value, visible: &str) -> String {
     let envelope = json!({
         "schema": PAYLOAD_SCHEMA_V2,
@@ -81,7 +77,7 @@ fn tracking_checkpoint_refusals_reject_source_plan_closeout_post_kinds() {
             kind,
         ]);
         assert_ne!(out.code, 0, "post {kind} should fail");
-        let envelope = json_stdout(&out);
+        let envelope = out.stdout_json();
         assert_eq!(
             envelope["error"]["code"],
             "tracking-checkpoint-role-not-allowed"
@@ -118,8 +114,8 @@ fn tracking_checkpoint_refusals_block_when_run_state_stale_vs_issue_closed() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let codes: Vec<&str> = result["blocked"]
         .as_array()
         .unwrap()
@@ -205,8 +201,8 @@ fn tracking_checkpoint_blocks_when_recorded_ledger_ref_is_unresolvable() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let codes: Vec<&str> = result["blocked"]
         .as_array()
         .unwrap()
@@ -236,7 +232,7 @@ fn tracking_checkpoint_refusals_block_unknown_role() {
         "bogus",
     ]);
     assert_ne!(out.code, 0);
-    let envelope = json_stdout(&out);
+    let envelope = out.stdout_json();
     assert_eq!(
         envelope["error"]["code"],
         "tracking-checkpoint-unknown-role"

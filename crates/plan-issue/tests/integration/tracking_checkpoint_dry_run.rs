@@ -10,10 +10,6 @@ use plan_issue::lifecycle_record::PAYLOAD_SCHEMA_V2;
 
 use crate::common;
 
-fn json_stdout(out: &common::CmdOut) -> Value {
-    serde_json::from_str(&out.stdout).expect("json stdout")
-}
-
 fn v2_comment(role: &str, profile: &str, data: Value, visible: &str) -> String {
     let envelope = json!({
         "schema": PAYLOAD_SCHEMA_V2,
@@ -135,8 +131,8 @@ fn tracking_checkpoint_dry_run_renders_state_role_from_run_state() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert_eq!(result["mode"], "dry-run");
     let planned: Vec<&str> = result["roles_planned"]
         .as_array()
@@ -224,8 +220,8 @@ fn tracking_checkpoint_state_body_renders_full_execution_state_ledger() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let body = result["rendered"][0]["body"]
         .as_str()
         .expect("body")
@@ -330,8 +326,8 @@ fn tracking_checkpoint_state_body_renders_live_header_not_frozen_preflight() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let body = json_stdout(&out)["payload"]["result"]["rendered"][0]["body"]
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let body = out.stdout_json()["payload"]["result"]["rendered"][0]["body"]
         .as_str()
         .expect("body")
         .to_string();
@@ -414,8 +410,8 @@ fn tracking_checkpoint_dry_run_session_renders_from_activity_validation_still_sk
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let planned: Vec<&str> = result["roles_planned"]
         .as_array()
         .unwrap()
@@ -496,8 +492,8 @@ fn tracking_checkpoint_dry_run_session_skipped_for_bare_run_state() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let skipped: Vec<&str> = result["roles_skipped"]
         .as_array()
         .unwrap()
@@ -548,8 +544,8 @@ fn tracking_checkpoint_blocks_review_role_without_decision() {
         "--fixture",
         fixture.path().to_str().expect("fixture"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     let blocked_codes: Vec<&str> = result["blocked"]
         .as_array()
         .unwrap()
@@ -631,7 +627,7 @@ fn tracking_checkpoint_dry_run_renders_rich_review_evidence() {
         "--rendered-out",
         rendered_dir.to_str().expect("rendered out"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     let body = fs::read_to_string(rendered_dir.join("review-comment.md")).expect("rendered review");
     assert!(body.contains("- Decision: approve"));
     assert!(body.contains("- Lenses: testing, maintainability"));
@@ -690,7 +686,7 @@ fn tracking_checkpoint_dry_run_ignores_prior_review_disposition_hint() {
         "--rendered-out",
         rendered_dir.to_str().expect("rendered out"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     let body = fs::read_to_string(rendered_dir.join("review-comment.md")).expect("rendered review");
     assert!(body.contains("- Decision: approve"));
     assert!(body.contains("- Lenses: testing"));
@@ -738,8 +734,8 @@ fn tracking_checkpoint_dry_run_writes_rendered_bodies_under_run_dir() {
         "--rendered-out",
         rendered_dir.to_str().expect("rendered out"),
     ]);
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let result = json_stdout(&out)["payload"]["result"].clone();
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
     assert_eq!(result["mode"], "dry-run");
     let written = rendered_dir.join("state-comment.md");
     assert!(

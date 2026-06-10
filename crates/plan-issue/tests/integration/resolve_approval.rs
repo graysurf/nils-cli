@@ -8,14 +8,9 @@ use std::fs;
 use nils_test_support::StubBinDir;
 use nils_test_support::cmd::CmdOptions;
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 use tempfile::TempDir;
 
 use crate::common;
-
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
 
 /// `gh api repos/.../issues/<pr>/comments` stub. Reads JSON from the path
 /// in `RESOLVE_APPROVAL_GH_COMMENTS` and prints it back unchanged. Other
@@ -93,13 +88,13 @@ fn resolve_approval_text_prints_url_when_exactly_one_match() {
         cmd_options(&stub, &comments),
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert_eq!(
-        out.stdout.trim(),
+        out.stdout_text().trim(),
         "https://github.com/owner/repo/pull/12#issuecomment-2",
         "single-match text output should print only the URL: stdout={:?} stderr={:?}",
-        out.stdout,
-        out.stderr
+        out.stdout_text(),
+        out.stderr_text()
     );
 }
 
@@ -129,15 +124,15 @@ fn resolve_approval_text_fails_when_no_decision_merge_comment() {
 
     assert_ne!(out.code, 0, "expected non-zero exit on no-match");
     assert!(
-        out.stderr
+        out.stderr_text()
             .contains("no merge-decision review-evidence comment found"),
         "stderr should describe the empty case: {:?}",
-        out.stderr
+        out.stderr_text()
     );
     assert!(
-        out.stdout.trim().is_empty(),
+        out.stdout_text().trim().is_empty(),
         "stdout must stay empty when text mode fails: {:?}",
-        out.stdout
+        out.stdout_text()
     );
 }
 
@@ -172,15 +167,15 @@ fn resolve_approval_text_fails_when_multiple_decision_merge_comments() {
 
     assert_ne!(out.code, 0, "expected non-zero exit when ambiguous");
     assert!(
-        out.stderr
+        out.stderr_text()
             .contains("found 2 merge-decision review-evidence comments"),
         "stderr should name the count: {:?}",
-        out.stderr
+        out.stderr_text()
     );
     assert!(
-        out.stdout.trim().is_empty(),
+        out.stdout_text().trim().is_empty(),
         "stdout must stay empty when text mode fails: {:?}",
-        out.stdout
+        out.stdout_text()
     );
 }
 
@@ -220,8 +215,8 @@ fn resolve_approval_json_reports_zero_one_or_many_candidates() {
         ],
         cmd_options(&stub, &comments),
     );
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let result = &payload["payload"]["result"];
     assert_eq!(result["count"], 2);
     assert_eq!(
@@ -249,8 +244,8 @@ fn resolve_approval_json_reports_zero_one_or_many_candidates() {
         ],
         cmd_options(&stub, &comments),
     );
-    assert_eq!(out.code, 0, "JSON mode keeps exit 0: {}", out.stderr);
-    let payload = parse_json(&out.stdout);
+    assert_eq!(out.code, 0, "JSON mode keeps exit 0: {}", out.stderr_text());
+    let payload = out.stdout_json();
     let result = &payload["payload"]["result"];
     assert_eq!(result["count"], 0);
     assert!(result["url"].is_null());

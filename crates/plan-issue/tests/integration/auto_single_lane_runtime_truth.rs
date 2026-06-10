@@ -26,10 +26,6 @@ struct SpecRow {
     notes: String,
 }
 
-fn parse_json(stdout: &str) -> Value {
-    serde_json::from_str(stdout).expect("stdout should be valid JSON")
-}
-
 fn result_path(payload: &Value, key: &str) -> String {
     payload["payload"]["result"][key]
         .as_str()
@@ -230,7 +226,12 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
         ],
         &[("PLAN_ISSUE_HOME", &state_dir_s)],
     );
-    assert_eq!(start_plan_out.code, 0, "stderr: {}", start_plan_out.stderr);
+    assert_eq!(
+        start_plan_out.code,
+        0,
+        "stderr: {}",
+        start_plan_out.stderr_text()
+    );
 
     let issue_body = fs::read_to_string(&plan_issue_body).expect("read issue body");
     let issue_rows = parse_task_decomposition_rows(&issue_body);
@@ -288,12 +289,14 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
         ),
     );
     assert_eq!(
-        start_sprint_out.code, 0,
+        start_sprint_out.code,
+        0,
         "stdout:\n{}\nstderr:\n{}",
-        start_sprint_out.stdout, start_sprint_out.stderr
+        start_sprint_out.stdout_text(),
+        start_sprint_out.stderr_text()
     );
 
-    let sprint_payload = parse_json(&start_sprint_out.stdout);
+    let sprint_payload = start_sprint_out.stdout_json();
     let start_comment_path = result_path(&sprint_payload, "comment_path");
     let start_comment = fs::read_to_string(&start_comment_path).expect("read start comment");
     assert!(
@@ -320,7 +323,7 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
     let prompt_files = sprint_payload["payload"]["result"]["subagent_prompt_files"]
         .as_array()
         .expect("prompt files");
-    assert_eq!(prompt_files.len(), 2, "{}", start_sprint_out.stdout);
+    assert_eq!(prompt_files.len(), 2, "{}", start_sprint_out.stdout_text());
 
     let prompt_path = prompt_files[0].as_str().expect("prompt path");
     assert!(prompt_path.ends_with("/S1T1.md"), "{prompt_path}");
@@ -357,12 +360,14 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
         ),
     );
     assert_eq!(
-        ready_out.code, 0,
+        ready_out.code,
+        0,
         "stdout:\n{}\nstderr:\n{}",
-        ready_out.stdout, ready_out.stderr
+        ready_out.stdout_text(),
+        ready_out.stderr_text()
     );
 
-    let ready_payload = parse_json(&ready_out.stdout);
+    let ready_payload = ready_out.stdout_json();
     let ready_comment_path = result_path(&ready_payload, "comment_path");
     let ready_comment = fs::read_to_string(&ready_comment_path).expect("read ready comment");
     assert!(
