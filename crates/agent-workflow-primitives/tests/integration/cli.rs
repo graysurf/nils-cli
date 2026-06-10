@@ -12,10 +12,6 @@ fn run(bin: &str, dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved_in_dir(bin, dir, args, &[("AGENT_HOME", &agent_home_value)], None)
 }
 
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
-}
-
 fn out_arg(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -99,7 +95,7 @@ fn repo_retro_reports_git_heuristic_analysis_and_sources() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.repo-retro.report.v2");
     assert_eq!(value["data"]["schema"], "repo-retro.report.v2");
     assert_eq!(value["data"]["mode"], "team");
@@ -178,7 +174,7 @@ fn repo_retro_discovers_core_policies_heuristic_root_with_nested_entries() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     let heuristic = &value["data"]["heuristicSystem"];
     assert_eq!(heuristic["state"], "present");
     // Nested `<slug>/ENTRY.md` entries are discovered; archived entries and the
@@ -216,7 +212,7 @@ fn repo_retro_heuristic_root_override_points_at_explicit_directory() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["data"]["heuristicSystem"]["state"], "present");
     assert_eq!(value["data"]["heuristicSystem"]["activeInbox"]["total"], 1);
 }
@@ -302,7 +298,7 @@ fn repo_retro_active_days_stay_within_committer_window() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     let summary = &value["data"]["git"]["summary"];
     assert_eq!(
         summary["commitCount"], 3,
@@ -378,7 +374,7 @@ fn repo_retro_loads_all_typed_jsonl_inputs_and_warns_on_malformed_lines() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(
         value["data"]["optionalInputs"]["timeline"]["malformedLines"],
         1
@@ -430,7 +426,7 @@ fn repo_retro_history_dir_without_write_does_not_create_files() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["data"]["history"]["enabled"], true);
     assert_eq!(value["data"]["history"]["write"], false);
     assert!(
@@ -468,7 +464,7 @@ fn repo_retro_history_write_creates_index_raw_and_markdown() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     let markdown_path = Path::new(
         value["data"]["history"]["intended"]["markdown"]
             .as_str()
@@ -558,7 +554,7 @@ fn docs_impact_scans_docs_and_non_docs_changes() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.docs-impact.scan.v1");
     assert_eq!(value["data"]["docs_changed"], true);
     assert_eq!(value["data"]["non_docs_changed"], true);
@@ -593,7 +589,7 @@ fn canary_check_records_passing_command() {
         ],
     );
     assert_eq!(run_output.code, 0, "stderr={}", run_output.stderr_text());
-    let run_json = json_stdout(&run_output);
+    let run_json = run_output.stdout_json();
     assert_eq!(run_json["schema_version"], "cli.canary-check.run.v1");
     assert_eq!(run_json["data"]["record"]["last_run"]["status"], "pass");
 
@@ -604,7 +600,7 @@ fn canary_check_records_passing_command() {
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
     assert_eq!(
-        json_stdout(&verify)["data"]["last_run"]["stdout_preview"],
+        verify.stdout_json()["data"]["last_run"]["stdout_preview"],
         "ok"
     );
 }
@@ -669,7 +665,7 @@ fn review_evidence_requires_no_open_medium_or_high_findings() {
         &["verify", "--out", &out, "--format", "json"],
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-    assert_eq!(json_stdout(&verify)["data"]["complete"], true);
+    assert_eq!(verify.stdout_json()["data"]["complete"], true);
 }
 
 #[test]
@@ -763,7 +759,7 @@ fn skill_usage_records_successful_skill_invocation() {
         &["verify", "--out", &out, "--format", "json"],
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-    let value = json_stdout(&verify);
+    let value = verify.stdout_json();
     assert_eq!(value["schema_version"], "cli.skill-usage.verify.v1");
     assert_eq!(value["data"]["complete"], true);
     assert_eq!(value["data"]["record"]["schema"], "skill-usage.record.v1");
@@ -953,7 +949,7 @@ fn browser_session_records_steps_and_verifies() {
         &["verify", "--out", &out, "--format", "json"],
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-    assert_eq!(json_stdout(&verify)["data"]["complete"], true);
+    assert_eq!(verify.stdout_json()["data"]["complete"], true);
 }
 
 #[test]
@@ -1008,7 +1004,7 @@ fn model_cross_check_requires_primary_and_checker_observations() {
         &["verify", "--out", &out, "--format", "json"],
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-    assert_eq!(json_stdout(&verify)["data"]["complete"], true);
+    assert_eq!(verify.stdout_json()["data"]["complete"], true);
 }
 
 #[test]
@@ -1420,7 +1416,7 @@ Promote after a durable fix and validation are linked.\n\n\
             &["deliver", "--dry-run", "--format", "json"],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert_eq!(payload["ok"], true);
         assert_eq!(payload["data"]["dry_run"], true);
         assert!(payload["data"]["pr_url"].is_null());
@@ -1463,7 +1459,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert!(
             payload["data"]["branch"]
                 .as_str()
@@ -1487,7 +1483,7 @@ Promote after a durable fix and validation are linked.\n\n\
             &["deliver", "--dry-run", "--format", "json"],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert_eq!(payload["ok"], false);
         assert_eq!(payload["error"]["code"], "nothing-to-deliver");
     }
@@ -1510,7 +1506,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert_eq!(payload["data"]["ok"], true);
         assert_eq!(payload["data"]["kind"], "inbox");
         assert_eq!(payload["data"]["fields"]["status"], "open");
@@ -1540,7 +1536,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .expect("violations array");
@@ -1576,7 +1572,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .expect("violations array");
@@ -1621,7 +1617,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let duplicates = payload["error"]["details"]["duplicates"]
             .as_array()
             .expect("duplicates array");
@@ -1651,7 +1647,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let entries = payload["data"]["entries"]
             .as_array()
             .expect("entries array");
@@ -1690,7 +1686,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let entries = payload["data"]["entries"].as_array().unwrap();
         assert_eq!(entries[0]["status"], "planned");
     }
@@ -1719,7 +1715,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert_eq!(payload["data"]["ok"], true);
         assert_eq!(payload["data"]["fields"]["status"], "triaged");
     }
@@ -1761,13 +1757,13 @@ Promote after a durable fix and validation are linked.\n\n\
                 "json",
             ],
         );
-        let active_paths: Vec<String> = json_stdout(&active)["data"]["entries"]
+        let active_paths: Vec<String> = active.stdout_json()["data"]["entries"]
             .as_array()
             .unwrap()
             .iter()
             .map(|e| e["path"].as_str().unwrap().to_string())
             .collect();
-        let archive_paths: Vec<String> = json_stdout(&with_archive)["data"]["entries"]
+        let archive_paths: Vec<String> = with_archive.stdout_json()["data"]["entries"]
             .as_array()
             .unwrap()
             .iter()
@@ -1802,7 +1798,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let entry = PathBuf::from(payload["data"]["path"].as_str().unwrap());
         let entry_text = fs::read_to_string(&entry).unwrap();
         assert!(entry_text.contains("- Status: open"));
@@ -1840,7 +1836,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let entry = PathBuf::from(payload["data"]["path"].as_str().unwrap());
         let folder = entry.parent().unwrap();
         let entry_text = fs::read_to_string(&entry).unwrap();
@@ -1864,7 +1860,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-        assert_eq!(json_stdout(&verify)["data"]["ok"], true);
+        assert_eq!(verify.stdout_json()["data"]["ok"], true);
     }
 
     #[test]
@@ -1890,7 +1886,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let entry = PathBuf::from(payload["data"]["path"].as_str().unwrap());
         let folder = entry.parent().unwrap();
         let entry_text = fs::read_to_string(&entry).unwrap();
@@ -1909,7 +1905,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-        assert_eq!(json_stdout(&verify)["data"]["ok"], true);
+        assert_eq!(verify.stdout_json()["data"]["ok"], true);
     }
 
     #[test]
@@ -1971,7 +1967,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert_eq!(payload["data"]["status"], "promoted");
         let text = fs::read_to_string(&entry).unwrap();
         assert!(text.contains("- Status: promoted"));
@@ -1996,7 +1992,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let msg = payload["error"]["message"].as_str().unwrap_or("");
         assert!(msg.contains("retired lifecycle status"));
         assert!(msg.contains("open|promoted|wontfix"));
@@ -2032,7 +2028,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let destination = payload["data"]["destination"].as_str().unwrap();
         assert!(destination.ends_with("archive/2026/fixture-gap/ENTRY.md"));
         assert_eq!(payload["data"]["dry_run"], true);
@@ -2066,7 +2062,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 64, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert_eq!(payload["error"]["code"], "archive-confirmation-required");
         assert!(entry.exists());
     }
@@ -2110,7 +2106,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let destination = PathBuf::from(payload["data"]["destination"].as_str().unwrap());
         assert!(!entry.exists());
         assert!(destination.exists());
@@ -2160,7 +2156,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let destination = PathBuf::from(payload["data"]["destination"].as_str().unwrap());
         // The reported destination resolved inside the case's own inbox tree.
         assert!(
@@ -2221,7 +2217,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let destination = PathBuf::from(payload["data"]["destination"].as_str().unwrap());
         let text = fs::read_to_string(&destination).unwrap();
         assert!(text.contains("- Durable link: `docs/accepted-risk.md`"));
@@ -2245,7 +2241,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .unwrap();
@@ -2283,7 +2279,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .unwrap();
@@ -2320,7 +2316,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .unwrap();
@@ -2367,7 +2363,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .unwrap();
@@ -2407,7 +2403,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .unwrap();
@@ -2439,7 +2435,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .unwrap();
@@ -2471,7 +2467,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .unwrap();
@@ -2506,7 +2502,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert_eq!(payload["data"]["ok"], true);
         assert_eq!(payload["data"]["strict"], false);
         let body_violations = payload["data"]["body_violations"]
@@ -2552,7 +2548,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert_eq!(payload["error"]["details"]["strict"], true);
         let violations = payload["error"]["details"]["violations"]
             .as_array()
@@ -2597,7 +2593,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .expect("violations array");
@@ -2633,7 +2629,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .expect("violations array");
@@ -2664,7 +2660,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .unwrap();
@@ -2697,7 +2693,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_ne!(out.code, 0);
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let violations = payload["error"]["details"]["violations"]
             .as_array()
             .unwrap();
@@ -2736,7 +2732,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let target = PathBuf::from(payload["data"]["path"].as_str().unwrap());
         assert_eq!(target.file_name().unwrap(), "validation-summary.md");
         let text = fs::read_to_string(&target).unwrap();
@@ -2768,7 +2764,7 @@ Promote after a durable fix and validation are linked.\n\n\
             ],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         let target = PathBuf::from(payload["data"]["path"].as_str().unwrap());
         let text = fs::read_to_string(&target).unwrap();
         assert!(!text.contains("/Users/example"));
@@ -2812,7 +2808,7 @@ All gates green.\n",
             &["verify", record_root.to_str().unwrap(), "--format", "json"],
         );
         assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
-        let payload = json_stdout(&out);
+        let payload = out.stdout_json();
         assert_eq!(payload["data"]["ok"], true);
         assert_eq!(payload["data"]["kind"], "record");
     }

@@ -19,10 +19,6 @@ fn run(bin: &str, dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved_in_dir(bin, dir, args, &[("AGENT_HOME", &agent_home_value)], None)
 }
 
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
-}
-
 fn path_arg(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -39,7 +35,7 @@ fn review_specialists_validate_normalizes_findings() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(
         value["schema_version"],
         "cli.review-specialists.validate.v1"
@@ -118,7 +114,7 @@ fn review_specialists_merge_dedupes_and_writes_summary() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["data"]["counts"]["input_rows"], 3);
     assert_eq!(value["data"]["counts"]["merged"], 2);
     assert_eq!(value["data"]["counts"]["displayed"], 1);
@@ -300,7 +296,7 @@ fn review_specialists_scope_classifies_git_diff() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["data"]["schema"], "review-specialists.scope.v1");
     assert_eq!(value["data"]["scope_backend"], true);
     assert!(

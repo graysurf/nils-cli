@@ -4,7 +4,6 @@ use std::path::Path;
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use nils_test_support::git::{git, init_repo_main};
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 
 fn run(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
     run_with_env_remove(dir, args, envs, &[])
@@ -21,10 +20,6 @@ fn run_with_env_remove(
         .with_env_remove_many(remove_envs)
         .with_envs(envs);
     run_resolved("agent-out", args, &options)
-}
-
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
 }
 
 #[test]
@@ -128,7 +123,7 @@ fn project_json_uses_versioned_envelope() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-out.project.v1");
     assert_eq!(value["command"], "agent-out project");
     assert_eq!(value["ok"], true);
@@ -199,7 +194,7 @@ fn project_requires_agent_home_from_flag_or_env() {
     );
 
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "missing-agent-home");
     assert!(
@@ -254,7 +249,7 @@ fn audit_separates_allowlisted_roots_from_violations() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-out.audit.v1");
     assert_eq!(value["ok"], true);
     assert_eq!(value["result"]["summary"]["allowed_roots"], 2);
@@ -283,7 +278,7 @@ fn audit_strict_exits_nonzero_with_json_error_details() {
     );
 
     assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "audit-violations");
     assert_eq!(value["error"]["details"]["summary"]["violations"], 1);
@@ -309,7 +304,7 @@ fn audit_missing_out_root_is_ok() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["result"]["out_root_exists"], false);
     assert_eq!(value["result"]["summary"]["violations"], 0);
 }

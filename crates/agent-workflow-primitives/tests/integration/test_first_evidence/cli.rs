@@ -3,14 +3,9 @@ use std::path::Path;
 
 use nils_test_support::cmd::{CmdOutput, run_resolved_in_dir};
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 
 fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved_in_dir("test-first-evidence", dir, args, &[], None)
-}
-
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
 }
 
 fn out_arg(path: &Path) -> String {
@@ -58,7 +53,7 @@ fn records_failing_evidence_final_validation_and_verifies_json() {
         ],
     );
     assert_eq!(init.code, 0, "stderr={}", init.stderr_text());
-    let init_json = json_stdout(&init);
+    let init_json = init.stdout_json();
     assert_eq!(
         init_json["schema_version"],
         "cli.test-first-evidence.init.v1"
@@ -86,7 +81,7 @@ fn records_failing_evidence_final_validation_and_verifies_json() {
         ],
     );
     assert_eq!(failing.code, 0, "stderr={}", failing.stderr_text());
-    let failing_json = json_stdout(&failing);
+    let failing_json = failing.stdout_json();
     assert_eq!(
         failing_json["schema_version"],
         "cli.test-first-evidence.record-failing.v1"
@@ -118,14 +113,14 @@ fn records_failing_evidence_final_validation_and_verifies_json() {
         "stderr={}",
         final_validation.stderr_text()
     );
-    assert_eq!(json_stdout(&final_validation)["result"]["complete"], true);
+    assert_eq!(final_validation.stdout_json()["result"]["complete"], true);
 
     let verify = run(
         tmp.path(),
         &["verify", "--out", &out_arg, "--format", "json"],
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
-    let verify_json = json_stdout(&verify);
+    let verify_json = verify.stdout_json();
     assert_eq!(
         verify_json["schema_version"],
         "cli.test-first-evidence.verify.v1"
@@ -216,7 +211,7 @@ fn verify_incomplete_record_returns_json_error() {
         &["verify", "--out", &out_arg, "--format", "json"],
     );
     assert_eq!(verify.code, 1, "stdout={}", verify.stdout_text());
-    let value = json_stdout(&verify);
+    let value = verify.stdout_json();
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "incomplete-evidence");
     assert_eq!(
@@ -279,7 +274,7 @@ fn missing_record_fails_with_json_error() {
     let output = run(tmp.path(), &["show", "--out", &out_arg, "--format", "json"]);
 
     assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.test-first-evidence.show.v1");
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "missing-record");

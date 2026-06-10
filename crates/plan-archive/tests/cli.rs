@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 
 fn run(args: &[&str]) -> CmdOutput {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -92,14 +91,6 @@ fn build_query_catalog_archive() -> Archive {
     }
 }
 
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
-}
-
-fn json_stderr(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stderr_text()).expect("stderr should be json")
-}
-
 #[test]
 fn validate_hosts_text_reads_stdin_and_reports_summary() {
     let hosts = "\
@@ -132,7 +123,7 @@ fn validate_metadata_json_preserves_warning_envelope() {
     let output = run(&["--format", "json", "validate-metadata", "--input", &input]);
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let json = json_stdout(&output);
+    let json = output.stdout_json();
     assert_eq!(
         json["schema_version"],
         "cli.plan-archive.validate-metadata.v1"
@@ -163,7 +154,7 @@ fn refresh_no_selector_json_uses_refresh_error_contract() {
 
     assert_eq!(output.code, 65, "stdout={}", output.stdout_text());
     assert_eq!(output.stdout_text(), "");
-    let json = json_stderr(&output);
+    let json = output.stderr_json();
     assert_eq!(json["schema_version"], "cli.plan-archive.refresh.v1");
     assert_eq!(json["ok"].as_bool(), Some(false));
     assert_eq!(json["error"]["code"], "refresh-no-selector");
@@ -175,7 +166,7 @@ fn unknown_subcommand_json_exits_usage_with_contract_error() {
 
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
     assert_eq!(output.stderr_text(), "");
-    let json = json_stdout(&output);
+    let json = output.stdout_json();
     assert_eq!(json["schema_version"], "cli.plan-archive.error.v1");
     assert_eq!(json["ok"].as_bool(), Some(false));
     assert_eq!(json["error"]["code"], "unknown-subcommand");
@@ -225,7 +216,7 @@ fn query_plan_json_resolves_metadata_refs() {
     ]);
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let json = json_stdout(&output);
+    let json = output.stdout_json();
     assert_eq!(json["schema_version"], "cli.plan-archive.query.v1");
     assert_eq!(json["data"]["mode"], "plan_link");
     assert_eq!(json["data"]["plan"], archive.plan_rel);
@@ -268,7 +259,7 @@ fn catalog_refs_to_json_filters_by_canonical_ref() {
     ]);
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let json = json_stdout(&output);
+    let json = output.stdout_json();
     assert_eq!(json["schema_version"], "cli.plan-archive.catalog.v1");
     assert_eq!(json["data"]["total_records"], 2);
     assert_eq!(json["data"]["records"].as_array().unwrap().len(), 1);

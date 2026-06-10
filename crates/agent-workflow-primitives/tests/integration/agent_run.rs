@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use nils_common::cli_contract::exit;
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use pretty_assertions::{assert_eq, assert_ne};
-use serde_json::Value;
 
 fn run(args: &[&str], options: &CmdOptions) -> CmdOutput {
     run_resolved("agent-run", args, options)
@@ -13,10 +12,6 @@ fn run(args: &[&str], options: &CmdOptions) -> CmdOutput {
 
 fn arg(path: &Path) -> String {
     path.to_string_lossy().to_string()
-}
-
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
 }
 
 #[test]
@@ -228,7 +223,7 @@ fn env_json_reports_status_without_environment_diff() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-run.env.v1");
     assert_eq!(value["data"]["schema"], "agent-run.env.v1");
     assert_eq!(value["data"]["env_file"]["kind"], ".envrc");
@@ -266,7 +261,7 @@ fn env_json_reports_dotenv_status_without_environment_diff() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-run.env.v1");
     assert_eq!(value["data"]["env_file"]["kind"], ".env");
     assert_eq!(value["data"]["decision"]["kind"], "direnv-dotenv");
@@ -306,7 +301,7 @@ fn doctor_json_reports_missing_direnv_when_env_file_applies() {
     );
 
     assert_eq!(output.code, 0, "doctor reports status without failing");
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-run.doctor.v1");
     assert_eq!(value["data"]["schema"], "agent-run.doctor.v1");
     assert_eq!(value["data"]["direnv"]["available"], false);

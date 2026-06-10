@@ -10,7 +10,6 @@ use std::path::Path;
 use nils_test_support::cmd::{CmdOutput, run_resolved_in_dir};
 use nils_test_support::http::{HttpResponse, TestServer};
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 
 fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved_in_dir(
@@ -29,10 +28,6 @@ fn run(dir: &Path, args: &[&str]) -> CmdOutput {
 
 fn out_arg(path: &Path) -> String {
     path.to_string_lossy().to_string()
-}
-
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
 }
 
 /// A loopback address with nothing listening, so a request reliably refuses.
@@ -190,7 +185,7 @@ fn large_body_is_truncated_before_preview() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["result"]["body_truncated"], true);
     assert_eq!(value["result"]["body_bytes_captured"], 10);
 
@@ -221,7 +216,7 @@ fn connection_failure_writes_failure_artifacts() {
     );
 
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["ok"], false);
     let code = value["error"]["code"].as_str().expect("error code");
     assert!(
@@ -258,7 +253,7 @@ fn zero_timeout_is_usage_error() {
         ],
     );
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
-    assert_eq!(json_stdout(&output)["error"]["code"], "invalid-timeout");
+    assert_eq!(output.stdout_json()["error"]["code"], "invalid-timeout");
 }
 
 #[test]
@@ -280,7 +275,7 @@ fn zero_max_body_bytes_is_usage_error() {
     );
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
     assert_eq!(
-        json_stdout(&output)["error"]["code"],
+        output.stdout_json()["error"]["code"],
         "invalid-max-body-bytes"
     );
 }
@@ -304,7 +299,7 @@ fn zero_body_preview_bytes_is_usage_error() {
     );
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
     assert_eq!(
-        json_stdout(&output)["error"]["code"],
+        output.stdout_json()["error"]["code"],
         "invalid-body-preview-bytes"
     );
 }
@@ -325,7 +320,7 @@ fn malformed_url_is_usage_error() {
         ],
     );
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
-    assert_eq!(json_stdout(&output)["error"]["code"], "invalid-url");
+    assert_eq!(output.stdout_json()["error"]["code"], "invalid-url");
 }
 
 #[test]

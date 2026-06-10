@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use nils_test_support::cmd::{CmdOutput, run_resolved_in_dir};
 use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 
 fn init_repo() -> tempfile::TempDir {
     init_repo_with(
@@ -16,10 +15,6 @@ fn init_repo() -> tempfile::TempDir {
 
 fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved_in_dir("agent-scope-lock", dir, args, &[], None)
-}
-
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
 }
 
 fn lock_arg(path: &Path) -> String {
@@ -111,7 +106,7 @@ fn json_create_uses_versioned_envelope() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-scope-lock.create.v1");
     assert_eq!(value["command"], "agent-scope-lock create");
     assert_eq!(value["ok"], true);
@@ -134,7 +129,7 @@ fn validate_succeeds_when_changed_paths_are_allowed() {
 
     let validate = run(repo.path(), &["validate", "--format", "json"]);
     assert_eq!(validate.code, 0, "stderr={}", validate.stderr_text());
-    let value = json_stdout(&validate);
+    let value = validate.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-scope-lock.validate.v1");
     assert_eq!(value["command"], "agent-scope-lock validate");
     assert_eq!(value["ok"], true);
@@ -177,7 +172,7 @@ fn missing_lock_fails_with_json_error() {
     );
 
     assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-scope-lock.validate.v1");
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "missing-lock");
@@ -255,7 +250,7 @@ fn create_treats_relative_paths_as_repo_relative_from_subdirectories() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["result"]["lock"]["allowed_paths"][0], "README.md");
 }
 
