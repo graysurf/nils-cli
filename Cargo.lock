@@ -1784,6 +1784,7 @@ dependencies = [
  "clap_complete",
  "nils-build-info",
  "nils-common",
+ "nils-test-support",
  "pretty_assertions",
  "serde_json",
  "tempfile",

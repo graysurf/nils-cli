@@ -23,5 +23,6 @@ nils-common = { version = "1.0.14", path = "../nils-common", package = "nils-com
 serde_json = { workspace = true }
 
 [dev-dependencies]
+nils-test-support = { version = "1.0.14", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"

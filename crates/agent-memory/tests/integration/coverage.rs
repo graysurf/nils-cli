@@ -3,48 +3,31 @@
 //! happy-path `cli` suite does not exercise.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
+use nils_test_support::cmd::{CmdOptions, run_resolved};
 use pretty_assertions::assert_eq;
 
+/// Decoded view over [`nils_test_support::cmd::CmdOutput`] so assertions can
+/// compare `stdout`/`stderr` as strings directly.
 struct Out {
     code: i32,
     stdout: String,
     stderr: String,
 }
 
-fn agent_memory_bin() -> PathBuf {
-    for key in ["CARGO_BIN_EXE_agent-memory", "CARGO_BIN_EXE_agent_memory"] {
-        if let Ok(path) = std::env::var(key) {
-            return path.into();
-        }
-    }
-    let exe = std::env::current_exe().expect("current exe");
-    let target_dir = exe
-        .parent()
-        .and_then(|path| path.parent())
-        .expect("target dir");
-    target_dir.join(format!("agent-memory{}", std::env::consts::EXE_SUFFIX))
-}
-
 /// Run the binary with a fully controlled environment. `AGENT_MEMORY_HOME`,
 /// `XDG_CONFIG_HOME`, and `HOME` are stripped first so the child can never
 /// inherit the developer's real configuration; only the provided pairs are set.
 fn run_env(args: &[&str], envs: &[(&str, &str)]) -> Out {
-    let mut cmd = Command::new(agent_memory_bin());
-    cmd.args(args);
-    for key in ["AGENT_MEMORY_HOME", "XDG_CONFIG_HOME", "HOME"] {
-        cmd.env_remove(key);
-    }
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
-    let output = cmd.output().expect("agent-memory command");
+    let options = CmdOptions::new()
+        .with_env_remove_many(&["AGENT_MEMORY_HOME", "XDG_CONFIG_HOME", "HOME"])
+        .with_envs(envs);
+    let output = run_resolved("agent-memory", args, &options);
     Out {
-        code: output.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        code: output.code,
+        stdout: output.stdout_text(),
+        stderr: output.stderr_text(),
     }
 }
 
