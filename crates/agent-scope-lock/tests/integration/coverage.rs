@@ -9,7 +9,6 @@ use std::path::Path;
 use nils_test_support::cmd::{CmdOutput, run_resolved_in_dir};
 use nils_test_support::git::{InitRepoOptions, init_repo_with};
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 
 fn init_repo() -> tempfile::TempDir {
     init_repo_with(
@@ -21,10 +20,6 @@ fn init_repo() -> tempfile::TempDir {
 
 fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved_in_dir("agent-scope-lock", dir, args, &[], None)
-}
-
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
 }
 
 fn lock_arg(path: &Path) -> String {
@@ -56,7 +51,7 @@ fn create_refuses_to_overwrite_existing_lock_without_force() {
         ],
     );
     assert_eq!(second.code, 1, "stdout={}", second.stdout_text());
-    assert_eq!(json_stdout(&second)["error"]["code"], "lock-exists");
+    assert_eq!(second.stdout_json()["error"]["code"], "lock-exists");
 
     // --force overwrites in place.
     let forced = run(
@@ -105,7 +100,7 @@ fn create_rejects_paths_outside_the_repository() {
         ],
     );
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
-    assert_eq!(json_stdout(&output)["error"]["code"], "path-outside-repo");
+    assert_eq!(output.stdout_json()["error"]["code"], "path-outside-repo");
 }
 
 #[test]
@@ -126,7 +121,7 @@ fn create_rejects_targeting_the_git_metadata_directory() {
         ],
     );
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
-    assert_eq!(json_stdout(&output)["error"]["code"], "git-dir-not-allowed");
+    assert_eq!(output.stdout_json()["error"]["code"], "git-dir-not-allowed");
 }
 
 #[test]
@@ -145,7 +140,7 @@ fn create_without_paths_is_usage_error() {
         ],
     );
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
-    assert_eq!(json_stdout(&output)["error"]["code"], "missing-path");
+    assert_eq!(output.stdout_json()["error"]["code"], "missing-path");
 }
 
 #[test]
@@ -166,7 +161,7 @@ fn create_outside_git_repository_surfaces_git_failure() {
         ],
     );
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "git-command-failed");
 }
@@ -182,7 +177,7 @@ fn read_reports_invalid_lock_json() {
         &["read", "--lock-file", &lock_arg(&lock), "--format", "json"],
     );
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-    assert_eq!(json_stdout(&output)["error"]["code"], "invalid-lock-json");
+    assert_eq!(output.stdout_json()["error"]["code"], "invalid-lock-json");
 }
 
 #[test]
@@ -201,7 +196,7 @@ fn read_reports_unsupported_lock_version() {
     );
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
     assert_eq!(
-        json_stdout(&output)["error"]["code"],
+        output.stdout_json()["error"]["code"],
         "unsupported-lock-version"
     );
 }
@@ -221,7 +216,7 @@ fn read_reports_lock_without_allowed_paths() {
         &["read", "--lock-file", &lock_arg(&lock), "--format", "json"],
     );
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-    assert_eq!(json_stdout(&output)["error"]["code"], "invalid-lock");
+    assert_eq!(output.stdout_json()["error"]["code"], "invalid-lock");
 }
 
 #[test]
@@ -240,7 +235,7 @@ fn read_missing_lock_is_a_runtime_error() {
         ],
     );
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-scope-lock.read.v1");
     assert_eq!(value["error"]["code"], "missing-lock");
 }
@@ -262,7 +257,7 @@ fn read_and_clear_render_json_envelopes() {
         &["read", "--lock-file", &lock_arg, "--format", "json"],
     );
     assert_eq!(read.code, 0, "stderr={}", read.stderr_text());
-    let read_value = json_stdout(&read);
+    let read_value = read.stdout_json();
     assert_eq!(read_value["schema_version"], "cli.agent-scope-lock.read.v1");
     assert_eq!(
         read_value["result"]["lock"]["allowed_paths"][0],
@@ -274,7 +269,7 @@ fn read_and_clear_render_json_envelopes() {
         &["clear", "--lock-file", &lock_arg, "--format", "json"],
     );
     assert_eq!(clear.code, 0, "stderr={}", clear.stderr_text());
-    let clear_value = json_stdout(&clear);
+    let clear_value = clear.stdout_json();
     assert_eq!(
         clear_value["schema_version"],
         "cli.agent-scope-lock.clear.v1"

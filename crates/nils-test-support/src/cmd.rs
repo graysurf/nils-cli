@@ -23,6 +23,20 @@ impl CmdOutput {
         String::from_utf8_lossy(&self.stderr).to_string()
     }
 
+    /// Parse stdout as JSON, panicking when it is not valid JSON.
+    ///
+    /// Replaces the per-crate `fn json_stdout(&CmdOutput)` test helpers; the
+    /// panic message is kept identical to theirs.
+    pub fn stdout_json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.stdout_text()).expect("stdout should be json")
+    }
+
+    /// Parse stderr as JSON, panicking when it is not valid JSON. Used for
+    /// CLIs whose error envelopes are written to stderr.
+    pub fn stderr_json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.stderr_text()).expect("stderr should be json")
+    }
+
     /// Convert to `std::process::Output` for integration with assertion APIs
     /// that expect process output semantics.
     pub fn into_output(self) -> Output {

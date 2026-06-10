@@ -21,10 +21,6 @@ fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     )
 }
 
-fn json_stdout(output: &CmdOutput) -> Value {
-    serde_json::from_str(&output.stdout_text()).expect("stdout should be json")
-}
-
 fn out_arg(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -69,7 +65,7 @@ fn capture_success_writes_redacted_artifact_bundle_and_json() {
     );
 
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.web-evidence.capture.v1");
     assert_eq!(value["command"], "web-evidence capture");
     assert_eq!(value["ok"], true);
@@ -122,7 +118,7 @@ fn http_status_failure_is_classified_and_keeps_artifacts() {
     );
 
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "http-status-error");
     assert_eq!(value["error"]["details"]["status_code"], 500);
@@ -165,7 +161,7 @@ fn invalid_url_scheme_returns_json_usage_error_without_network() {
     );
 
     assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
-    let value = json_stdout(&output);
+    let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.web-evidence.capture.v1");
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "unsupported-url-scheme");
