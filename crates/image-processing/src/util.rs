@@ -1,3 +1,4 @@
+use nils_common::fs as common_fs;
 use nils_common::git as common_git;
 use nils_common::shell::{SingleQuoteEscapeStyle, quote_posix_single_with_style};
 use std::path::{Component, Path, PathBuf};
@@ -32,21 +33,7 @@ pub fn find_repo_root() -> PathBuf {
 }
 
 pub fn expand_user(raw: &str) -> PathBuf {
-    if raw == "~" {
-        return home_dir().unwrap_or_else(|| PathBuf::from(raw));
-    }
-
-    if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = home_dir()
-    {
-        return home.join(rest);
-    }
-
-    PathBuf::from(raw)
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    common_fs::expand_home(Path::new(raw))
 }
 
 pub fn abs_path(path: &Path, cwd: &Path) -> PathBuf {

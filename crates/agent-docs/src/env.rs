@@ -100,9 +100,9 @@ fn resolve_docs_home(cli_value: Option<&Path>, cwd: &Path) -> Result<(PathBuf, D
 }
 
 /// The user's home directory, honoring `HOME` (so it can be overridden in
-/// subprocess tests).
+/// subprocess tests) with a `USERPROFILE` fallback for Windows.
 pub fn home_dir() -> Option<PathBuf> {
-    read_env_path("HOME").or_else(|| read_env_path("USERPROFILE"))
+    nils_common::fs::home_dir().or_else(|| read_env_path("USERPROFILE"))
 }
 
 /// Derive the docs-home from the harness install symlinks: the docs-home is the

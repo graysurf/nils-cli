@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
+use nils_common::fs::expand_home;
 use nils_markdown::Engine;
 use regex::Regex;
 use serde::Serialize;
@@ -571,7 +572,7 @@ struct NameStatusEvent {
 }
 
 fn build_report(args: &ReportArgs) -> Result<RepoRetroReport, CliError> {
-    let repo = repo_root(&expand_user(&args.repo))?;
+    let repo = repo_root(&expand_home(&args.repo))?;
     let window = resolve_window(args)?;
     let mut warnings = Vec::new();
     let mut sources = Vec::new();
@@ -1326,7 +1327,7 @@ fn load_path_classifier(path: Option<&PathBuf>) -> Result<PathClassifier, CliErr
     let Some(path) = path else {
         return Ok(PathClassifier::default());
     };
-    let path = expand_user(path);
+    let path = expand_home(path);
     let body = fs::read_to_string(&path).map_err(|err| {
         CliError::runtime(
             "read-path-class-config-failed",
@@ -1795,7 +1796,7 @@ fn load_jsonl_summary(path: Option<&PathBuf>, label: &str) -> Result<JsonlSummar
             recent: Vec::new(),
         });
     };
-    let path = expand_user(path);
+    let path = expand_home(path);
     if !path.is_file() {
         return Err(CliError::runtime(
             "missing-jsonl-input",
@@ -1913,7 +1914,7 @@ fn build_history_metadata(
             None,
         ));
     }
-    let Some(history_dir) = args.history_dir.as_ref().map(|path| expand_user(path)) else {
+    let Some(history_dir) = args.history_dir.as_ref().map(|path| expand_home(path)) else {
         return Ok(HistoryMetadata {
             enabled: false,
             write: false,
@@ -2468,23 +2469,6 @@ fn render_markdown(report: &RepoRetroReport) -> String {
     engine
         .render(REPO_RETRO_TEMPLATE_NAME, &view)
         .expect("repo_retro template renders")
-}
-
-fn expand_user(path: &Path) -> PathBuf {
-    let value = path.to_string_lossy();
-    if value == "~" {
-        return home_dir().unwrap_or_else(|| path.to_path_buf());
-    }
-    if let Some(rest) = value.strip_prefix("~/")
-        && let Some(home) = home_dir()
-    {
-        return home.join(rest);
-    }
-    path.to_path_buf()
-}
-
-fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
 }
 
 fn slugify(value: &str) -> String {

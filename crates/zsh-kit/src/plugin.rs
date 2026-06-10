@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, TimeZone};
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit};
-use nils_common::fs::display_path;
+use nils_common::fs::{display_path, expand_home};
 use nils_common::redact::redact_text;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -494,25 +494,8 @@ fn non_empty_env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn home_dir() -> Result<PathBuf, PluginError> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
+    nils_common::fs::home_dir()
         .ok_or_else(|| PluginError::data("home-not-set", "HOME is required", None))
-}
-
-fn expand_home(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if text == "~"
-        && let Ok(home) = home_dir()
-    {
-        return home;
-    }
-    if let Some(rest) = text.strip_prefix("~/")
-        && let Ok(home) = home_dir()
-    {
-        return home.join(rest);
-    }
-    path.to_path_buf()
 }
 
 fn now_epoch() -> Result<i64, PluginError> {

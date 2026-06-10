@@ -37,6 +37,45 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// The user's home directory from `HOME`, treating an unset or empty value as
+/// absent. Reads the environment on every call so subprocess tests can
+/// override it.
+///
+/// Consolidates the per-crate `home_dir` helpers that previously lived in
+/// `agent-workflow-primitives`, `image-processing`, and `zsh-kit`. Empty-value
+/// filtering is now uniform; previously only `zsh-kit` and
+/// `provider_runtime::paths` filtered empty `HOME` values. Callers that need a
+/// platform fallback (for example `USERPROFILE` on Windows) or a
+/// crate-specific error type layer it on top of this helper.
+pub fn home_dir() -> Option<PathBuf> {
+    let raw = std::env::var_os("HOME")?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(raw))
+}
+
+/// Expand a leading `~` (the literal `~` or a `~/` prefix) using [`home_dir`].
+///
+/// The path is returned unchanged when it has no `~` prefix or when no home
+/// directory is available. `~user` forms are not expanded.
+///
+/// Behavior matches the per-crate `expand_user` / `expand_home` helpers that
+/// previously lived in `agent-workflow-primitives::repo_retro`,
+/// `image-processing`, and `zsh-kit`.
+pub fn expand_home(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if text == "~" {
+        return home_dir().unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = text.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
+    }
+    path.to_path_buf()
+}
+
 pub const SECRET_FILE_MODE: u32 = 0o600;
 const MAX_TEMP_PATH_ATTEMPTS: u32 = 10;
 
@@ -528,12 +567,60 @@ const ROUND_CONSTANTS: [u32; 64] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nils_test_support::{EnvGuard, GlobalStateLock};
     use tempfile::TempDir;
 
     #[test]
     fn display_path_renders_unicode_paths_losslessly() {
         assert_eq!(display_path(Path::new("/tmp/repo")), "/tmp/repo");
         assert_eq!(display_path(Path::new("")), "");
+    }
+
+    #[test]
+    fn home_dir_reads_home_and_filters_unset_and_empty_values() {
+        let lock = GlobalStateLock::new();
+        {
+            let _guard = EnvGuard::set(&lock, "HOME", "/tmp/test-home");
+            assert_eq!(home_dir(), Some(PathBuf::from("/tmp/test-home")));
+        }
+        {
+            let _guard = EnvGuard::set(&lock, "HOME", "");
+            assert_eq!(home_dir(), None);
+        }
+        {
+            let _guard = EnvGuard::remove(&lock, "HOME");
+            assert_eq!(home_dir(), None);
+        }
+    }
+
+    #[test]
+    fn expand_home_expands_tilde_and_tilde_slash_prefixes_only() {
+        let lock = GlobalStateLock::new();
+        let _guard = EnvGuard::set(&lock, "HOME", "/tmp/test-home");
+
+        assert_eq!(expand_home(Path::new("~")), PathBuf::from("/tmp/test-home"));
+        assert_eq!(
+            expand_home(Path::new("~/x/y")),
+            PathBuf::from("/tmp/test-home/x/y")
+        );
+        assert_eq!(
+            expand_home(Path::new("relative/path")),
+            PathBuf::from("relative/path")
+        );
+        assert_eq!(
+            expand_home(Path::new("/abs/path")),
+            PathBuf::from("/abs/path")
+        );
+        assert_eq!(expand_home(Path::new("~user/x")), PathBuf::from("~user/x"));
+    }
+
+    #[test]
+    fn expand_home_returns_path_unchanged_without_home() {
+        let lock = GlobalStateLock::new();
+        let _guard = EnvGuard::remove(&lock, "HOME");
+
+        assert_eq!(expand_home(Path::new("~")), PathBuf::from("~"));
+        assert_eq!(expand_home(Path::new("~/x")), PathBuf::from("~/x"));
     }
 
     #[test]

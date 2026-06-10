@@ -131,7 +131,7 @@ fn env_path(key: &str) -> Option<PathBuf> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    env_path("HOME")
+    crate::fs::home_dir()
 }
 
 fn parent_dir(path: &Path, levels: usize) -> Option<PathBuf> {
