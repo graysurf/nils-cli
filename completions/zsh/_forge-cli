@@ -176,6 +176,20 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':id -- Numeric PR / MR id:_default' \
 && ret=0
 ;;
+(review-threads)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric PR / MR id:_default' \
+&& ret=0
+;;
 (merge)
 _arguments "${_arguments_options[@]}" : \
 '--method=[Merge method override. When omitted, falls back to \`.forge-cli.toml \[merge\].method\` then the spec default \`squash\`]:METHOD:(squash merge rebase)' \
@@ -187,6 +201,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--keep-branch[Skip the post-merge branch deletion (\`--delete-branch\` on gh, \`--remove-source-branch\` on glab). Mutually exclusive with the implicit-true default; flagging both is \`keep_branch_conflict\`]' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch. Without this flag, mismatched bases trigger \`default_branch_protected\`]' \
+'--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any unresolved thread (bot or human) triggers \`unresolved_review_threads\`]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -261,6 +276,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--strict-labels[Fail when selected labels are missing, not applicable, or conflict]' \
 '--no-merge[Stop after \`pr.wait-checks\` — do not promote to ready or merge]' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch]' \
+'--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any unresolved thread (bot or human) triggers \`unresolved_review_threads\` at the merge step]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -303,6 +319,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (ready)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(review-threads)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1193,6 +1213,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(review-threads)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (merge)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1727,6 +1751,7 @@ _forge-cli__subcmd__help__subcmd__pr_commands() {
 'comment:Append a comment to a PR / MR' \
 'comments:List the issue-style comment stream attached to a PR / MR' \
 'ready:Promote a draft PR / MR to ready-for-review' \
+'review-threads:List review threads attached to a PR / MR with their resolved state' \
 'merge:Merge a ready PR / MR' \
 'close:Close a PR / MR without merging' \
 'checks:One-shot snapshot of PR / MR check state' \
@@ -1784,6 +1809,11 @@ _forge-cli__subcmd__help__subcmd__pr__subcmd__merge_commands() {
 _forge-cli__subcmd__help__subcmd__pr__subcmd__ready_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli help pr ready commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__review-threads_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__review-threads_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr review-threads commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__view_commands] )) ||
 _forge-cli__subcmd__help__subcmd__pr__subcmd__view_commands() {
@@ -2054,6 +2084,7 @@ _forge-cli__subcmd__pr_commands() {
 'comment:Append a comment to a PR / MR' \
 'comments:List the issue-style comment stream attached to a PR / MR' \
 'ready:Promote a draft PR / MR to ready-for-review' \
+'review-threads:List review threads attached to a PR / MR with their resolved state' \
 'merge:Merge a ready PR / MR' \
 'close:Close a PR / MR without merging' \
 'checks:One-shot snapshot of PR / MR check state' \
@@ -2108,6 +2139,7 @@ _forge-cli__subcmd__pr__subcmd__help_commands() {
 'comment:Append a comment to a PR / MR' \
 'comments:List the issue-style comment stream attached to a PR / MR' \
 'ready:Promote a draft PR / MR to ready-for-review' \
+'review-threads:List review threads attached to a PR / MR with their resolved state' \
 'merge:Merge a ready PR / MR' \
 'close:Close a PR / MR without merging' \
 'checks:One-shot snapshot of PR / MR check state' \
@@ -2172,6 +2204,11 @@ _forge-cli__subcmd__pr__subcmd__help__subcmd__ready_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr help ready commands' commands "$@"
 }
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__review-threads_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__review-threads_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help review-threads commands' commands "$@"
+}
 (( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__view_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__help__subcmd__view_commands() {
     local commands; commands=()
@@ -2196,6 +2233,11 @@ _forge-cli__subcmd__pr__subcmd__merge_commands() {
 _forge-cli__subcmd__pr__subcmd__ready_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr ready commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__review-threads_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__review-threads_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr review-threads commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__view_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__view_commands() {

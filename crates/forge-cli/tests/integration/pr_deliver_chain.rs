@@ -180,6 +180,12 @@ EOF
   "pr ready")
     :
     ;;
+  "api graphql")
+    # Merge lock-down rule 12 — review-thread sweep; all resolved.
+    cat <<'EOF'
+{{ "data": {{ "repository": {{ "pullRequest": {{ "reviewThreads": {{ "nodes": [] }} }} }} }} }}
+EOF
+    ;;
   "pr merge")
 {merge_branch}
     ;;

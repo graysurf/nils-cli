@@ -1,7 +1,7 @@
 //! `pr merge` atom — the heaviest single atom in the v1 surface.
 //!
-//! Spec / ops: `cli.forge-cli.pr.merge.v1`. Layers six lock-down policy rules
-//! on top of a backend invocation:
+//! Spec / ops: `cli.forge-cli.pr.merge.v1`. Layers seven lock-down policy
+//! rules on top of a backend invocation:
 //!
 //! | Rule                                | Triggered when                                              | Error kind                | Exit       |
 //! | ----------------------------------- | ----------------------------------------------------------- | ------------------------- | ---------- |
@@ -11,6 +11,7 @@
 //! | 8 — required_checks_green (TTL=0)   | fresh `pr.checks --required-only` not all green             | `checks_pending`/`failed` | DATA / RT  |
 //! | 9 — merge_method_supported          | resolved method not in `repo.view.merge_methods_allowed`    | `merge_method_unsupported`| DATA 65    |
 //! | 10 — keep_branch_conflict           | `--keep-branch` set while `[merge].delete_branch=true`      | `keep_branch_conflict`    | DATA 65    |
+//! | 12 — review_threads_resolved        | unresolved review threads, `--allow-unresolved-threads=0`   | `unresolved_review_threads`| DATA 65   |
 //!
 //! Backend argv (per ops YAML):
 //! - GitHub: `gh pr merge <id> --{method} [--delete-branch]`
@@ -33,6 +34,7 @@ use crate::config::{ForgeConfig, MergeMethod};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::gitlab_api;
+use crate::ops::pr_review_threads;
 use crate::ops::pr_view;
 use crate::ops::repo_view::{self, RepoViewPayload};
 use crate::ops::required_check_gate::ensure_required_checks_green;
@@ -184,6 +186,13 @@ fn run_lockdown_chain<R: BackendRunner>(
 
     // Rule 8 — TTL-zero required-check re-check.
     ensure_required_checks_green(runner, global, ctx, &args.id.to_string())?;
+
+    // Rule 12 — unresolved review threads block the merge. Bot reviewers post
+    // asynchronously after PR creation, so this gate runs at merge time — the
+    // last action — and fails closed unless explicitly bypassed.
+    if !args.allow_unresolved_threads {
+        pr_review_threads::ensure_review_threads_resolved(runner, ctx, &pr.url, args.id)?;
+    }
 
     // All gates clear — invoke the backend.
     let merge_call = build_live_merge_call(ctx, args.id, &pr, method, delete_branch)?;

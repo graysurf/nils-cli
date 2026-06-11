@@ -187,7 +187,7 @@ fn build_comments_call(
 /// wire `glab api --hostname` against the actual GitLab instance the MR
 /// lives on rather than `ProviderContext::host` (which defaults to
 /// `gitlab.com` when `--provider gitlab` is forced).
-fn gitlab_host_from_url(url: &str) -> Option<String> {
+pub(crate) fn gitlab_host_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest)?;
     let host = after_scheme.split_once('/').map(|(host, _)| host)?;
     if host.is_empty() {
@@ -281,7 +281,9 @@ fn parse_gitlab_notes(
 /// `gh api --paginate` / `glab api --paginate` concatenate JSON arrays
 /// back-to-back when results span pages. Parse the trimmed stdout as one or
 /// more arrays.
-fn split_concatenated_arrays(stdout: &str) -> Result<Vec<serde_json::Value>, ForgeError> {
+pub(crate) fn split_concatenated_arrays(
+    stdout: &str,
+) -> Result<Vec<serde_json::Value>, ForgeError> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -319,7 +321,7 @@ fn split_concatenated_arrays(stdout: &str) -> Result<Vec<serde_json::Value>, For
 
 /// Extract `owner/repo` from a GitHub PR URL like
 /// `https://github.com/owner/repo/pull/<n>`.
-fn github_repo_slug_from_url(url: &str) -> Option<String> {
+pub(crate) fn github_repo_slug_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let path = after_scheme.split_once('/').map(|(_, rest)| rest)?;
     let pull_idx = path.find("/pull/").or_else(|| path.find("/issues/"))?;
@@ -335,7 +337,7 @@ fn github_repo_slug_from_url(url: &str) -> Option<String> {
 
 /// Extract the GitLab project path (group[/subgroup]/project) from an MR's
 /// `web_url` like `https://gitlab.example.com/group/project/-/merge_requests/<iid>`.
-fn gitlab_project_path_from_url(url: &str) -> Option<String> {
+pub(crate) fn gitlab_project_path_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let path = after_scheme.split_once('/').map(|(_, rest)| rest)?;
     let path = path.trim_end_matches('/');
