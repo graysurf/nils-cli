@@ -148,10 +148,19 @@ pub fn ensure_tasklist_complete(body: &str) -> Result<(), ForgeError> {
 /// Parse GFM task-list items out of a Markdown body. Recognizes bullet
 /// (`-` / `*` / `+`) and ordered (`1.` / `1)`) list items whose content
 /// starts with `[ ]`, `[x]`, `[X]`, or `[~]` followed by whitespace or end
-/// of line. Lines inside fenced code blocks (``` or ~~~) are skipped.
+/// of line. Lines inside fenced code blocks (``` or ~~~) are skipped, and so
+/// are indented code blocks (4+ spaces outside a list context — inside a
+/// list, 4-space indentation is nested-item continuation, which GitHub
+/// renders as a checkbox). This is a line-level approximation of GFM block
+/// structure, deliberately biased so realistic descriptions (nested
+/// checklists, fenced examples) parse the way GitHub renders them.
 pub fn parse_task_items(body: &str) -> Vec<PrTaskItem> {
     let mut items = Vec::new();
     let mut fence: Option<char> = None;
+    // Content column of the innermost list item seen, while the list is
+    // still "open". A 4-space-indented line counts as indented code only
+    // when it is not plausibly a continuation of an open list.
+    let mut list_content_indent: Option<usize> = None;
     for (idx, line) in body.lines().enumerate() {
         let trimmed = line.trim_start();
         if let Some(open) = fence {
@@ -169,6 +178,16 @@ pub fn parse_task_items(body: &str) -> Vec<PrTaskItem> {
             fence = Some('~');
             continue;
         }
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        let code_threshold = list_content_indent.map_or(4, |content| content + 4);
+        if indent >= code_threshold {
+            // Indented code block (relative to the enclosing list item's
+            // content column when a list is open) — literal text on GitHub.
+            continue;
+        }
         if let Some((checked, marker, text)) = parse_task_line(trimmed) {
             items.push(PrTaskItem {
                 checked,
@@ -176,6 +195,15 @@ pub fn parse_task_items(body: &str) -> Vec<PrTaskItem> {
                 text,
                 line: idx + 1,
             });
+            list_content_indent = Some(indent + 2);
+        } else if strip_list_marker(trimmed).is_some() {
+            // Plain (non-task) list item still keeps the list open for
+            // nested-continuation purposes.
+            list_content_indent = Some(indent + 2);
+        } else if indent < 4 {
+            // A non-list, non-indented line (paragraph, heading, table row)
+            // closes the list context.
+            list_content_indent = None;
         }
     }
     items
@@ -426,6 +454,43 @@ mod tests {
     #[test]
     fn parse_handles_unclosed_fence_to_end_of_body() {
         let body = "- [x] before\n```\n- [ ] swallowed by open fence\n";
+        let items = parse_task_items(body);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].checked);
+    }
+
+    #[test]
+    fn parse_skips_indented_code_blocks_outside_lists() {
+        let body =
+            "Example output:\n\n    - [ ] literal text in indented code\n\n- [ ] real item\n";
+        let items = parse_task_items(body);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "real item");
+    }
+
+    #[test]
+    fn parse_keeps_deeply_nested_items_inside_open_lists() {
+        let body = "- [ ] parent\n  - [ ] child\n    - [ ] grandchild\n";
+        let items = parse_task_items(body);
+        assert_eq!(
+            items.len(),
+            3,
+            "4-space nesting under a list is a checkbox, not code"
+        );
+        assert_eq!(items[2].text, "grandchild");
+    }
+
+    #[test]
+    fn parse_skips_indented_code_inside_list_items() {
+        let body = "- [x] item with example\n\n      indented code - [ ] not a task\n";
+        let items = parse_task_items(body);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].checked);
+    }
+
+    #[test]
+    fn parse_paragraph_closes_list_context() {
+        let body = "- [x] item\n\nA closing paragraph.\n\n    - [ ] indented code again\n";
         let items = parse_task_items(body);
         assert_eq!(items.len(), 1);
         assert!(items[0].checked);

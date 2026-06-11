@@ -462,7 +462,8 @@ pub struct PrMergeArgs {
     #[arg(
         long = "allow-unchecked-tasks-reason",
         value_name = "TEXT",
-        requires = "allow_unchecked_tasks"
+        requires = "allow_unchecked_tasks",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
     )]
     pub allow_unchecked_tasks_reason: Option<String>,
 }
@@ -759,7 +760,8 @@ pub struct PrDeliverArgs {
     #[arg(
         long = "allow-unchecked-tasks-reason",
         value_name = "TEXT",
-        requires = "allow_unchecked_tasks"
+        requires = "allow_unchecked_tasks",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
     )]
     pub allow_unchecked_tasks_reason: Option<String>,
 }
@@ -1503,6 +1505,18 @@ mod tests {
                 "tracked in #99"
             ])
             .is_ok()
+        );
+        assert!(
+            parse(&[
+                "pr",
+                "merge",
+                "1",
+                "--allow-unchecked-tasks",
+                "--allow-unchecked-tasks-reason",
+                ""
+            ])
+            .is_err(),
+            "empty bypass reason must be rejected"
         );
         assert!(
             parse(&[

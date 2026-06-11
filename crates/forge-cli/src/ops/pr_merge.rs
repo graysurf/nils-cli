@@ -1,6 +1,6 @@
 //! `pr merge` atom — the heaviest single atom in the v1 surface.
 //!
-//! Spec / ops: `cli.forge-cli.pr.merge.v1`. Layers seven lock-down policy
+//! Spec / ops: `cli.forge-cli.pr.merge.v1`. Layers eight lock-down policy
 //! rules on top of a backend invocation:
 //!
 //! | Rule                                | Triggered when                                              | Error kind                | Exit       |
@@ -373,6 +373,9 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from("view"),
             OsString::from(id_str),
             OsString::from("--json"),
+            // Diverges from `pr_view::GH_JSON_FIELDS` on purpose: the merge
+            // chain needs `body` for the rule-13 task-list gate and fetches
+            // `mergeCommit` separately post-merge via `merge_sha_call`.
             OsString::from(
                 "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,labels,body",
             ),
@@ -760,6 +763,38 @@ mod tests {
         };
         let err = extract_merge_sha(&ctx(Provider::GitHub), &output).expect_err("must fail");
         assert_eq!(err.kind(), "software_error");
+    }
+
+    #[test]
+    fn extract_body_github_reads_body_field() {
+        let output = BackendSuccess {
+            stdout: r#"{"number":7,"body":"- [ ] item"}"#.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(extract_body(&ctx(Provider::GitHub), &output), "- [ ] item");
+    }
+
+    #[test]
+    fn extract_body_gitlab_reads_description_field() {
+        let output = BackendSuccess {
+            stdout: r#"{"iid":9,"description":"- [x] item"}"#.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(extract_body(&ctx(Provider::GitLab), &output), "- [x] item");
+    }
+
+    #[test]
+    fn extract_body_defaults_empty_on_missing_or_invalid() {
+        let missing = BackendSuccess {
+            stdout: r#"{"number":7}"#.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(extract_body(&ctx(Provider::GitHub), &missing), "");
+        let invalid = BackendSuccess {
+            stdout: "not json".into(),
+            stderr: String::new(),
+        };
+        assert_eq!(extract_body(&ctx(Provider::GitHub), &invalid), "");
     }
 
     #[test]
