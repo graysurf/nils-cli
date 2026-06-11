@@ -408,6 +408,14 @@ pub struct PrReadyArgs {
     pub id: u64,
 }
 
+/// `pr review-threads` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.review-threads` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewThreadsArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+}
+
 /// `pr merge` arguments. Maps to
 /// `forge-cli-ops-v1.yaml::operations.pr.merge` inputs.
 #[derive(Args, Debug, Clone)]
@@ -427,6 +435,10 @@ pub struct PrMergeArgs {
     /// Without this flag, mismatched bases trigger `default_branch_protected`.
     #[arg(long = "allow-non-default-base", action = ArgAction::SetTrue)]
     pub allow_non_default_base: bool,
+    /// Merge despite unresolved review threads. Without this flag, any
+    /// unresolved thread (bot or human) triggers `unresolved_review_threads`.
+    #[arg(long = "allow-unresolved-threads", action = ArgAction::SetTrue)]
+    pub allow_unresolved_threads: bool,
 }
 
 /// CLI-facing merge method enum so clap can render `--method squash|merge|rebase`
@@ -591,6 +603,8 @@ pub enum PrCommand {
     Comments(PrCommentsArgs),
     /// Promote a draft PR / MR to ready-for-review.
     Ready(PrReadyArgs),
+    /// List review threads attached to a PR / MR with their resolved state.
+    ReviewThreads(PrReviewThreadsArgs),
     /// Merge a ready PR / MR.
     Merge(PrMergeArgs),
     /// Close a PR / MR without merging.
@@ -696,6 +710,11 @@ pub struct PrDeliverArgs {
     /// Allow merges where the PR's base is not the repo's default branch.
     #[arg(long = "allow-non-default-base", action = ArgAction::SetTrue)]
     pub allow_non_default_base: bool,
+    /// Merge despite unresolved review threads. Without this flag, any
+    /// unresolved thread (bot or human) triggers `unresolved_review_threads`
+    /// at the merge step.
+    #[arg(long = "allow-unresolved-threads", action = ArgAction::SetTrue)]
+    pub allow_unresolved_threads: bool,
 }
 
 /// `issue` subtree.
@@ -1121,6 +1140,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             command: Some(PrCommand::Ready(args)),
         })) => ops::pr_ready::run(&global, args, format),
         Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::ReviewThreads(args)),
+        })) => ops::pr_review_threads::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Checks(args)),
         })) => {
             if global.dry_run {
@@ -1380,7 +1402,9 @@ mod tests {
             "list",
             "edit",
             "comment",
+            "comments",
             "ready",
+            "review-threads",
             "merge",
             "close",
             "checks",
@@ -1390,7 +1414,8 @@ mod tests {
             let mut argv = vec!["pr", sub];
             match sub {
                 "view" | "checks" | "wait-checks" => argv.push("1"),
-                "edit" | "comment" | "ready" | "merge" | "close" => argv.push("1"),
+                "edit" | "comment" | "comments" | "ready" | "review-threads" | "merge"
+                | "close" => argv.push("1"),
                 "create" => {
                     argv.extend(["--title", "demo", "--kind", "feature", "--body", "x"]);
                 }

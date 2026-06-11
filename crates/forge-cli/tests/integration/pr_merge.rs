@@ -53,6 +53,12 @@ fn make_gitlab_repo() -> TempDir {
 }
 
 fn gitlab_merge_api_stub(stub: &StubEnv) -> String {
+    gitlab_merge_api_stub_with_discussions(stub, "[]")
+}
+
+/// Same stub, with a caller-provided MR discussions response so tests can
+/// exercise merge lock-down rule 12 (unresolved review threads).
+fn gitlab_merge_api_stub_with_discussions(stub: &StubEnv, discussions: &str) -> String {
     let sentinel = stub.tempdir.path().join("merged");
     let args_log = stub.tempdir.path().join("merge-args");
     format!(
@@ -129,6 +135,20 @@ EOF
         ;;
     esac
     ;;
+  "api --paginate")
+    case "$*" in
+      *"projects/group%2Fproject/merge_requests/7/discussions?per_page=100"*)
+        # Merge lock-down rule 12 — review-thread sweep.
+        cat <<'EOF'
+{discussions}
+EOF
+        ;;
+      *)
+        echo "stub: unexpected paginate api args: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
   "api --method")
     printf '%s\n' "$*" > {args_log}
     case "$*" in
@@ -152,6 +172,7 @@ esac
 "#,
         sentinel = sentinel.display(),
         args_log = args_log.display(),
+        discussions = discussions,
     )
 }
 
@@ -323,4 +344,94 @@ fn pr_merge_gitlab_uses_api_merge_after_required_checks_pass() {
         "{args}"
     );
     assert!(args.contains("sha=abc123"), "{args}");
+}
+
+const UNRESOLVED_DISCUSSIONS_JSON: &str = r#"[
+  {
+    "id": "d1",
+    "notes": [
+      {
+        "id": 21,
+        "resolvable": true,
+        "resolved": false,
+        "body": "please address this finding",
+        "author": { "username": "quality-bot" },
+        "created_at": "2026-06-11T04:49:36Z",
+        "position": { "new_path": "src/lib.rs" }
+      }
+    ]
+  }
+]"#;
+
+#[test]
+fn pr_merge_gitlab_blocks_on_unresolved_review_threads() {
+    let tempdir = make_gitlab_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let args_log = stub.tempdir.path().join("merge-args");
+    let body = gitlab_merge_api_stub_with_discussions(&stub, UNRESOLVED_DISCUSSIONS_JSON);
+    let stub = stub.glab_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(
+        out.code, 65,
+        "expected DATA 65 on unresolved threads, stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "unresolved_review_threads");
+    let message = env["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("--allow-unresolved-threads"),
+        "message must name the bypass flag: {message}"
+    );
+    // The gate fired before the backend merge call.
+    assert!(
+        !args_log.exists(),
+        "merge API must not run when the thread gate blocks"
+    );
+}
+
+#[test]
+fn pr_merge_gitlab_allow_unresolved_threads_bypasses_gate() {
+    let tempdir = make_gitlab_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let args_log = stub.tempdir.path().join("merge-args");
+    let body = gitlab_merge_api_stub_with_discussions(&stub, UNRESOLVED_DISCUSSIONS_JSON);
+    let stub = stub.glab_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--allow-unresolved-threads",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["merge_sha"], "def456");
+    assert!(args_log.exists(), "bypassed merge must reach the backend");
 }

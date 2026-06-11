@@ -71,6 +71,10 @@ validations_catalog:
     rule: "--keep-branch and --delete-branch are mutually exclusive"
     error_kind: keep_branch_conflict
     exit: DATA
+  review_threads_resolved:
+    rule: "no unresolved review threads at merge time unless --allow-unresolved-threads is set"
+    error_kind: unresolved_review_threads
+    exit: DATA
   label_catalog:
     rule: "when --strict-labels is set, every selected label exists in --label-catalog, applies to the target, and exclusive groups do not conflict"
     error_kind: label_unknown | label_not_applicable | label_group_conflict | label_catalog_missing
@@ -237,6 +241,23 @@ operations:
       github: { program: gh,   argv: [pr, ready,  "{id}"] }
       gitlab: { program: glab, argv: [mr, update, "{id}", "--ready"] }
 
+  - id: pr.review-threads
+    schema_version: cli.forge-cli.pr.review-threads.v1
+    summary: List review threads attached to a PR/MR with their resolved state.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+    backends:
+      github: { program: gh,   argv: [api, graphql, -f, "query=<reviewThreads query>", -f, "owner={owner}", -f, "name={name}", -F, "pr={id}"] }
+      gitlab: { program: glab, argv: [api, --paginate, --hostname, "{host}", "projects/{project}/merge_requests/{id}/discussions?per_page=100"] }
+      # local: no review-thread model; returns an empty thread list.
+    output:
+      data:
+        number: integer
+        url: string
+        total: integer
+        unresolved: integer
+        threads: list<{resolved, outdated, author, path, created_at, url, body}>
+
   - id: pr.merge
     schema_version: cli.forge-cli.pr.merge.v1
     summary: Merge a ready PR/MR with the configured method.
@@ -245,6 +266,7 @@ operations:
       - { name: --method,                   type: enum<squash|merge|rebase>,     default: squash }
       - { name: --keep-branch,              type: bool,                          default: false }
       - { name: --allow-non-default-base,   type: bool,                          default: false }
+      - { name: --allow-unresolved-threads, type: bool,                          default: false }
     validations:
       - worktree_clean
       - draft_merge_refused
@@ -252,6 +274,7 @@ operations:
       - required_checks_green   # TTL-zero re-check
       - merge_method_supported
       - keep_branch_conflict
+      - review_threads_resolved
     backends:
       github: { program: gh,   argv: [pr, merge, "{id}", "--{method}", "--delete-branch?"] }
       gitlab: { program: glab, argv: [mr, merge, "{id}", "--squash?", "--remove-source-branch?"] }
@@ -653,6 +676,7 @@ macros:
       - { name: --timeout,                  type: duration,                     default: 30m }
       - { name: --no-merge,                 type: bool,                         default: false }
       - { name: --allow-non-default-base,   type: bool,                         default: false }
+      - { name: --allow-unresolved-threads, type: bool,                         default: false }
     sequence:
       - { step: auth_status,        op: auth.status }
       - { step: repo_view,          op: repo.view }

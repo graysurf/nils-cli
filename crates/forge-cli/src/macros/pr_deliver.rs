@@ -289,6 +289,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         method: Some(args.method),
         keep_branch: false,
         allow_non_default_base: args.allow_non_default_base,
+        allow_unresolved_threads: args.allow_unresolved_threads,
     };
     let merge_payload = match pr_merge::compute(runner, global, &merge_args, workdir) {
         Ok(p) => p,
@@ -694,6 +695,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(30 * 60),
             no_merge,
             allow_non_default_base: false,
+            allow_unresolved_threads: false,
         }
     }
 
