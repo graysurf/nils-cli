@@ -1,6 +1,6 @@
 //! `pr merge` atom — the heaviest single atom in the v1 surface.
 //!
-//! Spec / ops: `cli.forge-cli.pr.merge.v1`. Layers seven lock-down policy
+//! Spec / ops: `cli.forge-cli.pr.merge.v1`. Layers eight lock-down policy
 //! rules on top of a backend invocation:
 //!
 //! | Rule                                | Triggered when                                              | Error kind                | Exit       |
@@ -12,6 +12,7 @@
 //! | 9 — merge_method_supported          | resolved method not in `repo.view.merge_methods_allowed`    | `merge_method_unsupported`| DATA 65    |
 //! | 10 — keep_branch_conflict           | `--keep-branch` set while `[merge].delete_branch=true`      | `keep_branch_conflict`    | DATA 65    |
 //! | 12 — review_threads_resolved        | unresolved review threads, `--allow-unresolved-threads=0`   | `unresolved_review_threads`| DATA 65   |
+//! | 13 — tasklist_complete              | unchecked task-list items, `--allow-unchecked-tasks=0`      | `unchecked_task_items`    | DATA 65    |
 //!
 //! Backend argv (per ops YAML):
 //! - GitHub: `gh pr merge <id> --{method} [--delete-branch]`
@@ -35,6 +36,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::gitlab_api;
 use crate::ops::pr_review_threads;
+use crate::ops::pr_tasks;
 use crate::ops::pr_view;
 use crate::ops::repo_view::{self, RepoViewPayload};
 use crate::ops::required_check_gate::ensure_required_checks_green;
@@ -55,6 +57,10 @@ pub struct PrMergePayload {
     pub deleted_branch: bool,
     pub base: String,
     pub head: String,
+    /// Recorded `--allow-unchecked-tasks-reason` when the task-list gate
+    /// (rule 13) was explicitly bypassed; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unchecked_tasks_override_reason: Option<String>,
 }
 
 pub fn run(
@@ -194,6 +200,14 @@ fn run_lockdown_chain<R: BackendRunner>(
         pr_review_threads::ensure_review_threads_resolved(runner, ctx, &pr.url, args.id)?;
     }
 
+    // Rule 13 — unchecked task-list items in the description block the
+    // merge. The description is the delivery contract: every `- [ ]` must be
+    // checked off or rewritten as dispositioned before merge, unless
+    // explicitly bypassed with a recorded reason.
+    if !args.allow_unchecked_tasks {
+        pr_tasks::ensure_tasklist_complete(&pr.body)?;
+    }
+
     // All gates clear — invoke the backend.
     let merge_call = build_live_merge_call(ctx, args.id, &pr, method, delete_branch)?;
     invoke_merge_with_idempotency_check(runner, ctx, args.id, &merge_call)?;
@@ -210,6 +224,11 @@ fn run_lockdown_chain<R: BackendRunner>(
         deleted_branch: delete_branch,
         base: pr.base,
         head: pr.head,
+        unchecked_tasks_override_reason: if args.allow_unchecked_tasks {
+            args.allow_unchecked_tasks_reason.clone()
+        } else {
+            None
+        },
     })
 }
 
@@ -332,6 +351,7 @@ fn fetch_pr_view<R: BackendRunner>(
     let output = runner.run(&call)?;
     let payload = pr_view::parse_view_output(ctx, &output)?;
     let head_sha = extract_head_sha(ctx, &output);
+    let body = extract_body(ctx, &output);
     Ok(PrView {
         number: payload.number,
         url: payload.url,
@@ -340,6 +360,7 @@ fn fetch_pr_view<R: BackendRunner>(
         head: payload.head,
         state: payload.state.to_string(),
         head_sha,
+        body,
     })
 }
 
@@ -352,8 +373,11 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from("view"),
             OsString::from(id_str),
             OsString::from("--json"),
+            // Diverges from `pr_view::GH_JSON_FIELDS` on purpose: the merge
+            // chain needs `body` for the rule-13 task-list gate and fetches
+            // `mergeCommit` separately post-merge via `merge_sha_call`.
             OsString::from(
-                "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,labels",
+                "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,labels,body",
             ),
         ],
         Provider::GitLab => vec![
@@ -487,6 +511,25 @@ fn extract_head_sha(ctx: &ProviderContext, output: &BackendSuccess) -> Option<St
         .filter(|s| !s.is_empty())
 }
 
+/// Pull the PR/MR description out of the raw view output for the rule-13
+/// task-list gate: `body` on GitHub, `description` on GitLab. Providers
+/// without a body model (local) yield the empty string, which passes the
+/// gate trivially.
+fn extract_body(ctx: &ProviderContext, output: &BackendSuccess) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output.stdout.trim()) else {
+        return String::new();
+    };
+    let key = match ctx.provider {
+        Provider::GitHub | Provider::Local => "body",
+        Provider::GitLab => "description",
+    };
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 fn enforce_keep_branch_conflict(keep_branch: bool, cfg: &ForgeConfig) -> Result<(), ForgeError> {
     // Conflict surfaces when the user asks to keep the source branch AND the
     // repo config explicitly opts into branch deletion. The implicit default
@@ -566,6 +609,9 @@ struct PrView {
     head: String,
     state: String,
     head_sha: Option<String>,
+    /// PR/MR description used by the rule-13 task-list gate; empty when the
+    /// provider has no body model.
+    body: String,
 }
 
 #[cfg(test)]
@@ -717,6 +763,38 @@ mod tests {
         };
         let err = extract_merge_sha(&ctx(Provider::GitHub), &output).expect_err("must fail");
         assert_eq!(err.kind(), "software_error");
+    }
+
+    #[test]
+    fn extract_body_github_reads_body_field() {
+        let output = BackendSuccess {
+            stdout: r#"{"number":7,"body":"- [ ] item"}"#.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(extract_body(&ctx(Provider::GitHub), &output), "- [ ] item");
+    }
+
+    #[test]
+    fn extract_body_gitlab_reads_description_field() {
+        let output = BackendSuccess {
+            stdout: r#"{"iid":9,"description":"- [x] item"}"#.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(extract_body(&ctx(Provider::GitLab), &output), "- [x] item");
+    }
+
+    #[test]
+    fn extract_body_defaults_empty_on_missing_or_invalid() {
+        let missing = BackendSuccess {
+            stdout: r#"{"number":7}"#.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(extract_body(&ctx(Provider::GitHub), &missing), "");
+        let invalid = BackendSuccess {
+            stdout: "not json".into(),
+            stderr: String::new(),
+        };
+        assert_eq!(extract_body(&ctx(Provider::GitHub), &invalid), "");
     }
 
     #[test]

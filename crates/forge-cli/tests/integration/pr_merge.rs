@@ -53,12 +53,18 @@ fn make_gitlab_repo() -> TempDir {
 }
 
 fn gitlab_merge_api_stub(stub: &StubEnv) -> String {
-    gitlab_merge_api_stub_with_discussions(stub, "[]")
+    gitlab_merge_api_stub_full(stub, "[]", "null")
 }
 
 /// Same stub, with a caller-provided MR discussions response so tests can
 /// exercise merge lock-down rule 12 (unresolved review threads).
 fn gitlab_merge_api_stub_with_discussions(stub: &StubEnv, discussions: &str) -> String {
+    gitlab_merge_api_stub_full(stub, discussions, "null")
+}
+
+/// Base stub: caller provides the MR discussions response (rule 12) and the
+/// MR `description` as a raw JSON value (rule 13 — task-list gate).
+fn gitlab_merge_api_stub_full(stub: &StubEnv, discussions: &str, description: &str) -> String {
     let sentinel = stub.tempdir.path().join("merged");
     let args_log = stub.tempdir.path().join("merge-args");
     format!(
@@ -83,6 +89,7 @@ EOF
 {{
   "iid": 7,
   "web_url": "https://gitlab.example.com/group/project/-/merge_requests/7",
+  "description": {description},
   "state": "merged",
   "draft": false,
   "title": "feat: sample",
@@ -100,6 +107,7 @@ EOF
 {{
   "iid": 7,
   "web_url": "https://gitlab.example.com/group/project/-/merge_requests/7",
+  "description": {description},
   "state": "opened",
   "draft": false,
   "title": "feat: sample",
@@ -173,6 +181,7 @@ esac
         sentinel = sentinel.display(),
         args_log = args_log.display(),
         discussions = discussions,
+        description = description,
     )
 }
 
@@ -433,5 +442,95 @@ fn pr_merge_gitlab_allow_unresolved_threads_bypasses_gate() {
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["data"]["merge_sha"], "def456");
+    assert!(args_log.exists(), "bypassed merge must reach the backend");
+}
+
+/// MR description with one unchecked task-list item (raw JSON string value).
+const UNCHECKED_TASKS_DESCRIPTION_JSON: &str =
+    r###""## Test plan\n\n- [x] unit tests\n- [ ] run e2e suite""###;
+
+#[test]
+fn pr_merge_gitlab_blocks_on_unchecked_task_items() {
+    let tempdir = make_gitlab_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let args_log = stub.tempdir.path().join("merge-args");
+    let body = gitlab_merge_api_stub_full(&stub, "[]", UNCHECKED_TASKS_DESCRIPTION_JSON);
+    let stub = stub.glab_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(
+        out.code, 65,
+        "expected DATA 65 on unchecked task items, stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "unchecked_task_items");
+    let message = env["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("--allow-unchecked-tasks"),
+        "message must name the bypass flag: {message}"
+    );
+    let detail = env["error"]["details"]["detail"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        detail.contains("run e2e suite"),
+        "detail must list the unchecked item: {detail}"
+    );
+    // The gate fired before the backend merge call.
+    assert!(
+        !args_log.exists(),
+        "merge API must not run when the task-list gate blocks"
+    );
+}
+
+#[test]
+fn pr_merge_gitlab_allow_unchecked_tasks_bypasses_gate_and_records_reason() {
+    let tempdir = make_gitlab_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let args_log = stub.tempdir.path().join("merge-args");
+    let body = gitlab_merge_api_stub_full(&stub, "[]", UNCHECKED_TASKS_DESCRIPTION_JSON);
+    let stub = stub.glab_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--allow-unchecked-tasks",
+            "--allow-unchecked-tasks-reason",
+            "e2e deferred to follow-up #814",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["merge_sha"], "def456");
+    assert_eq!(
+        env["data"]["unchecked_tasks_override_reason"],
+        "e2e deferred to follow-up #814"
+    );
     assert!(args_log.exists(), "bypassed merge must reach the backend");
 }

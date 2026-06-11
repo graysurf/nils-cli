@@ -416,6 +416,14 @@ pub struct PrReviewThreadsArgs {
     pub id: u64,
 }
 
+/// `pr tasks` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.tasks` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrTasksArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+}
+
 /// `pr merge` arguments. Maps to
 /// `forge-cli-ops-v1.yaml::operations.pr.merge` inputs.
 #[derive(Args, Debug, Clone)]
@@ -439,6 +447,25 @@ pub struct PrMergeArgs {
     /// unresolved thread (bot or human) triggers `unresolved_review_threads`.
     #[arg(long = "allow-unresolved-threads", action = ArgAction::SetTrue)]
     pub allow_unresolved_threads: bool,
+    /// Merge despite unchecked task-list items in the PR/MR description.
+    /// Without this flag, any unchecked `- [ ]` item triggers
+    /// `unchecked_task_items`. Requires `--allow-unchecked-tasks-reason`.
+    #[arg(
+        long = "allow-unchecked-tasks",
+        action = ArgAction::SetTrue,
+        requires = "allow_unchecked_tasks_reason"
+    )]
+    pub allow_unchecked_tasks: bool,
+    /// Required when `--allow-unchecked-tasks` is set. Non-empty free-form
+    /// text describing why the unchecked items are safe to merge past; the
+    /// reason is recorded in the merge envelope payload.
+    #[arg(
+        long = "allow-unchecked-tasks-reason",
+        value_name = "TEXT",
+        requires = "allow_unchecked_tasks",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub allow_unchecked_tasks_reason: Option<String>,
 }
 
 /// CLI-facing merge method enum so clap can render `--method squash|merge|rebase`
@@ -605,6 +632,8 @@ pub enum PrCommand {
     Ready(PrReadyArgs),
     /// List review threads attached to a PR / MR with their resolved state.
     ReviewThreads(PrReviewThreadsArgs),
+    /// List GFM task-list items in the PR / MR description with their state.
+    Tasks(PrTasksArgs),
     /// Merge a ready PR / MR.
     Merge(PrMergeArgs),
     /// Close a PR / MR without merging.
@@ -715,6 +744,26 @@ pub struct PrDeliverArgs {
     /// at the merge step.
     #[arg(long = "allow-unresolved-threads", action = ArgAction::SetTrue)]
     pub allow_unresolved_threads: bool,
+    /// Merge despite unchecked task-list items in the PR/MR description.
+    /// Without this flag, any unchecked `- [ ]` item triggers
+    /// `unchecked_task_items` at the merge step. Requires
+    /// `--allow-unchecked-tasks-reason`.
+    #[arg(
+        long = "allow-unchecked-tasks",
+        action = ArgAction::SetTrue,
+        requires = "allow_unchecked_tasks_reason"
+    )]
+    pub allow_unchecked_tasks: bool,
+    /// Required when `--allow-unchecked-tasks` is set. Non-empty free-form
+    /// text describing why the unchecked items are safe to merge past; the
+    /// reason is recorded in the merge-step payload.
+    #[arg(
+        long = "allow-unchecked-tasks-reason",
+        value_name = "TEXT",
+        requires = "allow_unchecked_tasks",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub allow_unchecked_tasks_reason: Option<String>,
 }
 
 /// `issue` subtree.
@@ -1143,6 +1192,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             command: Some(PrCommand::ReviewThreads(args)),
         })) => ops::pr_review_threads::run(&global, args, format),
         Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Tasks(args)),
+        })) => ops::pr_tasks::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Checks(args)),
         })) => {
             if global.dry_run {
@@ -1405,6 +1457,7 @@ mod tests {
             "comments",
             "ready",
             "review-threads",
+            "tasks",
             "merge",
             "close",
             "checks",
@@ -1414,8 +1467,8 @@ mod tests {
             let mut argv = vec!["pr", sub];
             match sub {
                 "view" | "checks" | "wait-checks" => argv.push("1"),
-                "edit" | "comment" | "comments" | "ready" | "review-threads" | "merge"
-                | "close" => argv.push("1"),
+                "edit" | "comment" | "comments" | "ready" | "review-threads" | "tasks"
+                | "merge" | "close" => argv.push("1"),
                 "create" => {
                     argv.extend(["--title", "demo", "--kind", "feature", "--body", "x"]);
                 }
@@ -1427,6 +1480,56 @@ mod tests {
             let result = parse(&argv);
             assert!(result.is_ok(), "pr {sub} should parse, got {result:?}");
         }
+    }
+
+    #[test]
+    fn pr_merge_allow_unchecked_tasks_requires_reason() {
+        assert!(parse(&["pr", "merge", "1", "--allow-unchecked-tasks"]).is_err());
+        assert!(
+            parse(&[
+                "pr",
+                "merge",
+                "1",
+                "--allow-unchecked-tasks-reason",
+                "tracked in #99"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "pr",
+                "merge",
+                "1",
+                "--allow-unchecked-tasks",
+                "--allow-unchecked-tasks-reason",
+                "tracked in #99"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "pr",
+                "merge",
+                "1",
+                "--allow-unchecked-tasks",
+                "--allow-unchecked-tasks-reason",
+                ""
+            ])
+            .is_err(),
+            "empty bypass reason must be rejected"
+        );
+        assert!(
+            parse(&[
+                "pr",
+                "deliver",
+                "--kind",
+                "feature",
+                "--title",
+                "demo",
+                "--allow-unchecked-tasks"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -111,6 +111,7 @@ Parity matrix (v1):
 | `pr comment <id>`        | `gh pr comment <id> --body …`                                    | `glab mr note <id> --message …`                             | exact                                |
 | `pr ready <id>`          | `gh pr ready <id>`                                               | `glab mr update <id> --ready`                               | exact                                |
 | `pr review-threads <id>` | `gh api graphql` (`reviewThreads` connection)                    | `glab api …/merge_requests/<iid>/discussions`               | normalized thread state              |
+| `pr tasks <id>`          | `gh pr view <id> --json number,url,body`                         | `glab mr view <id> -F json` (`description`)                 | normalized task-list state           |
 | `pr merge <id>`          | `gh pr merge <id> --squash --delete-branch`                      | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg) |
 | `pr close <id>`          | `gh pr close <id>`                                               | `glab mr close <id>`                                        | exact                                |
 | `pr checks <id>`         | `gh pr checks <id> --json …` plus `--required` for gating        | `glab mr view -F json` + `glab api .../pipelines/<id>/jobs` | emulated on GitLab                   |
@@ -360,6 +361,11 @@ backend mapping, validation rules, and output schema versions.
   - no unresolved review threads OR explicitly bypassed via
     `--allow-unresolved-threads` (bot reviewers post asynchronously, so
     this is re-checked at merge time — the last action);
+  - no unchecked task-list items in the description OR explicitly
+    bypassed via `--allow-unchecked-tasks` with a recorded
+    `--allow-unchecked-tasks-reason` (the description is the delivery
+    contract: every `- [ ]` is checked off or rewritten as
+    dispositioned before merge);
   - `--method squash|merge|rebase` (default `squash`, configurable
     per repo).
 - Post-merge: deletes the remote branch (default `true`, disable via
@@ -494,6 +500,16 @@ backend implementations cannot diverge.
     with `--allow-unresolved-threads`. The local provider has no
     thread model and passes trivially. The error `detail` lists each
     unresolved thread (author, file anchor, first line).
+13. **Task-list gating.** `pr merge` (and the `pr deliver` merge step)
+    parses GFM task-list items out of the PR/MR description fetched at
+    merge time and refuses to merge while any `- [ ]` item is
+    unchecked (`- [x]` / `- [X]` count as done, GitLab's `- [~]` as
+    inapplicable; fenced code blocks are skipped). Bypass with
+    `--allow-unchecked-tasks` plus a required
+    `--allow-unchecked-tasks-reason`, which is recorded in the merge
+    payload as `unchecked_tasks_override_reason`. Providers without a
+    body model (local) pass trivially. The error `detail` lists each
+    unchecked item (line number, text).
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 
@@ -514,6 +530,7 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `keep_branch_conflict`      | 10                |
 | `local_path_present`        | 11                |
 | `unresolved_review_threads` | 12                |
+| `unchecked_task_items`      | 13                |
 
 ## Activity output contract
 

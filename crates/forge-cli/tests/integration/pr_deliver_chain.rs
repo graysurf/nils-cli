@@ -36,6 +36,23 @@ const FULL_PR_VIEW_JSON: &str = r#"{
   "labels": []
 }"#;
 
+/// Same as [`FULL_PR_VIEW_JSON`] plus a `body` whose description still
+/// carries an unchecked GFM task-list item, used to exercise merge
+/// lock-down rule 13 on the GitHub path (`extract_body` reads `body`).
+const UNCHECKED_TASKS_PR_VIEW_JSON: &str = r###"{
+  "number": 123,
+  "url": "https://github.com/sympoies/nils-cli/pull/123",
+  "state": "OPEN",
+  "isDraft": false,
+  "title": "feat: sample feature",
+  "headRefName": "feat/sample",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergedAt": null,
+  "labels": [],
+  "body": "## Summary\n\nx\n\n## Test plan\n\n- [x] unit\n- [ ] run e2e suite\n"
+}"###;
+
 /// Post-merge `pr view` payload — same as [`FULL_PR_VIEW_JSON`] except the
 /// state has flipped to `MERGED`. Used by stubs that need to surface a
 /// merged PR after the merge step ran (and possibly exited non-zero).
@@ -419,6 +436,62 @@ fn pr_deliver_short_circuits_when_pr_create_validation_fails_with_data_65() {
         .map(|s| s["step"].as_str().unwrap_or(""))
         .collect();
     assert_eq!(steps, vec!["auth_status", "repo_view"]);
+}
+
+#[test]
+fn pr_deliver_github_merge_step_blocks_on_unchecked_task_items() {
+    // Merge lock-down rule 13 on the GitHub path: the merge step parses the
+    // PR body fetched via `pr view --json …,body` and must fail closed with
+    // unchecked_task_items before the backend `pr merge` call runs.
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let sentinel = stub.tempdir.path().join("merge-called");
+    let gh_path = write_chain_stub(
+        &stub,
+        UNCHECKED_TASKS_PR_VIEW_JSON,
+        MERGED_PR_VIEW_JSON,
+        false,
+    );
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nx\n\n## Test plan\n\n- [x] unit\n- [ ] run e2e suite\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(
+        out.code, 65,
+        "expected DATA 65 on unchecked task items, stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "unchecked_task_items");
+    assert!(
+        !sentinel.exists(),
+        "backend merge must not run when the task-list gate blocks"
+    );
 }
 
 #[test]
