@@ -26,6 +26,7 @@ pub mod pr_merge;
 pub mod pr_ready;
 pub mod pr_review_threads;
 pub mod pr_state;
+pub mod pr_tasks;
 pub mod pr_view;
 pub mod pr_wait_checks;
 pub mod repo_view;
