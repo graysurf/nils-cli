@@ -1,6 +1,7 @@
-use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use std::{env, fs, thread};
 
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use serde::{Deserialize, Serialize};
@@ -222,56 +223,58 @@ fn init_record(args: &InitArgs) -> Result<RecordResult, CliError> {
     ensure_non_empty("--intent", &args.intent)?;
     ensure_non_empty("--user-request-summary", &args.user_request_summary)?;
     let path = record_path(&args.common.out_dir, RECORD_FILE)?;
-    if path.exists() && !args.force {
-        return Err(CliError::runtime(
-            "record-exists",
-            format!(
-                "{} already exists; pass --force to overwrite",
-                path.display()
-            ),
-            Some(json!({ "record_file": display_path(&path), "force_flag": "--force" })),
-        ));
-    }
+    with_record_lock(&path, || {
+        if path.exists() && !args.force {
+            return Err(CliError::runtime(
+                "record-exists",
+                format!(
+                    "{} already exists; pass --force to overwrite",
+                    path.display()
+                ),
+                Some(json!({ "record_file": display_path(&path), "force_flag": "--force" })),
+            ));
+        }
 
-    let cwd = match &args.cwd {
-        Some(path) => absolute_path(path)?,
-        None => env::current_dir().map_err(|err| {
-            CliError::runtime(
-                "cwd-unavailable",
-                format!("failed to read current directory: {err}"),
-                None,
-            )
-        })?,
-    };
-    let record = SkillUsageRecord {
-        schema: RECORD_SCHEMA_VERSION.to_string(),
-        skill: redact_text(&args.skill),
-        started_at: match &args.started_at {
-            Some(value) => redact_text(value),
-            None => now_rfc3339()?,
-        },
-        ended_at: None,
-        cwd: redact_text(&display_path(&cwd)),
-        trigger: args.trigger.as_str().to_string(),
-        intent: redact_text(&args.intent),
-        inputs: Inputs {
-            user_request_summary: redact_text(&args.user_request_summary),
-            referenced_files: redact_strings(&normalized_paths(&args.referenced_file)),
-            external_sources: redact_strings(&args.external_source),
-        },
-        outcome: Outcome {
-            status: "skipped".to_string(),
-            summary: "initialized; final outcome not recorded".to_string(),
-        },
-        artifacts: Vec::new(),
-        linked_records: Vec::new(),
-        validation_required: args.validation_waiver.as_ref().map(|_| false),
-        validation_waiver: args.validation_waiver.as_deref().map(redact_text),
-        validation: Vec::new(),
-        failures: Vec::new(),
-        follow_up: Vec::new(),
-    };
-    write_record(&path, &record)
+        let cwd = match &args.cwd {
+            Some(path) => absolute_path(path)?,
+            None => env::current_dir().map_err(|err| {
+                CliError::runtime(
+                    "cwd-unavailable",
+                    format!("failed to read current directory: {err}"),
+                    None,
+                )
+            })?,
+        };
+        let record = SkillUsageRecord {
+            schema: RECORD_SCHEMA_VERSION.to_string(),
+            skill: redact_text(&args.skill),
+            started_at: match &args.started_at {
+                Some(value) => redact_text(value),
+                None => now_rfc3339()?,
+            },
+            ended_at: None,
+            cwd: redact_text(&display_path(&cwd)),
+            trigger: args.trigger.as_str().to_string(),
+            intent: redact_text(&args.intent),
+            inputs: Inputs {
+                user_request_summary: redact_text(&args.user_request_summary),
+                referenced_files: redact_strings(&normalized_paths(&args.referenced_file)),
+                external_sources: redact_strings(&args.external_source),
+            },
+            outcome: Outcome {
+                status: "skipped".to_string(),
+                summary: "initialized; final outcome not recorded".to_string(),
+            },
+            artifacts: Vec::new(),
+            linked_records: Vec::new(),
+            validation_required: args.validation_waiver.as_ref().map(|_| false),
+            validation_waiver: args.validation_waiver.as_deref().map(redact_text),
+            validation: Vec::new(),
+            failures: Vec::new(),
+            follow_up: Vec::new(),
+        };
+        write_record(&path, &record)
+    })
 }
 
 fn update_record<F>(out_dir: &Path, update: F) -> Result<RecordResult, CliError>
@@ -279,9 +282,90 @@ where
     F: FnOnce(&mut SkillUsageRecord) -> Result<(), CliError>,
 {
     let path = record_path(out_dir, RECORD_FILE)?;
-    let mut record: SkillUsageRecord = crate::common::read_json(&path)?;
-    update(&mut record)?;
-    write_record(&path, &record)
+    with_record_lock(&path, || {
+        let mut record: SkillUsageRecord = crate::common::read_json(&path)?;
+        update(&mut record)?;
+        write_record(&path, &record)
+    })
+}
+
+fn with_record_lock<T>(
+    record_file: &Path,
+    operation: impl FnOnce() -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    let _guard = RecordLock::acquire(record_file)?;
+    operation()
+}
+
+struct RecordLock {
+    path: PathBuf,
+}
+
+impl RecordLock {
+    fn acquire(record_file: &Path) -> Result<Self, CliError> {
+        let lock_dir = record_lock_path(record_file);
+        if let Some(parent) = lock_dir.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                CliError::runtime(
+                    "record-lock-parent-create-failed",
+                    format!(
+                        "failed to create record lock parent {}: {err}",
+                        parent.display()
+                    ),
+                    Some(json!({ "path": display_path(parent) })),
+                )
+            })?;
+        }
+
+        let started = Instant::now();
+        let timeout = Duration::from_secs(30);
+        loop {
+            match fs::create_dir(&lock_dir) {
+                Ok(()) => return Ok(Self { path: lock_dir }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if started.elapsed() >= timeout {
+                        return Err(CliError::runtime(
+                            "record-lock-timeout",
+                            format!(
+                                "timed out waiting for exclusive record lock {}",
+                                lock_dir.display()
+                            ),
+                            Some(json!({
+                                "lock_dir": display_path(&lock_dir),
+                                "record_file": display_path(record_file),
+                                "timeout_seconds": timeout.as_secs()
+                            })),
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => {
+                    return Err(CliError::runtime(
+                        "record-lock-create-failed",
+                        format!("failed to create record lock {}: {err}", lock_dir.display()),
+                        Some(json!({
+                            "lock_dir": display_path(&lock_dir),
+                            "record_file": display_path(record_file)
+                        })),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RecordLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn record_lock_path(record_file: &Path) -> PathBuf {
+    let file_name = record_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(RECORD_FILE);
+    record_file.with_file_name(format!("{file_name}.lock"))
 }
 
 fn write_record(path: &Path, record: &SkillUsageRecord) -> Result<RecordResult, CliError> {
@@ -292,8 +376,10 @@ fn write_record(path: &Path, record: &SkillUsageRecord) -> Result<RecordResult, 
 
 fn read_record_result(out_dir: &Path) -> Result<RecordResult, CliError> {
     let path = record_path(out_dir, RECORD_FILE)?;
-    let value: Value = crate::common::read_json(&path)?;
-    Ok(RecordResult::new(path, value))
+    with_record_lock(&path, || {
+        let value: Value = crate::common::read_json(&path)?;
+        Ok(RecordResult::new(path.clone(), value))
+    })
 }
 
 fn now_rfc3339() -> Result<String, CliError> {
