@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::thread;
 
 use nils_test_support::cmd::{CmdOutput, run_resolved_in_dir};
 use pretty_assertions::assert_eq;
@@ -768,6 +769,98 @@ fn skill_usage_records_successful_skill_invocation() {
         value["data"]["record"]["linked_records"][0]["type"],
         "review-evidence"
     );
+}
+
+#[test]
+fn skill_usage_serializes_concurrent_record_mutations() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("skill-concurrent");
+    let out = out_arg(&out_dir);
+
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "init",
+                "--out",
+                &out,
+                "--skill",
+                "skills/tools/devex/skill-usage",
+                "--intent",
+                "record skill usage",
+                "--user-request-summary",
+                "record this workflow",
+            ],
+        )
+        .code,
+        0
+    );
+
+    let dir = tmp.path().to_path_buf();
+    let handles: Vec<_> = (0..16)
+        .map(|idx| {
+            let dir = dir.clone();
+            let out = out.clone();
+            thread::spawn(move || {
+                let command = format!("check-{idx:02}");
+                let summary = format!("validation {idx:02}");
+                run(
+                    "skill-usage",
+                    &dir,
+                    &[
+                        "record-validation",
+                        "--out",
+                        &out,
+                        "--command",
+                        &command,
+                        "--status",
+                        "pass",
+                        "--summary",
+                        &summary,
+                    ],
+                )
+            })
+        })
+        .collect();
+
+    let outputs: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("validation thread should not panic"))
+        .collect();
+    for (idx, output) in outputs.iter().enumerate() {
+        assert_eq!(
+            output.code,
+            0,
+            "worker {idx} failed: stdout={} stderr={}",
+            output.stdout_text(),
+            output.stderr_text()
+        );
+    }
+
+    let show = run(
+        "skill-usage",
+        tmp.path(),
+        &["show", "--out", &out, "--format", "json"],
+    );
+    assert_eq!(show.code, 0, "stderr={}", show.stderr_text());
+    let value = show.stdout_json();
+    let validation = value["data"]["record"]["validation"]
+        .as_array()
+        .expect("validation array");
+    let mut commands: Vec<String> = validation
+        .iter()
+        .map(|item| {
+            item["command"]
+                .as_str()
+                .expect("validation command")
+                .to_string()
+        })
+        .collect();
+    commands.sort();
+    let expected: Vec<String> = (0..16).map(|idx| format!("check-{idx:02}")).collect();
+
+    assert_eq!(commands, expected);
 }
 
 #[test]
