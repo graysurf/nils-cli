@@ -89,7 +89,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--execution-state=[Path to the \`<slug>-execution-state.md\` file]:path:_default' \
 '--task=[Ledger row ID to patch (exact match)]:id:_default' \
-'--status=[New row status]:status:(pending in-progress done blocked waived)' \
+'--status=[New row status]:status:(pending in-progress done deferred blocked waived)' \
 '--evidence=[Evidence text to merge into the Evidence cell]:text:_default' \
 '--notes=[Optional notes value; omit to leave Notes untouched]:text:_default' \
 '--format=[Output format]:fmt:(text json)' \
@@ -106,6 +106,20 @@ _arguments "${_arguments_options[@]}" : \
 '--fixture=[Fixture directory containing \`body.md\` + \`comments.json\`]:dir:_default' \
 '--format=[Output format]:fmt:(text json)' \
 '--write[Patch the ledger file (empty-cell preference rule)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(exec-state-sync)
+_arguments "${_arguments_options[@]}" : \
+'--bundle=[Plan bundle directory containing \`*-execution-state.md\`]:dir:_default' \
+'--execution-state=[Explicit execution-state file (overrides --bundle lookup)]:path:_default' \
+'--issue-url=[Tracking issue URL to record (autolinked)]:url:_default' \
+'--status=[Terminal \`Status\` value]:text:_default' \
+'--last-updated=[\`Last updated\` stamp]:date:_default' \
+'--branch-commit-pr=[\`Branch/commit/PR\` value]:text:_default' \
+'--format=[Output format]:fmt:(text json)' \
+'--dry-run[Report the change set without writing the file]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -155,6 +169,7 @@ _plan-tooling_commands() {
 'split-prs:Build task-to-PR split records (deterministic/auto)' \
 'ledger-update:Patch one row in an execution-state \`## Task Ledger\` table' \
 'ledger-sync:Reconcile a ledger Evidence column against tracking-issue evidence' \
+'exec-state-sync:Repair an execution-state file'\''s tracking issue URL / terminal state' \
 'scaffold:Create a new plan from template' \
 'spec:Dump the validate catalog (class, pattern, rule, example)' \
 'completion:Export shell completion script' \
@@ -176,6 +191,11 @@ _plan-tooling__subcmd__batches_commands() {
 _plan-tooling__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'plan-tooling completion commands' commands "$@"
+}
+(( $+functions[_plan-tooling__subcmd__exec-state-sync_commands] )) ||
+_plan-tooling__subcmd__exec-state-sync_commands() {
+    local commands; commands=()
+    _describe -t commands 'plan-tooling exec-state-sync commands' commands "$@"
 }
 (( $+functions[_plan-tooling__subcmd__help_commands] )) ||
 _plan-tooling__subcmd__help_commands() {

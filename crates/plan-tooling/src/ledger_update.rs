@@ -28,7 +28,8 @@ Purpose:
 Options:
   --execution-state <path>  Path to the `<slug>-execution-state.md` file
   --task <id>               Ledger row ID to patch (exact match)
-  --status <status>         New status: pending | in-progress | done | blocked | waived
+  --status <status>         New status: pending | in-progress | done | deferred |
+                            blocked | waived
   --evidence <text>         Evidence text to merge into the Evidence cell
                             (empty string preserves existing value)
   --notes <text>            Optional notes value; omit to leave Notes untouched
