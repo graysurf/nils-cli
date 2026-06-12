@@ -156,7 +156,9 @@ Mechanics:
 2. Create an isolated worktree off `origin/<base>` on a `<prefix>/<slug>` branch
    whose prefix matches `--kind` (e.g. `--kind docs` → `docs/...`), under the
    same managed path scheme as `git-cli worktree` so it is removable via
-   `git-cli worktree remove <slug>`.
+   `git-cli worktree remove <slug>`. The default date slug is auto-suffixed
+   (`-2`, `-3`, ...) when an earlier local records branch or worktree already
+   uses it; an explicit `--slug` collision fails with `records-target-exists`.
 3. Copy only the changed files under the heuristic-system root into the
    worktree, `git add` that path, and **refuse** (`dirty-records-worktree`) if
    anything outside it is dirty.

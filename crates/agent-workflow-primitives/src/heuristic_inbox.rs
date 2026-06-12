@@ -2400,6 +2400,137 @@ fn default_records_slug() -> String {
     format!("heuristic-records-{}", today_utc())
 }
 
+#[derive(Debug)]
+struct RecordsTarget {
+    branch: String,
+    worktree_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct RecordsTargetCollision {
+    local_branch_exists: bool,
+    remote_branch_exists: bool,
+    worktree_path_exists: bool,
+}
+
+impl RecordsTargetCollision {
+    fn any(&self) -> bool {
+        self.local_branch_exists || self.remote_branch_exists || self.worktree_path_exists
+    }
+}
+
+fn resolve_records_target(
+    runner: &dyn CommandRunner,
+    git: &str,
+    repo_root: &Path,
+    kind: DeliverKind,
+    requested_slug: Option<&str>,
+) -> Result<RecordsTarget, CliError> {
+    let base_slug = requested_slug
+        .map(str::to_string)
+        .unwrap_or_else(default_records_slug);
+    let base_slug = sanitize_slug_segment(&base_slug);
+    if base_slug.is_empty() {
+        return Err(CliError::usage(
+            "invalid-slug",
+            "--slug must contain at least one ASCII letter or digit",
+            None,
+        ));
+    }
+
+    let auto_suffix = requested_slug.is_none();
+    for attempt in 0..100 {
+        let slug = if attempt == 0 {
+            base_slug.clone()
+        } else {
+            format!("{base_slug}-{}", attempt + 1)
+        };
+        let branch = records_branch(kind, &slug);
+        let worktree_path = managed_worktree_path(repo_root, &slug);
+        let collision = records_target_collision(runner, git, repo_root, &branch, &worktree_path)?;
+        if !collision.any() {
+            return Ok(RecordsTarget {
+                branch,
+                worktree_path,
+            });
+        }
+        if !auto_suffix {
+            return Err(records_target_collision_error(
+                slug,
+                branch,
+                worktree_path,
+                collision,
+            ));
+        }
+    }
+
+    Err(CliError::runtime(
+        "records-target-exhausted",
+        format!("could not find an available records slug derived from {base_slug}"),
+        Some(json!({ "base_slug": base_slug, "attempts": 100 })),
+    ))
+}
+
+fn records_target_collision(
+    runner: &dyn CommandRunner,
+    git: &str,
+    repo_root: &Path,
+    branch: &str,
+    worktree_path: &Path,
+) -> Result<RecordsTargetCollision, CliError> {
+    let local_ref = format!("refs/heads/{branch}");
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    Ok(RecordsTargetCollision {
+        local_branch_exists: git_ref_exists(runner, git, repo_root, &local_ref)?,
+        remote_branch_exists: git_ref_exists(runner, git, repo_root, &remote_ref)?,
+        worktree_path_exists: worktree_path.exists(),
+    })
+}
+
+fn git_ref_exists(
+    runner: &dyn CommandRunner,
+    git: &str,
+    repo_root: &Path,
+    ref_name: &str,
+) -> Result<bool, CliError> {
+    let result = runner.run(
+        git,
+        &["show-ref", "--verify", "--quiet", ref_name],
+        Some(repo_root),
+    )?;
+    if result.success {
+        return Ok(true);
+    }
+    if result.stderr.trim().is_empty() {
+        return Ok(false);
+    }
+    Err(CliError::runtime(
+        "git-show-ref-failed",
+        format!("git show-ref failed while checking {ref_name}"),
+        Some(json!({ "ref": ref_name, "stderr": result.stderr.trim() })),
+    ))
+}
+
+fn records_target_collision_error(
+    slug: String,
+    branch: String,
+    worktree_path: PathBuf,
+    collision: RecordsTargetCollision,
+) -> CliError {
+    CliError::runtime(
+        "records-target-exists",
+        format!("records branch/worktree target already exists for {branch}; pass a unique --slug"),
+        Some(json!({
+            "slug": slug,
+            "branch": branch,
+            "worktree_path": display_path(&worktree_path),
+            "local_branch_exists": collision.local_branch_exists,
+            "remote_branch_exists": collision.remote_branch_exists,
+            "worktree_path_exists": collision.worktree_path_exists,
+        })),
+    )
+}
+
 /// Parse `git status --porcelain` lines into repo-relative paths. Renames keep
 /// the post-rename path; quoted paths are unquoted on a best-effort basis.
 fn parse_porcelain_paths(stdout: &str) -> Vec<String> {
@@ -2509,17 +2640,9 @@ fn run_deliver(runner: &dyn CommandRunner, args: &DeliverArgs) -> Result<Deliver
     }
 
     // 4. Compute the records branch + managed worktree path (git-cli semantics).
-    let slug = args.slug.clone().unwrap_or_else(default_records_slug);
-    let slug = sanitize_slug_segment(&slug);
-    if slug.is_empty() {
-        return Err(CliError::usage(
-            "invalid-slug",
-            "--slug must contain at least one ASCII letter or digit",
-            None,
-        ));
-    }
-    let branch = records_branch(args.kind, &slug);
-    let worktree_path = managed_worktree_path(&repo_root, &slug);
+    let target = resolve_records_target(runner, &git, &repo_root, args.kind, args.slug.as_deref())?;
+    let branch = target.branch;
+    let worktree_path = target.worktree_path;
     let worktree_display = display_path(&worktree_path);
     let base = args.base.clone();
     let origin_base = format!("origin/{base}");
@@ -3697,6 +3820,7 @@ mod tests {
         source_status: String,
         worktree_status: String,
         forge_stdout: String,
+        existing_refs: Vec<String>,
         calls: RefCell<Vec<Vec<String>>>,
     }
 
@@ -3731,6 +3855,11 @@ mod tests {
             match args {
                 ["rev-parse", "--show-toplevel"] => ok(&format!("{}\n", self.repo_root.display())),
                 ["status", "--porcelain", "-uall", "--", _] => ok(&self.source_status),
+                ["show-ref", "--verify", "--quiet", ref_name] => Ok(RunResult {
+                    success: self.existing_refs.iter().any(|r| r == ref_name),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
                 ["fetch", "origin", _] => ok(""),
                 ["worktree", "add", "-b", _branch, path, _base] => {
                     fs::create_dir_all(path).expect("stub creates worktree dir");
@@ -3844,6 +3973,7 @@ mod tests {
             source_status: format!("?? {REC_REL}\n"),
             worktree_status: format!(" M {REC_REL}\n"),
             forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            existing_refs: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
 
@@ -3885,6 +4015,7 @@ mod tests {
             source_status: format!("?? {REC_REL}\n"),
             worktree_status: format!(" M {REC_REL}\n"),
             forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            existing_refs: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
         let mut args = deliver_args(repo.path(), false);
@@ -3908,6 +4039,77 @@ mod tests {
     }
 
     #[test]
+    fn deliver_default_slug_auto_uniquifies_existing_target() {
+        let lock = GlobalStateLock::new();
+        let repo = seed_repo();
+        let agent_home = repo.path().join(".agent-home");
+        let _agent_home = EnvGuard::set(&lock, "AGENT_HOME", &agent_home.to_string_lossy());
+        let default_slug = default_records_slug();
+        let default_branch = records_branch(DeliverKind::Docs, &default_slug);
+        fs::create_dir_all(managed_worktree_path(repo.path(), &default_slug))
+            .expect("existing worktree path");
+        let runner = ScriptedRunner {
+            repo_root: repo.path().to_path_buf(),
+            source_status: format!("?? {REC_REL}\n"),
+            worktree_status: format!(" M {REC_REL}\n"),
+            forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            existing_refs: vec![format!("refs/heads/{default_branch}")],
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut args = deliver_args(repo.path(), false);
+        args.slug = None;
+
+        let result = run_deliver(&runner, &args).expect("deliver ok");
+
+        let uniquified_slug = format!("{default_slug}-2");
+        assert_eq!(
+            result.branch,
+            records_branch(DeliverKind::Docs, &uniquified_slug)
+        );
+        assert_eq!(
+            result.worktree_path,
+            display_path(&managed_worktree_path(repo.path(), &uniquified_slug))
+        );
+        let log = runner.argv_log();
+        assert!(
+            log.iter()
+                .any(|c| c.contains(&format!("worktree add -b docs/{uniquified_slug}"))),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn deliver_explicit_slug_collision_returns_error_before_mutation() {
+        let lock = GlobalStateLock::new();
+        let repo = seed_repo();
+        let agent_home = repo.path().join(".agent-home");
+        let _agent_home = EnvGuard::set(&lock, "AGENT_HOME", &agent_home.to_string_lossy());
+        fs::create_dir_all(managed_worktree_path(repo.path(), "fixed-slug"))
+            .expect("existing worktree path");
+        let runner = ScriptedRunner {
+            repo_root: repo.path().to_path_buf(),
+            source_status: format!("?? {REC_REL}\n"),
+            worktree_status: format!(" M {REC_REL}\n"),
+            forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            existing_refs: vec!["refs/heads/docs/fixed-slug".to_string()],
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let err =
+            run_deliver(&runner, &deliver_args(repo.path(), false)).expect_err("should refuse");
+
+        assert_eq!(err.code(), "records-target-exists");
+        let log = runner.argv_log();
+        assert!(!log.iter().any(|c| c.starts_with("git fetch")), "{log:?}");
+        assert!(!log.iter().any(|c| c.contains("worktree add")), "{log:?}");
+        assert!(
+            !log.iter().any(|c| c.starts_with("semantic-commit commit")),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|c| c.starts_with("git push")), "{log:?}");
+    }
+
+    #[test]
     fn deliver_dry_run_renders_labels_in_plan() {
         let lock = GlobalStateLock::new();
         let repo = seed_repo();
@@ -3921,6 +4123,7 @@ mod tests {
             source_status: format!("?? {REC_REL}\n"),
             worktree_status: String::new(),
             forge_stdout: String::new(),
+            existing_refs: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
         let mut args = deliver_args(repo.path(), true);
@@ -3954,6 +4157,7 @@ mod tests {
             // A stray non-heuristic-system path leaked into the records worktree.
             worktree_status: format!(" M {REC_REL}\n M src/unrelated.rs\n"),
             forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            existing_refs: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
 
@@ -3984,6 +4188,7 @@ mod tests {
             source_status: format!("?? {REC_REL}\n"),
             worktree_status: String::new(),
             forge_stdout: String::new(),
+            existing_refs: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
 
