@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `b1a3150010d5a3c53b6877151911f040bbd989dde0a04497724734a8f925bf53`
+- Cargo.lock SHA256: `f54c7d84d61af5ed5d033f9e6e82b8027db0368007beb4d280a80f7d2257f61f`
 - Third-party crates (`source != null`): 460
 - Workspace crates (`source == null`, excluded below): 39
 
@@ -204,9 +204,9 @@ This file documents third-party Rust crate licenses used by this workspace.
 | ipnet | 2.12.0 | MIT OR Apache-2.0 | crates.io |
 | is_terminal_polyfill | 1.70.2 | MIT OR Apache-2.0 | crates.io |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | crates.io |
-| jaq-core | 3.0.0 | MIT | crates.io |
-| jaq-json | 2.0.0 | MIT | crates.io |
-| jaq-std | 3.0.0 | MIT | crates.io |
+| jaq-core | 3.1.0 | MIT | crates.io |
+| jaq-json | 2.0.1 | MIT | crates.io |
+| jaq-std | 3.0.1 | MIT | crates.io |
 | jiff | 0.2.28 | Unlicense OR MIT | crates.io |
 | jiff-static | 0.2.28 | Unlicense OR MIT | crates.io |
 | jiff-tzdb | 0.1.6 | Unlicense OR MIT | crates.io |
@@ -378,9 +378,9 @@ This file documents third-party Rust crate licenses used by this workspace.
 | thiserror | 2.0.18 | MIT OR Apache-2.0 | crates.io |
 | thiserror-impl | 2.0.18 | MIT OR Apache-2.0 | crates.io |
 | thread_local | 1.1.9 | MIT OR Apache-2.0 | crates.io |
-| time | 0.3.47 | MIT OR Apache-2.0 | crates.io |
-| time-core | 0.1.8 | MIT OR Apache-2.0 | crates.io |
-| time-macros | 0.2.27 | MIT OR Apache-2.0 | crates.io |
+| time | 0.3.48 | MIT OR Apache-2.0 | crates.io |
+| time-core | 0.1.9 | MIT OR Apache-2.0 | crates.io |
+| time-macros | 0.2.28 | MIT OR Apache-2.0 | crates.io |
 | tiny-skia | 0.12.0 | BSD-3-Clause | crates.io |
 | tiny-skia-path | 0.12.0 | BSD-3-Clause | crates.io |
 | tinystr | 0.8.3 | Unicode-3.0 | crates.io |

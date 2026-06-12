@@ -32,12 +32,16 @@ pub(crate) fn sanitize_id(id: &str) -> String {
 }
 
 pub(crate) fn time_run_id_now() -> Result<String> {
-    let format = time::format_description::parse("[year][month][day]-[hour][minute][second]Z")?;
+    let format = time::format_description::parse_borrowed::<2>(
+        "[year][month][day]-[hour][minute][second]Z",
+    )?;
     Ok(time::OffsetDateTime::now_utc().format(&format)?)
 }
 
 pub(crate) fn time_iso_now() -> Result<String> {
-    let format = time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]Z")?;
+    let format = time::format_description::parse_borrowed::<2>(
+        "[year]-[month]-[day]T[hour]:[minute]:[second]Z",
+    )?;
     Ok(time::OffsetDateTime::now_utc().format(&format)?)
 }
 
