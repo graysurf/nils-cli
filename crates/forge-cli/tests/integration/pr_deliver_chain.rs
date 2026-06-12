@@ -69,6 +69,60 @@ const MERGED_PR_VIEW_JSON: &str = r#"{
   "labels": []
 }"#;
 
+/// One open PR for `feat/sample`, in the shape `gh pr list --json` returns.
+/// Used by the adopt-path stubs to answer the macro's head-branch lookup.
+const OPEN_PR_LIST_JSON: &str = r#"[{"number":123,"url":"https://github.com/sympoies/nils-cli/pull/123","state":"OPEN","title":"feat: sample feature","headRefName":"feat/sample","author":{"login":"testuser-gh"}}]"#;
+
+/// Adoptable draft PR view: open, draft, and carrying a gate-compliant body
+/// (so both the adopt-time body re-validation and the merge-time task-list
+/// gate pass).
+const ADOPTABLE_PR_VIEW_JSON: &str = r###"{
+  "number": 123,
+  "url": "https://github.com/sympoies/nils-cli/pull/123",
+  "state": "OPEN",
+  "isDraft": true,
+  "title": "feat: sample feature",
+  "headRefName": "feat/sample",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergedAt": null,
+  "labels": [],
+  "body": "## Summary\n\nAdopted draft.\n\n## Test plan\n\n- [x] unit\n"
+}"###;
+
+/// Post-ready view of the adopted PR: same record once `pr ready` promoted
+/// the draft, so the merge step's draft gate passes.
+const ADOPTED_READY_PR_VIEW_JSON: &str = r###"{
+  "number": 123,
+  "url": "https://github.com/sympoies/nils-cli/pull/123",
+  "state": "OPEN",
+  "isDraft": false,
+  "title": "feat: sample feature",
+  "headRefName": "feat/sample",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergedAt": null,
+  "labels": [],
+  "body": "## Summary\n\nAdopted draft.\n\n## Test plan\n\n- [x] unit\n"
+}"###;
+
+/// Same as [`ADOPTABLE_PR_VIEW_JSON`] but the body lacks the required
+/// `## Summary` / `## Test plan` sections, so the adopt-time body
+/// re-validation must fail closed.
+const ADOPT_VIEW_MISSING_SECTIONS_JSON: &str = r###"{
+  "number": 123,
+  "url": "https://github.com/sympoies/nils-cli/pull/123",
+  "state": "OPEN",
+  "isDraft": true,
+  "title": "feat: sample feature",
+  "headRefName": "feat/sample",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergedAt": null,
+  "labels": [],
+  "body": "no required sections here"
+}"###;
+
 /// Build the canonical Sprint 2 git tempdir: clean worktree on `feat/sample`
 /// tracking `origin/feat/sample` at the same SHA, with the remote URL set to
 /// `https://<host>/<repo_slug>.git` so provider detection lands on GitHub.
@@ -184,6 +238,9 @@ EOF
 }}
 EOF
     ;;
+  "pr list")
+    echo '[]'
+    ;;
   "pr create")
     cat <<'EOF'
 {create}
@@ -241,6 +298,112 @@ esac
         checks = FIXTURE_CHECKS_JSON,
         merge_branch = merge_branch,
         sentinel = sentinel.display(),
+    );
+    let path = stub.tempdir.path().join("gh");
+    fs::write(&path, body).expect("write gh stub");
+    let mut perm = fs::metadata(&path).expect("metadata").permissions();
+    perm.set_mode(0o755);
+    fs::set_permissions(&path, perm).expect("chmod");
+    path
+}
+
+/// Chain stub for the adopt path: `pr list` reports an existing open PR for
+/// the head branch, and `pr create` is a tripwire — it touches the
+/// `create-called` sentinel and exits 99 so any create attempt fails the
+/// test loudly. `pr view` serves `pre_view` until the merge sentinel
+/// appears, then flips to the merged payload.
+fn write_adopt_chain_stub(stub: &StubEnv, pre_view: &str) -> PathBuf {
+    let merge_sentinel = stub.tempdir.path().join("merge-called");
+    let ready_sentinel = stub.tempdir.path().join("ready-called");
+    let create_sentinel = stub.tempdir.path().join("create-called");
+    let body = format!(
+        r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "auth status")
+    cat <<'EOF' 1>&2
+github.com
+  ✓ Logged in to github.com account testuser-gh (keyring)
+  - Token scopes: 'repo', 'read:org'
+EOF
+    ;;
+  "repo view")
+    cat <<'EOF'
+{{
+  "name": "nils-cli",
+  "owner": {{ "login": "sympoies" }},
+  "url": "https://github.com/sympoies/nils-cli",
+  "defaultBranchRef": {{ "name": "main" }},
+  "mergeCommitAllowed": false,
+  "squashMergeAllowed": true,
+  "rebaseMergeAllowed": false
+}}
+EOF
+    ;;
+  "pr list")
+    cat <<'EOF'
+{list}
+EOF
+    ;;
+  "pr create")
+    touch {create_sentinel}
+    echo "stub: pr create must not run on the adopt path" >&2
+    exit 99
+    ;;
+  "pr checks")
+    cat <<'EOF'
+{checks}
+EOF
+    ;;
+  "pr ready")
+    touch {ready_sentinel}
+    ;;
+  "api graphql")
+    cat <<'EOF'
+{{ "data": {{ "repository": {{ "pullRequest": {{ "reviewThreads": {{ "nodes": [] }} }} }} }} }}
+EOF
+    ;;
+  "pr merge")
+    touch {merge_sentinel}
+    ;;
+  "pr view")
+    case "$*" in
+      *"--json mergeCommit"*)
+        cat <<'EOF'
+{{ "mergeCommit": {{ "oid": "abc123def456" }} }}
+EOF
+        ;;
+      *)
+        if [ -e {merge_sentinel} ]; then
+          cat <<'EOF'
+{merged}
+EOF
+        elif [ -e {ready_sentinel} ]; then
+          cat <<'EOF'
+{ready_view}
+EOF
+        else
+          cat <<'EOF'
+{pre_view}
+EOF
+        fi
+        ;;
+    esac
+    ;;
+  *)
+    echo "stub: unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+        list = OPEN_PR_LIST_JSON,
+        checks = FIXTURE_CHECKS_JSON,
+        merged = MERGED_PR_VIEW_JSON,
+        ready_view = ADOPTED_READY_PR_VIEW_JSON,
+        pre_view = pre_view,
+        create_sentinel = create_sentinel.display(),
+        ready_sentinel = ready_sentinel.display(),
+        merge_sentinel = merge_sentinel.display(),
     );
     let path = stub.tempdir.path().join("gh");
     fs::write(&path, body).expect("write gh stub");
@@ -566,4 +729,184 @@ fn pr_deliver_treats_gh_exit_1_after_successful_merge_as_success() {
     );
     assert_eq!(envelope["data"]["pr"]["merged"], true);
     assert_eq!(envelope["data"]["pr"]["merge_sha"], "abc123def456");
+}
+
+#[test]
+fn pr_deliver_adopts_existing_open_pr_for_head_branch() {
+    // Regression for the create-then-deliver dead end: a draft PR opened
+    // earlier via `pr create` could never be finished by `pr deliver`
+    // because the macro validated its create-step inputs (body gate) before
+    // looking up the head branch. The adopt path must find the open PR,
+    // skip create entirely, and run the remaining lifecycle steps — even
+    // when the invocation carries no `--body`.
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let create_sentinel = stub.tempdir.path().join("create-called");
+    let gh_path = write_adopt_chain_stub(&stub, ADOPTABLE_PR_VIEW_JSON);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], true);
+    let steps: Vec<&str> = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .map(|s| s["step"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            "auth_status",
+            "repo_view",
+            "adopt",
+            "wait_checks",
+            "ready",
+            "merge",
+        ],
+        "adopt must replace create and continue the lifecycle"
+    );
+    assert_eq!(envelope["data"]["steps"][2]["ok"], true);
+    assert_eq!(
+        envelope["data"]["steps"][2]["schema_version"], "cli.forge-cli.pr.view.v1",
+        "adopt step payload is the adopted PR's view"
+    );
+    assert_eq!(envelope["data"]["pr"]["number"], 123);
+    assert_eq!(envelope["data"]["pr"]["merged"], true);
+    assert_eq!(envelope["data"]["pr"]["merge_sha"], "abc123def456");
+    assert!(
+        !create_sentinel.exists(),
+        "adopt path must never call the backend pr create"
+    );
+}
+
+#[test]
+fn pr_deliver_adopt_revalidates_existing_pr_body_and_fails_closed() {
+    // The adopted PR's actual body (fetched via pr view) goes through the
+    // same `## Summary` / `## Test plan` gate as a create-path body. A
+    // non-compliant body fails closed with DATA 65 — and unlike the
+    // pre-fix behaviour, the envelope names the PR it found instead of
+    // reporting number 0.
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let gh_path = write_adopt_chain_stub(&stub, ADOPT_VIEW_MISSING_SECTIONS_JSON);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(
+        out.code, 65,
+        "expected DATA 65 when the adopted PR body lacks required sections, stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "body_missing_sections");
+    let steps: Vec<&str> = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .map(|s| s["step"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(steps, vec!["auth_status", "repo_view", "adopt"]);
+    assert_eq!(envelope["data"]["steps"][2]["ok"], false);
+    assert_eq!(
+        envelope["data"]["pr"]["number"], 123,
+        "failure envelope must name the adopted PR, not number 0"
+    );
+}
+
+#[test]
+fn pr_deliver_without_body_and_no_open_pr_still_fails_create_body_gate() {
+    // When the head-branch lookup finds nothing, the macro falls through to
+    // the unchanged create path: a missing `--body` still trips the
+    // create-step body gate after the lookup ran.
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let gh_path = write_full_chain_stub(&stub);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+        ],
+    );
+    assert_eq!(
+        out.code, 65,
+        "expected DATA 65 on missing body with no adoptable PR, stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "body_missing_sections");
+    let steps: Vec<&str> = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .map(|s| s["step"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(steps, vec!["auth_status", "repo_view"]);
 }

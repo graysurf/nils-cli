@@ -645,7 +645,8 @@ pub enum PrCommand {
     Checks(PrChecksArgs),
     /// Block until every required check reaches a terminal state.
     WaitChecks(PrWaitChecksArgs),
-    /// End-to-end "open draft → CI green → ready → merge" macro.
+    /// End-to-end "open draft (or adopt the branch's open PR) → CI green →
+    /// ready → merge" macro.
     Deliver(PrDeliverArgs),
 }
 

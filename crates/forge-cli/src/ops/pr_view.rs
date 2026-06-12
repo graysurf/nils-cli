@@ -25,8 +25,7 @@ use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 const SCHEMA: &str = "pr.view";
 const SCHEMA_VERSION: u32 = 1;
 
-const GH_JSON_FIELDS: &str =
-    "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels";
+const GH_JSON_FIELDS: &str = "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels,body";
 
 /// Envelope payload for `cli.forge-cli.pr.view.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -47,6 +46,11 @@ pub struct PrViewPayload {
     /// `merge_commit_sha`.
     pub merge_commit_sha: Option<String>,
     pub labels: Vec<String>,
+    /// PR/MR description body. Additive: GitHub reads `body`, GitLab reads
+    /// `description`; `null` when the provider response omits the field
+    /// (callers that re-parse view JSON with narrower field lists, e.g.
+    /// `pr ready`, keep working).
+    pub body: Option<String>,
 }
 
 pub fn run(global: &GlobalFlags, id: String, format: OutputFormat) -> Result<i32, ForgeError> {
@@ -100,6 +104,19 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         format,
         render_text,
     ))
+}
+
+/// Macro-facing entry point: fetch one PR/MR by number and return the typed
+/// view payload (including `body` on providers that model it). Used by
+/// `pr deliver` to inspect and re-validate an adopted PR.
+pub(crate) fn compute<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+) -> Result<PrViewPayload, ForgeError> {
+    let call = build_view_call(ctx, &number.to_string());
+    let output = runner.run(&call)?;
+    parse_view_output(ctx, &output)
 }
 
 pub(crate) fn build_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
@@ -218,6 +235,10 @@ fn parse_github(
         merged_at,
         merge_commit_sha,
         labels,
+        body: value
+            .get("body")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -259,6 +280,10 @@ fn parse_gitlab(
         merged_at,
         merge_commit_sha,
         labels,
+        body: value
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 

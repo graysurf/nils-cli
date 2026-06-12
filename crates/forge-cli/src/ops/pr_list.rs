@@ -86,7 +86,20 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     ))
 }
 
-fn build_list_call(ctx: &ProviderContext, args: &PrListArgs) -> BackendCall {
+/// Macro-facing entry point: build the list call, run it, and return the
+/// typed payload without emitting an envelope. Used by `pr deliver` for the
+/// head-branch adopt lookup.
+pub(crate) fn compute<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    args: &PrListArgs,
+) -> Result<PrListPayload, ForgeError> {
+    let call = build_list_call(ctx, args);
+    let output = runner.run(&call)?;
+    parse_list_output(ctx, &output)
+}
+
+pub(crate) fn build_list_call(ctx: &ProviderContext, args: &PrListArgs) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let limit = args.limit.max(1);
     let mut argv: Vec<OsString> = Vec::new();
