@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `fd57d4ba3fc9df74bfac9febdc04ad263589426e31e339f79957b0d85847ea9e`
+- Cargo.lock SHA256: `54cf3dc80bb01f7878dd59135f173e19945c84ee4e7678b03bf1066a1e014660`
 - Third-party crates (`source != null`): 460
 - Workspace crates (`source == null`, excluded below): 39
 
@@ -428,7 +428,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | usvg | 0.47.0 | Apache-2.0 OR MIT | crates.io |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT | crates.io |
 | utf8parse | 0.2.2 | Apache-2.0 OR MIT | crates.io |
-| uuid | 1.23.2 | Apache-2.0 OR MIT | crates.io |
+| uuid | 1.23.3 | Apache-2.0 OR MIT | crates.io |
 | valuable | 0.1.1 | MIT | crates.io |
 | vcpkg | 0.2.15 | MIT/Apache-2.0 | crates.io |
 | version_check | 0.9.5 | MIT/Apache-2.0 | crates.io |
