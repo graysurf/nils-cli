@@ -306,14 +306,14 @@ pub struct RecordPostArgs {
     pub payload_file: Option<PathBuf>,
 
     /// Markdown execution-state document for state lifecycle comments.
-    #[arg(
-        long = "execution-state-file",
-        value_name = "path",
-        conflicts_with = "summary_file"
-    )]
+    /// Composes with `--summary-file`: the summary renders above the
+    /// execution-state document.
+    #[arg(long = "execution-state-file", value_name = "path")]
     pub execution_state_file: Option<PathBuf>,
 
-    /// Visible Markdown commentary appended after the structured payload.
+    /// Visible Markdown commentary rendered after the comment header, above
+    /// the generated lifecycle body (and above the execution-state document
+    /// when `--execution-state-file` is also given).
     #[arg(long = "summary-file", value_name = "path")]
     pub summary_file: Option<PathBuf>,
 

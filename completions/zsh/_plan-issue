@@ -382,8 +382,8 @@ _arguments "${_arguments_options[@]}" : \
 '--profile=[Lifecycle profile for the marker and payload]:PROFILE:(tracking dispatch)' \
 '--kind=[Lifecycle comment kind. \`source\` and \`plan\` kinds are owned by \`record open\` and rejected here]:KIND:(source plan state session validation review closeout)' \
 '--payload-file=[JSON file containing the structured payload \`data\` field]:path:_files' \
-'(--summary-file)--execution-state-file=[Markdown execution-state document for state lifecycle comments]:path:_files' \
-'--summary-file=[Visible Markdown commentary appended after the structured payload]:path:_files' \
+'--execution-state-file=[Markdown execution-state document for state lifecycle comments. Composes with \`--summary-file\`\: the summary renders above the execution-state document]:path:_files' \
+'--summary-file=[Visible Markdown commentary rendered after the comment header, above the generated lifecycle body (and above the execution-state document when \`--execution-state-file\` is also given)]:path:_files' \
 '--task-ledger-display=[Task Ledger display mode for state lifecycle comments (\`auto\`, \`collapsed\`, \`expanded\`, \`open\`)]:TASK_LEDGER_DISPLAY:((auto\:"Expand the rows when the state is terminal, collapse them otherwise"
 collapsed\:"Wrap the rows in a closed \`<details>\` fold"
 expanded\:"Render the rows directly with no fold (required for the final pre-closeout state; visible-lint forbids a \`<details>\` wrapper there)"

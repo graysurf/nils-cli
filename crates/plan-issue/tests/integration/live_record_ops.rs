@@ -406,6 +406,75 @@ fn record_post_state_execution_state_file_collapses_non_final_in_dry_run() {
 }
 
 #[test]
+fn record_post_state_execution_state_file_composes_summary_in_dry_run() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    let execution_state = tmp.path().join("state.md");
+    let summary = tmp.path().join("summary.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "ledger surface",
+            "current": "working",
+            "next_action": "continue",
+            "tasks": [{"id": "1.1", "status": "pending", "title": "Demo task"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &execution_state,
+        "# Sample Execution State\n\n## Execution State\n\n- Status: in-progress\n\n## Task Ledger\n\n| ID | Status | Task |\n| --- | --- | --- |\n| 1.1 | pending | Demo task |\n",
+    )
+    .expect("write execution state");
+    fs::write(&summary, "Checkpoint summary above the ledger.\n").expect("write summary");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+        "--summary-file",
+        summary.to_str().expect("summary str"),
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let parsed = out.stdout_json();
+    let body = parsed["payload"]["result"]["comment_body"]
+        .as_str()
+        .expect("comment body");
+    assert_comment_visible_prefix(
+        body,
+        concat!(
+            "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n",
+            "## Execution State\n\n",
+            "- Profile: tracking\n",
+            "Checkpoint summary above the ledger.\n\n",
+            "- Status: in-progress\n\n",
+            "## Task Ledger\n\n",
+            "<details>\n",
+            "<summary>Show task ledger</summary>\n\n",
+            "| ID | Status | Task |\n",
+            "| --- | --- | --- |\n",
+            "| 1.1 | pending | Demo task |\n\n",
+            "</details>\n\n",
+        ),
+    );
+}
+
+#[test]
 fn record_post_state_execution_state_file_expands_final_in_dry_run() {
     let tmp = TempDir::new().expect("tempdir");
     let payload = tmp.path().join("state.json");
@@ -535,6 +604,48 @@ fn record_post_state_execution_state_file_preserves_execution_metadata_fields() 
             "| 1.1 | pending | Renderer |\n\n",
             "</details>\n\n",
         ),
+    );
+}
+
+#[test]
+fn record_post_execution_state_file_rejects_empty_document() {
+    let tmp = TempDir::new().expect("tempdir");
+    let payload = tmp.path().join("state.json");
+    let execution_state = tmp.path().join("state.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "tasks": [],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(&execution_state, "   \n\n").expect("write execution state");
+
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--payload-file",
+        payload.to_str().expect("payload str"),
+        "--execution-state-file",
+        execution_state.to_str().expect("execution state str"),
+    ]);
+    assert_ne!(out.code, 0);
+    assert!(
+        out.stdout_text()
+            .contains("record-post-execution-state-empty"),
+        "{}",
+        out.stdout_text()
     );
 }
 
