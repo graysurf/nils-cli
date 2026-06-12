@@ -1329,6 +1329,31 @@ pub fn extract_payload(comment_body: &str) -> Result<RecordPayload, PayloadError
     Ok(payload)
 }
 
+pub(crate) fn raw_payload_marker_count(body: &str) -> usize {
+    raw_payload_comment_marker_count(body) + raw_payload_fence_marker_count(body)
+}
+
+fn raw_payload_comment_marker_count(body: &str) -> usize {
+    body.lines()
+        .filter(|line| {
+            line.trim()
+                .strip_prefix("<!--")
+                .and_then(|value| value.strip_suffix("-->"))
+                .is_some_and(|inner| inner.trim().starts_with(PAYLOAD_COMMENT_PREFIX))
+        })
+        .count()
+}
+
+fn raw_payload_fence_marker_count(body: &str) -> usize {
+    body.lines()
+        .filter(|line| {
+            line.trim_start()
+                .strip_prefix("```")
+                .is_some_and(|rest| rest.trim() == PAYLOAD_FENCE_INFO)
+        })
+        .count()
+}
+
 fn collect_payload_comment_carriers(body: &str) -> Result<Vec<String>, PayloadError> {
     let mut out = Vec::new();
     let mut details_depth = 0usize;
