@@ -169,7 +169,7 @@ operations:
       - { name: <id>, type: integer-or-branch, required: true }
     validations: []
     backends:
-      github: { program: gh,   argv: [pr,   view, "{id}", --json, "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,labels"] }
+      github: { program: gh,   argv: [pr,   view, "{id}", --json, "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels,body"] }
       gitlab: { program: glab, argv: [mr,   view, "{id}", -F, json] }
     output:
       data:
@@ -182,7 +182,9 @@ operations:
         base: string
         mergeable: enum<yes|no|unknown>
         merged_at: optional<string>
+        merge_commit_sha: optional<string>
         labels: list<string>
+        body: optional<string>   # GitHub `body` / GitLab `description`; null when the response omits it
 
   - id: pr.list
     schema_version: cli.forge-cli.pr.list.v1
@@ -684,7 +686,7 @@ macros:
 
   - id: pr.deliver
     schema_version: cli.forge-cli.pr.deliver.v1
-    summary: End-to-end "open draft → CI green → ready → merge" flow.
+    summary: End-to-end "open draft (or adopt the branch's open PR) → CI green → ready → merge" flow.
     inputs:
       - { name: --kind,                     type: enum<feature|bug>,            required: true }
       - { name: --title,                    type: string,                       required: false }
@@ -706,7 +708,13 @@ macros:
     sequence:
       - { step: auth_status,        op: auth.status }
       - { step: repo_view,          op: repo.view }
-      - { step: create,             op: pr.create }
+      # Head-branch lookup (pr.list --state open --head <branch>): an open
+      # PR/MR on the resolved head branch is adopted — `adopt` replaces
+      # `create` in data.steps[] (payload is the PR's pr.view shape, body
+      # re-validated against the body-section gate) and the lifecycle
+      # resumes at wait_checks. The lookup itself is not a recorded step.
+      - { step: adopt,              op: pr.view,   when: "open PR exists for head branch" }
+      - { step: create,             op: pr.create, when: "no open PR exists for head branch" }
       - { step: wait_checks,        op: pr.wait-checks }
       - { step: ready,              op: pr.ready,  skip_when: "--no-merge" }
       - { step: merge,              op: pr.merge,  skip_when: "--no-merge" }

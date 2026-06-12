@@ -25,8 +25,7 @@ use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 const SCHEMA: &str = "pr.view";
 const SCHEMA_VERSION: u32 = 1;
 
-const GH_JSON_FIELDS: &str =
-    "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels";
+const GH_JSON_FIELDS: &str = "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels,body";
 
 /// Envelope payload for `cli.forge-cli.pr.view.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -47,6 +46,11 @@ pub struct PrViewPayload {
     /// `merge_commit_sha`.
     pub merge_commit_sha: Option<String>,
     pub labels: Vec<String>,
+    /// PR/MR description body. Additive: GitHub reads `body`, GitLab reads
+    /// `description`; `null` when the provider response omits the field
+    /// (callers that re-parse view JSON with narrower field lists, e.g.
+    /// `pr ready`, keep working).
+    pub body: Option<String>,
 }
 
 pub fn run(global: &GlobalFlags, id: String, format: OutputFormat) -> Result<i32, ForgeError> {
@@ -100,6 +104,19 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         format,
         render_text,
     ))
+}
+
+/// Macro-facing entry point: fetch one PR/MR by number and return the typed
+/// view payload (including `body` on providers that model it). Used by
+/// `pr deliver` to inspect and re-validate an adopted PR.
+pub(crate) fn compute<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+) -> Result<PrViewPayload, ForgeError> {
+    let call = build_view_call(ctx, &number.to_string());
+    let output = runner.run(&call)?;
+    parse_view_output(ctx, &output)
 }
 
 pub(crate) fn build_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
@@ -218,6 +235,10 @@ fn parse_github(
         merged_at,
         merge_commit_sha,
         labels,
+        body: value
+            .get("body")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -259,6 +280,10 @@ fn parse_gitlab(
         merged_at,
         merge_commit_sha,
         labels,
+        body: value
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -397,6 +422,34 @@ mod tests {
         assert!(p.draft);
         assert_eq!(p.mergeable, "yes");
         assert_eq!(p.labels, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn parse_github_extracts_body_and_defaults_to_none_when_absent() {
+        let with_body = BackendSuccess {
+            stdout: r###"{"number":5,"url":"u","state":"OPEN","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[],"body":"## Summary\nx"}"###.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitHub), &with_body).unwrap();
+        assert_eq!(p.body.as_deref(), Some("## Summary\nx"));
+
+        // Narrower field lists (e.g. pr ready's re-fetch) omit `body`.
+        let without_body = BackendSuccess {
+            stdout: r#"{"number":5,"url":"u","state":"OPEN","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}"#.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitHub), &without_body).unwrap();
+        assert_eq!(p.body, None);
+    }
+
+    #[test]
+    fn parse_gitlab_maps_description_to_body() {
+        let output = BackendSuccess {
+            stdout: r###"{"iid":7,"web_url":"u","state":"opened","draft":false,"title":"t","source_branch":"feat/x","target_branch":"main","merge_status":"can_be_merged","labels":[],"description":"## Summary\ny"}"###.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitLab), &output).unwrap();
+        assert_eq!(p.body.as_deref(), Some("## Summary\ny"));
     }
 
     #[test]

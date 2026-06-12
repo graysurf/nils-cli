@@ -4,10 +4,16 @@
 //! pr deliver":
 //!
 //! ```text
-//! auth.status → repo.view → pr.create → pr.wait-checks
-//!                                     → pr.ready (skip if --no-merge)
-//!                                     → pr.merge (skip if --no-merge)
+//! auth.status → repo.view → lookup → pr.create → pr.wait-checks
+//!                                  ↘ adopt    ↗ → pr.ready (skip if --no-merge)
+//!                                               → pr.merge (skip if --no-merge)
 //! ```
+//!
+//! The lookup resolves the head branch and asks the provider for an open
+//! PR/MR on it. When one exists the macro adopts it — recording an `adopt`
+//! step carrying the PR's view payload — instead of creating, so the split
+//! create → iterate → deliver workflow resumes its lifecycle. The adopted
+//! PR's *actual* body is re-validated against the body-section gate.
 //!
 //! Each step's typed payload is captured via the atom's `compute` helper
 //! (no subprocess re-spawn through a child binary) and appended to
@@ -22,16 +28,23 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, ProcessRunner};
-use crate::cli::{BINARY, GlobalFlags, PrCreateArgs, PrDeliverArgs, PrMergeArgs, PrWaitChecksArgs};
+use crate::cli::{
+    BINARY, GlobalFlags, PrCreateArgs, PrDeliverArgs, PrListArgs, PrMergeArgs, PrStateFilter,
+    PrWaitChecksArgs,
+};
 use crate::config::ForgeConfig;
 use crate::error::ForgeError;
 use crate::ops::pr_create::{self, Environment};
+use crate::ops::pr_view::PrViewPayload;
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
-use crate::ops::{auth_status, pr_checks, pr_merge, pr_ready, pr_wait_checks, repo_view};
+use crate::ops::{
+    auth_status, pr_checks, pr_list, pr_merge, pr_ready, pr_view, pr_wait_checks, repo_view,
+};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::{
-    BodyHeadings, PreflightInputs, RuleVerdict, git_current_branch, git_head_state,
-    git_status_porcelain, run_local_preflight,
+    BodyHeadings, PreflightInputs, RuleVerdict, body_sections, branch_kind_matches, branch_name,
+    git_current_branch, git_head_state, git_status_porcelain, head_pushed, run_local_preflight,
+    worktree_clean,
 };
 
 pub const SCHEMA: &str = "pr.deliver";
@@ -163,23 +176,89 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         payload: to_value(&repo_payload),
     });
 
-    // 3. pr.create
-    let create_args = build_create_args(args, &repo_payload.default_branch);
-    let env = Environment::production();
-    let create_payload = match pr_create::compute(runner, global, &create_args, &env) {
-        Ok(p) => p,
+    // 3. Head-branch lookup, then adopt-or-create. An open PR already on
+    //    the resolved head branch is adopted — the macro skips the create
+    //    step (and its create-input gates) so a draft opened earlier via
+    //    `pr create` can be finished here instead of dead-ending on the
+    //    body gate. The adopted PR's actual body is re-fetched via pr.view
+    //    and re-validated before the lifecycle continues.
+    let head = match &args.head {
+        Some(h) => h.clone(),
+        None => match git_current_branch(workdir) {
+            Ok(b) => b,
+            Err(err) => {
+                return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
+            }
+        },
+    };
+    let lookup_args = adopt_lookup_args(&head);
+    let existing = match pr_list::compute(runner, ctx, &lookup_args) {
+        Ok(payload) => payload.items.into_iter().next(),
         Err(err) => {
             return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
         }
     };
-    let pr_number = create_payload.number;
-    let pr_url = create_payload.url.clone();
-    steps.push(Step {
-        step: "create",
-        ok: true,
-        schema_version: schema_version_for(BINARY, "pr.create", 1),
-        payload: to_value(&create_payload),
-    });
+
+    let (pr_number, pr_url) = if let Some(found) = existing {
+        // adopt
+        let view = match pr_view::compute(runner, ctx, found.number) {
+            Ok(v) => v,
+            Err(err) => {
+                return Ok(emit_chain_failure(
+                    steps,
+                    args,
+                    ctx,
+                    Some((found.number, found.url.clone())),
+                    &err,
+                    format,
+                ));
+            }
+        };
+        let number = view.number;
+        let url = view.url.clone();
+        if let Err(err) = validate_adopted(&view, args, workdir) {
+            steps.push(Step {
+                step: "adopt",
+                ok: false,
+                schema_version: schema_version_for(BINARY, "pr.view", 1),
+                payload: to_value(&view),
+            });
+            return Ok(emit_chain_failure(
+                steps,
+                args,
+                ctx,
+                Some((number, url)),
+                &err,
+                format,
+            ));
+        }
+        steps.push(Step {
+            step: "adopt",
+            ok: true,
+            schema_version: schema_version_for(BINARY, "pr.view", 1),
+            payload: to_value(&view),
+        });
+        (number, url)
+    } else {
+        // pr.create
+        let create_args = build_create_args(args, &repo_payload.default_branch);
+        let env = Environment::production();
+        let create_payload = match pr_create::compute(runner, global, &create_args, &env) {
+            Ok(p) => p,
+            Err(err) => {
+                return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
+            }
+        };
+        let number = create_payload.number;
+        let url = create_payload.url.clone();
+        steps.push(Step {
+            step: "create",
+            ok: true,
+            schema_version: schema_version_for(BINARY, "pr.create", 1),
+            payload: to_value(&create_payload),
+        });
+        (number, url)
+    };
 
     // 4. pr.wait-checks
     let wait_args = PrWaitChecksArgs {
@@ -320,6 +399,39 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
     ))
 }
 
+/// Lookup filter for the adopt step: open PRs whose head / source branch is
+/// the resolved head. The first match wins; the provider returns them
+/// newest-first.
+fn adopt_lookup_args(head: &str) -> PrListArgs {
+    PrListArgs {
+        state: PrStateFilter::Open,
+        author: None,
+        head: Some(head.to_string()),
+        limit: 1,
+    }
+}
+
+/// Adopt-path validation. Mirrors the create-path gates that still apply to
+/// an existing PR: the adopted head branch must match `--kind`, the PR's
+/// *actual* body (fetched via pr.view) must pass the body-section gate, and
+/// the local tree must satisfy the same worktree / push rules as create
+/// (spec lock-down rules 4 and 5 cover `deliver`). Create-input-only gates
+/// (title, `--body`, local-path) are skipped — the PR already carries its
+/// own provider-validated title and body.
+fn validate_adopted(
+    view: &PrViewPayload,
+    args: &PrDeliverArgs,
+    workdir: &Path,
+) -> Result<(), ForgeError> {
+    let prefix = branch_name(&view.head)?;
+    branch_kind_matches(prefix, args.kind.into_kind())?;
+    let headings = BodyHeadings::default();
+    body_sections(view.body.as_deref().unwrap_or(""), &headings)?;
+    worktree_clean(workdir, git_status_porcelain)?;
+    head_pushed(workdir, git_head_state)?;
+    Ok(())
+}
+
 fn build_create_args(args: &PrDeliverArgs, default_branch: &str) -> PrCreateArgs {
     PrCreateArgs {
         head: args.head.clone(),
@@ -360,6 +472,10 @@ fn emit_dry_run(
     format: OutputFormat,
     workdir: &Path,
 ) -> i32 {
+    let branch = match &args.head {
+        Some(head) => head.clone(),
+        None => git_current_branch(workdir).unwrap_or_default(),
+    };
     let mut plan_steps = vec![
         DryRunStep {
             step: "auth_status",
@@ -375,6 +491,10 @@ fn emit_dry_run(
         DryRunStep {
             step: "repo_view",
             plan: repo_view_dry_plan(ctx),
+        },
+        DryRunStep {
+            step: "lookup",
+            plan: pr_lookup_dry_plan(ctx, &branch),
         },
         DryRunStep {
             step: "create",
@@ -399,10 +519,6 @@ fn emit_dry_run(
     // and report each verdict. This runs local string / `git` checks only —
     // never a provider backend — so a dry-run predicts the real run's local
     // gates (e.g. a bad body and an unpushed head surface together).
-    let branch = match &args.head {
-        Some(head) => head.clone(),
-        None => git_current_branch(workdir).unwrap_or_default(),
-    };
     let body = resolve_preview_body(args);
     let headings = BodyHeadings::default();
     let inputs = PreflightInputs {
@@ -425,6 +541,15 @@ fn emit_dry_run(
     let envelope = Envelope::success(schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION), payload);
     write_envelope(&envelope, format);
     nils_common::cli_contract::exit::SUCCESS
+}
+
+fn pr_lookup_dry_plan(ctx: &ProviderContext, head: &str) -> Vec<String> {
+    let head = if head.is_empty() {
+        "<current-branch>"
+    } else {
+        head
+    };
+    pr_list::build_list_call(ctx, &adopt_lookup_args(head)).plan_argv()
 }
 
 fn repo_view_dry_plan(ctx: &ProviderContext) -> Vec<String> {
@@ -704,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_full_chain_lists_six_steps() {
+    fn dry_run_full_chain_lists_seven_steps() {
         let format = OutputFormat::Json;
         // Capture stdout would complicate this test; instead validate the
         // plan_steps[] vector via the dry-run helper directly.
@@ -718,6 +843,10 @@ mod tests {
         plan_steps.push(DryRunStep {
             step: "repo_view",
             plan: repo_view_dry_plan(&c),
+        });
+        plan_steps.push(DryRunStep {
+            step: "lookup",
+            plan: pr_lookup_dry_plan(&c, "feat/demo"),
         });
         plan_steps.push(DryRunStep {
             step: "create",
@@ -735,9 +864,25 @@ mod tests {
             step: "merge",
             plan: pr_merge_dry_plan(&c, &a),
         });
-        assert_eq!(plan_steps.len(), 6);
-        // Skip-when --no-merge collapses to 4 steps.
+        assert_eq!(plan_steps.len(), 7);
+        // Skip-when --no-merge collapses to 5 steps.
         let _ = format;
+    }
+
+    #[test]
+    fn lookup_dry_plan_filters_open_prs_on_head_branch() {
+        let plan = pr_lookup_dry_plan(&ctx(), "feat/demo");
+        let h_idx = plan.iter().position(|s| s == "--head").expect("--head");
+        assert_eq!(plan[h_idx + 1], "feat/demo");
+        let s_idx = plan.iter().position(|s| s == "--state").expect("--state");
+        assert_eq!(plan[s_idx + 1], "open");
+    }
+
+    #[test]
+    fn lookup_dry_plan_renders_placeholder_for_unknown_branch() {
+        let plan = pr_lookup_dry_plan(&ctx(), "");
+        let h_idx = plan.iter().position(|s| s == "--head").expect("--head");
+        assert_eq!(plan[h_idx + 1], "<current-branch>");
     }
 
     #[test]
