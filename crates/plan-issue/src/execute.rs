@@ -1385,6 +1385,7 @@ fn run_record_post(
         args.task_ledger_display,
     )
     .map_err(|err| CommandError::runtime("record-post-render-failed", err))?;
+    validate_record_post_payload_carrier(&body)?;
 
     let (add_labels, remove_labels) =
         normalize_label_mutations(&args.add_labels, &args.remove_labels, "record-post")?;
@@ -1450,6 +1451,19 @@ fn run_record_post(
         "comment_url": url,
         "labels": labels_preview,
     }))
+}
+
+fn validate_record_post_payload_carrier(body: &str) -> Result<(), CommandError> {
+    lifecycle_record::extract_payload(body)
+        .map(|_| ())
+        .map_err(|err| {
+            CommandError::usage(
+                "record-post-payload-carrier-conflict",
+                format!(
+                    "`record post` rendered body must contain exactly one plan-issue-record-payload carrier; {err}"
+                ),
+            )
+        })
 }
 
 fn run_record_repair_dashboard(

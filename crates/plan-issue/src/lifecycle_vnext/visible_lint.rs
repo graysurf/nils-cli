@@ -160,14 +160,15 @@ fn check_profile_only(spec: &RoleSpec, body: &str, report: &mut VisibleReport) {
 }
 
 fn check_state(body: &str, hints: LintHints, report: &mut VisibleReport) {
-    if !body_contains_heading(body, "## Task Ledger") {
+    let task_ledger = task_ledger_section(body);
+    if task_ledger.is_none() {
         report.push(VisibleFinding::new(
             PayloadRole::State,
             codes::STATE_MISSING_TASK_LEDGER,
             "state body must include a visible `## Task Ledger` heading",
         ));
     }
-    if hints.state_is_final && task_ledger_appears_collapsed(body) {
+    if hints.state_is_final && task_ledger.is_some_and(|section| section.appears_collapsed) {
         report.push(VisibleFinding::new(
             PayloadRole::State,
             codes::STATE_FINAL_TASK_LEDGER_NOT_EXPANDED,
@@ -309,30 +310,33 @@ fn body_contains_heading(body: &str, heading: &str) -> bool {
     body.lines().any(|line| line.trim_end() == heading)
 }
 
-fn task_ledger_appears_collapsed(body: &str) -> bool {
-    // Heuristic: look at the section between `## Task Ledger` and the next
-    // h2 heading. If a `<details>` opens before any table row appears, the
-    // ledger is collapsed.
-    let mut in_section = false;
-    for line in body.lines() {
+#[derive(Clone, Copy)]
+struct TaskLedgerSection {
+    appears_collapsed: bool,
+}
+
+fn task_ledger_section(body: &str) -> Option<TaskLedgerSection> {
+    // Free-form summaries may quote lifecycle headings above the generated
+    // state body. The renderer's Task Ledger is the final ledger section.
+    let lines = body.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim() == "## Task Ledger")?;
+    let mut appears_collapsed = false;
+    for line in &lines[start + 1..] {
         let trimmed = line.trim();
-        if trimmed == "## Task Ledger" {
-            in_section = true;
-            continue;
+        if trimmed.starts_with("## ") {
+            break;
         }
-        if in_section && trimmed.starts_with("## ") {
-            return false;
+        if trimmed.starts_with("<details") {
+            appears_collapsed = true;
+            break;
         }
-        if in_section {
-            if trimmed.starts_with("<details") {
-                return true;
-            }
-            if trimmed.starts_with("| ") {
-                return false;
-            }
+        if trimmed.starts_with("| ") {
+            break;
         }
     }
-    false
+    Some(TaskLedgerSection { appears_collapsed })
 }
 
 fn body_contains_validation_command_row(body: &str) -> bool {
@@ -451,5 +455,76 @@ fn missing_heading_code(role: PayloadRole) -> &'static str {
         PayloadRole::Validation => codes::VALIDATION_MISSING_HEADING,
         PayloadRole::Review => codes::REVIEW_MISSING_HEADING,
         PayloadRole::Closeout => codes::CLOSEOUT_MISSING_HEADING,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn final_state_hints() -> LintHints {
+        LintHints {
+            state_is_final: true,
+            ..LintHints::default()
+        }
+    }
+
+    #[test]
+    fn final_state_uses_real_task_ledger_after_summary_heading() {
+        let body = concat!(
+            "## Execution State\n\n",
+            "- Profile: tracking\n",
+            "- Status: complete\n\n",
+            "Summary quotes a task ledger heading and table:\n\n",
+            "## Task Ledger\n\n",
+            "| Quoted | Row |\n",
+            "| --- | --- |\n",
+            "| old | content |\n\n",
+            "## Current State\n\n",
+            "- Current task: done\n\n",
+            "## Task Ledger\n\n",
+            "<details>\n",
+            "<summary>Show task ledger</summary>\n\n",
+            "| ID | Status | Task |\n",
+            "| --- | --- | --- |\n",
+            "| 1.1 | done | Ship |\n\n",
+            "</details>\n"
+        );
+
+        let report = lint_visible(PayloadRole::State, body, final_state_hints());
+
+        assert!(
+            report
+                .codes()
+                .contains(&codes::STATE_FINAL_TASK_LEDGER_NOT_EXPANDED),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn final_state_ignores_summary_quoted_collapsed_ledger() {
+        let body = concat!(
+            "## Execution State\n\n",
+            "- Profile: tracking\n",
+            "- Status: complete\n\n",
+            "Summary quotes a prior collapsed task ledger:\n\n",
+            "## Task Ledger\n\n",
+            "<details>\n",
+            "<summary>Show task ledger</summary>\n\n",
+            "| ID | Status | Task |\n",
+            "| --- | --- | --- |\n",
+            "| 1.1 | done | Old |\n\n",
+            "</details>\n\n",
+            "## Current State\n\n",
+            "- Current task: done\n\n",
+            "## Task Ledger\n\n",
+            "| ID | Status | Task |\n",
+            "| --- | --- | --- |\n",
+            "| 1.1 | done | Ship |\n"
+        );
+
+        let report = lint_visible(PayloadRole::State, body, final_state_hints());
+
+        assert!(report.is_pass(), "{report:?}");
     }
 }
