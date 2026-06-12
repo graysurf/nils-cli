@@ -176,7 +176,7 @@ pub fn find_git_root(start_dir: &Path) -> Option<PathBuf> {
 }
 
 pub fn history_timestamp_now() -> Result<String> {
-    let format = time::format_description::parse(
+    let format = time::format_description::parse_borrowed::<2>(
         "[year]-[month]-[day]T[hour]:[minute]:[second][offset_hour sign:mandatory][offset_minute]",
     )?;
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
@@ -184,13 +184,14 @@ pub fn history_timestamp_now() -> Result<String> {
 }
 
 pub fn report_stamp_now() -> Result<String> {
-    let format = time::format_description::parse("[year][month][day]-[hour][minute]")?;
+    let format =
+        time::format_description::parse_borrowed::<2>("[year][month][day]-[hour][minute]")?;
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     Ok(now.format(&format)?)
 }
 
 pub fn report_date_now() -> Result<String> {
-    let format = time::format_description::parse("[year]-[month]-[day]")?;
+    let format = time::format_description::parse_borrowed::<2>("[year]-[month]-[day]")?;
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     Ok(now.format(&format)?)
 }

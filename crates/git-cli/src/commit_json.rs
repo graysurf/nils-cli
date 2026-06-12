@@ -454,7 +454,8 @@ fn generated_at() -> Option<String> {
     }
 
     let format =
-        format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]Z").ok()?;
+        format_description::parse_borrowed::<2>("[year]-[month]-[day]T[hour]:[minute]:[second]Z")
+            .ok()?;
     OffsetDateTime::now_utc().format(&format).ok()
 }
 
