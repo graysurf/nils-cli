@@ -211,6 +211,7 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/plan-bundle-validate.sh --strict`
 - `bash scripts/ci/cli-output-contract-lint.sh --strict`
 - `bash scripts/ci/forge-cli-fixture-lint.sh --strict`
+- `bash scripts/ci/tests/completion-freshness-audit.test.sh`
 - `bash scripts/ci/tests/local-fast-checks.test.sh`
 - `bash scripts/ci/tests/detect-docs-only.test.sh`
 - `bash scripts/ci/tests/shared-helper-adoption-audit.test.sh`
@@ -218,6 +219,7 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/workspace-version-lockstep.sh --strict`
 - `bash scripts/ci/third-party-artifacts-audit.sh --strict`
 - `bash scripts/ci/completion-asset-audit.sh --strict`
+- `bash scripts/ci/completion-freshness-audit.sh --strict`
 - `bash scripts/ci/completion-flag-parity-audit.sh --strict`
 - `zsh -f tests/zsh/completion.test.zsh`
 - `cargo fmt --all -- --check`
