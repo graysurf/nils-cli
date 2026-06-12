@@ -425,6 +425,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_github_extracts_body_and_defaults_to_none_when_absent() {
+        let with_body = BackendSuccess {
+            stdout: r###"{"number":5,"url":"u","state":"OPEN","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[],"body":"## Summary\nx"}"###.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitHub), &with_body).unwrap();
+        assert_eq!(p.body.as_deref(), Some("## Summary\nx"));
+
+        // Narrower field lists (e.g. pr ready's re-fetch) omit `body`.
+        let without_body = BackendSuccess {
+            stdout: r#"{"number":5,"url":"u","state":"OPEN","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}"#.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitHub), &without_body).unwrap();
+        assert_eq!(p.body, None);
+    }
+
+    #[test]
+    fn parse_gitlab_maps_description_to_body() {
+        let output = BackendSuccess {
+            stdout: r###"{"iid":7,"web_url":"u","state":"opened","draft":false,"title":"t","source_branch":"feat/x","target_branch":"main","merge_status":"can_be_merged","labels":[],"description":"## Summary\ny"}"###.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitLab), &output).unwrap();
+        assert_eq!(p.body.as_deref(), Some("## Summary\ny"));
+    }
+
+    #[test]
     fn parse_gitlab_locked_normalises_to_closed() {
         let output = BackendSuccess {
             stdout: r#"{"iid":7,"web_url":"u","state":"locked","draft":false,"title":"t","source_branch":"feat/x","target_branch":"main","merge_status":"cannot_be_merged","labels":[]}"#.into(),
