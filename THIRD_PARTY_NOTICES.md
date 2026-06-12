@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `96579b1fd362cf194e2d1b11e142ca567b9d6de61422728f5c08e17faf2e5bc3`
+- Cargo.lock SHA256: `fd57d4ba3fc9df74bfac9febdc04ad263589426e31e339f79957b0d85847ea9e`
 - Third-party crates (`source != null`): 460
 
 ## Notice Extraction Policy
@@ -1053,7 +1053,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### hashlink 0.11.0
+### hashlink 0.12.0
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -1508,7 +1508,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE.txt`
 
-### libsqlite3-sys 0.38.0
+### libsqlite3-sys 0.38.1
 
 - License: `MIT`
 - Source: `crates.io`
@@ -2335,7 +2335,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### rusqlite 0.40.0
+### rusqlite 0.40.1
 
 - License: `MIT`
 - Source: `crates.io`
