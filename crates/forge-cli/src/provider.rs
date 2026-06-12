@@ -94,9 +94,18 @@ pub fn detect(
     let repo = repo_override.map(str::to_string);
 
     if let ProviderHint::Forced(provider) = hint {
+        // Forcing `--provider` overrides provider classification only. The
+        // host still resolves from the remote when it classifies to the same
+        // provider (self-hosted GitLab/GHE); the provider default is the
+        // fallback, not the answer.
+        let host = remote_url_lookup(remote)
+            .as_deref()
+            .and_then(parse_host)
+            .filter(|host| classify_host(host) == Some(provider))
+            .unwrap_or_else(|| default_host_for(provider).to_string());
         return Ok(ProviderContext {
             provider,
-            host: default_host_for(provider).to_string(),
+            host,
             source: DetectionSource::Flag,
             repo,
         });
@@ -274,22 +283,70 @@ mod tests {
     }
 
     #[test]
-    fn detect_with_flag_does_not_consult_remote() {
-        let counter = std::cell::Cell::new(0_u32);
-        let lookup = |_: &str| -> Option<String> {
-            counter.set(counter.get() + 1);
-            None
-        };
+    fn detect_forced_provider_resolves_host_from_remote() {
+        let ctx = detect(
+            ProviderHint::Forced(Provider::GitLab),
+            "origin",
+            None,
+            |_| Some("git@gitlab.example.com:group/proj.git".to_string()),
+        )
+        .expect("forced provider");
+        assert_eq!(ctx.provider, Provider::GitLab);
+        assert_eq!(ctx.host, "gitlab.example.com");
+        assert_eq!(ctx.source, DetectionSource::Flag);
+    }
+
+    #[test]
+    fn detect_forced_provider_falls_back_to_default_host_without_remote() {
+        let ctx = detect(
+            ProviderHint::Forced(Provider::GitLab),
+            "origin",
+            None,
+            |_| None,
+        )
+        .expect("forced provider");
+        assert_eq!(ctx.provider, Provider::GitLab);
+        assert_eq!(ctx.host, "gitlab.com");
+        assert_eq!(ctx.source, DetectionSource::Flag);
+    }
+
+    #[test]
+    fn detect_forced_provider_ignores_remote_host_of_other_provider() {
+        let ctx = detect(
+            ProviderHint::Forced(Provider::GitLab),
+            "origin",
+            None,
+            |_| Some("git@github.com:owner/repo.git".to_string()),
+        )
+        .expect("forced provider");
+        assert_eq!(ctx.provider, Provider::GitLab);
+        assert_eq!(
+            ctx.host, "gitlab.com",
+            "a remote that classifies to a different provider must not leak its host"
+        );
+
         let ctx = detect(
             ProviderHint::Forced(Provider::GitHub),
             "origin",
             None,
-            lookup,
+            |_| Some("ssh://git@gitlab.example.com:22/group/proj.git".to_string()),
         )
         .expect("forced provider");
         assert_eq!(ctx.provider, Provider::GitHub);
-        assert_eq!(ctx.source, DetectionSource::Flag);
-        assert_eq!(counter.get(), 0, "remote lookup must not run when forced");
+        assert_eq!(ctx.host, "github.com");
+    }
+
+    #[test]
+    fn detect_forced_provider_ignores_unclassifiable_remote() {
+        let ctx = detect(
+            ProviderHint::Forced(Provider::GitLab),
+            "origin",
+            None,
+            |_| Some("https://bitbucket.org/owner/repo.git".to_string()),
+        )
+        .expect("forced provider must not error on unsupported remote hosts");
+        assert_eq!(ctx.provider, Provider::GitLab);
+        assert_eq!(ctx.host, "gitlab.com");
     }
 
     #[test]

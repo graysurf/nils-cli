@@ -771,6 +771,13 @@ host classification:
                                                   error.kind=provider_unsupported
 ```
 
+A forced `--provider` overrides provider classification only. The host
+still resolves from the remote URL when one is available and its host
+classifies to the forced provider (self-hosted GitLab / GHE shapes
+included); the provider default host (`github.com` / `gitlab.com`) is
+used only when no remote resolves or the remote host classifies to a
+different provider.
+
 `gh auth status` and `glab auth status` are *cached* per `forge-cli`
 invocation (single call per provider, memoised). They are not refreshed
 mid-run.
