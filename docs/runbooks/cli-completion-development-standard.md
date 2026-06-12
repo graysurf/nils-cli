@@ -67,6 +67,9 @@ Repository distribution contract:
 - generated zsh assets live in `completions/zsh/_<cli>`
 - generated bash assets live in `completions/bash/<cli>`
 - generated outputs must be deterministic and committed alongside CLI surface changes
+- full CI generates fresh bash/zsh output for comparison and fails when it
+  differs from committed generated snapshots; runtime loader adapters are
+  covered by adapter tests
 
 ### Thin adapter and dynamic extension contract
 
@@ -200,6 +203,8 @@ Mandatory local repository validation:
   - `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
 - docs-only fast path (when all changed files are docs):
   - `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`
+- full CI freshness check:
+  - `bash scripts/ci/completion-freshness-audit.sh --strict`
 - for non-doc changes, GitHub required checks enforce full workspace tests and
   coverage `>= 85.00%` per `DEVELOPMENT.md`
 

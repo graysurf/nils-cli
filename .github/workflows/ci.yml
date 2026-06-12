@@ -71,7 +71,7 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Nils CLI checks (includes third-party-artifacts-audit, Completion asset audit, docs-hygiene-audit, test-stale-audit)
+      - name: Nils CLI checks (includes third-party-artifacts-audit, completion audits, docs-hygiene-audit, test-stale-audit)
         env:
           NILS_CLI_TEST_RUNNER: nextest
         run: |
@@ -136,7 +136,7 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Nils CLI checks (includes third-party-artifacts-audit, Completion asset audit, docs-hygiene-audit, test-stale-audit)
+      - name: Nils CLI checks (includes third-party-artifacts-audit, completion audits, docs-hygiene-audit, test-stale-audit)
         env:
           NILS_CLI_TEST_RUNNER: nextest
         run: |

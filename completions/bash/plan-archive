@@ -37,6 +37,9 @@ _plan-archive() {
             plan__archive,refresh)
                 cmd="plan__archive__refresh"
                 ;;
+            plan__archive,search)
+                cmd="plan__archive__search"
+                ;;
             plan__archive,validate-hosts)
                 cmd="plan__archive__validate__hosts"
                 ;;
@@ -67,6 +70,9 @@ _plan-archive() {
             plan__archive__help,refresh)
                 cmd="plan__archive__help__refresh"
                 ;;
+            plan__archive__help,search)
+                cmd="plan__archive__help__search"
+                ;;
             plan__archive__help,validate-hosts)
                 cmd="plan__archive__help__validate__hosts"
                 ;;
@@ -83,7 +89,7 @@ _plan-archive() {
 
     case "${cmd}" in
         plan__archive)
-            opts="-h -V --format --json --help --version validate-hosts validate-local validate-metadata migrate discover refresh completion query catalog help"
+            opts="-h -V --format --json --help --version validate-hosts validate-local validate-metadata migrate discover refresh completion query catalog search help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -101,7 +107,7 @@ _plan-archive() {
             return 0
             ;;
         plan__archive__catalog)
-            opts="-h --write --grep --area --refs-to --archive --format --json --help"
+            opts="-h --write --grep --area --refs-to --deep --archive --format --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -187,7 +193,7 @@ _plan-archive() {
             return 0
             ;;
         plan__archive__help)
-            opts="validate-hosts validate-local validate-metadata migrate discover refresh completion query catalog help"
+            opts="validate-hosts validate-local validate-metadata migrate discover refresh completion query catalog search help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -285,6 +291,20 @@ _plan-archive() {
             return 0
             ;;
         plan__archive__help__refresh)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        plan__archive__help__search)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -460,6 +480,28 @@ _plan-archive() {
                     return 0
                     ;;
                 --hosts)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        plan__archive__search)
+            opts="-h --archive --format --json --help <TERM>"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --archive)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

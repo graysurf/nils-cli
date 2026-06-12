@@ -224,7 +224,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__preflight)
-            opts="-h --intent --format --strict --docs-home --project-path --worktree-fallback --help"
+            opts="-h --intent --format --strict --require-declared-intent --docs-home --project-path --worktree-fallback --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

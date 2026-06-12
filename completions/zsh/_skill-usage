@@ -15,8 +15,8 @@ _skill-usage() {
 
     local context curcontext="$curcontext" state line
     _arguments "${_arguments_options[@]}" : \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
 '--version[Print version]' \
 ":: :_skill-usage_commands" \
@@ -31,7 +31,8 @@ _skill-usage() {
             (init)
 _arguments "${_arguments_options[@]}" : \
 '--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
 '--skill=[Skill path or skill id]:TEXT:_default' \
 '--intent=[Skill invocation intent]:TEXT:_default' \
 '--trigger=[Trigger source]:TRIGGER:(user-explicit agent-selected project-policy other)' \
@@ -42,24 +43,26 @@ _arguments "${_arguments_options[@]}" : \
 '--started-at=[Start timestamp. Defaults to current UTC RFC3339 time]:TEXT:_default' \
 '--validation-waiver=[Explicit waiver when validation is not required]:TEXT:_default' \
 '--force[Overwrite an existing record]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (link-record)
 _arguments "${_arguments_options[@]}" : \
 '--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
 '--type=[Linked record type, such as \`test-first-evidence\`]:TEXT:_default' \
 '--path=[Linked record path]:PATH:_files' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (record-failure)
 _arguments "${_arguments_options[@]}" : \
 '--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
 '--phase=[Failure phase]:PHASE:(preflight execution validation cleanup delivery)' \
 '--command=[Optional failed command]:TEXT:_default' \
 '--exit-code=[Optional failed command exit code]:EXIT_CODE:_default' \
@@ -69,49 +72,53 @@ _arguments "${_arguments_options[@]}" : \
 '--handling=[Handling performed by the workflow]:TEXT:_default' \
 '--result=[Result after handling]:RESULT:(fixed worked-around blocked accepted-risk)' \
 '*--artifact=[Optional failure artifact path. Repeat for multiple artifacts]:PATH:_files' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (record-validation)
 _arguments "${_arguments_options[@]}" : \
 '--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
 '--command=[Validation command or manual validation step]:TEXT:_default' \
 '--status=[Validation status]:STATUS:(pass fail skipped)' \
 '--summary=[Validation summary]:TEXT:_default' \
 '--artifact=[Optional validation artifact path]:PATH:_files' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (record-outcome)
 _arguments "${_arguments_options[@]}" : \
 '--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
 '--status=[Final outcome status]:STATUS:(pass fail blocked worked-around accepted-risk skipped)' \
 '--summary=[Final outcome summary]:TEXT:_default' \
 '--ended-at=[End timestamp. Defaults to current UTC RFC3339 time]:TEXT:_default' \
 '*--artifact=[Top-level artifact path. Repeat for multiple artifacts]:PATH:_files' \
 '*--follow-up=[Follow-up item. Repeat for multiple items]:TEXT:_default' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (verify)
 _arguments "${_arguments_options[@]}" : \
 '--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
-'-h[Print help]' \
-'--help[Print help]' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (show)
 _arguments "${_arguments_options[@]}" : \
 '--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
-'--format=[Output format]:FORMAT:(text json)' \
-'-h[Print help]' \
-'--help[Print help]' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (completion)

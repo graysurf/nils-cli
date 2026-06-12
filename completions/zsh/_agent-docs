@@ -51,6 +51,7 @@ _arguments "${_arguments_options[@]}" : \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
 '--strict[Exit non-zero when required docs are unsatisfied]' \
+'--require-declared-intent[Exit non-zero when the requested intent is not declared by applicable documents or validation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
