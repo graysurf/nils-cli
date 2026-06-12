@@ -1470,6 +1470,43 @@ Promote after a durable fix and validation are linked.\n\n\
     }
 
     #[test]
+    fn deliver_explicit_slug_collision_outputs_json_error() {
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        nils_test_support::git::init_repo_at_with(
+            repo.path(),
+            nils_test_support::git::InitRepoOptions::new()
+                .with_branch("main")
+                .with_initial_commit(),
+        );
+        let rec = repo
+            .path()
+            .join("core/policies/heuristic-system/error-inbox/foo/ENTRY.md");
+        fs::create_dir_all(rec.parent().unwrap()).expect("mkdir record");
+        fs::write(&rec, "# record\n").expect("write record");
+        nils_test_support::git::git(repo.path(), &["branch", "docs/fixed-slug"]);
+
+        let out = run(
+            "heuristic-inbox",
+            repo.path(),
+            &[
+                "deliver",
+                "--dry-run",
+                "--slug",
+                "fixed-slug",
+                "--format",
+                "json",
+            ],
+        );
+
+        assert_ne!(out.code, 0);
+        let payload = out.stdout_json();
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["error"]["code"], "records-target-exists");
+        assert_eq!(payload["error"]["details"]["branch"], "docs/fixed-slug");
+        assert_eq!(payload["error"]["details"]["local_branch_exists"], true);
+    }
+
+    #[test]
     fn deliver_without_records_errors_nothing_to_deliver() {
         let repo = tempfile::TempDir::new().expect("tempdir");
         nils_test_support::git::init_repo_at_with(
