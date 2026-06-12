@@ -71,6 +71,74 @@ fn visible_lint_state_final_must_expand_task_ledger() {
 }
 
 #[test]
+fn visible_lint_state_final_anchors_to_rendered_task_ledger() {
+    let hints = LintHints {
+        state_is_final: true,
+        ..LintHints::default()
+    };
+    let body = "## Execution State\n\n\
+        - Profile: tracking\n\
+        - Status: complete\n\n\
+        ## Task Ledger\n\n\
+        <details>\n\
+        <summary>Show task ledger</summary>\n\n\
+        | ID | Status | Task |\n\
+        | --- | --- | --- |\n\
+        | 2.1 | done | implementation |\n\n\
+        </details>\n\n\
+        ## Validation Notes\n\n\
+        A reviewer quoted a later heading from a prior state comment:\n\n\
+        ## Task Ledger\n\n\
+        | ID | Status | Task |\n\
+        | --- | --- | --- |\n\
+        | quoted | done | not the rendered ledger |\n";
+
+    let report = lint_visible(PayloadRole::State, body, hints);
+
+    assert!(
+        report
+            .codes()
+            .contains(&codes::STATE_FINAL_TASK_LEDGER_NOT_EXPANDED),
+        "final state must inspect the rendered Task Ledger, not a later quote; codes={:?}",
+        report.codes()
+    );
+}
+
+#[test]
+fn visible_lint_state_final_prefers_later_execution_anchor_over_summary_current_state() {
+    let hints = LintHints {
+        state_is_final: true,
+        ..LintHints::default()
+    };
+    let body = "Summary quotes an earlier state section:\n\n\
+        ## Current State\n\n\
+        ## Task Ledger\n\n\
+        | ID | Status | Task |\n\
+        | --- | --- | --- |\n\
+        | quoted | done | old expanded ledger |\n\n\
+        ## Execution State\n\n\
+        - Profile: tracking\n\
+        - Status: complete\n\n\
+        ## Task Ledger\n\n\
+        <details>\n\
+        <summary>Show task ledger</summary>\n\n\
+        | ID | Status | Task |\n\
+        | --- | --- | --- |\n\
+        | 2.1 | done | implementation |\n\n\
+        </details>\n";
+
+    let report = lint_visible(PayloadRole::State, body, hints);
+
+    assert!(
+        report
+            .codes()
+            .contains(&codes::STATE_FINAL_TASK_LEDGER_NOT_EXPANDED),
+        "final state must prefer the later rendered Execution State anchor; codes={:?}",
+        report.codes()
+    );
+}
+
+#[test]
 fn visible_lint_state_final_expanded_passes() {
     let hints = LintHints {
         state_is_final: true,

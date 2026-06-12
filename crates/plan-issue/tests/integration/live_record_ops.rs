@@ -403,6 +403,80 @@ fn record_post_live_rejects_summary_payload_carrier_before_provider_mutation() {
 }
 
 #[test]
+fn record_post_live_rejects_summary_payload_carrier_before_unclosed_details() {
+    let tmp = TempDir::new().expect("tempdir");
+    let stub = StubBinDir::new();
+    stub.write_exe("gh", live_record_gh_stub());
+    let log_path = tmp.path().join("gh.log");
+    let log_s = log_path.to_string_lossy().to_string();
+
+    let payload = tmp.path().join("state.json");
+    let summary = tmp.path().join("summary.md");
+    fs::write(
+        &payload,
+        json!({
+            "status": "in-progress",
+            "target_scope": "summary surface",
+            "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        })
+        .to_string(),
+    )
+    .expect("write payload");
+    fs::write(
+        &summary,
+        concat!(
+            "Quoted prior lifecycle comment:\n\n",
+            "```plan-issue-record-payload\n",
+            "{\"schema\":\"plan-issue-record.payload.v2\",\"role\":\"state\",\"profile\":\"tracking\",\"data\":{\"status\":\"complete\",\"tasks\":[],\"prs\":[],\"blockers\":[],\"links\":{}}}\n",
+            "```\n\n",
+            "<details>\n",
+            "<summary>Unclosed quoted details</summary>\n"
+        ),
+    )
+    .expect("write summary");
+
+    let out = common::run_plan_issue_with_options(
+        &[
+            "--format",
+            "json",
+            "--repo",
+            "sympoies/nils-cli",
+            "record",
+            "post",
+            "--issue",
+            "217",
+            "--kind",
+            "state",
+            "--payload-file",
+            payload.to_str().expect("payload str"),
+            "--summary-file",
+            summary.to_str().expect("summary str"),
+        ],
+        live_record_options(stub.path(), &[("PLAN_ISSUE_GH_LOG", &log_s)]),
+    );
+
+    assert_eq!(out.code, 64, "stdout={}", out.stdout_text());
+    let parsed = out.stdout_json();
+    assert_eq!(parsed["status"], "error");
+    assert_eq!(
+        parsed["error"]["code"],
+        "record-post-payload-carrier-conflict"
+    );
+    let message = parsed["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("multiple plan-issue-record-payload carriers"),
+        "{message}"
+    );
+    assert!(
+        !log_path.exists(),
+        "gh must not run when rendered comment has multiple payload carriers"
+    );
+}
+
+#[test]
 fn record_post_state_execution_state_file_collapses_non_final_in_dry_run() {
     let tmp = TempDir::new().expect("tempdir");
     let payload = tmp.path().join("state.json");

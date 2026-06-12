@@ -1454,6 +1454,20 @@ fn run_record_post(
 }
 
 fn validate_record_post_payload_carrier(body: &str) -> Result<(), CommandError> {
+    let marker_count = lifecycle_record::raw_payload_marker_count(body);
+    if marker_count != 1 {
+        let message = if marker_count == 0 {
+            "no plan-issue-record-payload carrier or fence in comment body".to_string()
+        } else {
+            "multiple plan-issue-record-payload carriers or fences in comment body".to_string()
+        };
+        return Err(CommandError::usage(
+            "record-post-payload-carrier-conflict",
+            format!(
+                "`record post` rendered body must contain exactly one plan-issue-record-payload carrier; {message}"
+            ),
+        ));
+    }
     lifecycle_record::extract_payload(body)
         .map(|_| ())
         .map_err(|err| {

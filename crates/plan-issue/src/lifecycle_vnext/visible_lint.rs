@@ -316,12 +316,20 @@ struct TaskLedgerSection {
 }
 
 fn task_ledger_section(body: &str) -> Option<TaskLedgerSection> {
-    // Free-form summaries may quote lifecycle headings above the generated
-    // state body. The renderer's Task Ledger is the final ledger section.
     let lines = body.lines().collect::<Vec<_>>();
+    let rendered_start = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            matches!(line.trim(), "## Current State" | "## Execution State").then_some(idx)
+        })
+        .next_back()
+        .map_or(0, |idx| idx + 1);
     let start = lines
         .iter()
-        .rposition(|line| line.trim() == "## Task Ledger")?;
+        .enumerate()
+        .skip(rendered_start)
+        .find_map(|(idx, line)| (line.trim() == "## Task Ledger").then_some(idx))?;
     let mut appears_collapsed = false;
     for line in &lines[start + 1..] {
         let trimmed = line.trim();

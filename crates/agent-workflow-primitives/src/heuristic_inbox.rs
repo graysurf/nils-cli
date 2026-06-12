@@ -2411,11 +2411,12 @@ struct RecordsTargetCollision {
     local_branch_exists: bool,
     remote_branch_exists: bool,
     worktree_path_exists: bool,
+    worktree_path_blocked: bool,
 }
 
 impl RecordsTargetCollision {
     fn any(&self) -> bool {
-        self.local_branch_exists || self.remote_branch_exists || self.worktree_path_exists
+        self.local_branch_exists || self.remote_branch_exists || self.worktree_path_blocked
     }
 }
 
@@ -2425,6 +2426,7 @@ fn resolve_records_target(
     repo_root: &Path,
     kind: DeliverKind,
     requested_slug: Option<&str>,
+    check_remote: bool,
 ) -> Result<RecordsTarget, CliError> {
     let base_slug = requested_slug
         .map(str::to_string)
@@ -2447,7 +2449,14 @@ fn resolve_records_target(
         };
         let branch = records_branch(kind, &slug);
         let worktree_path = managed_worktree_path(repo_root, &slug);
-        let collision = records_target_collision(runner, git, repo_root, &branch, &worktree_path)?;
+        let collision = records_target_collision(
+            runner,
+            git,
+            repo_root,
+            &branch,
+            &worktree_path,
+            check_remote,
+        )?;
         if !collision.any() {
             return Ok(RecordsTarget {
                 branch,
@@ -2477,13 +2486,21 @@ fn records_target_collision(
     repo_root: &Path,
     branch: &str,
     worktree_path: &Path,
+    check_remote: bool,
 ) -> Result<RecordsTargetCollision, CliError> {
     let local_ref = format!("refs/heads/{branch}");
-    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let local_branch_exists = git_ref_exists(runner, git, repo_root, &local_ref)?;
+    let remote_branch_exists = if local_branch_exists || !check_remote {
+        false
+    } else {
+        git_remote_head_exists(runner, git, repo_root, branch)?
+    };
+    let (worktree_path_exists, worktree_path_blocked) = worktree_path_collision(worktree_path)?;
     Ok(RecordsTargetCollision {
-        local_branch_exists: git_ref_exists(runner, git, repo_root, &local_ref)?,
-        remote_branch_exists: git_ref_exists(runner, git, repo_root, &remote_ref)?,
-        worktree_path_exists: worktree_path.exists(),
+        local_branch_exists,
+        remote_branch_exists,
+        worktree_path_exists,
+        worktree_path_blocked,
     })
 }
 
@@ -2511,6 +2528,75 @@ fn git_ref_exists(
     ))
 }
 
+fn git_remote_head_exists(
+    runner: &dyn CommandRunner,
+    git: &str,
+    repo_root: &Path,
+    branch: &str,
+) -> Result<bool, CliError> {
+    let result = runner.run(
+        git,
+        &["ls-remote", "--exit-code", "--heads", "origin", branch],
+        Some(repo_root),
+    )?;
+    if result.success {
+        return Ok(true);
+    }
+    if result.stderr.trim().is_empty() {
+        return Ok(false);
+    }
+    Err(CliError::runtime(
+        "git-ls-remote-failed",
+        format!("git ls-remote failed while checking origin/{branch}"),
+        Some(json!({ "branch": branch, "stderr": result.stderr.trim() })),
+    ))
+}
+
+fn worktree_path_collision(worktree_path: &Path) -> Result<(bool, bool), CliError> {
+    let metadata = match fs::metadata(worktree_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((false, false)),
+        Err(err) => {
+            return Err(CliError::runtime(
+                "records-worktree-path-check-failed",
+                format!(
+                    "failed to inspect records worktree path {}",
+                    worktree_path.display()
+                ),
+                Some(
+                    json!({ "worktree_path": display_path(worktree_path), "error": err.to_string() }),
+                ),
+            ));
+        }
+    };
+
+    if !metadata.is_dir() {
+        return Ok((true, true));
+    }
+
+    let mut entries = fs::read_dir(worktree_path).map_err(|err| {
+        CliError::runtime(
+            "records-worktree-path-check-failed",
+            format!(
+                "failed to read records worktree path {}",
+                worktree_path.display()
+            ),
+            Some(json!({ "worktree_path": display_path(worktree_path), "error": err.to_string() })),
+        )
+    })?;
+    let has_entries = entries.next().transpose().map_err(|err| {
+        CliError::runtime(
+            "records-worktree-path-check-failed",
+            format!(
+                "failed to read records worktree path {}",
+                worktree_path.display()
+            ),
+            Some(json!({ "worktree_path": display_path(worktree_path), "error": err.to_string() })),
+        )
+    })?;
+    Ok((true, has_entries.is_some()))
+}
+
 fn records_target_collision_error(
     slug: String,
     branch: String,
@@ -2527,6 +2613,7 @@ fn records_target_collision_error(
             "local_branch_exists": collision.local_branch_exists,
             "remote_branch_exists": collision.remote_branch_exists,
             "worktree_path_exists": collision.worktree_path_exists,
+            "worktree_path_blocked": collision.worktree_path_blocked,
         })),
     )
 }
@@ -2640,7 +2727,14 @@ fn run_deliver(runner: &dyn CommandRunner, args: &DeliverArgs) -> Result<Deliver
     }
 
     // 4. Compute the records branch + managed worktree path (git-cli semantics).
-    let target = resolve_records_target(runner, &git, &repo_root, args.kind, args.slug.as_deref())?;
+    let target = resolve_records_target(
+        runner,
+        &git,
+        &repo_root,
+        args.kind,
+        args.slug.as_deref(),
+        !args.dry_run,
+    )?;
     let branch = target.branch;
     let worktree_path = target.worktree_path;
     let worktree_display = display_path(&worktree_path);
@@ -3821,6 +3915,7 @@ mod tests {
         worktree_status: String,
         forge_stdout: String,
         existing_refs: Vec<String>,
+        remote_heads: Vec<String>,
         calls: RefCell<Vec<Vec<String>>>,
     }
 
@@ -3860,6 +3955,21 @@ mod tests {
                     stdout: String::new(),
                     stderr: String::new(),
                 }),
+                ["ls-remote", "--exit-code", "--heads", "origin", branch] => {
+                    let exists = self
+                        .remote_heads
+                        .iter()
+                        .any(|head| head == branch || head == &format!("refs/heads/{branch}"));
+                    Ok(RunResult {
+                        success: exists,
+                        stdout: if exists {
+                            format!("abc123\trefs/heads/{branch}\n")
+                        } else {
+                            String::new()
+                        },
+                        stderr: String::new(),
+                    })
+                }
                 ["fetch", "origin", _] => ok(""),
                 ["worktree", "add", "-b", _branch, path, _base] => {
                     fs::create_dir_all(path).expect("stub creates worktree dir");
@@ -3974,6 +4084,7 @@ mod tests {
             worktree_status: format!(" M {REC_REL}\n"),
             forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
             existing_refs: Vec::new(),
+            remote_heads: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
 
@@ -4016,6 +4127,7 @@ mod tests {
             worktree_status: format!(" M {REC_REL}\n"),
             forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
             existing_refs: Vec::new(),
+            remote_heads: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
         let mut args = deliver_args(repo.path(), false);
@@ -4054,6 +4166,7 @@ mod tests {
             worktree_status: format!(" M {REC_REL}\n"),
             forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
             existing_refs: vec![format!("refs/heads/{default_branch}")],
+            remote_heads: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
         let mut args = deliver_args(repo.path(), false);
@@ -4092,6 +4205,7 @@ mod tests {
             worktree_status: format!(" M {REC_REL}\n"),
             forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
             existing_refs: vec!["refs/heads/docs/fixed-slug".to_string()],
+            remote_heads: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
 
@@ -4110,6 +4224,70 @@ mod tests {
     }
 
     #[test]
+    fn deliver_explicit_slug_remote_head_collision_returns_error_before_mutation() {
+        let lock = GlobalStateLock::new();
+        let repo = seed_repo();
+        let agent_home = repo.path().join(".agent-home");
+        let _agent_home = EnvGuard::set(&lock, "AGENT_HOME", &agent_home.to_string_lossy());
+        let runner = ScriptedRunner {
+            repo_root: repo.path().to_path_buf(),
+            source_status: format!("?? {REC_REL}\n"),
+            worktree_status: format!(" M {REC_REL}\n"),
+            forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            existing_refs: Vec::new(),
+            remote_heads: vec!["docs/fixed-slug".to_string()],
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let err =
+            run_deliver(&runner, &deliver_args(repo.path(), false)).expect_err("should refuse");
+
+        assert_eq!(err.code(), "records-target-exists");
+        let log = runner.argv_log();
+        assert!(
+            log.iter()
+                .any(|c| c == "git ls-remote --exit-code --heads origin docs/fixed-slug"),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|c| c.starts_with("git fetch")), "{log:?}");
+        assert!(!log.iter().any(|c| c.contains("worktree add")), "{log:?}");
+        assert!(
+            !log.iter().any(|c| c.starts_with("semantic-commit commit")),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|c| c.starts_with("git push")), "{log:?}");
+    }
+
+    #[test]
+    fn deliver_explicit_slug_allows_existing_empty_managed_worktree_path() {
+        let lock = GlobalStateLock::new();
+        let repo = seed_repo();
+        let agent_home = repo.path().join(".agent-home");
+        let _agent_home = EnvGuard::set(&lock, "AGENT_HOME", &agent_home.to_string_lossy());
+        fs::create_dir_all(managed_worktree_path(repo.path(), "fixed-slug"))
+            .expect("existing empty worktree path");
+        let runner = ScriptedRunner {
+            repo_root: repo.path().to_path_buf(),
+            source_status: format!("?? {REC_REL}\n"),
+            worktree_status: format!(" M {REC_REL}\n"),
+            forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
+            existing_refs: Vec::new(),
+            remote_heads: Vec::new(),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let result = run_deliver(&runner, &deliver_args(repo.path(), false)).expect("deliver ok");
+
+        assert_eq!(result.branch, "docs/fixed-slug");
+        let log = runner.argv_log();
+        assert!(
+            log.iter()
+                .any(|c| c.contains("worktree add -b docs/fixed-slug")),
+            "{log:?}"
+        );
+    }
+
+    #[test]
     fn deliver_dry_run_renders_labels_in_plan() {
         let lock = GlobalStateLock::new();
         let repo = seed_repo();
@@ -4124,6 +4302,7 @@ mod tests {
             worktree_status: String::new(),
             forge_stdout: String::new(),
             existing_refs: Vec::new(),
+            remote_heads: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
         let mut args = deliver_args(repo.path(), true);
@@ -4158,6 +4337,7 @@ mod tests {
             worktree_status: format!(" M {REC_REL}\n M src/unrelated.rs\n"),
             forge_stdout: forge_envelope("https://github.com/o/r/pull/7"),
             existing_refs: Vec::new(),
+            remote_heads: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
 
@@ -4189,6 +4369,7 @@ mod tests {
             worktree_status: String::new(),
             forge_stdout: String::new(),
             existing_refs: Vec::new(),
+            remote_heads: Vec::new(),
             calls: RefCell::new(Vec::new()),
         };
 
