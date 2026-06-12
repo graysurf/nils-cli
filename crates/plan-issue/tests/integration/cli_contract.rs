@@ -838,6 +838,45 @@ fn cli_parse_contract_record_post_accepts_execution_state_file_and_display() {
 }
 
 #[test]
+fn cli_parse_contract_record_post_accepts_execution_state_file_with_summary_file() {
+    let cli = Cli::try_parse_from([
+        "plan-issue",
+        "record",
+        "post",
+        "--issue",
+        "448",
+        "--kind",
+        "state",
+        "--execution-state-file",
+        "docs/plans/example/example-execution-state.md",
+        "--summary-file",
+        "docs/plans/example/checkpoint-summary.md",
+    ])
+    .expect("parse record post with execution state file and summary file");
+
+    cli.validate().expect("validation");
+
+    match &cli.command {
+        Command::Record(args) => match &args.command {
+            RecordCommand::Post(post) => {
+                assert_eq!(
+                    post.execution_state_file,
+                    Some(PathBuf::from(
+                        "docs/plans/example/example-execution-state.md"
+                    ))
+                );
+                assert_eq!(
+                    post.summary_file,
+                    Some(PathBuf::from("docs/plans/example/checkpoint-summary.md"))
+                );
+            }
+            other => panic!("unexpected record subcommand: {other:?}"),
+        },
+        other => panic!("unexpected command parsed: {other:?}"),
+    }
+}
+
+#[test]
 fn cli_parse_contract_record_post_accepts_open_task_ledger_display() {
     let cli = Cli::try_parse_from([
         "plan-issue",

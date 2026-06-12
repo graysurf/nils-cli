@@ -514,6 +514,7 @@ fn build_record_seed(
         profile,
         crate::commands::record::LifecycleCommentKind::State,
         initial_state,
+        None,
         Some(state_summary),
         None,
         crate::commands::record::TaskLedgerDisplay::Open,
@@ -1347,8 +1348,8 @@ fn run_record_post(
             ),
         )
     })?;
-    let summary = match (&args.execution_state_file, &args.summary_file) {
-        (Some(path), None) => {
+    let execution_state = match &args.execution_state_file {
+        Some(path) => {
             let text = read_text_file(path, "record-post-execution-state-read-failed")?;
             let trimmed = text.trim();
             if trimmed.is_empty() {
@@ -1368,14 +1369,17 @@ fn run_record_post(
             }
             Some(text)
         }
-        (None, Some(path)) => Some(read_text_file(path, "record-post-summary-read-failed")?),
-        (None, None) => None,
-        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both summary inputs"),
+        None => None,
+    };
+    let summary = match &args.summary_file {
+        Some(path) => Some(read_text_file(path, "record-post-summary-read-failed")?),
+        None => None,
     };
     let body = lifecycle_record::render_record_post_comment_with_display(
         args.profile,
         args.kind,
         payload_data,
+        execution_state.as_deref(),
         summary.as_deref(),
         None,
         args.task_ledger_display,
@@ -3107,6 +3111,7 @@ fn render_checkpoint_role(
         profile,
         kind,
         payload,
+        None,
         summary_ref,
         Some(run.updated_at.as_str()),
         TaskLedgerDisplay::Auto,

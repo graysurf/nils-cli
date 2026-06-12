@@ -6,10 +6,10 @@
 
 use std::path::PathBuf;
 
-use plan_issue::commands::record::{LifecycleCommentKind, RecordProfile};
+use plan_issue::commands::record::{LifecycleCommentKind, RecordProfile, TaskLedgerDisplay};
 use plan_issue::lifecycle_record::{
     DashboardInput, SnapshotData, render_dashboard, render_record_post_comment,
-    render_record_snapshot_comment,
+    render_record_post_comment_with_display, render_record_snapshot_comment,
 };
 use serde_json::json;
 
@@ -207,6 +207,43 @@ fn post_comment_state_matches_golden() {
     )
     .expect("render");
     assert_or_bless("post_comment_state.md", &out);
+}
+
+#[test]
+fn post_comment_state_with_summary_matches_golden() {
+    let out = render_record_post_comment_with_display(
+        RecordProfile::Tracking,
+        LifecycleCommentKind::State,
+        json!({
+            "status": "in-progress",
+            "target_scope": "sympoies/nils-cli#541",
+            "current": "Task 2.5b",
+            "next_action": "Open PR",
+            "tasks": [
+                {"id": "1.1", "status": "done", "title": "First"},
+                {"id": "1.2", "status": "in-progress", "title": "Second"}
+            ],
+            "prs": [],
+            "blockers": [],
+            "links": {}
+        }),
+        Some(concat!(
+            "# Sample Execution State\n\n",
+            "## Execution State\n\n",
+            "- Status: in-progress\n",
+            "- Target scope: sympoies/nils-cli#541\n\n",
+            "## Task Ledger\n\n",
+            "| ID | Status | Task |\n",
+            "| --- | --- | --- |\n",
+            "| 1.1 | done | First |\n",
+            "| 1.2 | in-progress | Second |\n",
+        )),
+        Some("Checkpoint summary: PR opened; ledger advanced."),
+        Some("2026-05-26T06:00:00Z"),
+        TaskLedgerDisplay::Collapsed,
+    )
+    .expect("render");
+    assert_or_bless("post_comment_state_with_summary.md", &out);
 }
 
 #[test]

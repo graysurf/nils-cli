@@ -1699,6 +1699,7 @@ pub fn render_record_post_comment(
         profile,
         kind,
         payload_data,
+        None,
         summary,
         updated_at,
         TaskLedgerDisplay::Auto,
@@ -1720,10 +1721,15 @@ pub enum StateHeaderMode {
     DeriveFromPayload,
 }
 
+/// `execution_state` carries the canonical execution-state Markdown for
+/// `state` comments; `summary` carries free-form commentary rendered after
+/// the comment header, above the generated body. When both are given for a
+/// `state` comment, the summary renders above the execution-state document.
 pub fn render_record_post_comment_with_display(
     profile: RecordProfile,
     kind: LifecycleCommentKind,
     payload_data: Value,
+    execution_state: Option<&str>,
     summary: Option<&str>,
     updated_at: Option<&str>,
     task_ledger_display: TaskLedgerDisplay,
@@ -1732,6 +1738,7 @@ pub fn render_record_post_comment_with_display(
         profile,
         kind,
         payload_data,
+        execution_state,
         summary,
         updated_at,
         task_ledger_display,
@@ -1739,10 +1746,12 @@ pub fn render_record_post_comment_with_display(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_record_post_comment_with_display_mode(
     profile: RecordProfile,
     kind: LifecycleCommentKind,
     payload_data: Value,
+    execution_state: Option<&str>,
     summary: Option<&str>,
     updated_at: Option<&str>,
     task_ledger_display: TaskLedgerDisplay,
@@ -1757,10 +1766,17 @@ pub fn render_record_post_comment_with_display_mode(
             kind.as_str()
         ));
     }
+    if execution_state.is_some() && kind != LifecycleCommentKind::State {
+        return Err(format!(
+            "render_record_post_comment: execution-state markdown is only valid for `state`, got `{}`",
+            kind.as_str()
+        ));
+    }
 
     let visible_content = render_visible_post_content(
         kind,
         &payload_data,
+        execution_state,
         summary,
         task_ledger_display,
         header_mode,
@@ -1794,17 +1810,34 @@ pub fn render_record_post_comment_with_display_mode(
 fn render_visible_post_content(
     kind: LifecycleCommentKind,
     payload_data: &Value,
+    execution_state: Option<&str>,
     summary: Option<&str>,
     task_ledger_display: TaskLedgerDisplay,
     header_mode: StateHeaderMode,
 ) -> Result<String, String> {
+    let execution_state = execution_state
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let summary = summary.map(str::trim).filter(|value| !value.is_empty());
     let generated = match kind {
         LifecycleCommentKind::State => {
             let state = serde_json::from_value::<StateData>(payload_data.clone())
                 .map_err(|err| format!("state payload invalid for visible rendering: {err}"))?;
-            match summary {
-                Some(text) if text.contains("## Task Ledger") => {
+            match (execution_state, summary) {
+                (Some(document), summary) => {
+                    let rendered = render_state_markdown_with_task_ledger_display(
+                        document,
+                        task_ledger_display,
+                        &state,
+                        header_mode,
+                    )?;
+                    combine_summary_and_generated(summary, rendered)
+                }
+                // Single-input path: a summary that carries the ledger
+                // document is rendered as the execution-state body. Still
+                // load-bearing for `record open` seeding and `tracking
+                // checkpoint`, which pass the document through `summary`.
+                (None, Some(text)) if text.contains("## Task Ledger") => {
                     render_state_markdown_with_task_ledger_display(
                         text,
                         task_ledger_display,
@@ -1812,8 +1845,8 @@ fn render_visible_post_content(
                         header_mode,
                     )?
                 }
-                Some(text) => text.to_string(),
-                None => render_state_payload_visible(&state),
+                (None, Some(text)) => text.to_string(),
+                (None, None) => render_state_payload_visible(&state),
             }
         }
         LifecycleCommentKind::Session => {
@@ -3314,6 +3347,7 @@ mod sprint3_tests {
                 "blockers": [],
                 "links": {}
             }),
+            None,
             Some(state_summary_with_task_ledger()),
             None,
             display,
