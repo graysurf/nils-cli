@@ -44,8 +44,10 @@ Outputs:
   with `fix(ci): refresh third-party artifacts for <dep> bump` and a body line short enough for the commit-body gate.
 - Pushes the fix commit to the PR branch on `origin` (unless `--skip-push`). If the push is rejected because the Dependabot branch moved,
   fetches the latest PR head, rebases only the refresh commit(s) onto it, and retries.
-- Waits for CI green via `gh pr checks <N> --watch` (unless `--no-ci-wait`). If GitHub has not attached checks to the PR summary yet,
-  falls back to `gh run list` + `gh run watch` for the PR head SHA.
+- Waits for CI green via `gh pr checks <N> --watch` (unless `--no-ci-wait`). After pushing a refresh commit, first waits for the PR
+  head to report the pushed commit (GitHub's read-after-write lag can briefly return the pre-push head, which would select the previous
+  head's already-failed run) and keys the CI watch on the pushed SHA. If GitHub has not attached checks to the PR summary yet,
+  falls back to `gh run list` + `gh run watch` for that SHA.
 - Merges the PR via `gh pr merge <N> --<merge-method>` on CI green (unless `--skip-merge`).
 - Restores the starting branch at the end. In `--all-open` mode, syncs `main` after each successful merge before delivering the next PR.
 
@@ -91,7 +93,8 @@ Failure modes:
    d. `git push origin HEAD` (unless `--skip-push`); if rejected, fetch the current PR head, `git rebase --onto` the refresh commit(s),
       and retry.
 8. On `--no-ci-wait` + not merging: exit 0.
-9. Wait for CI via `gh pr checks <N> --watch`; if no checks are reported yet, select the matching pull-request CI run by head SHA and
+9. Wait for CI: after a refresh push, poll `gh pr view` until the PR head reports the pushed commit, then watch via
+   `gh pr checks <N> --watch`; if no checks are reported yet, select the matching pull-request CI run by the pushed head SHA and
    wait with `gh run watch`.
 10. On `--skip-merge`: exit 0.
 11. `gh pr merge <N> --squash` (or configured merge method); restore starting branch.
