@@ -198,13 +198,37 @@ JSON
     ;;
   "run list")
     echo "gh:run-list:$*" >> "$log_file"
-    cat <<'JSON'
-[{"databaseId":4242,"status":"in_progress","conclusion":"","headSha":"foo-head-1","workflowName":"CI","event":"pull_request","url":"https://example.test/run/4242"}]
+    commit=""
+    args=("$@")
+    for (( i = 0; i < ${#args[@]}; i++ )); do
+      if [[ "${args[$i]}" == "--commit" ]]; then
+        commit="${args[$((i + 1))]:-}"
+      fi
+    done
+    if [[ "${MOCK_STALE_HEAD:-0}" == "1" ]]; then
+      pushed="$("$real_git" rev-parse HEAD)"
+      if [[ "$commit" == "$pushed" ]]; then
+        cat <<JSON
+[{"databaseId":5151,"status":"in_progress","conclusion":"","headSha":"${commit}","workflowName":"CI","event":"pull_request","url":"https://example.test/run/5151"}]
 JSON
+      else
+        cat <<JSON
+[{"databaseId":4242,"status":"completed","conclusion":"failure","headSha":"${commit}","workflowName":"CI","event":"pull_request","url":"https://example.test/run/4242"}]
+JSON
+      fi
+    else
+      cat <<JSON
+[{"databaseId":4242,"status":"in_progress","conclusion":"","headSha":"${commit:-foo-head-1}","workflowName":"CI","event":"pull_request","url":"https://example.test/run/4242"}]
+JSON
+    fi
     exit 0
     ;;
   "run watch")
     echo "gh:run-watch:$*" >> "$log_file"
+    if [[ "${MOCK_STALE_HEAD:-0}" == "1" && "${3:-}" == "4242" ]]; then
+      echo "Run CI (4242) has already completed with 'failure'" >&2
+      exit 1
+    fi
     exit 0
     ;;
   "pr merge")
@@ -312,6 +336,20 @@ assert_contains "$MOCK_LOG" "gh:pr-checks"
 assert_contains "$MOCK_LOG" "gh:run-list"
 assert_contains "$MOCK_LOG" "gh:run-watch"
 unset MOCK_PUSH_SUCCESS MOCK_CHECKS_NO_CHECKS_ONCE DEPENDABOT_BUMP_PR_CI_RUN_POLL_SECONDS
+
+create_case ci-stale-head
+repo_dir="$CASE_REPO_DIR"
+export MOCK_PUSH_SUCCESS=1
+export MOCK_CHECKS_NO_CHECKS_ONCE=1
+export MOCK_STALE_HEAD=1
+export DEPENDABOT_BUMP_PR_CI_RUN_POLL_SECONDS=2
+export DEPENDABOT_BUMP_PR_HEAD_SYNC_WAIT_SECONDS=1
+export DEPENDABOT_BUMP_PR_POLL_INTERVAL_SECONDS=1
+run_in_case "$repo_dir" --pr 101 --no-sync-main --skip-merge
+assert_contains "$MOCK_LOG" "gh:run-watch:run watch 5151"
+assert_not_contains "$MOCK_LOG" "gh:run-watch:run watch 4242"
+unset MOCK_PUSH_SUCCESS MOCK_CHECKS_NO_CHECKS_ONCE MOCK_STALE_HEAD
+unset DEPENDABOT_BUMP_PR_CI_RUN_POLL_SECONDS DEPENDABOT_BUMP_PR_HEAD_SYNC_WAIT_SECONDS DEPENDABOT_BUMP_PR_POLL_INTERVAL_SECONDS
 
 create_case push-rebase
 repo_dir="$CASE_REPO_DIR"

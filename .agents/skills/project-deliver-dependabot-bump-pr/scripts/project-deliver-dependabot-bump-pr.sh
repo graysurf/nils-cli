@@ -234,6 +234,28 @@ print("")
 ' "$head_oid"
 }
 
+# After a push, `gh pr view` can briefly report the pre-push head OID
+# (read-after-write lag); a CI watch keyed on that stale OID selects the
+# previous head's already-finished run and fails on its expected drift.
+wait_for_pr_head_oid() {
+  local pr="$1"
+  local expected_oid="$2"
+  local wait_seconds="${DEPENDABOT_BUMP_PR_HEAD_SYNC_WAIT_SECONDS:-120}"
+  local interval="${DEPENDABOT_BUMP_PR_POLL_INTERVAL_SECONDS:-5}"
+  local deadline=$((SECONDS + wait_seconds))
+
+  note "waiting for PR #${pr} head to report pushed commit ${expected_oid}"
+  while (( SECONDS <= deadline )); do
+    load_pr_meta "$pr"
+    if [[ "$pr_head_oid" == "$expected_oid" ]]; then
+      return 0
+    fi
+    sleep "$interval"
+  done
+
+  note "PR #${pr} head still reports ${pr_head_oid}; watching CI for pushed commit anyway"
+}
+
 wait_for_ci() {
   local pr="$1"
   local head_ref="$2"
@@ -532,12 +554,17 @@ case "$check_exit" in
     ;;
 esac
 
+pushed_head_oid=""
 if [[ "$refresh_committed" -eq 1 && "$skip_push" -eq 0 ]]; then
   push_refresh_commit "$pr_number" "$pr_head_ref" "$refresh_base"
+  pushed_head_oid="$(git rev-parse HEAD)"
 fi
 
 if [[ "$ci_wait" -eq 0 ]]; then
   note "skipping CI wait (--no-ci-wait or --skip-push)"
+elif [[ -n "$pushed_head_oid" ]]; then
+  wait_for_pr_head_oid "$pr_number" "$pushed_head_oid"
+  wait_for_ci "$pr_number" "$pr_head_ref" "$pushed_head_oid"
 else
   load_pr_meta "$pr_number"
   wait_for_ci "$pr_number" "$pr_head_ref" "$pr_head_oid"
