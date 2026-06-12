@@ -25,6 +25,9 @@ _plan-tooling() {
             plan__tooling,completion)
                 cmd="plan__tooling__completion"
                 ;;
+            plan__tooling,exec-state-sync)
+                cmd="plan__tooling__exec__state__sync"
+                ;;
             plan__tooling,help)
                 cmd="plan__tooling__help"
                 ;;
@@ -56,7 +59,7 @@ _plan-tooling() {
 
     case "${cmd}" in
         plan__tooling)
-            opts="-h -V --help --version to-json validate batches artifact-audit split-prs ledger-update ledger-sync scaffold spec completion help"
+            opts="-h -V --help --version to-json validate batches artifact-audit split-prs ledger-update ledger-sync exec-state-sync scaffold spec completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -139,6 +142,48 @@ _plan-tooling() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        plan__tooling__exec__state__sync)
+            opts="-h --bundle --execution-state --issue-url --status --last-updated --branch-commit-pr --dry-run --format --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --bundle)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --execution-state)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --issue-url)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --status)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --last-updated)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --branch-commit-pr)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         plan__tooling__help)
             opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
@@ -203,7 +248,7 @@ _plan-tooling() {
                     return 0
                     ;;
                 --status)
-                    COMPREPLY=($(compgen -W "pending in-progress done blocked waived" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "pending in-progress done deferred blocked waived" -- "${cur}"))
                     return 0
                     ;;
                 --evidence)

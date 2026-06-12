@@ -1,5 +1,8 @@
+use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, Command};
 use clap_complete::{Shell, generate};
+
+use crate::ledger;
 use std::io::{self, Write};
 
 pub fn run(args: &[String]) -> i32 {
@@ -274,7 +277,9 @@ fn build_completion_command() -> Command {
                         .long("status")
                         .help("New row status")
                         .value_name("status")
-                        .value_parser(["pending", "in-progress", "done", "blocked", "waived"])
+                        .value_parser(PossibleValuesParser::new(
+                            ledger::STATUS_VALUES.iter().copied(),
+                        ))
                         .required(true),
                 )
                 .arg(

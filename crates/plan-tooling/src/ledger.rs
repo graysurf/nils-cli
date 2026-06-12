@@ -19,7 +19,16 @@ const COL_STATUS: &str = "Status";
 const COL_EVIDENCE: &str = "Evidence";
 const COL_NOTES: &str = "Notes";
 
-const STATUS_VALUES: &[&str] = &["pending", "in-progress", "done", "blocked", "waived"];
+/// Status vocabulary for `ledger-update`; the completion clap model consumes
+/// this so the validator and shell completions cannot drift.
+pub const STATUS_VALUES: &[&str] = &[
+    "pending",
+    "in-progress",
+    "done",
+    "deferred",
+    "blocked",
+    "waived",
+];
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -639,6 +648,19 @@ mod tests {
         let _ = err.expect("patch_text accepts arbitrary status");
         let err = validate_status("nope").expect_err("invalid");
         assert_eq!(err.code(), "ledger-status-invalid");
+    }
+
+    #[test]
+    fn every_gate_terminal_status_is_a_valid_ledger_status() {
+        // plan-tracking-testbed#65: the closeout gates treat
+        // done/deferred/waived as terminal, so ledger-update must be able to
+        // set each of them.
+        for status in ["done", "deferred", "waived"] {
+            assert!(
+                validate_status(status).is_ok(),
+                "`{status}` should be a valid ledger status"
+            );
+        }
     }
 
     #[test]

@@ -1974,14 +1974,21 @@ fn normalize_state_markdown_for_comment(markdown: &str) -> Result<String, String
     Ok(normalized)
 }
 
+/// Shared terminal-status contract for closeout gates; must stay aligned with
+/// the close-ready terminal set in `execute.rs`.
+fn is_terminal_task_status(status: TaskRowStatus) -> bool {
+    matches!(
+        status,
+        TaskRowStatus::Done | TaskRowStatus::Deferred | TaskRowStatus::Waived
+    )
+}
+
 fn is_terminal_state(state: &StateData) -> bool {
     state.status == Some(StateStatus::Complete)
-        && state.tasks.iter().all(|task| {
-            matches!(
-                task.status,
-                TaskRowStatus::Done | TaskRowStatus::Deferred | TaskRowStatus::Waived
-            )
-        })
+        && state
+            .tasks
+            .iter()
+            .all(|task| is_terminal_task_status(task.status))
 }
 
 fn render_state_payload_visible(state: &StateData) -> String {
@@ -2453,12 +2460,9 @@ pub fn evaluate_strict_closeout_gate(
                     let tasks_incomplete = parsed
                         .as_ref()
                         .map(|data| {
-                            data.tasks.iter().any(|task| {
-                                !matches!(
-                                    task.status,
-                                    TaskRowStatus::Done | TaskRowStatus::Deferred
-                                )
-                            })
+                            data.tasks
+                                .iter()
+                                .any(|task| !is_terminal_task_status(task.status))
                         })
                         .unwrap_or(false);
                     if tasks_incomplete {
@@ -2466,7 +2470,7 @@ pub fn evaluate_strict_closeout_gate(
                             &mut checks,
                             &mut blocked_codes,
                             "execution state",
-                            "complete but tasks are not all done/deferred".to_string(),
+                            "complete but tasks are not all done/deferred/waived".to_string(),
                             "state-tasks-incomplete",
                         );
                     } else {
@@ -2840,6 +2844,78 @@ mod sprint3_tests {
             },
         );
         assert!(result.ready, "gate should pass: {:?}", result.checks);
+        assert!(result.blocked_codes.is_empty());
+    }
+
+    #[test]
+    fn strict_gate_passes_when_state_tasks_include_waived() {
+        // Reproduces plan-tracking-testbed#65: close-ready and
+        // `is_terminal_state` already treat `waived` as terminal, so the
+        // strict record-close gate must accept it too instead of blocking
+        // with `state-tasks-incomplete`.
+        let state = v2_body(
+            "state",
+            json!({
+                "status": "complete",
+                "target_scope": "scope",
+                "tasks": [
+                    {"id": "1.1", "status": "done", "title": "x"},
+                    {"id": "1.2", "status": "waived", "title": "y"},
+                ],
+                "prs": [{"ref": "owner/repo#1", "url": "u", "status": "merged"}],
+                "blockers": [],
+                "links": {},
+            }),
+        );
+        let validation = v2_body(
+            "validation",
+            json!({"overall": "pass", "commands": [], "waivers": []}),
+        );
+        let review = v2_body(
+            "review",
+            json!({
+                "decision": "approve",
+                "lenses": ["testing"],
+                "findings": [],
+            }),
+        );
+        let source = v2_body("source", json!({"path": "p", "commit": "c"}));
+        let plan = v2_body("plan", json!({"path": "p", "commit": "c"}));
+        let session = v2_body("session", json!({"summary": "session complete"}));
+        let audit = build_audit_with_evidence(vec![
+            (source, "u-src"),
+            (plan, "u-plan"),
+            (state, "u-state"),
+            (session, "u-session"),
+            (validation, "u-val"),
+            (review, "u-rev"),
+        ]);
+
+        let linked_prs = vec![LinkedPrEvidence {
+            pr_ref: "owner/repo#1".to_string(),
+            url: Some("https://github.com/owner/repo/pull/1".to_string()),
+            merge_sha: Some("abcdef1234567890".to_string()),
+            checks: CheckStatus::Pass,
+            required_state: Some(CheckStatus::Pass),
+            required_count: Some(1),
+            non_required_failures: Vec::new(),
+        }];
+        let result = evaluate_strict_closeout_gate(
+            &audit,
+            StrictCloseoutGateInput {
+                profile: RecordProfile::Tracking,
+                approval: Some("https://github.com/owner/repo/issues/1#issuecomment-9"),
+                linked_prs: &linked_prs,
+                current_body: None,
+                expected_dashboard: None,
+                allow_non_required_check_failure: false,
+            },
+        );
+        assert!(
+            result.ready,
+            "waived task row should be terminal: {:?}",
+            result.checks
+        );
         assert!(result.blocked_codes.is_empty());
     }
 
