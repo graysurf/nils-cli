@@ -226,7 +226,11 @@ impl ForgeConfig {
     /// Overlay `top` onto `self`: every field set in `top` wins; unset fields
     /// fall back to `self`. Warnings are concatenated (base first), and the
     /// `source_path` reports the higher-precedence file when present.
-    fn overlaid_by(self, top: Self) -> Self {
+    ///
+    /// Exposed to the crate so callers that must distinguish layers (e.g. the
+    /// `pr merge` rule-10 conflict check, which only fires on a repo-explicit
+    /// `delete_branch`) can compose the layers themselves.
+    pub(crate) fn overlaid_by(self, top: Self) -> Self {
         Self {
             merge_method: top.merge_method.or(self.merge_method),
             merge_delete_branch: top.merge_delete_branch.or(self.merge_delete_branch),
