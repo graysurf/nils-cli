@@ -756,7 +756,12 @@ The same schema may live in a user-global file at
 beneath the per-repo `.forge-cli.toml`, so a setting (e.g. `[test_first]
 require = true` or `[merge] method = "rebase"`) applies across every repo
 without duplicating it into each checkout. A missing global file is not an
-error. The global layer feeds every section, not just `[test_first]`.
+error. The global layer feeds the sections forge-cli actually consumes from
+config today — `[merge]`, `[inbox]`, and `[test_first]`. The `[checks]`,
+`[body]`, and `[branch]` keys are parsed (and validated) for
+forward-compatibility but are not yet wired into the corresponding command
+paths at either layer, so values placed there are accepted but currently
+inert.
 
 Resolution order for any setting: explicit flag > repo `.forge-cli.toml` >
 global `config.toml` > spec default. Inbox env vars sit between explicit flags
