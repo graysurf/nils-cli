@@ -47,6 +47,8 @@ mod prune_stale;
 mod purge_state;
 #[path = "integration/render.rs"]
 mod render;
+#[path = "integration/render_agents.rs"]
+mod render_agents;
 #[path = "integration/render_determinism.rs"]
 mod render_determinism;
 #[path = "integration/restore_backups.rs"]
