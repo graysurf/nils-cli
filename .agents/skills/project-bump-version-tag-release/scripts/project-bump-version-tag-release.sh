@@ -1392,10 +1392,15 @@ if [[ "$pr_mode" -eq 1 ]]; then
     for line in "${body_lines[@]}"; do
       printf '%s\n' "$line"
     done
+    # Plain bullets, NOT "- [ ]" task-list items: these describe the release
+    # pipeline's own post-merge steps (tag, release.yml, tap) which can never be
+    # checked off at merge time, so `forge-cli pr deliver`'s unchecked-task gate
+    # would reject a checkbox form and block every PR-mode release.
     printf '\n## Test plan\n\n'
-    printf -- '- [ ] CI: required status checks green\n'
-    printf -- '- [ ] After merge: tag %s and confirm release.yml publishes artifacts\n' "$tag"
-    printf -- '- [ ] Tap stage updates homebrew formula\n'
+    printf 'Release pipeline (automated; completed after this merge):\n\n'
+    printf -- '- CI required status checks green\n'
+    printf -- '- After merge: tag %s and confirm release.yml publishes artifacts\n' "$tag"
+    printf -- '- Tap stage updates homebrew formula\n'
   } >"$pr_body_file"
 
   note "opening + waiting + merging release PR via forge-cli pr deliver"
