@@ -31,13 +31,18 @@ use crate::cli::parse_duration;
 /// File name searched upward from CWD.
 pub const CONFIG_FILE_NAME: &str = ".forge-cli.toml";
 
+/// File name of the user-global config under
+/// `${XDG_CONFIG_HOME:-$HOME/.config}/forge-cli/`.
+pub const GLOBAL_CONFIG_FILE_NAME: &str = "config.toml";
+
 /// Top-level config sections recognised by this version.
-const KNOWN_SECTIONS: &[&str] = &["merge", "body", "branch", "checks", "inbox"];
+const KNOWN_SECTIONS: &[&str] = &["merge", "body", "branch", "checks", "inbox", "test_first"];
 
 /// Recognised keys per section.
 const KNOWN_MERGE_KEYS: &[&str] = &["method", "delete_branch"];
 const KNOWN_BODY_KEYS: &[&str] = &["summary_heading", "test_plan_heading"];
 const KNOWN_BRANCH_KEYS: &[&str] = &["feature_prefix", "bug_prefix"];
+const KNOWN_TEST_FIRST_KEYS: &[&str] = &["require"];
 const KNOWN_CHECKS_KEYS: &[&str] = &["timeout", "interval", "required_only"];
 const KNOWN_INBOX_KEYS: &[&str] = &[
     "gitlab_vpn",
@@ -112,6 +117,10 @@ pub struct ForgeConfig {
     pub inbox_cache_fallback: Option<bool>,
     pub inbox_cache_max_age: Option<Duration>,
     pub inbox_no_cache: Option<bool>,
+    /// `[test_first].require` — when true, `pr create` / `pr deliver` for
+    /// feature/bug kinds must carry verified test-first evidence (a failing
+    /// test or explicit waiver plus a passing final validation).
+    pub test_first_required: Option<bool>,
     /// Forward-compat warnings collected while parsing (unknown keys, bad
     /// scalar types). Each entry is prefixed `unknown-config-key:` or
     /// `invalid-config-value:` so callers can render them verbatim under
@@ -161,6 +170,94 @@ impl ForgeConfig {
         let mut cfg = parse_value(&value);
         cfg.source_path = Some(found);
         cfg
+    }
+
+    /// Load the user-global config from
+    /// `${XDG_CONFIG_HOME:-$HOME/.config}/forge-cli/config.toml`, if present.
+    /// Returns `ForgeConfig::default()` when no global file exists. Read or
+    /// parse failures degrade to defaults with a recorded warning, matching
+    /// [`load_from`](Self::load_from).
+    pub fn load_global() -> Self {
+        let Some(path) = global_config_path() else {
+            return Self::default();
+        };
+        if !path.is_file() {
+            return Self::default();
+        }
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(err) => {
+                let mut cfg = Self::default();
+                cfg.warnings
+                    .push(format!("invalid-config-value:global_read_error:{err}"));
+                cfg.source_path = Some(path);
+                return cfg;
+            }
+        };
+        match toml::from_str::<Value>(&contents) {
+            Ok(value) => {
+                let mut cfg = parse_value(&value);
+                cfg.source_path = Some(path);
+                cfg
+            }
+            Err(err) => {
+                let mut cfg = Self::default();
+                cfg.warnings
+                    .push(format!("invalid-config-value:global_parse_error:{err}"));
+                cfg.source_path = Some(path);
+                cfg
+            }
+        }
+    }
+
+    /// Layered load: the user-global config supplies defaults, the per-repo
+    /// `.forge-cli.toml` overrides field-by-field, and explicit flags still win
+    /// at `resolve_*` time. Precedence:
+    ///
+    /// ```text
+    /// explicit flag > repo .forge-cli.toml > global config > spec default
+    /// ```
+    pub fn load_layered(start_dir: &Path, git_toplevel: Option<&Path>) -> Self {
+        let global = Self::load_global();
+        let repo = Self::load_from(start_dir, git_toplevel);
+        global.overlaid_by(repo)
+    }
+
+    /// Overlay `top` onto `self`: every field set in `top` wins; unset fields
+    /// fall back to `self`. Warnings are concatenated (base first), and the
+    /// `source_path` reports the higher-precedence file when present.
+    fn overlaid_by(self, top: Self) -> Self {
+        Self {
+            merge_method: top.merge_method.or(self.merge_method),
+            merge_delete_branch: top.merge_delete_branch.or(self.merge_delete_branch),
+            body_summary_heading: top.body_summary_heading.or(self.body_summary_heading),
+            body_test_plan_heading: top.body_test_plan_heading.or(self.body_test_plan_heading),
+            branch_feature_prefix: top.branch_feature_prefix.or(self.branch_feature_prefix),
+            branch_bug_prefix: top.branch_bug_prefix.or(self.branch_bug_prefix),
+            checks_timeout: top.checks_timeout.or(self.checks_timeout),
+            checks_interval: top.checks_interval.or(self.checks_interval),
+            checks_required_only: top.checks_required_only.or(self.checks_required_only),
+            inbox_gitlab_vpn: top.inbox_gitlab_vpn.or(self.inbox_gitlab_vpn),
+            inbox_gitlab_vpn_check: top.inbox_gitlab_vpn_check.or(self.inbox_gitlab_vpn_check),
+            inbox_gitlab_vpn_check_timeout: top
+                .inbox_gitlab_vpn_check_timeout
+                .or(self.inbox_gitlab_vpn_check_timeout),
+            inbox_gitlab_openvpn_profile: top
+                .inbox_gitlab_openvpn_profile
+                .or(self.inbox_gitlab_openvpn_profile),
+            inbox_provider_timeout: top.inbox_provider_timeout.or(self.inbox_provider_timeout),
+            inbox_strict_providers: top.inbox_strict_providers.or(self.inbox_strict_providers),
+            inbox_cache_fallback: top.inbox_cache_fallback.or(self.inbox_cache_fallback),
+            inbox_cache_max_age: top.inbox_cache_max_age.or(self.inbox_cache_max_age),
+            inbox_no_cache: top.inbox_no_cache.or(self.inbox_no_cache),
+            test_first_required: top.test_first_required.or(self.test_first_required),
+            warnings: {
+                let mut merged = self.warnings;
+                merged.extend(top.warnings);
+                merged
+            },
+            source_path: top.source_path.or(self.source_path),
+        }
     }
 
     /// Resolve `[merge].method` against an optional explicit flag.
@@ -225,6 +322,24 @@ impl ForgeConfig {
     pub fn resolve_required_only(&self, explicit: Option<bool>) -> bool {
         explicit.or(self.checks_required_only).unwrap_or(true)
     }
+
+    /// Resolve `[test_first].require`. Default is `false` per spec — the gate
+    /// is off unless a repo `.forge-cli.toml` or the user's global config
+    /// opts in.
+    pub fn resolve_test_first_required(&self, explicit: Option<bool>) -> bool {
+        explicit.or(self.test_first_required).unwrap_or(false)
+    }
+}
+
+/// Resolve the user-global config path
+/// `${XDG_CONFIG_HOME:-$HOME/.config}/forge-cli/config.toml`. Returns `None`
+/// when neither `XDG_CONFIG_HOME` nor `HOME` is set in the environment.
+fn global_config_path() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    Some(base.join("forge-cli").join(GLOBAL_CONFIG_FILE_NAME))
 }
 
 fn find_config_file(start_dir: &Path, git_toplevel: Option<&Path>) -> Option<PathBuf> {
@@ -272,6 +387,7 @@ fn parse_value(value: &Value) -> ForgeConfig {
             "branch" => parse_branch(section_table, &mut cfg),
             "checks" => parse_checks(section_table, &mut cfg),
             "inbox" => parse_inbox(section_table, &mut cfg),
+            "test_first" => parse_test_first(section_table, &mut cfg),
             _ => unreachable!("section filtered above"),
         }
     }
@@ -301,6 +417,25 @@ fn parse_merge(table: &toml::map::Map<String, Value>, cfg: &mut ForgeConfig) {
                 None => cfg
                     .warnings
                     .push("invalid-config-value:merge.delete_branch:not_a_bool".to_string()),
+            },
+            _ => unreachable!("key filtered above"),
+        }
+    }
+}
+
+fn parse_test_first(table: &toml::map::Map<String, Value>, cfg: &mut ForgeConfig) {
+    for (key, value) in table {
+        if !KNOWN_TEST_FIRST_KEYS.contains(&key.as_str()) {
+            cfg.warnings
+                .push(format!("unknown-config-key:test_first.{key}"));
+            continue;
+        }
+        match key.as_str() {
+            "require" => match value.as_bool() {
+                Some(b) => cfg.test_first_required = Some(b),
+                None => cfg
+                    .warnings
+                    .push("invalid-config-value:test_first.require:not_a_bool".to_string()),
             },
             _ => unreachable!("key filtered above"),
         }

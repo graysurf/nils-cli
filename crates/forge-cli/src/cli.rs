@@ -608,6 +608,11 @@ pub struct PrCreateArgs {
     /// Fail when selected labels are missing, not applicable, or conflict.
     #[arg(long = "strict-labels", action = ArgAction::SetTrue)]
     pub strict_labels: bool,
+    /// Directory holding a `test-first-evidence` record. Verified by the
+    /// test-first gate when `[test_first].require` resolves true for a
+    /// feature/bug PR (a failing test or explicit waiver plus a passing final).
+    #[arg(long = "test-first-evidence", value_name = "DIR")]
+    pub test_first_evidence: Option<String>,
 }
 
 /// `pr` subtree.
@@ -731,6 +736,11 @@ pub struct PrDeliverArgs {
     /// Fail when selected labels are missing, not applicable, or conflict.
     #[arg(long = "strict-labels", action = ArgAction::SetTrue)]
     pub strict_labels: bool,
+    /// Directory holding a `test-first-evidence` record, forwarded to the
+    /// create step and verified by the test-first gate when
+    /// `[test_first].require` resolves true for a feature/bug PR.
+    #[arg(long = "test-first-evidence", value_name = "DIR")]
+    pub test_first_evidence: Option<String>,
     /// CI-wait budget before declaring `checks_timeout` (default `30m`).
     #[arg(long, value_parser = parse_duration, default_value = "30m")]
     pub timeout: Duration,

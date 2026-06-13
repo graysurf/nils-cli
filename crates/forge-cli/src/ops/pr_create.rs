@@ -30,6 +30,7 @@ use crate::backend::{
     BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload, ProcessRunner,
 };
 use crate::cli::{BINARY, GlobalFlags, PrCreateArgs};
+use crate::config::ForgeConfig;
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::label::{LabelTarget, validate_label_inputs};
@@ -86,11 +87,17 @@ pub struct Environment<'a> {
     pub head_state: HeadStateFn<'a>,
     pub workdir: PathBuf,
     pub headings: BodyHeadings,
+    /// Resolved `[test_first].require`: when true, feature/bug PRs must carry
+    /// verified test-first evidence. Injected by tests; loaded from layered
+    /// config in [`Environment::production`].
+    pub test_first_required: bool,
 }
 
 impl<'a> Environment<'a> {
     /// Real implementation that talks to git + the backend.
     pub fn production() -> Self {
+        let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cfg = ForgeConfig::load_layered(&workdir, find_git_toplevel(&workdir).as_deref());
         Self {
             remote_url: Box::new(git_remote_url),
             current_branch: Box::new(|| {
@@ -121,8 +128,9 @@ impl<'a> Environment<'a> {
             }),
             git_status: Box::new(git_status_porcelain),
             head_state: Box::new(git_head_state),
-            workdir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            workdir,
             headings: BodyHeadings::default(),
+            test_first_required: cfg.resolve_test_first_required(None),
         }
     }
 }
@@ -133,6 +141,64 @@ fn schema_err() -> String {
 
 fn schema_ok() -> String {
     schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION)
+}
+
+/// Resolve the git toplevel for layered-config discovery. Returns `None`
+/// outside a work tree (the layered loader then walks to the filesystem root).
+fn find_git_toplevel(start: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .current_dir(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Test-first gate. When `required` is true (resolved from
+/// `[test_first].require`) and the PR is a feature/bug change, the
+/// `--test-first-evidence` directory must hold a verified `test-first-evidence`
+/// record — a failing test or explicit waiver plus a passing final validation.
+/// Other kinds (docs, chore, ci, refactor) are exempt.
+fn test_first_gate(
+    kind: PrKind,
+    required: bool,
+    evidence_dir: Option<&str>,
+) -> Result<(), ForgeError> {
+    if !required || !matches!(kind, PrKind::Feature | PrKind::Bug) {
+        return Ok(());
+    }
+    let Some(dir) = evidence_dir else {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "test_first_evidence_required",
+            "this repo requires test-first evidence for feature/bug PRs; pass \
+             --test-first-evidence <dir> pointing at a verified test-first-evidence \
+             record (a failing test or explicit waiver plus a passing final validation)",
+            None,
+        ));
+    };
+    match agent_workflow_primitives::test_first_evidence::verify_dir(Path::new(dir)) {
+        Ok(result) if result.complete => Ok(()),
+        Ok(result) => Err(ForgeError::validation(
+            schema_err(),
+            "test_first_evidence_incomplete",
+            format!(
+                "test-first evidence at '{dir}' is incomplete: missing {missing}",
+                missing = result.missing.join(", ")
+            ),
+            Some(format!("record_file={}", result.record_file)),
+        )),
+        Err(message) => Err(ForgeError::validation(
+            schema_err(),
+            "test_first_evidence_unreadable",
+            format!("could not read test-first evidence at '{dir}'"),
+            Some(message),
+        )),
+    }
 }
 
 /// Test-friendly entrypoint: caller injects the runner + environment.
@@ -187,6 +253,11 @@ pub fn run_with<R: BackendRunner>(
     )?;
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
     head_pushed(&env.workdir, |w| (env.head_state)(w))?;
+    test_first_gate(
+        kind,
+        env.test_first_required,
+        args.test_first_evidence.as_deref(),
+    )?;
 
     let draft = !args.no_draft;
 
@@ -262,6 +333,11 @@ pub fn compute<R: BackendRunner>(
     )?;
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
     head_pushed(&env.workdir, |w| (env.head_state)(w))?;
+    test_first_gate(
+        kind,
+        env.test_first_required,
+        args.test_first_evidence.as_deref(),
+    )?;
 
     let draft = !args.no_draft;
     let body_tempfile = write_body_tempfile(&body)?;
@@ -782,6 +858,7 @@ mod tests {
             labels: Vec::new(),
             label_catalog: None,
             strict_labels: false,
+            test_first_evidence: None,
         }
     }
 
@@ -806,6 +883,7 @@ mod tests {
             }),
             workdir: PathBuf::from("."),
             headings: BodyHeadings::default(),
+            test_first_required: false,
         }
     }
 
@@ -906,5 +984,90 @@ mod tests {
         )
         .expect_err("no summary");
         assert_eq!(err.kind(), "body_missing_summary");
+    }
+
+    fn write_evidence(dir: &Path, json: &str) {
+        std::fs::write(dir.join("test-first-evidence.json"), json).unwrap();
+    }
+
+    #[test]
+    fn test_first_gate_passes_when_not_required() {
+        assert!(test_first_gate(PrKind::Feature, false, None).is_ok());
+    }
+
+    #[test]
+    fn test_first_gate_exempts_non_behavior_kinds() {
+        for kind in [PrKind::Docs, PrKind::Chore, PrKind::Ci, PrKind::Refactor] {
+            assert!(
+                test_first_gate(kind, true, None).is_ok(),
+                "{kind:?} should be exempt",
+                kind = kind,
+            );
+        }
+    }
+
+    #[test]
+    fn test_first_gate_requires_evidence_for_feature_and_bug() {
+        for kind in [PrKind::Feature, PrKind::Bug] {
+            let err = test_first_gate(kind, true, None).expect_err("required");
+            assert_eq!(err.kind(), "test_first_evidence_required");
+        }
+    }
+
+    #[test]
+    fn test_first_gate_accepts_complete_record() {
+        let dir = tempfile::tempdir().unwrap();
+        write_evidence(
+            dir.path(),
+            r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"},"final_validation":{"command":"cargo test","status":"pass"}}"#,
+        );
+        assert!(test_first_gate(PrKind::Feature, true, dir.path().to_str()).is_ok());
+    }
+
+    #[test]
+    fn test_first_gate_rejects_incomplete_record() {
+        let dir = tempfile::tempdir().unwrap();
+        write_evidence(
+            dir.path(),
+            r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"}}"#,
+        );
+        let err =
+            test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("incomplete");
+        assert_eq!(err.kind(), "test_first_evidence_incomplete");
+    }
+
+    #[test]
+    fn test_first_gate_rejects_unreadable_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("unreadable");
+        assert_eq!(err.kind(), "test_first_evidence_unreadable");
+    }
+
+    #[test]
+    fn run_with_blocks_feature_when_required_without_evidence() {
+        let runner = StubRunner;
+        let env = Environment {
+            test_first_required: true,
+            ..passthrough_env()
+        };
+        let global = GlobalFlags {
+            format: None,
+            remote: "origin".into(),
+            provider: None,
+            repo: None,
+            store_root: None,
+            dry_run: true,
+        };
+        let body = "## Summary\n\nyes.\n\n## Test plan\n\nverified.\n";
+        let err = run_with(
+            &runner,
+            &global,
+            args("demo: ok", PrKindFlag::Feature, Some(body)),
+            OutputFormat::Json,
+            &env,
+        )
+        .expect_err("gate");
+        assert_eq!(err.kind(), "test_first_evidence_required");
     }
 }

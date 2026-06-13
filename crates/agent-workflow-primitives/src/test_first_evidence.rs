@@ -255,6 +255,22 @@ fn verify_record(args: &CommonArgs) -> Result<VerifyResult, CliError> {
     })
 }
 
+/// Verify a test-first-evidence record directory for external callers such as
+/// the `forge-cli` PR test-first gate. Returns the structured [`VerifyResult`]
+/// (inspect `complete` / `missing`), or an error message when the record
+/// directory is missing or unreadable. A record is `complete` when it carries
+/// a failing test or an explicit waiver plus a passing final validation.
+pub fn verify_dir(out_dir: &Path) -> Result<VerifyResult, String> {
+    let result = read_record_result(out_dir).map_err(|err| err.message)?;
+    let missing = missing_evidence_fields(&result.record);
+    Ok(VerifyResult {
+        record_file: result.record_file,
+        complete: missing.is_empty(),
+        missing,
+        record: result.record,
+    })
+}
+
 fn read_record_result(out_dir: &Path) -> Result<RecordResult, CliError> {
     let record_file = record_file_path(out_dir)?;
     let record = read_record(&record_file)?;

@@ -448,6 +448,7 @@ fn build_create_args(args: &PrDeliverArgs, default_branch: &str) -> PrCreateArgs
         labels: args.labels.clone(),
         label_catalog: args.label_catalog.clone(),
         strict_labels: args.strict_labels,
+        test_first_evidence: args.test_first_evidence.clone(),
     }
 }
 
@@ -819,6 +820,7 @@ mod tests {
             labels: Vec::new(),
             label_catalog: None,
             strict_labels: false,
+            test_first_evidence: None,
             timeout: std::time::Duration::from_secs(30 * 60),
             no_merge,
             allow_non_default_base: false,
