@@ -99,6 +99,12 @@ pub fn run_forge_cli_in(stub: &StubEnv, args: &[&str], cwd: Option<&Path>) -> Cm
     for key in SCRUBBED_ENV {
         cmd.env_remove(key);
     }
+    // Isolate the user-global config layer. `ForgeConfig::load_global()` reads
+    // `${XDG_CONFIG_HOME}/forge-cli/config.toml`, so without this the developer's
+    // real global config (e.g. `[test_first] require = true`) would leak into
+    // tests and flip outcomes. Point it at an empty per-run dir; individual
+    // stubs may still override it via `.env("XDG_CONFIG_HOME", …)`.
+    cmd.env("XDG_CONFIG_HOME", stub.tempdir.path().join("xdg-config"));
     for (k, v) in &stub.envs {
         cmd.env(k, v);
     }
