@@ -91,6 +91,10 @@ validations_catalog:
     rule: "search refs-to <ref> parses as a GitHub URL, owner/name#number, or #number / number"
     error_kind: ref_invalid
     exit: DATA
+  test_first_evidence:
+    rule: "when [test_first].require resolves true (repo or global config) and --kind is feature/bug, --test-first-evidence <dir> must point at a verified test-first-evidence record (a failing test or explicit waiver plus a passing final validation); docs/chore/ci/refactor are exempt"
+    error_kind: test_first_evidence_required | test_first_evidence_incomplete | test_first_evidence_unreadable
+    exit: DATA
 
 # ---------------------------------------------------------------------------
 # Global flags every subcommand inherits.
@@ -132,6 +136,7 @@ operations:
       - { name: --label,       type: list<string>,   default: [] }
       - { name: --label-catalog, type: path,          required: false }
       - { name: --strict-labels, type: bool,          default: false }
+      - { name: --test-first-evidence, type: path,    required: false } # required only when [test_first].require resolves true for feature/bug
     validations:
       - branch_name
       - branch_kind_matches
@@ -142,6 +147,7 @@ operations:
       - label_catalog # only when --strict-labels is set
       - worktree_clean
       - head_pushed
+      - test_first_evidence # only when [test_first].require resolves true
     backends:
       github:
         program: gh
@@ -705,14 +711,17 @@ macros:
       - { name: --allow-unresolved-threads, type: bool,                         default: false }
       - { name: --allow-unchecked-tasks,    type: bool,                         default: false }
       - { name: --allow-unchecked-tasks-reason, type: string,                   default: null }
+      - { name: --test-first-evidence,      type: path,                         required: false } # forwarded to create and enforced on the adopt path when [test_first].require resolves true
     sequence:
       - { step: auth_status,        op: auth.status }
       - { step: repo_view,          op: repo.view }
       # Head-branch lookup (pr.list --state open --head <branch>): an open
       # PR/MR on the resolved head branch is adopted — `adopt` replaces
       # `create` in data.steps[] (payload is the PR's pr.view shape, body
-      # re-validated against the body-section gate) and the lifecycle
-      # resumes at wait_checks. The lookup itself is not a recorded step.
+      # re-validated against the body-section gate). When [test_first].require
+      # resolves true the adopt path also enforces the test_first_evidence
+      # validation, so an adopted feature/bug PR cannot bypass the gate. The
+      # lifecycle then resumes at wait_checks. The lookup is not a recorded step.
       - { step: adopt,              op: pr.view,   when: "open PR exists for head branch" }
       - { step: create,             op: pr.create, when: "no open PR exists for head branch" }
       - { step: wait_checks,        op: pr.wait-checks }

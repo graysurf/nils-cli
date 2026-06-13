@@ -742,12 +742,38 @@ strict_providers = false
 cache_fallback = false
 cache_max_age = "30m"
 no_cache = false
+
+[test_first]
+require = false                       # when true, pr create / pr deliver for
+                                      # feature/bug kinds must carry verified
+                                      # test-first evidence (see below)
 ```
 
-Resolution order for any setting: explicit flag > `.forge-cli.toml` >
-spec default. Inbox env vars sit between explicit flags and `.forge-cli.toml`.
-Unknown keys produce a `warnings[]` entry, not an error —
-forward-compatibility for v2 fields.
+### Global config layer
+
+The same schema may live in a user-global file at
+`${XDG_CONFIG_HOME:-$HOME/.config}/forge-cli/config.toml`. It supplies defaults
+beneath the per-repo `.forge-cli.toml`, so a setting (e.g. `[test_first]
+require = true` or `[merge] method = "rebase"`) applies across every repo
+without duplicating it into each checkout. A missing global file is not an
+error. The global layer feeds every section, not just `[test_first]`.
+
+Resolution order for any setting: explicit flag > repo `.forge-cli.toml` >
+global `config.toml` > spec default. Inbox env vars sit between explicit flags
+and `.forge-cli.toml`. Unknown keys produce a `warnings[]` entry, not an
+error — forward-compatibility for v2 fields.
+
+### `[test_first]` — test-first evidence gate
+
+`require` defaults to `false`; the gate is off unless a repo or the global
+config opts in. When it resolves `true`, `pr create` and `pr deliver` (both the
+create and adopt paths, and the `--dry-run` preflight) require
+`--test-first-evidence <dir>` for `--kind feature` / `bug`. The directory must
+hold a verified `test-first-evidence` record — a failing test or an explicit
+waiver, plus a passing final validation. `docs` / `chore` / `ci` / `refactor`
+kinds are exempt. Failures surface as `test_first_evidence_required`,
+`test_first_evidence_incomplete`, or `test_first_evidence_unreadable`
+(exit `DATA`).
 
 Environment variables (read once at startup, all optional):
 

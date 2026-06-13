@@ -416,7 +416,7 @@ pub struct RuleVerdict {
 }
 
 impl RuleVerdict {
-    fn from_result(rule: &'static str, result: Result<(), ForgeError>) -> Self {
+    pub(crate) fn from_result(rule: &'static str, result: Result<(), ForgeError>) -> Self {
         match result {
             Ok(()) => Self {
                 rule,

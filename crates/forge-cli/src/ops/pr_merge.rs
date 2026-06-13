@@ -94,9 +94,10 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         remote_url_lookup,
     )?;
 
-    // Load .forge-cli.toml so the method default + delete_branch default flow
-    // from the per-repo config when no explicit flag is set.
-    let cfg = ForgeConfig::load_from(workdir, find_git_toplevel(workdir).as_deref());
+    // Load layered config (global ~/.config/forge-cli + per-repo
+    // .forge-cli.toml) so the method default + delete_branch default flow from
+    // either layer when no explicit flag is set.
+    let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
     let method = cfg.resolve_merge_method(args.method.map(|m| m.into_method()));
     let cfg_delete = cfg.resolve_delete_branch(None);
     // --keep-branch flips the implicit-true default off; explicit conflict
@@ -141,7 +142,7 @@ pub fn compute<R: BackendRunner>(
         global.repo.as_deref(),
         git_remote_url,
     )?;
-    let cfg = ForgeConfig::load_from(workdir, find_git_toplevel(workdir).as_deref());
+    let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
     let method = cfg.resolve_merge_method(args.method.map(|m| m.into_method()));
     let cfg_delete = cfg.resolve_delete_branch(None);
     enforce_keep_branch_conflict(args.keep_branch, &cfg)?;

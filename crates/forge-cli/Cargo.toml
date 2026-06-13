@@ -22,6 +22,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 nils-build-info = { version = "1.1.0", path = "../nils-build-info" }
 libc = "0.2"
 nils-common = { version = "1.1.0", path = "../nils-common", package = "nils-common" }
+agent-workflow-primitives = { version = "1.1.0", path = "../agent-workflow-primitives", package = "nils-agent-workflow-primitives" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml_ng = { workspace = true }
