@@ -34,7 +34,7 @@ use crate::cli::{
 };
 use crate::config::ForgeConfig;
 use crate::error::ForgeError;
-use crate::ops::pr_create::{self, Environment};
+use crate::ops::pr_create::{self, Environment, find_git_toplevel, test_first_gate};
 use crate::ops::pr_view::PrViewPayload;
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
 use crate::ops::{
@@ -216,7 +216,13 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         };
         let number = view.number;
         let url = view.url.clone();
-        if let Err(err) = validate_adopted(&view, args, workdir) {
+        // Resolve the test-first gate from layered config so an adopted
+        // feature/bug PR is held to the same evidence requirement as the
+        // create path (a draft opened earlier must still carry evidence to
+        // be delivered in an opted-in repo).
+        let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
+        let test_first_required = cfg.resolve_test_first_required(None);
+        if let Err(err) = validate_adopted(&view, args, workdir, test_first_required) {
             steps.push(Step {
                 step: "adopt",
                 ok: false,
@@ -413,15 +419,18 @@ fn adopt_lookup_args(head: &str) -> PrListArgs {
 
 /// Adopt-path validation. Mirrors the create-path gates that still apply to
 /// an existing PR: the adopted head branch must match `--kind`, the PR's
-/// *actual* body (fetched via pr.view) must pass the body-section gate, and
-/// the local tree must satisfy the same worktree / push rules as create
-/// (spec lock-down rules 4 and 5 cover `deliver`). Create-input-only gates
-/// (title, `--body`, local-path) are skipped — the PR already carries its
-/// own provider-validated title and body.
+/// *actual* body (fetched via pr.view) must pass the body-section gate, the
+/// local tree must satisfy the same worktree / push rules as create (spec
+/// lock-down rules 4 and 5 cover `deliver`), and — when the repo opts in — the
+/// test-first evidence gate. Create-input-only gates (title, `--body`,
+/// local-path) are skipped — the PR already carries its own provider-validated
+/// title and body. `test_first_required` is resolved by the caller from
+/// layered config so this stays a pure validation.
 fn validate_adopted(
     view: &PrViewPayload,
     args: &PrDeliverArgs,
     workdir: &Path,
+    test_first_required: bool,
 ) -> Result<(), ForgeError> {
     let prefix = branch_name(&view.head)?;
     branch_kind_matches(prefix, args.kind.into_kind())?;
@@ -429,6 +438,11 @@ fn validate_adopted(
     body_sections(view.body.as_deref().unwrap_or(""), &headings)?;
     worktree_clean(workdir, git_status_porcelain)?;
     head_pushed(workdir, git_head_state)?;
+    test_first_gate(
+        args.kind.into_kind(),
+        test_first_required,
+        args.test_first_evidence.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -465,6 +479,26 @@ fn resolve_preview_body(args: &PrDeliverArgs) -> String {
         return std::fs::read_to_string(path).unwrap_or_default();
     }
     String::new()
+}
+
+/// Build the test-first preflight verdict for `pr deliver --dry-run`. Returns
+/// `None` when the gate is off (`required == false`) so the dry-run only
+/// surfaces the rule for repos that opted in; otherwise it reports the same
+/// pass/fail the real run's `test_first_gate` would produce (exempt kinds such
+/// as docs/chore pass without evidence). Kept pure so the caller injects the
+/// resolved config and tests need no environment.
+fn test_first_preflight_verdict(args: &PrDeliverArgs, required: bool) -> Option<RuleVerdict> {
+    if !required {
+        return None;
+    }
+    Some(RuleVerdict::from_result(
+        "test_first",
+        test_first_gate(
+            args.kind.into_kind(),
+            required,
+            args.test_first_evidence.as_deref(),
+        ),
+    ))
 }
 
 fn emit_dry_run(
@@ -529,8 +563,17 @@ fn emit_dry_run(
         body: &body,
         headings: &headings,
     };
-    let local_preflight =
+    let mut local_preflight =
         run_local_preflight(&inputs, workdir, git_status_porcelain, git_head_state);
+    // Faithful test-first gate: when the repo opts in, the real run enforces
+    // evidence for feature/bug kinds (both create and adopt paths), so surface
+    // the same verdict here instead of predicting a success the real deliver
+    // would refuse.
+    let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
+    if let Some(verdict) = test_first_preflight_verdict(args, cfg.resolve_test_first_required(None))
+    {
+        local_preflight.push(verdict);
+    }
 
     let payload = PrDeliverDryRun {
         provider: ctx.provider.as_str(),
@@ -905,5 +948,57 @@ mod tests {
         assert_eq!(pc.base.as_deref(), Some("main"));
         assert_eq!(pc.title, "demo");
         assert!(!pc.no_draft, "deliver always creates draft");
+    }
+
+    #[test]
+    fn build_create_args_forwards_test_first_evidence() {
+        let mut a = args(false);
+        a.test_first_evidence = Some("evidence/dir".into());
+        let pc = build_create_args(&a, "main");
+        assert_eq!(pc.test_first_evidence.as_deref(), Some("evidence/dir"));
+    }
+
+    #[test]
+    fn dry_run_verdict_absent_when_gate_off() {
+        // The gate is off (no repo/global opt-in) → no test_first verdict so the
+        // dry-run preflight stays identical to pre-gate behaviour.
+        assert!(test_first_preflight_verdict(&args(false), false).is_none());
+    }
+
+    #[test]
+    fn dry_run_verdict_fails_feature_without_evidence_when_required() {
+        let a = args(false); // feature, no --test-first-evidence
+        let verdict = test_first_preflight_verdict(&a, true).expect("verdict surfaced");
+        assert_eq!(verdict.rule, "test_first");
+        assert!(
+            !verdict.ok,
+            "missing evidence must fail the dry-run preflight"
+        );
+        assert_eq!(
+            verdict.code.as_deref(),
+            Some("test_first_evidence_required")
+        );
+    }
+
+    #[test]
+    fn dry_run_verdict_passes_exempt_kind_when_required() {
+        let mut a = args(false);
+        a.kind = PrKindFlag::Docs; // exempt kind needs no evidence
+        let verdict = test_first_preflight_verdict(&a, true).expect("verdict surfaced");
+        assert!(verdict.ok, "docs is exempt from the test-first gate");
+    }
+
+    #[test]
+    fn dry_run_verdict_passes_feature_with_complete_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("test-first-evidence.json"),
+            r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"},"final_validation":{"command":"cargo test","status":"pass"}}"#,
+        )
+        .unwrap();
+        let mut a = args(false);
+        a.test_first_evidence = Some(dir.path().to_str().unwrap().to_string());
+        let verdict = test_first_preflight_verdict(&a, true).expect("verdict surfaced");
+        assert!(verdict.ok, "complete evidence must pass: {verdict:?}");
     }
 }

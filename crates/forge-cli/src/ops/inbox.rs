@@ -599,7 +599,7 @@ impl InboxRuntimeConfig {
 
 fn load_repo_config() -> ForgeConfig {
     let workdir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    ForgeConfig::load_from(&workdir, find_git_toplevel(&workdir).as_deref())
+    ForgeConfig::load_layered(&workdir, find_git_toplevel(&workdir).as_deref())
 }
 
 fn find_git_toplevel(start: &Path) -> Option<PathBuf> {

@@ -145,7 +145,7 @@ fn schema_ok() -> String {
 
 /// Resolve the git toplevel for layered-config discovery. Returns `None`
 /// outside a work tree (the layered loader then walks to the filesystem root).
-fn find_git_toplevel(start: &Path) -> Option<PathBuf> {
+pub(crate) fn find_git_toplevel(start: &Path) -> Option<PathBuf> {
     let output = std::process::Command::new("git")
         .current_dir(start)
         .args(["rev-parse", "--show-toplevel"])
@@ -163,7 +163,7 @@ fn find_git_toplevel(start: &Path) -> Option<PathBuf> {
 /// `--test-first-evidence` directory must hold a verified `test-first-evidence`
 /// record — a failing test or explicit waiver plus a passing final validation.
 /// Other kinds (docs, chore, ci, refactor) are exempt.
-fn test_first_gate(
+pub(crate) fn test_first_gate(
     kind: PrKind,
     required: bool,
     evidence_dir: Option<&str>,
