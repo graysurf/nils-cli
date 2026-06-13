@@ -11,9 +11,9 @@
 //! `../../etc` lands outside the source root and is rejected before any
 //! I/O happens.
 
-use crate::render::cache::{CACHE_FILE, CacheEntry, RenderCache};
+use crate::render::cache::{AGENTS_CACHE_FILE, CACHE_FILE, CacheEntry, RenderCache};
 use crate::render::helpers::{HelperContext, register_all};
-use crate::render::manifest::{ManifestSet, Skill, SourceRoot};
+use crate::render::manifest::{Agent, ManifestSet, Skill, SourceRoot};
 use anyhow::{Context, Result, anyhow};
 use nils_markdown::Engine;
 use sha2::{Digest, Sha256};
@@ -22,6 +22,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 pub const SKILL_TEMPLATE_FILE: &str = "SKILL.md.tera";
+/// Required canonical template under each `core/agents/<name>/` source
+/// dir. Mirrors [`SKILL_TEMPLATE_FILE`]; the rendered output lands at the
+/// product's `render_to` (e.g. `agents/<name>.toml`).
+pub const AGENT_TEMPLATE_FILE: &str = "AGENT.md.tera";
 const TERA_EXT: &str = "tera";
 
 /// One file under a skill source directory. The path is relative to the
@@ -69,7 +73,30 @@ pub fn write_product(
 /// guards apply *relative to* the caller-provided `output_root`, so
 /// the caller is responsible for choosing a safe root (audit-drift
 /// uses a fresh `TempDir`).
+///
+/// Renders the skills surface and the optional agents surface into the
+/// same `output_root`. The two surfaces keep independent cache files
+/// ([`CACHE_FILE`] / [`AGENTS_CACHE_FILE`]) so neither reconciles away the
+/// other's outputs on save. The returned report merges the rendered,
+/// cached, and skipped ids from both surfaces.
 pub(crate) fn write_product_to(
+    root: &SourceRoot,
+    manifests: Arc<ManifestSet>,
+    product: &str,
+    output_root: &Path,
+) -> Result<RenderReport> {
+    let mut report = write_skills_to(root, manifests.clone(), product, output_root)?;
+    let agents = write_agents_to(root, manifests, product, output_root)?;
+    report.rendered.extend(agents.rendered);
+    report.cached.extend(agents.cached);
+    report.skipped.extend(agents.skipped);
+    Ok(report)
+}
+
+/// Render every skill declared for `product` into `output_root`. This is
+/// the original per-product writer; the optional agents surface renders
+/// separately through [`write_agents_to`] against its own cache file.
+fn write_skills_to(
     root: &SourceRoot,
     manifests: Arc<ManifestSet>,
     product: &str,
@@ -163,7 +190,7 @@ pub(crate) fn write_product_to(
 
         let input_hash = input_hash(
             product,
-            skill,
+            &skill.id,
             &render.render_to,
             &source_files,
             &canonical_source_dir,
@@ -304,6 +331,217 @@ pub(crate) fn write_product_to(
     // skill that lingers in build/ is treated as still-expected and silently
     // kept in the live home (`candidates=0`). Removing the retired outputs
     // here closes both gaps from one place.
+    reconcile_retired_skills(
+        &prior_cache,
+        &next_cache,
+        &output_root,
+        &canonical_output_root,
+    )?;
+
+    next_cache
+        .save(&cache_path)
+        .with_context(|| format!("write {}", cache_path.display()))?;
+    Ok(report)
+}
+
+/// Render every agent declared in the optional `agents.yaml` for
+/// `product` into `output_root`. Structurally mirrors [`write_skills_to`]
+/// — same sandboxing, stale-output removal, sibling rendering, and retired
+/// reconcile — but keys its cache on [`AGENTS_CACHE_FILE`], requires the
+/// [`AGENT_TEMPLATE_FILE`] canonical template, and renders through
+/// [`render_agent_template`]. A tree with no agents (the common case)
+/// returns an empty report and only writes the agents cache file.
+fn write_agents_to(
+    root: &SourceRoot,
+    manifests: Arc<ManifestSet>,
+    product: &str,
+    output_root: &Path,
+) -> Result<RenderReport> {
+    require_known_product(&manifests, product)?;
+    let output_root = output_root.to_path_buf();
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("create_dir_all {}", output_root.display()))?;
+
+    let cache_path = output_root.join(AGENTS_CACHE_FILE);
+    let prior_cache = RenderCache::load_or_empty(&cache_path);
+    let manifest_bytes = read_manifest_bundle(root)?;
+    let mut next_cache = RenderCache::empty();
+    let mut report = RenderReport {
+        product: product.to_string(),
+        output_root: output_root.clone(),
+        ..RenderReport::default()
+    };
+
+    let canonical_source_root = root.path().to_path_buf();
+    let canonical_output_root = output_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize output root {}", output_root.display()))?;
+
+    for agent in &manifests.agents.agents {
+        let Some(render) = agent.products.get(product) else {
+            report.skipped.push(agent.id.clone());
+            continue;
+        };
+        validate_render_to(&agent.id, product, &render.render_to)?;
+
+        let source_dir = sandboxed_join(root.path(), &agent.source)?;
+        let canonical_source_dir = canonicalize_under(&canonical_source_root, &source_dir)?;
+        let source_files = walk_skill_source(&canonical_source_dir, &canonical_source_root)
+            .with_context(|| {
+                format!(
+                    "walk source for agent {} at {}",
+                    agent.id,
+                    canonical_source_dir.display()
+                )
+            })?;
+        let template_file = source_files
+            .iter()
+            .find(|f| f.rel == Path::new(AGENT_TEMPLATE_FILE))
+            .ok_or_else(|| {
+                anyhow!(
+                    "agent {} source {} is missing required {AGENT_TEMPLATE_FILE}",
+                    agent.id,
+                    agent.source
+                )
+            })?;
+        let template_body = fs::read_to_string(&template_file.abs).with_context(|| {
+            format!(
+                "read template {} for agent {}",
+                template_file.abs.display(),
+                agent.id
+            )
+        })?;
+
+        let render_to_rel = PathBuf::from(&render.render_to);
+        let output_dir_rel = render_to_rel.parent().ok_or_else(|| {
+            anyhow!(
+                "render_to {:?} for agent {} has no parent dir",
+                render.render_to,
+                agent.id,
+            )
+        })?;
+        let mut planned_outputs: Vec<String> = Vec::with_capacity(source_files.len());
+        for file in &source_files {
+            let rel = if file.rel == Path::new(AGENT_TEMPLATE_FILE) {
+                render_to_rel.clone()
+            } else {
+                output_dir_rel.join(strip_tera_suffix(&file.rel))
+            };
+            planned_outputs.push(rel.to_string_lossy().into_owned());
+        }
+        planned_outputs.sort();
+        planned_outputs.dedup();
+
+        let input_hash = input_hash(
+            product,
+            &agent.id,
+            &render.render_to,
+            &source_files,
+            &canonical_source_dir,
+            &manifest_bytes,
+        )
+        .with_context(|| format!("hash source tree for agent {}", agent.id))?;
+        let entry = CacheEntry {
+            hash: input_hash.clone(),
+            outputs: planned_outputs.clone(),
+        };
+        let output_path = sandboxed_join(&output_root, &render.render_to)?;
+        let cache_hit = prior_cache
+            .skills
+            .get(&agent.id)
+            .is_some_and(|prior| prior == &entry)
+            && output_path.exists();
+
+        if cache_hit {
+            report.cached.push(agent.id.clone());
+        } else {
+            // Same surgical stale-file removal as the skills path: only
+            // touch paths recorded in this agent's prior cache entry.
+            if let Some(prior) = prior_cache.skills.get(&agent.id) {
+                let planned: std::collections::BTreeSet<&String> = planned_outputs.iter().collect();
+                for stale in &prior.outputs {
+                    if planned.contains(stale) {
+                        continue;
+                    }
+                    let stale_path = sandboxed_join(&output_root, stale)?;
+                    if !stale_path.exists() {
+                        continue;
+                    }
+                    let canonical_stale = stale_path.canonicalize().with_context(|| {
+                        format!("canonicalize stale output {}", stale_path.display())
+                    })?;
+                    if !canonical_stale.starts_with(&canonical_output_root) {
+                        return Err(anyhow!(
+                            "stale rendered output {} resolves outside the build root \
+                             ({} not under {}) — refusing to remove",
+                            stale_path.display(),
+                            canonical_stale.display(),
+                            canonical_output_root.display(),
+                        ));
+                    }
+                    fs::remove_file(&canonical_stale).with_context(|| {
+                        format!("remove stale rendered file {}", canonical_stale.display())
+                    })?;
+                }
+            }
+
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create_dir_all {}", parent.display()))?;
+            }
+            let rendered =
+                render_agent_template(root.path(), &manifests, product, agent, &template_body)?;
+            let output_path_guarded = guard_write_under(&canonical_output_root, &output_path)?;
+            fs::write(&output_path_guarded, rendered.as_bytes())
+                .with_context(|| format!("write {}", output_path_guarded.display()))?;
+
+            for file in &source_files {
+                if file.rel == Path::new(AGENT_TEMPLATE_FILE) {
+                    continue;
+                }
+                let dest_rel = strip_tera_suffix(&file.rel);
+                let dest = sandboxed_join(
+                    &output_root,
+                    &output_dir_rel.join(&dest_rel).to_string_lossy(),
+                )?;
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("create_dir_all {}", parent.display()))?;
+                }
+                let dest = guard_write_under(&canonical_output_root, &dest)?;
+                if file.rel.extension().and_then(|e| e.to_str()) == Some(TERA_EXT) {
+                    let body = fs::read_to_string(&file.abs).with_context(|| {
+                        format!(
+                            "read sibling tera template {} for agent {}",
+                            file.abs.display(),
+                            agent.id
+                        )
+                    })?;
+                    let rendered =
+                        render_agent_template(root.path(), &manifests, product, agent, &body)?;
+                    fs::write(&dest, rendered.as_bytes())
+                        .with_context(|| format!("write {}", dest.display()))?;
+                } else {
+                    fs::copy(&file.abs, &dest).with_context(|| {
+                        format!("copy {} -> {}", file.abs.display(), dest.display())
+                    })?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let perms = fs::Permissions::from_mode(file.mode);
+                        fs::set_permissions(&dest, perms).with_context(|| {
+                            format!("set mode {:#o} on {}", file.mode, dest.display())
+                        })?;
+                    }
+                }
+            }
+            report.rendered.push(agent.id.clone());
+        }
+        next_cache.skills.insert(agent.id.clone(), entry);
+    }
+
+    // `reconcile_retired_skills` is generic over the `RenderCache.skills`
+    // map; here it reconciles retired *agents* against the agents cache.
     reconcile_retired_skills(
         &prior_cache,
         &next_cache,
@@ -481,12 +719,43 @@ fn render_template(
         .with_context(|| format!("render skill {}", skill.id))
 }
 
+/// Render an agent template. Mirrors [`render_template`] but builds the
+/// helper context from an [`Agent`] (which carries no `required_clis` or
+/// `state_out_mode` of its own) and exposes the active `product` and agent
+/// `id` as Tera variables, so one canonical `AGENT.md.tera` can branch to
+/// Codex TOML vs Claude Markdown. The skill-bound helpers stay registered
+/// for `cli_ref` reuse; agent templates are not expected to call
+/// `skill_ref` / `state_out`.
+fn render_agent_template(
+    source_root: &Path,
+    manifests: &Arc<ManifestSet>,
+    product: &str,
+    agent: &Agent,
+    template_body: &str,
+) -> Result<String> {
+    let ctx = HelperContext {
+        source_root: source_root.to_path_buf(),
+        manifests: manifests.clone(),
+        current_product: product.to_string(),
+        current_skill_id: agent.id.clone(),
+        current_skill_required_clis: Default::default(),
+        current_skill_state_out_mode: Default::default(),
+    };
+    let mut engine = Engine::builder().build();
+    register_all(&mut engine, Arc::new(ctx));
+    let vars = serde_json::json!({ "product": product, "id": agent.id });
+    engine
+        .render_str(template_body, &vars)
+        .with_context(|| format!("render agent {}", agent.id))
+}
+
 struct ManifestBytes {
     skills: Vec<u8>,
     plugins: Vec<u8>,
     product_capabilities: Vec<u8>,
     runtime_roots: Vec<u8>,
     cli_tools: Vec<u8>,
+    agents: Vec<u8>,
 }
 
 fn read_manifest_bundle(root: &SourceRoot) -> Result<ManifestBytes> {
@@ -495,31 +764,43 @@ fn read_manifest_bundle(root: &SourceRoot) -> Result<ManifestBytes> {
         let path = dir.join(name);
         fs::read(&path).with_context(|| format!("hash-read {}", path.display()))
     };
+    // `agents.yaml` is optional; absence hashes as empty bytes so a tree
+    // without the file keeps a stable digest.
+    let read_optional = |name: &str| -> Result<Vec<u8>> {
+        let path = dir.join(name);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        fs::read(&path).with_context(|| format!("hash-read {}", path.display()))
+    };
     Ok(ManifestBytes {
         skills: read("skills.yaml")?,
         plugins: read("plugins.yaml")?,
         product_capabilities: read("product-capabilities.yaml")?,
         runtime_roots: read("runtime-roots.yaml")?,
         cli_tools: read("cli-tools.yaml")?,
+        agents: read_optional("agents.yaml")?,
     })
 }
 
 fn input_hash(
     product: &str,
-    skill: &Skill,
+    id: &str,
     render_to: &str,
     source_files: &[SourceFile],
     canonical_source_dir: &Path,
     manifests: &ManifestBytes,
 ) -> Result<String> {
-    // Hash version bumped to v2 when multi-file render landed; cache
-    // entries from v0.13 are auto-invalidated because the version tag
-    // changes the digest of an otherwise-identical input set.
+    // Hash version bumped to v3 when the agents render surface landed:
+    // the manifest bundle now folds in `agents.yaml`, so every prior
+    // cache entry is auto-invalidated by the version tag (v2 entries no
+    // longer match) and re-rendered byte-identically. v2 itself landed
+    // with multi-file render; v0.13 entries were invalidated then.
     let mut hasher = Sha256::new();
-    hasher.update(b"agent-runtime-cli render v2\0");
+    hasher.update(b"agent-runtime-cli render v3\0");
     hasher.update(product.as_bytes());
     hasher.update(b"\0");
-    hasher.update(skill.id.as_bytes());
+    hasher.update(id.as_bytes());
     hasher.update(b"\0");
     hasher.update(render_to.as_bytes());
     hasher.update(b"\0");
@@ -566,6 +847,8 @@ fn input_hash(
     hasher.update(&manifests.runtime_roots);
     hasher.update(b"\0");
     hasher.update(&manifests.cli_tools);
+    hasher.update(b"\0");
+    hasher.update(&manifests.agents);
     let digest = hasher.finalize();
     let mut out = String::with_capacity(7 + digest.len() * 2);
     out.push_str("sha256:");
@@ -900,6 +1183,91 @@ formulas:
 
     fn load_set(root: &SourceRoot) -> Arc<ManifestSet> {
         Arc::new(crate::render::manifest::load_all(root).unwrap())
+    }
+
+    /// Drop an optional `manifests/agents.yaml` and one canonical agent
+    /// source onto an existing fixture root. The single `AGENT.md.tera`
+    /// branches on the `product` template variable so it can emit Codex
+    /// TOML or Claude Markdown from one source.
+    fn add_agent_fixture(root: &SourceRoot) {
+        write(
+            &root.path().join("manifests/agents.yaml"),
+            r#"
+schema_version: 1
+agents:
+  - id: reviewer-quick
+    source: core/agents/reviewer-quick
+    products:
+      codex:
+        render_to: agents/reviewer-quick.toml
+      claude:
+        render_to: agents/reviewer-quick.md
+"#,
+        );
+        write(
+            &root.path().join("core/agents/reviewer-quick/AGENT.md.tera"),
+            "{% if product == \"codex\" %}name = \"reviewer-quick\"\n\
+             {% else %}---\nname: reviewer-quick\n---\n{% endif %}",
+        );
+    }
+
+    #[test]
+    fn write_product_renders_codex_agent_into_build_tree() {
+        let tmp = TempDir::new().unwrap();
+        let root = fixture_source_root(&tmp);
+        add_agent_fixture(&root);
+        let set = load_set(&root);
+
+        let report = write_product(&root, set, "codex").unwrap();
+
+        let out = report.output_root.join("agents/reviewer-quick.toml");
+        assert!(out.exists(), "expected agent render at {}", out.display());
+        let body = fs::read_to_string(&out).unwrap();
+        assert!(body.contains("name = \"reviewer-quick\""), "{body}");
+        assert!(
+            report.rendered.iter().any(|id| id == "reviewer-quick"),
+            "agent id absent from rendered report: {:?}",
+            report.rendered
+        );
+    }
+
+    #[test]
+    fn write_product_renders_claude_agent_with_product_branch() {
+        let tmp = TempDir::new().unwrap();
+        let root = fixture_source_root(&tmp);
+        add_agent_fixture(&root);
+        let set = load_set(&root);
+
+        let report = write_product(&root, set, "claude").unwrap();
+
+        // The one canonical AGENT.md.tera branched on `product` to the
+        // Claude Markdown arm and landed at the claude `render_to`.
+        let out = report.output_root.join("agents/reviewer-quick.md");
+        let body = fs::read_to_string(&out).unwrap();
+        assert!(body.contains("---\nname: reviewer-quick"), "{body}");
+        assert!(!body.contains("name = \"reviewer-quick\""), "{body}");
+        assert!(report.rendered.iter().any(|id| id == "reviewer-quick"));
+    }
+
+    #[test]
+    fn agent_render_is_cached_on_second_run() {
+        let tmp = TempDir::new().unwrap();
+        let root = fixture_source_root(&tmp);
+        add_agent_fixture(&root);
+        let set = load_set(&root);
+
+        let first = write_product(&root, set.clone(), "codex").unwrap();
+        assert!(first.rendered.iter().any(|id| id == "reviewer-quick"));
+
+        // Second run with unchanged source: the agents cache (its own
+        // `.render-cache-agents.json`) reports a hit, not a re-render.
+        let second = write_product(&root, set, "codex").unwrap();
+        assert!(
+            second.cached.iter().any(|id| id == "reviewer-quick"),
+            "expected agent cache hit, got rendered={:?} cached={:?}",
+            second.rendered,
+            second.cached
+        );
     }
 
     #[test]

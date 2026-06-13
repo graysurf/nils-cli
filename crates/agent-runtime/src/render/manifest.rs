@@ -87,6 +87,10 @@ pub struct ManifestSet {
     pub product_capabilities: ProductCapabilitiesManifest,
     pub runtime_roots: RuntimeRootsManifest,
     pub cli_tools: CliToolsManifest,
+    /// Optional reviewer-agent definitions. Absent `agents.yaml` resolves
+    /// to an empty manifest so source trees and fixtures without the file
+    /// keep loading and rendering unchanged.
+    pub agents: AgentsManifest,
 }
 
 /// Read and validate every Phase 1 manifest under
@@ -103,6 +107,8 @@ pub fn load_all(root: &SourceRoot) -> Result<ManifestSet, ManifestError> {
         )?,
         runtime_roots: load::<RuntimeRootsManifest>(&dir.join("runtime-roots.yaml"), &root.path)?,
         cli_tools: load::<CliToolsManifest>(&dir.join("cli-tools.yaml"), &root.path)?,
+        agents: load_optional::<AgentsManifest>(&dir.join("agents.yaml"), &root.path)?
+            .unwrap_or_default(),
     })
 }
 
@@ -136,6 +142,20 @@ where
         });
     }
     Ok(parsed)
+}
+
+/// Like [`load`], but a missing file resolves to `Ok(None)` instead of
+/// [`ManifestError::Missing`]. Used for optional manifests (`agents.yaml`)
+/// that not every source tree ships. A present-but-malformed or
+/// wrong-`schema_version` file still errors.
+fn load_optional<T>(file: &Path, root: &Path) -> Result<Option<T>, ManifestError>
+where
+    T: for<'de> Deserialize<'de> + WithSchemaVersion,
+{
+    if !file.exists() {
+        return Ok(None);
+    }
+    load(file, root).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +239,41 @@ pub struct ProductRender {
     pub render_to: String,
     #[serde(default)]
     pub path_override: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// agents.yaml (optional)
+// ---------------------------------------------------------------------------
+
+/// Optional canonical reviewer-agent definitions. An absent `agents.yaml`
+/// deserializes to the [`Default`] empty manifest (see [`load_optional`]),
+/// so the render surface is additive: trees without the file render their
+/// skills exactly as before. `agents` defaults to empty when the key is
+/// omitted but `schema_version` is still validated when the file exists.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsManifest {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub agents: Vec<Agent>,
+}
+
+impl WithSchemaVersion for AgentsManifest {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+/// One canonical agent definition rendered into product-native files
+/// (Codex TOML, Claude Markdown). Reuses the skill `products` /
+/// `render_to` shape: each product's `render_to` selects the output path
+/// and extension under `build/<product>/`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Agent {
+    pub id: String,
+    pub source: String,
+    pub products: SkillProducts,
 }
 
 // ---------------------------------------------------------------------------
@@ -725,5 +780,49 @@ plugins:
 "#;
         let err = serde_yaml_ng::from_str::<PluginsManifest>(yaml).unwrap_err();
         assert!(format!("{err}").contains("cluade"));
+    }
+
+    #[test]
+    fn absent_agents_manifest_defaults_to_empty() {
+        let tmp = TempDir::new().unwrap();
+        // No agents.yaml in the fixture — the surface is optional.
+        write_fixture(tmp.path(), &[]);
+        let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
+        let set = load_all(&root).unwrap();
+        assert!(set.agents.agents.is_empty());
+    }
+
+    #[test]
+    fn present_agents_manifest_is_parsed() {
+        let tmp = TempDir::new().unwrap();
+        let agents = r#"schema_version: 1
+agents:
+  - id: reviewer-quick
+    source: core/agents/reviewer-quick
+    products:
+      codex:
+        render_to: agents/reviewer-quick.toml
+"#;
+        write_fixture(tmp.path(), &[("agents.yaml", agents)]);
+        let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
+        let set = load_all(&root).unwrap();
+        assert_eq!(set.agents.agents.len(), 1);
+        let agent = &set.agents.agents[0];
+        assert_eq!(agent.id, "reviewer-quick");
+        assert!(agent.products.get("codex").is_some());
+        assert!(agent.products.get("claude").is_none());
+    }
+
+    #[test]
+    fn unknown_field_in_agents_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let agents = "schema_version: 1\nagents: []\nbogus: true\n";
+        write_fixture(tmp.path(), &[("agents.yaml", agents)]);
+        let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
+        let err = load_all(&root).unwrap_err();
+        match err {
+            ManifestError::Parse { file, .. } => assert!(file.ends_with("agents.yaml")),
+            other => panic!("expected ManifestError::Parse, got {other:?}"),
+        }
     }
 }
