@@ -47,6 +47,28 @@ pub fn update_golden(
             .with_context(|| format!("create_dir_all {}", dst_dir.display()))?;
         copy_tree(&src_dir, &dst_dir, &mut copied)?;
     }
+    // Mirror the copy for the optional agents surface. Agent ids land in
+    // the same merged `report.rendered`/`cached` set, so `touched` already
+    // covers them; the render dir is the parent of `render_to` (e.g.
+    // `agents/` for `agents/<id>.toml`).
+    for agent in &manifests.agents.agents {
+        if !touched.contains(&agent.id) {
+            continue;
+        }
+        let Some(render) = agent.products.get(&report.product) else {
+            continue;
+        };
+        let render_to = Path::new(&render.render_to);
+        let render_dir = render_to.parent().unwrap_or_else(|| Path::new(""));
+        let src_dir = sandboxed_join(&report.output_root, &render_dir.to_string_lossy())?;
+        let dst_dir = sandboxed_join(&golden_root, &format!("{}/expected", render_dir.display()))?;
+        if !src_dir.exists() {
+            continue;
+        }
+        fs::create_dir_all(&dst_dir)
+            .with_context(|| format!("create_dir_all {}", dst_dir.display()))?;
+        copy_tree(&src_dir, &dst_dir, &mut copied)?;
+    }
     Ok(copied)
 }
 
@@ -278,5 +300,31 @@ formulas:
         update_golden(root.path(), &set, &second).unwrap();
         let body = fs::read_to_string(&expected).unwrap();
         assert!(body.contains("# /market-favorites"), "{body}");
+    }
+
+    #[test]
+    fn update_golden_copies_agent_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let root = fixture(&tmp);
+        write(
+            &root.path().join("manifests/agents.yaml"),
+            "schema_version: 1\nagents:\n  - id: reviewer-quick\n    \
+             source: core/agents/reviewer-quick\n    products:\n      codex:\n        \
+             render_to: agents/reviewer-quick.toml\n",
+        );
+        write(
+            &root.path().join("core/agents/reviewer-quick/AGENT.md.tera"),
+            "name = \"reviewer-quick\"\n",
+        );
+        let set = Arc::new(manifest::load_all(&root).unwrap());
+        let report = writer::write_product(&root, set.clone(), "codex").unwrap();
+        let copied = update_golden(root.path(), &set, &report).unwrap();
+        assert!(!copied.is_empty(), "golden update copied nothing");
+        let expected = root
+            .path()
+            .join("tests/golden/codex/agents/expected/reviewer-quick.toml");
+        assert!(expected.exists(), "{} missing", expected.display());
+        let body = fs::read_to_string(&expected).unwrap();
+        assert!(body.contains("name = \"reviewer-quick\""), "{body}");
     }
 }

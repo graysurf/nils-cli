@@ -170,6 +170,7 @@ mod test_support {
                 },
                 formulas,
             },
+            agents: Default::default(),
         }
     }
 

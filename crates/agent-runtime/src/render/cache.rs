@@ -13,6 +13,11 @@ use std::fs;
 use std::path::Path;
 
 pub const CACHE_FILE: &str = ".render-cache.json";
+/// Separate cache file for the optional agents render surface. Kept
+/// distinct from `CACHE_FILE` so the agents loop and the skills loop
+/// never reconcile against each other's entries (a shared cache would
+/// make each surface delete the other's outputs on save).
+pub const AGENTS_CACHE_FILE: &str = ".render-cache-agents.json";
 /// Bumped to 2 alongside the multi-file render landing (v0.14): cache
 /// entries now record every file the skill wrote (`outputs: Vec<String>`)
 /// so the renderer can surgically remove sibling files that disappear
