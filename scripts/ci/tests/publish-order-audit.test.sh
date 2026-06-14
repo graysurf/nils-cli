@@ -98,14 +98,15 @@ assert_fails "missing order file is exit 2" 2 \
 
 # --- Synthetic-metadata cases (--metadata-file) ------------------------------
 
-# Optional normal dependency is a real ordering constraint: crate-a optionally
-# depends on crate-b, so listing crate-a before crate-b is an inversion.
+# Optional normal PATH dependency is a real ordering constraint: crate-a
+# optionally (path-)depends on crate-b, so listing crate-a before crate-b is an
+# inversion.
 cat >"$tmp_dir/meta-optional.json" <<'JSON'
 {
   "workspace_members": ["crate-a 0.0.0 (path+file:///a)", "crate-b 0.0.0 (path+file:///b)"],
   "packages": [
     {"id": "crate-a 0.0.0 (path+file:///a)", "name": "crate-a", "publish": null,
-     "dependencies": [{"name": "crate-b", "kind": null, "optional": true}]},
+     "dependencies": [{"name": "crate-b", "kind": null, "optional": true, "path": "/b"}]},
     {"id": "crate-b 0.0.0 (path+file:///b)", "name": "crate-b", "publish": null,
      "dependencies": []}
   ]
@@ -116,18 +117,18 @@ assert_fails "optional dependency constrains order" 1 \
   "before its dependency crate-b" \
   --order-file "$tmp_dir/order-optional.txt" --metadata-file "$tmp_dir/meta-optional.json"
 
-# Dev-dependency DOES constrain the order: cargo resolves versioned path
+# Dev PATH dependency DOES constrain the order: cargo resolves versioned path
 # dev-dependencies while packaging, so the real publisher (publish-crates.sh,
 # which constrains on any workspace path dep regardless of kind) requires
-# crate-b before crate-a. Listing crate-a (dev-depends crate-b) before crate-b
-# is an inversion the audit must catch, or it would green-light an order the
-# publisher rejects.
+# crate-b before crate-a. Listing crate-a (path dev-depends crate-b) before
+# crate-b is an inversion the audit must catch, or it would green-light an order
+# the publisher rejects.
 cat >"$tmp_dir/meta-dev.json" <<'JSON'
 {
   "workspace_members": ["crate-a 0.0.0 (path+file:///a)", "crate-b 0.0.0 (path+file:///b)"],
   "packages": [
     {"id": "crate-a 0.0.0 (path+file:///a)", "name": "crate-a", "publish": null,
-     "dependencies": [{"name": "crate-b", "kind": "dev"}]},
+     "dependencies": [{"name": "crate-b", "kind": "dev", "path": "/b"}]},
     {"id": "crate-b 0.0.0 (path+file:///b)", "name": "crate-b", "publish": null,
      "dependencies": []}
   ]
@@ -137,6 +138,29 @@ printf 'crate-a\ncrate-b\n' >"$tmp_dir/order-dev.txt"
 assert_fails "dev dependency constrains order" 1 \
   "before its dependency crate-b" \
   --order-file "$tmp_dir/order-dev.txt" --metadata-file "$tmp_dir/meta-dev.json"
+
+# A dependency on an already-published REGISTRY version of a sibling crate is
+# NOT a publish-order edge, even when it shares a workspace member's name: cargo
+# reports it by name with a `source: registry...` and no `path`, and the real
+# publisher (publish-crates.sh, which keys on `dep.get("path")`) does not
+# constrain order on it. crate-a dev-depends on the *registry* crate-b, so
+# listing crate-a before crate-b must PASS — treating it as an edge by name
+# alone would reject an order the publisher accepts.
+cat >"$tmp_dir/meta-dev-registry.json" <<'JSON'
+{
+  "workspace_members": ["crate-a 0.0.0 (path+file:///a)", "crate-b 0.0.0 (path+file:///b)"],
+  "packages": [
+    {"id": "crate-a 0.0.0 (path+file:///a)", "name": "crate-a", "publish": null,
+     "dependencies": [{"name": "crate-b", "kind": "dev",
+       "source": "registry+https://github.com/rust-lang/crates.io-index", "req": "^0.0.0"}]},
+    {"id": "crate-b 0.0.0 (path+file:///b)", "name": "crate-b", "publish": null,
+     "dependencies": []}
+  ]
+}
+JSON
+printf 'crate-a\ncrate-b\n' >"$tmp_dir/order-dev-registry.txt"
+assert_passes "registry dev-dependency does not constrain order" \
+  --order-file "$tmp_dir/order-dev-registry.txt" --metadata-file "$tmp_dir/meta-dev-registry.json"
 
 # A publish=false crate must not appear in the order.
 cat >"$tmp_dir/meta-pubfalse.json" <<'JSON'
