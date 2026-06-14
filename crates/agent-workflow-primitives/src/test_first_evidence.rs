@@ -259,7 +259,8 @@ fn verify_record(args: &CommonArgs) -> Result<VerifyResult, CliError> {
 /// the `forge-cli` PR test-first gate. Returns the structured [`VerifyResult`]
 /// (inspect `complete` / `missing`), or an error message when the record
 /// directory is missing or unreadable. A record is `complete` when it carries
-/// a failing test or an explicit waiver plus a passing final validation.
+/// a failing test (non-zero exit) or an explicit waiver, plus a passing final
+/// validation.
 pub fn verify_dir(out_dir: &Path) -> Result<VerifyResult, String> {
     let result = read_record_result(out_dir).map_err(|err| err.message)?;
     let missing = missing_evidence_fields(&result.record);
@@ -363,8 +364,17 @@ fn record_result(record_file: PathBuf, record: EvidenceRecord) -> RecordResult {
 
 fn missing_evidence_fields(record: &EvidenceRecord) -> Vec<String> {
     let mut missing = Vec::new();
-    if record.failing_test.is_none() && record.waiver.is_none() {
-        missing.push("failing_test_or_waiver".to_string());
+    match (record.failing_test.as_ref(), record.waiver.as_ref()) {
+        // A waiver substitutes for failing-test evidence; the failing_test's
+        // exit code is irrelevant on the waiver path.
+        (_, Some(_)) => {}
+        // A "failing" test that exited 0 never demonstrated a pre-fix failure,
+        // so it does not satisfy "a failing test or an explicit waiver".
+        (Some(failing), None) if failing.exit_code == 0 => {
+            missing.push("failing_test_nonzero_exit".to_string());
+        }
+        (Some(_), None) => {}
+        (None, None) => missing.push("failing_test_or_waiver".to_string()),
     }
     match record.final_validation.as_ref() {
         None => missing.push("final_validation".to_string()),
@@ -674,5 +684,51 @@ mod tests {
                 "final_validation".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn zero_exit_failing_test_is_not_complete_evidence() {
+        // A `failing_test` that exited 0 never demonstrated a pre-fix failure,
+        // so without a waiver it must not satisfy the gate even alongside a
+        // passing final validation.
+        let record = super::EvidenceRecord {
+            schema_version: super::RECORD_SCHEMA_VERSION.to_string(),
+            change_classification: "bug-fix".to_string(),
+            production_paths: Vec::new(),
+            notes: Vec::new(),
+            failing_test: Some(super::FailingEvidence {
+                command: "cargo test".to_string(),
+                exit_code: 0,
+                summary: "all green".to_string(),
+                test_name: None,
+                artifacts: Vec::new(),
+            }),
+            waiver: None,
+            final_validation: Some(super::FinalValidation {
+                command: "cargo test".to_string(),
+                status: "pass".to_string(),
+                summary: None,
+                artifacts: Vec::new(),
+            }),
+        };
+        assert_eq!(
+            missing_evidence_fields(&record),
+            vec!["failing_test_nonzero_exit".to_string()],
+        );
+
+        // A genuinely failing test (non-zero exit) is complete evidence.
+        let mut failing = record;
+        failing.failing_test.as_mut().unwrap().exit_code = 1;
+        assert!(missing_evidence_fields(&failing).is_empty());
+
+        // A waiver substitutes for failing-test evidence, so a zero-exit
+        // failing_test paired with a waiver is still complete.
+        let mut waived = failing;
+        waived.failing_test.as_mut().unwrap().exit_code = 0;
+        waived.waiver = Some(super::WaiverEvidence {
+            reason: "non-testable change".to_string(),
+            substitute_validation: Vec::new(),
+        });
+        assert!(missing_evidence_fields(&waived).is_empty());
     }
 }

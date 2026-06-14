@@ -96,14 +96,15 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
     // Load layered config (global ~/.config/forge-cli + per-repo
     // .forge-cli.toml) so the method default + delete_branch default flow from
-    // either layer when no explicit flag is set.
-    let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
+    // either layer when no explicit flag is set. `repo_delete_branch` keeps the
+    // repo-layer `delete_branch` value alone for the rule-10 conflict check.
+    let (cfg, repo_delete_branch) = load_merge_config(workdir);
     let method = cfg.resolve_merge_method(args.method.map(|m| m.into_method()));
     let cfg_delete = cfg.resolve_delete_branch(None);
     // --keep-branch flips the implicit-true default off; explicit conflict
     // (rule 10) fires only when the user paired --keep-branch with an explicit
     // [merge].delete_branch = true config in the same repo.
-    enforce_keep_branch_conflict(args.keep_branch, &cfg)?;
+    enforce_keep_branch_conflict(args.keep_branch, repo_delete_branch)?;
     let delete_branch = if args.keep_branch { false } else { cfg_delete };
 
     if global.dry_run {
@@ -142,12 +143,30 @@ pub fn compute<R: BackendRunner>(
         global.repo.as_deref(),
         git_remote_url,
     )?;
-    let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
+    let (cfg, repo_delete_branch) = load_merge_config(workdir);
     let method = cfg.resolve_merge_method(args.method.map(|m| m.into_method()));
     let cfg_delete = cfg.resolve_delete_branch(None);
-    enforce_keep_branch_conflict(args.keep_branch, &cfg)?;
+    enforce_keep_branch_conflict(args.keep_branch, repo_delete_branch)?;
     let delete_branch = if args.keep_branch { false } else { cfg_delete };
     run_lockdown_chain(runner, global, &ctx, args, workdir, method, delete_branch)
+}
+
+/// Load the layered merge config and, alongside the merged view, surface the
+/// repo-layer `[merge].delete_branch` value on its own.
+///
+/// Rule 10 (`keep_branch_conflict`) must check only an explicit *repo*
+/// `.forge-cli.toml` opt-in: an explicit `--keep-branch` outranks a global
+/// default in the precedence chain (`explicit flag > repo > global > spec
+/// default`), so a global `delete_branch = true` must not collide with it.
+/// The merged `cfg` is still used for every other resolution (method, the
+/// effective `delete_branch` default when `--keep-branch` is absent).
+fn load_merge_config(workdir: &std::path::Path) -> (ForgeConfig, Option<bool>) {
+    let repo = ForgeConfig::load_from(workdir, find_git_toplevel(workdir).as_deref());
+    let repo_delete_branch = repo.merge_delete_branch;
+    (
+        ForgeConfig::load_global().overlaid_by(repo),
+        repo_delete_branch,
+    )
 }
 
 fn run_lockdown_chain<R: BackendRunner>(
@@ -531,12 +550,16 @@ fn extract_body(ctx: &ProviderContext, output: &BackendSuccess) -> String {
         .to_string()
 }
 
-fn enforce_keep_branch_conflict(keep_branch: bool, cfg: &ForgeConfig) -> Result<(), ForgeError> {
+fn enforce_keep_branch_conflict(
+    keep_branch: bool,
+    repo_delete_branch: Option<bool>,
+) -> Result<(), ForgeError> {
     // Conflict surfaces when the user asks to keep the source branch AND the
-    // repo config explicitly opts into branch deletion. The implicit default
-    // (`delete_branch=true` when nothing is set) is silently overridden by
-    // `--keep-branch`; only an explicit collision is an error.
-    if keep_branch && matches!(cfg.merge_delete_branch, Some(true)) {
+    // *repo* `.forge-cli.toml` explicitly opts into branch deletion. The
+    // implicit default (`delete_branch=true` when nothing is set) and a
+    // lower-precedence global default are both silently overridden by
+    // `--keep-branch`; only an explicit same-repo collision is an error.
+    if keep_branch && matches!(repo_delete_branch, Some(true)) {
         return Err(ForgeError::validation(
             schema_err(),
             "keep_branch_conflict",
@@ -699,17 +722,38 @@ mod tests {
 
     #[test]
     fn keep_branch_conflict_fires_only_on_explicit_config_collision() {
-        let mut cfg = ForgeConfig::default();
-        // Implicit default — no conflict.
-        assert!(enforce_keep_branch_conflict(true, &cfg).is_ok());
-        cfg.merge_delete_branch = Some(false);
-        assert!(enforce_keep_branch_conflict(true, &cfg).is_ok());
-        cfg.merge_delete_branch = Some(true);
-        let err = enforce_keep_branch_conflict(true, &cfg).expect_err("must fail");
+        // Implicit default (None) — no conflict.
+        assert!(enforce_keep_branch_conflict(true, None).is_ok());
+        // Explicit repo delete_branch = false — no conflict.
+        assert!(enforce_keep_branch_conflict(true, Some(false)).is_ok());
+        // Explicit repo delete_branch = true — conflict.
+        let err = enforce_keep_branch_conflict(true, Some(true)).expect_err("must fail");
         assert_eq!(err.kind(), "keep_branch_conflict");
         assert_eq!(err.exit_code(), 65);
         // Without --keep-branch, no collision regardless of config.
-        assert!(enforce_keep_branch_conflict(false, &cfg).is_ok());
+        assert!(enforce_keep_branch_conflict(false, Some(true)).is_ok());
+    }
+
+    #[test]
+    fn keep_branch_ignores_global_layer_delete_branch() {
+        // Regression for the layered-config edge case: a *global*
+        // `[merge] delete_branch = true` with no repo override must not collide
+        // with an explicit `--keep-branch` (explicit flag > repo > global).
+        let global = ForgeConfig {
+            merge_delete_branch: Some(true),
+            ..ForgeConfig::default()
+        };
+        let repo = ForgeConfig::default();
+        let merged = global.overlaid_by(repo.clone());
+
+        // The merged view carries the global default (so passing it to the
+        // conflict check — the old bug — would wrongly error)...
+        assert_eq!(merged.merge_delete_branch, Some(true));
+        // ...but the conflict check sees only the repo layer, so no conflict.
+        assert!(enforce_keep_branch_conflict(true, repo.merge_delete_branch).is_ok());
+        // The merged default still drives the actual deletion when --keep-branch
+        // is absent.
+        assert!(merged.resolve_delete_branch(None));
     }
 
     #[test]
