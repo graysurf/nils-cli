@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use plan_archive::scrub;
+use nils_scrub as scrub;
 
 fn fixture(name: &str) -> String {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -62,9 +62,9 @@ fn clean_fixture_produces_zero_matches() {
 fn log_format_is_stable_for_fixture() {
     let payload = fixture("all-patterns.txt");
     let result = scrub::scrub_text(&payload);
-    let body = scrub::format_log(&result.matches);
-    // The header pair is fixed and the summary line carries the
-    // sorted distinct pattern set.
+    // The header carries the caller-supplied label; the summary line
+    // carries the sorted distinct pattern set.
+    let body = scrub::format_log("plan-archive", &result.matches);
     assert!(body.starts_with("# plan-archive scrub log\n"));
     assert!(body.contains("# pattern_set: v1\n"));
     assert!(body.lines().last().unwrap().starts_with(
@@ -78,8 +78,8 @@ fn write_log_round_trips_through_tempfile() {
     let result = scrub::scrub_text(&payload);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("20260527T012345Z.scrub.log");
-    let wrote = scrub::write_log_if_any(&path, &result.matches).unwrap();
+    let wrote = scrub::write_log_if_any("plan-archive", &path, &result.matches).unwrap();
     assert!(wrote);
     let body = fs::read_to_string(&path).unwrap();
-    assert_eq!(body, scrub::format_log(&result.matches));
+    assert_eq!(body, scrub::format_log("plan-archive", &result.matches));
 }

@@ -1,9 +1,11 @@
 //! Secret-scrub library v1.
 //!
-//! Used by `plan-archive refresh` to redact provider payloads before
-//! the JSON snapshot is written into `_index/`. The pattern set is
-//! intentionally small and stable so the resulting `.scrub.log`
-//! sibling stays diffable across refreshes.
+//! Shared across the nils-cli workspace by any caller that must redact
+//! secrets from text before it is persisted (for example
+//! `plan-archive refresh` snapshots and `evidence migrate` rollups). The
+//! pattern set is intentionally small and stable so the resulting
+//! `.scrub.log` sibling stays diffable across writes. Callers label their
+//! own scrub-log header via [`log::format_log`] / [`log::write_log_if_any`].
 
 use regex::Regex;
 use serde::Serialize;
@@ -14,7 +16,7 @@ pub mod log;
 pub use log::{format_log, write_log_if_any};
 
 /// Pattern set identifier embedded in scrub-log headers and the
-/// `cli.plan-archive.refresh.v1` JSON envelope.
+/// consuming CLI's JSON envelope.
 pub const PATTERN_SET: &str = "v1";
 
 /// Placeholder text inserted in place of the matched secret.

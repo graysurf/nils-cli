@@ -2,6 +2,7 @@
 members = [
   "crates/nils-common",
   "crates/nils-build-info",
+  "crates/nils-scrub",
   "crates/nils-markdown",
   "crates/nils-term",
   "crates/nils-test-support",
