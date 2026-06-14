@@ -61,10 +61,18 @@ pub fn derive_repo_identity(
     let slug = split_owner_repo(project_dir_name);
 
     // (B) `--host` override: the operator vouches for the host of a slug-only
-    // record. It only applies when the agent-out dir is an `<owner__repo>` slug
-    // (org/repo come from the slug); the host must be present in
-    // config/hosts.yaml so a typo is rejected rather than silently archived.
+    // record whose `cwd` cannot be resolved. `--host` is GLOBAL, so it must not
+    // clobber the authoritative `cwd -> origin` identity of a record that DOES
+    // resolve (even to a different host) — otherwise rescuing one slug-only
+    // record silently mis-attributes other records in the same batch. So the
+    // override is a FALLBACK: try the record's own cwd first, and apply the
+    // override only when cwd resolution fails. It still only applies to an
+    // `<owner__repo>` slug, and the host must be present in config/hosts.yaml so
+    // a typo is rejected rather than silently archived.
     if let Some(host) = host_override {
+        if let Some(identity) = identity_from_cwd(cwd) {
+            return Ok(identity);
+        }
         let Some((org, repo)) = slug else {
             return Err(IdentityError::HostOverrideNeedsSlug(
                 host.to_string(),

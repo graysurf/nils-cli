@@ -116,8 +116,12 @@ assert_fails "optional dependency constrains order" 1 \
   "before its dependency crate-b" \
   --order-file "$tmp_dir/order-optional.txt" --metadata-file "$tmp_dir/meta-optional.json"
 
-# Dev-dependency does NOT constrain the order: crate-a dev-depends on crate-b,
-# and crate-a precedes crate-b — this must PASS (dev edges are excluded).
+# Dev-dependency DOES constrain the order: cargo resolves versioned path
+# dev-dependencies while packaging, so the real publisher (publish-crates.sh,
+# which constrains on any workspace path dep regardless of kind) requires
+# crate-b before crate-a. Listing crate-a (dev-depends crate-b) before crate-b
+# is an inversion the audit must catch, or it would green-light an order the
+# publisher rejects.
 cat >"$tmp_dir/meta-dev.json" <<'JSON'
 {
   "workspace_members": ["crate-a 0.0.0 (path+file:///a)", "crate-b 0.0.0 (path+file:///b)"],
@@ -130,7 +134,8 @@ cat >"$tmp_dir/meta-dev.json" <<'JSON'
 }
 JSON
 printf 'crate-a\ncrate-b\n' >"$tmp_dir/order-dev.txt"
-assert_passes "dev dependency does not constrain order" \
+assert_fails "dev dependency constrains order" 1 \
+  "before its dependency crate-b" \
   --order-file "$tmp_dir/order-dev.txt" --metadata-file "$tmp_dir/meta-dev.json"
 
 # A publish=false crate must not appear in the order.

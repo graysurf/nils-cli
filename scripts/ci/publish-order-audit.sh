@@ -161,16 +161,18 @@ if len(members) != len(names):
 publish_false = {p["name"] for p in ws_pkgs if p.get("publish") == []}
 publishable = members - publish_false
 
-# Publish-relevant dependency edges from the manifest: normal + build deps,
-# including optional and target-gated ones. Dev-dependencies do not need to be
-# published before their dependent, so they do not constrain the order (and
-# dev-only cycles must not make a valid order impossible).
+# Publish-relevant dependency edges from the manifest: every workspace-internal
+# dependency constrains the order, regardless of kind (normal, build, AND dev),
+# including optional and target-gated ones. cargo resolves versioned path
+# dev-dependencies while packaging a crate, so a dev-dependency on a workspace
+# member must be published first — this mirrors scripts/publish-crates.sh, which
+# constrains on any workspace path dependency without filtering by kind.
+# (A genuine dev-only cycle is a real publish blocker the topological check
+# below should surface, not hide.)
 deps_of = {}
 for p in ws_pkgs:
     edges = set()
     for d in p.get("dependencies", []):
-        if d.get("kind") not in (None, "build"):
-            continue
         dep_name = d["name"]
         if dep_name in members and dep_name != p["name"]:
             edges.add(dep_name)
