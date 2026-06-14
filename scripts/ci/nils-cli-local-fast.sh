@@ -200,7 +200,7 @@ for package in metadata["packages"]:
     package_has_doctests[package["name"]] = has_doctests
 crate_roots.sort(key=lambda item: len(item[0]), reverse=True)
 
-shared_packages = {"nils-common", "nils-term", "nils-test-support"}
+shared_packages = {"nils-common", "nils-term", "nils-test-support", "nils-scrub"}
 
 
 def package_for_path(path):

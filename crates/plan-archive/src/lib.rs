@@ -13,6 +13,7 @@ pub mod discover;
 pub mod migrate;
 pub mod query;
 pub mod refresh;
+pub mod scrub;
 pub mod search;
 pub mod source;
 pub mod validate;

@@ -85,6 +85,16 @@ assert_shared_crate_escalates_to_workspace() {
   echo "ok"
 }
 
+assert_shared_scrub_crate_escalates_to_workspace() {
+  echo "== shared nils-scrub crate escalates to workspace =="
+  local output
+  output="$(plan_for --changed-file crates/nils-scrub/src/lib.rs)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=workspace"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_REASON=shared package changed: nils-scrub"
+  assert_not_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE=nils-scrub"
+  echo "ok"
+}
+
 assert_docs_only_uses_docs_mode() {
   echo "== docs-only changes use docs mode =="
   local output
@@ -222,6 +232,7 @@ assert_package_crate_uses_package_mode
 assert_bin_only_package_skips_doctests
 assert_library_package_keeps_doctests
 assert_shared_crate_escalates_to_workspace
+assert_shared_scrub_crate_escalates_to_workspace
 assert_docs_only_uses_docs_mode
 assert_docs_only_plan_does_not_require_cargo
 assert_crate_src_asset_md_runs_package

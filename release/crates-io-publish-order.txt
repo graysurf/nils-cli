@@ -26,6 +26,8 @@ nils-git-scope
 nils-git-summary
 nils-image-processing
 nils-zsh-kit
+nils-scrub
+nils-evidence
 nils-plan-archive
 nils-plan-tooling
 nils-plan-issue
