@@ -422,11 +422,13 @@ Validator behaviour is covered by:
 - Integration tests in `tests/validators.rs` driving the shipped
   fixture set under `tests/fixtures/{hosts,local,metadata}/`.
 
-Scrub behaviour is covered by:
+Scrub behaviour now lives in the shared `nils-scrub` crate (`refresh`
+consumes it via `nils_scrub` and labels its scrub-log header
+`plan-archive`). Its coverage is:
 
-- Unit tests inside `src/scrub/{mod,log}.rs`.
-- Integration tests in `tests/scrub.rs` driving
-  `tests/fixtures/scrub/{all-patterns,clean}.txt`.
+- Unit tests inside `crates/nils-scrub/src/{lib,log}.rs`.
+- Integration tests in `crates/nils-scrub/tests/scrub.rs` driving
+  `crates/nils-scrub/tests/fixtures/scrub/{all-patterns,clean}.txt`.
 
 ## Related
 

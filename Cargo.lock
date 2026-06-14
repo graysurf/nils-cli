@@ -2269,6 +2269,7 @@ dependencies = [
  "indexmap",
  "nils-build-info",
  "nils-common",
+ "nils-scrub",
  "nils-test-support",
  "pretty_assertions",
  "regex",
@@ -2340,6 +2341,15 @@ dependencies = [
  "tempfile",
  "x11rb",
  "zbus",
+]
+
+[[package]]
+name = "nils-scrub"
+version = "1.4.0"
+dependencies = [
+ "regex",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]

@@ -13,12 +13,11 @@ pub mod discover;
 pub mod migrate;
 pub mod query;
 pub mod refresh;
-pub mod scrub;
 pub mod search;
 pub mod source;
 pub mod validate;
 
-pub use scrub::{Match, PATTERN_SET, REDACTION_TOKEN, ScrubResult, pattern_ids, scrub_text};
+pub use nils_scrub::{Match, PATTERN_SET, REDACTION_TOKEN, ScrubResult, pattern_ids, scrub_text};
 pub use validate::{
     hosts::{HostsConfig, HostsValidation, HostsValidationData, validate_hosts_yaml},
     local::{

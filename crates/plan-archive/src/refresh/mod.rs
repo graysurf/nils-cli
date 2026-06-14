@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
 use serde::Serialize;
 
-use crate::scrub;
 use crate::validate;
 use crate::validate::hosts::{HostsConfig, validate_hosts_yaml};
+use nils_scrub as scrub;
 
 pub mod forge;
 pub mod refparse;
@@ -231,7 +231,7 @@ fn refresh_one<F: ForgeFetcher, C: Clock>(
         None
     } else {
         let log_path = dir.join(format!("{stamp}.scrub.log"));
-        scrub::write_log_if_any(&log_path, &scrubbed.matches)
+        scrub::write_log_if_any("plan-archive", &log_path, &scrubbed.matches)
             .map_err(|e| RefreshError::Io(e.to_string()))?;
         Some(log_path.display().to_string())
     };
