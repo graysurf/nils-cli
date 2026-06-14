@@ -225,7 +225,7 @@ fn matches_filters(args: &DispatchArgs, rollup: &RawRollup, repo: &RawRepo) -> b
         }
     }
     if let Some(repo_filter) = &args.repo
-        && repo.repo.as_deref().unwrap_or_default() != repo_filter
+        && !repo_filter_matches(repo, repo_filter)
     {
         return false;
     }
@@ -251,6 +251,22 @@ fn matches_filters(args: &DispatchArgs, rollup: &RawRollup, repo: &RawRepo) -> b
         return false;
     }
     true
+}
+
+/// `--repo` matches the bare repo name or the full `<org>__<repo>` slug —
+/// exact, never a substring. A slug filter must match BOTH halves: an
+/// `<owner>__<repo>` filter never matches a repo of the same name under a
+/// different owner.
+fn repo_filter_matches(repo: &RawRepo, filter: &str) -> bool {
+    let bare = repo.repo.as_deref().unwrap_or_default();
+    if bare.is_empty() {
+        return false;
+    }
+    if bare == filter {
+        return true;
+    }
+    let org = repo.org.as_deref().unwrap_or_default();
+    !org.is_empty() && format!("{org}__{bare}") == filter
 }
 
 fn iso_date_part(iso: &str) -> String {
@@ -429,6 +445,46 @@ mod tests {
         let report = run(&args).unwrap();
         assert_eq!(report.counts.returned, 1);
         assert_eq!(report.records[0].skill, "deliver-pr");
+    }
+
+    #[test]
+    fn repo_filter_accepts_owner_repo_slug_like_migrate() {
+        // The archive stores org=graysurf, repo=kit. `query --repo` advertises a
+        // "repo slug"; `migrate` accepts the `<owner>__<repo>` form, so query
+        // must too — and a bare repo name must still match, while a wrong slug
+        // must not (no substring over-match).
+        let tmp = tempfile::tempdir().unwrap();
+        write_rollup(
+            tmp.path(),
+            "id1",
+            "skill-usage.rollup.v1",
+            "deliver-pr",
+            "pass",
+            "2026-06-10T10:00:00Z",
+        );
+        let query = |filter: &str| {
+            let args = DispatchArgs {
+                skill: None,
+                outcome: None,
+                repo: Some(filter.to_string()),
+                host: None,
+                org: None,
+                since: None,
+                until: None,
+                archive: Some(tmp.path().to_path_buf()),
+                format: OutputFormat::Json,
+            };
+            run(&args).unwrap().counts.returned
+        };
+        assert_eq!(query("graysurf__kit"), 1, "owner__repo slug should match");
+        assert_eq!(query("kit"), 1, "bare repo name should match");
+        assert_eq!(query("graysurf__other"), 0, "wrong slug must not match");
+        assert_eq!(query("ki"), 0, "substring must not match");
+        assert_eq!(
+            query("other__kit"),
+            0,
+            "a slug under a different owner must not match the repo half"
+        );
     }
 
     #[test]

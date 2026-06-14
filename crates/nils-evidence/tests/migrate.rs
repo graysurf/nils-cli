@@ -1127,3 +1127,120 @@ fn with_path<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     unsafe { std::env::set_var("PATH", original) };
     result
 }
+
+// ---- review-cleanup regression coverage (PR #848 / #850 bot review) ----
+
+/// A GitHub token shape that `nils-scrub` redacts (ghp_ + 36 chars).
+const GHP_TOKEN: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[test]
+fn promotion_case_link_is_scrubbed_before_archiving() {
+    // A heuristic-inbox promotion link whose path carries a token must be
+    // scrubbed before it lands in the rollup / metadata / catalog.
+    let s = build_empty_scenario();
+    let links =
+        format!(r#"[{{ "type": "heuristic-inbox", "path": "https://example/case/{GHP_TOKEN}" }}]"#);
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-120000",
+        &record_json_with_links("deliver-pr", "2026-06-14T12:00:00Z", &links),
+    );
+    let report = migrate::prepare(&dry_run_args(&s)).expect("prepare");
+    let rec = report
+        .records
+        .iter()
+        .find(|r| r.rollup.promotion.is_some())
+        .expect("a promotion record");
+    let case = &rec.rollup.promotion.as_ref().unwrap().heuristic_inbox_case;
+    assert!(
+        !case.contains("ghp_"),
+        "promotion link leaked a token: {case}"
+    );
+    assert!(
+        case.contains("[REDACTED]"),
+        "promotion link not redacted: {case}"
+    );
+}
+
+#[test]
+fn bare_skill_id_is_scrubbed() {
+    // A skill value with no `/` must still be scrubbed, not copied verbatim.
+    let s = build_empty_scenario();
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-130000",
+        &record_json_with_links(GHP_TOKEN, "2026-06-14T13:00:00Z", "[]"),
+    );
+    let report = migrate::prepare(&dry_run_args(&s)).expect("prepare");
+    let rec = &report.records[0];
+    assert!(
+        !rec.rollup.skill.contains("ghp_"),
+        "bare skill id leaked a token: {}",
+        rec.rollup.skill
+    );
+}
+
+#[test]
+fn linked_evidence_type_is_scrubbed() {
+    // The linked-evidence `type` written into the rollup must be scrubbed.
+    let s = build_empty_scenario();
+    let links = format!(r#"[{{ "type": "review-evidence-{GHP_TOKEN}", "path": "notes.txt" }}]"#);
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-140000",
+        &record_json_with_links("deliver-pr", "2026-06-14T14:00:00Z", &links),
+    );
+    let report = migrate::prepare(&dry_run_args(&s)).expect("prepare");
+    let rec = &report.records[0];
+    assert!(
+        !rec.rollup
+            .linked_evidence
+            .iter()
+            .any(|l| l.evidence_type.contains("ghp_")),
+        "linked-evidence type leaked a token: {:?}",
+        rec.rollup
+            .linked_evidence
+            .iter()
+            .map(|l| &l.evidence_type)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unsupported_record_schema_is_skipped_not_normalized_to_v1() {
+    // A future/incompatible source schema must be skipped, never silently
+    // archived as a `skill-usage.rollup.v1`.
+    let s = build_empty_scenario();
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-150000",
+        &record_json_with_links("deliver-pr", "2026-06-14T15:00:00Z", "[]"),
+    );
+    let v2 = record_json_with_links("code-review", "2026-06-14T16:00:00Z", "[]")
+        .replace("skill-usage.record.v1", "skill-usage.record.v2");
+    write_record(&s.source_out, "graysurf__kit", "20260614-160000", &v2);
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("prepare");
+    assert_eq!(report.eligible, 1, "only the v1 record should be eligible");
+    assert!(
+        report
+            .records
+            .iter()
+            .all(|r| r.rollup.skill != "code-review"),
+        "the unsupported v2 record must not be normalized into a rollup"
+    );
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "the v2 record should be recorded as a blocked (skipped) record"
+    );
+    assert!(
+        report.blocked[0].reason.contains("skill-usage.record.v2"),
+        "blocked reason should name the unsupported schema: {}",
+        report.blocked[0].reason
+    );
+}

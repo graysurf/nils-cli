@@ -113,7 +113,7 @@ pub fn validate_local_yaml(input: &str) -> Result<LocalValidation, LocalValidati
         .archive_clone_path
         .as_deref()
         .map(expand_path)
-        .unwrap_or_else(|| expand_path(DEFAULT_ARCHIVE_CLONE_PATH));
+        .unwrap_or_else(expanded_default_archive_clone_path);
 
     let working_repo_roots = raw
         .working_repo_roots
@@ -163,7 +163,7 @@ fn default_validation(source: LocalSource) -> LocalValidation {
             source,
             config: LocalConfig {
                 version: SUPPORTED_VERSION,
-                archive_clone_path: expand_path(DEFAULT_ARCHIVE_CLONE_PATH),
+                archive_clone_path: expanded_default_archive_clone_path(),
                 working_repo_roots: Vec::new(),
                 performance: LocalPerformance {
                     migrate_batch_size: DEFAULT_MIGRATE_BATCH_SIZE,
@@ -178,6 +178,21 @@ fn default_validation(source: LocalSource) -> LocalValidation {
 }
 
 /// Expand a single `~` prefix and `$VAR` / `${VAR}` references.
+/// The no-config default archive clone path:
+/// `${XDG_DATA_HOME:-$HOME/.local/share}/agent-evidence-archive`.
+///
+/// Honors `XDG_DATA_HOME` when set and non-empty (matching the documented
+/// default and the crate's `XDG_CONFIG_HOME` handling for the config file);
+/// otherwise expands the `~/.local/share` fallback via `$HOME`.
+fn expanded_default_archive_clone_path() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("agent-evidence-archive");
+    }
+    expand_path(DEFAULT_ARCHIVE_CLONE_PATH)
+}
+
 fn expand_path(input: &str) -> PathBuf {
     let mut s = input.trim().to_string();
     if let Some(rest) = s.strip_prefix("~/")
@@ -290,6 +305,39 @@ performance:
         assert_eq!(
             v.data.config.archive_clone_path,
             PathBuf::from("/Users/test/.local/share/agent-evidence-archive")
+        );
+    }
+
+    #[test]
+    fn default_archive_clone_path_honours_xdg_data_home() {
+        use nils_test_support::{EnvGuard, GlobalStateLock};
+        let lock = GlobalStateLock::new();
+        let _xdg = EnvGuard::set(&lock, "XDG_DATA_HOME", "/xdg-data");
+        // No config file -> documented default, which must live under
+        // $XDG_DATA_HOME (the `${XDG_DATA_HOME:-$HOME/.local/share}` contract).
+        let v = validate_local_path(&PathBuf::from(
+            "/nonexistent/agent-evidence-archive/config.yaml",
+        ))
+        .expect("defaults");
+        assert_eq!(
+            v.data.config.archive_clone_path,
+            PathBuf::from("/xdg-data/agent-evidence-archive")
+        );
+    }
+
+    #[test]
+    fn default_archive_clone_path_falls_back_to_home_local_share() {
+        use nils_test_support::{EnvGuard, GlobalStateLock};
+        let lock = GlobalStateLock::new();
+        let _no_xdg = EnvGuard::remove(&lock, "XDG_DATA_HOME");
+        let _home = EnvGuard::set(&lock, "HOME", "/home/me");
+        let v = validate_local_path(&PathBuf::from(
+            "/nonexistent/agent-evidence-archive/config.yaml",
+        ))
+        .expect("defaults");
+        assert_eq!(
+            v.data.config.archive_clone_path,
+            PathBuf::from("/home/me/.local/share/agent-evidence-archive")
         );
     }
 

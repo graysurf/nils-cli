@@ -98,6 +98,20 @@ impl SkillUsageRecord {
         serde_json::from_slice(bytes).map_err(|e| format!("skill-usage.record.json parse: {e}"))
     }
 
+    /// Peek only the `schema` discriminator without committing to the full v1
+    /// shape. Callers gate on the schema *before* a `from_json_bytes` that, for
+    /// an incompatible future schema, might fail or mis-parse — so an
+    /// unsupported schema is reported as such rather than as a parse error.
+    pub fn peek_schema(bytes: &[u8]) -> Result<String, String> {
+        #[derive(Deserialize)]
+        struct SchemaOnly {
+            schema: String,
+        }
+        let probe: SchemaOnly = serde_json::from_slice(bytes)
+            .map_err(|e| format!("skill-usage.record.json parse: {e}"))?;
+        Ok(probe.schema)
+    }
+
     /// Parse a record from a JSON string.
     pub fn from_json_str(s: &str) -> Result<Self, String> {
         serde_json::from_str(s).map_err(|e| format!("skill-usage.record.json parse: {e}"))
