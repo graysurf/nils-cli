@@ -115,6 +115,15 @@ enum Command {
         /// Only records that link a heuristic-inbox promotion case.
         #[arg(long)]
         promotion_only: bool,
+        /// Host (FQDN) to attribute slug-only records to (e.g.
+        /// `github.com`, `gitlab.gamania.com`). The agent-out `<owner__repo>`
+        /// slug carries no host; under a multi-host `config/hosts.yaml` this
+        /// override pins the host the operator vouches for. Must be present in
+        /// `config/hosts.yaml`; records whose dir is not an `<owner__repo>`
+        /// slug, or whose host is absent from the config, are reported as
+        /// blocked.
+        #[arg(long)]
+        host: Option<String>,
         /// Apply the migration. Without this flag the command runs in dry-run
         /// mode.
         #[arg(long)]
@@ -234,6 +243,7 @@ pub fn run() -> i32 {
             since,
             until,
             promotion_only,
+            host,
             apply,
         } => crate::migrate::dispatch(crate::migrate::DispatchArgs {
             source_out,
@@ -244,6 +254,7 @@ pub fn run() -> i32 {
             since,
             until,
             promotion_only,
+            host,
             apply,
             format,
         }),
@@ -580,6 +591,8 @@ mod tests {
             "--until",
             "2026-06-30",
             "--promotion-only",
+            "--host",
+            "gitlab.gamania.com",
             "--apply",
             "--format",
             "json",
@@ -595,6 +608,7 @@ mod tests {
                 since,
                 until,
                 promotion_only,
+                host,
                 apply,
                 ..
             } => {
@@ -605,6 +619,7 @@ mod tests {
                 assert_eq!(since.as_deref(), Some("2026-06-01"));
                 assert_eq!(until.as_deref(), Some("2026-06-30"));
                 assert!(promotion_only);
+                assert_eq!(host.as_deref(), Some("gitlab.gamania.com"));
                 assert!(apply);
             }
             _ => panic!("expected Migrate"),

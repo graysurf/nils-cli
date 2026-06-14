@@ -333,7 +333,7 @@ _evidence() {
             return 0
             ;;
         evidence__migrate)
-            opts="-h --source-out --archive --hosts --repo --skill --since --until --promotion-only --apply --format --json --help"
+            opts="-h --source-out --archive --hosts --repo --skill --since --until --promotion-only --host --apply --format --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -364,6 +364,10 @@ _evidence() {
                     return 0
                     ;;
                 --until)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --host)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

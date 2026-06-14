@@ -30,6 +30,14 @@ pub struct RepoIdentity {
 pub enum IdentityError {
     #[error("could not derive repo identity from agent-out dir `{0}` or record cwd `{1}`")]
     Unresolvable(String, String),
+    #[error(
+        "--host `{0}` is not present in config/hosts.yaml; add it or drop the override to fall back to cwd->origin"
+    )]
+    HostNotConfigured(String),
+    #[error(
+        "--host `{0}` was supplied but the agent-out dir `{1}` is not an `<owner__repo>` slug, so org/repo cannot be derived"
+    )]
+    HostOverrideNeedsSlug(String, String),
     #[error("git command failed: {0}")]
     Io(String),
 }
@@ -40,13 +48,38 @@ pub enum IdentityError {
 /// `graysurf__agent-runtime-kit`). `hosts` is the archive's host config used
 /// to disambiguate the host for an `<owner__repo>` slug (which carries no
 /// host). `cwd` is the record's recorded working directory, used only for the
-/// fallback path.
+/// fallback path. `host_override` is the operator-supplied `--host` value: when
+/// present and the slug resolves to `(org, repo)`, it pins the host directly
+/// (after validating it against `hosts`), bypassing the multi-host cwd
+/// ambiguity.
 pub fn derive_repo_identity(
     project_dir_name: &str,
     hosts: &HostsConfig,
     cwd: &str,
+    host_override: Option<&str>,
 ) -> Result<RepoIdentity, IdentityError> {
     let slug = split_owner_repo(project_dir_name);
+
+    // (B) `--host` override: the operator vouches for the host of a slug-only
+    // record. It only applies when the agent-out dir is an `<owner__repo>` slug
+    // (org/repo come from the slug); the host must be present in
+    // config/hosts.yaml so a typo is rejected rather than silently archived.
+    if let Some(host) = host_override {
+        let Some((org, repo)) = slug else {
+            return Err(IdentityError::HostOverrideNeedsSlug(
+                host.to_string(),
+                project_dir_name.to_string(),
+            ));
+        };
+        if !hosts.hosts.contains_key(host) {
+            return Err(IdentityError::HostNotConfigured(host.to_string()));
+        }
+        return Ok(RepoIdentity {
+            host: host.to_string(),
+            org,
+            repo,
+        });
+    }
 
     // F8: the agent-out `<owner__repo>` slug carries NO host. When more than
     // one host is configured we must not guess one (that mis-attributes an
@@ -165,7 +198,8 @@ mod tests {
     #[test]
     fn derive_from_agent_out_dir_single_host() {
         let h = hosts("version: 1\nhosts:\n  github.com:\n    class: personal\n");
-        let id = derive_repo_identity("graysurf__agent-runtime-kit", &h, "/anywhere").unwrap();
+        let id =
+            derive_repo_identity("graysurf__agent-runtime-kit", &h, "/anywhere", None).unwrap();
         assert_eq!(id.host, "github.com");
         assert_eq!(id.org, "graysurf");
         assert_eq!(id.repo, "agent-runtime-kit");
@@ -180,7 +214,7 @@ mod tests {
         let h = hosts(
             "version: 1\nhosts:\n  gitlab.example.com:\n    class: employer\n    employer: X\n  github.com:\n    class: personal\n",
         );
-        let err = derive_repo_identity("graysurf__kit", &h, "").unwrap_err();
+        let err = derive_repo_identity("graysurf__kit", &h, "", None).unwrap_err();
         assert!(
             matches!(err, IdentityError::Unresolvable(_, _)),
             "multi-host slug-only identity must not guess a host"
@@ -190,7 +224,40 @@ mod tests {
     #[test]
     fn unresolvable_when_no_separator_and_no_cwd() {
         let h = hosts("version: 1\nhosts:\n  github.com:\n    class: personal\n");
-        let err = derive_repo_identity("localonly", &h, "").unwrap_err();
+        let err = derive_repo_identity("localonly", &h, "", None).unwrap_err();
         assert!(matches!(err, IdentityError::Unresolvable(_, _)));
+    }
+
+    #[test]
+    fn host_override_resolves_slug_only_under_multi_host() {
+        // (B): with multiple hosts configured and an unresolvable cwd, an
+        // operator-supplied `--host` present in the config pins the host
+        // directly from the slug — no cwd derivation needed.
+        let h = hosts(
+            "version: 1\nhosts:\n  gitlab.example.com:\n    class: employer\n    employer: X\n  github.com:\n    class: personal\n",
+        );
+        let id = derive_repo_identity("graysurf__kit", &h, "", Some("github.com")).unwrap();
+        assert_eq!(id.host, "github.com");
+        assert_eq!(id.org, "graysurf");
+        assert_eq!(id.repo, "kit");
+    }
+
+    #[test]
+    fn host_override_rejects_host_absent_from_config() {
+        let h = hosts("version: 1\nhosts:\n  github.com:\n    class: personal\n");
+        let err = derive_repo_identity("graysurf__kit", &h, "", Some("nope.example")).unwrap_err();
+        match err {
+            IdentityError::HostNotConfigured(host) => assert_eq!(host, "nope.example"),
+            other => panic!("expected HostNotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_override_requires_a_slug() {
+        // The override pins only the host; org/repo still come from the slug.
+        // A dir name with no `__` cannot supply org/repo, so it is rejected.
+        let h = hosts("version: 1\nhosts:\n  github.com:\n    class: personal\n");
+        let err = derive_repo_identity("localonly", &h, "", Some("github.com")).unwrap_err();
+        assert!(matches!(err, IdentityError::HostOverrideNeedsSlug(_, _)));
     }
 }
