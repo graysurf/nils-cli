@@ -180,6 +180,11 @@ and `FORGE_CLI_BIN`.
 
 `skill-usage` is the broadest recorder in this crate. It links the rest of the evidence records back to one skill invocation.
 
+`init` stamps an additive `producer` block (`tool` + `nils_cli_version`) into the
+record so archived evidence always carries the producing nils-cli version,
+independent of the host's current version-pin. The field is backward compatible:
+records written before it existed deserialize with `producer` absent.
+
 ```bash
 skill-usage init --out <dir> --skill <skill-path> \
   --intent <intent> --user-request-summary <summary>

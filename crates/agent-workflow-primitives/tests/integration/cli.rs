@@ -772,6 +772,50 @@ fn skill_usage_records_successful_skill_invocation() {
 }
 
 #[test]
+fn skill_usage_init_stamps_producer_version() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("skill-producer");
+    let out = out_arg(&out_dir);
+
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "init",
+                "--out",
+                &out,
+                "--skill",
+                "skills/tools/devex/review-evidence",
+                "--intent",
+                "record review evidence",
+                "--user-request-summary",
+                "Review PR #12",
+                "--format",
+                "json",
+            ],
+        )
+        .code,
+        0
+    );
+
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.join("skill-usage.record.json")).expect("record file"),
+    )
+    .expect("record json");
+    assert_eq!(record["producer"]["tool"], "skill-usage");
+    let version = record["producer"]["nils_cli_version"]
+        .as_str()
+        .expect("producer.nils_cli_version must be a string");
+    assert!(!version.is_empty(), "producer version must be non-empty");
+    assert_eq!(
+        version,
+        env!("CARGO_PKG_VERSION"),
+        "producer version must equal the producing crate version"
+    );
+}
+
+#[test]
 fn skill_usage_serializes_concurrent_record_mutations() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let out_dir = tmp.path().join("skill-concurrent");
