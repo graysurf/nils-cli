@@ -59,6 +59,11 @@ pub struct DispatchArgs {
     pub until: Option<String>,
     pub promotion_only: bool,
     pub apply: bool,
+    /// Operator-supplied host override for slug-only records (`--host`). When
+    /// present and the agent-out slug resolves to `(org, repo)`, this host is
+    /// used directly (after validation against `config/hosts.yaml`), bypassing
+    /// the multi-host cwd ambiguity.
+    pub host: Option<String>,
     pub format: OutputFormat,
 }
 
@@ -228,6 +233,16 @@ pub struct AlreadyArchived {
     pub source_digest: String,
 }
 
+/// A record skipped because its repo identity could not be resolved (e.g. a
+/// multi-host config + slug-only dir + ephemeral/removed `cwd`). The batch
+/// continues; the operator sees what was skipped and why, and can re-run with
+/// `--host` to vouch for the host of records they recognize.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BlockedRecord {
+    pub record_path: String,
+    pub reason: String,
+}
+
 /// Result of `migrate` dry-run (also the prelude of an apply).
 #[derive(Debug, Clone, Serialize)]
 pub struct DryRunReport {
@@ -235,6 +250,9 @@ pub struct DryRunReport {
     pub archive: String,
     pub records: Vec<PreparedRecord>,
     pub already_archived: Vec<AlreadyArchived>,
+    /// Records skipped because their repo identity was unresolvable. Reported,
+    /// never fatal (an all-blocked run is a successful no-op).
+    pub blocked: Vec<BlockedRecord>,
     pub scanned: usize,
     pub eligible: usize,
     pub skipped: usize,
@@ -246,6 +264,9 @@ pub struct ApplyReport {
     pub archive_commit: String,
     pub archived: usize,
     pub skipped: usize,
+    /// Records skipped because their repo identity was unresolvable (same as
+    /// the dry-run `blocked` list; only the resolved records are written).
+    pub blocked: Vec<BlockedRecord>,
     pub targets: Vec<String>,
     pub rollup_paths: Vec<String>,
     pub scrub_log_paths: Vec<String>,
@@ -265,8 +286,6 @@ pub enum MigrateError {
     HostsLoadFailed(String),
     #[error("failed to parse archive `config/hosts.yaml`: {0}")]
     HostsParseFailed(String),
-    #[error("could not derive repo identity for record `{0}`: {1}")]
-    IdentityFailed(String, String),
     #[error("archive target `{0}` already exists; resolve the conflict and re-run")]
     ArchiveTargetExists(String),
     #[error("archive clone has uncommitted changes under `evidence/` or `catalog.json`")]
@@ -286,7 +305,6 @@ impl MigrateError {
             MigrateError::ArchiveCloneMissing(_) => "migrate-archive-clone-missing",
             MigrateError::HostsLoadFailed(_) => "migrate-hosts-load-failed",
             MigrateError::HostsParseFailed(_) => "migrate-hosts-parse-failed",
-            MigrateError::IdentityFailed(_, _) => "migrate-identity-failed",
             MigrateError::ArchiveTargetExists(_) => "migrate-archive-target-exists",
             MigrateError::ArchiveRepoDirty => "migrate-archive-repo-dirty",
             MigrateError::Timestamp(_) => "migrate-timestamp-failed",
@@ -344,20 +362,31 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
 
     let mut prepared = Vec::new();
     let mut already = Vec::new();
+    let mut blocked = Vec::new();
 
     for record_path in record_paths {
+        // A per-record read or parse failure (e.g. a truncated or malformed
+        // skill-usage.record.json) must not abort the batch: record it as
+        // blocked, skip it, and continue.
         let raw = match fs::read(&record_path) {
             Ok(bytes) => bytes,
             Err(e) => {
-                return Err(MigrateError::Io(format!(
-                    "read `{}`: {e}",
-                    record_path.display()
-                )));
+                blocked.push(BlockedRecord {
+                    record_path: record_path.display().to_string(),
+                    reason: format!("read failed: {e}"),
+                });
+                continue;
             }
         };
         let record = match SkillUsageRecord::from_json_bytes(&raw) {
             Ok(r) => r,
-            Err(e) => return Err(MigrateError::Io(e)),
+            Err(e) => {
+                blocked.push(BlockedRecord {
+                    record_path: record_path.display().to_string(),
+                    reason: format!("parse failed: {e}"),
+                });
+                continue;
+            }
         };
 
         let source_digest = format!("sha256:{}", sha256_hex(&raw));
@@ -399,17 +428,44 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
             continue;
         }
 
-        let prepared_record = build_prepared(
+        // Resolve the repo identity FIRST. A per-record identity failure must
+        // not abort the whole batch: record it as blocked, skip it (no rollup,
+        // no staged files), and continue. The operator can re-run with `--host`
+        // to vouch for records they recognize.
+        let repo_identity =
+            match derive_repo_identity(&project_dir, &hosts, &record.cwd, args.host.as_deref()) {
+                Ok(id) => id,
+                Err(e) => {
+                    blocked.push(BlockedRecord {
+                        record_path: record_path.display().to_string(),
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+        // A per-record rollup/scrub/staging failure must not abort the batch
+        // either: record it as blocked and continue.
+        let prepared_record = match build_prepared(
             &archive,
             &source_out,
             &record_path,
-            &project_dir,
             &record,
             &hosts,
             &archived_at,
             source_digest,
             promotion,
-        )?;
+            repo_identity,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                blocked.push(BlockedRecord {
+                    record_path: record_path.display().to_string(),
+                    reason: format!("rollup preparation failed: {e}"),
+                });
+                continue;
+            }
+        };
         prepared.push(prepared_record);
     }
 
@@ -420,6 +476,7 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
         archive: archive.display().to_string(),
         records: prepared,
         already_archived: already,
+        blocked,
         scanned,
         eligible,
         skipped,
@@ -431,18 +488,14 @@ fn build_prepared(
     archive: &Path,
     source_out: &Path,
     record_path: &Path,
-    project_dir: &str,
     record: &SkillUsageRecord,
     hosts: &crate::validate::hosts::HostsConfig,
     archived_at: &str,
     source_digest: String,
     promotion: Option<Promotion>,
+    repo_identity: RepoIdentity,
 ) -> Result<PreparedRecord, MigrateError> {
     let mut warnings = Vec::new();
-
-    let repo_identity = derive_repo_identity(project_dir, hosts, &record.cwd).map_err(|e| {
-        MigrateError::IdentityFailed(record_path.display().to_string(), e.to_string())
-    })?;
 
     let host_entry = hosts.hosts.get(&repo_identity.host);
     let classification = match host_entry {
@@ -675,11 +728,13 @@ pub fn apply(args: &DispatchArgs, report: DryRunReport) -> Result<ApplyReport, M
     let archive = source::resolve_archive(args.archive.as_deref())?;
 
     if report.records.is_empty() {
-        // Nothing to do; surface a clean no-op apply.
+        // Nothing to do; surface a clean no-op apply. An all-blocked run lands
+        // here too — it is a success that reports the skipped records.
         return Ok(ApplyReport {
             archive_commit: String::new(),
             archived: 0,
             skipped: report.skipped,
+            blocked: report.blocked.clone(),
             targets: Vec::new(),
             rollup_paths: Vec::new(),
             scrub_log_paths: Vec::new(),
@@ -795,6 +850,7 @@ pub fn apply(args: &DispatchArgs, report: DryRunReport) -> Result<ApplyReport, M
         archive_commit,
         archived: report.records.len(),
         skipped: report.skipped,
+        blocked: report.blocked.clone(),
         targets,
         rollup_paths,
         scrub_log_paths,
@@ -1128,8 +1184,11 @@ fn emit_dry_run(format: OutputFormat, report: &DryRunReport) -> i32 {
             println!("  source out        : {}", report.source_out);
             println!("  archive           : {}", report.archive);
             println!(
-                "  scanned/eligible/skipped : {}/{}/{}",
-                report.scanned, report.eligible, report.skipped
+                "  scanned/eligible/skipped/blocked : {}/{}/{}/{}",
+                report.scanned,
+                report.eligible,
+                report.skipped,
+                report.blocked.len()
             );
             for rec in &report.records {
                 println!(
@@ -1159,6 +1218,14 @@ fn emit_dry_run(format: OutputFormat, report: &DryRunReport) -> i32 {
                     println!("    - {} ({})", a.source_path, a.source_digest);
                 }
             }
+            if !report.blocked.is_empty() {
+                println!(
+                    "  blocked (unresolvable identity; skipped, re-run with --host to vouch):"
+                );
+                for b in &report.blocked {
+                    println!("    - {} ({})", b.record_path, b.reason);
+                }
+            }
             println!("  (no files modified; pass --apply to commit)");
             exit::SUCCESS
         }
@@ -1172,11 +1239,15 @@ fn emit_apply(format: OutputFormat, report: &ApplyReport) -> i32 {
             println!("evidence migrate (applied)");
             println!("  archived : {}", report.archived);
             println!("  skipped  : {}", report.skipped);
+            println!("  blocked  : {}", report.blocked.len());
             if !report.archive_commit.is_empty() {
                 println!("  commit   : {}", report.archive_commit);
             }
             for t in &report.targets {
                 println!("    - {t}");
+            }
+            for b in &report.blocked {
+                eprintln!("  blocked : {} ({})", b.record_path, b.reason);
             }
             for w in &report.warnings {
                 eprintln!("  warning : {w}");

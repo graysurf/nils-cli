@@ -218,6 +218,80 @@ fn build_empty_scenario() -> Scenario {
     }
 }
 
+/// Like `build_empty_scenario` but with a multi-host `config/hosts.yaml` so the
+/// agent-out `<owner__repo>` slug cannot pin a host on its own (F8). A test can
+/// then exercise the cwd-fallback / `--host` override / blocked paths.
+fn build_multi_host_empty_scenario() -> Scenario {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let source_out = root.join("out").join("projects");
+    let archive = root.join("archive");
+    fs::create_dir_all(&source_out).unwrap();
+    fs::create_dir_all(archive.join("config")).unwrap();
+    fs::create_dir_all(archive.join("evidence")).unwrap();
+    fs::write(
+        archive.join("config").join("hosts.yaml"),
+        "version: 1\nhosts:\n  gitlab.gamania.com:\n    class: employer\n    employer: Gamania\n  github.com:\n    class: personal\n    primary_identity: graysurf\n",
+    )
+    .unwrap();
+    git(&archive, &["init", "-q", "-b", "main"]);
+    git(&archive, &["add", "-A"]);
+    git(
+        &archive,
+        &[
+            "-c",
+            "user.name=tester",
+            "-c",
+            "user.email=tester@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+    Scenario {
+        _tmp: tmp,
+        root,
+        source_out,
+        archive,
+    }
+}
+
+/// Build a record body with an explicit `cwd`, started on `started`.
+fn record_json_with_cwd(skill: &str, started: &str, cwd: &str) -> String {
+    format!(
+        r#"{{
+            "schema": "skill-usage.record.v1",
+            "producer": {{ "tool": "skill-usage", "nils_cli_version": "1.4.0" }},
+            "skill": "{skill}",
+            "started_at": "{started}",
+            "ended_at": "{started}",
+            "cwd": "{cwd}",
+            "trigger": "user_explicit",
+            "intent": "intent",
+            "inputs": {{ "user_request_summary": "x", "referenced_files": [], "external_sources": [] }},
+            "outcome": {{ "status": "pass", "summary": "done" }},
+            "artifacts": [],
+            "linked_records": [],
+            "validation": [],
+            "failures": []
+        }}"#
+    )
+}
+
+/// Create a real git checkout at `path` whose `origin` points at `<host>/<org>/<repo>`,
+/// returning the absolute checkout path. Used to give a record a resolvable
+/// `cwd -> origin` identity.
+fn make_git_checkout(root: &Path, name: &str, origin_url: &str) -> PathBuf {
+    let dir = root.join(name);
+    fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["remote", "add", "origin", origin_url]);
+    dir
+}
+
 fn dry_run_args(s: &Scenario) -> DispatchArgs {
     DispatchArgs {
         source_out: Some(s.source_out.clone()),
@@ -229,8 +303,171 @@ fn dry_run_args(s: &Scenario) -> DispatchArgs {
         until: None,
         promotion_only: false,
         apply: false,
+        host: None,
         format: OutputFormat::Json,
     }
+}
+
+#[test]
+fn migrate_skips_and_reports_unresolvable_records_without_aborting() {
+    // Core fix (A): under a multi-host hosts.yaml a slug-only record whose cwd
+    // cannot be resolved is UNRESOLVABLE (F8 refuses to guess a host). It must
+    // be SKIPPED and REPORTED in `blocked`, never abort the whole batch. The
+    // resolvable record (a cwd pointing at a real git checkout) still rolls up.
+    let s = build_multi_host_empty_scenario();
+
+    // Resolvable record: cwd is a real git checkout on github.com.
+    let checkout = make_git_checkout(&s.root, "live-checkout", "git@github.com:graysurf/kit.git");
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &checkout.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    // Unresolvable record: empty cwd, slug carries no host -> blocked under a
+    // multi-host config.
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-110000",
+        &record_json_with_cwd("code-review", "2026-06-14T11:00:00Z", ""),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed, not abort");
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.eligible, 1, "the resolvable record rolls up");
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "the unresolvable record is blocked"
+    );
+    assert_eq!(report.records.len(), 1);
+    assert_eq!(report.records[0].rollup.repo.host, "github.com");
+    assert_eq!(report.records[0].rollup.repo.repo, "kit");
+    // The blocked entry names the record and a reason.
+    let blocked = &report.blocked[0];
+    assert!(
+        blocked.record_path.contains("20260614-110000"),
+        "blocked entry should name the skipped record: {}",
+        blocked.record_path
+    );
+    assert!(
+        !blocked.reason.is_empty(),
+        "blocked entry must carry a reason"
+    );
+}
+
+#[test]
+fn migrate_skips_and_reports_unparseable_records_without_aborting() {
+    // Core fix (A), parse path: a malformed / truncated skill-usage.record.json
+    // (trailing characters after the JSON object) must be SKIPPED and REPORTED
+    // in `blocked`, never abort the whole batch.
+    let s = build_multi_host_empty_scenario();
+
+    // Parseable, resolvable record: cwd is a real git checkout on github.com.
+    let checkout = make_git_checkout(&s.root, "live-checkout", "git@github.com:graysurf/kit.git");
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &checkout.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    // Malformed record: a valid object followed by trailing characters.
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-120000",
+        &format!(
+            "{}\nTRAILING GARBAGE\n",
+            record_json_with_cwd("code-review", "2026-06-14T12:00:00Z", "")
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed, not abort");
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.eligible, 1, "the parseable record rolls up");
+    assert_eq!(report.blocked.len(), 1, "the malformed record is blocked");
+    let blocked = &report.blocked[0];
+    assert!(
+        blocked.record_path.contains("20260614-120000"),
+        "blocked entry should name the malformed record: {}",
+        blocked.record_path
+    );
+    assert!(
+        blocked.reason.contains("parse failed"),
+        "blocked reason should identify the parse failure: {}",
+        blocked.reason
+    );
+}
+
+#[test]
+fn migrate_all_blocked_is_successful_no_op() {
+    // A run where every record is blocked is a success (no-op), reporting them.
+    let s = build_multi_host_empty_scenario();
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-110000",
+        &record_json_with_cwd("code-review", "2026-06-14T11:00:00Z", ""),
+    );
+    let report = migrate::prepare(&dry_run_args(&s)).expect("all-blocked is not an error");
+    assert_eq!(report.eligible, 0);
+    assert_eq!(report.blocked.len(), 1);
+}
+
+#[test]
+fn migrate_host_override_resolves_slug_only_record() {
+    // Fix (B): `--host github.com` lets a slug-only record (empty cwd) resolve
+    // to github.com/<org>/<repo>, bypassing the multi-host cwd ambiguity.
+    let s = build_multi_host_empty_scenario();
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-110000",
+        &record_json_with_cwd("code-review", "2026-06-14T11:00:00Z", ""),
+    );
+    let mut args = dry_run_args(&s);
+    args.host = Some("github.com".to_string());
+    let report = migrate::prepare(&args).expect("prepare with host override");
+    assert_eq!(report.eligible, 1, "the slug record now resolves");
+    assert_eq!(report.blocked.len(), 0);
+    let id = &report.records[0].rollup.repo;
+    assert_eq!(id.host, "github.com");
+    assert_eq!(id.org, "graysurf");
+    assert_eq!(id.repo, "kit");
+}
+
+#[test]
+fn migrate_host_override_rejects_host_absent_from_config() {
+    // Fix (B): `--host nope.example` is not present in hosts.yaml; the record
+    // is blocked with a clear reason rather than silently archived.
+    let s = build_multi_host_empty_scenario();
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-110000",
+        &record_json_with_cwd("code-review", "2026-06-14T11:00:00Z", ""),
+    );
+    let mut args = dry_run_args(&s);
+    args.host = Some("nope.example".to_string());
+    let report = migrate::prepare(&args).expect("prepare must not abort on a bad host");
+    assert_eq!(report.eligible, 0);
+    assert_eq!(report.blocked.len(), 1);
+    assert!(
+        report.blocked[0].reason.contains("nope.example"),
+        "reason should name the absent host: {}",
+        report.blocked[0].reason
+    );
 }
 
 #[test]
