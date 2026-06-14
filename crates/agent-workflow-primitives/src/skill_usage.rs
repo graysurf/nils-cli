@@ -247,6 +247,10 @@ fn init_record(args: &InitArgs) -> Result<RecordResult, CliError> {
         };
         let record = SkillUsageRecord {
             schema: RECORD_SCHEMA_VERSION.to_string(),
+            producer: Some(Producer {
+                tool: "skill-usage".to_string(),
+                nils_cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            }),
             skill: redact_text(&args.skill),
             started_at: match &args.started_at {
                 Some(value) => redact_text(value),
@@ -451,6 +455,7 @@ fn validate_record(value: &Value) -> Vec<Violation> {
         ));
     }
 
+    validate_producer(&mut violations, data.get("producer"));
     validate_inputs(&mut violations, data.get("inputs"));
     let outcome_status = validate_outcome(&mut violations, data.get("outcome"));
 
@@ -498,6 +503,36 @@ fn validate_record(value: &Value) -> Vec<Violation> {
 
     scan_secret_like_values(&mut violations, value, "$".to_string());
     violations
+}
+
+fn validate_producer(violations: &mut Vec<Violation>, value: Option<&Value>) {
+    // Additive field: records produced before it existed omit it and stay valid.
+    let Some(producer) = value else {
+        return;
+    };
+    let Some(producer) = producer.as_object() else {
+        violations.push(Violation::new(
+            "invalid_producer",
+            "$.producer",
+            "must be an object",
+        ));
+        return;
+    };
+    for key in ["tool", "nils_cli_version"] {
+        match producer.get(key) {
+            Some(field) => expect_nonempty_string(
+                violations,
+                field,
+                format!("$.producer.{key}"),
+                format!("invalid_producer_{key}"),
+            ),
+            None => violations.push(Violation::new(
+                format!("missing_producer_{key}"),
+                format!("$.producer.{key}"),
+                "required when producer is present",
+            )),
+        }
+    }
 }
 
 fn validate_inputs(violations: &mut Vec<Violation>, value: Option<&Value>) {
@@ -1152,6 +1187,8 @@ impl FailureResult {
 #[derive(Debug, Deserialize, Serialize)]
 struct SkillUsageRecord {
     schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    producer: Option<Producer>,
     skill: String,
     started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1171,6 +1208,16 @@ struct SkillUsageRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     failures: Vec<Failure>,
     follow_up: Vec<String>,
+}
+
+/// Additive provenance block stamped at record creation so an archived record
+/// always carries the producing tool and nils-cli version, even after the host
+/// version-pin moves. Backward compatible: records created before this field
+/// existed deserialize with `producer: None`.
+#[derive(Debug, Deserialize, Serialize)]
+struct Producer {
+    tool: String,
+    nils_cli_version: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
