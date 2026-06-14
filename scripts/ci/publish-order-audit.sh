@@ -161,18 +161,26 @@ if len(members) != len(names):
 publish_false = {p["name"] for p in ws_pkgs if p.get("publish") == []}
 publishable = members - publish_false
 
-# Publish-relevant dependency edges from the manifest: every workspace-internal
-# dependency constrains the order, regardless of kind (normal, build, AND dev),
-# including optional and target-gated ones. cargo resolves versioned path
-# dev-dependencies while packaging a crate, so a dev-dependency on a workspace
-# member must be published first — this mirrors scripts/publish-crates.sh, which
-# constrains on any workspace path dependency without filtering by kind.
-# (A genuine dev-only cycle is a real publish blocker the topological check
-# below should surface, not hide.)
+# Publish-relevant dependency edges from the manifest: a workspace-internal
+# *path* dependency constrains the order, regardless of kind (normal, build, AND
+# dev), including optional and target-gated ones. cargo resolves versioned path
+# dev-dependencies while packaging a crate, so a path dev-dependency on a
+# workspace member must be published first.
+#
+# This mirrors scripts/publish-crates.sh exactly, which keys on `dep.get("path")`
+# (lines 287-295). The `path` check is essential, not just the name: a
+# dependency that resolves to an already-published *registry* version of a
+# sibling crate (e.g. a dev-dependency `nils-foo = "1.0"`) is reported by
+# `cargo metadata` by name but with a `source: registry...` and NO `path`. Such
+# a dependency is NOT a publish-order edge — treating it as one (by name alone)
+# would reject orders the publisher accepts. (A genuine path dev-only cycle is a
+# real publish blocker the topological check below should surface, not hide.)
 deps_of = {}
 for p in ws_pkgs:
     edges = set()
     for d in p.get("dependencies", []):
+        if not d.get("path"):
+            continue
         dep_name = d["name"]
         if dep_name in members and dep_name != p["name"]:
             edges.add(dep_name)
