@@ -149,7 +149,8 @@ enum Command {
         /// Filter records by case-insensitive substring.
         #[arg(long)]
         grep: Option<String>,
-        /// With `--grep`, widen to full-text intent + outcome summary.
+        /// No-op for catalog, kept for CLI parity: `--grep` already matches
+        /// full-text intent + outcome summary, so this does not change results.
         #[arg(long)]
         deep: bool,
         /// Filter records by exact outcome status (case-insensitive).

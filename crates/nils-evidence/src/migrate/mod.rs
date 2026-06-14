@@ -43,6 +43,11 @@ const BINARY: &str = "evidence";
 
 /// Rollup record schema id written into every `skill-usage.rollup.json`.
 pub const ROLLUP_SCHEMA: &str = "skill-usage.rollup.v1";
+/// Source `skill-usage.record.json` schema this migrator knows how to roll up.
+/// A record carrying any other schema (e.g. a future `skill-usage.record.v2`
+/// with changed semantics) is skipped with a warning rather than silently
+/// normalized to a `skill-usage.rollup.v1`.
+pub const SUPPORTED_RECORD_SCHEMA: &str = "skill-usage.record.v1";
 /// Provenance sidecar schema version written into every `metadata.yaml`.
 pub const METADATA_VERSION: u32 = 1;
 /// Default tool name synthesized for pre-producer records.
@@ -233,10 +238,12 @@ pub struct AlreadyArchived {
     pub source_digest: String,
 }
 
-/// A record skipped because its repo identity could not be resolved (e.g. a
-/// multi-host config + slug-only dir + ephemeral/removed `cwd`). The batch
-/// continues; the operator sees what was skipped and why, and can re-run with
-/// `--host` to vouch for the host of records they recognize.
+/// A record skipped (not fatal) and reported with a reason: an unresolvable
+/// repo identity (multi-host config + slug-only dir + ephemeral/removed `cwd`),
+/// a read/parse failure, a rollup-prep failure, or an unsupported source-record
+/// `schema` (e.g. a future `skill-usage.record.v2`, never normalized to v1).
+/// The batch continues; the operator sees what was skipped and why, and can
+/// re-run with `--host` to vouch for records they recognize.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BlockedRecord {
     pub record_path: String,
@@ -250,8 +257,9 @@ pub struct DryRunReport {
     pub archive: String,
     pub records: Vec<PreparedRecord>,
     pub already_archived: Vec<AlreadyArchived>,
-    /// Records skipped because their repo identity was unresolvable. Reported,
-    /// never fatal (an all-blocked run is a successful no-op).
+    /// Records skipped and reported with a reason (unresolvable identity,
+    /// read/parse failure, rollup-prep failure, or unsupported schema). Never
+    /// fatal — an all-blocked run is a successful no-op.
     pub blocked: Vec<BlockedRecord>,
     pub scanned: usize,
     pub eligible: usize,
@@ -378,6 +386,30 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
                 continue;
             }
         };
+        // Schema gate FIRST: peek the `schema` discriminator and reject an
+        // unsupported source schema before attempting the v1 deserialization,
+        // so a future `skill-usage.record.v2` cannot silently corrupt the
+        // archive and is reported as unsupported (not as a v1 parse failure).
+        match SkillUsageRecord::peek_schema(&raw) {
+            Ok(schema) if schema == SUPPORTED_RECORD_SCHEMA => {}
+            Ok(schema) => {
+                blocked.push(BlockedRecord {
+                    record_path: record_path.display().to_string(),
+                    reason: format!(
+                        "unsupported source schema `{schema}` (expected `{SUPPORTED_RECORD_SCHEMA}`); skipped"
+                    ),
+                });
+                continue;
+            }
+            Err(e) => {
+                blocked.push(BlockedRecord {
+                    record_path: record_path.display().to_string(),
+                    reason: format!("parse failed: {e}"),
+                });
+                continue;
+            }
+        }
+
         let record = match SkillUsageRecord::from_json_bytes(&raw) {
             Ok(r) => r,
             Err(e) => {
@@ -555,7 +587,10 @@ fn build_prepared(
         // *scrubbed* reference, sanitized to a single safe in-target segment,
         // so a secret never lands in a committed path and a malicious
         // `record_type` (e.g. `../../etc`) cannot escape the archive target.
-        let type_slug = sanitize_path_segment(&link.record_type, "evidence");
+        // The `type` is scrubbed (not just sanitized) so a token embedded in it
+        // never reaches the committed subdir name or the rollup `type` field.
+        let scrubbed_type = scrub_collect(&link.record_type, &mut all_matches);
+        let type_slug = sanitize_path_segment(&scrubbed_type, "evidence");
         let child_name = sanitize_path_segment(&child_basename(&scrubbed_ref.redacted), "evidence");
         let rel = unique_rel(&mut used_rels, &type_slug, &child_name);
         let rel_display = rel.to_string_lossy().replace('\\', "/");
@@ -597,7 +632,7 @@ fn build_prepared(
         // F3: the rollup reference points at the exact `rel` that was (or
         // would be) written, so the three values always agree.
         linked.push(LinkedEvidence {
-            evidence_type: link.record_type.clone(),
+            evidence_type: scrubbed_type,
             path: rel_display,
         });
     }
@@ -614,11 +649,15 @@ fn build_prepared(
     // never lands in the rollup or the catalog `outcome_status` column.
     let scrubbed_status = scrub_collect(&record.outcome.status, &mut all_matches);
     let scrubbed_cwd = scrub_collect(&scrub_cwd(&record.cwd), &mut all_matches);
-    let scrubbed_skill = if record.skill.contains('/') {
-        scrub_collect(&record.skill, &mut all_matches)
-    } else {
-        record.skill.clone()
-    };
+    // Scrub the skill unconditionally: a bare id (no `/`) can still embed a
+    // token, and scrubbing a clean id is a no-op.
+    let scrubbed_skill = scrub_collect(&record.skill, &mut all_matches);
+    // Scrub the promotion case link like every other archived text field so a
+    // token in a heuristic-inbox URL/path never lands raw in the rollup,
+    // metadata sidecar, or catalog.
+    let promotion = promotion.map(|p| Promotion {
+        heuristic_inbox_case: scrub_collect(&p.heuristic_inbox_case, &mut all_matches),
+    });
 
     let id = rollup_id(&record.started_at, &scrubbed_skill, &source_digest);
     let archive_target_rel = archive_target_path(
@@ -936,9 +975,12 @@ fn project_matches_repo(project_dir: &str, repo_filter: &str) -> bool {
     if project_dir == repo_filter {
         return true;
     }
+    // Match the full `<owner>__<repo>` slug (handled by the `==` above) or the
+    // bare repo half — never a substring, so `--repo kit` does not pull in
+    // `acme__toolkit`. A non-slug dir matches only on its exact name.
     match project_dir.split_once("__") {
-        Some((_, repo)) => repo == repo_filter || project_dir.contains(repo_filter),
-        None => project_dir.contains(repo_filter),
+        Some((_, repo)) => repo == repo_filter,
+        None => false,
     }
 }
 
@@ -957,9 +999,15 @@ fn scrub_cwd(cwd: &str) -> String {
         return String::new();
     }
     if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy().to_string();
+        let home = home.to_string_lossy();
+        // Trim a trailing separator so `/home/me/` and `/home/me` behave alike.
+        let home = home.trim_end_matches(['/', '\\']);
+        // Match on path-component boundaries, not raw byte prefix: with
+        // HOME=/Users/alice, a sibling like /Users/alice-work/repo is NOT under
+        // $HOME and must redact rather than leak its tail as `~-work/repo`.
         if !home.is_empty()
-            && let Some(rest) = cwd.strip_prefix(&home)
+            && let Some(rest) = cwd.strip_prefix(home)
+            && (rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'))
         {
             return format!("~{rest}");
         }
@@ -1220,7 +1268,7 @@ fn emit_dry_run(format: OutputFormat, report: &DryRunReport) -> i32 {
             }
             if !report.blocked.is_empty() {
                 println!(
-                    "  blocked (unresolvable identity; skipped, re-run with --host to vouch):"
+                    "  blocked (skipped + reported; unresolvable identity, bad record, or unsupported schema):"
                 );
                 for b in &report.blocked {
                     println!("    - {} ({})", b.record_path, b.reason);
@@ -1409,6 +1457,13 @@ mod tests {
             "graysurf__agent-runtime-kit",
             "nils-cli"
         ));
+        // A substring of the repo half must NOT match: `--repo kit` must not
+        // pull in `acme__toolkit`. The help promises the full slug or repo name.
+        assert!(!project_matches_repo("acme__toolkit", "kit"));
+        assert!(!project_matches_repo("acme__toolkit", "tool"));
+        // A non-slug project dir matches only on its exact name.
+        assert!(project_matches_repo("standalone", "standalone"));
+        assert!(!project_matches_repo("standalone", "stand"));
     }
 
     #[test]
@@ -1505,6 +1560,12 @@ mod tests {
         temp_env_home("/Users/someone", || {
             assert_eq!(scrub_cwd("/var/secret/path"), token);
             assert_eq!(scrub_cwd("/Users/someone/Project/x"), "~/Project/x");
+            // The home dir itself collapses to bare `~`.
+            assert_eq!(scrub_cwd("/Users/someone"), "~");
+            // A sibling that merely shares the $HOME byte-prefix is NOT under
+            // $HOME and must redact, not leak its tail as `~-work/...`.
+            assert_eq!(scrub_cwd("/Users/someone-work/repo"), token);
+            assert_eq!(scrub_cwd("/Users/someoneelse"), token);
         });
         assert_eq!(scrub_cwd(""), "");
     }

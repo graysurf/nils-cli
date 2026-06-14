@@ -9,12 +9,18 @@ use std::path::PathBuf;
 /// (not `plans/`). The host preserves dots; the `org_or_group_path`
 /// preserves nested GitLab group separators.
 pub fn archive_target_path(host: &str, org_or_group_path: &str, repo: &str, id: &str) -> PathBuf {
+    // Sanitize each identity component to a single safe in-target segment. Repo
+    // identity can derive from a crafted `origin` remote (cwd -> origin), so a
+    // `..`/separator in host/org/repo must never form a parent-dir escape. The
+    // group path is split first so legitimate nested GitLab groups are kept as
+    // distinct (sanitized) segments. `id` is internally generated and safe.
+    use super::sanitize_path_segment;
     let mut p = PathBuf::from("evidence");
-    p.push(host);
+    p.push(sanitize_path_segment(host, "unknown-host"));
     for segment in org_or_group_path.split('/').filter(|s| !s.is_empty()) {
-        p.push(segment);
+        p.push(sanitize_path_segment(segment, "unknown-org"));
     }
-    p.push(repo);
+    p.push(sanitize_path_segment(repo, "unknown-repo"));
     p.push(id);
     p
 }
@@ -159,6 +165,27 @@ mod tests {
             PathBuf::from(
                 "evidence/gitlab.example.com/acme/platform/backend/ingest/20260410T010203Z-cleanup-1234abcd"
             )
+        );
+    }
+
+    #[test]
+    fn archive_target_neutralizes_traversal_in_identity_segments() {
+        // A `..` reaching an identity component (e.g. a crafted `origin` remote
+        // resolved through cwd) must never form a parent-dir escape under the
+        // archive target. Every component stays a plain in-target name.
+        let p = archive_target_path("github.com", "../../../etc", "..", "id");
+        for comp in p.components() {
+            assert!(
+                !matches!(comp, std::path::Component::ParentDir),
+                "archive target escaped via `..`: {p:?}"
+            );
+        }
+        // Separators inside a single identity segment cannot widen the path.
+        let p2 = archive_target_path("evil/../host", "o", "r", "id");
+        assert!(
+            p2.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_))),
+            "identity segment introduced a non-normal component: {p2:?}"
         );
     }
 

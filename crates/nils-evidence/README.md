@@ -9,8 +9,10 @@ skill-usage records. Depends on the shared `nils-scrub` crate for redaction.
 - `evidence migrate [--repo --skill --since --until --promotion-only] [--apply]`
   — dry-run by default; rolls up + scrubs each `skill-usage.record.json` under
   the agent-out tree into a `skill-usage.rollup.v1`, dedups via the catalog
-  `source_digest`, and (with `--apply`) writes + one-batch-commits to the
-  archive. Raw records are never written.
+  `source_digest`, and (with `--apply`) writes, one-batch-commits, **and
+  `git push`es** to the archive clone's configured upstream — `--apply`
+  publishes to the remote, and fails the run if `git push` errors. Raw records
+  are never written.
 - `evidence discover` — read-only scan of the agent-out tree; classifies
   skill-runs eligible / blocked / unknown.
 - `evidence query [--skill --outcome --repo --host --org --since --until]` —
