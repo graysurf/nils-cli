@@ -11,7 +11,7 @@
 
 use crate::audit_drift::walk;
 use crate::audit_drift::{DriftReport, Finding, Severity};
-use crate::render::cache::CACHE_FILE;
+use crate::render::cache::{AGENTS_CACHE_FILE, CACHE_FILE};
 use crate::render::manifest::{self, ManifestSet, SourceRoot};
 use crate::render::writer;
 use anyhow::Result;
@@ -72,9 +72,10 @@ pub fn check(
 
 /// Walk `dir` into a `BTreeMap<RelPath, Vec<u8>>`. Returns an empty
 /// map when the directory does not exist (first-render case). Skips
-/// `.render-cache.json` because the cache file is a scratchpad — the
-/// determinism contract covers it via the render_determinism
-/// integration test, not via audit-drift's source-vs-build diff.
+/// the render cache scratchpads (`.render-cache.json` and
+/// `.render-cache-agents.json`) because cache equality is owned by the
+/// render_determinism integration test, not by audit-drift's
+/// source-vs-build diff.
 ///
 /// The walk goes through the shared `audit_drift::walk` helper, so
 /// symlinks that escape `containing_root` are silently dropped (no
@@ -93,7 +94,10 @@ pub(crate) fn snapshot_dir(dir: &Path, containing_root: &Path) -> BTreeMap<Strin
         return out;
     };
     for path in walk::collect_files_under(&canonical_dir, &canonical_root) {
-        if path.file_name().and_then(|n| n.to_str()) == Some(CACHE_FILE) {
+        if matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(CACHE_FILE) | Some(AGENTS_CACHE_FILE)
+        ) {
             continue;
         }
         if let Ok(bytes) = fs::read(&path) {
@@ -135,22 +139,22 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_dir_skips_render_cache_file() {
-        // The cache file lives at the root of build/<product>/; the
-        // diff class deliberately ignores it because cache equality is
+    fn snapshot_dir_skips_render_cache_files() {
+        // Both cache files live at the root of build/<product>/; the
+        // diff class deliberately ignores them because cache equality is
         // owned by the render_determinism test, not audit-drift.
         let tmp = TempDir::new().unwrap();
         let canon = tmp.path().canonicalize().unwrap();
         let build = canon.join("build/codex");
-        fs::create_dir_all(&build).unwrap();
-        fs::write(build.join("skills/SKILL.md"), "hello").ok();
         fs::create_dir_all(build.join("skills")).unwrap();
         fs::write(build.join("skills/SKILL.md"), "hello").unwrap();
         fs::write(build.join(CACHE_FILE), "{}").unwrap();
+        fs::write(build.join(AGENTS_CACHE_FILE), "{}").unwrap();
         let snap = snapshot_dir(&build, &canon);
         assert_eq!(snap.len(), 1, "{snap:?}");
         assert!(snap.contains_key("skills/SKILL.md"));
         assert!(!snap.contains_key(CACHE_FILE));
+        assert!(!snap.contains_key(AGENTS_CACHE_FILE));
     }
 
     #[test]
