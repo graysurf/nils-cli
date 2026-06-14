@@ -471,6 +471,37 @@ fn migrate_host_override_rejects_host_absent_from_config() {
 }
 
 #[test]
+fn host_override_does_not_clobber_a_resolvable_cwd() {
+    // `--host` is global and meant to rescue slug-only records whose cwd cannot
+    // resolve. It must NOT override the authoritative `cwd -> origin` identity
+    // of a record that DOES resolve (even to a different configured host) —
+    // otherwise rescuing one employer record mis-attributes a personal one.
+    let s = build_multi_host_empty_scenario();
+    let checkout = make_git_checkout(&s.root, "live-checkout", "git@github.com:graysurf/kit.git");
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &checkout.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+    // Operator passes --host for a different (employer) host to rescue some
+    // other blocked slug-only record in the same batch.
+    let mut args = dry_run_args(&s);
+    args.host = Some("gitlab.gamania.com".to_string());
+    let report = migrate::prepare(&args).expect("prepare");
+    assert_eq!(report.eligible, 1);
+    assert_eq!(report.blocked.len(), 0);
+    assert_eq!(
+        report.records[0].rollup.repo.host, "github.com",
+        "a resolvable cwd->origin must win over the global --host override"
+    );
+}
+
+#[test]
 fn dry_run_derives_rollups_and_scrubs_without_writing() {
     let s = build_scenario();
     let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run prepare");
