@@ -2052,6 +2052,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-evidence"
+version = "1.4.0"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "indexmap",
+ "nils-build-info",
+ "nils-common",
+ "nils-scrub",
+ "nils-test-support",
+ "pretty_assertions",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "nils-forge-cli"
 version = "1.4.0"
 dependencies = [

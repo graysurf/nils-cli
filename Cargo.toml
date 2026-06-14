@@ -32,6 +32,7 @@ members = [
   "crates/agent-docs",
   "crates/agent-out",
   "crates/agent-scope-lock",
+  "crates/nils-evidence",
   "crates/web-evidence",
   "crates/agent-workflow-primitives",
   "crates/gemini-cli",
