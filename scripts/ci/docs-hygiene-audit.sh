@@ -127,16 +127,27 @@ if [[ -n "$deep_links" ]]; then
   done <<<"$deep_links"
 fi
 
-dup_hashes="$(find docs crates/*/docs -type f -name '*.md' -print0 \
-  | xargs -0 shasum \
-  | awk '{print $1}' \
-  | sort \
-  | uniq -d || true)"
-if [[ -n "$dup_hashes" ]]; then
-  while IFS= read -r hash; do
-    [[ -n "$hash" ]] || continue
-    record_issue error "duplicate markdown payload hash detected: $hash"
-  done <<<"$dup_hashes"
+hash_cmd=""
+if command -v shasum >/dev/null 2>&1; then
+  hash_cmd="shasum"
+elif command -v sha1sum >/dev/null 2>&1; then
+  hash_cmd="sha1sum"
+fi
+
+if [[ -z "$hash_cmd" ]]; then
+  record_issue error "missing required hash command: install shasum or sha1sum"
+else
+  dup_hashes="$(find docs crates/*/docs -type f -name '*.md' -print0 \
+    | xargs -0 "$hash_cmd" \
+    | awk '{print $1}' \
+    | sort \
+    | uniq -d || true)"
+  if [[ -n "$dup_hashes" ]]; then
+    while IFS= read -r hash; do
+      [[ -n "$hash" ]] || continue
+      record_issue error "duplicate markdown payload hash detected: $hash"
+    done <<<"$dup_hashes"
+  fi
 fi
 
 # Legacy-removal guardrails (reintroduction detection)
