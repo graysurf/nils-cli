@@ -2646,6 +2646,43 @@ All gates green.\n",
     }
 
     #[test]
+    fn set_status_migrates_legacy_multiword_record() {
+        // Regression: a record carrying a legacy multi-word free-text status
+        // (still accepted by verify) must be migratable into the lifecycle.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let records = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records");
+        let record = write_record(
+            &records.join("legacy-record"),
+            &RecordOpts {
+                status: "implemented and validated",
+                ..RecordOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "set-status",
+                record.parent().unwrap().to_str().unwrap(),
+                "--status",
+                "superseded",
+                "--link",
+                "core/policies/heuristic-system/operation-records/replacement",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let text = fs::read_to_string(&record).unwrap();
+        assert!(text.contains("- Status: superseded"), "text={text}");
+        assert!(!text.contains("implemented and validated"), "text={text}");
+        assert_eq!(text.matches("- Status:").count(), 1, "text={text}");
+    }
+
+    #[test]
     fn set_status_rejects_invalid_record_status() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let records = tmp

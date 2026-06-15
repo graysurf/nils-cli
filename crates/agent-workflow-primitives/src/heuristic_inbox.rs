@@ -150,6 +150,16 @@ fn status_line_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?m)^-\s+Status:\s*\S+\s*$").expect("status line regex"))
 }
 
+/// Matches the whole `- Status:` line regardless of how many tokens the value
+/// has. Inbox statuses are always single tokens, but operation records may
+/// still carry a legacy multi-word free-text status (e.g. `- Status:
+/// implemented and validated`) that the record lifecycle migration must be able
+/// to rewrite.
+fn record_status_line_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?m)^-\s+Status:.*$").expect("record status line regex"))
+}
+
 fn date_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^\d{4}-\d{2}-\d{2}$").expect("date regex"))
@@ -1272,27 +1282,36 @@ fn upsert_status_field(text: &str, key: &str, value: &str) -> String {
     let section = &text[start..end];
     let new_line = format!("- {key}: {value}");
     let key_prefix = format!("- {key}:");
+    // Replace in place when the field already exists; only insert after the
+    // `- Status:` line when it does not. Doing both would leave two field lines
+    // whenever an existing supersession link is updated.
+    let exists = section
+        .lines()
+        .any(|line| line.trim_start().starts_with(&key_prefix));
 
     let mut rebuilt = String::with_capacity(section.len() + new_line.len() + 1);
-    let mut replaced = false;
-    let mut inserted = false;
+    let mut done = false;
     for line in section.split_inclusive('\n') {
         let body = line.trim_end_matches('\n');
-        if body.trim_start().starts_with(&key_prefix) {
-            // Replace the existing field line, preserving the original newline.
-            rebuilt.push_str(&new_line);
-            if line.ends_with('\n') {
-                rebuilt.push('\n');
+        if exists {
+            if !done && body.trim_start().starts_with(&key_prefix) {
+                // Replace the existing field line, preserving the original newline.
+                rebuilt.push_str(&new_line);
+                if line.ends_with('\n') {
+                    rebuilt.push('\n');
+                }
+                done = true;
+                continue;
             }
-            replaced = true;
-            continue;
-        }
-        rebuilt.push_str(line);
-        if !replaced && !inserted && body.trim_start().starts_with("- Status:") {
-            // Insert the new field on the line after `- Status:`.
-            rebuilt.push_str(&new_line);
-            rebuilt.push('\n');
-            inserted = true;
+            rebuilt.push_str(line);
+        } else {
+            rebuilt.push_str(line);
+            if !done && body.trim_start().starts_with("- Status:") {
+                // Insert the new field on the line after `- Status:`.
+                rebuilt.push_str(&new_line);
+                rebuilt.push('\n');
+                done = true;
+            }
         }
     }
 
@@ -1804,7 +1823,10 @@ fn run_set_status_record(
         ));
     }
     let text = read_text(&case.doc_path)?;
-    let re = status_line_regex();
+    // Records may carry a legacy multi-word status, so match the whole line
+    // rather than the single-token inbox status regex — otherwise the records
+    // that most need migrating into the lifecycle cannot be re-set.
+    let re = record_status_line_regex();
     if !re.is_match(&text) {
         return Err(CliError::runtime(
             "missing-status-line",
@@ -4101,6 +4123,21 @@ mod tests {
     fn upsert_status_field_replaces_existing() {
         let text = "# Title\n\n## Status\n\n- Status: superseded\n- Superseded-by: docs/old.md\n\n## Signal\n\nbody\n";
         let updated = upsert_status_field(text, "Superseded-by", "docs/new.md");
+        assert!(updated.contains("- Superseded-by: docs/new.md"));
+        assert!(!updated.contains("docs/old.md"));
+    }
+
+    #[test]
+    fn upsert_status_field_does_not_duplicate_existing_field() {
+        // Regression: when the field already exists below the `- Status:` line,
+        // the helper must replace it in place, never insert a second line.
+        let text = "# Title\n\n## Status\n\n- Status: superseded\n- System area: x\n- Superseded-by: docs/old.md\n\n## Signal\n\nbody\n";
+        let updated = upsert_status_field(text, "Superseded-by", "docs/new.md");
+        assert_eq!(
+            updated.matches("- Superseded-by:").count(),
+            1,
+            "expected a single Superseded-by line, got:\n{updated}"
+        );
         assert!(updated.contains("- Superseded-by: docs/new.md"));
         assert!(!updated.contains("docs/old.md"));
     }
