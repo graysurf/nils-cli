@@ -790,6 +790,99 @@ fn migrate_host_override_blocks_resolvable_mismatched_cwd() {
 }
 
 #[test]
+fn migrate_multi_host_blocks_legacy_underscore_slug_repointed_to_hyphen_repo() {
+    // #878 follow-up A: normalizing BOTH sides over-collapsed `_` and `-`, so a
+    // legacy/manual slug `acme__my_repo` matched a cwd repointed to the UNRELATED
+    // repo `acme/my-repo` (provider repo names distinguish `_` from `-`). The
+    // mismatched cwd must be rejected, not trusted: under multi-host the record
+    // is blocked rather than mis-archived under the reused checkout.
+    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+
+    // cwd resolves to acme/my-repo (hyphen) — a different repo than acme__my_repo.
+    let reused = make_git_checkout(&s.root, "my-repo", "git@github.com:acme/my-repo.git");
+    write_record(
+        &s.source_out,
+        "acme__my_repo",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &reused.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 0,
+        "a cwd at acme/my-repo must not match the legacy slug acme__my_repo"
+    );
+    assert_eq!(report.blocked.len(), 1, "the mismatched cwd is blocked");
+}
+
+#[test]
+fn migrate_multi_host_blocks_real_local_org_repo_repointed_cwd() {
+    // #878 follow-up B: a legitimate provider repo whose slug is shaped like a
+    // local fallback (`local__widget-deadbeef`: owner `local`, repo ending in
+    // `-<8 hex>`) must still get mismatch protection. The hash-suffix shape alone
+    // does not make it a fallback, so a cwd repointed to a DIFFERENT `local/...`
+    // repo must be rejected, not trusted.
+    let s = build_multi_host_empty_scenario();
+
+    let reused = make_git_checkout(
+        &s.root,
+        "other-widget",
+        "git@github.com:local/other-widget.git",
+    );
+    write_record(
+        &s.source_out,
+        "local__widget-deadbeef",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &reused.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 0,
+        "a real local/... repo must not accept an unrelated repointed cwd"
+    );
+    assert_eq!(report.blocked.len(), 1, "the mismatched cwd is blocked");
+}
+
+#[test]
+fn migrate_single_host_real_local_org_repo_matches_own_cwd() {
+    // Guard for #878 follow-up B: a real `local/widget-deadbeef` repo whose cwd
+    // still points at itself is trusted (exact (org, repo) match), so tightening
+    // the fallback heuristic does not regress legitimate `local/...` repos.
+    let s = build_empty_scenario(); // single host: github.com
+
+    let checkout = make_git_checkout(
+        &s.root,
+        "widget-deadbeef",
+        "git@github.com:local/widget-deadbeef.git",
+    );
+    write_record(
+        &s.source_out,
+        "local__widget-deadbeef",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &checkout.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
+    assert_eq!(report.eligible, 1, "the matching cwd is trusted");
+    assert_eq!(report.blocked.len(), 0, "not blocked");
+    assert_eq!(report.records[0].rollup.repo.org, "local");
+    assert_eq!(report.records[0].rollup.repo.repo, "widget-deadbeef");
+}
+
+#[test]
 fn migrate_skips_and_reports_unparseable_records_without_aborting() {
     // Core fix (A), parse path: a malformed / truncated skill-usage.record.json
     // (trailing characters after the JSON object) must be SKIPPED and REPORTED
