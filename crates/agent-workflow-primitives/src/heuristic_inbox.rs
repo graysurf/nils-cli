@@ -83,12 +83,28 @@ const REQUIRED_RECORD_SECTIONS: &[&str] = &[
     "Validation",
 ];
 
-const STATUS_FIELDS: &[&str] = &["Status", "First observed", "Area", "Severity"];
+// Inbox-entry status fields plus the operation-record-only fields
+// (Cluster / Superseded-by / Enforced-by). Inbox entries simply lack the
+// record-only lines, so parsing them here does not change inbox behavior.
+const STATUS_FIELDS: &[&str] = &[
+    "Status",
+    "First observed",
+    "Area",
+    "Severity",
+    "Cluster",
+    "Superseded-by",
+    "Enforced-by",
+];
 
 const VALID_STATUSES: &[&str] = &["open", "promoted", "wontfix"];
 const RETIRED_STATUSES: &[&str] = &["triaged", "planned"];
 const ARCHIVE_READY_STATUSES: &[&str] = &["promoted", "wontfix"];
 const VALID_SEVERITIES: &[&str] = &["low", "medium", "high"];
+
+// Operation-record lifecycle vocabulary (defined in the consuming repo's
+// Heuristic System policy; the CLI side enforces these values).
+const VALID_RECORD_STATUSES: &[&str] = &["active", "superseded", "retired"];
+const RECORD_ARCHIVE_READY_STATUSES: &[&str] = &["superseded", "retired"];
 
 fn readable_statuses() -> &'static [&'static str] {
     &["open", "promoted", "wontfix", "triaged", "planned"]
@@ -132,6 +148,16 @@ fn token_regexes() -> &'static [Regex] {
 fn status_line_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?m)^-\s+Status:\s*\S+\s*$").expect("status line regex"))
+}
+
+/// Matches the whole `- Status:` line regardless of how many tokens the value
+/// has. Inbox statuses are always single tokens, but operation records may
+/// still carry a multi-word free-text status (e.g. `- Status:
+/// implemented and validated`) that the record lifecycle migration must be able
+/// to rewrite.
+fn record_status_line_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?m)^-\s+Status:.*$").expect("record status line regex"))
 }
 
 fn date_regex() -> &'static Regex {
@@ -1245,6 +1271,57 @@ fn upsert_archive_section(text: &str, archive_date: &str, reason: &str, link: &s
     }
 }
 
+/// Insert or replace a `- {key}: {value}` field within the `## Status` section.
+/// If a line for `key` already exists it is replaced in place; otherwise a new
+/// line is inserted immediately after the `- Status:` line. When there is no
+/// `## Status` section the text is returned unchanged.
+fn upsert_status_field(text: &str, key: &str, value: &str) -> String {
+    let Some((start, end)) = find_section_span(text, "## Status") else {
+        return text.to_string();
+    };
+    let section = &text[start..end];
+    let new_line = format!("- {key}: {value}");
+    let key_prefix = format!("- {key}:");
+    // Replace in place when the field already exists; only insert after the
+    // `- Status:` line when it does not. Doing both would leave two field lines
+    // whenever an existing supersession link is updated.
+    let exists = section
+        .lines()
+        .any(|line| line.trim_start().starts_with(&key_prefix));
+
+    let mut rebuilt = String::with_capacity(section.len() + new_line.len() + 1);
+    let mut done = false;
+    for line in section.split_inclusive('\n') {
+        let body = line.trim_end_matches('\n');
+        if exists {
+            if !done && body.trim_start().starts_with(&key_prefix) {
+                // Replace the existing field line, preserving the original newline.
+                rebuilt.push_str(&new_line);
+                if line.ends_with('\n') {
+                    rebuilt.push('\n');
+                }
+                done = true;
+                continue;
+            }
+            rebuilt.push_str(line);
+        } else {
+            rebuilt.push_str(line);
+            if !done && body.trim_start().starts_with("- Status:") {
+                // Insert the new field on the line after `- Status:`.
+                rebuilt.push_str(&new_line);
+                rebuilt.push('\n');
+                done = true;
+            }
+        }
+    }
+
+    let mut out = String::with_capacity(text.len() + new_line.len() + 1);
+    out.push_str(&text[..start]);
+    out.push_str(&rebuilt);
+    out.push_str(&text[end..]);
+    out
+}
+
 fn normalize_archive_date(value: &str) -> Result<String, CliError> {
     if value.is_empty() {
         return Ok(today_utc());
@@ -1680,6 +1757,18 @@ fn replace_next_action(text: &str, link: &str, next_action: &str) -> String {
 
 fn run_set_status(args: &SetStatusArgs) -> Result<SetStatusResult, CliError> {
     let status = args.status.trim();
+    let case = resolve_case(&args.entry)?;
+    match case.kind {
+        CaseKind::Inbox => run_set_status_inbox(args, &case, status),
+        CaseKind::Record => run_set_status_record(args, &case, status),
+    }
+}
+
+fn run_set_status_inbox(
+    args: &SetStatusArgs,
+    case: &Case,
+    status: &str,
+) -> Result<SetStatusResult, CliError> {
     if RETIRED_STATUSES.contains(&status) {
         return Err(CliError::runtime(
             "retired-lifecycle-status",
@@ -1693,17 +1782,6 @@ fn run_set_status(args: &SetStatusArgs) -> Result<SetStatusResult, CliError> {
         return Err(CliError::usage(
             "invalid-status",
             format!("invalid status: {status}"),
-            None,
-        ));
-    }
-    let case = resolve_case(&args.entry)?;
-    if case.kind != CaseKind::Inbox {
-        return Err(CliError::usage(
-            "set-status-inbox-only",
-            format!(
-                "set-status is only supported for inbox cases (ENTRY.md); got kind={}",
-                case.kind.as_str()
-            ),
             None,
         ));
     }
@@ -1730,29 +1808,72 @@ fn run_set_status(args: &SetStatusArgs) -> Result<SetStatusResult, CliError> {
     })
 }
 
-fn run_archive(args: &ArchiveArgs) -> Result<ArchiveResult, CliError> {
-    let archive_date = normalize_archive_date(&args.date)?;
-    let case = resolve_case(&args.entry)?;
-    if case.kind != CaseKind::Inbox {
+fn run_set_status_record(
+    args: &SetStatusArgs,
+    case: &Case,
+    status: &str,
+) -> Result<SetStatusResult, CliError> {
+    if !VALID_RECORD_STATUSES.contains(&status) {
         return Err(CliError::usage(
-            "archive-inbox-only",
+            "invalid-record-status",
             format!(
-                "archive is only supported for inbox cases (ENTRY.md); got kind={}",
-                case.kind.as_str()
+                "invalid record status: {status}; the record lifecycle is active|superseded|retired"
             ),
             None,
         ));
     }
+    let text = read_text(&case.doc_path)?;
+    // Records may carry a multi-word free-text status, so match the whole line
+    // rather than the single-token inbox status regex — otherwise the records
+    // that most need migrating into the lifecycle cannot be re-set.
+    let re = record_status_line_regex();
+    if !re.is_match(&text) {
+        return Err(CliError::runtime(
+            "missing-status-line",
+            "record has no status line",
+            None,
+        ));
+    }
+    let mut new_text = re
+        .replace(&text, format!("- Status: {status}").as_str())
+        .into_owned();
+    if !args.link.is_empty() {
+        new_text = upsert_status_field(&new_text, "Superseded-by", &args.link);
+    }
+    write_text(&case.doc_path, &new_text)?;
+    Ok(SetStatusResult {
+        ok: true,
+        path: display_path(&case.doc_path),
+        folder: display_path(&case.folder),
+        status: status.to_string(),
+        link: args.link.clone(),
+    })
+}
+
+fn run_archive(args: &ArchiveArgs) -> Result<ArchiveResult, CliError> {
+    let archive_date = normalize_archive_date(&args.date)?;
+    let case = resolve_case(&args.entry)?;
+    match case.kind {
+        CaseKind::Inbox => run_archive_inbox(args, &case, &archive_date),
+        CaseKind::Record => run_archive_record(args, &case, &archive_date),
+    }
+}
+
+fn run_archive_inbox(
+    args: &ArchiveArgs,
+    case: &Case,
+    archive_date: &str,
+) -> Result<ArchiveResult, CliError> {
     let inbox_dir = resolve_archive_inbox_dir(args.inbox_dir.as_deref(), &case.folder);
     let archive_root = resolve_archive_root(args.archive_root.as_deref(), &inbox_dir);
-    let destination_folder = archive_destination(&case.folder, &archive_root, &archive_date);
+    let destination_folder = archive_destination(&case.folder, &archive_root, archive_date);
     let destination_doc = destination_folder.join("ENTRY.md");
     let reason = if args.reason.is_empty() {
         "Completed entry archived out of the active error inbox.".to_string()
     } else {
         args.reason.clone()
     };
-    let verification = verify_case(&case, Some(&inbox_dir), DEFAULT_EVIDENCE_MAX_BYTES, false)?;
+    let verification = verify_case(case, Some(&inbox_dir), DEFAULT_EVIDENCE_MAX_BYTES, false)?;
     let parsed = parse_entry(&case.doc_path)?;
     let sections = parsed.sections.clone();
     let fields = parsed.fields.clone();
@@ -1875,7 +1996,164 @@ fn run_archive(args: &ArchiveArgs) -> Result<ArchiveResult, CliError> {
     let text = read_text(&destination_doc)?;
     write_text(
         &destination_doc,
-        &upsert_archive_section(&text, &archive_date, &reason, &args.link),
+        &upsert_archive_section(&text, archive_date, &reason, &args.link),
+    )?;
+    Ok(payload)
+}
+
+fn run_archive_record(
+    args: &ArchiveArgs,
+    case: &Case,
+    archive_date: &str,
+) -> Result<ArchiveResult, CliError> {
+    let inbox_dir = resolve_archive_inbox_dir(args.inbox_dir.as_deref(), &case.folder);
+    let archive_root = resolve_archive_root(args.archive_root.as_deref(), &inbox_dir);
+    let destination_folder = archive_destination(&case.folder, &archive_root, archive_date);
+    let destination_doc = destination_folder.join("RECORD.md");
+
+    let verification = verify_case(case, Some(&inbox_dir), DEFAULT_EVIDENCE_MAX_BYTES, false)?;
+    let parsed = parse_entry(&case.doc_path)?;
+    let fields = parsed.fields.clone();
+    let mut violations = verification.violations.clone();
+
+    let status = fields.get("status").cloned().unwrap_or_default();
+    if !RECORD_ARCHIVE_READY_STATUSES.contains(&status.as_str()) {
+        violations.push(Violation::new(
+            "archive_record_status",
+            "archive requires a retired record status: superseded or retired",
+        ));
+    }
+
+    // The supersession link is satisfied either by a `Superseded-by` status
+    // field (non-empty and not "none") or by an explicit `--link`.
+    let superseded_by = fields.get("superseded-by").cloned().unwrap_or_default();
+    let superseded_by_present =
+        !superseded_by.trim().is_empty() && !superseded_by.trim().eq_ignore_ascii_case("none");
+    let link_present = superseded_by_present || !args.link.is_empty();
+    if !link_present {
+        violations.push(Violation::new(
+            "archive_record_supersede_link",
+            "archive requires a Superseded-by link or --link",
+        ));
+    }
+
+    if destination_folder.exists() {
+        violations.push(Violation::new(
+            "archive_target_exists",
+            format!(
+                "archive target already exists: {}",
+                destination_folder.display()
+            ),
+        ));
+    }
+
+    let mut durable_links: Vec<String> = Vec::new();
+    if superseded_by_present {
+        durable_links.push(superseded_by.trim().to_string());
+    }
+    if !args.link.is_empty() && !durable_links.iter().any(|l| l == &args.link) {
+        durable_links.push(args.link.clone());
+    }
+
+    let payload = ArchiveResult {
+        ok: violations.is_empty(),
+        archive_ready: violations.is_empty(),
+        dry_run: args.dry_run,
+        path: display_path(&destination_doc),
+        source: display_path(&case.folder),
+        destination: display_path(&destination_doc),
+        folder: display_path(&destination_folder),
+        status: status.clone(),
+        durable_links: durable_links.clone(),
+        violations: violations.clone(),
+        warnings: Vec::new(),
+    };
+    if !violations.is_empty() {
+        return Ok(payload);
+    }
+    if args.dry_run {
+        return Ok(payload);
+    }
+    if !args.yes {
+        let question = format!(
+            "Archive {} to {}? [y/N] ",
+            display_path(&case.folder),
+            display_path(&destination_folder)
+        );
+        match prompt::confirm(&question, true, PromptOptions::new()) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(CliError::runtime(
+                    "archive-cancelled",
+                    "archive cancelled",
+                    None,
+                ));
+            }
+            Err(PromptError::NonInteractive) => {
+                return Err(CliError::usage(
+                    "archive-confirmation-required",
+                    "archive requires --yes when stdin or stderr is not a TTY",
+                    Some(json!({
+                        "source": display_path(&case.folder),
+                        "destination": display_path(&destination_folder),
+                    })),
+                ));
+            }
+            Err(PromptError::Io(err)) => {
+                return Err(CliError::runtime(
+                    "archive-confirmation-failed",
+                    format!("failed to read archive confirmation: {err}"),
+                    None,
+                ));
+            }
+        }
+    }
+
+    if let Some(parent) = destination_folder.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::runtime(
+                "create-dir-failed",
+                format!("failed to create {}: {err}", parent.display()),
+                Some(json!({ "path": display_path(parent) })),
+            )
+        })?;
+    }
+    fs::rename(&case.folder, &destination_folder).map_err(|err| {
+        CliError::runtime(
+            "archive-move-failed",
+            format!(
+                "failed to move case folder {} -> {}: {err}",
+                case.folder.display(),
+                destination_folder.display()
+            ),
+            Some(json!({
+                "source": display_path(&case.folder),
+                "destination": display_path(&destination_folder),
+            })),
+        )
+    })?;
+    let reason = if args.reason.is_empty() {
+        "Retired operation record archived out of the active operation-records lane.".to_string()
+    } else {
+        args.reason.clone()
+    };
+    let link = if args.link.is_empty() {
+        superseded_by.trim().to_string()
+    } else {
+        args.link.clone()
+    };
+    let mut text = read_text(&destination_doc)?;
+    // When `--link` is the supersession source (the record had no usable
+    // `Superseded-by` field, or it still said `none`), persist it into the
+    // Status block as well — otherwise field consumers like `verify` and the
+    // lifecycle tooling lose the supersession metadata that only the rendered
+    // `## Archive` section would otherwise carry.
+    if !args.link.is_empty() && !superseded_by_present {
+        text = upsert_status_field(&text, "Superseded-by", &args.link);
+    }
+    write_text(
+        &destination_doc,
+        &upsert_archive_section(&text, archive_date, &reason, &link),
     )?;
     Ok(payload)
 }
@@ -3836,6 +4114,40 @@ mod tests {
         let updated = upsert_archive_section(text, "2026-05-18", "new reason", "docs/x.md");
         assert!(updated.contains("## Archive"));
         assert!(updated.contains("- Durable link: `docs/x.md`"));
+    }
+
+    #[test]
+    fn upsert_status_field_inserts_after_status_line() {
+        let text = "# Title\n\n## Status\n\n- Date: 2026-06-15\n- Status: superseded\n- System area: x\n\n## Signal\n\nbody\n";
+        let updated = upsert_status_field(text, "Superseded-by", "docs/next.md");
+        assert!(updated.contains("- Status: superseded\n- Superseded-by: docs/next.md\n"));
+        // The new field stays inside the Status section, ahead of the next header.
+        let status_idx = updated.find("- Superseded-by:").unwrap();
+        let signal_idx = updated.find("## Signal").unwrap();
+        assert!(status_idx < signal_idx);
+    }
+
+    #[test]
+    fn upsert_status_field_replaces_existing() {
+        let text = "# Title\n\n## Status\n\n- Status: superseded\n- Superseded-by: docs/old.md\n\n## Signal\n\nbody\n";
+        let updated = upsert_status_field(text, "Superseded-by", "docs/new.md");
+        assert!(updated.contains("- Superseded-by: docs/new.md"));
+        assert!(!updated.contains("docs/old.md"));
+    }
+
+    #[test]
+    fn upsert_status_field_does_not_duplicate_existing_field() {
+        // Regression: when the field already exists below the `- Status:` line,
+        // the helper must replace it in place, never insert a second line.
+        let text = "# Title\n\n## Status\n\n- Status: superseded\n- System area: x\n- Superseded-by: docs/old.md\n\n## Signal\n\nbody\n";
+        let updated = upsert_status_field(text, "Superseded-by", "docs/new.md");
+        assert_eq!(
+            updated.matches("- Superseded-by:").count(),
+            1,
+            "expected a single Superseded-by line, got:\n{updated}"
+        );
+        assert!(updated.contains("- Superseded-by: docs/new.md"));
+        assert!(!updated.contains("docs/old.md"));
     }
 
     #[test]

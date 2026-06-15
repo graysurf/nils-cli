@@ -1440,6 +1440,67 @@ Promote after a durable fix and validation are linked.\n\n\
         entry
     }
 
+    struct RecordOpts<'a> {
+        status: &'a str,
+        cluster: Option<&'a str>,
+        superseded_by: Option<&'a str>,
+    }
+
+    impl<'a> Default for RecordOpts<'a> {
+        fn default() -> Self {
+            Self {
+                status: "active",
+                cluster: None,
+                superseded_by: None,
+            }
+        }
+    }
+
+    /// Write a minimal operation record (RECORD.md) folder, mirroring the body
+    /// shape exercised by `verify_accepts_operation_record_folder` but using the
+    /// single-token record lifecycle vocabulary (active|superseded|retired) and
+    /// the optional `Cluster` / `Superseded-by` status fields.
+    fn write_record(folder: &Path, opts: &RecordOpts<'_>) -> PathBuf {
+        fs::create_dir_all(folder.join("evidence")).expect("record folder");
+        let mut status_extra = String::new();
+        if let Some(cluster) = opts.cluster {
+            status_extra.push_str(&format!("- Cluster: {cluster}\n"));
+        }
+        if let Some(link) = opts.superseded_by {
+            status_extra.push_str(&format!("- Superseded-by: {link}\n"));
+        }
+        let body = format!(
+            "# Sample Operation Record\n\n\
+## Status\n\n\
+- Date: 2026-05-19\n\
+- Status: {status}\n\
+- System area: sample area\n\
+{status_extra}\n\
+## Signal\n\n\
+A real workflow exercised the system.\n\n\
+## Evidence\n\n\
+- Local validation: see `evidence/validation.md`.\n\n\
+## Diagnosis\n\n\
+Root cause identified.\n\n\
+## Promotion Decision\n\n\
+Promoted for cross-skill audit value.\n\n\
+## Durable Fix\n\n\
+Fix landed in maintained code.\n\n\
+## Validation\n\n\
+All gates green.\n",
+            status = opts.status,
+            status_extra = status_extra,
+        );
+        let record = folder.join("RECORD.md");
+        fs::write(&record, body).expect("write record");
+        fs::write(
+            folder.join("evidence").join("validation.md"),
+            "Local validation: `scripts/check.sh --all` pass.\n",
+        )
+        .expect("write record evidence");
+        record
+    }
+
     fn write_skill_usage_record(dir: &Path) -> PathBuf {
         fs::create_dir_all(dir).expect("record dir");
         let path = dir.join("skill-usage.record.json");
@@ -2547,6 +2608,280 @@ Promote after a durable fix and validation are linked.\n\n\
                 .unwrap_or("")
                 .contains("archive target already exists")
         }));
+    }
+
+    #[test]
+    fn set_status_sets_record_superseded_with_link() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let records = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records");
+        let record = write_record(&records.join("sample-record"), &RecordOpts::default());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "set-status",
+                record.parent().unwrap().to_str().unwrap(),
+                "--status",
+                "superseded",
+                "--link",
+                "core/policies/heuristic-system/operation-records/replacement",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = out.stdout_json();
+        assert_eq!(payload["data"]["status"], "superseded");
+        let text = fs::read_to_string(&record).unwrap();
+        assert!(text.contains("- Status: superseded"), "text={text}");
+        assert!(
+            text.contains(
+                "- Superseded-by: core/policies/heuristic-system/operation-records/replacement"
+            ),
+            "text={text}"
+        );
+    }
+
+    #[test]
+    fn set_status_migrates_multiword_status_record() {
+        // Regression: a record carrying a multi-word free-text status
+        // (still accepted by verify) must be migratable into the lifecycle.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let records = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records");
+        let record = write_record(
+            &records.join("multiword-record"),
+            &RecordOpts {
+                status: "implemented and validated",
+                ..RecordOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "set-status",
+                record.parent().unwrap().to_str().unwrap(),
+                "--status",
+                "superseded",
+                "--link",
+                "core/policies/heuristic-system/operation-records/replacement",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let text = fs::read_to_string(&record).unwrap();
+        assert!(text.contains("- Status: superseded"), "text={text}");
+        assert!(!text.contains("implemented and validated"), "text={text}");
+        assert_eq!(text.matches("- Status:").count(), 1, "text={text}");
+    }
+
+    #[test]
+    fn set_status_rejects_invalid_record_status() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let records = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records");
+        let record = write_record(&records.join("sample-record"), &RecordOpts::default());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "set-status",
+                record.to_str().unwrap(),
+                "--status",
+                "bogus",
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = out.stdout_json();
+        let msg = payload["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("record lifecycle"), "msg={msg}");
+        let after = fs::read_to_string(&record).unwrap();
+        assert!(after.contains("- Status: active"));
+    }
+
+    #[test]
+    fn archive_rejects_active_record() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let records = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records");
+        let record = write_record(&records.join("active-record"), &RecordOpts::default());
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                record.parent().unwrap().to_str().unwrap(),
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = out.stdout_json();
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v["kind"].as_str().unwrap_or("") == "archive_record_status"),
+            "violations={violations:?}"
+        );
+        assert!(record.exists());
+    }
+
+    #[test]
+    fn archive_rejects_record_without_supersede_link() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let records = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records");
+        let record = write_record(
+            &records.join("superseded-record"),
+            &RecordOpts {
+                status: "superseded",
+                ..RecordOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                record.parent().unwrap().to_str().unwrap(),
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(out.code, 0);
+        let payload = out.stdout_json();
+        let violations = payload["error"]["details"]["violations"]
+            .as_array()
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v["kind"].as_str().unwrap_or("") == "archive_record_supersede_link"),
+            "violations={violations:?}"
+        );
+        assert!(record.exists());
+    }
+
+    #[test]
+    fn archive_moves_superseded_record() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let records = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records");
+        let record = write_record(
+            &records.join("retired-record"),
+            &RecordOpts {
+                status: "superseded",
+                superseded_by: Some("core/policies/heuristic-system/operation-records/replacement"),
+                ..RecordOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                record.parent().unwrap().to_str().unwrap(),
+                "--yes",
+                "--date",
+                "2026-06-15",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let payload = out.stdout_json();
+        let destination = PathBuf::from(payload["data"]["destination"].as_str().unwrap());
+        assert!(
+            destination.ends_with("operation-records/archive/2026/retired-record/RECORD.md"),
+            "destination={destination:?}"
+        );
+        assert!(!record.exists());
+        assert!(destination.exists());
+        let text = fs::read_to_string(&destination).unwrap();
+        assert!(text.contains("## Archive"), "text={text}");
+        let verify = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                destination.to_str().unwrap(),
+                "--strict",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+        let vpayload = verify.stdout_json();
+        assert_eq!(vpayload["data"]["ok"], true);
+        assert_eq!(vpayload["data"]["kind"], "record");
+    }
+
+    #[test]
+    fn archive_record_with_link_persists_superseded_by() {
+        // Regression: when `--link` is the supersession source (no Superseded-by
+        // field on the record), the moved RECORD.md must carry the link in its
+        // Status block, not only in the rendered `## Archive` section, so
+        // field consumers keep the lifecycle metadata.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let records = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records");
+        let record = write_record(
+            &records.join("retired-record"),
+            &RecordOpts {
+                status: "superseded",
+                superseded_by: None,
+                ..RecordOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                record.parent().unwrap().to_str().unwrap(),
+                "--link",
+                "core/policies/heuristic-system/operation-records/replacement",
+                "--yes",
+                "--date",
+                "2026-06-15",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let destination = PathBuf::from(out.stdout_json()["data"]["destination"].as_str().unwrap());
+        let text = fs::read_to_string(&destination).unwrap();
+        assert!(
+            text.contains(
+                "- Superseded-by: core/policies/heuristic-system/operation-records/replacement"
+            ),
+            "Status block must carry the supersession link, got:\n{text}"
+        );
+        assert_eq!(text.matches("- Superseded-by:").count(), 1, "text={text}");
     }
 
     #[test]
