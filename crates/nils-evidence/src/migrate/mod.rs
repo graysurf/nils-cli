@@ -713,9 +713,12 @@ fn build_prepared(
     // never lands in the rollup or the catalog `outcome_status` column.
     let scrubbed_status = scrub_collect(&record.outcome.status, &mut all_matches);
     let scrubbed_cwd = scrub_collect(&scrub_cwd(&record.cwd), &mut all_matches);
-    // Scrub the skill unconditionally: a bare id (no `/`) can still embed a
-    // token, and scrubbing a clean id is a no-op.
-    let scrubbed_skill = scrub_collect(&record.skill, &mut all_matches);
+    // Home-relativize an absolute skill path FIRST so neither the rollup
+    // `skill` field nor the derived `id`/slug (computed from `scrubbed_skill`
+    // below) leaks a machine home (e.g. `/Users/<user>/…` → `users-<user>-…`).
+    // Then scrub unconditionally: a bare id (no `/`) can still embed a token,
+    // and scrubbing a clean id is a no-op.
+    let scrubbed_skill = scrub_collect(&scrub_skill_path(&record.skill), &mut all_matches);
     // Scrub the promotion case link like every other archived text field so a
     // token in a heuristic-inbox URL/path never lands raw in the rollup,
     // metadata sidecar, or catalog.
@@ -1050,6 +1053,37 @@ fn project_matches_repo(project_dir: &str, repo_filter: &str) -> bool {
 
 fn iso_date_part(iso: &str) -> String {
     iso.split('T').next().unwrap_or(iso).to_string()
+}
+
+/// Home-relativize an absolute `skill` path so neither the rollup `skill` field
+/// nor the derived rollup `id`/slug leaks a machine home dir (e.g. an absolute
+/// `/Users/<user>/…/SKILL.md` would otherwise slug to `users-<user>-…` in the
+/// committed id and directory name).
+///
+/// Unlike [`scrub_cwd`], a `skill` is frequently a bare id (`issue-follow-up`)
+/// or a relative render path (`build/codex/…/SKILL.md`) that carries no home
+/// prefix; those pass through unchanged. Only an absolute path is normalized:
+/// under `$HOME` it becomes `~/…`; otherwise it redacts (an absolute path
+/// outside `$HOME` would leak another machine location).
+fn scrub_skill_path(skill: &str) -> String {
+    if is_absolute_path(skill) {
+        scrub_cwd(skill)
+    } else {
+        skill.to_string()
+    }
+}
+
+/// True when `s` is an absolute filesystem path (POSIX `/…`, UNC/`\…`, or a
+/// Windows drive `C:\…` / `C:/…`). A bare skill id or a relative render path
+/// returns false and is left untouched by [`scrub_skill_path`].
+fn is_absolute_path(s: &str) -> bool {
+    if s.starts_with('/') || s.starts_with('\\') {
+        return true;
+    }
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.next() == Some(':')
+        && matches!(chars.next(), Some('/') | Some('\\'))
 }
 
 /// $HOME-relative `cwd`, or `[REDACTED]` when it cannot be made relative.
@@ -1632,6 +1666,38 @@ mod tests {
             assert_eq!(scrub_cwd("/Users/someoneelse"), token);
         });
         assert_eq!(scrub_cwd(""), "");
+    }
+
+    #[test]
+    fn scrub_skill_path_relativizes_home_and_preserves_relative_ids() {
+        let token = nils_scrub::REDACTION_TOKEN;
+        temp_env_home("/Users/someone", || {
+            // Absolute path under $HOME → ~-relative, so neither the skill field
+            // nor the derived id/slug carries a machine home.
+            assert_eq!(
+                scrub_skill_path("/Users/someone/Project/kit/build/codex/x/SKILL.md"),
+                "~/Project/kit/build/codex/x/SKILL.md"
+            );
+            // Absolute path outside $HOME → redacted, never a raw machine path.
+            assert_eq!(scrub_skill_path("/var/lib/x/SKILL.md"), token);
+            assert_eq!(scrub_skill_path("/Users/other/x/SKILL.md"), token);
+        });
+        // A bare skill id or a relative render path carries no home prefix and
+        // is left untouched, independent of $HOME.
+        assert_eq!(scrub_skill_path("issue-follow-up"), "issue-follow-up");
+        assert_eq!(
+            scrub_skill_path("build/codex/plugins/pr/skills/deliver-pr/SKILL.md"),
+            "build/codex/plugins/pr/skills/deliver-pr/SKILL.md"
+        );
+        assert_eq!(scrub_skill_path(""), "");
+        // is_absolute_path covers the path shapes scrub_skill_path keys on.
+        assert!(is_absolute_path("/abs"));
+        assert!(is_absolute_path("\\\\unc\\share"));
+        assert!(is_absolute_path("C:\\win"));
+        assert!(is_absolute_path("C:/win"));
+        assert!(!is_absolute_path("rel/path"));
+        assert!(!is_absolute_path("bare-id"));
+        assert!(!is_absolute_path(""));
     }
 
     #[test]

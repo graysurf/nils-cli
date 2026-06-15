@@ -660,6 +660,44 @@ fn dry_run_derives_rollups_and_scrubs_without_writing() {
 }
 
 #[test]
+fn migrate_home_relativizes_skill_path_no_machine_leak() {
+    // Regression: skill_slug() slugs the FULL skill path, so an absolute skill
+    // path (e.g. /Users/<user>/.../SKILL.md) leaked the machine home both into
+    // the committed rollup `skill` field AND the derived rollup `id` / directory
+    // name (as `users-<user>-...`). A skill path under a foreign home must never
+    // commit a raw machine path; it redacts. (The under-$HOME `~/...`
+    // relativization branch is covered by the scrub_skill_path unit test, which
+    // controls $HOME; here we assert the no-leak invariant independent of the
+    // test runner's home.)
+    let s = build_empty_scenario();
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-100000",
+        &record_json(
+            "/Users/someoneelse/Project/kit/build/codex/plugins/pr/skills/deliver-pr/SKILL.md",
+            "pass",
+            "deliver a PR",
+            true,
+            false,
+        ),
+    );
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run prepare");
+    assert_eq!(report.eligible, 1);
+    let rec = &report.records[0];
+    assert!(
+        !rec.rollup.skill.contains("/Users/"),
+        "rollup.skill must not leak a raw machine path, got `{}`",
+        rec.rollup.skill
+    );
+    assert!(
+        !rec.rollup.id.contains("users-"),
+        "rollup.id must not leak a machine home slug, got `{}`",
+        rec.rollup.id
+    );
+}
+
+#[test]
 fn dry_run_dedups_already_archived_via_catalog_source_digest() {
     let s = build_scenario();
     // First compute the digest the prepare would assign.
