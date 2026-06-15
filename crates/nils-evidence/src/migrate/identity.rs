@@ -167,7 +167,7 @@ pub fn derive_repo_identity(
 ///    its identity normalizes to the same slug, folding exactly the
 ///    case/punctuation (including `_`/`-`) the sanitizer folds when agent-out
 ///    produces the dir (e.g. `Sympoies/My_Repo` -> `sympoies__my-repo`).
-/// 3. Legacy/manual dir — not a canonical slug (e.g. `acme__my_repo`, whose repo
+/// 3. Manual dir — not a canonical slug (e.g. `acme__my_repo`, whose repo
 ///    half keeps an underscore the sanitizer would fold). Match the raw
 ///    `(owner, repo)` case-insensitively but WITHOUT folding `_`/`-`, so it
 ///    accepts `acme/my_repo` and `Acme/my_repo` yet rejects the
@@ -192,7 +192,7 @@ fn cwd_identity_matches_slug(identity: &RepoIdentity, project_dir_name: &str) ->
         .as_deref()
             == Some(project_dir_name);
     }
-    // (3) legacy/manual dir: case-insensitive raw match, preserving `_`/`-`.
+    // (3) manual dir: case-insensitive raw match, preserving `_`/`-`.
     identity.org.eq_ignore_ascii_case(&dir_owner) && identity.repo.eq_ignore_ascii_case(&dir_repo)
 }
 
