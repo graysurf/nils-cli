@@ -1,6 +1,6 @@
 [package]
 name = "nils-agent-scope-lock"
-version = "1.7.1"
+version = "1.8.0"
 edition.workspace = true
 license.workspace = true
 
@@ -14,12 +14,12 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.7.1", path = "../nils-build-info" }
-nils-common = { version = "1.7.1", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.8.0", path = "../nils-build-info" }
+nils-common = { version = "1.8.0", path = "../nils-common", package = "nils-common" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "1.7.1", path = "../nils-test-support" }
+nils-test-support = { version = "1.8.0", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
