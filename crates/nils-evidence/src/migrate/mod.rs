@@ -17,7 +17,7 @@
 //!   catalog `source_digest` dedup above — a re-run re-reads the catalog and
 //!   skips any digest already archived.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -377,6 +377,10 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
     let mut prepared = Vec::new();
     let mut already = Vec::new();
     let mut blocked = Vec::new();
+    // Lazy slug -> identity index over `working_repo_roots`, built once on the
+    // first unresolvable record and reused for the rest of the batch (the rescue
+    // walk is otherwise repeated per record).
+    let mut rescue_index: Option<HashMap<String, RepoIdentity>> = None;
 
     for record_path in record_paths {
         // A per-record read or parse failure (e.g. a truncated or malformed
@@ -481,10 +485,10 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
                     // (operator typos in `--host`, etc.) are not rescued.
                     let rescued = matches!(e, IdentityError::Unresolvable(_, _))
                         .then(|| {
-                            rescue_identity_via_working_roots(
-                                &project_dir,
-                                &args.working_repo_roots,
-                            )
+                            rescue_index
+                                .get_or_insert_with(|| build_rescue_index(&args.working_repo_roots))
+                                .get(&project_dir)
+                                .cloned()
                         })
                         .flatten();
                     match rescued {
@@ -563,59 +567,59 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
 /// while bounding the filesystem walk for this last-resort rescue.
 const MAX_RESCUE_WALK_DEPTH: usize = 6;
 
-/// Last-resort identity rescue: when `derive_repo_identity` returns
-/// `Unresolvable` (the record's agent-out `<owner__repo>` slug is ambiguous
-/// under a multi-host config and its recorded `cwd` no longer exists — a removed
-/// agent worktree is the common case), find a matching local checkout under a
-/// configured `working_repo_roots` entry and recover the host from its `origin`
-/// remote.
+/// Build the last-resort identity rescue index: a map from agent-out
+/// `<owner__repo>` slug to the full origin identity of a local checkout under
+/// `working_repo_roots`. Used when `derive_repo_identity` returns `Unresolvable`
+/// (the record's `cwd` no longer exists — a removed agent worktree is the common
+/// case): the slug carries no host, so the host is recovered from a matching
+/// checkout's `origin`.
 ///
-/// A checkout matches when its `origin` `(org, repo)`, normalized with the SAME
-/// rule that produced the agent-out slug (`agent_out::project_slug_from_owner_repo`,
-/// which keeps only the last owner segment), equals the record's slug. This lets
-/// a nested provider group — full origin org such as `acme/platform/backend`,
-/// agent-out slug `backend__svc` — still match, and the FULL origin org/repo is
-/// preserved in the recovered identity (the slug's truncated owner is not used).
-fn rescue_identity_via_working_roots(
-    project_dir_name: &str,
-    working_repo_roots: &[PathBuf],
-) -> Option<RepoIdentity> {
-    // Only `<owner__repo>` slugs are rescuable (the record carries no host).
-    identity::split_owner_repo(project_dir_name)?;
+/// A checkout is keyed by its `origin` `(org, repo)` normalized with the SAME
+/// rule that produced the agent-out slug ([`nils_common::slug::project_slug_from_owner_repo`],
+/// which keeps only the last owner segment), so a nested provider group — full
+/// origin org such as `acme/platform/backend`, slug `backend__svc` — still
+/// matches, and the FULL origin org/repo is preserved in the recovered identity.
+/// The whole index is built once per migrate run and reused across records.
+fn build_rescue_index(working_repo_roots: &[PathBuf]) -> HashMap<String, RepoIdentity> {
+    let mut index = HashMap::new();
     for root in working_repo_roots {
-        if let Some(found) = find_checkout_for_slug(root, project_dir_name, 0) {
-            return Some(found);
-        }
+        collect_checkouts(root, 0, &mut index);
     }
-    None
+    index
 }
 
-/// Walk `dir` (bounded by [`MAX_RESCUE_WALK_DEPTH`]) for a git checkout whose
-/// `origin` normalizes to the agent-out slug `target_slug`, returning its full
-/// origin identity. A directory holding `.git` is treated as a checkout and not
-/// descended into.
-fn find_checkout_for_slug(dir: &Path, target_slug: &str, depth: usize) -> Option<RepoIdentity> {
+/// Walk `dir` (bounded by [`MAX_RESCUE_WALK_DEPTH`]) collecting git checkouts
+/// into `index`, keyed by their normalized slug. A directory holding `.git` is
+/// treated as a checkout and not descended into. Dot-directories are skipped and
+/// directory symlinks are not followed (`file_type` does not traverse), so a
+/// large `working_repo_roots` tree stays bounded and cycle-free.
+fn collect_checkouts(dir: &Path, depth: usize, index: &mut HashMap<String, RepoIdentity>) {
     if depth > MAX_RESCUE_WALK_DEPTH {
-        return None;
+        return;
     }
     if dir.join(".git").exists() {
-        let found = identity::identity_from_cwd(&dir.to_string_lossy())?;
-        let normalized = nils_common::slug::project_slug_from_owner_repo(&format!(
-            "{}/{}",
-            found.org, found.repo
-        ));
-        return (normalized.as_deref() == Some(target_slug)).then_some(found);
-    }
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir()
-            && let Some(found) = find_checkout_for_slug(&path, target_slug, depth + 1)
+        if let Some(found) = identity::identity_from_cwd(&dir.to_string_lossy())
+            && let Some(slug) = nils_common::slug::project_slug_from_owner_repo(&format!(
+                "{}/{}",
+                found.org, found.repo
+            ))
         {
-            return Some(found);
+            // First checkout wins for a given slug; later duplicates are ignored.
+            index.entry(slug).or_insert(found);
+        }
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let name = entry.file_name();
+        let skip = name.to_string_lossy().starts_with('.');
+        if is_dir && !skip {
+            collect_checkouts(&entry.path(), depth + 1, index);
         }
     }
-    None
 }
 
 #[allow(clippy::too_many_arguments)]

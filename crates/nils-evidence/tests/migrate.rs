@@ -543,6 +543,42 @@ fn migrate_rescues_nested_gitlab_checkout_via_working_repo_roots() {
 }
 
 #[test]
+fn migrate_rescue_ignores_checkout_whose_slug_does_not_match() {
+    // The rescue matches strictly by normalized slug: a decoy checkout under
+    // working_repo_roots that does NOT match the record's slug must be ignored,
+    // so the record stays blocked rather than being mis-attributed to the wrong
+    // repo's host.
+    let s = build_multi_host_empty_scenario();
+
+    let roots = s.root.join("mirror");
+    make_git_checkout(
+        &roots.join("other"),
+        "thing",
+        "git@github.com:other/thing.git",
+    );
+
+    write_record(
+        &s.source_out,
+        "backend__svc",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &s.root.join("gone").to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let mut args = dry_run_args(&s);
+    args.working_repo_roots = vec![roots.clone()];
+    let report = migrate::prepare(&args).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 0,
+        "a non-matching checkout must not rescue the record"
+    );
+    assert_eq!(report.blocked.len(), 1, "the record stays blocked");
+}
+
+#[test]
 fn migrate_skips_and_reports_unparseable_records_without_aborting() {
     // Core fix (A), parse path: a malformed / truncated skill-usage.record.json
     // (trailing characters after the JSON object) must be SKIPPED and REPORTED
