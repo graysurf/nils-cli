@@ -216,6 +216,7 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/tests/detect-docs-only.test.sh`
 - `bash scripts/ci/tests/shared-helper-adoption-audit.test.sh`
 - `bash scripts/ci/tests/publish-order-audit.test.sh`
+- `bash scripts/ci/tests/docs-hygiene-audit.test.sh`
 - `bash scripts/ci/test-stale-audit.sh --strict`
 - `bash scripts/ci/workspace-version-lockstep.sh --strict`
 - `bash scripts/ci/publish-order-audit.sh --strict`

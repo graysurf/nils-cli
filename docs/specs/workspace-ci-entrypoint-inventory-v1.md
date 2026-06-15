@@ -78,7 +78,7 @@ records the keep/delete decision plus the active caller evidence.
 | `scripts/ci/coverage-badge.sh` | keep | `.github/workflows/ci.yml` `coverage_badge` job |
 | `scripts/ci/coverage-summary.sh` | keep | `.github/workflows/ci.yml` `coverage` job + `DEVELOPMENT.md` coverage flow |
 | `scripts/ci/detect-docs-only.sh` | keep | `.github/workflows/ci.yml` `changes` job + `scripts/ci/tests/detect-docs-only.test.sh` |
-| `scripts/ci/docs-hygiene-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes |
+| `scripts/ci/docs-hygiene-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes + `scripts/ci/tests/docs-hygiene-audit.test.sh` |
 | `scripts/ci/docs-placement-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/markdownlint-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/nils-cli-checks-entrypoint.sh` | keep | `.github/workflows/ci.yml` `test` and `test_macos` jobs + `DEVELOPMENT.md` local-fast and CI/full commands |
