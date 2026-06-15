@@ -85,22 +85,7 @@ fn build() -> Archive {
         "20260603T000000Z-c",
     );
     git(&archive, &["init", "-q", "-b", "main"]);
-    git(&archive, &["add", "-A"]);
-    git(
-        &archive,
-        &[
-            "-c",
-            "user.name=tester",
-            "-c",
-            "user.email=tester@example.com",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "-m",
-            "seed",
-        ],
-    );
+    seed_commit(&archive, "seed");
     Archive {
         _tmp: tmp,
         root,
@@ -290,16 +275,31 @@ fn purge_rejects_path_like_host() {
     // `archive/evidence` once joined and `remove_dir_all`-ed. It must be
     // refused before any path join or deletion.
     let a = build();
-    for bad in ["../escape", "/etc", "..", ".", "a/b", ""] {
+    // A sentinel outside evidence/ that `archive/evidence/../../escape-sentinel`
+    // resolves to; it must survive a rejected path-like host even if the guard
+    // were ever reordered after path resolution.
+    let sentinel = a.root.join("escape-sentinel");
+    fs::create_dir_all(&sentinel).unwrap();
+    fs::write(sentinel.join("marker"), "keep").unwrap();
+    for bad in [
+        "../escape",
+        "../../escape-sentinel",
+        "/etc",
+        "..",
+        ".",
+        "a/b",
+        "",
+    ] {
         let err = purge::run(&args(&a.archive, vec![bad.to_string()], None, true)).unwrap_err();
         assert!(
             matches!(err, PurgeError::UnsafeHost(_)),
             "host {bad:?} must be rejected as unsafe, got {err:?}"
         );
     }
-    // Real host trees are untouched.
+    // Real host trees and the external sentinel are untouched.
     assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
     assert!(a.archive.join("evidence/github.com").exists());
+    assert!(sentinel.exists(), "external sentinel must not be deleted");
 }
 
 #[cfg(unix)]
@@ -425,4 +425,91 @@ fn purge_apply_rolls_back_on_catalog_failure() {
         before,
         "no purge commit on catalog failure"
     );
+    // Working tree is fully clean: proves the deletion was both attempted and
+    // completely reverted (a partial rollback would leave deleted entries).
+    let st = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&a.archive)
+        .output()
+        .unwrap();
+    assert!(
+        st.stdout.is_empty(),
+        "working tree clean after rollback, got: {}",
+        String::from_utf8_lossy(&st.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_apply_rejects_class_host_path_traversal() {
+    // A crafted/corrupt config host key must not escape evidence/ through the
+    // --class scope either: every resolved scope host is validated, not only
+    // explicit --host values.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let archive = root.join("archive");
+    fs::create_dir_all(archive.join("config")).unwrap();
+    fs::create_dir_all(archive.join("evidence")).unwrap();
+    fs::write(
+        archive.join("config").join("hosts.yaml"),
+        "version: 1\nhosts:\n  \"../escape\":\n    class: employer\n    employer: Evil\n",
+    )
+    .unwrap();
+    // Sentinel at archive/escape == archive/evidence/../escape, holding a rollup
+    // so a bypassed guard plus existence-based deletion would remove it.
+    let sentinel = archive.join("escape");
+    fs::create_dir_all(&sentinel).unwrap();
+    fs::write(sentinel.join("skill-usage.rollup.json"), "{}").unwrap();
+    git(&archive, &["init", "-q", "-b", "main"]);
+    let a = Archive {
+        _tmp: tmp,
+        root,
+        archive,
+    };
+    seed_commit(&a.archive, "seed");
+    configure_push_remote(&a);
+    let stub = install_semantic_commit_stub(&a);
+
+    let err = with_path(&stub, || {
+        purge::run(&args(&a.archive, vec![], Some(HostClass::Employer), true)).unwrap_err()
+    });
+    assert!(
+        matches!(err, PurgeError::UnsafeHost(_)),
+        "class-derived path-like host must be rejected, got {err:?}"
+    );
+    assert!(
+        a.archive.join("escape").exists(),
+        "path-traversal target outside evidence/ must not be deleted"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_apply_noop_when_scoped_host_absent() {
+    // A safe but on-disk-absent scoped host is a clean no-op: applied, but no
+    // deletion and no commit (the existing_host_roots == 0 branch).
+    let a = build();
+    configure_push_remote(&a);
+    let stub = install_semantic_commit_stub(&a);
+    let before = git_count_commits(&a.archive);
+
+    let report = with_path(&stub, || {
+        purge::run(&args(
+            &a.archive,
+            vec!["absent.example.com".to_string()],
+            None,
+            true,
+        ))
+        .expect("apply")
+    });
+
+    assert!(report.applied);
+    assert!(
+        report.archive_commit.is_none(),
+        "no commit when nothing exists to delete"
+    );
+    assert_eq!(git_count_commits(&a.archive), before, "no commit");
+    // Existing host trees are untouched.
+    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert!(a.archive.join("evidence/github.com").exists());
 }

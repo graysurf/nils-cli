@@ -84,6 +84,10 @@ pub enum PurgeError {
         "archive has pre-existing staged changes; purge --apply commits only its own changes, so stash or commit them first"
     )]
     StagedArchiveChanges,
+    #[error(
+        "failed to regenerate archive catalog ({catalog}) AND failed to roll back the evidence deletions ({rollback}); the archive working tree still has uncommitted deletions — recover with `git checkout -- evidence catalog.json`"
+    )]
+    RollbackFailed { catalog: String, rollback: String },
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error("failed to regenerate archive catalog: {0}")]
@@ -101,6 +105,7 @@ impl PurgeError {
             PurgeError::NoScope => "purge-no-scope",
             PurgeError::UnsafeHost(_) => "purge-unsafe-host",
             PurgeError::StagedArchiveChanges => "purge-staged-archive-changes",
+            PurgeError::RollbackFailed { .. } => "purge-rollback-failed",
             PurgeError::Source(_) => "purge-source-error",
             PurgeError::Catalog(_) => "purge-catalog-error",
             PurgeError::Io(_) => "purge-io-error",
@@ -124,12 +129,6 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
         return Err(PurgeError::NoScope);
     }
 
-    // Reject path-like explicit hosts before any join / deletion: a single
-    // safe path component can never escape `evidence/`.
-    for host in &args.host {
-        ensure_plain_host_label(host)?;
-    }
-
     let archive = source::resolve_archive(args.archive.as_deref())?;
     let hosts_path = source::hosts_path_for(&archive, args.hosts.as_deref());
     let hosts = source::load_hosts(&hosts_path)?;
@@ -144,6 +143,14 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
         }
     }
     let scope_hosts: Vec<String> = scope.into_iter().collect();
+
+    // Reject any path-like host before a join / deletion can act on it. This
+    // covers BOTH explicit --host values and --class-derived keys read from
+    // config/hosts.yaml (which is not shape-validated at load), so a single
+    // safe path component is the only thing that ever reaches `evidence/<host>`.
+    for host in &scope_hosts {
+        ensure_plain_host_label(host)?;
+    }
 
     // Enumerate the record directories under evidence/<host>/ for each host,
     // and track which scoped host trees actually exist on disk. The apply no-op
@@ -191,7 +198,9 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
     // semantic-commit step commits the whole index. Refuse any pre-existing
     // staged change anywhere in the archive so purge only commits what it
     // stages itself (evidence/ + catalog.json).
-    if has_staged_changes(&archive)? {
+    if nils_common::git::has_staged_changes_in(&archive)
+        .map_err(|e| PurgeError::Io(e.to_string()))?
+    {
         return Err(PurgeError::StagedArchiveChanges);
     }
 
@@ -219,10 +228,18 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
 
     // Regenerate the catalog after deletion. If it fails (e.g. a malformed
     // surviving rollup), roll the deletions back so apply never leaves
-    // uncommitted destructive state, then surface the catalog error.
-    if let Err(e) = crate::catalog::write_catalog(&archive) {
-        rollback_deletions(&archive);
-        return Err(PurgeError::Catalog(e.to_string()));
+    // uncommitted destructive state, then surface the catalog error. If the
+    // rollback itself fails, surface that loudly — the working tree still holds
+    // the destructive deletions.
+    if let Err(catalog_err) = crate::catalog::write_catalog(&archive) {
+        let catalog_err = catalog_err.to_string();
+        if let Err(rollback_err) = rollback_deletions(&archive) {
+            return Err(PurgeError::RollbackFailed {
+                catalog: catalog_err,
+                rollback: rollback_err,
+            });
+        }
+        return Err(PurgeError::Catalog(catalog_err));
     }
 
     // Stage the deletions + catalog, then one commit and push.
@@ -266,31 +283,28 @@ fn ensure_plain_host_label(host: &str) -> Result<(), PurgeError> {
     Ok(())
 }
 
-/// True when the archive has any staged change in its index relative to HEAD.
-/// `git diff --cached --name-only` lists staged paths; non-empty output means
-/// the index is not clean.
-fn has_staged_changes(archive: &Path) -> Result<bool, PurgeError> {
-    let out = nils_common::git::run_output_in(archive, &["diff", "--cached", "--name-only"])
-        .map_err(|e| PurgeError::Io(e.to_string()))?;
+/// Roll back the working-tree deletions after a failed catalog regeneration.
+/// The tree was proven clean (and the index empty) before deletion, so
+/// restoring the purge-owned paths to HEAD undoes the removal without touching
+/// anything else. `evidence/` and `catalog.json` are restored separately:
+/// `git checkout` aborts the whole operation if any one pathspec matches
+/// nothing (e.g. an archive that has never had a `catalog.json`), so a combined
+/// pathspec would leave `evidence/` unrestored.
+///
+/// Restoring `evidence/` is the destructive change that MUST be undone, so its
+/// failure is surfaced to the caller (`Err`); the `catalog.json` restore is
+/// best-effort because that path may legitimately not exist in HEAD.
+fn rollback_deletions(archive: &Path) -> Result<(), String> {
+    let out = nils_common::git::run_output_in(archive, &["checkout", "--", "evidence"])
+        .map_err(|e| e.to_string())?;
     if !out.status.success() {
-        return Err(PurgeError::Io(format!(
-            "git diff --cached failed: {}",
+        return Err(format!(
+            "git checkout -- evidence failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        ));
     }
-    Ok(!out.stdout.is_empty())
-}
-
-/// Best-effort rollback of the working-tree deletions after a failed catalog
-/// regeneration. The tree was proven clean (and the index empty) before
-/// deletion, so restoring the purge-owned paths to HEAD undoes the removal
-/// without touching anything else. `evidence/` and `catalog.json` are restored
-/// separately: `git checkout` aborts the whole operation if any one pathspec
-/// matches nothing (e.g. an archive that has never had a `catalog.json`), so a
-/// combined pathspec would leave `evidence/` unrestored.
-fn rollback_deletions(archive: &Path) {
-    let _ = nils_common::git::run_output_in(archive, &["checkout", "--", "evidence"]);
     let _ = nils_common::git::run_output_in(archive, &["checkout", "--", "catalog.json"]);
+    Ok(())
 }
 
 /// Collect archive-relative record directories (those containing a
