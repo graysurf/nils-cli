@@ -11,8 +11,20 @@
 //!   catalog, commit, and push.
 //! - A scope is REQUIRED — at least one of `--host` / `--class`. There is no
 //!   implicit whole-archive purge.
+//! - Explicit `--host` values must be plain host labels: a single path
+//!   component, never absolute, `.`, `..`, or path-separated, so the resolved
+//!   `evidence/<host>` tree can never escape the archive subtree.
 //! - `--apply` refuses to run against a dirty archive working tree (under
-//!   `evidence/` or `catalog.json`), so it never commits unrelated changes.
+//!   `evidence/` or `catalog.json`) AND against any pre-existing staged change
+//!   anywhere in the archive, so it only ever commits the purge-owned pathspec.
+//! - A scoped host tree is deleted whenever it exists, even when it holds only
+//!   orphaned files without a rollup; the dry-run surfaces this so it always
+//!   describes what apply will remove.
+//! - Apply refuses a scoped host tree that carries untracked or ignored files,
+//!   since a rollback (`git checkout`) could not restore them.
+//! - Any failure after deletion and before the commit lands (catalog regen,
+//!   stage, commit) rolls the deletions back, so apply never leaves uncommitted
+//!   destructive state.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -47,6 +59,10 @@ pub struct PurgeTarget {
     pub records: usize,
     /// Archive-relative record directories under this host.
     pub paths: Vec<String>,
+    /// Whether `evidence/<host>/` exists on disk. Apply removes the entire tree
+    /// when it does, even with zero discovered rollups — so the dry-run surfaces
+    /// this to describe exactly what apply will delete.
+    pub host_tree_present: bool,
 }
 
 /// Result of a purge dry-run or apply.
@@ -67,6 +83,22 @@ pub struct PurgeReport {
 pub enum PurgeError {
     #[error("specify a purge scope: at least one of --host or --class")]
     NoScope,
+    #[error(
+        "unsafe --host value `{0}`: expected a plain host label (no path separators, `.`, or `..`)"
+    )]
+    UnsafeHost(String),
+    #[error(
+        "archive has pre-existing staged changes; purge --apply commits only its own changes, so stash or commit them first"
+    )]
+    StagedArchiveChanges,
+    #[error(
+        "scoped host `{0}` contains untracked or ignored files that a rollback cannot restore; remove or commit them before purging"
+    )]
+    UnrestorableScope(String),
+    #[error(
+        "purge failed after deleting evidence ({cause}) AND the rollback also failed ({rollback}); the archive working tree still has uncommitted deletions — recover with `git checkout -- evidence catalog.json`"
+    )]
+    RollbackFailed { cause: String, rollback: String },
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error("failed to regenerate archive catalog: {0}")]
@@ -82,6 +114,10 @@ impl PurgeError {
     pub fn code(&self) -> &'static str {
         match self {
             PurgeError::NoScope => "purge-no-scope",
+            PurgeError::UnsafeHost(_) => "purge-unsafe-host",
+            PurgeError::StagedArchiveChanges => "purge-staged-archive-changes",
+            PurgeError::UnrestorableScope(_) => "purge-unrestorable-scope",
+            PurgeError::RollbackFailed { .. } => "purge-rollback-failed",
             PurgeError::Source(_) => "purge-source-error",
             PurgeError::Catalog(_) => "purge-catalog-error",
             PurgeError::Io(_) => "purge-io-error",
@@ -120,11 +156,27 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
     }
     let scope_hosts: Vec<String> = scope.into_iter().collect();
 
-    // Enumerate the record directories under evidence/<host>/ for each host.
+    // Reject any path-like host before a join / deletion can act on it. This
+    // covers BOTH explicit --host values and --class-derived keys read from
+    // config/hosts.yaml (which is not shape-validated at load), so a single
+    // safe path component is the only thing that ever reaches `evidence/<host>`.
+    for host in &scope_hosts {
+        ensure_plain_host_label(host)?;
+    }
+
+    // Enumerate the record directories under evidence/<host>/ for each host,
+    // and track which scoped host trees actually exist on disk. The apply no-op
+    // decision keys off existence, not the rollup count, so a host tree holding
+    // only orphaned files (no rollup) is still deleted.
     let mut targets = Vec::new();
     let mut total = 0usize;
+    let mut existing_host_roots = 0usize;
     for host in &scope_hosts {
         let host_root = archive.join("evidence").join(host);
+        let host_tree_present = host_root.exists();
+        if host_tree_present {
+            existing_host_roots += 1;
+        }
         let mut paths = Vec::new();
         collect_record_dirs(&archive, &host_root, &mut paths)?;
         paths.sort();
@@ -133,6 +185,7 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
             host: host.clone(),
             records: paths.len(),
             paths,
+            host_tree_present,
         });
     }
 
@@ -155,13 +208,35 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
         return Err(MigrateError::ArchiveRepoDirty.into());
     }
 
-    // Nothing matched the scope: a clean no-op (no deletion, no commit).
-    if total == 0 {
+    // The dirty guard above only covers the purge-owned pathspec, but the
+    // semantic-commit step commits the whole index. Refuse any pre-existing
+    // staged change anywhere in the archive so purge only commits what it
+    // stages itself (evidence/ + catalog.json).
+    if nils_common::git::has_staged_changes_in(&archive)
+        .map_err(|e| PurgeError::Io(e.to_string()))?
+    {
+        return Err(PurgeError::StagedArchiveChanges);
+    }
+
+    // Rollback restores tracked content from HEAD; it cannot bring back
+    // untracked or ignored files. Refuse any scoped host root that carries such
+    // files so a failed apply is always fully recoverable (and so deletion
+    // always produces a stageable change rather than an empty commit).
+    for host in &scope_hosts {
+        if scope_has_unrestorable_files(&archive, host)? {
+            return Err(PurgeError::UnrestorableScope(host.clone()));
+        }
+    }
+
+    // No scoped host tree exists on disk: a clean no-op (no deletion, no
+    // commit). Keyed on tree existence, not the rollup count, so a host tree
+    // with only orphaned files (total == 0) is still deleted below.
+    if existing_host_roots == 0 {
         return Ok(PurgeReport {
             archive: archive.display().to_string(),
             scope_hosts,
             targets,
-            total_records: 0,
+            total_records: total,
             applied: true,
             archive_commit: None,
         });
@@ -175,24 +250,24 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
         }
     }
 
-    // Regenerate the catalog after deletion.
-    crate::catalog::write_catalog(&archive).map_err(|e| PurgeError::Catalog(e.to_string()))?;
-
-    // Stage the deletions + catalog, then one commit and push.
-    let stage = ["add", "-A", "--", "evidence", "catalog.json"];
-    let out = nils_common::git::run_output_in(&archive, &stage)
-        .map_err(|e| PurgeError::Io(e.to_string()))?;
-    if !out.status.success() {
-        return Err(MigrateError::Subprocess(
-            "git add (archive)".to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        )
-        .into());
-    }
-
-    let message = purge_commit_message(&scope_hosts, total);
-    crate::migrate::run_semantic_commit(&archive, &message)?;
-    let archive_commit = crate::migrate::head_sha(&archive)?;
+    // From here until the commit lands, every step (catalog regen, stage,
+    // commit) leaves the destructive deletions in the working tree if it fails.
+    // Roll them back on ANY such failure so apply never leaves uncommitted
+    // destructive state; if the rollback itself fails, surface that loudly.
+    // Push failure is exempt — the commit already exists locally and a re-run
+    // dedups via the catalog.
+    let archive_commit = match commit_purge(&archive, &scope_hosts, total) {
+        Ok(sha) => sha,
+        Err(cause) => {
+            if let Err(rollback_err) = rollback_deletions(&archive) {
+                return Err(PurgeError::RollbackFailed {
+                    cause: cause.to_string(),
+                    rollback: rollback_err,
+                });
+            }
+            return Err(cause);
+        }
+    };
     crate::migrate::push_archive(&archive)?;
 
     Ok(PurgeReport {
@@ -203,6 +278,111 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
         applied: true,
         archive_commit: Some(archive_commit),
     })
+}
+
+/// Regenerate the catalog, stage the purge pathspec, and create the purge
+/// commit, returning the new commit SHA. Every failure here leaves the working
+/// tree holding the destructive deletions, so the caller rolls back on `Err`.
+fn commit_purge(
+    archive: &Path,
+    scope_hosts: &[String],
+    total: usize,
+) -> Result<String, PurgeError> {
+    crate::catalog::write_catalog(archive).map_err(|e| PurgeError::Catalog(e.to_string()))?;
+
+    let stage = ["add", "-A", "--", "evidence", "catalog.json"];
+    let out = nils_common::git::run_output_in(archive, &stage)
+        .map_err(|e| PurgeError::Io(e.to_string()))?;
+    if !out.status.success() {
+        return Err(MigrateError::Subprocess(
+            "git add (archive)".to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+        .into());
+    }
+
+    let message = purge_commit_message(scope_hosts, total);
+    crate::migrate::run_semantic_commit(archive, &message)?;
+    Ok(crate::migrate::head_sha(archive)?)
+}
+
+/// Reject a host value that is not a plain host label. A host must be a single
+/// normal path component so `evidence/<host>` stays exactly one level under
+/// `evidence/`; absolute values, `.`, `..`, path-separated values, and empty
+/// strings are refused before any join or deletion.
+///
+/// The raw-separator check comes first because `Path::components()` normalizes
+/// a trailing separator (and a non-leading `.`) away — `github.com/` and
+/// `github.com/.` would otherwise pass as a single `Normal` component.
+fn ensure_plain_host_label(host: &str) -> Result<(), PurgeError> {
+    use std::path::Component;
+    if host.contains('/') || host.contains('\\') {
+        return Err(PurgeError::UnsafeHost(host.to_string()));
+    }
+    let mut components = Path::new(host).components();
+    let only_normal = matches!(components.next(), Some(Component::Normal(_)));
+    if !only_normal || components.next().is_some() {
+        return Err(PurgeError::UnsafeHost(host.to_string()));
+    }
+    Ok(())
+}
+
+/// Whether `evidence/<host>/` carries untracked or ignored files that a
+/// `git checkout` rollback could not restore. Such files make a failed apply
+/// unrecoverable, so purge refuses the scope rather than risk permanent loss.
+fn scope_has_unrestorable_files(archive: &Path, host: &str) -> Result<bool, PurgeError> {
+    let rel = format!("evidence/{host}");
+    let out = nils_common::git::run_output_in(
+        archive,
+        &["status", "--porcelain", "--ignored", "--", &rel],
+    )
+    .map_err(|e| PurgeError::Io(e.to_string()))?;
+    if !out.status.success() {
+        return Err(PurgeError::Io(format!(
+            "git status --ignored failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text
+        .lines()
+        .any(|l| l.starts_with("??") || l.starts_with("!!")))
+}
+
+/// Roll back the working-tree deletions after a failed apply step. The tree was
+/// proven clean at HEAD (and the index clean) before deletion, so resetting the
+/// purge-owned pathspec back to HEAD and dropping any untracked residue returns
+/// the archive exactly to its pre-purge state — regardless of how far the
+/// partial run got (a catalog failure leaves nothing staged; a commit failure
+/// leaves the deletions and a regenerated `catalog.json` staged).
+///
+/// Restoring `evidence/` is the destructive change that MUST be undone, so a
+/// failure of that worktree restore is surfaced to the caller (`Err`); the
+/// `catalog.json` restore and untracked cleanup are best-effort because that
+/// path may legitimately not exist in HEAD.
+fn rollback_deletions(archive: &Path) -> Result<(), String> {
+    // Unstage the purge pathspec so the index matches HEAD before restoring.
+    let _ = nils_common::git::run_output_in(
+        archive,
+        &["reset", "-q", "HEAD", "--", "evidence", "catalog.json"],
+    );
+    // Restore the deleted evidence trees from HEAD — the destructive undo.
+    let out = nils_common::git::run_output_in(archive, &["checkout", "-q", "--", "evidence"])
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "git checkout -- evidence failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // Restore catalog.json if it exists in HEAD; drop any untracked residue
+    // (e.g. a freshly regenerated catalog.json that was never committed).
+    let _ = nils_common::git::run_output_in(archive, &["checkout", "-q", "--", "catalog.json"]);
+    let _ = nils_common::git::run_output_in(
+        archive,
+        &["clean", "-fdq", "--", "evidence", "catalog.json"],
+    );
+    Ok(())
 }
 
 /// Collect archive-relative record directories (those containing a
@@ -258,7 +438,14 @@ fn emit(format: OutputFormat, report: &PurgeReport) -> i32 {
             println!("  archive : {}", report.archive);
             println!("  scope   : {}", report.scope_hosts.join(", "));
             for t in &report.targets {
-                println!("  - {} : {} record(s)", t.host, t.records);
+                // Flag a present host tree with no discovered rollups: apply
+                // removes the whole tree, so dry-run must not read as empty.
+                let note = if t.host_tree_present && t.records == 0 {
+                    "  (host tree present, no rollups — entire tree removed)"
+                } else {
+                    ""
+                };
+                println!("  - {} : {} record(s){note}", t.host, t.records);
                 for p in &t.paths {
                     println!("      {p}");
                 }
