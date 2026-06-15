@@ -155,41 +155,45 @@ pub fn derive_repo_identity(
 /// archive the record under the wrong `(org, repo)` (and, on a multi-host
 /// config, the wrong host).
 ///
-/// The cwd is accepted when any of the following holds:
-/// 1. `project_dir_name` is not a parseable `<owner__repo>` slug — there is
-///    nothing authoritative to validate against, so trust the cwd.
-/// 2. The cwd identity's raw `(org, repo)` equals the slug's raw `(owner, repo)`
-///    exactly. This matches a legacy/manual slug whose repo half keeps an
-///    underscore (`acme__my_repo` vs cwd `acme/my_repo`) WITHOUT collapsing `_`
-///    and `-`, so the genuinely-different `acme/my-repo` is still rejected.
-/// 3. The cwd identity normalizes (via the agent-out slug rule) to exactly the
-///    stored `project_dir_name`. This matches a canonical agent-out dir against
-///    a raw origin that differs only in case/punctuation the sanitizer folds
-///    (e.g. `Sympoies/nils-cli` -> `sympoies__nils-cli`).
-/// 4. `project_dir_name` is an agent-out local-fallback slug
-///    (`local__<base>-<hash>`, produced when the repo had NO resolvable origin)
-///    AND the cwd resolves to a DIFFERENT owner than the `local` placeholder:
-///    such a record has no real identity, so a checkout that later gained a real
-///    origin is the best available signal. A genuine `local/...` repo (owner
-///    `local`) is NOT widened here — it is covered by the exact/canonical
-///    matches above — so its mismatch protection is preserved.
+/// Slugs are matched UNIFORMLY — there is no per-pattern special case (in
+/// particular none for the agent-out `local__<base>-<hash>` placeholder, which
+/// is indistinguishable by string from a real provider repo owned by `local`,
+/// so any heuristic for it is unsound). Two cases:
+///
+/// 1. `project_dir_name` is not a parseable `<owner__repo>` slug — nothing to
+///    validate against, so trust the cwd.
+/// 2. Canonical agent-out dir — `project_dir_name` equals its own normalization
+///    ([`nils_common::slug::project_slug_from_owner_repo`]). The cwd matches iff
+///    its identity normalizes to the same slug, folding exactly the
+///    case/punctuation (including `_`/`-`) the sanitizer folds when agent-out
+///    produces the dir (e.g. `Sympoies/My_Repo` -> `sympoies__my-repo`).
+/// 3. Legacy/manual dir — not a canonical slug (e.g. `acme__my_repo`, whose repo
+///    half keeps an underscore the sanitizer would fold). Match the raw
+///    `(owner, repo)` case-insensitively but WITHOUT folding `_`/`-`, so it
+///    accepts `acme/my_repo` and `Acme/my_repo` yet rejects the
+///    genuinely-different `acme/my-repo`.
+///
+/// A record whose cwd does not match (including a `local__` placeholder whose
+/// checkout later gained a real origin) is treated as unmatched: the caller
+/// blocks it (multi-host) or archives it under the slug + sole host
+/// (single-host) rather than trusting a checkout that may have been repointed.
 fn cwd_identity_matches_slug(identity: &RepoIdentity, project_dir_name: &str) -> bool {
     let Some((dir_owner, dir_repo)) = split_owner_repo(project_dir_name) else {
         return true; // (1)
     };
-    if identity.org == dir_owner && identity.repo == dir_repo {
-        return true; // (2)
+    let dir_norm =
+        nils_common::slug::project_slug_from_owner_repo(&format!("{dir_owner}/{dir_repo}"));
+    if dir_norm.as_deref() == Some(project_dir_name) {
+        // (2) canonical dir: compare normalized identity to the canonical slug.
+        return nils_common::slug::project_slug_from_owner_repo(&format!(
+            "{}/{}",
+            identity.org, identity.repo
+        ))
+        .as_deref()
+            == Some(project_dir_name);
     }
-    let id_slug = nils_common::slug::project_slug_from_owner_repo(&format!(
-        "{}/{}",
-        identity.org, identity.repo
-    ));
-    if id_slug.is_some_and(|slug| slug == project_dir_name) {
-        return true; // (3)
-    }
-    // (4): local-fallback placeholder slug whose cwd resolved to a real repo
-    // under a different owner.
-    nils_common::slug::is_local_fallback_slug(project_dir_name) && identity.org != dir_owner
+    // (3) legacy/manual dir: case-insensitive raw match, preserving `_`/`-`.
+    identity.org.eq_ignore_ascii_case(&dir_owner) && identity.repo.eq_ignore_ascii_case(&dir_repo)
 }
 
 /// Split an agent-out `<owner__repo>` slug into `(org, repo)`. The slug uses a
