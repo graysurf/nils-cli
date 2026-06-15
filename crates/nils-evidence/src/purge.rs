@@ -11,8 +11,17 @@
 //!   catalog, commit, and push.
 //! - A scope is REQUIRED — at least one of `--host` / `--class`. There is no
 //!   implicit whole-archive purge.
+//! - Explicit `--host` values must be plain host labels: a single path
+//!   component, never absolute, `.`, `..`, or path-separated, so the resolved
+//!   `evidence/<host>` tree can never escape the archive subtree.
 //! - `--apply` refuses to run against a dirty archive working tree (under
-//!   `evidence/` or `catalog.json`), so it never commits unrelated changes.
+//!   `evidence/` or `catalog.json`) AND against any pre-existing staged change
+//!   anywhere in the archive, so it only ever commits the purge-owned pathspec.
+//! - A scoped host tree is deleted whenever it exists, even when it holds only
+//!   legacy/orphaned files without a rollup.
+//! - Catalog regeneration runs after deletion; if it fails (e.g. a malformed
+//!   surviving rollup), the deletions are rolled back so apply never leaves
+//!   uncommitted destructive state.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -67,6 +76,14 @@ pub struct PurgeReport {
 pub enum PurgeError {
     #[error("specify a purge scope: at least one of --host or --class")]
     NoScope,
+    #[error(
+        "unsafe --host value `{0}`: expected a plain host label (no path separators, `.`, or `..`)"
+    )]
+    UnsafeHost(String),
+    #[error(
+        "archive has pre-existing staged changes; purge --apply commits only its own changes, so stash or commit them first"
+    )]
+    StagedArchiveChanges,
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error("failed to regenerate archive catalog: {0}")]
@@ -82,6 +99,8 @@ impl PurgeError {
     pub fn code(&self) -> &'static str {
         match self {
             PurgeError::NoScope => "purge-no-scope",
+            PurgeError::UnsafeHost(_) => "purge-unsafe-host",
+            PurgeError::StagedArchiveChanges => "purge-staged-archive-changes",
             PurgeError::Source(_) => "purge-source-error",
             PurgeError::Catalog(_) => "purge-catalog-error",
             PurgeError::Io(_) => "purge-io-error",
@@ -105,6 +124,12 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
         return Err(PurgeError::NoScope);
     }
 
+    // Reject path-like explicit hosts before any join / deletion: a single
+    // safe path component can never escape `evidence/`.
+    for host in &args.host {
+        ensure_plain_host_label(host)?;
+    }
+
     let archive = source::resolve_archive(args.archive.as_deref())?;
     let hosts_path = source::hosts_path_for(&archive, args.hosts.as_deref());
     let hosts = source::load_hosts(&hosts_path)?;
@@ -120,11 +145,18 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
     }
     let scope_hosts: Vec<String> = scope.into_iter().collect();
 
-    // Enumerate the record directories under evidence/<host>/ for each host.
+    // Enumerate the record directories under evidence/<host>/ for each host,
+    // and track which scoped host trees actually exist on disk. The apply no-op
+    // decision keys off existence, not the rollup count, so a host tree holding
+    // only legacy/orphaned files (no rollup) is still deleted.
     let mut targets = Vec::new();
     let mut total = 0usize;
+    let mut existing_host_roots = 0usize;
     for host in &scope_hosts {
         let host_root = archive.join("evidence").join(host);
+        if host_root.exists() {
+            existing_host_roots += 1;
+        }
         let mut paths = Vec::new();
         collect_record_dirs(&archive, &host_root, &mut paths)?;
         paths.sort();
@@ -155,13 +187,23 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
         return Err(MigrateError::ArchiveRepoDirty.into());
     }
 
-    // Nothing matched the scope: a clean no-op (no deletion, no commit).
-    if total == 0 {
+    // The dirty guard above only covers the purge-owned pathspec, but the
+    // semantic-commit step commits the whole index. Refuse any pre-existing
+    // staged change anywhere in the archive so purge only commits what it
+    // stages itself (evidence/ + catalog.json).
+    if has_staged_changes(&archive)? {
+        return Err(PurgeError::StagedArchiveChanges);
+    }
+
+    // No scoped host tree exists on disk: a clean no-op (no deletion, no
+    // commit). Keyed on tree existence, not the rollup count, so a host tree
+    // with only legacy files (total == 0) is still deleted below.
+    if existing_host_roots == 0 {
         return Ok(PurgeReport {
             archive: archive.display().to_string(),
             scope_hosts,
             targets,
-            total_records: 0,
+            total_records: total,
             applied: true,
             archive_commit: None,
         });
@@ -175,8 +217,13 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
         }
     }
 
-    // Regenerate the catalog after deletion.
-    crate::catalog::write_catalog(&archive).map_err(|e| PurgeError::Catalog(e.to_string()))?;
+    // Regenerate the catalog after deletion. If it fails (e.g. a malformed
+    // surviving rollup), roll the deletions back so apply never leaves
+    // uncommitted destructive state, then surface the catalog error.
+    if let Err(e) = crate::catalog::write_catalog(&archive) {
+        rollback_deletions(&archive);
+        return Err(PurgeError::Catalog(e.to_string()));
+    }
 
     // Stage the deletions + catalog, then one commit and push.
     let stage = ["add", "-A", "--", "evidence", "catalog.json"];
@@ -203,6 +250,47 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
         applied: true,
         archive_commit: Some(archive_commit),
     })
+}
+
+/// Reject an explicit `--host` value that is not a plain host label. A host
+/// must be a single normal path component so `evidence/<host>` stays exactly
+/// one level under `evidence/`; absolute values, `.`, `..`, path-separated
+/// values, and empty strings are refused before any join or deletion.
+fn ensure_plain_host_label(host: &str) -> Result<(), PurgeError> {
+    use std::path::Component;
+    let mut components = Path::new(host).components();
+    let only_normal = matches!(components.next(), Some(Component::Normal(_)));
+    if !only_normal || components.next().is_some() {
+        return Err(PurgeError::UnsafeHost(host.to_string()));
+    }
+    Ok(())
+}
+
+/// True when the archive has any staged change in its index relative to HEAD.
+/// `git diff --cached --name-only` lists staged paths; non-empty output means
+/// the index is not clean.
+fn has_staged_changes(archive: &Path) -> Result<bool, PurgeError> {
+    let out = nils_common::git::run_output_in(archive, &["diff", "--cached", "--name-only"])
+        .map_err(|e| PurgeError::Io(e.to_string()))?;
+    if !out.status.success() {
+        return Err(PurgeError::Io(format!(
+            "git diff --cached failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(!out.stdout.is_empty())
+}
+
+/// Best-effort rollback of the working-tree deletions after a failed catalog
+/// regeneration. The tree was proven clean (and the index empty) before
+/// deletion, so restoring the purge-owned paths to HEAD undoes the removal
+/// without touching anything else. `evidence/` and `catalog.json` are restored
+/// separately: `git checkout` aborts the whole operation if any one pathspec
+/// matches nothing (e.g. an archive that has never had a `catalog.json`), so a
+/// combined pathspec would leave `evidence/` unrestored.
+fn rollback_deletions(archive: &Path) {
+    let _ = nils_common::git::run_output_in(archive, &["checkout", "--", "evidence"]);
+    let _ = nils_common::git::run_output_in(archive, &["checkout", "--", "catalog.json"]);
 }
 
 /// Collect archive-relative record directories (those containing a

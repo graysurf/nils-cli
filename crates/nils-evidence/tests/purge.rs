@@ -264,3 +264,165 @@ fn purge_apply_by_host_deletes_only_that_host_and_commits() {
         "purged host no longer catalogued"
     );
 }
+
+fn seed_commit(archive: &Path, msg: &str) {
+    git(archive, &["add", "-A"]);
+    git(
+        archive,
+        &[
+            "-c",
+            "user.name=tester",
+            "-c",
+            "user.email=tester@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            msg,
+        ],
+    );
+}
+
+#[test]
+fn purge_rejects_path_like_host() {
+    // A `--host` value that is not a plain host label could escape
+    // `archive/evidence` once joined and `remove_dir_all`-ed. It must be
+    // refused before any path join or deletion.
+    let a = build();
+    for bad in ["../escape", "/etc", "..", ".", "a/b", ""] {
+        let err = purge::run(&args(&a.archive, vec![bad.to_string()], None, true)).unwrap_err();
+        assert!(
+            matches!(err, PurgeError::UnsafeHost(_)),
+            "host {bad:?} must be rejected as unsafe, got {err:?}"
+        );
+    }
+    // Real host trees are untouched.
+    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert!(a.archive.join("evidence/github.com").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_apply_refuses_foreign_staged_changes() {
+    // The dirty guard only covers evidence/ + catalog.json, but semantic-commit
+    // commits the whole index. A pre-staged change elsewhere in the archive must
+    // be refused so purge never folds it into the purge commit.
+    let a = build();
+    configure_push_remote(&a);
+    let stub = install_semantic_commit_stub(&a);
+    let before = git_count_commits(&a.archive);
+
+    let hosts_yaml = a.archive.join("config").join("hosts.yaml");
+    let edited = fs::read_to_string(&hosts_yaml).unwrap() + "\n# pre-staged unrelated edit\n";
+    fs::write(&hosts_yaml, edited).unwrap();
+    git(&a.archive, &["add", "config/hosts.yaml"]);
+
+    let err = with_path(&stub, || {
+        purge::run(&args(
+            &a.archive,
+            vec!["gitlab.gamania.com".to_string()],
+            None,
+            true,
+        ))
+        .unwrap_err()
+    });
+    assert!(
+        matches!(err, PurgeError::StagedArchiveChanges),
+        "foreign staged change must be refused, got {err:?}"
+    );
+
+    // Nothing deleted, nothing committed.
+    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert_eq!(git_count_commits(&a.archive), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_apply_deletes_host_tree_without_rollups() {
+    // A scoped host tree that holds only legacy/orphaned files (no
+    // skill-usage.rollup.json) must still be removed; the no-op decision is
+    // based on whether scoped host roots exist, not on the rollup count.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let archive = root.join("archive");
+    fs::create_dir_all(archive.join("config")).unwrap();
+    fs::create_dir_all(archive.join("evidence")).unwrap();
+    fs::write(
+        archive.join("config").join("hosts.yaml"),
+        "version: 1\nhosts:\n  gitlab.gamania.com:\n    class: employer\n    employer: Gamania\n",
+    )
+    .unwrap();
+    let legacy = archive.join("evidence/gitlab.gamania.com/orphan");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("secret.txt"), "sensitive").unwrap();
+    git(&archive, &["init", "-q", "-b", "main"]);
+    let a = Archive {
+        _tmp: tmp,
+        root,
+        archive,
+    };
+    seed_commit(&a.archive, "seed");
+    configure_push_remote(&a);
+    let stub = install_semantic_commit_stub(&a);
+    let before = git_count_commits(&a.archive);
+
+    let report = with_path(&stub, || {
+        purge::run(&args(&a.archive, vec![], Some(HostClass::Employer), true)).expect("apply")
+    });
+
+    assert!(report.applied);
+    assert_eq!(report.total_records, 0, "no rollups discovered");
+    assert!(
+        report.archive_commit.is_some(),
+        "legacy-only host tree deletion is still committed"
+    );
+    assert!(
+        !a.archive.join("evidence/gitlab.gamania.com").exists(),
+        "legacy host tree without rollups is removed"
+    );
+    assert_eq!(git_count_commits(&a.archive) - before, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_apply_rolls_back_on_catalog_failure() {
+    // If catalog regeneration fails on a malformed surviving (out-of-scope)
+    // rollup after the scoped host tree is deleted, the deletion must be rolled
+    // back so apply never leaves uncommitted destructive state.
+    let a = build();
+    configure_push_remote(&a);
+    let stub = install_semantic_commit_stub(&a);
+
+    let survivor = a
+        .archive
+        .join("evidence/github.com/graysurf/kit/20260603T000000Z-c/skill-usage.rollup.json");
+    fs::write(&survivor, "{ not valid json").unwrap();
+    seed_commit(&a.archive, "corrupt surviving rollup");
+    let before = git_count_commits(&a.archive);
+
+    let err = with_path(&stub, || {
+        purge::run(&args(
+            &a.archive,
+            vec!["gitlab.gamania.com".to_string()],
+            None,
+            true,
+        ))
+        .unwrap_err()
+    });
+    assert!(
+        matches!(err, PurgeError::Catalog(_)),
+        "catalog failure must surface, got {err:?}"
+    );
+
+    // Rolled back: scoped host tree restored, no purge commit.
+    assert!(
+        a.archive.join("evidence/gitlab.gamania.com").exists(),
+        "scoped host tree deletion rolled back after catalog failure"
+    );
+    assert_eq!(
+        git_count_commits(&a.archive),
+        before,
+        "no purge commit on catalog failure"
+    );
+}
