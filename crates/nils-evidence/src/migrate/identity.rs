@@ -70,7 +70,13 @@ pub fn derive_repo_identity(
     // `<owner__repo>` slug, and the host must be present in config/hosts.yaml so
     // a typo is rejected rather than silently archived.
     if let Some(host) = host_override {
-        if let Some(identity) = identity_from_cwd(cwd) {
+        // Trust the record's own cwd only when it still resolves to THIS
+        // record's slug. A cwd that has been repointed or reused for a different
+        // checkout is not this record's identity, so fall through to the
+        // operator-vouched `--host` + slug below.
+        if let Some(identity) = identity_from_cwd(cwd)
+            && cwd_identity_matches_slug(&identity, project_dir_name)
+        {
             return Ok(identity);
         }
         let Some((org, repo)) = slug else {
@@ -95,12 +101,15 @@ pub fn derive_repo_identity(
     // source is the record's own `cwd -> origin` remote. So prefer the cwd
     // derivation, falling back to the slug only when cwd resolution fails.
     if hosts.hosts.len() > 1 {
-        if let Some(identity) = identity_from_cwd(cwd) {
+        // Trust the cwd identity only when it still matches this record's slug.
+        // A repointed/reused cwd is not this record's identity, and the slug
+        // alone cannot pin a host under a multi-host config, so such a record is
+        // unresolvable rather than mis-archived under the wrong host.
+        if let Some(identity) = identity_from_cwd(cwd)
+            && cwd_identity_matches_slug(&identity, project_dir_name)
+        {
             return Ok(identity);
         }
-        // cwd could not be resolved; the slug alone cannot pin a host under a
-        // multi-host config, so surface it as unresolvable rather than
-        // silently guessing.
         return Err(IdentityError::Unresolvable(
             project_dir_name.to_string(),
             cwd.to_string(),
@@ -112,8 +121,12 @@ pub fn derive_repo_identity(
     // points at a DIFFERENT provider must be classified by its real host (and
     // blocked upstream if that host is absent from config/hosts.yaml), not
     // silently archived under the sole configured host. The slug -> sole-host
-    // mapping is the fallback used only when cwd cannot be resolved.
-    if let Some(identity) = identity_from_cwd(cwd) {
+    // mapping is the fallback used when cwd cannot be resolved OR when the cwd
+    // resolves to a different checkout than this record's slug (a repointed or
+    // reused cwd): the slug stays authoritative for `(org, repo)`.
+    if let Some(identity) = identity_from_cwd(cwd)
+        && cwd_identity_matches_slug(&identity, project_dir_name)
+    {
         return Ok(identity);
     }
     if let Some((org, repo)) = slug {
@@ -124,6 +137,23 @@ pub fn derive_repo_identity(
         project_dir_name.to_string(),
         cwd.to_string(),
     ))
+}
+
+/// True when a cwd-resolved identity actually belongs to THIS record — its
+/// `(org, repo)` normalized to the agent-out slug rule
+/// ([`nils_common::slug::project_slug_from_owner_repo`]) equals
+/// `project_dir_name`. A record whose recorded `cwd` has been repointed or
+/// reused for a different checkout resolves to an identity whose slug differs;
+/// trusting it would archive the record under the wrong `(org, repo)` (and, on
+/// a multi-host config, the wrong host). When `project_dir_name` is not a
+/// parseable `<owner__repo>` slug there is nothing to validate against, so the
+/// cwd identity is trusted as the only available signal.
+fn cwd_identity_matches_slug(identity: &RepoIdentity, project_dir_name: &str) -> bool {
+    if split_owner_repo(project_dir_name).is_none() {
+        return true;
+    }
+    nils_common::slug::project_slug_from_owner_repo(&format!("{}/{}", identity.org, identity.repo))
+        .is_some_and(|slug| slug == project_dir_name)
 }
 
 /// Split an agent-out `<owner__repo>` slug into `(org, repo)`. The slug uses a
