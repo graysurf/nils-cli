@@ -18,7 +18,7 @@
 //!   `evidence/` or `catalog.json`) AND against any pre-existing staged change
 //!   anywhere in the archive, so it only ever commits the purge-owned pathspec.
 //! - A scoped host tree is deleted whenever it exists, even when it holds only
-//!   legacy/orphaned files without a rollup.
+//!   orphaned files without a rollup.
 //! - Catalog regeneration runs after deletion; if it fails (e.g. a malformed
 //!   surviving rollup), the deletions are rolled back so apply never leaves
 //!   uncommitted destructive state.
@@ -155,7 +155,7 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
     // Enumerate the record directories under evidence/<host>/ for each host,
     // and track which scoped host trees actually exist on disk. The apply no-op
     // decision keys off existence, not the rollup count, so a host tree holding
-    // only legacy/orphaned files (no rollup) is still deleted.
+    // only orphaned files (no rollup) is still deleted.
     let mut targets = Vec::new();
     let mut total = 0usize;
     let mut existing_host_roots = 0usize;
@@ -206,7 +206,7 @@ pub fn run(args: &PurgeArgs) -> Result<PurgeReport, PurgeError> {
 
     // No scoped host tree exists on disk: a clean no-op (no deletion, no
     // commit). Keyed on tree existence, not the rollup count, so a host tree
-    // with only legacy files (total == 0) is still deleted below.
+    // with only orphaned files (total == 0) is still deleted below.
     if existing_host_roots == 0 {
         return Ok(PurgeReport {
             archive: archive.display().to_string(),

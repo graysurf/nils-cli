@@ -340,7 +340,7 @@ fn purge_apply_refuses_foreign_staged_changes() {
 #[cfg(unix)]
 #[test]
 fn purge_apply_deletes_host_tree_without_rollups() {
-    // A scoped host tree that holds only legacy/orphaned files (no
+    // A scoped host tree that holds only orphaned files (no
     // skill-usage.rollup.json) must still be removed; the no-op decision is
     // based on whether scoped host roots exist, not on the rollup count.
     let tmp = tempfile::tempdir().unwrap();
@@ -353,9 +353,9 @@ fn purge_apply_deletes_host_tree_without_rollups() {
         "version: 1\nhosts:\n  gitlab.gamania.com:\n    class: employer\n    employer: Gamania\n",
     )
     .unwrap();
-    let legacy = archive.join("evidence/gitlab.gamania.com/orphan");
-    fs::create_dir_all(&legacy).unwrap();
-    fs::write(legacy.join("secret.txt"), "sensitive").unwrap();
+    let orphan_dir = archive.join("evidence/gitlab.gamania.com/orphan");
+    fs::create_dir_all(&orphan_dir).unwrap();
+    fs::write(orphan_dir.join("secret.txt"), "sensitive").unwrap();
     git(&archive, &["init", "-q", "-b", "main"]);
     let a = Archive {
         _tmp: tmp,
@@ -375,11 +375,11 @@ fn purge_apply_deletes_host_tree_without_rollups() {
     assert_eq!(report.total_records, 0, "no rollups discovered");
     assert!(
         report.archive_commit.is_some(),
-        "legacy-only host tree deletion is still committed"
+        "orphan-only host tree deletion is still committed"
     );
     assert!(
         !a.archive.join("evidence/gitlab.gamania.com").exists(),
-        "legacy host tree without rollups is removed"
+        "orphaned host tree without rollups is removed"
     );
     assert_eq!(git_count_commits(&a.archive) - before, 1);
 }
