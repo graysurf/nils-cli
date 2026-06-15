@@ -393,7 +393,8 @@ fn local_project_slug(repo: &Path) -> String {
         .map(|value| sanitize_path_label(value, "repo"))
         .unwrap_or_else(|| "repo".to_string());
     let hash = stable_short_hash(&display_path(repo));
-    format!("local__{basename}-{hash}")
+    let prefix = nils_common::slug::LOCAL_FALLBACK_SLUG_PREFIX;
+    format!("{prefix}{basename}-{hash}")
 }
 
 pub fn sanitize_topic(topic: &str) -> String {
@@ -707,6 +708,12 @@ mod tests {
             "unexpected local slug: {slug}"
         );
         assert_eq!(slug.len(), "local__nils-cli-".len() + 8);
+        // The recognizer must agree with the producer, so identity matching
+        // treats this as a local fallback (no authoritative owner/repo).
+        assert!(
+            nils_common::slug::is_local_fallback_slug(&slug),
+            "is_local_fallback_slug must recognize local_project_slug output: {slug}"
+        );
     }
 
     #[test]

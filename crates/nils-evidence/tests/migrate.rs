@@ -675,6 +675,121 @@ fn migrate_rescue_ignores_checkout_whose_slug_does_not_match() {
 }
 
 #[test]
+fn migrate_single_host_local_fallback_slug_trusts_resolvable_cwd() {
+    // #877 follow-up part 1: agent-out's local fallback slug
+    // (`local__<base>-<hash>`, emitted when a repo has no resolvable origin) is
+    // NOT a provider `<owner>__<repo>` identity, even though it parses as one
+    // (`local` / `<base>-<hash>`). If that same checkout LATER gains a real
+    // origin, the record's cwd resolves to the true repo; treating the slug as
+    // authoritative would mis-archive it under a bogus `local` org. The
+    // resolvable cwd must win for a local-fallback slug.
+    let s = build_empty_scenario(); // single host: github.com
+
+    let checkout = make_git_checkout(&s.root, "nils-cli", "git@github.com:sympoies/nils-cli.git");
+    write_record(
+        &s.source_out,
+        "local__nils-cli-deadbeef",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &checkout.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 1,
+        "the local-fallback record rolls up under its real origin"
+    );
+    assert_eq!(
+        report.blocked.len(),
+        0,
+        "a resolvable cwd must not be rejected for a local slug"
+    );
+    assert_eq!(report.records[0].rollup.repo.host, "github.com");
+    assert_eq!(
+        report.records[0].rollup.repo.org, "sympoies",
+        "org must come from the resolvable cwd origin, not the bogus `local` slug owner"
+    );
+    assert_eq!(report.records[0].rollup.repo.repo, "nils-cli");
+}
+
+#[test]
+fn migrate_multi_host_accepts_legacy_underscore_slug_matching_cwd() {
+    // #877 follow-up part 2: a legacy/manual slug whose repo half keeps an
+    // underscore (`acme__my_repo`) is compared against a cwd origin
+    // (`acme/my_repo`) that the slug rule normalizes to `acme__my-repo`.
+    // Comparing the raw directory name against the normalized cwd slug would
+    // wrongly reject a cwd that points at the SAME repo. Both sides must be
+    // normalized through the same rule, so the matching cwd is trusted (and,
+    // under multi-host, supplies the otherwise-unknowable host).
+    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+
+    let checkout = make_git_checkout(&s.root, "my_repo", "git@github.com:acme/my_repo.git");
+    write_record(
+        &s.source_out,
+        "acme__my_repo",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &checkout.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 1,
+        "the underscore slug matches its cwd after normalization"
+    );
+    assert_eq!(
+        report.blocked.len(),
+        0,
+        "a matching cwd must not be blocked over slug formatting"
+    );
+    assert_eq!(report.records[0].rollup.repo.host, "github.com");
+    assert_eq!(report.records[0].rollup.repo.org, "acme");
+    assert_eq!(report.records[0].rollup.repo.repo, "my_repo");
+}
+
+#[test]
+fn migrate_host_override_blocks_resolvable_mismatched_cwd() {
+    // #877 follow-up part 3: `--host` is a GLOBAL operator override meant to
+    // rescue slug-only records whose cwd is GONE. A record whose cwd still
+    // RESOLVES but to a DIFFERENT checkout (repointed/reused) is not slug-only;
+    // slapping the override onto its slug would mis-attribute it. Such a record
+    // must be blocked as unresolvable, not archived under the override host.
+    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com (employer), github.com
+
+    // cwd resolves, but to a different repo than the record's slug.
+    let reused = make_git_checkout(&s.root, "reused", "git@github.com:other/reused.git");
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &reused.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let mut args = dry_run_args(&s);
+    args.host = Some("gitlab.gamania.com".to_string());
+    let report = migrate::prepare(&args).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 0,
+        "a resolvable-but-mismatched cwd must not be archived under --host"
+    );
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "the record is blocked as unresolvable"
+    );
+}
+
+#[test]
 fn migrate_skips_and_reports_unparseable_records_without_aborting() {
     // Core fix (A), parse path: a malformed / truncated skill-usage.record.json
     // (trailing characters after the JSON object) must be SKIPPED and REPORTED
