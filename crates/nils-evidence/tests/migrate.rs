@@ -543,6 +543,102 @@ fn migrate_rescues_nested_gitlab_checkout_via_working_repo_roots() {
 }
 
 #[test]
+fn migrate_single_host_uses_slug_when_cwd_repointed_to_other_repo() {
+    // #876 part 1: under a single-host config a record's recorded cwd may have
+    // been repointed or reused for a DIFFERENT checkout on the same host. The
+    // cwd identity then disagrees with the agent-out slug; trusting it would
+    // archive the record under the wrong (org, repo). The slug is authoritative
+    // for the repo, so the record must roll up under the slug + sole host, not
+    // the cwd's repo.
+    let s = build_empty_scenario(); // single host: github.com
+
+    // cwd resolves, but to a different repo than the record's slug.
+    let reused = make_git_checkout(&s.root, "reused", "git@github.com:other/reused.git");
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &reused.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 1,
+        "the record rolls up under its slug identity"
+    );
+    assert_eq!(
+        report.blocked.len(),
+        0,
+        "recovered from the slug, not blocked"
+    );
+    assert_eq!(report.records[0].rollup.repo.host, "github.com");
+    assert_eq!(
+        report.records[0].rollup.repo.org, "graysurf",
+        "org must come from the authoritative slug, not the repointed cwd"
+    );
+    assert_eq!(report.records[0].rollup.repo.repo, "kit");
+}
+
+#[test]
+fn migrate_blocks_ambiguous_rescue_slug() {
+    // #876 part 2: when two checkouts under working_repo_roots normalize to the
+    // SAME agent-out slug but resolve to DIFFERENT identities, the slug is
+    // ambiguous. With the record's own cwd gone there is no signal to pick one,
+    // so the record must stay BLOCKED rather than be rescued to whichever
+    // checkout was walked first (which could mis-archive employer / personal
+    // evidence by directory order).
+    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+
+    let roots = s.root.join("mirror");
+    // Both checkouts normalize to `teamx__widget` but resolve to different
+    // identities (different host and org).
+    make_git_checkout(
+        &roots.join("a"),
+        "widget",
+        "git@github.com:teamx/widget.git",
+    );
+    make_git_checkout(
+        &roots.join("b/group"),
+        "widget",
+        "git@gitlab.gamania.com:group/teamx/widget.git",
+    );
+
+    // Record whose recorded cwd is gone -> Unresolvable -> rescue path.
+    write_record(
+        &s.source_out,
+        "teamx__widget",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &s.root.join("gone").to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let mut args = dry_run_args(&s);
+    args.working_repo_roots = vec![roots.clone()];
+    let report = migrate::prepare(&args).expect("dry-run must succeed");
+    assert_eq!(report.eligible, 0, "an ambiguous slug must not be rescued");
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "the record is blocked, not mis-archived to the first-walked checkout"
+    );
+    assert!(
+        report.blocked[0]
+            .reason
+            .to_lowercase()
+            .contains("ambiguous"),
+        "blocked reason should explain the ambiguity: {}",
+        report.blocked[0].reason
+    );
+}
+
+#[test]
 fn migrate_rescue_ignores_checkout_whose_slug_does_not_match() {
     // The rescue matches strictly by normalized slug: a decoy checkout under
     // working_repo_roots that does NOT match the record's slug must be ignored,

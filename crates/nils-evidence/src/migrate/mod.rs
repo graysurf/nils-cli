@@ -379,8 +379,9 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
     let mut blocked = Vec::new();
     // Lazy slug -> identity index over `working_repo_roots`, built once on the
     // first unresolvable record and reused for the rest of the batch (the rescue
-    // walk is otherwise repeated per record).
-    let mut rescue_index: Option<HashMap<String, RepoIdentity>> = None;
+    // walk is otherwise repeated per record). A slug that matches two checkouts
+    // with different identities is poisoned to `Ambiguous` and never rescued.
+    let mut rescue_index: Option<HashMap<String, RescueSlot>> = None;
 
     for record_path in record_paths {
         // A per-record read or parse failure (e.g. a truncated or malformed
@@ -474,35 +475,53 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
         // not abort the whole batch: record it as blocked, skip it (no rollup,
         // no staged files), and continue. The operator can re-run with `--host`
         // to vouch for records they recognize.
-        let repo_identity =
-            match derive_repo_identity(&project_dir, &hosts, &record.cwd, args.host.as_deref()) {
-                Ok(id) => id,
-                Err(e) => {
-                    // Last-resort rescue for an UNRESOLVABLE identity (the record's
-                    // recorded cwd is gone, e.g. a removed agent worktree): if a
-                    // configured working_repo_root holds a matching local checkout,
-                    // recover the host from its `origin`. Other identity errors
-                    // (operator typos in `--host`, etc.) are not rescued.
-                    let rescued = matches!(e, IdentityError::Unresolvable(_, _))
-                        .then(|| {
-                            rescue_index
-                                .get_or_insert_with(|| build_rescue_index(&args.working_repo_roots))
-                                .get(&project_dir)
-                                .cloned()
-                        })
-                        .flatten();
-                    match rescued {
-                        Some(id) => id,
-                        None => {
-                            blocked.push(BlockedRecord {
+        let repo_identity = match derive_repo_identity(
+            &project_dir,
+            &hosts,
+            &record.cwd,
+            args.host.as_deref(),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                // Last-resort rescue for an UNRESOLVABLE identity (the record's
+                // recorded cwd is gone, e.g. a removed agent worktree): if a
+                // configured working_repo_root holds a matching local checkout,
+                // recover the host from its `origin`. Other identity errors
+                // (operator typos in `--host`, etc.) are not rescued.
+                let slot = matches!(e, IdentityError::Unresolvable(_, _))
+                    .then(|| {
+                        rescue_index
+                            .get_or_insert_with(|| build_rescue_index(&args.working_repo_roots))
+                            .get(&project_dir)
+                            .cloned()
+                    })
+                    .flatten();
+                match slot {
+                    Some(RescueSlot::Unique(id)) => id,
+                    Some(RescueSlot::Ambiguous) => {
+                        // The slug matches more than one checkout with
+                        // conflicting identities; with the record's own cwd
+                        // gone there is no way to pick the right one, so block
+                        // rather than mis-archive it to whichever was walked
+                        // first.
+                        blocked.push(BlockedRecord {
                                 record_path: record_path.display().to_string(),
-                                reason: e.to_string(),
+                                reason: format!(
+                                    "ambiguous rescue: agent-out slug `{project_dir}` matches multiple checkouts under working_repo_roots with different identities; cannot safely recover the host (the record's own cwd is gone)"
+                                ),
                             });
-                            continue;
-                        }
+                        continue;
+                    }
+                    None => {
+                        blocked.push(BlockedRecord {
+                            record_path: record_path.display().to_string(),
+                            reason: e.to_string(),
+                        });
+                        continue;
                     }
                 }
-            };
+            }
+        };
 
         // A resolved host that is ABSENT from `config/hosts.yaml` must NOT be
         // archived: the archive only holds records for hosts the operator has
@@ -567,8 +586,21 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
 /// while bounding the filesystem walk for this last-resort rescue.
 const MAX_RESCUE_WALK_DEPTH: usize = 6;
 
+/// A slot in the rescue index. A normalized slug maps either to exactly one
+/// identity (`Unique`) or to `Ambiguous` when two checkouts under
+/// `working_repo_roots` normalize to the SAME slug but resolve to DIFFERENT
+/// identities (e.g. `acme/platform/backend/svc` and `other/backend/svc` both
+/// collapse to `backend__svc`). With the record's own `cwd` gone there is no
+/// signal to disambiguate, so an ambiguous slug must NOT be rescued — picking
+/// one by walk order could mis-archive employer / personal evidence.
+#[derive(Clone)]
+enum RescueSlot {
+    Unique(RepoIdentity),
+    Ambiguous,
+}
+
 /// Build the last-resort identity rescue index: a map from agent-out
-/// `<owner__repo>` slug to the full origin identity of a local checkout under
+/// `<owner__repo>` slug to the origin identity of a local checkout under
 /// `working_repo_roots`. Used when `derive_repo_identity` returns `Unresolvable`
 /// (the record's `cwd` no longer exists — a removed agent worktree is the common
 /// case): the slug carries no host, so the host is recovered from a matching
@@ -579,8 +611,10 @@ const MAX_RESCUE_WALK_DEPTH: usize = 6;
 /// which keeps only the last owner segment), so a nested provider group — full
 /// origin org such as `acme/platform/backend`, slug `backend__svc` — still
 /// matches, and the FULL origin org/repo is preserved in the recovered identity.
-/// The whole index is built once per migrate run and reused across records.
-fn build_rescue_index(working_repo_roots: &[PathBuf]) -> HashMap<String, RepoIdentity> {
+/// When two checkouts normalize to the same slug with conflicting identities the
+/// slug is poisoned to [`RescueSlot::Ambiguous`] and never rescued. The whole
+/// index is built once per migrate run and reused across records.
+fn build_rescue_index(working_repo_roots: &[PathBuf]) -> HashMap<String, RescueSlot> {
     let mut index = HashMap::new();
     for root in working_repo_roots {
         collect_checkouts(root, 0, &mut index);
@@ -593,7 +627,7 @@ fn build_rescue_index(working_repo_roots: &[PathBuf]) -> HashMap<String, RepoIde
 /// treated as a checkout and not descended into. Dot-directories are skipped and
 /// directory symlinks are not followed (`file_type` does not traverse), so a
 /// large `working_repo_roots` tree stays bounded and cycle-free.
-fn collect_checkouts(dir: &Path, depth: usize, index: &mut HashMap<String, RepoIdentity>) {
+fn collect_checkouts(dir: &Path, depth: usize, index: &mut HashMap<String, RescueSlot>) {
     if depth > MAX_RESCUE_WALK_DEPTH {
         return;
     }
@@ -604,8 +638,21 @@ fn collect_checkouts(dir: &Path, depth: usize, index: &mut HashMap<String, RepoI
                 found.org, found.repo
             ))
         {
-            // First checkout wins for a given slug; later duplicates are ignored.
-            index.entry(slug).or_insert(found);
+            // Two checkouts of the SAME repo under different roots agree and
+            // stay `Unique`; a genuine identity conflict for one slug poisons it
+            // to `Ambiguous` so the record is never rescued to one of them.
+            match index.entry(slug) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(RescueSlot::Unique(found));
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    if let RescueSlot::Unique(existing) = o.get()
+                        && *existing != found
+                    {
+                        o.insert(RescueSlot::Ambiguous);
+                    }
+                }
+            }
         }
         return;
     }
