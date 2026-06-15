@@ -675,14 +675,15 @@ fn migrate_rescue_ignores_checkout_whose_slug_does_not_match() {
 }
 
 #[test]
-fn migrate_single_host_local_fallback_slug_trusts_resolvable_cwd() {
-    // #877 follow-up part 1: agent-out's local fallback slug
-    // (`local__<base>-<hash>`, emitted when a repo has no resolvable origin) is
-    // NOT a provider `<owner>__<repo>` identity, even though it parses as one
-    // (`local` / `<base>-<hash>`). If that same checkout LATER gains a real
-    // origin, the record's cwd resolves to the true repo; treating the slug as
-    // authoritative would mis-archive it under a bogus `local` org. The
-    // resolvable cwd must win for a local-fallback slug.
+fn migrate_single_host_local_fallback_slug_with_changed_origin_uses_placeholder() {
+    // #879 follow-up: agent-out's local-fallback slug (`local__<base>-<hash>`,
+    // emitted when a repo had NO resolvable origin) is INDISTINGUISHABLE by
+    // string from a real provider repo owned by `local`, so there is no sound
+    // way to "recover" it to a checkout that later gained a different origin (a
+    // repointed cwd looks identical). The matcher therefore treats it like any
+    // other slug: a cwd whose identity does not normalize to the slug does not
+    // match, so under single-host the record archives under the placeholder slug
+    // + sole host rather than trusting the (possibly repointed) cwd.
     let s = build_empty_scenario(); // single host: github.com
 
     let checkout = make_git_checkout(&s.root, "nils-cli", "git@github.com:sympoies/nils-cli.git");
@@ -700,19 +701,71 @@ fn migrate_single_host_local_fallback_slug_trusts_resolvable_cwd() {
     let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
     assert_eq!(
         report.eligible, 1,
-        "the local-fallback record rolls up under its real origin"
+        "single-host falls back to the slug + sole host"
     );
-    assert_eq!(
-        report.blocked.len(),
-        0,
-        "a resolvable cwd must not be rejected for a local slug"
-    );
+    assert_eq!(report.blocked.len(), 0);
     assert_eq!(report.records[0].rollup.repo.host, "github.com");
     assert_eq!(
-        report.records[0].rollup.repo.org, "sympoies",
-        "org must come from the resolvable cwd origin, not the bogus `local` slug owner"
+        report.records[0].rollup.repo.org, "local",
+        "the placeholder slug owner is used, NOT the possibly-repointed cwd origin"
     );
-    assert_eq!(report.records[0].rollup.repo.repo, "nils-cli");
+    assert_eq!(report.records[0].rollup.repo.repo, "nils-cli-deadbeef");
+}
+
+#[test]
+fn migrate_multi_host_accepts_legacy_slug_with_case_only_origin_difference() {
+    // #879 follow-up (r495): a legacy/manual dir `acme__my_repo` whose origin
+    // differs only by CASE (`Acme/my_repo`) must still match — case is folded,
+    // the underscore is not. (The earlier raw-only check wrongly blocked this.)
+    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+
+    let checkout = make_git_checkout(&s.root, "my_repo", "git@github.com:Acme/my_repo.git");
+    write_record(
+        &s.source_out,
+        "acme__my_repo",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &checkout.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 1,
+        "case-only origin difference still matches the legacy slug"
+    );
+    assert_eq!(report.blocked.len(), 0);
+    assert_eq!(report.records[0].rollup.repo.host, "github.com");
+}
+
+#[test]
+fn migrate_multi_host_blocks_real_local_repo_repointed_to_nonlocal_owner() {
+    // #879 follow-up (r499): a real provider repo shaped like a fallback
+    // (`local__widget-deadbeef`) repointed to a DIFFERENT owner (`other/widget`)
+    // must be blocked. The earlier `is_local_fallback && org != local` special
+    // case wrongly TRUSTED any non-`local` repoint; uniform matching rejects it.
+    let s = build_multi_host_empty_scenario();
+
+    let reused = make_git_checkout(&s.root, "widget", "git@github.com:other/widget.git");
+    write_record(
+        &s.source_out,
+        "local__widget-deadbeef",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &reused.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 0,
+        "a repoint to a different owner must not be trusted"
+    );
+    assert_eq!(report.blocked.len(), 1, "the mismatched cwd is blocked");
 }
 
 #[test]
