@@ -152,7 +152,7 @@ fn status_line_regex() -> &'static Regex {
 
 /// Matches the whole `- Status:` line regardless of how many tokens the value
 /// has. Inbox statuses are always single tokens, but operation records may
-/// still carry a legacy multi-word free-text status (e.g. `- Status:
+/// still carry a multi-word free-text status (e.g. `- Status:
 /// implemented and validated`) that the record lifecycle migration must be able
 /// to rewrite.
 fn record_status_line_regex() -> &'static Regex {
@@ -1823,7 +1823,7 @@ fn run_set_status_record(
         ));
     }
     let text = read_text(&case.doc_path)?;
-    // Records may carry a legacy multi-word status, so match the whole line
+    // Records may carry a multi-word free-text status, so match the whole line
     // rather than the single-token inbox status regex — otherwise the records
     // that most need migrating into the lifecycle cannot be re-set.
     let re = record_status_line_regex();

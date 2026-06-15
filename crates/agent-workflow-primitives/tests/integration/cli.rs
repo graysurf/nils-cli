@@ -2646,8 +2646,8 @@ All gates green.\n",
     }
 
     #[test]
-    fn set_status_migrates_legacy_multiword_record() {
-        // Regression: a record carrying a legacy multi-word free-text status
+    fn set_status_migrates_multiword_status_record() {
+        // Regression: a record carrying a multi-word free-text status
         // (still accepted by verify) must be migratable into the lifecycle.
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let records = tmp
@@ -2655,7 +2655,7 @@ All gates green.\n",
             .join("heuristic-system")
             .join("operation-records");
         let record = write_record(
-            &records.join("legacy-record"),
+            &records.join("multiword-record"),
             &RecordOpts {
                 status: "implemented and validated",
                 ..RecordOpts::default()
