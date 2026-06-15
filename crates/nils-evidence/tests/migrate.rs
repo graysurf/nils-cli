@@ -468,6 +468,81 @@ fn migrate_rescues_unresolvable_identity_via_working_repo_roots() {
 }
 
 #[test]
+fn migrate_single_host_blocks_record_whose_cwd_resolves_to_other_host() {
+    // #872 part 1: under a SINGLE-host config the slug used to map straight to
+    // the sole host without consulting the record's own cwd. A record whose
+    // cwd -> origin resolves to a DIFFERENT, unclassified host must instead be
+    // blocked, not silently archived under the sole configured host.
+    let s = build_empty_scenario(); // single host: github.com
+
+    let elsewhere = make_git_checkout(&s.root, "elsewhere", "git@gitlab.com:someone/proj.git");
+    write_record(
+        &s.source_out,
+        "someone__proj",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &elsewhere.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
+    assert_eq!(
+        report.eligible, 0,
+        "a record whose cwd resolves to an unclassified host must not roll up"
+    );
+    assert_eq!(report.blocked.len(), 1, "it is blocked, not archived");
+    assert!(
+        report.blocked[0].reason.contains("not classified")
+            && report.blocked[0].reason.contains("gitlab.com"),
+        "blocked reason should name the unclassified resolved host: {}",
+        report.blocked[0].reason
+    );
+}
+
+#[test]
+fn migrate_rescues_nested_gitlab_checkout_via_working_repo_roots() {
+    // #872 part 2: a nested GitLab group has a full origin org such as
+    // `acme/platform/backend`, but the agent-out slug keeps only the last owner
+    // segment (`backend__svc`). The working_repo_roots rescue must still find
+    // the checkout (mirrored at its full origin path) by matching the normalized
+    // slug, and preserve the FULL origin org/repo in the rollup.
+    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com (employer), github.com
+
+    let roots = s.root.join("mirror");
+    make_git_checkout(
+        &roots.join("acme/platform/backend"),
+        "svc",
+        "git@gitlab.gamania.com:acme/platform/backend/svc.git",
+    );
+
+    // Record whose recorded cwd is gone -> Unresolvable -> rescue path.
+    write_record(
+        &s.source_out,
+        "backend__svc",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &s.root.join("gone").to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let mut args = dry_run_args(&s);
+    args.working_repo_roots = vec![roots.clone()];
+    let report = migrate::prepare(&args).expect("dry-run must succeed");
+    assert_eq!(report.eligible, 1, "the nested checkout is rescued");
+    assert_eq!(report.blocked.len(), 0, "rescued, not blocked");
+    assert_eq!(report.records[0].rollup.repo.host, "gitlab.gamania.com");
+    assert_eq!(
+        report.records[0].rollup.repo.org, "acme/platform/backend",
+        "the full origin org is preserved, not the truncated slug owner"
+    );
+    assert_eq!(report.records[0].rollup.repo.repo, "svc");
+}
+
+#[test]
 fn migrate_skips_and_reports_unparseable_records_without_aborting() {
     // Core fix (A), parse path: a malformed / truncated skill-usage.record.json
     // (trailing characters after the JSON object) must be SKIPPED and REPORTED

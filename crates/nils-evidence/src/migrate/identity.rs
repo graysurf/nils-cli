@@ -107,14 +107,18 @@ pub fn derive_repo_identity(
         ));
     }
 
-    // Single-host (or empty) config: the slug unambiguously maps to that host.
+    // Single-host (or empty) config. The record's own `cwd -> origin` is the
+    // authoritative host signal, so prefer it even here: a record whose checkout
+    // points at a DIFFERENT provider must be classified by its real host (and
+    // blocked upstream if that host is absent from config/hosts.yaml), not
+    // silently archived under the sole configured host. The slug -> sole-host
+    // mapping is the fallback used only when cwd cannot be resolved.
+    if let Some(identity) = identity_from_cwd(cwd) {
+        return Ok(identity);
+    }
     if let Some((org, repo)) = slug {
         let host = sole_host(hosts);
         return Ok(RepoIdentity { host, org, repo });
-    }
-    // No `__` separator: resolve cwd -> repo root -> origin remote.
-    if let Some(identity) = identity_from_cwd(cwd) {
-        return Ok(identity);
     }
     Err(IdentityError::Unresolvable(
         project_dir_name.to_string(),

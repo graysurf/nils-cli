@@ -35,6 +35,7 @@ pub mod provider_runtime;
 pub mod rate_limits_ansi;
 pub mod redact;
 pub mod shell;
+pub mod slug;
 
 pub fn greeting(name: &str) -> String {
     format!("Hello, {name}!")

@@ -557,30 +557,62 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
     })
 }
 
+/// Maximum directory depth searched under each `working_repo_roots` entry for a
+/// matching checkout. Covers flat `<root>/<owner>/<repo>` layouts (depth 2) and
+/// nested provider groups such as `<root>/acme/platform/backend/svc` (depth 4),
+/// while bounding the filesystem walk for this last-resort rescue.
+const MAX_RESCUE_WALK_DEPTH: usize = 6;
+
 /// Last-resort identity rescue: when `derive_repo_identity` returns
 /// `Unresolvable` (the record's agent-out `<owner__repo>` slug is ambiguous
 /// under a multi-host config and its recorded `cwd` no longer exists — a removed
-/// agent worktree is the common case), try to find a matching local checkout
-/// under a configured `working_repo_roots` entry and recover the host from its
-/// `origin` remote. The slug stays authoritative for `(org, repo)`; the checkout
-/// only supplies the host, and only when its own `origin` `(org, repo)` matches
-/// the slug (otherwise it is the wrong checkout and is ignored).
+/// agent worktree is the common case), find a matching local checkout under a
+/// configured `working_repo_roots` entry and recover the host from its `origin`
+/// remote.
+///
+/// A checkout matches when its `origin` `(org, repo)`, normalized with the SAME
+/// rule that produced the agent-out slug (`agent_out::project_slug_from_owner_repo`,
+/// which keeps only the last owner segment), equals the record's slug. This lets
+/// a nested provider group — full origin org such as `acme/platform/backend`,
+/// agent-out slug `backend__svc` — still match, and the FULL origin org/repo is
+/// preserved in the recovered identity (the slug's truncated owner is not used).
 fn rescue_identity_via_working_roots(
     project_dir_name: &str,
     working_repo_roots: &[PathBuf],
 ) -> Option<RepoIdentity> {
-    let (org, repo) = identity::split_owner_repo(project_dir_name)?;
+    // Only `<owner__repo>` slugs are rescuable (the record carries no host).
+    identity::split_owner_repo(project_dir_name)?;
     for root in working_repo_roots {
-        let candidate = root.join(&org).join(&repo);
-        let Some(found) = identity::identity_from_cwd(&candidate.to_string_lossy()) else {
-            continue;
-        };
-        if found.org == org && found.repo == repo {
-            return Some(RepoIdentity {
-                host: found.host,
-                org,
-                repo,
-            });
+        if let Some(found) = find_checkout_for_slug(root, project_dir_name, 0) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Walk `dir` (bounded by [`MAX_RESCUE_WALK_DEPTH`]) for a git checkout whose
+/// `origin` normalizes to the agent-out slug `target_slug`, returning its full
+/// origin identity. A directory holding `.git` is treated as a checkout and not
+/// descended into.
+fn find_checkout_for_slug(dir: &Path, target_slug: &str, depth: usize) -> Option<RepoIdentity> {
+    if depth > MAX_RESCUE_WALK_DEPTH {
+        return None;
+    }
+    if dir.join(".git").exists() {
+        let found = identity::identity_from_cwd(&dir.to_string_lossy())?;
+        let normalized = nils_common::slug::project_slug_from_owner_repo(&format!(
+            "{}/{}",
+            found.org, found.repo
+        ));
+        return (normalized.as_deref() == Some(target_slug)).then_some(found);
+    }
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir()
+            && let Some(found) = find_checkout_for_slug(&path, target_slug, depth + 1)
+        {
+            return Some(found);
         }
     }
     None
