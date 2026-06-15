@@ -240,10 +240,12 @@ pub struct AlreadyArchived {
 
 /// A record skipped (not fatal) and reported with a reason: an unresolvable
 /// repo identity (multi-host config + slug-only dir + ephemeral/removed `cwd`),
+/// a resolved host that is absent from `config/hosts.yaml` (not classified),
 /// a read/parse failure, a rollup-prep failure, or an unsupported source-record
 /// `schema` (e.g. a future `skill-usage.record.v2`, never normalized to v1).
 /// The batch continues; the operator sees what was skipped and why, and can
-/// re-run with `--host` to vouch for records they recognize.
+/// re-run with `--host` to vouch for records they recognize, or add the host to
+/// `config/hosts.yaml` to classify it.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BlockedRecord {
     pub record_path: String,
@@ -476,6 +478,24 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
                 }
             };
 
+        // A resolved host that is ABSENT from `config/hosts.yaml` must NOT be
+        // archived: the archive only holds records for hosts the operator has
+        // explicitly classified (personal/employer). Block-and-report instead of
+        // silently recording it as "unknown personal" — that would leak and
+        // mis-classify (e.g. employer evidence stored as personal, escaping the
+        // employer `delete-on-termination` retention class). To archive such a
+        // record, the operator first opts the host in by adding it to hosts.yaml.
+        if !hosts.hosts.contains_key(&repo_identity.host) {
+            blocked.push(BlockedRecord {
+                record_path: record_path.display().to_string(),
+                reason: format!(
+                    "host `{}` is not classified in config/hosts.yaml; add it (personal or employer) to archive this record",
+                    repo_identity.host
+                ),
+            });
+            continue;
+        }
+
         // A per-record rollup/scrub/staging failure must not abort the batch
         // either: record it as blocked and continue.
         let prepared_record = match build_prepared(
@@ -529,23 +549,16 @@ fn build_prepared(
 ) -> Result<PreparedRecord, MigrateError> {
     let mut warnings = Vec::new();
 
-    let host_entry = hosts.hosts.get(&repo_identity.host);
-    let classification = match host_entry {
-        Some(entry) => ClassificationSnapshot::from(&repo_identity.host, entry),
-        None => {
-            warnings.push(format!(
-                "host `{}` is not classified in config/hosts.yaml; recording as unknown personal",
-                repo_identity.host
-            ));
-            ClassificationSnapshot {
-                host: repo_identity.host.clone(),
-                class: HostClass::Personal,
-                employer: None,
-                primary_identity: None,
-                retention: None,
-            }
-        }
-    };
+    // The caller (`prepare`) blocks any record whose host is absent from
+    // hosts.yaml before reaching here, so an unclassified host is an internal
+    // invariant violation rather than an "unknown personal" fallback.
+    let host_entry = hosts.hosts.get(&repo_identity.host).ok_or_else(|| {
+        MigrateError::Io(format!(
+            "internal invariant violated: host `{}` reached build_prepared without a config/hosts.yaml classification",
+            repo_identity.host
+        ))
+    })?;
+    let classification = ClassificationSnapshot::from(&repo_identity.host, host_entry);
 
     // Producer: read or synthesize-with-warning.
     let producer = match &record.producer {
