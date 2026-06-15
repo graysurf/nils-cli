@@ -35,7 +35,7 @@ use crate::validate::hosts::{HostClass, HostEntry};
 pub mod identity;
 pub mod path;
 
-pub use identity::{RepoIdentity, derive_repo_identity};
+pub use identity::{IdentityError, RepoIdentity, derive_repo_identity};
 pub use path::{archive_target_path, encode_basic_stamp, rollup_id, skill_slug};
 
 const COMMAND: &str = "migrate";
@@ -69,6 +69,10 @@ pub struct DispatchArgs {
     /// used directly (after validation against `config/hosts.yaml`), bypassing
     /// the multi-host cwd ambiguity.
     pub host: Option<String>,
+    /// Local-checkout roots (from the machine-local config `working_repo_roots`)
+    /// used as a last-resort host-resolution hint when a record's recorded `cwd`
+    /// no longer exists. Empty disables the rescue.
+    pub working_repo_roots: Vec<PathBuf>,
     pub format: OutputFormat,
 }
 
@@ -470,11 +474,29 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
             match derive_repo_identity(&project_dir, &hosts, &record.cwd, args.host.as_deref()) {
                 Ok(id) => id,
                 Err(e) => {
-                    blocked.push(BlockedRecord {
-                        record_path: record_path.display().to_string(),
-                        reason: e.to_string(),
-                    });
-                    continue;
+                    // Last-resort rescue for an UNRESOLVABLE identity (the record's
+                    // recorded cwd is gone, e.g. a removed agent worktree): if a
+                    // configured working_repo_root holds a matching local checkout,
+                    // recover the host from its `origin`. Other identity errors
+                    // (operator typos in `--host`, etc.) are not rescued.
+                    let rescued = matches!(e, IdentityError::Unresolvable(_, _))
+                        .then(|| {
+                            rescue_identity_via_working_roots(
+                                &project_dir,
+                                &args.working_repo_roots,
+                            )
+                        })
+                        .flatten();
+                    match rescued {
+                        Some(id) => id,
+                        None => {
+                            blocked.push(BlockedRecord {
+                                record_path: record_path.display().to_string(),
+                                reason: e.to_string(),
+                            });
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -533,6 +555,35 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
         eligible,
         skipped,
     })
+}
+
+/// Last-resort identity rescue: when `derive_repo_identity` returns
+/// `Unresolvable` (the record's agent-out `<owner__repo>` slug is ambiguous
+/// under a multi-host config and its recorded `cwd` no longer exists — a removed
+/// agent worktree is the common case), try to find a matching local checkout
+/// under a configured `working_repo_roots` entry and recover the host from its
+/// `origin` remote. The slug stays authoritative for `(org, repo)`; the checkout
+/// only supplies the host, and only when its own `origin` `(org, repo)` matches
+/// the slug (otherwise it is the wrong checkout and is ignored).
+fn rescue_identity_via_working_roots(
+    project_dir_name: &str,
+    working_repo_roots: &[PathBuf],
+) -> Option<RepoIdentity> {
+    let (org, repo) = identity::split_owner_repo(project_dir_name)?;
+    for root in working_repo_roots {
+        let candidate = root.join(&org).join(&repo);
+        let Some(found) = identity::identity_from_cwd(&candidate.to_string_lossy()) else {
+            continue;
+        };
+        if found.org == org && found.repo == repo {
+            return Some(RepoIdentity {
+                host: found.host,
+                org,
+                repo,
+            });
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]

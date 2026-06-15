@@ -304,6 +304,7 @@ fn dry_run_args(s: &Scenario) -> DispatchArgs {
         promotion_only: false,
         apply: false,
         host: None,
+        working_repo_roots: Vec::new(),
         format: OutputFormat::Json,
     }
 }
@@ -419,6 +420,51 @@ fn migrate_blocks_resolved_host_absent_from_hosts_yaml() {
         "blocked reason should explain the missing classification: {}",
         blocked.reason
     );
+}
+
+#[test]
+fn migrate_rescues_unresolvable_identity_via_working_repo_roots() {
+    // N2 part 1: a record whose recorded cwd no longer exists (e.g. a removed
+    // agent worktree) is normally UNRESOLVABLE under a multi-host config. When a
+    // configured working_repo_roots entry holds a matching local checkout, the
+    // host is recovered from that checkout's origin and the record rolls up.
+    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+
+    // A local checkout mirror under a working-repo root; its origin pins the host.
+    let roots = s.root.join("mirror");
+    make_git_checkout(
+        &roots.join("graysurf"),
+        "kit",
+        "git@github.com:graysurf/kit.git",
+    );
+
+    // Record whose cwd does not exist -> derive_repo_identity fails (Unresolvable).
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &s.root
+                .join("gone-worktree")
+                .to_string_lossy()
+                .replace('\\', "/"),
+        ),
+    );
+
+    let mut args = dry_run_args(&s);
+    args.working_repo_roots = vec![roots.clone()];
+    let report = migrate::prepare(&args).expect("dry-run must succeed");
+    assert_eq!(report.eligible, 1, "the record is rescued and rolls up");
+    assert_eq!(
+        report.blocked.len(),
+        0,
+        "rescued via working_repo_roots, not blocked"
+    );
+    assert_eq!(report.records[0].rollup.repo.host, "github.com");
+    assert_eq!(report.records[0].rollup.repo.org, "graysurf");
+    assert_eq!(report.records[0].rollup.repo.repo, "kit");
 }
 
 #[test]

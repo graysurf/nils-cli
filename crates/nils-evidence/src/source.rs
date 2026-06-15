@@ -104,6 +104,15 @@ pub fn default_archive_clone_path() -> Result<PathBuf, SourceError> {
     Ok(local.data.config.archive_clone_path)
 }
 
+/// Read `working_repo_roots` from the machine-local config (empty when the file
+/// is absent or unreadable). Used as a last-resort host-resolution hint for a
+/// record whose recorded `cwd` no longer exists (e.g. a removed agent worktree).
+pub fn resolve_working_repo_roots() -> Vec<PathBuf> {
+    validate::local::validate_local_path(&local_config_path())
+        .map(|v| v.data.config.working_repo_roots)
+        .unwrap_or_default()
+}
+
 /// Machine-local config path, honouring `AGENT_EVIDENCE_LOCAL_CONFIG`, then
 /// `XDG_CONFIG_HOME`, then `$HOME/.config`, then a non-existent sentinel.
 pub fn local_config_path() -> PathBuf {

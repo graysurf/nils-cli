@@ -257,6 +257,7 @@ pub fn run() -> i32 {
             promotion_only,
             host,
             apply,
+            working_repo_roots: crate::source::resolve_working_repo_roots(),
             format,
         }),
         Command::Discover {
