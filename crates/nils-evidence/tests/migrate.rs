@@ -713,8 +713,8 @@ fn migrate_single_host_local_fallback_slug_with_changed_origin_uses_placeholder(
 }
 
 #[test]
-fn migrate_multi_host_accepts_legacy_slug_with_case_only_origin_difference() {
-    // #879 follow-up (r495): a legacy/manual dir `acme__my_repo` whose origin
+fn migrate_multi_host_accepts_manual_slug_with_case_only_origin_difference() {
+    // #879 follow-up (r495): a manual dir `acme__my_repo` whose origin
     // differs only by CASE (`Acme/my_repo`) must still match — case is folded,
     // the underscore is not. (The earlier raw-only check wrongly blocked this.)
     let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
@@ -734,7 +734,7 @@ fn migrate_multi_host_accepts_legacy_slug_with_case_only_origin_difference() {
     let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
     assert_eq!(
         report.eligible, 1,
-        "case-only origin difference still matches the legacy slug"
+        "case-only origin difference still matches the manual slug"
     );
     assert_eq!(report.blocked.len(), 0);
     assert_eq!(report.records[0].rollup.repo.host, "github.com");
@@ -769,8 +769,8 @@ fn migrate_multi_host_blocks_real_local_repo_repointed_to_nonlocal_owner() {
 }
 
 #[test]
-fn migrate_multi_host_accepts_legacy_underscore_slug_matching_cwd() {
-    // #877 follow-up part 2: a legacy/manual slug whose repo half keeps an
+fn migrate_multi_host_accepts_manual_underscore_slug_matching_cwd() {
+    // #877 follow-up part 2: a manual slug whose repo half keeps an
     // underscore (`acme__my_repo`) is compared against a cwd origin
     // (`acme/my_repo`) that the slug rule normalizes to `acme__my-repo`.
     // Comparing the raw directory name against the normalized cwd slug would
@@ -843,9 +843,9 @@ fn migrate_host_override_blocks_resolvable_mismatched_cwd() {
 }
 
 #[test]
-fn migrate_multi_host_blocks_legacy_underscore_slug_repointed_to_hyphen_repo() {
+fn migrate_multi_host_blocks_manual_underscore_slug_repointed_to_hyphen_repo() {
     // #878 follow-up A: normalizing BOTH sides over-collapsed `_` and `-`, so a
-    // legacy/manual slug `acme__my_repo` matched a cwd repointed to the UNRELATED
+    // manual slug `acme__my_repo` matched a cwd repointed to the UNRELATED
     // repo `acme/my-repo` (provider repo names distinguish `_` from `-`). The
     // mismatched cwd must be rejected, not trusted: under multi-host the record
     // is blocked rather than mis-archived under the reused checkout.
@@ -867,7 +867,7 @@ fn migrate_multi_host_blocks_legacy_underscore_slug_repointed_to_hyphen_repo() {
     let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed");
     assert_eq!(
         report.eligible, 0,
-        "a cwd at acme/my-repo must not match the legacy slug acme__my_repo"
+        "a cwd at acme/my-repo must not match the manual slug acme__my_repo"
     );
     assert_eq!(report.blocked.len(), 1, "the mismatched cwd is blocked");
 }
