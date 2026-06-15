@@ -2142,7 +2142,15 @@ fn run_archive_record(
     } else {
         args.link.clone()
     };
-    let text = read_text(&destination_doc)?;
+    let mut text = read_text(&destination_doc)?;
+    // When `--link` is the supersession source (the record had no usable
+    // `Superseded-by` field, or it still said `none`), persist it into the
+    // Status block as well — otherwise field consumers like `verify` and the
+    // lifecycle tooling lose the supersession metadata that only the rendered
+    // `## Archive` section would otherwise carry.
+    if !args.link.is_empty() && !superseded_by_present {
+        text = upsert_status_field(&text, "Superseded-by", &args.link);
+    }
     write_text(
         &destination_doc,
         &upsert_archive_section(&text, archive_date, &reason, &link),

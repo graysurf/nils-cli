@@ -2839,6 +2839,52 @@ All gates green.\n",
     }
 
     #[test]
+    fn archive_record_with_link_persists_superseded_by() {
+        // Regression: when `--link` is the supersession source (no Superseded-by
+        // field on the record), the moved RECORD.md must carry the link in its
+        // Status block, not only in the rendered `## Archive` section, so
+        // field consumers keep the lifecycle metadata.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let records = tmp
+            .path()
+            .join("heuristic-system")
+            .join("operation-records");
+        let record = write_record(
+            &records.join("retired-record"),
+            &RecordOpts {
+                status: "superseded",
+                superseded_by: None,
+                ..RecordOpts::default()
+            },
+        );
+        let out = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "archive",
+                record.parent().unwrap().to_str().unwrap(),
+                "--link",
+                "core/policies/heuristic-system/operation-records/replacement",
+                "--yes",
+                "--date",
+                "2026-06-15",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let destination = PathBuf::from(out.stdout_json()["data"]["destination"].as_str().unwrap());
+        let text = fs::read_to_string(&destination).unwrap();
+        assert!(
+            text.contains(
+                "- Superseded-by: core/policies/heuristic-system/operation-records/replacement"
+            ),
+            "Status block must carry the supersession link, got:\n{text}"
+        );
+        assert_eq!(text.matches("- Superseded-by:").count(), 1, "text={text}");
+    }
+
+    #[test]
     fn verify_rejects_raw_skill_usage_evidence() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let inbox = inbox_root(tmp.path());
