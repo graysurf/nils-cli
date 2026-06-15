@@ -11,6 +11,11 @@ use std::process::Command as ProcessCommand;
 use chrono::Local;
 use clap::Parser;
 use clap::error::ErrorKind;
+// Project-slug normalization now lives in the shared crate so `nils-evidence`
+// can reuse the exact same rule. Re-export the public helpers to preserve the
+// `agent_out::project_slug_*` API.
+use nils_common::slug::sanitize_path_label;
+pub use nils_common::slug::{project_slug_from_owner_repo, project_slug_from_remote_url};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -381,34 +386,6 @@ fn git_origin_url(repo: &Path) -> Option<String> {
     }
 }
 
-pub fn project_slug_from_remote_url(remote: &str) -> Option<String> {
-    let parsed = nils_common::git::parse_git_remote_url(remote)?;
-    project_slug_from_owner_repo(&parsed.path)
-}
-
-pub fn project_slug_from_owner_repo(value: &str) -> Option<String> {
-    let mut parts: Vec<&str> = value
-        .trim()
-        .trim_end_matches(".git")
-        .split('/')
-        .filter(|part| !part.trim().is_empty())
-        .collect();
-
-    if parts.len() >= 2 {
-        let repo = parts.pop().expect("repo segment");
-        let owner = parts.pop().expect("owner segment");
-        let owner = sanitize_path_label(owner, "");
-        let repo = sanitize_path_label(repo, "");
-        if owner.is_empty() || repo.is_empty() {
-            return None;
-        }
-        return Some(format!("{owner}__{repo}"));
-    }
-
-    let slug = sanitize_path_label(value, "");
-    if slug.is_empty() { None } else { Some(slug) }
-}
-
 fn local_project_slug(repo: &Path) -> String {
     let basename = repo
         .file_name()
@@ -421,31 +398,6 @@ fn local_project_slug(repo: &Path) -> String {
 
 pub fn sanitize_topic(topic: &str) -> String {
     sanitize_path_label(topic, "untitled")
-}
-
-fn sanitize_path_label(value: &str, fallback: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-
-    let trimmed = out.trim_matches('-');
-    let mut sanitized: String = trimmed.chars().take(80).collect();
-    sanitized = sanitized.trim_matches('-').to_string();
-
-    if sanitized.is_empty() {
-        fallback.to_string()
-    } else {
-        sanitized
-    }
 }
 
 fn stable_short_hash(value: &str) -> String {
