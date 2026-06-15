@@ -163,6 +163,21 @@ git -C "$repo" -c user.name=tester -c user.email=tester@example.com -c commit.gp
     bin_dir
 }
 
+/// A semantic-commit stub on PATH that always fails, to drive the commit-step
+/// rollback path.
+#[cfg(unix)]
+fn install_failing_semantic_commit_stub(a: &Archive) -> PathBuf {
+    let bin_dir = a.root.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("semantic-commit");
+    fs::write(&stub, "#!/bin/sh\necho 'commit boom' >&2\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(&stub).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&stub, perms).unwrap();
+    bin_dir
+}
+
 /// Run `f` with `dir` prepended to PATH. Serialized via a process-global mutex
 /// because PATH is process-wide.
 #[cfg(unix)]
@@ -288,6 +303,10 @@ fn purge_rejects_path_like_host() {
         "..",
         ".",
         "a/b",
+        // Trailing/embedded separators that Path::components() would normalize
+        // away but still resolve to a real host tree.
+        "github.com/",
+        "github.com/.",
         "",
     ] {
         let err = purge::run(&args(&a.archive, vec![bad.to_string()], None, true)).unwrap_err();
@@ -512,4 +531,131 @@ fn purge_apply_noop_when_scoped_host_absent() {
     // Existing host trees are untouched.
     assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
     assert!(a.archive.join("evidence/github.com").exists());
+}
+
+#[test]
+fn purge_dry_run_flags_host_tree_without_rollups() {
+    // Dry-run must describe what apply removes: a scoped host tree with no
+    // rollups still surfaces host_tree_present so it does not read as empty.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let archive = root.join("archive");
+    fs::create_dir_all(archive.join("config")).unwrap();
+    fs::create_dir_all(archive.join("evidence")).unwrap();
+    fs::write(
+        archive.join("config").join("hosts.yaml"),
+        "version: 1\nhosts:\n  gitlab.gamania.com:\n    class: employer\n    employer: Gamania\n",
+    )
+    .unwrap();
+    let orphan_dir = archive.join("evidence/gitlab.gamania.com/orphan");
+    fs::create_dir_all(&orphan_dir).unwrap();
+    fs::write(orphan_dir.join("secret.txt"), "sensitive").unwrap();
+    git(&archive, &["init", "-q", "-b", "main"]);
+    let a = Archive {
+        _tmp: tmp,
+        root,
+        archive,
+    };
+    seed_commit(&a.archive, "seed");
+
+    let report = purge::run(&args(&a.archive, vec![], Some(HostClass::Employer), false)).unwrap();
+    assert!(!report.applied);
+    assert_eq!(report.total_records, 0, "no rollups discovered");
+    let target = report
+        .targets
+        .iter()
+        .find(|t| t.host == "gitlab.gamania.com")
+        .expect("scoped host present in report");
+    assert_eq!(target.records, 0);
+    assert!(
+        target.host_tree_present,
+        "dry-run flags that the host tree exists and will be removed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_apply_rolls_back_when_commit_fails() {
+    // A failure in the commit step (here: a failing semantic-commit) after the
+    // host tree is deleted must roll the deletion back, not just catalog errors.
+    let a = build();
+    configure_push_remote(&a);
+    let stub = install_failing_semantic_commit_stub(&a);
+    let before = git_count_commits(&a.archive);
+
+    let err = with_path(&stub, || {
+        purge::run(&args(
+            &a.archive,
+            vec!["gitlab.gamania.com".to_string()],
+            None,
+            true,
+        ))
+        .unwrap_err()
+    });
+    // Surfaced as a transaction (commit) error, not RollbackFailed — the
+    // rollback itself succeeds.
+    assert!(
+        !matches!(err, PurgeError::RollbackFailed { .. }),
+        "rollback should succeed, got {err:?}"
+    );
+
+    // Rolled back: scoped host tree restored, no commit, working tree clean.
+    assert!(
+        a.archive.join("evidence/gitlab.gamania.com").exists(),
+        "deletion rolled back after commit failure"
+    );
+    assert_eq!(git_count_commits(&a.archive), before, "no purge commit");
+    let st = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&a.archive)
+        .output()
+        .unwrap();
+    assert!(
+        st.stdout.is_empty(),
+        "working tree clean after rollback, got: {}",
+        String::from_utf8_lossy(&st.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_apply_refuses_ignored_files_in_scope() {
+    // A rollback (git checkout) cannot restore ignored files, so apply refuses a
+    // scoped host tree that carries them rather than risk permanent loss.
+    let a = build();
+    configure_push_remote(&a);
+    let stub = install_semantic_commit_stub(&a);
+
+    fs::write(a.archive.join(".gitignore"), "*.secret\n").unwrap();
+    seed_commit(&a.archive, "add gitignore");
+    let before = git_count_commits(&a.archive);
+    // An ignored sidecar under the scoped host (not tracked, not shown by a
+    // plain status).
+    fs::write(
+        a.archive.join("evidence/gitlab.gamania.com/sidecar.secret"),
+        "local secret",
+    )
+    .unwrap();
+
+    let err = with_path(&stub, || {
+        purge::run(&args(
+            &a.archive,
+            vec!["gitlab.gamania.com".to_string()],
+            None,
+            true,
+        ))
+        .unwrap_err()
+    });
+    assert!(
+        matches!(err, PurgeError::UnrestorableScope(_)),
+        "scope with ignored files must be refused, got {err:?}"
+    );
+    // Nothing deleted, no commit.
+    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert!(
+        a.archive
+            .join("evidence/gitlab.gamania.com/sidecar.secret")
+            .exists()
+    );
+    assert_eq!(git_count_commits(&a.archive), before);
 }
