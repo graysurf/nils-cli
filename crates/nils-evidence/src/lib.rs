@@ -22,6 +22,7 @@ pub mod cli;
 pub mod completion;
 pub mod discover;
 pub mod migrate;
+pub mod purge;
 pub mod query;
 pub mod record;
 pub mod search;

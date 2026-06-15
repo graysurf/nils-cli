@@ -146,7 +146,10 @@ fn sole_host(hosts: &HostsConfig) -> String {
         .unwrap_or_else(|| "github.com".to_string())
 }
 
-fn identity_from_cwd(cwd: &str) -> Option<RepoIdentity> {
+/// Resolve a repo identity from a local checkout path by reading its `origin`
+/// remote. Returns `None` when the path is not a git repo or has no usable
+/// `origin`. Exposed for the migrate `working_repo_roots` rescue path.
+pub fn identity_from_cwd(cwd: &str) -> Option<RepoIdentity> {
     if cwd.is_empty() {
         return None;
     }
