@@ -1241,7 +1241,7 @@ fn truncate_header(header: &str, max: usize) -> String {
     header.chars().take(max).collect()
 }
 
-fn run_semantic_commit(repo: &Path, message: &str) -> Result<(), MigrateError> {
+pub(crate) fn run_semantic_commit(repo: &Path, message: &str) -> Result<(), MigrateError> {
     let mut child = ProcCommand::new("semantic-commit")
         .arg("commit")
         .arg("-m")
@@ -1264,7 +1264,7 @@ fn run_semantic_commit(repo: &Path, message: &str) -> Result<(), MigrateError> {
     Ok(())
 }
 
-fn head_sha(repo: &Path) -> Result<String, MigrateError> {
+pub(crate) fn head_sha(repo: &Path) -> Result<String, MigrateError> {
     let out = nils_common::git::run_output_in(repo, &["rev-parse", "HEAD"])
         .map_err(|e| MigrateError::Io(e.to_string()))?;
     if !out.status.success() {
@@ -1276,7 +1276,7 @@ fn head_sha(repo: &Path) -> Result<String, MigrateError> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn push_archive(repo: &Path) -> Result<(), MigrateError> {
+pub(crate) fn push_archive(repo: &Path) -> Result<(), MigrateError> {
     let out = nils_common::git::run_output_in(repo, &["push"])
         .map_err(|e| MigrateError::Io(e.to_string()))?;
     if !out.status.success() {

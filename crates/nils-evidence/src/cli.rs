@@ -17,7 +17,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use nils_common::cli_contract::{
     Envelope, EnvelopeError, OutputFormat, emit_parse_error, exit, schema_version_for,
 };
@@ -25,12 +25,28 @@ use serde::Serialize;
 
 use crate::validate::{
     self,
-    hosts::HostsValidation,
+    hosts::{HostClass, HostsValidation},
     local::{LocalSource, LocalValidation},
     record::RecordValidation,
 };
 
 const BINARY: &str = "evidence";
+
+/// `--class` selector for `purge`, mapped onto the archive `HostClass`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PurgeClass {
+    Personal,
+    Employer,
+}
+
+impl From<PurgeClass> for HostClass {
+    fn from(c: PurgeClass) -> Self {
+        match c {
+            PurgeClass::Personal => HostClass::Personal,
+            PurgeClass::Employer => HostClass::Employer,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -126,6 +142,29 @@ enum Command {
         host: Option<String>,
         /// Apply the migration. Without this flag the command runs in dry-run
         /// mode.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Purge archived evidence for named hosts / host classes (the retention
+    /// counterpart to `migrate`; e.g. employer `delete-on-termination`).
+    /// Dry-run by default; `--apply` deletes, regenerates the catalog, commits,
+    /// and pushes. A scope (`--host` and/or `--class`) is required — there is no
+    /// implicit whole-archive purge.
+    Purge {
+        /// Host (FQDN) to purge (repeatable). Removes `evidence/<host>/`.
+        #[arg(long)]
+        host: Vec<String>,
+        /// Purge every host classified as this class in `config/hosts.yaml`.
+        #[arg(long, value_enum)]
+        class: Option<PurgeClass>,
+        /// Archive clone path. Defaults as for `migrate`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Path to the archive `config/hosts.yaml`. Defaults to
+        /// `<archive>/config/hosts.yaml`.
+        #[arg(long)]
+        hosts: Option<PathBuf>,
+        /// Apply the purge. Without this flag the command runs in dry-run mode.
         #[arg(long)]
         apply: bool,
     },
@@ -258,6 +297,20 @@ pub fn run() -> i32 {
             host,
             apply,
             working_repo_roots: crate::source::resolve_working_repo_roots(),
+            format,
+        }),
+        Command::Purge {
+            host,
+            class,
+            archive,
+            hosts,
+            apply,
+        } => crate::purge::dispatch(crate::purge::PurgeArgs {
+            archive,
+            hosts,
+            host,
+            class: class.map(HostClass::from),
+            apply,
             format,
         }),
         Command::Discover {
