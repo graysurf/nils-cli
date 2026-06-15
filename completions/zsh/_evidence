@@ -80,6 +80,20 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(purge)
+_arguments "${_arguments_options[@]}" : \
+'*--host=[Host (FQDN) to purge (repeatable). Removes \`evidence/<host>/\`]:HOST:_default' \
+'--class=[Purge every host classified as this class in \`config/hosts.yaml\`]:CLASS:(personal employer)' \
+'--archive=[Archive clone path. Defaults as for \`migrate\`]:ARCHIVE:_files' \
+'--hosts=[Path to the archive \`config/hosts.yaml\`. Defaults to \`<archive>/config/hosts.yaml\`]:HOSTS:_files' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--apply[Apply the purge. Without this flag the command runs in dry-run mode]' \
+'(--format)--json[Hidden alias for \`--format json\` kept for symmetry with neighbouring CLIs]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (discover)
 _arguments "${_arguments_options[@]}" : \
 '--source-out=[Agent-out projects root. Defaults to \`\${AGENT_HOME}/out/projects\`]:SOURCE_OUT:_files' \
@@ -173,6 +187,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(purge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (discover)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -213,6 +231,7 @@ _evidence_commands() {
 'validate-local:Validate a machine-local \`agent-evidence-archive/config.yaml\` document. Missing files return documented defaults with exit code 0' \
 'validate-record:Validate an archived \`skill-usage.rollup.json\` document' \
 'migrate:Migrate skill-usage records out of the agent-out tree into the archive. Dry-run by default; use \`--apply\` to write, commit, and push' \
+'purge:Purge archived evidence for named hosts / host classes (the retention counterpart to \`migrate\`; e.g. employer \`delete-on-termination\`). Dry-run by default; \`--apply\` deletes, regenerates the catalog, commits, and pushes. A scope (\`--host\` and/or \`--class\`) is required — there is no implicit whole-archive purge' \
 'discover:Read-only scan of the agent-out tree for archivable records' \
 'catalog:Generate, write, or filter the derived archive catalog' \
 'query:Filtered read over archived rollups (cross-version aware)' \
@@ -244,6 +263,7 @@ _evidence__subcmd__help_commands() {
 'validate-local:Validate a machine-local \`agent-evidence-archive/config.yaml\` document. Missing files return documented defaults with exit code 0' \
 'validate-record:Validate an archived \`skill-usage.rollup.json\` document' \
 'migrate:Migrate skill-usage records out of the agent-out tree into the archive. Dry-run by default; use \`--apply\` to write, commit, and push' \
+'purge:Purge archived evidence for named hosts / host classes (the retention counterpart to \`migrate\`; e.g. employer \`delete-on-termination\`). Dry-run by default; \`--apply\` deletes, regenerates the catalog, commits, and pushes. A scope (\`--host\` and/or \`--class\`) is required — there is no implicit whole-archive purge' \
 'discover:Read-only scan of the agent-out tree for archivable records' \
 'catalog:Generate, write, or filter the derived archive catalog' \
 'query:Filtered read over archived rollups (cross-version aware)' \
@@ -278,6 +298,11 @@ _evidence__subcmd__help__subcmd__migrate_commands() {
     local commands; commands=()
     _describe -t commands 'evidence help migrate commands' commands "$@"
 }
+(( $+functions[_evidence__subcmd__help__subcmd__purge_commands] )) ||
+_evidence__subcmd__help__subcmd__purge_commands() {
+    local commands; commands=()
+    _describe -t commands 'evidence help purge commands' commands "$@"
+}
 (( $+functions[_evidence__subcmd__help__subcmd__query_commands] )) ||
 _evidence__subcmd__help__subcmd__query_commands() {
     local commands; commands=()
@@ -307,6 +332,11 @@ _evidence__subcmd__help__subcmd__validate-record_commands() {
 _evidence__subcmd__migrate_commands() {
     local commands; commands=()
     _describe -t commands 'evidence migrate commands' commands "$@"
+}
+(( $+functions[_evidence__subcmd__purge_commands] )) ||
+_evidence__subcmd__purge_commands() {
+    local commands; commands=()
+    _describe -t commands 'evidence purge commands' commands "$@"
 }
 (( $+functions[_evidence__subcmd__query_commands] )) ||
 _evidence__subcmd__query_commands() {
