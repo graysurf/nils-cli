@@ -363,6 +363,65 @@ fn migrate_skips_and_reports_unresolvable_records_without_aborting() {
 }
 
 #[test]
+fn migrate_blocks_resolved_host_absent_from_hosts_yaml() {
+    // Core safety fix: a record whose host RESOLVES (via cwd -> origin) but is
+    // ABSENT from config/hosts.yaml must be SKIPPED and REPORTED in `blocked`,
+    // not silently archived as "unknown personal". The archive can only hold
+    // records for hosts the operator has explicitly classified.
+    let s = build_multi_host_empty_scenario(); // hosts: gitlab.gamania.com, github.com
+
+    // Resolvable + classified (github.com) -> rolls up.
+    let classified = make_git_checkout(&s.root, "classified", "git@github.com:graysurf/kit.git");
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-100000",
+        &record_json_with_cwd(
+            "deliver-pr",
+            "2026-06-14T10:00:00Z",
+            &classified.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    // Resolvable but UNCLASSIFIED: cwd resolves to gitlab.com, which is absent
+    // from this archive's hosts.yaml -> must be blocked, not written.
+    let unclassified =
+        make_git_checkout(&s.root, "unclassified", "git@gitlab.com:someone/proj.git");
+    write_record(
+        &s.source_out,
+        "someone__proj",
+        "20260614-110000",
+        &record_json_with_cwd(
+            "code-review",
+            "2026-06-14T11:00:00Z",
+            &unclassified.to_string_lossy().replace('\\', "/"),
+        ),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("dry-run must succeed, not abort");
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.eligible, 1, "only the classified record rolls up");
+    assert_eq!(report.records.len(), 1);
+    assert_eq!(report.records[0].rollup.repo.host, "github.com");
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "the unclassified-host record is blocked, not written"
+    );
+    let blocked = &report.blocked[0];
+    assert!(
+        blocked.record_path.contains("20260614-110000"),
+        "blocked entry should name the unclassified record: {}",
+        blocked.record_path
+    );
+    assert!(
+        blocked.reason.contains("not classified") && blocked.reason.contains("gitlab.com"),
+        "blocked reason should explain the missing classification: {}",
+        blocked.reason
+    );
+}
+
+#[test]
 fn migrate_skips_and_reports_unparseable_records_without_aborting() {
     // Core fix (A), parse path: a malformed / truncated skill-usage.record.json
     // (trailing characters after the JSON object) must be SKIPPED and REPORTED
