@@ -34,6 +34,35 @@ pub fn project_slug_from_owner_repo(value: &str) -> Option<String> {
     if slug.is_empty() { None } else { Some(slug) }
 }
 
+/// Prefix of agent-out's local-fallback project slug (`local__<base>-<hash>`),
+/// produced when a repo has no resolvable `origin`. Kept here so the producer
+/// (`agent-out`) and the recognizer ([`is_local_fallback_slug`]) agree on the
+/// shape.
+pub const LOCAL_FALLBACK_SLUG_PREFIX: &str = "local__";
+
+/// True when `slug` has agent-out's local-fallback shape
+/// `local__<base>-<8-hex-hash>`. Such a slug is NOT a provider
+/// `<owner>__<repo>` identity even though it splits like one (owner `local`,
+/// repo `<base>-<hash>`): the `local` owner is a placeholder, not a real org.
+/// Identity matching must therefore treat a local-fallback slug as carrying no
+/// authoritative `(org, repo)`, so a record's resolvable `cwd -> origin` is
+/// trusted over the slug. The hash suffix is matched precisely (8 lowercase hex
+/// chars, see `agent-out`'s `stable_short_hash`) so a genuine owner literally
+/// named `local` (e.g. `local/some-repo`) is not misclassified.
+pub fn is_local_fallback_slug(slug: &str) -> bool {
+    let Some(rest) = slug.strip_prefix(LOCAL_FALLBACK_SLUG_PREFIX) else {
+        return false;
+    };
+    let Some((base, hash)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    !base.is_empty()
+        && hash.len() == 8
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Derive the `<owner>__<repo>` project slug from a git remote URL by parsing
 /// the URL and normalizing its `owner/repo` path.
 pub fn project_slug_from_remote_url(remote: &str) -> Option<String> {
@@ -108,6 +137,26 @@ mod tests {
             Some("solo".to_string())
         );
         assert_eq!(project_slug_from_owner_repo("   "), None);
+    }
+
+    #[test]
+    fn recognizes_local_fallback_slug() {
+        // agent-out's `local__<base>-<8 hex>` shape.
+        assert!(is_local_fallback_slug("local__nils-cli-deadbeef"));
+        assert!(is_local_fallback_slug("local__repo-00000000"));
+    }
+
+    #[test]
+    fn rejects_non_local_fallback_slugs() {
+        // A real provider slug, even with owner literally `local`, lacks the
+        // 8-hex-hash suffix and must not be treated as a local fallback.
+        assert!(!is_local_fallback_slug("sympoies__nils-cli"));
+        assert!(!is_local_fallback_slug("local__some-repo"));
+        assert!(!is_local_fallback_slug("local__widget"));
+        assert!(!is_local_fallback_slug("local__repo-deadbeefa")); // 9 hex chars
+        assert!(!is_local_fallback_slug("local__repo-DEADBEEF")); // uppercase, not produced
+        assert!(!is_local_fallback_slug("local__-deadbeef")); // empty base
+        assert!(!is_local_fallback_slug("notlocal__repo-deadbeef"));
     }
 
     #[test]
