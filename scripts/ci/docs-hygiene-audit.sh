@@ -134,14 +134,21 @@ elif command -v sha1sum >/dev/null 2>&1; then
   hash_cmd="sha1sum"
 fi
 
+# Unlike the ripgrep probes (which use `|| true` because a no-match exit 1 is
+# expected), a hashing failure is a real audit gap, so surface it via
+# record_issue rather than swallowing it. nullglob (scoped to the subshell)
+# keeps an unmatched `crates/*/docs` from reaching find as a literal path.
 if [[ -z "$hash_cmd" ]]; then
   record_issue error "missing required hash command: install shasum or sha1sum"
-else
-  dup_hashes="$(find docs crates/*/docs -type f -name '*.md' -print0 \
+elif ! md_hashes="$(
+  shopt -s nullglob
+  find docs crates/*/docs -type f -name '*.md' -print0 \
     | xargs -0 "$hash_cmd" \
-    | awk '{print $1}' \
-    | sort \
-    | uniq -d || true)"
+    | awk '{print $1}'
+)"; then
+  record_issue error "failed to enumerate or hash markdown payloads with $hash_cmd"
+else
+  dup_hashes="$(printf '%s\n' "$md_hashes" | sort | uniq -d)"
   if [[ -n "$dup_hashes" ]]; then
     while IFS= read -r hash; do
       [[ -n "$hash" ]] || continue
