@@ -102,39 +102,41 @@ value (REST passthrough = same as `gh api` + rename).
 
 Parity matrix (v1):
 
-| forge-cli op             | github backend                                                                              | gitlab backend                                              | Parity                               |
-| ------------------------ | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------ |
-| `pr create`              | `gh pr create --draft`                                                                      | `glab mr create --draft`                                    | exact                                |
-| `pr view <id>`           | `gh pr view <id> --json …`                                                                  | `glab mr view <id> -F json`                                 | exact                                |
-| `pr list`                | `gh pr list --json …`                                                                       | `glab mr list -F json`                                      | exact                                |
-| `pr edit <id>`           | `gh pr edit <id> …`                                                                         | `glab mr update <id> …`                                     | exact                                |
-| `pr comment <id>`        | `gh pr comment <id> --body …`                                                               | `glab mr note <id> --message …`                             | exact                                |
-| `pr ready <id>`          | `gh pr ready <id>`                                                                          | `glab mr update <id> --ready`                               | exact                                |
-| `pr review-threads <id>` | `gh api graphql` (`reviewThreads` connection)                                               | `glab api …/merge_requests/<iid>/discussions`               | normalized thread state              |
-| `pr tasks <id>`          | `gh pr view <id> --json number,url,body`                                                    | `glab mr view <id> -F json` (`description`)                 | normalized task-list state           |
-| `pr merge <id>`          | `gh pr merge <id> --squash --delete-branch`                                                 | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg) |
-| `pr close <id>`          | `gh pr close <id>`                                                                          | `glab mr close <id>`                                        | exact                                |
-| `pr checks <id>`         | `gh pr checks <id> --json …` plus `--required` for gating                                   | `glab mr view -F json` + `glab api .../pipelines/<id>/jobs` | emulated on GitLab                   |
-| `pr wait-checks <id>`    | poll `gh pr checks` / `gh pr checks --required`                                             | poll structured MR pipeline/jobs snapshot                   | emulated; same envelope              |
-| `issue create`           | `gh issue create …`                                                                         | `glab issue create …`                                       | exact                                |
-| `issue view <id>`        | `gh issue view <id> --json …`                                                               | `glab issue view <id> -F json`                              | exact                                |
-| `issue edit <id>`        | `gh issue edit <id> …`                                                                      | `glab issue update <id> …`                                  | exact                                |
-| `issue comment <id>`     | `gh issue comment <id> --body …`                                                            | `glab issue note <id> --message …`                          | exact                                |
-| `issue close <id>`       | `gh issue close <id>`                                                                       | `glab issue close <id>`                                     | exact                                |
-| `issue reopen <id>`      | `gh issue reopen <id>`                                                                      | `glab issue reopen <id>`                                    | exact                                |
-| `label list`             | `gh label list --json …`                                                                    | `glab label list --output json`                             | exact                                |
-| `label audit`            | read labels, compare with caller catalog                                                    | same                                                        | exact                                |
-| `label ensure`           | `gh label create/edit`                                                                      | `glab label create/edit`                                    | exact (no delete/rename by default)  |
-| `auth status`            | `gh auth status`                                                                            | `glab auth status`                                          | exact (text → typed)                 |
-| `repo view`              | `gh repo view --json …`                                                                     | `glab repo view -F json`                                    | exact                                |
-| `inbox list`             | `gh search prs/issues --json …`                                                             | `glab api --hostname <host> …`                              | normalized aggregation               |
-| `inbox status`           | same provider reads as `inbox list`                                                         | same provider reads as `inbox list`                         | bounded counts                       |
-| `inbox next`             | same provider reads as `inbox list`                                                         | same provider reads as `inbox list`                         | ranked bounded subset                |
-| `activity commits`       | `gh api search/commits`                                                                     | unsupported in v1                                           | GitHub-only seam                     |
-| `activity events`        | `gh api users/<login>/events[/public]`                                                      | unsupported in v1                                           | GitHub-only seam                     |
-| `activity feed`          | `gh api repos/<owner>/<repo>/commits` + repository activity REST                            | `glab api projects/:id/repository/commits` + project events | normalized open vocabulary           |
-| `activity summary`       | `gh api graphql` contribution query                                                         | unsupported in v1                                           | GitHub-only seam                     |
-| `pr deliver`             | macro: `pr list` lookup → `pr create` or adopt → `pr wait-checks` → `pr ready` → `pr merge` | same composition with gitlab atoms                          | exact (same macro logic on both)     |
+| forge-cli op                                | github backend                                                                              | gitlab backend                                              | Parity                               |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------ |
+| `pr create`                                 | `gh pr create --draft`                                                                      | `glab mr create --draft`                                    | exact                                |
+| `pr view <id>`                              | `gh pr view <id> --json …`                                                                  | `glab mr view <id> -F json`                                 | exact                                |
+| `pr list`                                   | `gh pr list --json …`                                                                       | `glab mr list -F json`                                      | exact                                |
+| `pr edit <id>`                              | `gh pr edit <id> …`                                                                         | `glab mr update <id> …`                                     | exact                                |
+| `pr comment <id>`                           | `gh pr comment <id> --body …`                                                               | `glab mr note <id> --message …`                             | exact                                |
+| `pr ready <id>`                             | `gh pr ready <id>`                                                                          | `glab mr update <id> --ready`                               | exact                                |
+| `pr review-threads <id>`                    | `gh api graphql` (`reviewThreads` connection)                                               | `glab api …/merge_requests/<iid>/discussions`               | normalized thread state              |
+| `pr review-threads resolve <id> --thread …` | `gh api graphql` (`addPullRequestReviewThreadReply` then `resolveReviewThread`)             | unsupported in v1                                           | GitHub-only seam                     |
+| `pr review-threads reply <id> --thread …`   | `gh api graphql` (`addPullRequestReviewThreadReply`)                                        | unsupported in v1                                           | GitHub-only seam                     |
+| `pr tasks <id>`                             | `gh pr view <id> --json number,url,body`                                                    | `glab mr view <id> -F json` (`description`)                 | normalized task-list state           |
+| `pr merge <id>`                             | `gh pr merge <id> --squash --delete-branch`                                                 | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg) |
+| `pr close <id>`                             | `gh pr close <id>`                                                                          | `glab mr close <id>`                                        | exact                                |
+| `pr checks <id>`                            | `gh pr checks <id> --json …` plus `--required` for gating                                   | `glab mr view -F json` + `glab api .../pipelines/<id>/jobs` | emulated on GitLab                   |
+| `pr wait-checks <id>`                       | poll `gh pr checks` / `gh pr checks --required`                                             | poll structured MR pipeline/jobs snapshot                   | emulated; same envelope              |
+| `issue create`                              | `gh issue create …`                                                                         | `glab issue create …`                                       | exact                                |
+| `issue view <id>`                           | `gh issue view <id> --json …`                                                               | `glab issue view <id> -F json`                              | exact                                |
+| `issue edit <id>`                           | `gh issue edit <id> …`                                                                      | `glab issue update <id> …`                                  | exact                                |
+| `issue comment <id>`                        | `gh issue comment <id> --body …`                                                            | `glab issue note <id> --message …`                          | exact                                |
+| `issue close <id>`                          | `gh issue close <id>`                                                                       | `glab issue close <id>`                                     | exact                                |
+| `issue reopen <id>`                         | `gh issue reopen <id>`                                                                      | `glab issue reopen <id>`                                    | exact                                |
+| `label list`                                | `gh label list --json …`                                                                    | `glab label list --output json`                             | exact                                |
+| `label audit`                               | read labels, compare with caller catalog                                                    | same                                                        | exact                                |
+| `label ensure`                              | `gh label create/edit`                                                                      | `glab label create/edit`                                    | exact (no delete/rename by default)  |
+| `auth status`                               | `gh auth status`                                                                            | `glab auth status`                                          | exact (text → typed)                 |
+| `repo view`                                 | `gh repo view --json …`                                                                     | `glab repo view -F json`                                    | exact                                |
+| `inbox list`                                | `gh search prs/issues --json …`                                                             | `glab api --hostname <host> …`                              | normalized aggregation               |
+| `inbox status`                              | same provider reads as `inbox list`                                                         | same provider reads as `inbox list`                         | bounded counts                       |
+| `inbox next`                                | same provider reads as `inbox list`                                                         | same provider reads as `inbox list`                         | ranked bounded subset                |
+| `activity commits`                          | `gh api search/commits`                                                                     | unsupported in v1                                           | GitHub-only seam                     |
+| `activity events`                           | `gh api users/<login>/events[/public]`                                                      | unsupported in v1                                           | GitHub-only seam                     |
+| `activity feed`                             | `gh api repos/<owner>/<repo>/commits` + repository activity REST                            | `glab api projects/:id/repository/commits` + project events | normalized open vocabulary           |
+| `activity summary`                          | `gh api graphql` contribution query                                                         | unsupported in v1                                           | GitHub-only seam                     |
+| `pr deliver`                                | macro: `pr list` lookup → `pr create` or adopt → `pr wait-checks` → `pr ready` → `pr merge` | same composition with gitlab atoms                          | exact (same macro logic on both)     |
 
 "emulated" means the backend's native command differs in shape, but
 `forge-cli` normalises both into the same `cli.forge-cli.pr.checks.v1`
@@ -348,6 +350,44 @@ backend mapping, validation rules, and output schema versions.
     `error.kind = "checks_timeout"`.
 - Output schema: `cli.forge-cli.pr.checks.v1`,
   `data = { state, required_count, success_count, failed:[…], pending:[…], duration_ms }`.
+
+### `pr review-threads` (read)
+
+- The `pr review-threads <id>` read surface (and the equivalent
+  `pr review-threads list <id>` subcommand) emits
+  `cli.forge-cli.pr.review-threads.v1`. Each thread now carries an
+  `id` handle in addition to its state fields:
+  `data.threads[] = { id, resolved, outdated, author, path, created_at,
+  url, body }`. On GitHub `id` is the `reviewThreads` node id
+  (`PRRT_...`) — the single handle consumed by both write ops below
+  (as `threadId` for resolve and `pullRequestReviewThreadId` for
+  reply). On GitLab `id` is the discussion id. The field is additive;
+  existing consumers are unaffected.
+
+### `pr review-threads resolve` / `pr review-threads reply`
+
+- GitHub-first write surfaces over a single review thread, keyed by the
+  thread `id` from the read surface. GitLab and Local have no
+  GitHub-shaped thread-mutation surface, so both return
+  `provider_unsupported` (`USAGE 64`) before any backend call.
+- `pr review-threads resolve <id> --thread <thread_id>
+  [--note <text> | --note-file <path>]`:
+  - With `--note` / `--note-file`, posts a reply first via
+    `addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId,
+    body })`, then resolves via `resolveReviewThread(input: { threadId
+    })`. Without a note, only resolves.
+  - Idempotent: `resolveReviewThread` succeeds on an already-resolved
+    thread, so resolving twice is success rather than an error.
+  - Output schema: `cli.forge-cli.pr.review-threads.resolve.v1`,
+    `data = { provider, thread_id, resolved, replied }`.
+- `pr review-threads reply <id> --thread <thread_id>
+  --body <text> | --body-file <path>`:
+  - Posts a reply via `addPullRequestReviewThreadReply` only; never
+    resolves the thread.
+  - Output schema: `cli.forge-cli.pr.review-threads.reply.v1`,
+    `data = { provider, thread_id, comment_url }`.
+- The `no_local_path` privacy guard runs over the reply note / body
+  before the backend call, matching `pr comment`.
 
 ### `pr merge`
 

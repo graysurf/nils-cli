@@ -268,7 +268,53 @@ operations:
         url: string
         total: integer
         unresolved: integer
-        threads: list<{resolved, outdated, author, path, created_at, url, body}>
+        threads: list<{id, resolved, outdated, author, path, created_at, url, body}>
+
+  - id: pr.review-threads.resolve
+    schema_version: cli.forge-cli.pr.review-threads.resolve.v1
+    summary: Resolve a review thread, optionally posting a reply first (GitHub-only in v1).
+    inputs:
+      - { name: <id>,        type: integer, required: true }
+      - { name: --thread,    type: string,  required: true }   # thread node id (PRRT_...)
+      - { name: --note,      type: string,  required: false }  # optional reply posted before resolving
+      - { name: --note-file, type: path,    required: false }
+    validations:
+      - no_local_path # optional reply note
+    backends:
+      # With a note: the reply mutation runs first, then resolve. Without a
+      # note: only resolve. resolveReviewThread is idempotent — resolving an
+      # already-resolved thread succeeds rather than erroring.
+      github:
+        - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReviewThreadReply>", -f, "tid={thread}", -f, "body={note_or_file}"] }  # only when --note/--note-file given
+        - { program: gh, argv: [api, graphql, -f, "query=<resolveReviewThread>", -f, "tid={thread}"] }
+      gitlab: unsupported  # no GitHub-shaped thread-mutation surface in v1 → provider_unsupported (USAGE 64)
+      # local: no thread model → provider_unsupported (USAGE 64).
+    output:
+      data:
+        provider: enum<github>
+        thread_id: string
+        resolved: bool
+        replied: bool
+
+  - id: pr.review-threads.reply
+    schema_version: cli.forge-cli.pr.review-threads.reply.v1
+    summary: Reply to a review thread without resolving it (GitHub-only in v1).
+    inputs:
+      - { name: <id>,        type: integer, required: true }
+      - { name: --thread,    type: string,  required: true }   # thread node id (PRRT_...)
+      - { name: --body,      type: string,  required: false }
+      - { name: --body-file, type: path,    required: false }
+    validations:
+      - no_local_path # reply body
+    backends:
+      github: { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReviewThreadReply>", -f, "tid={thread}", -f, "body={body_or_file}"] }
+      gitlab: unsupported  # provider_unsupported (USAGE 64)
+      # local: provider_unsupported (USAGE 64).
+    output:
+      data:
+        provider: enum<github>
+        thread_id: string
+        comment_url: string
 
   - id: pr.tasks
     schema_version: cli.forge-cli.pr.tasks.v1

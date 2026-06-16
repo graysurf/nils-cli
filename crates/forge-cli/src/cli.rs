@@ -410,10 +410,77 @@ pub struct PrReadyArgs {
 
 /// `pr review-threads` arguments. Maps to
 /// `forge-cli-ops-v1.yaml::operations.pr.review-threads` inputs.
+///
+/// Back-compat shape: a bare `pr review-threads <id>` still LISTS (the
+/// positional `id`), while the optional subcommand routes the write surfaces
+/// (`list`, `resolve`, `reply`). `args_conflicts_with_subcommands` lets clap
+/// accept the positional id OR a subcommand without ambiguity.
 #[derive(Args, Debug, Clone)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct PrReviewThreadsArgs {
+    /// Numeric PR / MR id (lists threads when no subcommand is given).
+    pub id: Option<u64>,
+    #[command(subcommand)]
+    pub command: Option<ReviewThreadsCommand>,
+}
+
+/// Resolved list arguments handed to the read op (`pr review-threads` read
+/// surface). The CLI accepts the id either as the bare positional or via the
+/// `list <id>` subcommand; both normalise to this single-field shape.
+#[derive(Debug, Clone)]
+pub struct PrReviewThreadsListArgs {
     /// Numeric PR / MR id.
     pub id: u64,
+}
+
+/// `pr review-threads` subtree: read (`list`) plus the GitHub-first write
+/// surfaces (`resolve`, `reply`).
+#[derive(Subcommand, Debug, Clone)]
+pub enum ReviewThreadsCommand {
+    /// List review threads attached to a PR / MR with their resolved state.
+    List {
+        /// Numeric PR / MR id.
+        id: u64,
+    },
+    /// Resolve a review thread, optionally posting a reply first (GitHub).
+    Resolve(PrReviewThreadResolveArgs),
+    /// Reply to a review thread without resolving it (GitHub).
+    Reply(PrReviewThreadReplyArgs),
+}
+
+/// `pr review-threads resolve` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.review-threads.resolve` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewThreadResolveArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+    /// Thread node id to resolve (GitHub `PRRT_...`).
+    #[arg(long, value_name = "THREAD_ID")]
+    pub thread: String,
+    /// Optional reply body posted before resolving. Mutually exclusive with
+    /// `--note-file`.
+    #[arg(long, conflicts_with = "note_file")]
+    pub note: Option<String>,
+    /// Read the optional reply body from a file. Use `-` for stdin.
+    #[arg(long = "note-file", value_name = "PATH")]
+    pub note_file: Option<String>,
+}
+
+/// `pr review-threads reply` arguments. Maps to
+/// `forge-cli-ops-v1.yaml::operations.pr.review-threads.reply` inputs.
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewThreadReplyArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+    /// Thread node id to reply to (GitHub `PRRT_...`).
+    #[arg(long, value_name = "THREAD_ID")]
+    pub thread: String,
+    /// Reply body. Mutually exclusive with `--body-file`.
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read the reply body from a file. Use `-` for stdin.
+    #[arg(long = "body-file", value_name = "PATH")]
+    pub body_file: Option<String>,
 }
 
 /// `pr tasks` arguments. Maps to
@@ -1201,7 +1268,30 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         })) => ops::pr_ready::run(&global, args, format),
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::ReviewThreads(args)),
-        })) => ops::pr_review_threads::run(&global, args, format),
+        })) => match args.command {
+            // `resolve` / `reply` route to the write ops.
+            Some(ReviewThreadsCommand::Resolve(resolve_args)) => {
+                ops::pr_review_thread_resolve::run(&global, resolve_args, format)
+            }
+            Some(ReviewThreadsCommand::Reply(reply_args)) => {
+                ops::pr_review_thread_reply::run(&global, reply_args, format)
+            }
+            // `list <id>` and the bare positional `<id>` both LIST.
+            Some(ReviewThreadsCommand::List { id }) => {
+                ops::pr_review_threads::run(&global, PrReviewThreadsListArgs { id }, format)
+            }
+            None => match args.id {
+                Some(id) => {
+                    ops::pr_review_threads::run(&global, PrReviewThreadsListArgs { id }, format)
+                }
+                None => {
+                    // No positional id and no subcommand: surface the same
+                    // missing-argument error clap would give for `list`.
+                    let _ = <Cli as clap::CommandFactory>::command().print_help();
+                    return exit::USAGE;
+                }
+            },
+        },
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Tasks(args)),
         })) => ops::pr_tasks::run(&global, args, format),
@@ -1491,6 +1581,102 @@ mod tests {
             let result = parse(&argv);
             assert!(result.is_ok(), "pr {sub} should parse, got {result:?}");
         }
+    }
+
+    #[test]
+    fn pr_review_threads_bare_id_lists() {
+        let cli = parse(&["pr", "review-threads", "7"]).expect("bare id parses");
+        match cli.command {
+            Some(Command::Pr(PrArgs {
+                command: Some(PrCommand::ReviewThreads(args)),
+            })) => {
+                assert_eq!(args.id, Some(7));
+                assert!(args.command.is_none(), "bare id must have no subcommand");
+            }
+            other => panic!("expected pr review-threads, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_review_threads_list_subcommand_parses() {
+        let cli = parse(&["pr", "review-threads", "list", "7"]).expect("list subcommand parses");
+        match cli.command {
+            Some(Command::Pr(PrArgs {
+                command:
+                    Some(PrCommand::ReviewThreads(PrReviewThreadsArgs {
+                        command: Some(ReviewThreadsCommand::List { id }),
+                        ..
+                    })),
+            })) => assert_eq!(id, 7),
+            other => panic!("expected review-threads list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_review_threads_resolve_subcommand_parses() {
+        let cli = parse(&["pr", "review-threads", "resolve", "7", "--thread", "PRRT_x"])
+            .expect("resolve subcommand parses");
+        match cli.command {
+            Some(Command::Pr(PrArgs {
+                command:
+                    Some(PrCommand::ReviewThreads(PrReviewThreadsArgs {
+                        command: Some(ReviewThreadsCommand::Resolve(args)),
+                        ..
+                    })),
+            })) => {
+                assert_eq!(args.id, 7);
+                assert_eq!(args.thread, "PRRT_x");
+                assert!(args.note.is_none());
+                assert!(args.note_file.is_none());
+            }
+            other => panic!("expected review-threads resolve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_review_threads_reply_subcommand_parses() {
+        let cli = parse(&[
+            "pr",
+            "review-threads",
+            "reply",
+            "7",
+            "--thread",
+            "PRRT_x",
+            "--body",
+            "ack",
+        ])
+        .expect("reply subcommand parses");
+        match cli.command {
+            Some(Command::Pr(PrArgs {
+                command:
+                    Some(PrCommand::ReviewThreads(PrReviewThreadsArgs {
+                        command: Some(ReviewThreadsCommand::Reply(args)),
+                        ..
+                    })),
+            })) => {
+                assert_eq!(args.id, 7);
+                assert_eq!(args.thread, "PRRT_x");
+                assert_eq!(args.body.as_deref(), Some("ack"));
+            }
+            other => panic!("expected review-threads reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_review_threads_resolve_rejects_note_and_note_file_together() {
+        let result = parse(&[
+            "pr",
+            "review-threads",
+            "resolve",
+            "7",
+            "--thread",
+            "PRRT_x",
+            "--note",
+            "inline",
+            "--note-file",
+            "-",
+        ]);
+        assert!(result.is_err(), "--note + --note-file must conflict");
     }
 
     #[test]
