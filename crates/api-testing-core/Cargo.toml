@@ -14,9 +14,9 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 base64 = "0.22"
 clap = { workspace = true }
-jaq-core = "3.0.0-gamma"
-jaq-json = { version = "2.0.0-gamma", features = ["serde"] }
-jaq-std = "3.0.0-gamma"
+jaq-core = "3.1.0"
+jaq-json = { version = "2.0.1", features = ["serde"] }
+jaq-std = "3.0.1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "multipart", "rustls"] }
 shell-words = "1"
 serde = { workspace = true }
