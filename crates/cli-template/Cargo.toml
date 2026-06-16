@@ -1,6 +1,6 @@
 [package]
 name = "nils-cli-template"
-version = "1.9.0"
+version = "1.9.1"
 edition.workspace = true
 license.workspace = true
 
@@ -12,14 +12,14 @@ name = "cli-template"
 path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
-nils-build-info = { version = "1.9.0", path = "../nils-build-info" }
-nils-common = { version = "1.9.0", path = "../nils-common", package = "nils-common" }
-nils-term = { version = "1.9.0", path = "../nils-term", package = "nils-term" }
+nils-build-info = { version = "1.9.1", path = "../nils-build-info" }
+nils-common = { version = "1.9.1", path = "../nils-common", package = "nils-common" }
+nils-term = { version = "1.9.1", path = "../nils-term", package = "nils-term" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "1.9.0", path = "../nils-test-support" }
+nils-test-support = { version = "1.9.1", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
