@@ -411,22 +411,19 @@ pub struct PrReadyArgs {
 /// `pr review-threads` arguments. Maps to
 /// `forge-cli-ops-v1.yaml::operations.pr.review-threads` inputs.
 ///
-/// Back-compat shape: a bare `pr review-threads <id>` still LISTS (the
-/// positional `id`), while the optional subcommand routes the write surfaces
-/// (`list`, `resolve`, `reply`). `args_conflicts_with_subcommands` lets clap
-/// accept the positional id OR a subcommand without ambiguity.
+/// `pr review-threads` is a clean subcommand group: `list <id>` reads, while
+/// `resolve` / `reply` are the GitHub-first write surfaces. A subcommand is
+/// required — there is no bare positional, so clap's zsh completion routes the
+/// subcommand at `$line[1]` (the workspace completion-parity audit assumes a
+/// clean group; a leading positional would shift it to `$line[2]`).
 #[derive(Args, Debug, Clone)]
-#[command(args_conflicts_with_subcommands = true)]
 pub struct PrReviewThreadsArgs {
-    /// Numeric PR / MR id (lists threads when no subcommand is given).
-    pub id: Option<u64>,
     #[command(subcommand)]
-    pub command: Option<ReviewThreadsCommand>,
+    pub command: ReviewThreadsCommand,
 }
 
-/// Resolved list arguments handed to the read op (`pr review-threads` read
-/// surface). The CLI accepts the id either as the bare positional or via the
-/// `list <id>` subcommand; both normalise to this single-field shape.
+/// Resolved list arguments handed to the read op (`pr review-threads list`
+/// read surface).
 #[derive(Debug, Clone)]
 pub struct PrReviewThreadsListArgs {
     /// Numeric PR / MR id.
@@ -1269,28 +1266,17 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::ReviewThreads(args)),
         })) => match args.command {
-            // `resolve` / `reply` route to the write ops.
-            Some(ReviewThreadsCommand::Resolve(resolve_args)) => {
+            // `resolve` / `reply` route to the GitHub-first write ops.
+            ReviewThreadsCommand::Resolve(resolve_args) => {
                 ops::pr_review_thread_resolve::run(&global, resolve_args, format)
             }
-            Some(ReviewThreadsCommand::Reply(reply_args)) => {
+            ReviewThreadsCommand::Reply(reply_args) => {
                 ops::pr_review_thread_reply::run(&global, reply_args, format)
             }
-            // `list <id>` and the bare positional `<id>` both LIST.
-            Some(ReviewThreadsCommand::List { id }) => {
+            // `list <id>` reads.
+            ReviewThreadsCommand::List { id } => {
                 ops::pr_review_threads::run(&global, PrReviewThreadsListArgs { id }, format)
             }
-            None => match args.id {
-                Some(id) => {
-                    ops::pr_review_threads::run(&global, PrReviewThreadsListArgs { id }, format)
-                }
-                None => {
-                    // No positional id and no subcommand: surface the same
-                    // missing-argument error clap would give for `list`.
-                    let _ = <Cli as clap::CommandFactory>::command().print_help();
-                    return exit::USAGE;
-                }
-            },
         },
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Tasks(args)),
@@ -1568,8 +1554,11 @@ mod tests {
             let mut argv = vec!["pr", sub];
             match sub {
                 "view" | "checks" | "wait-checks" => argv.push("1"),
-                "edit" | "comment" | "comments" | "ready" | "review-threads" | "tasks"
-                | "merge" | "close" => argv.push("1"),
+                // `review-threads` is a clean subcommand group: list via `list <id>`.
+                "review-threads" => argv.extend(["list", "1"]),
+                "edit" | "comment" | "comments" | "ready" | "tasks" | "merge" | "close" => {
+                    argv.push("1")
+                }
                 "create" => {
                     argv.extend(["--title", "demo", "--kind", "feature", "--body", "x"]);
                 }
@@ -1584,17 +1573,14 @@ mod tests {
     }
 
     #[test]
-    fn pr_review_threads_bare_id_lists() {
-        let cli = parse(&["pr", "review-threads", "7"]).expect("bare id parses");
-        match cli.command {
-            Some(Command::Pr(PrArgs {
-                command: Some(PrCommand::ReviewThreads(args)),
-            })) => {
-                assert_eq!(args.id, Some(7));
-                assert!(args.command.is_none(), "bare id must have no subcommand");
-            }
-            other => panic!("expected pr review-threads, got {other:?}"),
-        }
+    fn pr_review_threads_bare_id_is_rejected() {
+        // `review-threads` is a clean subcommand group: a bare positional id is
+        // no longer accepted (it would shift the zsh subcommand to $line[2] and
+        // break the workspace completion-parity audit). Use `list <id>`.
+        assert!(
+            parse(&["pr", "review-threads", "7"]).is_err(),
+            "bare `review-threads <id>` must be rejected; use `list <id>`",
+        );
     }
 
     #[test]
@@ -1604,8 +1590,7 @@ mod tests {
             Some(Command::Pr(PrArgs {
                 command:
                     Some(PrCommand::ReviewThreads(PrReviewThreadsArgs {
-                        command: Some(ReviewThreadsCommand::List { id }),
-                        ..
+                        command: ReviewThreadsCommand::List { id },
                     })),
             })) => assert_eq!(id, 7),
             other => panic!("expected review-threads list, got {other:?}"),
@@ -1620,8 +1605,7 @@ mod tests {
             Some(Command::Pr(PrArgs {
                 command:
                     Some(PrCommand::ReviewThreads(PrReviewThreadsArgs {
-                        command: Some(ReviewThreadsCommand::Resolve(args)),
-                        ..
+                        command: ReviewThreadsCommand::Resolve(args),
                     })),
             })) => {
                 assert_eq!(args.id, 7);
@@ -1650,8 +1634,7 @@ mod tests {
             Some(Command::Pr(PrArgs {
                 command:
                     Some(PrCommand::ReviewThreads(PrReviewThreadsArgs {
-                        command: Some(ReviewThreadsCommand::Reply(args)),
-                        ..
+                        command: ReviewThreadsCommand::Reply(args),
                     })),
             })) => {
                 assert_eq!(args.id, 7);

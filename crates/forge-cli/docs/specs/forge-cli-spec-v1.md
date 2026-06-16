@@ -110,7 +110,7 @@ Parity matrix (v1):
 | `pr edit <id>`                              | `gh pr edit <id> …`                                                                         | `glab mr update <id> …`                                     | exact                                |
 | `pr comment <id>`                           | `gh pr comment <id> --body …`                                                               | `glab mr note <id> --message …`                             | exact                                |
 | `pr ready <id>`                             | `gh pr ready <id>`                                                                          | `glab mr update <id> --ready`                               | exact                                |
-| `pr review-threads <id>`                    | `gh api graphql` (`reviewThreads` connection)                                               | `glab api …/merge_requests/<iid>/discussions`               | normalized thread state              |
+| `pr review-threads list <id>`               | `gh api graphql` (`reviewThreads` connection)                                               | `glab api …/merge_requests/<iid>/discussions`               | normalized thread state              |
 | `pr review-threads resolve <id> --thread …` | `gh api graphql` (`addPullRequestReviewThreadReply` then `resolveReviewThread`)             | unsupported in v1                                           | GitHub-only seam                     |
 | `pr review-threads reply <id> --thread …`   | `gh api graphql` (`addPullRequestReviewThreadReply`)                                        | unsupported in v1                                           | GitHub-only seam                     |
 | `pr tasks <id>`                             | `gh pr view <id> --json number,url,body`                                                    | `glab mr view <id> -F json` (`description`)                 | normalized task-list state           |
@@ -353,8 +353,7 @@ backend mapping, validation rules, and output schema versions.
 
 ### `pr review-threads` (read)
 
-- The `pr review-threads <id>` read surface (and the equivalent
-  `pr review-threads list <id>` subcommand) emits
+- The `pr review-threads list <id>` read surface emits
   `cli.forge-cli.pr.review-threads.v1`. Each thread now carries an
   `id` handle in addition to its state fields:
   `data.threads[] = { id, resolved, outdated, author, path, created_at,
