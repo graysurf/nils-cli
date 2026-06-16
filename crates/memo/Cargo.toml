@@ -22,7 +22,7 @@ clap_complete = { workspace = true }
 nils-build-info = { version = "1.9.1", path = "../nils-build-info" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
-rusqlite = { version = "0.40.0", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 nils-common = { version = "1.9.1", path = "../nils-common", package = "nils-common" }
