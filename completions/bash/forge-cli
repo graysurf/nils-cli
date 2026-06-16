@@ -3487,7 +3487,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__review__threads)
-            opts="-h --format --remote --provider --repo --store-root --dry-run --help [ID] list resolve reply help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help list resolve reply help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

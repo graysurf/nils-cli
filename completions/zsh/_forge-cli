@@ -188,17 +188,16 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-'::id -- Numeric PR / MR id (lists threads when no subcommand is given):_default' \
 ":: :_forge-cli__subcmd__pr__subcmd__review-threads_commands" \
 "*::: :->review-threads" \
 && ret=0
 
     case $state in
     (review-threads)
-        words=($line[2] "${words[@]}")
+        words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:forge-cli-pr-review-threads-command-$line[2]:"
-        case $line[2] in
+        curcontext="${curcontext%:*:*}:forge-cli-pr-review-threads-command-$line[1]:"
+        case $line[1] in
             (list)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
