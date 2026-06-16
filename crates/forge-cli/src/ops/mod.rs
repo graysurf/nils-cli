@@ -24,6 +24,8 @@ pub mod pr_edit;
 pub mod pr_list;
 pub mod pr_merge;
 pub mod pr_ready;
+pub mod pr_review_thread_reply;
+pub mod pr_review_thread_resolve;
 pub mod pr_review_threads;
 pub mod pr_state;
 pub mod pr_tasks;

@@ -141,7 +141,7 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     BackendCall::new(program, argv)
 }
 
-fn read_body(inline: Option<&str>, file: Option<&str>) -> Result<String, ForgeError> {
+pub(crate) fn read_body(inline: Option<&str>, file: Option<&str>) -> Result<String, ForgeError> {
     if let Some(s) = inline {
         return Ok(s.to_string());
     }

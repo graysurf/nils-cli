@@ -22,7 +22,7 @@ use serde::Serialize;
 use crate::backend::{
     BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload, ProcessRunner,
 };
-use crate::cli::{BINARY, GlobalFlags, PrReviewThreadsArgs};
+use crate::cli::{BINARY, GlobalFlags, PrReviewThreadsListArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_comments::{
@@ -38,11 +38,15 @@ const SCHEMA_VERSION: u32 = 1;
 /// GitHub exposes thread resolution only through GraphQL. `first: 100` is far
 /// beyond practical thread counts for a single PR; the merge gate fails
 /// closed on what one page returns.
-const GITHUB_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { reviewThreads(first: 100) { nodes { isResolved isOutdated path comments(first: 1) { nodes { author { login } body createdAt url } } } } } } }";
+const GITHUB_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { reviewThreads(first: 100) { nodes { id isResolved isOutdated path comments(first: 1) { nodes { author { login } body createdAt url } } } } } } }";
 
 /// One review thread, normalized across providers.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PrReviewThreadSummary {
+    /// Provider thread handle. GitHub: the `reviewThreads` node `id`
+    /// (`PRRT_...`), used as both `threadId` for resolve and
+    /// `pullRequestReviewThreadId` for reply. GitLab: the discussion id.
+    pub id: String,
     pub resolved: bool,
     /// GitHub `isOutdated` (the anchored diff hunk changed); always false on
     /// GitLab. Outdated-but-unresolved threads still count as unresolved.
@@ -69,7 +73,7 @@ pub struct PrReviewThreadsPayload {
 
 pub fn run(
     global: &GlobalFlags,
-    args: PrReviewThreadsArgs,
+    args: PrReviewThreadsListArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
     if global.is_local() {
@@ -83,7 +87,7 @@ pub fn run(
 pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     runner: &R,
     global: &GlobalFlags,
-    args: PrReviewThreadsArgs,
+    args: PrReviewThreadsListArgs,
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
@@ -297,6 +301,11 @@ fn parse_github_threads(output: &BackendSuccess) -> Result<Vec<PrReviewThreadSum
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         out.push(PrReviewThreadSummary {
+            id: node
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             resolved: node
                 .get("isResolved")
                 .and_then(|v| v.as_bool())
@@ -372,7 +381,15 @@ fn parse_gitlab_discussions(
                 .and_then(|v| v.as_u64())
                 .map(|n| n.to_string())
                 .unwrap_or_default();
+            // The thread handle is the discussion id (a string on GitLab), not
+            // the per-note id used to anchor the URL fragment below.
+            let discussion_id = discussion
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             out.push(PrReviewThreadSummary {
+                id: discussion_id,
                 resolved,
                 outdated: false,
                 author: first
@@ -560,6 +577,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_github_threads_populates_thread_node_id() {
+        let output = BackendSuccess {
+            stdout: r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"PRRT_kwDOExample1","isResolved":false,"isOutdated":false,"path":"src/lib.rs","comments":{"nodes":[{"author":{"login":"quality-bot"},"body":"finding","createdAt":"t","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}]}}]}}}}}"#
+                .into(),
+            stderr: String::new(),
+        };
+        let threads = parse_github_threads(&output).expect("parse");
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "PRRT_kwDOExample1");
+    }
+
+    #[test]
     fn parse_github_threads_extracts_state_author_and_path() {
         let output = BackendSuccess {
             stdout: github_threads_json(&[
@@ -610,6 +639,9 @@ mod tests {
         assert!(!threads[0].resolved);
         assert_eq!(threads[0].author, "quality-bot");
         assert_eq!(threads[0].path, "src/lib.rs");
+        // The thread handle is the discussion id, not the per-note id.
+        assert_eq!(threads[0].id, "d2");
+        assert_eq!(threads[1].id, "d3");
         assert_eq!(
             threads[0].url,
             "https://gitlab.example.com/group/project/-/merge_requests/9#note_21"
@@ -688,7 +720,7 @@ mod tests {
             stderr: String::new(),
         };
         let runner = ScriptedRunner::new(vec![view, threads]);
-        let args = PrReviewThreadsArgs { id: 7 };
+        let args = PrReviewThreadsListArgs { id: 7 };
         let code = run_with(&runner, &json_global(), args, OutputFormat::Json, |_| {
             Some("git@github.com:acme/widgets.git".into())
         })
@@ -708,7 +740,7 @@ mod tests {
         let runner = ScriptedRunner::new(vec![view]);
         let mut global = json_global();
         global.dry_run = true;
-        let args = PrReviewThreadsArgs { id: 7 };
+        let args = PrReviewThreadsListArgs { id: 7 };
         let code = run_with(&runner, &global, args, OutputFormat::Json, |_| {
             Some("git@github.com:acme/widgets.git".into())
         })
