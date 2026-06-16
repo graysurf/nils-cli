@@ -56,6 +56,7 @@ fn auth_save_errors_when_secret_dir_missing() {
     );
     assert_eq!(output.code, 1);
     assert!(stderr(&output).contains("CODEX_SECRET_DIR is not configured"));
+    assert!(stderr(&output).contains("export CODEX_SECRET_DIR=\"$HOME/.config/codex_secrets\""));
 }
 
 #[test]
@@ -76,6 +77,7 @@ fn auth_save_keeps_env_only_contract_even_if_home_secret_dir_exists() {
 
     assert_eq!(output.code, 1);
     assert!(stderr(&output).contains("CODEX_SECRET_DIR is not configured"));
+    assert!(stderr(&output).contains("mkdir -p \"$CODEX_SECRET_DIR\" && chmod 700"));
     assert!(
         !fallback_secret_dir.join("alpha.json").exists(),
         "save must not use HOME fallback when CODEX_SECRET_DIR is empty"

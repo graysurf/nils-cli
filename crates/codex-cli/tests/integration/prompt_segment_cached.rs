@@ -258,6 +258,36 @@ fn prompt_segment_cached_output_formats_and_supports_no_5h() {
 }
 
 #[test]
+fn prompt_segment_zsh_escape_mode_doubles_prompt_percent_tokens() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
+
+    let fetched_at = now_epoch().saturating_sub(1).max(1);
+    write_prompt_segment_cache_kv(
+        &cache_root,
+        "alpha",
+        &format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=94\nweekly_remaining=88\nweekly_reset_epoch=1700600000\n"
+        ),
+    );
+
+    let output = run(
+        &["prompt-segment", "--time-format", "%Y-%m-%dT%H:%MZ"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_PROMPT_SEGMENT_ENABLED", "true"),
+            ("CODEX_PROMPT_SEGMENT_ZSH_ESCAPE_ENABLED", "true"),
+        ],
+    );
+    assert_exit(&output, 0);
+    assert_eq!(stdout(&output), "alpha 5h:94%% W:88%% 2023-11-21T20:53Z\n");
+}
+
+#[test]
 fn prompt_segment_status_json_reports_current_render_readiness() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);

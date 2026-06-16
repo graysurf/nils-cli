@@ -66,6 +66,7 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
             && let Some(line) = render::render_line(&entry, &prefix, show_5h, time_format)
             && !line.trim().is_empty()
         {
+            let line = apply_prompt_escape(line);
             println!("{line}");
         }
         return 0;
@@ -79,6 +80,7 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
             line.push_str(&stale_suffix);
         }
         if !line.trim().is_empty() {
+            let line = apply_prompt_escape(line);
             println!("{line}");
         }
     }
@@ -127,6 +129,17 @@ pub fn status(output_json: bool) -> i32 {
 
 fn prompt_segment_enabled() -> bool {
     shared_env::env_truthy("CODEX_PROMPT_SEGMENT_ENABLED")
+}
+
+fn apply_prompt_escape(line: String) -> String {
+    if shared_env::env_truthy("CODEX_PROMPT_SEGMENT_ZSH_ESCAPE_ENABLED") {
+        return escape_zsh_prompt_percent(&line);
+    }
+    line
+}
+
+fn escape_zsh_prompt_percent(line: &str) -> String {
+    line.replace('%', "%%")
 }
 
 fn resolve_ttl_seconds(cli_ttl: Option<&str>) -> Result<u64, ()> {

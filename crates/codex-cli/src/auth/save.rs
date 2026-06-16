@@ -46,6 +46,7 @@ pub fn run_with_json(target: &str, yes: bool, output_json: bool) -> Result<i32> 
                 )?;
             } else {
                 eprintln!("codex-save: CODEX_SECRET_DIR is not configured");
+                print_secret_dir_setup_hint("codex-save");
             }
             return Ok(1);
         }
@@ -69,6 +70,7 @@ pub fn run_with_json(target: &str, yes: bool, output_json: bool) -> Result<i32> 
                 "codex-save: CODEX_SECRET_DIR not found: {}",
                 secret_dir.display()
             );
+            print_secret_dir_setup_hint("codex-save");
         }
         return Ok(1);
     }
@@ -231,6 +233,11 @@ fn usage_error(output_json: bool, message: &str) -> Result<i32> {
 
 fn interactive_io_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn print_secret_dir_setup_hint(prefix: &str) {
+    eprintln!("{prefix}: hint: export CODEX_SECRET_DIR=\"$HOME/.config/codex_secrets\"");
+    eprintln!("{prefix}: hint: mkdir -p \"$CODEX_SECRET_DIR\" && chmod 700 \"$CODEX_SECRET_DIR\"");
 }
 
 fn confirm_overwrite(target: &Path) -> Result<bool> {

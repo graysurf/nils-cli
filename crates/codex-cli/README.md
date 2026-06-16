@@ -126,6 +126,8 @@ Auth examples:
 - `CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED`: default `diag rate-limits` to `--all` when no target is provided (default: `false`).
 - `CODEX_PROMPT_SEGMENT_ENABLED`: enable prompt-segment output (default: `false`; set `true` to enable).
 - `CODEX_PROMPT_SEGMENT_TTL`: prompt-segment cache TTL override (default: `3m`; supports `s|m|h|d|w` suffixes or raw seconds).
+- `CODEX_PROMPT_SEGMENT_ZSH_ESCAPE_ENABLED`: escape `%` as `%%` for zsh prompt expansion when a Starship adapter embeds output in `PROMPT`
+  (default: `false`; set `true` only for zsh prompt adapters).
 - `CODEX_AUTO_REFRESH_ENABLED`: enable `auth auto-refresh` behavior where applicable (default: `false`).
 - `CODEX_AUTO_REFRESH_MIN_DAYS`: `auth auto-refresh` minimum token age threshold (default: `5`).
 
