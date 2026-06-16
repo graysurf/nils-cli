@@ -258,8 +258,11 @@ operations:
     summary: List review threads attached to a PR/MR with their resolved state.
     inputs:
       - { name: <id>, type: integer, required: true }
+    dry_run:
+      offline: true
+      repo_resolution: "--repo owner/name or recognised forge remote"
     backends:
-      github: { program: gh,   argv: [api, graphql, -f, "query=<reviewThreads query>", -f, "owner={owner}", -f, "name={name}", -F, "pr={id}"] }
+      github: { program: gh,   argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<reviewThreads query>", -f, "owner={owner}", -f, "name={name}", -F, "pr={id}"] }
       gitlab: { program: glab, argv: [api, --paginate, --hostname, "{host}", "projects/{project}/merge_requests/{id}/discussions?per_page=100"] }
       # local: no review-thread model; returns an empty thread list.
     output:
@@ -280,13 +283,14 @@ operations:
       - { name: --note-file, type: path,    required: false }
     validations:
       - no_local_path # optional reply note
+      - review_thread_pr_mismatch # live GitHub only: --thread must belong to <id> before mutation
     backends:
       # With a note: the reply mutation runs first, then resolve. Without a
       # note: only resolve. resolveReviewThread is idempotent — resolving an
       # already-resolved thread succeeds rather than erroring.
       github:
-        - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReviewThreadReply>", -f, "tid={thread}", -f, "body={note_or_file}"] }  # only when --note/--note-file given
-        - { program: gh, argv: [api, graphql, -f, "query=<resolveReviewThread>", -f, "tid={thread}"] }
+        - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<addPullRequestReviewThreadReply>", -f, "tid={thread}", -f, "body={note_or_file}"] }  # only when --note/--note-file given
+        - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<resolveReviewThread>", -f, "tid={thread}"] }
       gitlab: unsupported  # no GitHub-shaped thread-mutation surface in v1 → provider_unsupported (USAGE 64)
       # local: no thread model → provider_unsupported (USAGE 64).
     output:
@@ -306,8 +310,9 @@ operations:
       - { name: --body-file, type: path,    required: false }
     validations:
       - no_local_path # reply body
+      - review_thread_pr_mismatch # live GitHub only: --thread must belong to <id> before mutation
     backends:
-      github: { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReviewThreadReply>", -f, "tid={thread}", -f, "body={body_or_file}"] }
+      github: { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<addPullRequestReviewThreadReply>", -f, "tid={thread}", -f, "body={body_or_file}"] }
       gitlab: unsupported  # provider_unsupported (USAGE 64)
       # local: provider_unsupported (USAGE 64).
     output:

@@ -362,6 +362,11 @@ backend mapping, validation rules, and output schema versions.
   (as `threadId` for resolve and `pullRequestReviewThreadId` for
   reply). On GitLab `id` is the discussion id. The field is additive;
   existing consumers are unaffected.
+- Text output includes the same thread id on each thread line so terminal users
+  can copy the `--thread` value without switching to JSON.
+- `--dry-run` emits the planned thread-list backend call without running the
+  preliminary PR/MR view lookup or touching the provider network. It resolves
+  the repo/project from `--repo` or the configured remote URL.
 
 ### `pr review-threads resolve` / `pr review-threads reply`
 
@@ -369,6 +374,10 @@ backend mapping, validation rules, and output schema versions.
   thread `id` from the read surface. GitLab and Local have no
   GitHub-shaped thread-mutation surface, so both return
   `provider_unsupported` (`USAGE 64`) before any backend call.
+- Live GitHub writes first verify that `--thread <thread_id>` belongs to the
+  positional PR id. A mismatch fails with
+  `review_thread_pr_mismatch` (`DATA 65`) before any reply or resolve mutation.
+  `--dry-run` remains offline and does not perform this validation lookup.
 - `pr review-threads resolve <id> --thread <thread_id>
   [--note <text> | --note-file <path>]`:
   - With `--note` / `--note-file`, posts a reply first via
@@ -559,6 +568,11 @@ backend implementations cannot diverge.
     payload as `unchecked_tasks_override_reason`. Providers without a
     body model (local) pass trivially. The error `detail` lists each
     unchecked item (line number, text).
+14. **Review-thread write ownership.** `pr review-threads reply` and
+    `pr review-threads resolve` verify live GitHub writes by fetching the
+    positional PR's review threads and confirming `--thread <id>` is present
+    before posting a reply or resolving. `--dry-run` remains offline and skips
+    this lookup.
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 
@@ -580,6 +594,7 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `local_path_present`        | 11                |
 | `unresolved_review_threads` | 12                |
 | `unchecked_task_items`      | 13                |
+| `review_thread_pr_mismatch` | 14                |
 
 ## Activity output contract
 

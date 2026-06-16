@@ -86,6 +86,10 @@ const LOCKDOWN_DATA_KINDS: &[&str] = &[
     "checks_pending",
     "merge_method_unsupported",
     "keep_branch_conflict",
+    "local_path_present",
+    "unresolved_review_threads",
+    "unchecked_task_items",
+    "review_thread_pr_mismatch",
 ];
 
 #[test]
