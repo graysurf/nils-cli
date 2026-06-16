@@ -23,6 +23,7 @@ use crate::cli::{BINARY, GlobalFlags, PrReviewThreadResolveArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_comment::read_body;
+use crate::ops::pr_review_threads;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::no_local_path;
 
@@ -105,6 +106,8 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
+    pr_review_threads::ensure_thread_belongs_to_pr(runner, &ctx, args.id, &args.thread)?;
+
     let replied = if let Some(call) = &reply_call {
         runner.run(call)?;
         true
@@ -147,34 +150,30 @@ fn ensure_github(ctx: &ProviderContext) -> Result<(), ForgeError> {
 
 pub(crate) fn build_resolve_call(ctx: &ProviderContext, thread_id: &str) -> BackendCall {
     debug_assert!(matches!(ctx.provider, Provider::GitHub));
-    BackendCall::new(
-        BackendProgram::Gh,
-        [
-            OsString::from("api"),
-            OsString::from("graphql"),
-            OsString::from("-f"),
-            OsString::from(format!("query={GITHUB_RESOLVE_MUTATION}")),
-            OsString::from("-f"),
-            OsString::from(format!("tid={thread_id}")),
-        ],
-    )
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_RESOLVE_MUTATION}")),
+        OsString::from("-f"),
+        OsString::from(format!("tid={thread_id}")),
+    ]);
+    BackendCall::new(BackendProgram::Gh, argv)
 }
 
 pub(crate) fn build_reply_call(ctx: &ProviderContext, thread_id: &str, body: &str) -> BackendCall {
     debug_assert!(matches!(ctx.provider, Provider::GitHub));
-    BackendCall::new(
-        BackendProgram::Gh,
-        [
-            OsString::from("api"),
-            OsString::from("graphql"),
-            OsString::from("-f"),
-            OsString::from(format!("query={GITHUB_REPLY_MUTATION}")),
-            OsString::from("-f"),
-            OsString::from(format!("tid={thread_id}")),
-            OsString::from("-f"),
-            OsString::from(format!("body={body}")),
-        ],
-    )
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_REPLY_MUTATION}")),
+        OsString::from("-f"),
+        OsString::from(format!("tid={thread_id}")),
+        OsString::from("-f"),
+        OsString::from(format!("body={body}")),
+    ]);
+    BackendCall::new(BackendProgram::Gh, argv)
 }
 
 fn schema_err() -> String {
@@ -295,6 +294,18 @@ mod tests {
     }
 
     #[test]
+    fn build_resolve_call_adds_hostname_for_enterprise_host() {
+        let mut ctx = ctx(Provider::GitHub);
+        ctx.host = "internal.ghe.com".into();
+        let argv = build_resolve_call(&ctx, "PRRT_abc").plan_argv();
+        let pos = argv
+            .iter()
+            .position(|s| s == "--hostname")
+            .expect("enterprise host must be passed to gh api");
+        assert_eq!(argv[pos + 1], "internal.ghe.com");
+    }
+
+    #[test]
     fn build_reply_call_uses_add_reply_mutation_with_tid_and_body() {
         let call = build_reply_call(&ctx(Provider::GitHub), "PRRT_abc", "ack");
         let argv = call.plan_argv();
@@ -309,11 +320,54 @@ mod tests {
     }
 
     #[test]
-    fn run_with_resolve_only_runs_single_mutation() {
-        let runner = ScriptedRunner::new(vec![BackendSuccess {
-            stdout: r#"{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}"#.into(),
+    fn build_reply_call_adds_hostname_for_enterprise_host() {
+        let mut ctx = ctx(Provider::GitHub);
+        ctx.host = "internal.ghe.com".into();
+        let argv = build_reply_call(&ctx, "PRRT_abc", "ack").plan_argv();
+        let pos = argv
+            .iter()
+            .position(|s| s == "--hostname")
+            .expect("enterprise host must be passed to gh api");
+        assert_eq!(argv[pos + 1], "internal.ghe.com");
+    }
+
+    fn pr_view_json(number: u64) -> BackendSuccess {
+        BackendSuccess {
+            stdout: format!(
+                r#"{{"number":{number},"url":"https://github.com/acme/widgets/pull/{number}","state":"OPEN","isDraft":false,"title":"demo","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}}"#
+            ),
             stderr: String::new(),
-        }]);
+        }
+    }
+
+    fn github_threads_json(ids: &[&str]) -> BackendSuccess {
+        let nodes: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                format!(
+                    r#"{{"id":"{id}","isResolved":false,"isOutdated":false,"path":"src/lib.rs","comments":{{"nodes":[{{"author":{{"login":"reviewer"}},"body":"finding","createdAt":"t","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}}]}}}}"#
+                )
+            })
+            .collect();
+        BackendSuccess {
+            stdout: format!(
+                r#"{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{}]}}}}}}}}}}"#,
+                nodes.join(",")
+            ),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn run_with_resolve_only_runs_single_mutation() {
+        let runner = ScriptedRunner::new(vec![
+            pr_view_json(7),
+            github_threads_json(&["PRRT_abc"]),
+            BackendSuccess {
+                stdout: r#"{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}"#.into(),
+                stderr: String::new(),
+            },
+        ]);
         let code = run_with(
             &runner,
             &global(ProviderFlag::Github, false),
@@ -324,13 +378,42 @@ mod tests {
         .expect("resolve only");
         assert_eq!(code, exit::SUCCESS);
         let calls = runner.calls();
-        assert_eq!(calls.len(), 1, "no note → only the resolve mutation runs");
-        assert!(calls[0].1.iter().any(|s| s.contains("resolveReviewThread")));
+        assert_eq!(
+            calls.len(),
+            3,
+            "view + thread validation run before the resolve mutation"
+        );
+        assert!(calls[2].1.iter().any(|s| s.contains("resolveReviewThread")));
+    }
+
+    #[test]
+    fn run_with_resolve_rejects_thread_from_another_pr_before_mutating() {
+        let runner =
+            ScriptedRunner::new(vec![pr_view_json(7), github_threads_json(&["PRRT_other"])]);
+        let err = run_with(
+            &runner,
+            &global(ProviderFlag::Github, false),
+            args("PRRT_target", None, None),
+            OutputFormat::Json,
+            |_| Some("git@github.com:acme/widgets.git".into()),
+        )
+        .expect_err("thread does not belong to PR");
+        assert_eq!(err.kind(), "review_thread_pr_mismatch");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2, "must only view PR and list its threads");
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, argv)| argv.iter().any(|s| s.contains("resolveReviewThread"))),
+            "resolve mutation must not run when the thread is not on the PR"
+        );
     }
 
     #[test]
     fn run_with_note_replies_before_resolving() {
         let runner = ScriptedRunner::new(vec![
+            pr_view_json(7),
+            github_threads_json(&["PRRT_abc"]),
             BackendSuccess {
                 stdout: r#"{"data":{"addPullRequestReviewThreadReply":{"comment":{"url":"u"}}}}"#
                     .into(),
@@ -351,14 +434,18 @@ mod tests {
         .expect("reply then resolve");
         assert_eq!(code, exit::SUCCESS);
         let calls = runner.calls();
-        assert_eq!(calls.len(), 2, "note → reply then resolve");
+        assert_eq!(
+            calls.len(),
+            4,
+            "view + thread validation run before reply then resolve"
+        );
         assert!(
-            calls[0]
+            calls[2]
                 .1
                 .iter()
                 .any(|s| s.contains("addPullRequestReviewThreadReply"))
         );
-        assert!(calls[1].1.iter().any(|s| s.contains("resolveReviewThread")));
+        assert!(calls[3].1.iter().any(|s| s.contains("resolveReviewThread")));
     }
 
     #[test]

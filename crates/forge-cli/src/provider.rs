@@ -68,6 +68,15 @@ impl ProviderContext {
             argv.push(OsString::from(slug));
         }
     }
+
+    /// Push `gh api --hostname <host>` for GitHub Enterprise hosts. `gh api`
+    /// defaults to github.com unless this flag is present.
+    pub fn push_github_api_hostname(&self, argv: &mut Vec<OsString>) {
+        if matches!(self.provider, Provider::GitHub) && self.host != "github.com" {
+            argv.push(OsString::from("--hostname"));
+            argv.push(OsString::from(&self.host));
+        }
+    }
 }
 
 /// Where the provider decision came from. Useful for diagnostics and tests.

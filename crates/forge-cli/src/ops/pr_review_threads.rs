@@ -95,8 +95,32 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         global.provider_hint(),
         &global.remote,
         global.repo.as_deref(),
-        remote_url_lookup,
+        &remote_url_lookup,
     )?;
+
+    if global.dry_run {
+        if matches!(ctx.provider, Provider::Local) {
+            return Ok(emit_success(
+                schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
+                DryRunPayload {
+                    provider: ctx.provider.as_str(),
+                    plan: Vec::new(),
+                },
+                format,
+                |p| println!("would run: {plan}", plan = p.plan.join(" ")),
+            ));
+        }
+
+        let threads_call =
+            build_threads_dry_run_call(&ctx, &global.remote, args.id, &remote_url_lookup)?;
+        let payload = DryRunPayload::new(ctx.provider, &threads_call);
+        return Ok(emit_success(
+            schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
+            payload,
+            format,
+            |p| println!("would run: {plan}", plan = p.plan.join(" ")),
+        ));
+    }
 
     // Resolve the canonical PR/MR URL first (same pattern as `pr comments`):
     // both providers derive the API path segments from it.
@@ -121,16 +145,6 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     }
 
     let threads_call = build_threads_call(&ctx, &view.url, view.number)?;
-
-    if global.dry_run {
-        let payload = DryRunPayload::new(ctx.provider, &threads_call);
-        return Ok(emit_success(
-            schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
-            payload,
-            format,
-            |p| println!("would run: {plan}", plan = p.plan.join(" ")),
-        ));
-    }
 
     let threads_output = runner.run(&threads_call)?;
     let threads = parse_threads(&ctx, &threads_output, &view.url)?;
@@ -216,21 +230,7 @@ pub(crate) fn build_threads_call(
                     Some(format!("slug={slug}")),
                 )
             })?;
-            Ok(BackendCall::new(
-                BackendProgram::Gh,
-                [
-                    OsString::from("api"),
-                    OsString::from("graphql"),
-                    OsString::from("-f"),
-                    OsString::from(format!("query={GITHUB_THREADS_QUERY}")),
-                    OsString::from("-f"),
-                    OsString::from(format!("owner={owner}")),
-                    OsString::from("-f"),
-                    OsString::from(format!("name={name}")),
-                    OsString::from("-F"),
-                    OsString::from(format!("pr={number}")),
-                ],
-            ))
+            Ok(build_github_threads_call(ctx, owner, name, number))
         }
         Provider::GitLab => {
             let project = gitlab_project_path_from_url(pr_url).ok_or_else(|| {
@@ -264,6 +264,86 @@ pub(crate) fn build_threads_call(
     }
 }
 
+fn build_threads_dry_run_call<F: Fn(&str) -> Option<String>>(
+    ctx: &ProviderContext,
+    remote: &str,
+    number: u64,
+    remote_url_lookup: &F,
+) -> Result<BackendCall, ForgeError> {
+    let slug = resolve_repo_slug(ctx, remote, remote_url_lookup)?;
+    match ctx.provider {
+        Provider::GitHub => {
+            let (owner, name) = slug.split_once('/').ok_or_else(|| {
+                ForgeError::validation(
+                    schema_err(),
+                    "repo_required",
+                    "review-threads dry-run requires a repo slug shaped as owner/name",
+                    Some(format!("repo={slug}")),
+                )
+            })?;
+            Ok(build_github_threads_call(ctx, owner, name, number))
+        }
+        Provider::GitLab => {
+            let encoded = slug.replace('/', "%2F");
+            let path =
+                format!("projects/{encoded}/merge_requests/{number}/discussions?per_page=100");
+            Ok(BackendCall::new(
+                BackendProgram::Glab,
+                [
+                    OsString::from("api"),
+                    OsString::from("--paginate"),
+                    OsString::from("--hostname"),
+                    OsString::from(&ctx.host),
+                    OsString::from(path),
+                ],
+            ))
+        }
+        Provider::Local => unreachable!("local dry-run returns before building a backend call"),
+    }
+}
+
+fn build_github_threads_call(
+    ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_THREADS_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("owner={owner}")),
+        OsString::from("-f"),
+        OsString::from(format!("name={name}")),
+        OsString::from("-F"),
+        OsString::from(format!("pr={number}")),
+    ]);
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn resolve_repo_slug<F: Fn(&str) -> Option<String>>(
+    ctx: &ProviderContext,
+    remote: &str,
+    lookup: &F,
+) -> Result<String, ForgeError> {
+    if let Some(slug) = ctx.repo.clone() {
+        return Ok(slug);
+    }
+    if let Some(url) = lookup(remote)
+        && let Some(parsed) = nils_common::git::parse_git_remote_url(&url)
+    {
+        return Ok(parsed.path);
+    }
+    Err(ForgeError::validation(
+        schema_err(),
+        "repo_required",
+        "review-threads dry-run requires --repo owner/name or a recognised forge remote",
+        None,
+    ))
+}
+
 pub(crate) fn parse_threads(
     ctx: &ProviderContext,
     output: &BackendSuccess,
@@ -273,6 +353,31 @@ pub(crate) fn parse_threads(
         Provider::GitHub | Provider::Local => parse_github_threads(output),
         Provider::GitLab => parse_gitlab_discussions(output, pr_url),
     }
+}
+
+pub(crate) fn ensure_thread_belongs_to_pr<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+    thread_id: &str,
+) -> Result<(), ForgeError> {
+    let view_output = runner.run(&pr_view::build_view_call(ctx, &number.to_string()))?;
+    let view = pr_view::parse_view_output(ctx, &view_output)?;
+    let threads_call = build_threads_call(ctx, &view.url, view.number)?;
+    let threads_output = runner.run(&threads_call)?;
+    let threads = parse_threads(ctx, &threads_output, &view.url)?;
+    if threads.iter().any(|thread| thread.id == thread_id) {
+        return Ok(());
+    }
+    Err(ForgeError::validation(
+        schema_err(),
+        "review_thread_pr_mismatch",
+        format!("review thread {thread_id} does not belong to PR #{number}"),
+        Some(format!(
+            "thread_id={thread_id}; pr={number}; url={url}",
+            url = view.url
+        )),
+    ))
 }
 
 fn parse_github_threads(output: &BackendSuccess) -> Result<Vec<PrReviewThreadSummary>, ForgeError> {
@@ -424,14 +529,20 @@ fn schema_err() -> String {
 }
 
 fn render_text(payload: &PrReviewThreadsPayload) {
-    println!(
+    for line in render_text_lines(payload) {
+        println!("{line}");
+    }
+}
+
+fn render_text_lines(payload: &PrReviewThreadsPayload) -> Vec<String> {
+    let mut lines = vec![format!(
         "{provider} #{number} ({total} review threads, {unresolved} unresolved)\n  {url}",
         provider = payload.provider,
         number = payload.number,
         total = payload.total,
         unresolved = payload.unresolved,
         url = payload.url,
-    );
+    )];
     for thread in &payload.threads {
         let body_first_line = thread.body.lines().next().unwrap_or("");
         let state = if thread.resolved {
@@ -439,17 +550,23 @@ fn render_text(payload: &PrReviewThreadsPayload) {
         } else {
             "UNRESOLVED"
         };
+        let id = if thread.id.is_empty() {
+            String::new()
+        } else {
+            format!(" {id}", id = thread.id)
+        };
         let anchor = if thread.path.is_empty() {
             String::new()
         } else {
             format!(" @ {path}", path = thread.path)
         };
-        println!(
-            "  - [{state}] {author}{anchor}: {body}",
+        lines.push(format!(
+            "  - [{state}]{id} {author}{anchor}: {body}",
             author = thread.author,
             body = body_first_line,
-        );
+        ));
     }
+    lines
 }
 
 #[cfg(test)]
@@ -556,6 +673,24 @@ mod tests {
     }
 
     #[test]
+    fn github_threads_call_adds_hostname_for_enterprise_host() {
+        let mut ctx = ctx(Provider::GitHub);
+        ctx.host = "internal.ghe.com".into();
+        let call = build_threads_call(&ctx, "https://internal.ghe.com/acme/widgets/pull/7", 7)
+            .expect("call");
+        let argv: Vec<String> = call
+            .argv
+            .iter()
+            .map(|os| os.to_string_lossy().into_owned())
+            .collect();
+        let pos = argv
+            .iter()
+            .position(|s| s == "--hostname")
+            .expect("enterprise host must be passed to gh api");
+        assert_eq!(argv[pos + 1], "internal.ghe.com");
+    }
+
+    #[test]
     fn gitlab_threads_call_targets_discussions_from_nested_group_url() {
         let call = build_threads_call(
             &ctx(Provider::GitLab),
@@ -650,6 +785,33 @@ mod tests {
     }
 
     #[test]
+    fn render_text_includes_thread_id_for_follow_up_commands() {
+        let payload = PrReviewThreadsPayload {
+            provider: "github",
+            number: 7,
+            url: "https://github.com/acme/widgets/pull/7".into(),
+            total: 1,
+            unresolved: 1,
+            threads: vec![PrReviewThreadSummary {
+                id: "PRRT_kwDOExample1".into(),
+                resolved: false,
+                outdated: false,
+                author: "reviewer".into(),
+                path: "src/lib.rs".into(),
+                created_at: "t".into(),
+                url: "https://github.com/acme/widgets/pull/7#discussion_r1".into(),
+                body: "finding body\nsecond line".into(),
+            }],
+        };
+
+        let lines = render_text_lines(&payload);
+        assert!(
+            lines.iter().any(|line| line.contains("PRRT_kwDOExample1")),
+            "text output must expose the value accepted by --thread: {lines:?}"
+        );
+    }
+
+    #[test]
     fn ensure_resolves_ok_when_all_threads_resolved() {
         let view = BackendSuccess {
             stdout: github_threads_json(&[(true, "bot", "a.rs"), (true, "bot", "b.rs")]),
@@ -732,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn run_with_dry_run_plans_threads_call_after_view() {
+    fn run_with_dry_run_plans_threads_call_without_backend_calls() {
         let view = BackendSuccess {
             stdout: r#"{"number":7,"url":"https://github.com/acme/widgets/pull/7","state":"OPEN","isDraft":false,"title":"demo","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}"#.into(),
             stderr: String::new(),
@@ -746,7 +908,9 @@ mod tests {
         })
         .expect("run");
         assert_eq!(code, 0);
-        // Only the view call ran; the threads call stayed a plan.
-        assert_eq!(runner.calls().len(), 1);
+        assert!(
+            runner.calls().is_empty(),
+            "dry-run must not invoke pr view or any live backend call"
+        );
     }
 }

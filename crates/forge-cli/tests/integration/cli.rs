@@ -120,6 +120,24 @@ fn pr_help_lists_every_v1_subcommand() {
 }
 
 #[test]
+fn pr_review_threads_missing_subcommand_preserves_json_error_envelope() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(&stub, &["--format", "json", "pr", "review-threads"]);
+    assert_eq!(out.code, 64, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "parse-error");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("subcommand"),
+        "message should explain the missing subcommand: {envelope}"
+    );
+}
+
+#[test]
 fn issue_help_lists_every_v1_subcommand() {
     let stub = StubEnv::new();
     let out = run_forge_cli(&stub, &["issue", "--help"]);

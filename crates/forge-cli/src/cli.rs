@@ -1352,6 +1352,14 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         | Some(Command::Label(LabelArgs { command: None }))
         | Some(Command::Inbox(InboxArgs { command: None }))
         | Some(Command::Search(SearchArgs { command: None })) => {
+            if matches!(format, OutputFormat::Json) {
+                return emit_parse_error(
+                    BINARY,
+                    format,
+                    "parse-error",
+                    "missing required subcommand",
+                );
+            }
             // No subcommand: print help and exit USAGE so callers don't
             // mistake the no-op for success.
             let _ = <Cli as clap::CommandFactory>::command().print_help();
@@ -1378,19 +1386,27 @@ fn parse_or_exit(args: Vec<OsString>) -> Result<Cli, i32> {
         Err(err) => {
             use clap::error::ErrorKind;
             let kind = err.kind();
-            if matches!(
-                kind,
-                ErrorKind::DisplayHelp
-                    | ErrorKind::DisplayVersion
-                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-            ) {
+            let format = detect_format_from_argv(&argv);
+            if matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
                 // Mirror clap's own help/version output to the user's terminal
                 // and exit cleanly.
                 let _ = err.print();
                 return Err(exit::SUCCESS);
             }
+            if matches!(kind, ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand) {
+                if matches!(format, OutputFormat::Json) {
+                    return Err(emit_parse_error(
+                        BINARY,
+                        format,
+                        "parse-error",
+                        "missing required subcommand",
+                    ));
+                }
+                // Text mode keeps clap's help output for interactive use.
+                let _ = err.print();
+                return Err(exit::SUCCESS);
+            }
 
-            let format = detect_format_from_argv(&argv);
             let code = match kind {
                 ErrorKind::InvalidSubcommand
                 | ErrorKind::UnknownArgument
