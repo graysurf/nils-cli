@@ -54,6 +54,7 @@ pub struct AuthAutoRefreshTargetResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthAutoRefreshResult {
+    pub enabled: bool,
     pub refreshed: i64,
     pub skipped: i64,
     pub failed: i64,

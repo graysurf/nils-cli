@@ -349,6 +349,95 @@ fn rate_limits_single_json_outputs_body() {
 }
 
 #[test]
+fn rate_limits_single_401_does_not_refresh_auth_by_default() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    write_secret(&secrets, "alpha.json", Some("tok"));
+
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&cache_root).expect("cache root");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/wham/usage", HttpResponse::new(401, ""));
+
+    let output = run(
+        &["diag", "rate-limits", "--json", "alpha.json"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+        ],
+    );
+    assert_exit(&output, 3);
+    assert!(!stderr(&output).contains("codex-refresh"));
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["error"]["code"], "request-failed");
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("HTTP 401")
+    );
+
+    let requests = server.take_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "GET" && request.path == "/wham/usage")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn rate_limits_single_401_refreshes_auth_when_enabled() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    write_secret(&secrets, "alpha.json", Some("tok"));
+
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&cache_root).expect("cache root");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/wham/usage", HttpResponse::new(401, ""));
+
+    let output = run(
+        &["diag", "rate-limits", "--json", "alpha.json"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_AUTO_REFRESH_ENABLED", "true"),
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+        ],
+    );
+    assert_exit(&output, 3);
+    assert!(stderr(&output).contains("codex-refresh"));
+    assert!(stderr(&output).contains("failed to read refresh token"));
+
+    let requests = server.take_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "GET" && request.path == "/wham/usage")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn rate_limits_all_mode_renders_table() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let secrets = dir.path().join("secrets");

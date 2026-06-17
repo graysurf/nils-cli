@@ -34,6 +34,36 @@ fn assert_exit(output: &CmdOutput, code: i32) {
 }
 
 #[test]
+fn auth_auto_refresh_disabled_by_default_does_not_refresh_due_targets() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let auth_file = dir.path().join("auth.json");
+    let cache = dir.path().join("cache");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&cache).expect("cache dir");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    fs::write(
+        &auth_file,
+        r#"{"tokens":{"access_token":"tok"},"last_refresh":"2025-01-20T12:34:56Z"}"#,
+    )
+    .expect("write auth");
+
+    let output = run(
+        &["auth", "auto-refresh"],
+        &[("CODEX_AUTO_REFRESH_MIN_DAYS", "0")],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_CACHE_DIR", &cache),
+            ("CODEX_SECRET_DIR", &secrets),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    assert!(stdout(&output).contains("disabled"));
+    assert!(!stderr(&output).contains("failed to read refresh token"));
+    assert!(!cache.join("auth.json.timestamp").exists());
+}
+
+#[test]
 fn auth_auto_refresh_invalid_min_days() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let auth_file = dir.path().join("auth.json");
@@ -41,7 +71,10 @@ fn auth_auto_refresh_invalid_min_days() {
 
     let output = run(
         &["auth", "auto-refresh"],
-        &[("CODEX_AUTO_REFRESH_MIN_DAYS", "oops")],
+        &[
+            ("CODEX_AUTO_REFRESH_ENABLED", "true"),
+            ("CODEX_AUTO_REFRESH_MIN_DAYS", "oops"),
+        ],
         &[("CODEX_AUTH_FILE", &auth_file)],
     );
 
@@ -66,7 +99,10 @@ fn auth_auto_refresh_backfills_timestamp() {
 
     let output = run(
         &["auth", "auto-refresh"],
-        &[("CODEX_AUTO_REFRESH_MIN_DAYS", "9999")],
+        &[
+            ("CODEX_AUTO_REFRESH_ENABLED", "true"),
+            ("CODEX_AUTO_REFRESH_MIN_DAYS", "9999"),
+        ],
         &[
             ("CODEX_AUTH_FILE", &auth_file),
             ("CODEX_SECRET_CACHE_DIR", &cache),
@@ -91,7 +127,7 @@ fn auth_auto_refresh_unconfigured_exits_zero() {
 
     let output = run(
         &["auth", "auto-refresh"],
-        &[],
+        &[("CODEX_AUTO_REFRESH_ENABLED", "true")],
         &[
             ("CODEX_AUTH_FILE", &auth_file),
             ("CODEX_SECRET_DIR", &secrets),
@@ -117,7 +153,10 @@ fn auth_auto_refresh_warns_on_future_timestamp_and_skips() {
 
     let output = run(
         &["auth", "auto-refresh"],
-        &[("CODEX_AUTO_REFRESH_MIN_DAYS", "1")],
+        &[
+            ("CODEX_AUTO_REFRESH_ENABLED", "true"),
+            ("CODEX_AUTO_REFRESH_MIN_DAYS", "1"),
+        ],
         &[
             ("CODEX_AUTH_FILE", &auth_file),
             ("CODEX_SECRET_CACHE_DIR", &cache),
@@ -144,7 +183,10 @@ fn auth_auto_refresh_counts_non_file_secret_entry_as_failed() {
 
     let output = run(
         &["auth", "auto-refresh"],
-        &[("CODEX_AUTO_REFRESH_MIN_DAYS", "9999")],
+        &[
+            ("CODEX_AUTO_REFRESH_ENABLED", "true"),
+            ("CODEX_AUTO_REFRESH_MIN_DAYS", "9999"),
+        ],
         &[
             ("CODEX_AUTH_FILE", &auth_file),
             ("CODEX_SECRET_CACHE_DIR", &cache),
@@ -170,7 +212,10 @@ fn auth_auto_refresh_normalizes_fractional_last_refresh() {
 
     let output = run(
         &["auth", "auto-refresh"],
-        &[("CODEX_AUTO_REFRESH_MIN_DAYS", "9999")],
+        &[
+            ("CODEX_AUTO_REFRESH_ENABLED", "true"),
+            ("CODEX_AUTO_REFRESH_MIN_DAYS", "9999"),
+        ],
         &[
             ("CODEX_AUTH_FILE", &auth_file),
             ("CODEX_SECRET_CACHE_DIR", &cache),
