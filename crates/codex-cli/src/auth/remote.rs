@@ -12,12 +12,26 @@ use nils_common::fs;
 const COMMAND_PULL: &str = "auth remote pull";
 
 pub fn pull_with_json(
-    ssh_host: &str,
-    name: &str,
+    ssh_host: Option<&str>,
+    name: Option<&str>,
     access_only: bool,
     write_active: bool,
     output_json: bool,
 ) -> Result<i32> {
+    let Some(ssh_host) = ssh_host else {
+        return usage_error(
+            output_json,
+            "missing-ssh",
+            "codex-remote-pull: --ssh is required",
+        );
+    };
+    let Some(name) = name else {
+        return usage_error(
+            output_json,
+            "missing-name",
+            "codex-remote-pull: --name is required",
+        );
+    };
     if !is_valid_ssh_host(ssh_host) {
         return usage_error(
             output_json,
@@ -113,7 +127,22 @@ pub fn pull_with_json(
         }
     };
 
-    write_active_auth(&auth_file, &imported)?;
+    if let Err(err) = write_active_auth(&auth_file, &imported) {
+        return runtime_error(
+            output_json,
+            err.code(),
+            format!(
+                "codex-remote-pull: failed to write active auth {}: {}",
+                auth_file.display(),
+                err.source()
+            ),
+            Some(serde_json::json!({
+                "auth_file": auth_file.display().to_string(),
+                "phase": err.phase(),
+                "auth_written": err.auth_written(),
+            })),
+        );
+    }
 
     let result = AuthRemotePullResult {
         ssh: ssh_host.to_string(),
@@ -209,13 +238,50 @@ fn runtime_error(
     Ok(1)
 }
 
-fn write_active_auth(auth_file: &Path, value: &Value) -> Result<()> {
-    let output = serde_json::to_vec(value)?;
-    fs::write_atomic(auth_file, &output, fs::SECRET_FILE_MODE)?;
+enum ActiveAuthWriteError {
+    AuthFile(anyhow::Error),
+    Timestamp(anyhow::Error),
+}
+
+impl ActiveAuthWriteError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::AuthFile(_) => "active-auth-write-failed",
+            Self::Timestamp(_) => "active-auth-timestamp-write-failed",
+        }
+    }
+
+    fn phase(&self) -> &'static str {
+        match self {
+            Self::AuthFile(_) => "auth-file",
+            Self::Timestamp(_) => "timestamp",
+        }
+    }
+
+    fn auth_written(&self) -> bool {
+        matches!(self, Self::Timestamp(_))
+    }
+
+    fn source(&self) -> &anyhow::Error {
+        match self {
+            Self::AuthFile(err) | Self::Timestamp(err) => err,
+        }
+    }
+}
+
+fn write_active_auth(
+    auth_file: &Path,
+    value: &Value,
+) -> std::result::Result<(), ActiveAuthWriteError> {
+    let output =
+        serde_json::to_vec(value).map_err(|err| ActiveAuthWriteError::AuthFile(err.into()))?;
+    fs::write_atomic(auth_file, &output, fs::SECRET_FILE_MODE)
+        .map_err(|err| ActiveAuthWriteError::AuthFile(err.into()))?;
 
     if let Some(timestamp_path) = paths::resolve_secret_timestamp_path(auth_file) {
         let last_refresh = json::string_at(value, &["last_refresh"]);
-        fs::write_timestamp(&timestamp_path, last_refresh.as_deref())?;
+        fs::write_timestamp(&timestamp_path, last_refresh.as_deref())
+            .map_err(|err| ActiveAuthWriteError::Timestamp(err.into()))?;
     }
 
     Ok(())

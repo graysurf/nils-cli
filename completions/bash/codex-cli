@@ -598,7 +598,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__auth__help__remote)
-            opts="pull export"
+            opts="pull"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -746,7 +746,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__auth__remote)
-            opts="-h --help pull export help"
+            opts="-h --help pull help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -778,7 +778,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__auth__remote__help)
-            opts="pull export help"
+            opts="pull help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1294,7 +1294,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__help__auth__remote)
-            opts="pull export"
+            opts="pull"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
