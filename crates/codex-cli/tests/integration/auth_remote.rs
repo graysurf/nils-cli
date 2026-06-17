@@ -86,6 +86,15 @@ fn assert_exit(output: &CmdOutput, code: i32) {
     assert_eq!(output.code, code, "stderr: {}", stderr(output));
 }
 
+fn assert_auth_remote_error(output: &CmdOutput, code: &str) -> Value {
+    let payload: Value = serde_json::from_str(&stdout(output)).expect("json error envelope");
+    assert_eq!(payload["schema_version"], "codex-cli.auth.v1");
+    assert_eq!(payload["command"], "auth remote pull");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error"]["code"], code);
+    payload
+}
+
 #[test]
 fn auth_remote_export_access_only_strips_refresh_token() {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -276,4 +285,176 @@ fn auth_remote_pull_rejects_secret_name_shell_metachar() {
 
     assert_exit(&output, 64);
     assert!(stderr(&output).contains("invalid secret name"));
+}
+
+#[test]
+fn auth_remote_pull_json_reports_missing_ssh_flag() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let auth_file = dir.path().join("auth.json");
+
+    let output = run(
+        &[
+            "auth",
+            "remote",
+            "pull",
+            "--format",
+            "json",
+            "--name",
+            "gamania",
+            "--access-only",
+            "--write-active",
+        ],
+        &[("CODEX_AUTH_FILE", &auth_file)],
+        &[],
+    );
+
+    assert_exit(&output, 64);
+    assert_auth_remote_error(&output, "missing-ssh");
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn auth_remote_pull_json_reports_missing_name_flag() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let auth_file = dir.path().join("auth.json");
+
+    let output = run(
+        &[
+            "auth",
+            "remote",
+            "pull",
+            "--format",
+            "json",
+            "--ssh",
+            "g14",
+            "--access-only",
+            "--write-active",
+        ],
+        &[("CODEX_AUTH_FILE", &auth_file)],
+        &[],
+    );
+
+    assert_exit(&output, 64);
+    assert_auth_remote_error(&output, "missing-name");
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn auth_remote_pull_json_reports_active_auth_write_failure() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let stubs = dir.path().join("stubs");
+    fs::create_dir_all(&stubs).expect("stubs dir");
+
+    let auth_parent = dir.path().join("not-a-directory");
+    fs::write(&auth_parent, "occupied").expect("write auth parent file");
+    let auth_file = auth_parent.join("auth.json");
+
+    write_exe(
+        &stubs,
+        "ssh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
+"#,
+    );
+
+    let remote_payload = auth_json(
+        PAYLOAD_ALPHA,
+        "acct_001",
+        "remote_refresh_secret",
+        "2025-01-20T12:34:56Z",
+    );
+    let output = run_with_path_prepend(
+        &[
+            "auth",
+            "remote",
+            "pull",
+            "--ssh",
+            "g14",
+            "--name",
+            "gamania",
+            "--access-only",
+            "--write-active",
+            "--format",
+            "json",
+        ],
+        &[("CODEX_AUTH_FILE", &auth_file)],
+        &[("REMOTE_AUTH_PAYLOAD", &remote_payload)],
+        &stubs,
+    );
+
+    assert_exit(&output, 1);
+    let payload = assert_auth_remote_error(&output, "active-auth-write-failed");
+    assert_eq!(
+        payload["error"]["details"]["auth_file"],
+        auth_file.to_string_lossy().as_ref()
+    );
+    assert_eq!(payload["error"]["details"]["phase"], "auth-file");
+    assert_eq!(payload["error"]["details"]["auth_written"], false);
+    assert!(!stdout(&output).contains("remote_refresh_secret"));
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn auth_remote_pull_json_reports_timestamp_write_failure_after_active_auth_write() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let stubs = dir.path().join("stubs");
+    fs::create_dir_all(&stubs).expect("stubs dir");
+
+    let auth_file = dir.path().join("auth.json");
+    let cache_file = dir.path().join("cache-file");
+    fs::write(&cache_file, "occupied").expect("write cache file");
+
+    write_exe(
+        &stubs,
+        "ssh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
+"#,
+    );
+
+    let remote_payload = auth_json(
+        PAYLOAD_ALPHA,
+        "acct_001",
+        "remote_refresh_secret",
+        "2025-01-20T12:34:56Z",
+    );
+    let output = run_with_path_prepend(
+        &[
+            "auth",
+            "remote",
+            "pull",
+            "--ssh",
+            "g14",
+            "--name",
+            "gamania",
+            "--access-only",
+            "--write-active",
+            "--format",
+            "json",
+        ],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_CACHE_DIR", &cache_file),
+        ],
+        &[("REMOTE_AUTH_PAYLOAD", &remote_payload)],
+        &stubs,
+    );
+
+    assert_exit(&output, 1);
+    let payload = assert_auth_remote_error(&output, "active-auth-timestamp-write-failed");
+    assert_eq!(
+        payload["error"]["details"]["auth_file"],
+        auth_file.to_string_lossy().as_ref()
+    );
+    assert_eq!(payload["error"]["details"]["phase"], "timestamp");
+    assert_eq!(payload["error"]["details"]["auth_written"], true);
+    assert!(!stdout(&output).contains("remote_refresh_secret"));
+    assert!(stderr(&output).is_empty());
+
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(&auth_file).expect("read auth file"))
+            .expect("applied auth json");
+    assert!(applied["tokens"].get("refresh_token").is_none());
 }

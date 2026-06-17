@@ -918,14 +918,8 @@ _codex-cli__subcmd__auth__subcmd__help__subcmd__refresh_commands() {
 _codex-cli__subcmd__auth__subcmd__help__subcmd__remote_commands() {
     local commands; commands=(
 'pull:Pull remote auth over SSH and write it to CODEX_AUTH_FILE' \
-'export:Export remote auth payload for SSH transport' \
     )
     _describe -t commands 'codex-cli auth help remote commands' commands "$@"
-}
-(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__export_commands] )) ||
-_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__export_commands() {
-    local commands; commands=()
-    _describe -t commands 'codex-cli auth help remote export commands' commands "$@"
 }
 (( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__pull_commands] )) ||
 _codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__pull_commands() {
@@ -971,29 +965,17 @@ _codex-cli__subcmd__auth__subcmd__refresh_commands() {
 _codex-cli__subcmd__auth__subcmd__remote_commands() {
     local commands; commands=(
 'pull:Pull remote auth over SSH and write it to CODEX_AUTH_FILE' \
-'export:Export remote auth payload for SSH transport' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'codex-cli auth remote commands' commands "$@"
-}
-(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__export_commands] )) ||
-_codex-cli__subcmd__auth__subcmd__remote__subcmd__export_commands() {
-    local commands; commands=()
-    _describe -t commands 'codex-cli auth remote export commands' commands "$@"
 }
 (( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__help_commands] )) ||
 _codex-cli__subcmd__auth__subcmd__remote__subcmd__help_commands() {
     local commands; commands=(
 'pull:Pull remote auth over SSH and write it to CODEX_AUTH_FILE' \
-'export:Export remote auth payload for SSH transport' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'codex-cli auth remote help commands' commands "$@"
-}
-(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__export_commands] )) ||
-_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__export_commands() {
-    local commands; commands=()
-    _describe -t commands 'codex-cli auth remote help export commands' commands "$@"
 }
 (( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__help_commands] )) ||
 _codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__help_commands() {
@@ -1197,14 +1179,8 @@ _codex-cli__subcmd__help__subcmd__auth__subcmd__refresh_commands() {
 _codex-cli__subcmd__help__subcmd__auth__subcmd__remote_commands() {
     local commands; commands=(
 'pull:Pull remote auth over SSH and write it to CODEX_AUTH_FILE' \
-'export:Export remote auth payload for SSH transport' \
     )
     _describe -t commands 'codex-cli help auth remote commands' commands "$@"
-}
-(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__export_commands] )) ||
-_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__export_commands() {
-    local commands; commands=()
-    _describe -t commands 'codex-cli help auth remote export commands' commands "$@"
 }
 (( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__pull_commands] )) ||
 _codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__pull_commands() {

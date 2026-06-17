@@ -221,10 +221,10 @@ pub enum AuthRemoteCommand {
         output: OutputModeArgs,
         /// SSH host alias for the token authority
         #[arg(long = "ssh", value_name = "host")]
-        ssh: String,
+        ssh: Option<String>,
         /// Remote stored secret name
         #[arg(long = "name", value_name = "name")]
-        name: String,
+        name: Option<String>,
         /// Import access/id/account fields only; never import refresh_token
         #[arg(long = "access-only")]
         access_only: bool,

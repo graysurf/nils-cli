@@ -152,6 +152,31 @@ fn completion_bash_candidates_remain_context_aware() {
         );
     }
 
+    let auth_remote_opts = bash_case_opts(&script, "codex__cli__auth__remote");
+    assert!(
+        contains_token(&auth_remote_opts, "pull"),
+        "missing auth remote pull candidate"
+    );
+    assert!(
+        !contains_token(&auth_remote_opts, "export"),
+        "hidden auth remote export command should not be a bash completion candidate"
+    );
+    for token in [
+        "codex__cli__auth__help__remote,export)",
+        "codex__cli__auth__remote,export)",
+        "codex__cli__auth__remote__help,export)",
+        "codex__cli__help__auth__remote,export)",
+        "codex__cli__auth__help__remote__export)",
+        "codex__cli__auth__remote__export)",
+        "codex__cli__auth__remote__help__export)",
+        "codex__cli__help__auth__remote__export)",
+    ] {
+        assert!(
+            !script.contains(token),
+            "hidden auth remote export command should not appear in bash completion: {token}"
+        );
+    }
+
     let diag_rate_limits_opts = bash_case_opts(&script, "codex__cli__diag__rate__limits");
     for token in [
         "--clear-cache",
@@ -170,6 +195,31 @@ fn completion_bash_candidates_remain_context_aware() {
         assert!(
             !contains_token(&diag_rate_limits_opts, token),
             "unexpected diag token: {token}"
+        );
+    }
+}
+
+#[test]
+fn completion_zsh_omits_hidden_auth_remote_export_command() {
+    let output = run(&["completion", "zsh"]);
+    assert_exit(&output, 0);
+    let script = stdout(&output);
+
+    assert!(
+        script.contains("pull:Pull remote auth over SSH and write it to CODEX_AUTH_FILE"),
+        "missing auth remote pull zsh candidate"
+    );
+    for token in [
+        "export:Export remote auth payload for SSH transport",
+        "_codex-cli__subcmd__auth__subcmd__remote__subcmd__export_commands",
+        "_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__export_commands",
+        "codex-cli auth remote export commands",
+        "codex-cli auth help remote export commands",
+        "codex-cli help auth remote export commands",
+    ] {
+        assert!(
+            !script.contains(token),
+            "hidden auth remote export command should not appear in zsh completion: {token}"
         );
     }
 }
