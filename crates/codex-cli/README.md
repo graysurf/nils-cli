@@ -78,8 +78,8 @@ Auth examples:
 - `codex-cli auth save --yes team-alpha.json`: Force overwrite without prompt.
 - `codex-cli auth remove --yes team-alpha`: Remove `team-alpha.json`.
 - `codex-cli auth status --format json`: Check active auth readiness for automation.
-- `codex-cli auth remote pull --ssh g14 --name gamania --access-only --write-active`: Import g14's current access-only `gamania` auth into
-  the active local auth file.
+- Import auth-host's current access-only `team` auth into the active local auth file:
+  `codex-cli auth remote pull --ssh auth-host --name team --access-only --write-active`
 
 ### diag
 

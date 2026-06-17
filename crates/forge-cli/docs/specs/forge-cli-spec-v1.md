@@ -891,8 +891,8 @@ through `forge-cli` before agent-runtime-kit can adopt the new CLI:
 | `deliver-feature-pr` / `deliver-github-pr`     | `forge-cli pr deliver --kind feature`                   |
 | `deliver-bug-pr`                               | `forge-cli pr deliver --kind bug`                       |
 | `gh-fix-ci`                                    | `forge-cli pr wait-checks` + skill's fix-and-push loop  |
-| `gamania:create-feature-mr` / `-bug-mr`        | `forge-cli pr create` (provider auto-detected gitlab)   |
-| `gamania:close-*-mr` / `deliver-*-mr`          | same as github counterparts                             |
+| `example:create-feature-mr` / `-bug-mr`        | `forge-cli pr create` (provider auto-detected gitlab)   |
+| `example:close-*-mr` / `deliver-*-mr`          | same as github counterparts                             |
 | `issue-lifecycle`                              | `forge-cli issue create|view|edit|comment|close|reopen` |
 | `issue-follow-up`                              | `forge-cli issue create` (+ subsequent comments)        |
 

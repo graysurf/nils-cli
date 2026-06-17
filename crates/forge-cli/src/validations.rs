@@ -1010,10 +1010,10 @@ mod tests {
 
     #[test]
     fn no_local_path_rejects_macos_home_path() {
-        let err = no_local_path("clone into /Users/terry/Project/x", "body").expect_err("macos");
+        let err = no_local_path("clone into /Users/example/Project/x", "body").expect_err("macos");
         assert_eq!(err.kind(), "local_path_present");
         let detail = err.detail().expect("detail present");
-        assert!(!detail.contains("/Users/terry"), "{detail}");
+        assert!(!detail.contains("/Users/example"), "{detail}");
         assert!(detail.contains("use $HOME/Project/x"), "{detail}");
     }
 
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn no_local_path_message_names_the_field() {
-        let err = no_local_path("/Users/terry", "title").expect_err("title field");
+        let err = no_local_path("/Users/example", "title").expect_err("title field");
         assert!(
             err.message().starts_with("title contains"),
             "{}",
@@ -1046,25 +1046,25 @@ mod tests {
 
     #[test]
     fn scan_local_paths_strips_trailing_sentence_punctuation() {
-        let hits = scan_local_paths("the path is /Users/terry/notes.md.");
+        let hits = scan_local_paths("the path is /Users/example/notes.md.");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].sample, "/Users/terry/notes.md");
+        assert_eq!(hits[0].sample, "/Users/example/notes.md");
         assert_eq!(hits[0].suggestion, "$HOME/notes.md");
     }
 
     #[test]
     fn scan_local_paths_stops_tail_at_delimiters() {
         // A backtick-fenced path terminates at the closing delimiter.
-        let hits = scan_local_paths("run `/Users/terry/bin/tool` now");
+        let hits = scan_local_paths("run `/Users/example/bin/tool` now");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].sample, "/Users/terry/bin/tool");
+        assert_eq!(hits[0].sample, "/Users/example/bin/tool");
     }
 
     #[test]
     fn scan_local_paths_owner_only_without_tail() {
-        let hits = scan_local_paths("home is /Users/terry");
+        let hits = scan_local_paths("home is /Users/example");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].sample, "/Users/terry");
+        assert_eq!(hits[0].sample, "/Users/example");
         assert_eq!(hits[0].suggestion, "$HOME");
     }
 
@@ -1075,12 +1075,13 @@ mod tests {
 
     #[test]
     fn scan_local_paths_reports_line_numbers_and_dedups_per_line() {
-        let text = "line one is clean\nsee /Users/terry/a and /Users/terry/a again\n/home/bob/c";
+        let text =
+            "line one is clean\nsee /Users/example/a and /Users/example/a again\n/home/bob/c";
         let hits = scan_local_paths(text);
         // Repeated identical path on line 2 collapses to one; line 3 adds another.
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].line, 2);
-        assert_eq!(hits[0].sample, "/Users/terry/a");
+        assert_eq!(hits[0].sample, "/Users/example/a");
         assert_eq!(hits[1].line, 3);
         assert_eq!(hits[1].sample, "/home/bob/c");
     }

@@ -36,7 +36,7 @@ consistent with the run state.
 
 ## Failure Case To Preserve
 
-- A read-only `plan-archive discover --source-repo /Users/terry/Project/sympoies/nils-cli --format json`
+- A read-only `plan-archive discover --source-repo $HOME/Project/sympoies/nils-cli --format json`
   scan reported `docs/plans/2026-05-31-forge-cli-search/` as:
   - `status`: `blocked`
   - `reason`: `no-provider-refs`

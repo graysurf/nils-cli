@@ -235,7 +235,7 @@ fn repo_retro_active_days_stay_within_committer_window() {
     fs::create_dir_all(&repo).expect("repo dir");
     git(&repo, &["init", "-q"]);
     git(&repo, &["config", "user.name", "Terry"]);
-    git(&repo, &["config", "user.email", "terry@example.com"]);
+    git(&repo, &["config", "user.email", "user@example.com"]);
 
     // Baseline commit squarely inside the window (Asia/Taipei 2026-05-13).
     fs::write(repo.join("a.txt"), "a\n").expect("write a");
@@ -1217,7 +1217,7 @@ fn create_repo_retro_fixture(tmp: &Path) -> std::path::PathBuf {
     fs::create_dir_all(&repo).expect("repo dir");
     git(&repo, &["init", "-q"]);
     git(&repo, &["config", "user.name", "Terry"]);
-    git(&repo, &["config", "user.email", "terry@example.com"]);
+    git(&repo, &["config", "user.email", "user@example.com"]);
     commit_retro_file(
         &repo,
         "src/retro.rs",
@@ -1289,7 +1289,7 @@ fn create_repo_retro_core_policies_fixture(tmp: &Path) -> std::path::PathBuf {
     fs::create_dir_all(&repo).expect("repo dir");
     git(&repo, &["init", "-q"]);
     git(&repo, &["config", "user.name", "Terry"]);
-    git(&repo, &["config", "user.email", "terry@example.com"]);
+    git(&repo, &["config", "user.email", "user@example.com"]);
     commit_retro_file(
         &repo,
         "src/retro.rs",

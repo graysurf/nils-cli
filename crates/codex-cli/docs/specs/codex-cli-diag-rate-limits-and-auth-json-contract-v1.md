@@ -473,8 +473,8 @@ metadata in the JSON envelope.
   "command": "auth remote pull",
   "ok": true,
   "result": {
-    "ssh": "g14",
-    "name": "gamania",
+    "ssh": "auth-host",
+    "name": "team",
     "access_only": true,
     "write_active": true,
     "auth_file": "$HOME/.agents/auth.json",

@@ -60,19 +60,19 @@ fn build() -> Archive {
     fs::create_dir_all(archive.join("evidence")).unwrap();
     fs::write(
         archive.join("config").join("hosts.yaml"),
-        "version: 1\nhosts:\n  gitlab.gamania.com:\n    class: employer\n    employer: Gamania\n  github.com:\n    class: personal\n    primary_identity: graysurf\n",
+        "version: 1\nhosts:\n  gitlab.example.com:\n    class: employer\n    employer: ExampleCo\n  github.com:\n    class: personal\n    primary_identity: graysurf\n",
     )
     .unwrap();
     write_rollup(
         &archive,
-        "gitlab.gamania.com",
+        "gitlab.example.com",
         "gim",
         "svc",
         "20260601T000000Z-a",
     );
     write_rollup(
         &archive,
-        "gitlab.gamania.com",
+        "gitlab.example.com",
         "gim",
         "svc",
         "20260602T000000Z-b",
@@ -201,7 +201,7 @@ fn purge_requires_a_scope() {
     let err = purge::run(&args(&a.archive, vec![], None, false)).unwrap_err();
     assert!(matches!(err, PurgeError::NoScope));
     // Nothing was touched.
-    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert!(a.archive.join("evidence/gitlab.example.com").exists());
     assert!(a.archive.join("evidence/github.com").exists());
 }
 
@@ -209,7 +209,7 @@ fn purge_requires_a_scope() {
 fn purge_dry_run_by_class_scopes_employer_hosts_only() {
     let a = build();
     let report = purge::run(&args(&a.archive, vec![], Some(HostClass::Employer), false)).unwrap();
-    assert_eq!(report.scope_hosts, vec!["gitlab.gamania.com".to_string()]);
+    assert_eq!(report.scope_hosts, vec!["gitlab.example.com".to_string()]);
     assert_eq!(
         report.total_records, 2,
         "two employer-host records in scope"
@@ -217,7 +217,7 @@ fn purge_dry_run_by_class_scopes_employer_hosts_only() {
     assert!(!report.applied);
     assert!(report.archive_commit.is_none());
     // Dry-run deletes nothing.
-    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert!(a.archive.join("evidence/gitlab.example.com").exists());
     assert!(a.archive.join("evidence/github.com").exists());
 }
 
@@ -232,7 +232,7 @@ fn purge_apply_by_host_deletes_only_that_host_and_commits() {
     let report = with_path(&stub, || {
         purge::run(&args(
             &a.archive,
-            vec!["gitlab.gamania.com".to_string()],
+            vec!["gitlab.example.com".to_string()],
             None,
             true,
         ))
@@ -245,7 +245,7 @@ fn purge_apply_by_host_deletes_only_that_host_and_commits() {
 
     // Only the named host tree is gone; the other host is untouched.
     assert!(
-        !a.archive.join("evidence/gitlab.gamania.com").exists(),
+        !a.archive.join("evidence/gitlab.example.com").exists(),
         "purged host tree removed"
     );
     assert!(
@@ -260,7 +260,7 @@ fn purge_apply_by_host_deletes_only_that_host_and_commits() {
     let cat = fs::read_to_string(a.archive.join("catalog.json")).unwrap();
     assert!(cat.contains("github.com"), "survivor is catalogued");
     assert!(
-        !cat.contains("gitlab.gamania.com"),
+        !cat.contains("gitlab.example.com"),
         "purged host no longer catalogued"
     );
 }
@@ -316,7 +316,7 @@ fn purge_rejects_path_like_host() {
         );
     }
     // Real host trees and the external sentinel are untouched.
-    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert!(a.archive.join("evidence/gitlab.example.com").exists());
     assert!(a.archive.join("evidence/github.com").exists());
     assert!(sentinel.exists(), "external sentinel must not be deleted");
 }
@@ -340,7 +340,7 @@ fn purge_apply_refuses_foreign_staged_changes() {
     let err = with_path(&stub, || {
         purge::run(&args(
             &a.archive,
-            vec!["gitlab.gamania.com".to_string()],
+            vec!["gitlab.example.com".to_string()],
             None,
             true,
         ))
@@ -352,7 +352,7 @@ fn purge_apply_refuses_foreign_staged_changes() {
     );
 
     // Nothing deleted, nothing committed.
-    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert!(a.archive.join("evidence/gitlab.example.com").exists());
     assert_eq!(git_count_commits(&a.archive), before);
 }
 
@@ -369,10 +369,10 @@ fn purge_apply_deletes_host_tree_without_rollups() {
     fs::create_dir_all(archive.join("evidence")).unwrap();
     fs::write(
         archive.join("config").join("hosts.yaml"),
-        "version: 1\nhosts:\n  gitlab.gamania.com:\n    class: employer\n    employer: Gamania\n",
+        "version: 1\nhosts:\n  gitlab.example.com:\n    class: employer\n    employer: ExampleCo\n",
     )
     .unwrap();
-    let orphan_dir = archive.join("evidence/gitlab.gamania.com/orphan");
+    let orphan_dir = archive.join("evidence/gitlab.example.com/orphan");
     fs::create_dir_all(&orphan_dir).unwrap();
     fs::write(orphan_dir.join("secret.txt"), "sensitive").unwrap();
     git(&archive, &["init", "-q", "-b", "main"]);
@@ -397,7 +397,7 @@ fn purge_apply_deletes_host_tree_without_rollups() {
         "orphan-only host tree deletion is still committed"
     );
     assert!(
-        !a.archive.join("evidence/gitlab.gamania.com").exists(),
+        !a.archive.join("evidence/gitlab.example.com").exists(),
         "orphaned host tree without rollups is removed"
     );
     assert_eq!(git_count_commits(&a.archive) - before, 1);
@@ -423,7 +423,7 @@ fn purge_apply_rolls_back_on_catalog_failure() {
     let err = with_path(&stub, || {
         purge::run(&args(
             &a.archive,
-            vec!["gitlab.gamania.com".to_string()],
+            vec!["gitlab.example.com".to_string()],
             None,
             true,
         ))
@@ -436,7 +436,7 @@ fn purge_apply_rolls_back_on_catalog_failure() {
 
     // Rolled back: scoped host tree restored, no purge commit.
     assert!(
-        a.archive.join("evidence/gitlab.gamania.com").exists(),
+        a.archive.join("evidence/gitlab.example.com").exists(),
         "scoped host tree deletion rolled back after catalog failure"
     );
     assert_eq!(
@@ -529,7 +529,7 @@ fn purge_apply_noop_when_scoped_host_absent() {
     );
     assert_eq!(git_count_commits(&a.archive), before, "no commit");
     // Existing host trees are untouched.
-    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert!(a.archive.join("evidence/gitlab.example.com").exists());
     assert!(a.archive.join("evidence/github.com").exists());
 }
 
@@ -544,10 +544,10 @@ fn purge_dry_run_flags_host_tree_without_rollups() {
     fs::create_dir_all(archive.join("evidence")).unwrap();
     fs::write(
         archive.join("config").join("hosts.yaml"),
-        "version: 1\nhosts:\n  gitlab.gamania.com:\n    class: employer\n    employer: Gamania\n",
+        "version: 1\nhosts:\n  gitlab.example.com:\n    class: employer\n    employer: ExampleCo\n",
     )
     .unwrap();
-    let orphan_dir = archive.join("evidence/gitlab.gamania.com/orphan");
+    let orphan_dir = archive.join("evidence/gitlab.example.com/orphan");
     fs::create_dir_all(&orphan_dir).unwrap();
     fs::write(orphan_dir.join("secret.txt"), "sensitive").unwrap();
     git(&archive, &["init", "-q", "-b", "main"]);
@@ -564,7 +564,7 @@ fn purge_dry_run_flags_host_tree_without_rollups() {
     let target = report
         .targets
         .iter()
-        .find(|t| t.host == "gitlab.gamania.com")
+        .find(|t| t.host == "gitlab.example.com")
         .expect("scoped host present in report");
     assert_eq!(target.records, 0);
     assert!(
@@ -586,7 +586,7 @@ fn purge_apply_rolls_back_when_commit_fails() {
     let err = with_path(&stub, || {
         purge::run(&args(
             &a.archive,
-            vec!["gitlab.gamania.com".to_string()],
+            vec!["gitlab.example.com".to_string()],
             None,
             true,
         ))
@@ -601,7 +601,7 @@ fn purge_apply_rolls_back_when_commit_fails() {
 
     // Rolled back: scoped host tree restored, no commit, working tree clean.
     assert!(
-        a.archive.join("evidence/gitlab.gamania.com").exists(),
+        a.archive.join("evidence/gitlab.example.com").exists(),
         "deletion rolled back after commit failure"
     );
     assert_eq!(git_count_commits(&a.archive), before, "no purge commit");
@@ -632,7 +632,7 @@ fn purge_apply_refuses_ignored_files_in_scope() {
     // An ignored sidecar under the scoped host (not tracked, not shown by a
     // plain status).
     fs::write(
-        a.archive.join("evidence/gitlab.gamania.com/sidecar.secret"),
+        a.archive.join("evidence/gitlab.example.com/sidecar.secret"),
         "local secret",
     )
     .unwrap();
@@ -640,7 +640,7 @@ fn purge_apply_refuses_ignored_files_in_scope() {
     let err = with_path(&stub, || {
         purge::run(&args(
             &a.archive,
-            vec!["gitlab.gamania.com".to_string()],
+            vec!["gitlab.example.com".to_string()],
             None,
             true,
         ))
@@ -651,10 +651,10 @@ fn purge_apply_refuses_ignored_files_in_scope() {
         "scope with ignored files must be refused, got {err:?}"
     );
     // Nothing deleted, no commit.
-    assert!(a.archive.join("evidence/gitlab.gamania.com").exists());
+    assert!(a.archive.join("evidence/gitlab.example.com").exists());
     assert!(
         a.archive
-            .join("evidence/gitlab.gamania.com/sidecar.secret")
+            .join("evidence/gitlab.example.com/sidecar.secret")
             .exists()
     );
     assert_eq!(git_count_commits(&a.archive), before);
