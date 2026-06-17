@@ -1,140 +1,1345 @@
-#compdef codex-cli cx \
-#  cxgp cxga cxgk cxgc cxau cxar cxaa cxac cxas cxps cxdr cxdra \
-#  cxcs cxct
+#compdef codex-cli
 
-_nils_cli_codex_cli_source_common_zsh() {
-  (( $+functions[_nils_cli_completion_common_load_generated_zsh] )) && return 0
-
-  local source_file="${functions_source[_codex-cli]-}"
-  local helper_path=''
-
-  if [[ -n "$source_file" && -r "$source_file" ]]; then
-    helper_path="${source_file:h}/_completion-adapter-common.zsh"
-    if [[ -r "$helper_path" ]]; then
-      source "$helper_path" || return 1
-      (( $+functions[_nils_cli_completion_common_load_generated_zsh] )) && return 0
-    fi
-  fi
-
-  local dir=''
-  for dir in "${fpath[@]}"; do
-    helper_path="${dir}/_completion-adapter-common.zsh"
-    if [[ -r "$helper_path" ]]; then
-      source "$helper_path" || return 1
-      (( $+functions[_nils_cli_completion_common_load_generated_zsh] )) && return 0
-    fi
-  done
-
-  return 1
-}
-
-typeset -gi _NILS_CODEX_CLI_ZSH_GENERATED_STATE=0
-
-_nils_cli_codex_cli_load_generated_zsh() {
-  _nils_cli_codex_cli_source_common_zsh || return 1
-
-  _nils_cli_completion_common_load_generated_zsh \
-    "_NILS_CODEX_CLI_ZSH_GENERATED_STATE" \
-    "_nils_cli_codex_cli_generated" \
-    "codex-cli" \
-    "_codex-cli" \
-    '^if \[ "\$funcstack\[1\]" = "_nils_cli_codex_cli_generated" \]; then$' \
-    '^fi$'
-}
-
-_nils_cli_codex_cli_apply_alias_rewrite_zsh() {
-  local invoked_as="${words[1]-}"
-  local -a inject=()
-  local implied_async=''
-
-  case "$invoked_as" in
-    cxau) inject=(auth use) ;;
-    cxar) inject=(auth refresh) ;;
-    cxaa) inject=(auth auto-refresh) ;;
-    cxdr) inject=(diag rate-limits) ;;
-    cxdra) inject=(diag rate-limits); implied_async='1' ;;
-    cxps) inject=(prompt-segment) ;;
-    cxgp) inject=(agent prompt) ;;
-    cxga) inject=(agent advice) ;;
-    cxgk) inject=(agent knowledge) ;;
-    cxgc) inject=(agent commit) ;;
-    cxac) inject=(auth current) ;;
-    cxas) inject=(auth sync) ;;
-    cxcs) inject=(config show) ;;
-    cxct) inject=(config set) ;;
-  esac
-
-  if [[ "$invoked_as" != "codex-cli" ]]; then
-    local -a rewritten_words=('codex-cli')
-    local token=''
-    local -i idx=2
-
-    for token in "${inject[@]}"; do
-      rewritten_words+=("$token")
-    done
-
-    while (( idx <= ${#words[@]} )); do
-      rewritten_words+=("${words[idx]}")
-      (( idx++ ))
-    done
-
-    words=("${rewritten_words[@]}")
-    (( CURRENT += ${#inject[@]} ))
-  fi
-
-  if [[ -n "$implied_async" && " ${words[*]-} " != *" --async "* ]]; then
-    local -a async_words=()
-    local -i idx=1
-
-    while (( idx < CURRENT )); do
-      async_words+=("${words[idx]}")
-      (( idx++ ))
-    done
-
-    async_words+=("--async")
-
-    while (( idx <= ${#words[@]} )); do
-      async_words+=("${words[idx]}")
-      (( idx++ ))
-    done
-
-    words=("${async_words[@]}")
-    (( CURRENT++ ))
-  fi
-}
+autoload -U is-at-least
 
 _codex-cli() {
-  emulate -L zsh -o extendedglob
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
 
-  local -i saved_current="$CURRENT"
-  local -a saved_words=("${words[@]}")
-
-  if ! _nils_cli_codex_cli_load_generated_zsh; then
-    words=("${saved_words[@]}")
-    CURRENT="$saved_current"
-    if (( $+functions[_nils_cli_completion_common_fail_closed_zsh] )); then
-      _nils_cli_completion_common_fail_closed_zsh
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
     fi
-    return 1
-  fi
 
-  _nils_cli_codex_cli_apply_alias_rewrite_zsh
-  _nils_cli_codex_cli_generated
-  local rc=$?
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_codex-cli_commands" \
+"*::: :->codex-cli" \
+&& ret=0
+    case $state in
+    (codex-cli)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-command-$line[1]:"
+        case $line[1] in
+            (agent)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_codex-cli__subcmd__agent_commands" \
+"*::: :->agent" \
+&& ret=0
 
-  words=("${saved_words[@]}")
-  CURRENT="$saved_current"
-  return $rc
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-agent-command-$line[1]:"
+        case $line[1] in
+            (prompt)
+_arguments "${_arguments_options[@]}" : \
+'--ephemeral[Run without persisting Codex session files to disk]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::prompt:_default' \
+&& ret=0
+;;
+(advice)
+_arguments "${_arguments_options[@]}" : \
+'--ephemeral[Run without persisting Codex session files to disk]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::question:_default' \
+&& ret=0
+;;
+(knowledge)
+_arguments "${_arguments_options[@]}" : \
+'--ephemeral[Run without persisting Codex session files to disk]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::concept:_default' \
+&& ret=0
+;;
+(commit)
+_arguments "${_arguments_options[@]}" : \
+'-p[Push after committing]' \
+'--push[Push after committing]' \
+'-a[Autostage changes before committing]' \
+'--auto-stage[Autostage changes before committing]' \
+'--ephemeral[Run without persisting Codex session files to disk]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::extra -- Extra prompt text:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__agent__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-agent-help-command-$line[1]:"
+        case $line[1] in
+            (prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(advice)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(knowledge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(commit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(auth)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_codex-cli__subcmd__auth_commands" \
+"*::: :->auth" \
+&& ret=0
+
+    case $state in
+    (auth)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-auth-command-$line[1]:"
+        case $line[1] in
+            (login)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'--api-key[Use API key login flow]' \
+'--device-code[Use ChatGPT device-code login flow]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(use)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::target:_default' \
+&& ret=0
+;;
+(save)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-y[Overwrite target file if it already exists (non-interactive)]' \
+'--yes[Overwrite target file if it already exists (non-interactive)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::secret:_default' \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-y[Remove target file without prompt (non-interactive)]' \
+'--yes[Remove target file without prompt (non-interactive)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::secret:_default' \
+&& ret=0
+;;
+(refresh)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::secret:_default' \
+&& ret=0
+;;
+(auto-refresh)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(current)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(sync)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(remote)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_codex-cli__subcmd__auth__subcmd__remote_commands" \
+"*::: :->remote" \
+&& ret=0
+
+    case $state in
+    (remote)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-auth-remote-command-$line[1]:"
+        case $line[1] in
+            (pull)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'--ssh=[SSH host alias for the token authority]:host:_default' \
+'--name=[Remote stored secret name]:name:_default' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'--access-only[Import access/id/account fields only; never import refresh_token]' \
+'--write-active[Write the pulled auth payload into CODEX_AUTH_FILE]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(export)
+_arguments "${_arguments_options[@]}" : \
+'--name=[Remote stored secret name]:name:_default' \
+'--access-only[Export access/id/account fields only; never export refresh_token]' \
+'--refresh[Refresh the named remote secret before exporting it]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__auth__subcmd__remote__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-auth-remote-help-command-$line[1]:"
+        case $line[1] in
+            (pull)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(export)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__auth__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-auth-help-command-$line[1]:"
+        case $line[1] in
+            (login)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(use)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(save)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(refresh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(auto-refresh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(current)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(sync)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(remote)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__auth__subcmd__help__subcmd__remote_commands" \
+"*::: :->remote" \
+&& ret=0
+
+    case $state in
+    (remote)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-auth-help-remote-command-$line[1]:"
+        case $line[1] in
+            (pull)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(export)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(diag)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_codex-cli__subcmd__diag_commands" \
+"*::: :->diag" \
+&& ret=0
+
+    case $state in
+    (diag)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-diag-command-$line[1]:"
+        case $line[1] in
+            (rate-limits)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'--jobs=[Max concurrent jobs (async mode)]:JOBS:_default' \
+'-c[Clear prompt-segment cache before querying]' \
+'--clear-cache[Clear prompt-segment cache before querying]' \
+'-d[Debug output]' \
+'--debug[Debug output]' \
+'--cached[Cached mode (no network)]' \
+'--no-refresh-auth[Disable refresh-on-401 behavior even when CODEX_AUTO_REFRESH_ENABLED=true]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'--one-line[Output a one-line summary]' \
+'--all[Query all secrets under CODEX_SECRET_DIR]' \
+'--async[Run concurrent async mode]' \
+'--watch[Refresh output every 60 seconds until interrupted (requires --async)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'::secret -- Optional secret.json:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__diag__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-diag-help-command-$line[1]:"
+        case $line[1] in
+            (rate-limits)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_codex-cli__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-config-command-$line[1]:"
+        case $line[1] in
+            (show)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':key:_default' \
+':value:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__config__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-config-help-command-$line[1]:"
+        case $line[1] in
+            (show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(prompt-segment)
+_arguments "${_arguments_options[@]}" : \
+'--ttl=[Cache TTL]:TTL:_default' \
+'--time-format=[Reset time format (local time)]:TIME_FORMAT:_default' \
+'--no-5h[Hide the 5h window output]' \
+'--show-timezone[Show timezone offset in the default reset time display]' \
+'--refresh[Force a blocking refresh]' \
+'--is-enabled[Exit 0 if prompt-segment output is enabled and active auth is usable]' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_codex-cli__subcmd__prompt-segment_commands" \
+"*::: :->prompt-segment" \
+&& ret=0
+
+    case $state in
+    (prompt-segment)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-prompt-segment-command-$line[1]:"
+        case $line[1] in
+            (check)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__prompt-segment__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-prompt-segment-help-command-$line[1]:"
+        case $line[1] in
+            (check)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-help-command-$line[1]:"
+        case $line[1] in
+            (agent)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__help__subcmd__agent_commands" \
+"*::: :->agent" \
+&& ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-help-agent-command-$line[1]:"
+        case $line[1] in
+            (prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(advice)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(knowledge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(commit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(auth)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__help__subcmd__auth_commands" \
+"*::: :->auth" \
+&& ret=0
+
+    case $state in
+    (auth)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-help-auth-command-$line[1]:"
+        case $line[1] in
+            (login)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(use)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(save)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(refresh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(auto-refresh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(current)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(sync)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(remote)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__help__subcmd__auth__subcmd__remote_commands" \
+"*::: :->remote" \
+&& ret=0
+
+    case $state in
+    (remote)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-help-auth-remote-command-$line[1]:"
+        case $line[1] in
+            (pull)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(export)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(diag)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__help__subcmd__diag_commands" \
+"*::: :->diag" \
+&& ret=0
+
+    case $state in
+    (diag)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-help-diag-command-$line[1]:"
+        case $line[1] in
+            (rate-limits)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__help__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-help-config-command-$line[1]:"
+        case $line[1] in
+            (show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(prompt-segment)
+_arguments "${_arguments_options[@]}" : \
+":: :_codex-cli__subcmd__help__subcmd__prompt-segment_commands" \
+"*::: :->prompt-segment" \
+&& ret=0
+
+    case $state in
+    (prompt-segment)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:codex-cli-help-prompt-segment-command-$line[1]:"
+        case $line[1] in
+            (check)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
 }
 
-if _nils_cli_codex_cli_source_common_zsh; then
-  _nils_cli_completion_common_register_zsh _codex-cli \
-    codex-cli cx \
-    cxgp cxga cxgk cxgc cxau cxar cxaa cxac cxas cxps cxdr cxdra \
-    cxcs cxct
+(( $+functions[_codex-cli_commands] )) ||
+_codex-cli_commands() {
+    local commands; commands=(
+'agent:Agent command group' \
+'auth:Authentication command group' \
+'diag:Diagnostics command group' \
+'config:Configuration command group' \
+'prompt-segment:Prompt-segment command group' \
+'completion:Export shell completion script' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent_commands] )) ||
+_codex-cli__subcmd__agent_commands() {
+    local commands; commands=(
+'prompt:Run a raw prompt' \
+'advice:Get actionable engineering advice' \
+'knowledge:Get an explanation for a concept' \
+'commit:Run the semantic-commit workflow' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli agent commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__advice_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__advice_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent advice commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__commit_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent commit commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__help_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__help_commands() {
+    local commands; commands=(
+'prompt:Run a raw prompt' \
+'advice:Get actionable engineering advice' \
+'knowledge:Get an explanation for a concept' \
+'commit:Run the semantic-commit workflow' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli agent help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__help__subcmd__advice_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__help__subcmd__advice_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent help advice commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__help__subcmd__commit_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__help__subcmd__commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent help commit commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__help__subcmd__help_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent help help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__help__subcmd__knowledge_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__help__subcmd__knowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent help knowledge commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__help__subcmd__prompt_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__help__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent help prompt commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__knowledge_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__knowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent knowledge commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__prompt_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent prompt commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth_commands] )) ||
+_codex-cli__subcmd__auth_commands() {
+    local commands; commands=(
+'login:Login to Codex with ChatGPT (browser/device-code) or API key' \
+'use:Switch to a secret by name/name.json or email' \
+'save:Save active CODEX_AUTH_FILE into CODEX_SECRET_DIR as SECRET_JSON (auto-appends .json when missing)' \
+'remove:Remove SECRET_JSON from CODEX_SECRET_DIR (auto-appends .json when missing)' \
+'refresh:Refresh OAuth tokens' \
+'auto-refresh:Refresh stale tokens across auth + secrets' \
+'status:Report active Codex auth readiness without exposing secrets' \
+'current:Show which secret matches CODEX_AUTH_FILE' \
+'sync:Sync CODEX_AUTH_FILE back into matching secrets' \
+'remote:Pull access-only auth from a remote Codex token authority' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli auth commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__auto-refresh_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__auto-refresh_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth auto-refresh commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__current_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__current_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth current commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help_commands() {
+    local commands; commands=(
+'login:Login to Codex with ChatGPT (browser/device-code) or API key' \
+'use:Switch to a secret by name/name.json or email' \
+'save:Save active CODEX_AUTH_FILE into CODEX_SECRET_DIR as SECRET_JSON (auto-appends .json when missing)' \
+'remove:Remove SECRET_JSON from CODEX_SECRET_DIR (auto-appends .json when missing)' \
+'refresh:Refresh OAuth tokens' \
+'auto-refresh:Refresh stale tokens across auth + secrets' \
+'status:Report active Codex auth readiness without exposing secrets' \
+'current:Show which secret matches CODEX_AUTH_FILE' \
+'sync:Sync CODEX_AUTH_FILE back into matching secrets' \
+'remote:Pull access-only auth from a remote Codex token authority' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli auth help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__auto-refresh_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__auto-refresh_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help auto-refresh commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__current_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__current_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help current commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__help_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__login_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__login_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help login commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__refresh_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__refresh_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help refresh commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__remote_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__remote_commands() {
+    local commands; commands=(
+'pull:Pull remote auth over SSH and write it to CODEX_AUTH_FILE' \
+'export:Export remote auth payload for SSH transport' \
+    )
+    _describe -t commands 'codex-cli auth help remote commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__export_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__export_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help remote export commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__pull_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__pull_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help remote pull commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__remove_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help remove commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__save_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__save_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help save commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__status_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help status commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__sync_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__sync_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help sync commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__use_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__help__subcmd__use_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth help use commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__login_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__login_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth login commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__refresh_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__refresh_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth refresh commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__remote_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__remote_commands() {
+    local commands; commands=(
+'pull:Pull remote auth over SSH and write it to CODEX_AUTH_FILE' \
+'export:Export remote auth payload for SSH transport' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli auth remote commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__export_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__remote__subcmd__export_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth remote export commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__help_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__remote__subcmd__help_commands() {
+    local commands; commands=(
+'pull:Pull remote auth over SSH and write it to CODEX_AUTH_FILE' \
+'export:Export remote auth payload for SSH transport' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli auth remote help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__export_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__export_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth remote help export commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__help_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth remote help help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__pull_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__pull_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth remote help pull commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__pull_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__remote__subcmd__pull_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth remote pull commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__remove_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth remove commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__save_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__save_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth save commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__status_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth status commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__sync_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__sync_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth sync commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__auth__subcmd__use_commands] )) ||
+_codex-cli__subcmd__auth__subcmd__use_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli auth use commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__completion_commands] )) ||
+_codex-cli__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli completion commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__config_commands] )) ||
+_codex-cli__subcmd__config_commands() {
+    local commands; commands=(
+'show:Show current configuration' \
+'set:Set configuration value (current shell only)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli config commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__config__subcmd__help_commands] )) ||
+_codex-cli__subcmd__config__subcmd__help_commands() {
+    local commands; commands=(
+'show:Show current configuration' \
+'set:Set configuration value (current shell only)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli config help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__config__subcmd__help__subcmd__help_commands] )) ||
+_codex-cli__subcmd__config__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli config help help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__config__subcmd__help__subcmd__set_commands] )) ||
+_codex-cli__subcmd__config__subcmd__help__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli config help set commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__config__subcmd__help__subcmd__show_commands] )) ||
+_codex-cli__subcmd__config__subcmd__help__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli config help show commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__config__subcmd__set_commands] )) ||
+_codex-cli__subcmd__config__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli config set commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__config__subcmd__show_commands] )) ||
+_codex-cli__subcmd__config__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli config show commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__diag_commands] )) ||
+_codex-cli__subcmd__diag_commands() {
+    local commands; commands=(
+'rate-limits:Rate-limits diagnostics' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli diag commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__diag__subcmd__help_commands] )) ||
+_codex-cli__subcmd__diag__subcmd__help_commands() {
+    local commands; commands=(
+'rate-limits:Rate-limits diagnostics' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli diag help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__diag__subcmd__help__subcmd__help_commands] )) ||
+_codex-cli__subcmd__diag__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli diag help help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__diag__subcmd__help__subcmd__rate-limits_commands] )) ||
+_codex-cli__subcmd__diag__subcmd__help__subcmd__rate-limits_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli diag help rate-limits commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__diag__subcmd__rate-limits_commands] )) ||
+_codex-cli__subcmd__diag__subcmd__rate-limits_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli diag rate-limits commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help_commands] )) ||
+_codex-cli__subcmd__help_commands() {
+    local commands; commands=(
+'agent:Agent command group' \
+'auth:Authentication command group' \
+'diag:Diagnostics command group' \
+'config:Configuration command group' \
+'prompt-segment:Prompt-segment command group' \
+'completion:Export shell completion script' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__agent_commands] )) ||
+_codex-cli__subcmd__help__subcmd__agent_commands() {
+    local commands; commands=(
+'prompt:Run a raw prompt' \
+'advice:Get actionable engineering advice' \
+'knowledge:Get an explanation for a concept' \
+'commit:Run the semantic-commit workflow' \
+    )
+    _describe -t commands 'codex-cli help agent commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__agent__subcmd__advice_commands] )) ||
+_codex-cli__subcmd__help__subcmd__agent__subcmd__advice_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help agent advice commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__agent__subcmd__commit_commands] )) ||
+_codex-cli__subcmd__help__subcmd__agent__subcmd__commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help agent commit commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__agent__subcmd__knowledge_commands] )) ||
+_codex-cli__subcmd__help__subcmd__agent__subcmd__knowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help agent knowledge commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__agent__subcmd__prompt_commands] )) ||
+_codex-cli__subcmd__help__subcmd__agent__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help agent prompt commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth_commands() {
+    local commands; commands=(
+'login:Login to Codex with ChatGPT (browser/device-code) or API key' \
+'use:Switch to a secret by name/name.json or email' \
+'save:Save active CODEX_AUTH_FILE into CODEX_SECRET_DIR as SECRET_JSON (auto-appends .json when missing)' \
+'remove:Remove SECRET_JSON from CODEX_SECRET_DIR (auto-appends .json when missing)' \
+'refresh:Refresh OAuth tokens' \
+'auto-refresh:Refresh stale tokens across auth + secrets' \
+'status:Report active Codex auth readiness without exposing secrets' \
+'current:Show which secret matches CODEX_AUTH_FILE' \
+'sync:Sync CODEX_AUTH_FILE back into matching secrets' \
+'remote:Pull access-only auth from a remote Codex token authority' \
+    )
+    _describe -t commands 'codex-cli help auth commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__auto-refresh_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__auto-refresh_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth auto-refresh commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__current_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__current_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth current commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__login_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__login_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth login commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__refresh_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__refresh_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth refresh commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__remote_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__remote_commands() {
+    local commands; commands=(
+'pull:Pull remote auth over SSH and write it to CODEX_AUTH_FILE' \
+'export:Export remote auth payload for SSH transport' \
+    )
+    _describe -t commands 'codex-cli help auth remote commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__export_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__export_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth remote export commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__pull_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__pull_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth remote pull commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__remove_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth remove commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__save_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__save_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth save commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__status_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth status commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__sync_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__sync_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth sync commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__use_commands] )) ||
+_codex-cli__subcmd__help__subcmd__auth__subcmd__use_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help auth use commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__completion_commands] )) ||
+_codex-cli__subcmd__help__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help completion commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__config_commands] )) ||
+_codex-cli__subcmd__help__subcmd__config_commands() {
+    local commands; commands=(
+'show:Show current configuration' \
+'set:Set configuration value (current shell only)' \
+    )
+    _describe -t commands 'codex-cli help config commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__config__subcmd__set_commands] )) ||
+_codex-cli__subcmd__help__subcmd__config__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help config set commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__config__subcmd__show_commands] )) ||
+_codex-cli__subcmd__help__subcmd__config__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help config show commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__diag_commands] )) ||
+_codex-cli__subcmd__help__subcmd__diag_commands() {
+    local commands; commands=(
+'rate-limits:Rate-limits diagnostics' \
+    )
+    _describe -t commands 'codex-cli help diag commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__diag__subcmd__rate-limits_commands] )) ||
+_codex-cli__subcmd__help__subcmd__diag__subcmd__rate-limits_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help diag rate-limits commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__help_commands] )) ||
+_codex-cli__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__prompt-segment_commands] )) ||
+_codex-cli__subcmd__help__subcmd__prompt-segment_commands() {
+    local commands; commands=(
+'check:Exit 0 when Starship should run the prompt segment' \
+'status:Report prompt-segment readiness without exposing secrets' \
+    )
+    _describe -t commands 'codex-cli help prompt-segment commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__prompt-segment__subcmd__check_commands] )) ||
+_codex-cli__subcmd__help__subcmd__prompt-segment__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help prompt-segment check commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__prompt-segment__subcmd__status_commands] )) ||
+_codex-cli__subcmd__help__subcmd__prompt-segment__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help prompt-segment status commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__prompt-segment_commands] )) ||
+_codex-cli__subcmd__prompt-segment_commands() {
+    local commands; commands=(
+'check:Exit 0 when Starship should run the prompt segment' \
+'status:Report prompt-segment readiness without exposing secrets' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli prompt-segment commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__prompt-segment__subcmd__check_commands] )) ||
+_codex-cli__subcmd__prompt-segment__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli prompt-segment check commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__prompt-segment__subcmd__help_commands] )) ||
+_codex-cli__subcmd__prompt-segment__subcmd__help_commands() {
+    local commands; commands=(
+'check:Exit 0 when Starship should run the prompt segment' \
+'status:Report prompt-segment readiness without exposing secrets' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'codex-cli prompt-segment help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__prompt-segment__subcmd__help__subcmd__check_commands] )) ||
+_codex-cli__subcmd__prompt-segment__subcmd__help__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli prompt-segment help check commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__prompt-segment__subcmd__help__subcmd__help_commands] )) ||
+_codex-cli__subcmd__prompt-segment__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli prompt-segment help help commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__prompt-segment__subcmd__help__subcmd__status_commands] )) ||
+_codex-cli__subcmd__prompt-segment__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli prompt-segment help status commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__prompt-segment__subcmd__status_commands] )) ||
+_codex-cli__subcmd__prompt-segment__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli prompt-segment status commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_codex-cli" ]; then
+    _codex-cli "$@"
 else
-  compdef _codex-cli \
-    codex-cli cx \
-    cxgp cxga cxgk cxgc cxau cxar cxaa cxac cxas cxps cxdr cxdra \
-    cxcs cxct
+    compdef _codex-cli codex-cli
 fi

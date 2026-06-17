@@ -107,6 +107,17 @@ pub struct AuthSyncResult {
     pub updated_files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthRemotePullResult {
+    pub ssh: String,
+    pub name: String,
+    pub access_only: bool,
+    pub write_active: bool,
+    pub auth_file: String,
+    pub has_oauth_access_token: bool,
+    pub has_oauth_refresh_token: bool,
+}
+
 pub fn emit_result<T: Serialize>(command: &str, result: T) -> Result<()> {
     diag_output::emit_success_result(AUTH_SCHEMA_VERSION, command, result)
 }

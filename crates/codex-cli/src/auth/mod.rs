@@ -3,6 +3,7 @@ pub mod current;
 pub mod login;
 pub mod output;
 pub mod refresh;
+pub mod remote;
 pub mod remove;
 pub mod save;
 pub mod status;

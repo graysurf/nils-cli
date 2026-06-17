@@ -203,6 +203,48 @@ pub enum AuthCommand {
         #[command(flatten)]
         output: OutputModeArgs,
     },
+    /// Pull access-only auth from a remote Codex token authority
+    Remote(AuthRemoteArgs),
+}
+
+#[derive(Args)]
+pub struct AuthRemoteArgs {
+    #[command(subcommand)]
+    pub command: Option<AuthRemoteCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum AuthRemoteCommand {
+    /// Pull remote auth over SSH and write it to CODEX_AUTH_FILE
+    Pull {
+        #[command(flatten)]
+        output: OutputModeArgs,
+        /// SSH host alias for the token authority
+        #[arg(long = "ssh", value_name = "host")]
+        ssh: String,
+        /// Remote stored secret name
+        #[arg(long = "name", value_name = "name")]
+        name: String,
+        /// Import access/id/account fields only; never import refresh_token
+        #[arg(long = "access-only")]
+        access_only: bool,
+        /// Write the pulled auth payload into CODEX_AUTH_FILE
+        #[arg(long = "write-active")]
+        write_active: bool,
+    },
+    /// Export remote auth payload for SSH transport
+    #[command(hide = true)]
+    Export {
+        /// Remote stored secret name
+        #[arg(long = "name", value_name = "name")]
+        name: String,
+        /// Export access/id/account fields only; never export refresh_token
+        #[arg(long = "access-only")]
+        access_only: bool,
+        /// Refresh the named remote secret before exporting it
+        #[arg(long = "refresh")]
+        refresh: bool,
+    },
 }
 
 #[derive(Args)]

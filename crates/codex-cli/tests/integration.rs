@@ -23,6 +23,8 @@ mod auth_json_contract_more;
 mod auth_login;
 #[path = "integration/auth_refresh.rs"]
 mod auth_refresh;
+#[path = "integration/auth_remote.rs"]
+mod auth_remote;
 #[path = "integration/auth_remove.rs"]
 mod auth_remove;
 #[path = "integration/auth_save.rs"]
