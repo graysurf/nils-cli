@@ -48,7 +48,7 @@ resolver = "2"
 # edition.
 edition = "2024"
 license = "MIT"
-version = "1.9.2"
+version = "1.9.3"
 
 [workspace.dependencies]
 anyhow = "1"
