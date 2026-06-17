@@ -308,6 +308,28 @@ fn doctor_json_reports_missing_direnv_when_env_file_applies() {
     assert_eq!(value["data"]["decision"]["status"], "missing-direnv");
 }
 
+#[test]
+fn missing_direnv_exec_error_includes_install_remediation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir(&cwd).expect("repo");
+    fs::write(cwd.join(".envrc"), "export NEEDS_DIRENV=1\n").expect("envrc");
+    let empty_path = tmp.path().join("empty-bin");
+    fs::create_dir(&empty_path).expect("empty path");
+    let cwd_arg = arg(&cwd);
+    let path_value = arg(&empty_path);
+
+    let output = run(
+        &["exec", "--cwd", &cwd_arg, "--", "sh", "-c", "exit 9"],
+        &CmdOptions::new().with_env("PATH", &path_value),
+    );
+
+    assert_eq!(output.code, exit::UNAVAILABLE);
+    let stderr = output.stderr_text();
+    assert!(stderr.contains("direnv-unavailable"), "{stderr}");
+    assert!(stderr.contains("brew install direnv"), "{stderr}");
+}
+
 enum FakeDirenv {
     Success { log: PathBuf },
     Dotenv { log: PathBuf },

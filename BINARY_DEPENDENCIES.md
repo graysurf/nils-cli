@@ -30,6 +30,7 @@ These tools are required for common command paths. Each row is anchored to at le
 | `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
 | `gh` | `git-cli open *` GitHub helpers, `plan-issue` GitHub I/O, `forge-cli` GitHub backend | Required for GitHub-facing flows | `brew install gh` |
 | `glab` | `forge-cli` GitLab backend, including `glab api` for MR checks/wait/merge and inbox reads | Required for GitLab-facing `forge-cli` flows | `brew install glab` |
+| `direnv` | `agent-run exec` project environment activation for applicable `.envrc` / `.env` files | Required when a project env file applies and `--direnv` is not `off` | `brew install direnv` |
 
 ### 1.1 `image-processing` runtime policy
 
@@ -50,7 +51,6 @@ in `crates/*/src`.
 
 | Tool | Behavior Impact | Install (brew/linuxbrew) |
 |---|---|---|
-| `direnv` | Enables `agent-run exec` to activate allowed project `.envrc` / `.env` files; required only when a project env file applies and `--direnv` is not `off` | `brew install direnv` |
 | `file` | MIME-based binary detection in `git-scope` and `git-cli commit context` | Usually preinstalled |
 | `lsof` | Preferred backend for `fzf-cli port` (fallback: `netstat`); required for `fzf-cli kill-port` | `brew install lsof` |
 | `netstat` | Fallback backend for `fzf-cli port` when `lsof` is missing | Usually preinstalled |

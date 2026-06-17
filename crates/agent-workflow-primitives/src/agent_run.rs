@@ -82,6 +82,11 @@ fn run_exec(args: ExecArgs) -> i32 {
                     plan.decision.error_code(),
                     plan.decision.message()
                 );
+                if matches!(plan.decision.status, DecisionStatus::MissingDirenv) {
+                    eprintln!(
+                        "agent-run exec: fix: install direnv (`brew install direnv`) or rerun with `--direnv off` only when project env loading is intentionally bypassed"
+                    );
+                }
                 if let Some(env_file) = plan.env_file.as_ref() {
                     eprintln!("agent-run exec: env-file={}", env_file.path.display());
                 }
