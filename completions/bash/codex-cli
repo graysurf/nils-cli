@@ -133,23 +133,14 @@ _codex-cli() {
             codex__cli__auth__help,use)
                 cmd="codex__cli__auth__help__use"
                 ;;
-            codex__cli__auth__help__remote,export)
-                cmd="codex__cli__auth__help__remote__export"
-                ;;
             codex__cli__auth__help__remote,pull)
                 cmd="codex__cli__auth__help__remote__pull"
-                ;;
-            codex__cli__auth__remote,export)
-                cmd="codex__cli__auth__remote__export"
                 ;;
             codex__cli__auth__remote,help)
                 cmd="codex__cli__auth__remote__help"
                 ;;
             codex__cli__auth__remote,pull)
                 cmd="codex__cli__auth__remote__pull"
-                ;;
-            codex__cli__auth__remote__help,export)
-                cmd="codex__cli__auth__remote__help__export"
                 ;;
             codex__cli__auth__remote__help,help)
                 cmd="codex__cli__auth__remote__help__help"
@@ -249,9 +240,6 @@ _codex-cli() {
                 ;;
             codex__cli__help__auth,use)
                 cmd="codex__cli__help__auth__use"
-                ;;
-            codex__cli__help__auth__remote,export)
-                cmd="codex__cli__help__auth__remote__export"
                 ;;
             codex__cli__help__auth__remote,pull)
                 cmd="codex__cli__help__auth__remote__pull"
@@ -611,20 +599,6 @@ _codex-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        codex__cli__auth__help__remote__export)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
         codex__cli__auth__help__remote__pull)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
@@ -759,41 +733,9 @@ _codex-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        codex__cli__auth__remote__export)
-            opts="-h --name --access-only --refresh --help"
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                --name)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
         codex__cli__auth__remote__help)
             opts="pull help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        codex__cli__auth__remote__help__export)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -1296,20 +1238,6 @@ _codex-cli() {
         codex__cli__help__auth__remote)
             opts="pull"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        codex__cli__help__auth__remote__export)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

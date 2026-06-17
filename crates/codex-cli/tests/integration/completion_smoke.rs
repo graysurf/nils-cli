@@ -161,6 +161,21 @@ fn completion_bash_candidates_remain_context_aware() {
         !contains_token(&auth_remote_opts, "export"),
         "hidden auth remote export command should not be a bash completion candidate"
     );
+    for token in [
+        "codex__cli__auth__help__remote,export)",
+        "codex__cli__auth__remote,export)",
+        "codex__cli__auth__remote__help,export)",
+        "codex__cli__help__auth__remote,export)",
+        "codex__cli__auth__help__remote__export)",
+        "codex__cli__auth__remote__export)",
+        "codex__cli__auth__remote__help__export)",
+        "codex__cli__help__auth__remote__export)",
+    ] {
+        assert!(
+            !script.contains(token),
+            "hidden auth remote export command should not appear in bash completion: {token}"
+        );
+    }
 
     let diag_rate_limits_opts = bash_case_opts(&script, "codex__cli__diag__rate__limits");
     for token in [

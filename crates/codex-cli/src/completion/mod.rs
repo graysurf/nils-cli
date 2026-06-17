@@ -40,13 +40,57 @@ fn normalize_bash_completion(script: String) -> String {
 }
 
 fn hide_auth_remote_export_bash(script: String) -> String {
-    script
+    let without_candidates = script
         .replace(
             "opts=\"-h --help pull export help\"",
             "opts=\"-h --help pull help\"",
         )
         .replace("opts=\"pull export help\"", "opts=\"pull help\"")
-        .replace("opts=\"pull export\"", "opts=\"pull\"")
+        .replace("opts=\"pull export\"", "opts=\"pull\"");
+
+    remove_bash_case_arms(
+        without_candidates,
+        &[
+            "codex__cli__auth__help__remote,export)",
+            "codex__cli__auth__remote,export)",
+            "codex__cli__auth__remote__help,export)",
+            "codex__cli__help__auth__remote,export)",
+            "codex__cli__auth__help__remote__export)",
+            "codex__cli__auth__remote__export)",
+            "codex__cli__auth__remote__help__export)",
+            "codex__cli__help__auth__remote__export)",
+        ],
+    )
+}
+
+fn remove_bash_case_arms(script: String, labels: &[&str]) -> String {
+    let mut output = String::new();
+    let mut skip_until: Option<&str> = None;
+
+    for line in script.lines() {
+        let trimmed = line.trim();
+
+        if skip_until.is_none() && labels.contains(&trimmed) {
+            skip_until = Some(if trimmed.contains(',') {
+                "                ;;"
+            } else {
+                "            ;;"
+            });
+            continue;
+        }
+
+        if let Some(end_marker) = skip_until {
+            if line == end_marker {
+                skip_until = None;
+            }
+            continue;
+        }
+
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    output
 }
 
 fn hide_auth_remote_export_zsh(script: String) -> String {
@@ -54,25 +98,19 @@ fn hide_auth_remote_export_zsh(script: String) -> String {
     let mut skipping_function = false;
 
     for line in script.lines() {
-        if !skipping_function
-            && (line
-                .contains("_codex-cli__subcmd__auth__subcmd__remote__subcmd__export_commands")
-                || line.contains(
-                    "_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__export_commands",
-                )
-                || line.contains(
-                    "_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__export_commands",
-                )
-                || line.contains(
-                    "_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__export_commands",
-                ))
-        {
+        let trimmed = line.trim();
+
+        if !skipping_function && is_auth_remote_export_zsh_guard(trimmed) {
+            continue;
+        }
+
+        if !skipping_function && is_auth_remote_export_zsh_function(trimmed) {
             skipping_function = true;
             continue;
         }
 
         if skipping_function {
-            if line.trim() == "}" {
+            if trimmed == "}" {
                 skipping_function = false;
             }
             continue;
@@ -87,4 +125,26 @@ fn hide_auth_remote_export_zsh(script: String) -> String {
     }
 
     output
+}
+
+fn is_auth_remote_export_zsh_guard(line: &str) -> bool {
+    const HIDDEN_GUARDS: &[&str] = &[
+        "(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__export_commands] )) ||",
+        "(( $+functions[_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__export_commands] )) ||",
+        "(( $+functions[_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__export_commands] )) ||",
+        "(( $+functions[_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__export_commands] )) ||",
+    ];
+
+    HIDDEN_GUARDS.contains(&line)
+}
+
+fn is_auth_remote_export_zsh_function(line: &str) -> bool {
+    const HIDDEN_FUNCTIONS: &[&str] = &[
+        "_codex-cli__subcmd__auth__subcmd__remote__subcmd__export_commands() {",
+        "_codex-cli__subcmd__auth__subcmd__help__subcmd__remote__subcmd__export_commands() {",
+        "_codex-cli__subcmd__auth__subcmd__remote__subcmd__help__subcmd__export_commands() {",
+        "_codex-cli__subcmd__help__subcmd__auth__subcmd__remote__subcmd__export_commands() {",
+    ];
+
+    HIDDEN_FUNCTIONS.contains(&line)
 }
