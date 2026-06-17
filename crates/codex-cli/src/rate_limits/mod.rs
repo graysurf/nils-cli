@@ -45,6 +45,10 @@ const DIAG_COMMAND: &str = "diag rate-limits";
 const WATCH_INTERVAL_SECONDS: u64 = 60;
 const ANSI_CLEAR_SCREEN_AND_HOME: &str = "\x1b[2J\x1b[H";
 
+fn refresh_on_401_enabled(no_refresh_auth: bool) -> bool {
+    !no_refresh_auth && shared_env::env_truthy(CODEX_PROVIDER_PROFILE.env.auto_refresh_enabled)
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RateLimitSummary {
     non_weekly_label: String,
@@ -410,7 +414,7 @@ fn collect_json_result_for_secret(
     let max_time = env_timeout("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", 8);
     let usage_request = UsageRequest {
         target_file: target_file.to_path_buf(),
-        refresh_on_401: !no_refresh_auth,
+        refresh_on_401: refresh_on_401_enabled(no_refresh_auth),
         base_url,
         connect_timeout_seconds: connect_timeout,
         max_time_seconds: max_time,
@@ -1291,7 +1295,7 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
 
     let usage_request = UsageRequest {
         target_file: target_file.to_path_buf(),
-        refresh_on_401: !no_refresh_auth,
+        refresh_on_401: refresh_on_401_enabled(no_refresh_auth),
         base_url,
         connect_timeout_seconds: connect_timeout,
         max_time_seconds: max_time,
@@ -1785,7 +1789,7 @@ fn run_single_mode(
 
     let usage_request = UsageRequest {
         target_file: target_file.clone(),
-        refresh_on_401: !args.no_refresh_auth,
+        refresh_on_401: refresh_on_401_enabled(args.no_refresh_auth),
         base_url,
         connect_timeout_seconds: connect_timeout,
         max_time_seconds: max_time,
@@ -2079,7 +2083,7 @@ fn single_one_line(
 
     let usage_request = UsageRequest {
         target_file: target_file.to_path_buf(),
-        refresh_on_401: !no_refresh_auth,
+        refresh_on_401: refresh_on_401_enabled(no_refresh_auth),
         base_url,
         connect_timeout_seconds: connect_timeout,
         max_time_seconds: max_time,

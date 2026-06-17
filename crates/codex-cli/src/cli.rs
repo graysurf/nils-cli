@@ -228,7 +228,7 @@ pub struct RateLimitsArgs {
     /// Cached mode (no network)
     #[arg(long = "cached")]
     pub cached: bool,
-    /// Disable refresh-on-401 behavior
+    /// Disable refresh-on-401 behavior even when CODEX_AUTO_REFRESH_ENABLED=true
     #[arg(long = "no-refresh-auth")]
     pub no_refresh_auth: bool,
     /// Output format (`text` or `json`)

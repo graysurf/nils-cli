@@ -92,7 +92,7 @@ Stable (safe for strict parsing):
     (`true` when an existing target file is replaced)
   - `auth remove`: `target_file`, `removed`
   - `auth refresh`: `target_file`, `refreshed`, `synced`, `refreshed_at`
-  - `auth auto-refresh`: `refreshed`, `skipped`, `failed`, `min_age_days`, `targets[*]`
+  - `auth auto-refresh`: `enabled`, `refreshed`, `skipped`, `failed`, `min_age_days`, `targets[*]`
   - `auth status`: `authenticated`, `prompt_segment_authenticated`, `auth_kind`,
     `reason`, `exists`, `readable`, `parse_ok`, credential presence booleans
   - `auth current`: `auth_file`, `matched`, `matched_secret`, `match_mode`
@@ -384,6 +384,7 @@ Informational (do not hard-depend for schema validation):
   "command": "auth auto-refresh",
   "ok": true,
   "result": {
+    "enabled": true,
     "refreshed": 2,
     "skipped": 1,
     "failed": 1,

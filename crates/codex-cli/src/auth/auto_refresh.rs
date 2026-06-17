@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::auth;
 use crate::auth::output::{self, AuthAutoRefreshResult, AuthAutoRefreshTargetResult};
 use crate::paths;
+use crate::provider_profile::CODEX_PROVIDER_PROFILE;
+use nils_common::env as shared_env;
 use nils_common::fs;
 
 pub fn run() -> Result<i32> {
@@ -12,18 +14,21 @@ pub fn run() -> Result<i32> {
 }
 
 pub fn run_with_json(output_json: bool) -> Result<i32> {
+    if !is_enabled() {
+        if output_json {
+            output::emit_result("auth auto-refresh", zero_result(false, 0))?;
+        } else {
+            println!(
+                "codex-auto-refresh: disabled (set {}=true to enable)",
+                CODEX_PROVIDER_PROFILE.env.auto_refresh_enabled
+            );
+        }
+        return Ok(0);
+    }
+
     if !is_configured() {
         if output_json {
-            output::emit_result(
-                "auth auto-refresh",
-                AuthAutoRefreshResult {
-                    refreshed: 0,
-                    skipped: 0,
-                    failed: 0,
-                    min_age_days: 0,
-                    targets: Vec::new(),
-                },
-            )?;
+            output::emit_result("auth auto-refresh", zero_result(true, 0))?;
         }
         return Ok(0);
     }
@@ -179,6 +184,7 @@ pub fn run_with_json(output_json: bool) -> Result<i32> {
         output::emit_result(
             "auth auto-refresh",
             AuthAutoRefreshResult {
+                enabled: true,
                 refreshed,
                 skipped,
                 failed,
@@ -198,6 +204,21 @@ pub fn run_with_json(output_json: bool) -> Result<i32> {
     }
 
     Ok(0)
+}
+
+fn is_enabled() -> bool {
+    shared_env::env_truthy(CODEX_PROVIDER_PROFILE.env.auto_refresh_enabled)
+}
+
+fn zero_result(enabled: bool, min_age_days: i64) -> AuthAutoRefreshResult {
+    AuthAutoRefreshResult {
+        enabled,
+        refreshed: 0,
+        skipped: 0,
+        failed: 0,
+        min_age_days,
+        targets: Vec::new(),
+    }
 }
 
 fn is_configured() -> bool {
