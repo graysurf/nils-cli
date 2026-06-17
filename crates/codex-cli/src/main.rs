@@ -141,7 +141,29 @@ fn handle_auth(args: &cli::AuthArgs) -> i32 {
         Some(cli::AuthCommand::Sync { output }) => {
             auth::sync::run_with_json(output.is_json()).unwrap_or(1)
         }
+        Some(cli::AuthCommand::Remote(remote_args)) => handle_auth_remote(remote_args),
         None => print_subcommand_help("auth"),
+    }
+}
+
+fn handle_auth_remote(args: &cli::AuthRemoteArgs) -> i32 {
+    match &args.command {
+        Some(cli::AuthRemoteCommand::Pull {
+            output,
+            ssh,
+            name,
+            access_only,
+            write_active,
+        }) => {
+            auth::remote::pull_with_json(ssh, name, *access_only, *write_active, output.is_json())
+                .unwrap_or(1)
+        }
+        Some(cli::AuthRemoteCommand::Export {
+            name,
+            access_only,
+            refresh,
+        }) => auth::remote::export(name, *access_only, *refresh).unwrap_or(1),
+        None => print_subcommand_help("auth remote"),
     }
 }
 

@@ -21,6 +21,7 @@ These tools are required for common command paths. Each row is anchored to at le
 | `grpcurl` | `api-grpc` unary backend (via `api-testing-core::grpc::runner`); overridable with `GRPCURL_BIN` | Required (for `api-grpc call` / suite gRPC cases) | `brew install grpcurl` |
 | `ffmpeg` | `screen-record` on Linux (X11 + Wayland portal capture, audio mux) | Required on Linux | `brew install ffmpeg` |
 | `codex` | `codex-cli auth login` and `codex-cli agent *` flows | Required for `codex-cli` runtime | Install from official Codex distribution |
+| `ssh` | `codex-cli auth remote pull` remote token-authority transport | Required for `codex-cli auth remote pull` | Usually preinstalled (`brew install openssh`) |
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
 | `opencode` | `opencode-cli agent *` flows | Required for `opencode-cli` runtime | Install from official OpenCode distribution |
 | `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |

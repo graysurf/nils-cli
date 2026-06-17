@@ -6,7 +6,7 @@ This document extends `docs/specs/cli-service-json-contract-guideline-v1.md` for
 JSON output from:
 
 - `codex-cli diag rate-limits` (single/all/async)
-- `codex-cli auth login|use|save|remove|refresh|auto-refresh|status|current|sync`
+- `codex-cli auth login|use|save|remove|refresh|auto-refresh|status|current|sync|remote pull`
 - `codex-cli prompt-segment status`
 
 Human-readable output remains the default UX. JSON mode must be explicit (`--format json` or
@@ -27,6 +27,7 @@ Human-readable output remains the default UX. JSON mode must be explicit (`--for
 | auth status | `auth status` | `codex-cli.auth.v1` | `result` |
 | auth current | `auth current` | `codex-cli.auth.v1` | `result` |
 | auth sync | `auth sync` | `codex-cli.auth.v1` | `result` |
+| auth remote pull | `auth remote pull` | `codex-cli.auth.v1` | `result` |
 | prompt-segment status | `prompt-segment status` | `codex-cli.prompt-segment.v1` | `result` |
 
 Auth surfaces use one shared schema contract: `codex-cli.auth.v1`. Prompt-segment readiness
@@ -97,6 +98,8 @@ Stable (safe for strict parsing):
     `reason`, `exists`, `readable`, `parse_ok`, credential presence booleans
   - `auth current`: `auth_file`, `matched`, `matched_secret`, `match_mode`
   - `auth sync`: `auth_file`, `synced`, `skipped`, `failed`, `updated_files`
+  - `auth remote pull`: `ssh`, `name`, `access_only`, `write_active`, `auth_file`,
+    `has_oauth_access_token`, `has_oauth_refresh_token`
 - Prompt segment:
   - `prompt-segment status`: `enabled`, `authenticated`, `prompt_segment_authenticated`,
     `cache_exists`, `cache_stale`, `would_render`, `reason`
@@ -454,6 +457,29 @@ Informational (do not hard-depend for schema validation):
     "updated_files": [
       "/home/user/.agents/secrets/alpha.json"
     ]
+  }
+}
+```
+
+### auth remote pull (success)
+
+`auth remote pull` fetches the remote payload over SSH, strips any `refresh_token`
+material, writes the sanitized payload to `CODEX_AUTH_FILE`, and emits only
+metadata in the JSON envelope.
+
+```json
+{
+  "schema_version": "codex-cli.auth.v1",
+  "command": "auth remote pull",
+  "ok": true,
+  "result": {
+    "ssh": "g14",
+    "name": "gamania",
+    "access_only": true,
+    "write_active": true,
+    "auth_file": "$HOME/.agents/auth.json",
+    "has_oauth_access_token": true,
+    "has_oauth_refresh_token": false
   }
 }
 ```

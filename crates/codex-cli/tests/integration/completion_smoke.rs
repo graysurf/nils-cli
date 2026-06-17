@@ -131,6 +131,27 @@ fn completion_bash_candidates_remain_context_aware() {
         );
     }
 
+    let auth_remote_pull_opts = bash_case_opts(&script, "codex__cli__auth__remote__pull");
+    for token in [
+        "--ssh",
+        "--name",
+        "--access-only",
+        "--write-active",
+        "--format",
+        "--json",
+    ] {
+        assert!(
+            contains_token(&auth_remote_pull_opts, token),
+            "missing auth remote pull token: {token}"
+        );
+    }
+    for token in ["--api-key", "--device-code", "--cached"] {
+        assert!(
+            !contains_token(&auth_remote_pull_opts, token),
+            "unexpected auth remote pull token: {token}"
+        );
+    }
+
     let diag_rate_limits_opts = bash_case_opts(&script, "codex__cli__diag__rate__limits");
     for token in [
         "--clear-cache",

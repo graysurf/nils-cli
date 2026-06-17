@@ -16,7 +16,7 @@ Usage:
 
 Groups:
   agent           prompt | advice | knowledge | commit
-  auth            login | use | save | remove | refresh | auto-refresh | status | current | sync
+  auth            login | use | save | remove | refresh | auto-refresh | status | current | sync | remote pull
   diag            rate-limits
   config          show | set
   prompt-segment  check | status | (render options)
@@ -66,6 +66,8 @@ Agent flag notes:
 - `status`: Report active auth readiness without exposing token or API-key material.
 - `current`: Show which secret matches `CODEX_AUTH_FILE`.
 - `sync`: Sync `CODEX_AUTH_FILE` back into matching secrets.
+- `remote pull --ssh <host> --name <secret> --access-only --write-active`: Pull access-only auth from a remote token authority over SSH and
+  write it to `CODEX_AUTH_FILE`. The local file never receives `refresh_token`; the remote authority remains the only refresh-token writer.
 
 Auth examples:
 
@@ -76,6 +78,8 @@ Auth examples:
 - `codex-cli auth save --yes team-alpha.json`: Force overwrite without prompt.
 - `codex-cli auth remove --yes team-alpha`: Remove `team-alpha.json`.
 - `codex-cli auth status --format json`: Check active auth readiness for automation.
+- `codex-cli auth remote pull --ssh g14 --name gamania --access-only --write-active`: Import g14's current access-only `gamania` auth into
+  the active local auth file.
 
 ### diag
 
@@ -108,8 +112,8 @@ Auth examples:
 - Machine-readable JSON mode is explicit: use `--format json` (preferred) or `--json` where supported for compatibility.
 - Contract spec: `docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - Consumer runbook: `docs/runbooks/json-consumers.md`
-- Covered surfaces: `diag rate-limits` (single/all/async), `auth login|use|save|remove|refresh|auto-refresh|status|current|sync`, and
-  `prompt-segment status`.
+- Covered surfaces: `diag rate-limits` (single/all/async),
+  `auth login|use|save|remove|refresh|auto-refresh|status|current|sync|remote pull`, and `prompt-segment status`.
 
 ## Environment
 
@@ -137,6 +141,7 @@ Auth examples:
 - `codex` is required for `agent` commands.
 - `git` is required for `agent commit`.
 - `semantic-commit` and `git-scope` are optional for `agent commit` (fallbacks apply).
+- `ssh` is required for `auth remote pull`.
 
 ## Exit codes
 

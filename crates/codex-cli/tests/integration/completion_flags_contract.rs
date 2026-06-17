@@ -167,6 +167,7 @@ fn leaf_paths() -> Vec<Vec<&'static str>> {
         vec!["auth", "status"],
         vec!["auth", "current"],
         vec!["auth", "sync"],
+        vec!["auth", "remote", "pull"],
         vec!["diag", "rate-limits"],
         vec!["config", "show"],
         vec!["config", "set"],
