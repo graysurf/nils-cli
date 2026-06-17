@@ -379,15 +379,15 @@ mod tests {
 
     #[test]
     fn remote_validates_ssh_host_and_secret_name() {
-        assert!(is_valid_ssh_host("g14"));
-        assert!(is_valid_ssh_host("terry@g14"));
+        assert!(is_valid_ssh_host("auth-host"));
+        assert!(is_valid_ssh_host("operator@auth-host"));
         assert!(!is_valid_ssh_host(""));
         assert!(!is_valid_ssh_host("-oProxyCommand=bad"));
-        assert!(!is_valid_ssh_host("g14;bad"));
-        assert!(!is_valid_ssh_host("g14 bad"));
+        assert!(!is_valid_ssh_host("auth-host;bad"));
+        assert!(!is_valid_ssh_host("auth-host bad"));
 
-        assert!(is_valid_secret_name("gamania"));
-        assert!(is_valid_secret_name("gamania.json"));
+        assert!(is_valid_secret_name("team"));
+        assert!(is_valid_secret_name("team.json"));
         assert!(!is_valid_secret_name(""));
         assert!(!is_valid_secret_name("-bad"));
         assert!(!is_valid_secret_name("../bad"));

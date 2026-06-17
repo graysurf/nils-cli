@@ -70,7 +70,7 @@ esac
 case "$*" in
   "api user --hostname gitlab.com")
     cat <<'EOF'
-{"id":1435,"username":"terrylin"}
+{"id":1435,"username":"example-user"}
 EOF
     ;;
   *"merge_requests"*"scope=assigned_to_me"*)
@@ -78,7 +78,7 @@ EOF
 [{"iid":21,"web_url":"https://gitlab.com/team/api/-/merge_requests/21","title":"Assigned MR","updated_at":"2026-05-22T08:00:00Z","author":{"username":"carol"},"references":{"full":"team/api!21"}}]
 EOF
     ;;
-  *"merge_requests"*"reviewer_username=terrylin"*)
+  *"merge_requests"*"reviewer_username=example-user"*)
     cat <<'EOF'
 [{"iid":22,"web_url":"https://gitlab.com/team/api/-/merge_requests/22","title":"Review MR","updated_at":"2026-05-22T11:00:00Z","author":{"username":"dave"},"references":{"full":"team/api!22"}}]
 EOF
@@ -855,7 +855,7 @@ set -e
 case "$*" in
   *"api user --hostname"*)
     cat <<'EOF'
-{"id":1435,"username":"terrylin"}
+{"id":1435,"username":"example-user"}
 EOF
     ;;
   *"todos"*"state=pending"*)

@@ -107,7 +107,7 @@ fn auth_remote_export_access_only_strips_refresh_token() {
         "refresh_secret_value",
         "2025-01-20T12:34:56Z",
     );
-    fs::write(secrets.join("gamania.json"), &content).expect("write secret");
+    fs::write(secrets.join("team.json"), &content).expect("write secret");
 
     let output = run(
         &[
@@ -115,7 +115,7 @@ fn auth_remote_export_access_only_strips_refresh_token() {
             "remote",
             "export",
             "--name",
-            "gamania",
+            "team",
             "--access-only",
         ],
         &[("CODEX_SECRET_DIR", &secrets)],
@@ -172,9 +172,9 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
             "remote",
             "pull",
             "--ssh",
-            "g14",
+            "auth-host",
             "--name",
-            "gamania",
+            "team",
             "--access-only",
             "--write-active",
             "--json",
@@ -201,8 +201,8 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
     assert_eq!(payload["schema_version"], "codex-cli.auth.v1");
     assert_eq!(payload["command"], "auth remote pull");
     assert_eq!(payload["ok"], true);
-    assert_eq!(payload["result"]["ssh"], "g14");
-    assert_eq!(payload["result"]["name"], "gamania");
+    assert_eq!(payload["result"]["ssh"], "auth-host");
+    assert_eq!(payload["result"]["name"], "team");
     assert_eq!(payload["result"]["access_only"], true);
     assert_eq!(payload["result"]["write_active"], true);
     assert_eq!(
@@ -225,9 +225,9 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
     assert!(applied.get("other").is_none());
 
     let captured_args = fs::read_to_string(&args_file).expect("read ssh args");
-    assert!(captured_args.contains("g14"));
+    assert!(captured_args.contains("auth-host"));
     assert!(captured_args.contains("codex-cli auth remote export"));
-    assert!(captured_args.contains("--name gamania"));
+    assert!(captured_args.contains("--name team"));
     assert!(captured_args.contains("--access-only"));
     assert!(captured_args.contains("--refresh"));
 
@@ -250,7 +250,7 @@ fn auth_remote_pull_rejects_ssh_option_injection() {
             "pull",
             "--ssh=-oProxyCommand=bad",
             "--name",
-            "gamania",
+            "team",
             "--access-only",
             "--write-active",
         ],
@@ -273,9 +273,9 @@ fn auth_remote_pull_rejects_secret_name_shell_metachar() {
             "remote",
             "pull",
             "--ssh",
-            "g14",
+            "auth-host",
             "--name",
-            "gamania;bad",
+            "team;bad",
             "--access-only",
             "--write-active",
         ],
@@ -300,7 +300,7 @@ fn auth_remote_pull_json_reports_missing_ssh_flag() {
             "--format",
             "json",
             "--name",
-            "gamania",
+            "team",
             "--access-only",
             "--write-active",
         ],
@@ -326,7 +326,7 @@ fn auth_remote_pull_json_reports_missing_name_flag() {
             "--format",
             "json",
             "--ssh",
-            "g14",
+            "auth-host",
             "--access-only",
             "--write-active",
         ],
@@ -370,9 +370,9 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
             "remote",
             "pull",
             "--ssh",
-            "g14",
+            "auth-host",
             "--name",
-            "gamania",
+            "team",
             "--access-only",
             "--write-active",
             "--format",
@@ -426,9 +426,9 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
             "remote",
             "pull",
             "--ssh",
-            "g14",
+            "auth-host",
             "--name",
-            "gamania",
+            "team",
             "--access-only",
             "--write-active",
             "--format",

@@ -215,24 +215,24 @@ mod tests {
 
     #[test]
     fn scan_local_paths_strips_trailing_sentence_punctuation() {
-        let hits = scan_local_paths("the path is /Users/terry/notes.md.");
+        let hits = scan_local_paths("the path is /Users/example/notes.md.");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].sample, "/Users/terry/notes.md");
+        assert_eq!(hits[0].sample, "/Users/example/notes.md");
         assert_eq!(hits[0].suggestion, "$HOME/notes.md");
     }
 
     #[test]
     fn scan_local_paths_stops_tail_at_delimiters() {
-        let hits = scan_local_paths("run `/Users/terry/bin/tool` now");
+        let hits = scan_local_paths("run `/Users/example/bin/tool` now");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].sample, "/Users/terry/bin/tool");
+        assert_eq!(hits[0].sample, "/Users/example/bin/tool");
     }
 
     #[test]
     fn scan_local_paths_owner_only_without_tail() {
-        let hits = scan_local_paths("home is /Users/terry");
+        let hits = scan_local_paths("home is /Users/example");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].sample, "/Users/terry");
+        assert_eq!(hits[0].sample, "/Users/example");
         assert_eq!(hits[0].suggestion, "$HOME");
     }
 
@@ -243,24 +243,25 @@ mod tests {
 
     #[test]
     fn scan_local_paths_reports_line_numbers_and_dedups_per_line() {
-        let text = "line one is clean\nsee /Users/terry/a and /Users/terry/a again\n/home/bob/c";
+        let text =
+            "line one is clean\nsee /Users/example/a and /Users/example/a again\n/home/bob/c";
         let hits = scan_local_paths(text);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].line, 2);
-        assert_eq!(hits[0].sample, "/Users/terry/a");
+        assert_eq!(hits[0].sample, "/Users/example/a");
         assert_eq!(hits[1].line, 3);
         assert_eq!(hits[1].sample, "/home/bob/c");
     }
 
     #[test]
     fn render_local_path_detail_suggests_home_without_echoing_personal_path() {
-        let hits = scan_local_paths("see /Users/terry/Project/private");
+        let hits = scan_local_paths("see /Users/example/Project/private");
         let detail = render_local_path_detail(&hits);
         assert!(
             detail.contains("line 1: use $HOME/Project/private"),
             "{detail}"
         );
-        assert!(!detail.contains("/Users/terry"), "{detail}");
+        assert!(!detail.contains("/Users/example"), "{detail}");
     }
 
     #[test]

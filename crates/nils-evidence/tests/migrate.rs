@@ -231,7 +231,7 @@ fn build_multi_host_empty_scenario() -> Scenario {
     fs::create_dir_all(archive.join("evidence")).unwrap();
     fs::write(
         archive.join("config").join("hosts.yaml"),
-        "version: 1\nhosts:\n  gitlab.gamania.com:\n    class: employer\n    employer: Gamania\n  github.com:\n    class: personal\n    primary_identity: graysurf\n",
+        "version: 1\nhosts:\n  gitlab.example.com:\n    class: employer\n    employer: ExampleCo\n  github.com:\n    class: personal\n    primary_identity: graysurf\n",
     )
     .unwrap();
     git(&archive, &["init", "-q", "-b", "main"]);
@@ -369,7 +369,7 @@ fn migrate_blocks_resolved_host_absent_from_hosts_yaml() {
     // ABSENT from config/hosts.yaml must be SKIPPED and REPORTED in `blocked`,
     // not silently archived as "unknown personal". The archive can only hold
     // records for hosts the operator has explicitly classified.
-    let s = build_multi_host_empty_scenario(); // hosts: gitlab.gamania.com, github.com
+    let s = build_multi_host_empty_scenario(); // hosts: gitlab.example.com, github.com
 
     // Resolvable + classified (github.com) -> rolls up.
     let classified = make_git_checkout(&s.root, "classified", "git@github.com:graysurf/kit.git");
@@ -428,7 +428,7 @@ fn migrate_rescues_unresolvable_identity_via_working_repo_roots() {
     // agent worktree) is normally UNRESOLVABLE under a multi-host config. When a
     // configured working_repo_roots entry holds a matching local checkout, the
     // host is recovered from that checkout's origin and the record rolls up.
-    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+    let s = build_multi_host_empty_scenario(); // gitlab.example.com, github.com
 
     // A local checkout mirror under a working-repo root; its origin pins the host.
     let roots = s.root.join("mirror");
@@ -508,13 +508,13 @@ fn migrate_rescues_nested_gitlab_checkout_via_working_repo_roots() {
     // segment (`backend__svc`). The working_repo_roots rescue must still find
     // the checkout (mirrored at its full origin path) by matching the normalized
     // slug, and preserve the FULL origin org/repo in the rollup.
-    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com (employer), github.com
+    let s = build_multi_host_empty_scenario(); // gitlab.example.com (employer), github.com
 
     let roots = s.root.join("mirror");
     make_git_checkout(
         &roots.join("acme/platform/backend"),
         "svc",
-        "git@gitlab.gamania.com:acme/platform/backend/svc.git",
+        "git@gitlab.example.com:acme/platform/backend/svc.git",
     );
 
     // Record whose recorded cwd is gone -> Unresolvable -> rescue path.
@@ -534,7 +534,7 @@ fn migrate_rescues_nested_gitlab_checkout_via_working_repo_roots() {
     let report = migrate::prepare(&args).expect("dry-run must succeed");
     assert_eq!(report.eligible, 1, "the nested checkout is rescued");
     assert_eq!(report.blocked.len(), 0, "rescued, not blocked");
-    assert_eq!(report.records[0].rollup.repo.host, "gitlab.gamania.com");
+    assert_eq!(report.records[0].rollup.repo.host, "gitlab.example.com");
     assert_eq!(
         report.records[0].rollup.repo.org, "acme/platform/backend",
         "the full origin org is preserved, not the truncated slug owner"
@@ -591,7 +591,7 @@ fn migrate_blocks_ambiguous_rescue_slug() {
     // so the record must stay BLOCKED rather than be rescued to whichever
     // checkout was walked first (which could mis-archive employer / personal
     // evidence by directory order).
-    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+    let s = build_multi_host_empty_scenario(); // gitlab.example.com, github.com
 
     let roots = s.root.join("mirror");
     // Both checkouts normalize to `teamx__widget` but resolve to different
@@ -604,7 +604,7 @@ fn migrate_blocks_ambiguous_rescue_slug() {
     make_git_checkout(
         &roots.join("b/group"),
         "widget",
-        "git@gitlab.gamania.com:group/teamx/widget.git",
+        "git@gitlab.example.com:group/teamx/widget.git",
     );
 
     // Record whose recorded cwd is gone -> Unresolvable -> rescue path.
@@ -717,7 +717,7 @@ fn migrate_multi_host_accepts_manual_slug_with_case_only_origin_difference() {
     // #879 follow-up (r495): a manual dir `acme__my_repo` whose origin
     // differs only by CASE (`Acme/my_repo`) must still match — case is folded,
     // the underscore is not. (The earlier raw-only check wrongly blocked this.)
-    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+    let s = build_multi_host_empty_scenario(); // gitlab.example.com, github.com
 
     let checkout = make_git_checkout(&s.root, "my_repo", "git@github.com:Acme/my_repo.git");
     write_record(
@@ -777,7 +777,7 @@ fn migrate_multi_host_accepts_manual_underscore_slug_matching_cwd() {
     // wrongly reject a cwd that points at the SAME repo. Both sides must be
     // normalized through the same rule, so the matching cwd is trusted (and,
     // under multi-host, supplies the otherwise-unknowable host).
-    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+    let s = build_multi_host_empty_scenario(); // gitlab.example.com, github.com
 
     let checkout = make_git_checkout(&s.root, "my_repo", "git@github.com:acme/my_repo.git");
     write_record(
@@ -813,7 +813,7 @@ fn migrate_host_override_blocks_resolvable_mismatched_cwd() {
     // RESOLVES but to a DIFFERENT checkout (repointed/reused) is not slug-only;
     // slapping the override onto its slug would mis-attribute it. Such a record
     // must be blocked as unresolvable, not archived under the override host.
-    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com (employer), github.com
+    let s = build_multi_host_empty_scenario(); // gitlab.example.com (employer), github.com
 
     // cwd resolves, but to a different repo than the record's slug.
     let reused = make_git_checkout(&s.root, "reused", "git@github.com:other/reused.git");
@@ -829,7 +829,7 @@ fn migrate_host_override_blocks_resolvable_mismatched_cwd() {
     );
 
     let mut args = dry_run_args(&s);
-    args.host = Some("gitlab.gamania.com".to_string());
+    args.host = Some("gitlab.example.com".to_string());
     let report = migrate::prepare(&args).expect("dry-run must succeed");
     assert_eq!(
         report.eligible, 0,
@@ -849,7 +849,7 @@ fn migrate_multi_host_blocks_manual_underscore_slug_repointed_to_hyphen_repo() {
     // repo `acme/my-repo` (provider repo names distinguish `_` from `-`). The
     // mismatched cwd must be rejected, not trusted: under multi-host the record
     // is blocked rather than mis-archived under the reused checkout.
-    let s = build_multi_host_empty_scenario(); // gitlab.gamania.com, github.com
+    let s = build_multi_host_empty_scenario(); // gitlab.example.com, github.com
 
     // cwd resolves to acme/my-repo (hyphen) — a different repo than acme__my_repo.
     let reused = make_git_checkout(&s.root, "my-repo", "git@github.com:acme/my-repo.git");
@@ -1064,7 +1064,7 @@ fn host_override_does_not_clobber_a_resolvable_cwd() {
     // Operator passes --host for a different (employer) host to rescue some
     // other blocked slug-only record in the same batch.
     let mut args = dry_run_args(&s);
-    args.host = Some("gitlab.gamania.com".to_string());
+    args.host = Some("gitlab.example.com".to_string());
     let report = migrate::prepare(&args).expect("prepare");
     assert_eq!(report.eligible, 1);
     assert_eq!(report.blocked.len(), 0);

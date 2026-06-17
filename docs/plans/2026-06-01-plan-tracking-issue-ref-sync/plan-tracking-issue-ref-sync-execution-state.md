@@ -78,8 +78,8 @@
 | --- | --- | --- | --- |
 | `plan-tooling validate --file docs/plans/2026-06-01-plan-tracking-issue-ref-sync/plan-tracking-issue-ref-sync-plan.md --format text --explain` | pass | Plan-source bundle validated with zero errors. | local |
 | `bash scripts/ci/plan-bundle-validate.sh --strict --file docs/plans/2026-06-01-plan-tracking-issue-ref-sync/plan-tracking-issue-ref-sync-plan.md` | pass | Repository plan-bundle validator passed for this new bundle. | local |
-| `agent-run exec --cwd /Users/terry/Project/sympoies/nils-cli -- bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Docs placement, hygiene, markdown lint, cli-output contract lint, and forge-cli fixture lint passed. | local |
-| `agent-run exec --cwd /Users/terry/Project/sympoies/nils-cli -- bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Local-fast selected docs-only mode for this three-file plan bundle and passed. | local |
+| `agent-run exec --cwd $HOME/Project/sympoies/nils-cli -- bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Docs placement, hygiene, markdown lint, cli-output contract lint, and forge-cli fixture lint passed. | local |
+| `agent-run exec --cwd $HOME/Project/sympoies/nils-cli -- bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Local-fast selected docs-only mode for this three-file plan bundle and passed. | local |
 | `plan-issue --repo sympoies/nils-cli --format json --dry-run record open --profile tracking --bundle ...` | pass | Dry-run preview rendered source, plan, and state lifecycle comments from commit `f34b082`. | local |
 | `plan-issue --repo sympoies/nils-cli --format json record open --profile tracking --bundle ...` | pass | Opened tracker issue #738 and posted source, plan, and state lifecycle comments. | <https://github.com/sympoies/nils-cli/issues/738> |
 | `plan-issue --format json tracking run init --provider-repo sympoies/nils-cli --issue 738 --bundle ...` | pass | Initialized typed run state `20260531T193736Z-issue-738` for branch `feat/plan-tracking-issue-ref-sync`. | local |
