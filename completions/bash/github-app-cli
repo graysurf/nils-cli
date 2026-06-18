@@ -17,13 +17,13 @@ _github-app-cli() {
                 cmd="github__app__cli"
                 ;;
             github__app__cli,completion)
-                cmd="github__app__cli__subcmd__completion"
+                cmd="github__app__cli__completion"
                 ;;
             github__app__cli,installations)
-                cmd="github__app__cli__subcmd__installations"
+                cmd="github__app__cli__installations"
                 ;;
             github__app__cli,token)
-                cmd="github__app__cli__subcmd__token"
+                cmd="github__app__cli__token"
                 ;;
             *)
                 ;;
@@ -49,7 +49,7 @@ _github-app-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        github__subcmd__app__subcmd__cli__subcmd__completion)
+        github__app__cli__completion)
             opts="-h --format --help bash zsh"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -67,7 +67,7 @@ _github-app-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        github__subcmd__app__subcmd__cli__subcmd__installations)
+        github__app__cli__installations)
             opts="-h --app-id --key --api-url --format --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -97,7 +97,7 @@ _github-app-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        github__subcmd__app__subcmd__cli__subcmd__token)
+        github__app__cli__token)
             opts="-h --app-id --key --api-url --installation-id --format --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
