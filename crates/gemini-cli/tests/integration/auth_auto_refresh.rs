@@ -45,6 +45,7 @@ fn auth_auto_refresh_invalid_min_days() {
     fs::write(&auth_file, r#"{"last_refresh":"2025-01-20T12:34:56Z"}"#).expect("write auth");
 
     let _auth = set_env(&lock, "GEMINI_AUTH_FILE", &auth_file);
+    let _enabled = set_env(&lock, "GEMINI_AUTO_REFRESH_ENABLED", "true");
     let _min = set_env(&lock, "GEMINI_AUTO_REFRESH_MIN_DAYS", "oops");
 
     let code = auth::auto_refresh::run();
@@ -87,6 +88,7 @@ fn auth_auto_refresh_backfills_timestamp() {
     let _auth = set_env(&lock, "GEMINI_AUTH_FILE", &auth_file);
     let _cache = set_env(&lock, "GEMINI_SECRET_CACHE_DIR", &cache);
     let _secret = set_env(&lock, "GEMINI_SECRET_DIR", &secrets);
+    let _enabled = set_env(&lock, "GEMINI_AUTO_REFRESH_ENABLED", "true");
     let _min = set_env(&lock, "GEMINI_AUTO_REFRESH_MIN_DAYS", "9999");
 
     let code = auth::auto_refresh::run();

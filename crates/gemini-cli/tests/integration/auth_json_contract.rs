@@ -121,6 +121,41 @@ fn auth_json_contract_auto_refresh_unconfigured_returns_zeroed_result() {
     let secret_dir = dir.path().join("secrets");
     fs::create_dir_all(&secret_dir).expect("secret dir");
 
+    let output = run_with(
+        &["auth", "auto-refresh", "--json"],
+        &[
+            ("GEMINI_AUTH_FILE", &auth_file),
+            ("GEMINI_SECRET_DIR", &secret_dir),
+        ],
+        &[("GEMINI_AUTO_REFRESH_ENABLED", "true")],
+    );
+    assert_eq!(output.code, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["schema_version"], "gemini-cli.auth.v1");
+    assert_eq!(payload["command"], "auth auto-refresh");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["enabled"], true);
+    assert_eq!(payload["result"]["refreshed"], 0);
+    assert_eq!(payload["result"]["failed"], 0);
+}
+
+#[test]
+fn auth_json_contract_auto_refresh_disabled_returns_zeroed_result() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let auth_file = dir.path().join("auth.json");
+    let secret_dir = dir.path().join("secrets");
+    fs::create_dir_all(&secret_dir).expect("secret dir");
+    fs::write(
+        &auth_file,
+        auth_json(
+            PAYLOAD_ALPHA,
+            "acct_001",
+            "refresh_a",
+            "2999-01-20T12:34:56Z",
+        ),
+    )
+    .expect("write auth");
+
     let output = run(
         &["auth", "auto-refresh", "--json"],
         &[
@@ -133,8 +168,11 @@ fn auth_json_contract_auto_refresh_unconfigured_returns_zeroed_result() {
     assert_eq!(payload["schema_version"], "gemini-cli.auth.v1");
     assert_eq!(payload["command"], "auth auto-refresh");
     assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["enabled"], false);
     assert_eq!(payload["result"]["refreshed"], 0);
+    assert_eq!(payload["result"]["skipped"], 0);
     assert_eq!(payload["result"]["failed"], 0);
+    assert_eq!(payload["result"]["targets"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -576,7 +614,10 @@ fn auth_json_contract_auto_refresh_invalid_min_days_is_structured() {
             ("GEMINI_AUTH_FILE", &auth_file),
             ("GEMINI_SECRET_DIR", &secret_dir),
         ],
-        &[("GEMINI_AUTO_REFRESH_MIN_DAYS", "oops")],
+        &[
+            ("GEMINI_AUTO_REFRESH_ENABLED", "true"),
+            ("GEMINI_AUTO_REFRESH_MIN_DAYS", "oops"),
+        ],
     );
     assert_eq!(output.code, 64);
 

@@ -2,24 +2,29 @@ use std::path::{Path, PathBuf};
 
 use crate::auth;
 use crate::auth::output;
+use crate::provider_profile::GEMINI_PROVIDER_PROFILE;
+use nils_common::env as shared_env;
 
 pub fn run() -> i32 {
     run_with_json(false)
 }
 
 pub fn run_with_json(output_json: bool) -> i32 {
+    if !is_enabled() {
+        if output_json {
+            let _ = output::emit_result("auth auto-refresh", zero_result(false, 0));
+        } else {
+            println!(
+                "gemini-auto-refresh: disabled (set {}=true to enable)",
+                GEMINI_PROVIDER_PROFILE.env.auto_refresh_enabled
+            );
+        }
+        return 0;
+    }
+
     if !is_configured() {
         if output_json {
-            let _ = output::emit_result(
-                "auth auto-refresh",
-                output::obj(vec![
-                    ("refreshed", output::n(0)),
-                    ("skipped", output::n(0)),
-                    ("failed", output::n(0)),
-                    ("min_age_days", output::n(0)),
-                    ("targets", output::arr(Vec::new())),
-                ]),
-            );
+            let _ = output::emit_result("auth auto-refresh", zero_result(true, 0));
         }
         return 0;
     }
@@ -153,13 +158,7 @@ pub fn run_with_json(output_json: bool) -> i32 {
     if output_json {
         let _ = output::emit_result(
             "auth auto-refresh",
-            output::obj(vec![
-                ("refreshed", output::n(refreshed)),
-                ("skipped", output::n(skipped)),
-                ("failed", output::n(failed)),
-                ("min_age_days", output::n(min_days)),
-                ("targets", output::arr(target_results)),
-            ]),
+            auto_refresh_result(true, refreshed, skipped, failed, min_days, target_results),
         );
     } else {
         println!(
@@ -173,6 +172,32 @@ pub fn run_with_json(output_json: bool) -> i32 {
     }
 
     0
+}
+
+fn is_enabled() -> bool {
+    shared_env::env_truthy(GEMINI_PROVIDER_PROFILE.env.auto_refresh_enabled)
+}
+
+fn zero_result(enabled: bool, min_age_days: i64) -> output::JsonValue {
+    auto_refresh_result(enabled, 0, 0, 0, min_age_days, Vec::new())
+}
+
+fn auto_refresh_result(
+    enabled: bool,
+    refreshed: i64,
+    skipped: i64,
+    failed: i64,
+    min_age_days: i64,
+    targets: Vec<output::JsonValue>,
+) -> output::JsonValue {
+    output::obj(vec![
+        ("enabled", output::b(enabled)),
+        ("refreshed", output::n(refreshed)),
+        ("skipped", output::n(skipped)),
+        ("failed", output::n(failed)),
+        ("min_age_days", output::n(min_age_days)),
+        ("targets", output::arr(targets)),
+    ])
 }
 
 fn target_result(target: &Path, status: &str, reason: Option<&str>) -> output::JsonValue {
@@ -300,6 +325,7 @@ mod tests {
             "GEMINI_SECRET_DIR",
             dir.path().join("missing-secrets"),
         );
+        let _enabled = set_env(&lock, "GEMINI_AUTO_REFRESH_ENABLED", "true");
         assert_eq!(run_with_json(true), 0);
         assert_eq!(run_with_json(false), 0);
     }
@@ -318,6 +344,7 @@ mod tests {
             dir.path().join("missing-auth.json"),
         );
         let _secret = set_env(&lock, "GEMINI_SECRET_DIR", &secrets);
+        let _enabled = set_env(&lock, "GEMINI_AUTO_REFRESH_ENABLED", "true");
         let _min_days = set_env(&lock, "GEMINI_AUTO_REFRESH_MIN_DAYS", "bogus");
 
         assert_eq!(run_with_json(true), 64);
@@ -420,6 +447,7 @@ mod tests {
             dir.path().join("missing-auth.json"),
         );
         let _secret = set_env(&lock, "GEMINI_SECRET_DIR", &secrets);
+        let _enabled = set_env(&lock, "GEMINI_AUTO_REFRESH_ENABLED", "true");
         let _min_days = set_env(&lock, "GEMINI_AUTO_REFRESH_MIN_DAYS", "5");
         assert_eq!(run_with_json(false), 1);
     }
@@ -438,6 +466,7 @@ mod tests {
             dir.path().join("missing-auth.json"),
         );
         let _secret = set_env(&lock, "GEMINI_SECRET_DIR", &secrets);
+        let _enabled = set_env(&lock, "GEMINI_AUTO_REFRESH_ENABLED", "true");
         let _min_days = set_env(&lock, "GEMINI_AUTO_REFRESH_MIN_DAYS", "99999");
         assert_eq!(run_with_json(true), 0);
     }
