@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `737dac8def5fd2232fb4186eecbfe54c359963f56efa3c7bc18467a9c760f5ad`
-- Third-party crates (`source != null`): 460
+- Cargo.lock SHA256: `cd0e13420c4d5d0a54dda1dc72d68718f770c107c2d2d04263756b74c09fd11c`
+- Third-party crates (`source != null`): 463
 
 ## Notice Extraction Policy
 
@@ -1464,6 +1464,14 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
+### jsonwebtoken 9.3.1
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
 ### kurbo 0.13.1
 
 - License: `Apache-2.0 OR MIT`
@@ -1880,6 +1888,14 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file references:
   - `LICENSE`
+
+### pem 3.0.6
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE.md`
 
 ### percent-encoding 2.3.2
 
@@ -2663,6 +2679,14 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE-Apache`
   - `LICENSE-MIT`
+
+### simple_asn1 0.6.4
+
+- License: `ISC`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
 
 ### simplecss 0.2.2
 

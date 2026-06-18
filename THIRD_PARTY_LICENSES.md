@@ -3,9 +3,9 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `737dac8def5fd2232fb4186eecbfe54c359963f56efa3c7bc18467a9c760f5ad`
-- Third-party crates (`source != null`): 460
-- Workspace crates (`source == null`, excluded below): 41
+- Cargo.lock SHA256: `cd0e13420c4d5d0a54dda1dc72d68718f770c107c2d2d04263756b74c09fd11c`
+- Third-party crates (`source != null`): 463
+- Workspace crates (`source == null`, excluded below): 42
 
 ## Notes
 
@@ -18,7 +18,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | License Expression | Crate Count |
 | --- | ---: |
 | MIT OR Apache-2.0 | 221 |
-| MIT | 85 |
+| MIT | 87 |
 | Apache-2.0 OR MIT | 36 |
 | Zlib OR Apache-2.0 OR MIT | 19 |
 | Unicode-3.0 | 18 |
@@ -29,11 +29,11 @@ This file documents third-party Rust crate licenses used by this workspace.
 | MIT OR Apache-2.0 OR Zlib | 4 |
 | Apache-2.0 OR ISC OR MIT | 3 |
 | CDLA-Permissive-2.0 | 3 |
+| ISC | 3 |
 | Zlib | 3 |
 | Apache-2.0 | 2 |
 | BSD-2-Clause OR Apache-2.0 OR MIT | 2 |
 | BSD-3-Clause OR Apache-2.0 | 2 |
-| ISC | 2 |
 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | 2 |
 | Unlicense/MIT | 2 |
 | (MIT OR Apache-2.0) AND Unicode-3.0 | 1 |
@@ -217,6 +217,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | jni-sys-macros | 0.4.1 | MIT OR Apache-2.0 | crates.io |
 | jobserver | 0.1.34 | MIT OR Apache-2.0 | crates.io |
 | js-sys | 0.3.102 | MIT OR Apache-2.0 | crates.io |
+| jsonwebtoken | 9.3.1 | MIT | crates.io |
 | kurbo | 0.13.1 | Apache-2.0 OR MIT | crates.io |
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 | crates.io |
 | leb128fmt | 0.1.0 | MIT OR Apache-2.0 | crates.io |
@@ -268,6 +269,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | ordered-stream | 0.2.0 | MIT OR Apache-2.0 | crates.io |
 | parking | 2.2.1 | Apache-2.0 OR MIT | crates.io |
 | parse-zoneinfo | 0.3.1 | MIT | crates.io |
+| pem | 3.0.6 | MIT | crates.io |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 | crates.io |
 | pest | 2.8.6 | MIT OR Apache-2.0 | crates.io |
 | pest_derive | 2.8.6 | MIT OR Apache-2.0 | crates.io |
@@ -357,6 +359,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | simd-adler32 | 0.3.9 | MIT | crates.io |
 | simd_cesu8 | 1.1.1 | Apache-2.0 OR MIT | crates.io |
 | simdutf8 | 0.1.5 | MIT OR Apache-2.0 | crates.io |
+| simple_asn1 | 0.6.4 | ISC | crates.io |
 | simplecss | 0.2.2 | Apache-2.0 OR MIT | crates.io |
 | siphasher | 1.0.3 | MIT/Apache-2.0 | crates.io |
 | slab | 0.4.12 | MIT | crates.io |

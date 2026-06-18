@@ -1,0 +1,99 @@
+#compdef github-app-cli
+
+autoload -U is-at-least
+
+_github-app-cli() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_github-app-cli_commands" \
+"*::: :->github-app-cli" \
+&& ret=0
+    case $state in
+    (github-app-cli)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:github-app-cli-command-$line[1]:"
+        case $line[1] in
+            (token)
+_arguments "${_arguments_options[@]}" : \
+'--app-id=[GitHub App ID or Client ID (used as the JWT issuer)]:ID:_default' \
+'--key=[Path to the App'\''s RSA private-key PEM. Overridden by GITHUB_APP_PRIVATE_KEY]:PATH:_files' \
+'--api-url=[GitHub REST API base URL (set for GitHub Enterprise)]:URL:_default' \
+'--installation-id=[Installation ID to mint a token for (discover via \`installations\`)]:ID:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(installations)
+_arguments "${_arguments_options[@]}" : \
+'--app-id=[GitHub App ID or Client ID (used as the JWT issuer)]:ID:_default' \
+'--key=[Path to the App'\''s RSA private-key PEM. Overridden by GITHUB_APP_PRIVATE_KEY]:PATH:_files' \
+'--api-url=[GitHub REST API base URL (set for GitHub Enterprise)]:URL:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':shell -- Shell to emit a completion script for:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_github-app-cli_commands] )) ||
+_github-app-cli_commands() {
+    local commands; commands=(
+'token:Mint an installation access token (text mode\: token on stdout)' \
+'installations:List the App'\''s installations and their installation IDs' \
+'completion:Print a shell completion script' \
+    )
+    _describe -t commands 'github-app-cli commands' commands "$@"
+}
+(( $+functions[_github-app-cli__subcmd__completion_commands] )) ||
+_github-app-cli__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'github-app-cli completion commands' commands "$@"
+}
+(( $+functions[_github-app-cli__subcmd__installations_commands] )) ||
+_github-app-cli__subcmd__installations_commands() {
+    local commands; commands=()
+    _describe -t commands 'github-app-cli installations commands' commands "$@"
+}
+(( $+functions[_github-app-cli__subcmd__token_commands] )) ||
+_github-app-cli__subcmd__token_commands() {
+    local commands; commands=()
+    _describe -t commands 'github-app-cli token commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_github-app-cli" ]; then
+    _github-app-cli "$@"
+else
+    compdef _github-app-cli github-app-cli
+fi
