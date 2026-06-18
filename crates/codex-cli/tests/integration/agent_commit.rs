@@ -1,8 +1,8 @@
 use nils_common::process as shared_process;
-use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOptions, CmdOutput};
 use nils_test_support::fs as test_fs;
 use nils_test_support::git as test_git;
+use nils_test_support::{GlobalStateLock, bin};
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -77,6 +77,7 @@ fn init_repo(dir: &Path) {
 
 #[test]
 fn agent_commit_fallback_creates_commit() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -107,6 +108,7 @@ fn agent_commit_fallback_creates_commit() {
 
 #[test]
 fn agent_commit_semantic_mode_executes_codex_with_template_and_push_note() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");

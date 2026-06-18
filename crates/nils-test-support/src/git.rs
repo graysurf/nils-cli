@@ -1,8 +1,13 @@
+use std::env;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 use tempfile::TempDir;
+
+static GIT_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct InitRepoOptions {
@@ -47,7 +52,7 @@ impl Default for InitRepoOptions {
 }
 
 pub fn git_output(dir: &Path, args: &[&str]) -> Output {
-    Command::new("git")
+    Command::new(git_command())
         .args(args)
         .current_dir(dir)
         .output()
@@ -81,12 +86,122 @@ pub fn git_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> String 
 }
 
 fn git_output_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_command());
     cmd.args(args).current_dir(dir);
     for (key, value) in envs {
         cmd.env(key, value);
     }
     cmd.output().expect("git command failed to spawn")
+}
+
+fn git_command() -> &'static Path {
+    GIT_PATH.get_or_init(resolve_git_path).as_path()
+}
+
+fn resolve_git_path() -> PathBuf {
+    if let Some(path) =
+        env::var_os("NILS_TEST_SUPPORT_GIT").and_then(|value| executable_path(PathBuf::from(value)))
+    {
+        return path;
+    }
+
+    if let Some(path) =
+        option_env!("PATH").and_then(|value| find_in_path_value(OsStr::new(value), "git"))
+    {
+        return path;
+    }
+
+    if let Some(path) = env::var_os("PATH").and_then(|value| find_in_path_value(&value, "git")) {
+        return path;
+    }
+
+    for candidate in common_git_candidates() {
+        if let Some(path) = executable_path(PathBuf::from(candidate)) {
+            return path;
+        }
+    }
+
+    panic!("git command failed to resolve; set NILS_TEST_SUPPORT_GIT to the git executable");
+}
+
+fn find_in_path_value(paths: &OsStr, program: &str) -> Option<PathBuf> {
+    for dir in env::split_paths(paths) {
+        for candidate in path_lookup_candidates(&dir, program) {
+            if let Some(path) = executable_path(candidate) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn path_lookup_candidates(dir: &Path, program: &str) -> Vec<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        vec![dir.join(program)]
+    }
+
+    #[cfg(windows)]
+    {
+        let mut candidates = vec![dir.join(program)];
+
+        if Path::new(program).extension().is_none() {
+            for extension in windows_pathext_extensions() {
+                let mut file_name = std::ffi::OsString::from(program);
+                file_name.push(extension);
+                candidates.push(dir.join(file_name));
+            }
+        }
+
+        candidates
+    }
+}
+
+fn executable_path(path: PathBuf) -> Option<PathBuf> {
+    is_executable_file(&path).then_some(path)
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn common_git_candidates() -> &'static [&'static str] {
+    &[
+        "/usr/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+        "/home/linuxbrew/.linuxbrew/bin/git",
+    ]
+}
+
+#[cfg(windows)]
+fn common_git_candidates() -> &'static [&'static str] {
+    &[]
+}
+
+#[cfg(windows)]
+fn windows_pathext_extensions() -> Vec<std::ffi::OsString> {
+    let pathext =
+        env::var_os("PATHEXT").unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
+    pathext
+        .to_string_lossy()
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(std::ffi::OsString::from)
+        .collect()
 }
 
 pub fn init_repo_at_with(dir: &Path, options: InitRepoOptions) {
