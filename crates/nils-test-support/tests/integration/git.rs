@@ -1,4 +1,4 @@
-use nils_test_support::git;
+use nils_test_support::{EnvGuard, GlobalStateLock, git};
 use pretty_assertions::assert_eq;
 use std::fs;
 
@@ -88,6 +88,17 @@ fn git_with_env_applies_env_vars() {
 fn git_output_returns_status() {
     let repo = git::init_repo_with(git::InitRepoOptions::default());
     let output = git::git_output(repo.path(), &["status", "--porcelain"]);
+    assert_eq!(output.status.success(), true);
+}
+
+#[test]
+fn git_output_ignores_later_path_mutation() {
+    let repo = git::init_repo_with(git::InitRepoOptions::default());
+    let lock = GlobalStateLock::new();
+    let _path = EnvGuard::set(&lock, "PATH", "");
+
+    let output = git::git_output(repo.path(), &["status", "--porcelain"]);
+
     assert_eq!(output.status.success(), true);
 }
 

@@ -1,4 +1,5 @@
 use nils_common::process as shared_process;
+use nils_test_support::GlobalStateLock;
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOptions, CmdOutput};
 use nils_test_support::fs as test_fs;
@@ -48,6 +49,7 @@ fn write_git_proxy(dir: &Path) {
 
 #[test]
 fn agent_commit_fallback_commits_with_prompted_header() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -77,6 +79,7 @@ fn agent_commit_fallback_commits_with_prompted_header() {
 
 #[test]
 fn agent_commit_fallback_defaults_type_and_scope() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -105,6 +108,7 @@ fn agent_commit_fallback_defaults_type_and_scope() {
 
 #[test]
 fn agent_commit_fallback_aborts_on_confirmation_reject() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -130,6 +134,7 @@ fn agent_commit_fallback_aborts_on_confirmation_reject() {
 
 #[test]
 fn agent_commit_fallback_push_flag_returns_1_when_push_fails() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -158,6 +163,7 @@ fn agent_commit_fallback_push_flag_returns_1_when_push_fails() {
 
 #[test]
 fn agent_commit_without_staged_changes_returns_1() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
@@ -175,6 +181,7 @@ fn agent_commit_without_staged_changes_returns_1() {
 
 #[test]
 fn agent_commit_auto_stage_in_fallback_stages_and_commits() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
