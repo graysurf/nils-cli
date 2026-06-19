@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::Command;
 
 use nils_common::cli_contract::schema_version_for;
-use nils_common::provider_payload;
+use nils_common::{markdown, provider_payload};
 use serde::Serialize;
 
 use crate::cli::BINARY;
@@ -341,6 +341,32 @@ pub fn no_local_path(text: &str, field: &str) -> Result<(), ForgeError> {
     ))
 }
 
+/// Escaped-control markdown guard — posted text (title / body / comment) MUST
+/// NOT embed literal escaped-control artifacts (`\n`, `\r`, `\t`) in prose or
+/// structure. These usually mean a payload was double-escaped before being
+/// handed to the forge, producing cosmetically corrupt rendering. Escaped
+/// controls inside fenced code blocks and inline code spans are legitimate
+/// (e.g. `printf 'a\nb'`) and are exempt — the scan is delegated to
+/// [`nils_common::markdown::validate_markdown_payload`], which strips code
+/// segments before inspecting.
+///
+/// Re-homed from plan-issue's retired `GhCliAdapter::guard_provider_payload`
+/// so the guard survives routing plan-issue's GitHub writes through forge-cli.
+/// Mirrors [`no_local_path`]'s `DATA 65` validation class.
+pub fn no_escaped_control_markdown(text: &str) -> Result<(), ForgeError> {
+    markdown::validate_markdown_payload(text).map_err(|err| {
+        ForgeError::validation(
+            schema(),
+            "markdown_escaped_control",
+            format!(
+                "{err}. Replace escaped controls (\\n / \\r / \\t) with real characters \
+                 or wrap them in a code span."
+            ),
+            None,
+        )
+    })
+}
+
 /// Rule 4 — `git status --porcelain` is empty (no staged, unstaged, or
 /// untracked changes).
 ///
@@ -629,6 +655,19 @@ mod tests {
 
     fn err_kind(err: ForgeError) -> &'static str {
         err.kind()
+    }
+
+    #[test]
+    fn no_escaped_control_markdown_rejects_literal_escape_artifacts() {
+        // A payload carrying a literal `\n` in prose (not inside a code span)
+        // is rejected as cosmetic corruption.
+        let err = no_escaped_control_markdown("line one\\nline two")
+            .expect_err("escaped control should be rejected");
+        assert_eq!(err.kind(), "markdown_escaped_control");
+        // Clean prose passes.
+        no_escaped_control_markdown("line one\nline two").expect("clean markdown passes");
+        // Escaped controls inside an inline code span are legitimate.
+        no_escaped_control_markdown("run `printf 'a\\nb'` here").expect("code span is exempt");
     }
 
     #[test]
