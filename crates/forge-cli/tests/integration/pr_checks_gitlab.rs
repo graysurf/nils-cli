@@ -7,7 +7,7 @@
 
 use pretty_assertions::assert_eq;
 
-use super::support::{StubEnv, parse_envelope, run_forge_cli};
+use super::support::{StubEnv, parse_envelope, run_forge_cli, run_forge_cli_in};
 
 const VERSION_OK: &str = include_str!("../fixtures/gitlab/pr_checks/version_supported.txt");
 const VERSION_TOO_NEW: &str = include_str!("../fixtures/gitlab/pr_checks/version_too_new.txt");
@@ -80,7 +80,12 @@ fn run_checks(
         id,
     ];
     argv.extend_from_slice(extra);
-    let out = run_forge_cli(&stub, &argv);
+    // Run from a non-git cwd so no origin remote is resolvable, keeping
+    // ctx.repo = None. That selects the text `glab ci status` path these tests
+    // exercise; with a project context, GitLab pr checks now prefers the
+    // structured `glab api` path (covered by the merge-requests-api test).
+    let cwd = stub.tempdir.path().to_path_buf();
+    let out = run_forge_cli_in(&stub, &argv, Some(&cwd));
     let env = parse_envelope(&out.stdout);
     (out.code, env)
 }
@@ -272,7 +277,9 @@ fn pr_checks_glab_no_pipeline_is_success_zero_count() {
         "checks",
         "feat/sample",
     ];
-    let out = run_forge_cli(&stub, &argv);
+    // Non-git cwd → ctx.repo = None → text `glab ci status` path (see run_checks).
+    let cwd = stub.tempdir.path().to_path_buf();
+    let out = run_forge_cli_in(&stub, &argv, Some(&cwd));
     let env = parse_envelope(&out.stdout);
     assert_eq!(out.code, 0, "no-pipeline should be success, got {env:?}");
     assert_eq!(env["data"]["state"], "success");
@@ -291,4 +298,87 @@ fn pr_checks_glab_version_too_new_fails_unavailable() {
             .unwrap_or("")
             .contains("outside the supported")
     );
+}
+
+/// Stub for the structured non-numeric path: resolve the MR for a branch via
+/// `glab api .../merge_requests?source_branch=...`, fetch the MR, then its jobs.
+/// Fails loudly if the version probe runs — this path must not touch it.
+fn glab_branch_api_stub() -> String {
+    r#"#!/bin/sh
+set -e
+case "$1" in
+  "--version")
+    echo "version probe must not run for the merge-requests API path" >&2
+    exit 99
+    ;;
+  "api")
+    case "$*" in
+      *"merge_requests/7"*)
+        cat <<'EOF'
+{
+  "iid": 7,
+  "web_url": "https://gitlab.com/group/project/-/merge_requests/7",
+  "head_pipeline": {
+    "id": 99,
+    "status": "success",
+    "web_url": "https://gitlab.com/group/project/-/pipelines/99"
+  }
+}
+EOF
+        ;;
+      *"merge_requests?state=opened"*"source_branch=feat%2Fsample"*)
+        cat <<'EOF'
+[ { "iid": 7 } ]
+EOF
+        ;;
+      *"pipelines/99/jobs"*)
+        cat <<'EOF'
+[
+  { "name": "build", "stage": "test", "status": "success", "allow_failure": false },
+  { "name": "test", "stage": "test", "status": "success", "allow_failure": false }
+]
+EOF
+        ;;
+      *)
+        echo "stub: unexpected api args: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  *)
+    echo "stub: unexpected glab args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    .to_string()
+}
+
+#[test]
+fn pr_checks_glab_branch_with_repo_uses_merge_requests_api() {
+    // Method A pins `--repo`, so a non-numeric `pr checks <branch>` now has a
+    // project context and resolves the MR via the structured `glab api`
+    // merge-requests path (fork-safe) rather than the text `ci status` path.
+    // The explicit `--repo` makes the project context deterministic regardless
+    // of the test's working directory.
+    let stub = StubEnv::new().glab_stub(&glab_branch_api_stub());
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--repo",
+            "group/project",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "feat/sample",
+        ],
+    );
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(out.code, 0, "stderr={}\nenv={env:?}", out.stderr);
+    assert_eq!(env["data"]["provider"], "gitlab");
+    assert_eq!(env["data"]["state"], "success");
+    assert_eq!(env["data"]["checks"].as_array().unwrap().len(), 2);
 }

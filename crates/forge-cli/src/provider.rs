@@ -51,17 +51,20 @@ pub struct ProviderContext {
     pub provider: Provider,
     pub host: String,
     pub source: DetectionSource,
-    /// Repo slug from `--repo owner/name`; ops push `--repo <slug>` into the
-    /// backend argv when set so dry-run plans and live calls hit the same repo.
+    /// Repo slug, from explicit `--repo owner/name` or else derived from the
+    /// detected remote (see [`detect`]). Ops push `--repo <slug>` into the
+    /// backend argv when set so dry-run plans and live calls hit the cloned repo
+    /// instead of gh/glab's cwd default (which retargets a fork clone to its
+    /// upstream parent).
     pub repo: Option<String>,
 }
 
 impl ProviderContext {
-    /// Push `--repo <owner/name>` into `argv` when the caller passed
-    /// `--repo`. Both `gh` and `glab` accept the long form across all
-    /// non-`repo view` subcommands, so this helper centralizes the wiring.
-    /// `repo view` does not use this — it pushes the slug as a positional
-    /// argument instead.
+    /// Push `--repo <owner/name>` into `argv` when a repo slug is set (an
+    /// explicit `--repo` or one derived from the remote). Both `gh` and `glab`
+    /// accept the long form across all non-`repo view` subcommands, so this
+    /// helper centralizes the wiring. `repo view` does not use this — it pushes
+    /// the slug as a positional argument instead.
     pub fn push_repo_override(&self, argv: &mut Vec<OsString>) {
         if let Some(slug) = self.repo.as_deref() {
             argv.push(OsString::from("--repo"));
@@ -100,14 +103,22 @@ pub fn detect(
     repo_override: Option<&str>,
     remote_url_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<ProviderContext, ForgeError> {
-    let repo = repo_override.map(str::to_string);
+    // Resolve the remote URL once and reuse it for both host classification
+    // and repo-slug derivation. An explicit `--repo` wins; otherwise the slug
+    // is derived from the same remote so ops pin `--repo <owner/name>` to the
+    // cloned repo instead of letting gh/glab re-derive from cwd (which silently
+    // retargets a fork clone to its upstream parent).
+    let url = remote_url_lookup(remote);
+    let repo = repo_override
+        .map(str::to_string)
+        .or_else(|| url.as_deref().and_then(parse_slug));
 
     if let ProviderHint::Forced(provider) = hint {
         // Forcing `--provider` overrides provider classification only. The
         // host still resolves from the remote when it classifies to the same
         // provider (self-hosted GitLab/GHE); the provider default is the
         // fallback, not the answer.
-        let host = remote_url_lookup(remote)
+        let host = url
             .as_deref()
             .and_then(parse_host)
             .filter(|host| classify_host(host) == Some(provider))
@@ -120,7 +131,6 @@ pub fn detect(
         });
     }
 
-    let url = remote_url_lookup(remote);
     if let Some(url) = url.as_deref()
         && let Some(host) = parse_host(url)
     {
@@ -179,6 +189,17 @@ pub fn classify_host(host: &str) -> Option<Provider> {
 /// optional userinfo+port, SCP-style `user@host:path`).
 pub fn parse_host(url: &str) -> Option<String> {
     nils_common::git::parse_git_remote_url(url).map(|remote| remote.host)
+}
+
+/// Parse the `owner/name` (or GitLab `group/.../project`) slug out of a remote
+/// URL, using the same parser as [`parse_host`] so the supported URL shapes
+/// match. Returns `None` when the URL has no `owner/name`-shaped path (e.g.
+/// `file://` remotes or a bare segment), in which case ops fall back to
+/// gh/glab's own cwd-based repo resolution rather than pinning a bad `--repo`.
+pub fn parse_slug(url: &str) -> Option<String> {
+    nils_common::git::parse_git_remote_url(url)
+        .map(|remote| remote.path)
+        .filter(|path| path.contains('/'))
 }
 
 /// Default `git remote get-url` lookup used in production. Returns `None`
@@ -382,5 +403,54 @@ mod tests {
     fn detect_no_remote_errors() {
         let err = detect(ProviderHint::Auto, "origin", None, |_| None).expect_err("no remote");
         assert_eq!(err.kind(), "provider_unsupported");
+    }
+
+    #[test]
+    fn detect_derives_repo_slug_from_remote_when_no_override() {
+        // Without --repo, the repo slug must be derived from the same remote
+        // used for host detection, so ops pin `--repo <slug>` to the cloned
+        // repo instead of letting gh/glab silently default to a fork's upstream.
+        let ctx = detect(ProviderHint::Auto, "origin", None, |_| {
+            Some("git@github.com:sympoies/nils-cli.git".to_string())
+        })
+        .expect("auto from remote");
+        assert_eq!(ctx.repo.as_deref(), Some("sympoies/nils-cli"));
+    }
+
+    #[test]
+    fn detect_explicit_repo_override_wins_over_derived_slug() {
+        let ctx = detect(ProviderHint::Auto, "origin", Some("acme/override"), |_| {
+            Some("git@github.com:sympoies/nils-cli.git".to_string())
+        })
+        .expect("auto from remote");
+        assert_eq!(ctx.repo.as_deref(), Some("acme/override"));
+    }
+
+    #[test]
+    fn detect_forced_provider_also_derives_repo_slug() {
+        // Nested GitLab paths (group/subgroup/project) must survive intact for
+        // `glab --repo`.
+        let ctx = detect(
+            ProviderHint::Forced(Provider::GitLab),
+            "origin",
+            None,
+            |_| Some("git@gitlab.example.com:group/sub/proj.git".to_string()),
+        )
+        .expect("forced provider");
+        assert_eq!(ctx.repo.as_deref(), Some("group/sub/proj"));
+    }
+
+    #[test]
+    fn detect_no_remote_leaves_repo_none() {
+        // Graceful degradation: with no resolvable remote and no override, the
+        // slug is None, so ops fall back to today's behavior (no --repo pinned).
+        let ctx = detect(
+            ProviderHint::Forced(Provider::GitHub),
+            "origin",
+            None,
+            |_| None,
+        )
+        .expect("forced provider");
+        assert_eq!(ctx.repo, None);
     }
 }
