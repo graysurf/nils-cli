@@ -81,14 +81,16 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
     let comment_output = runner.run(&call)?;
     let comment_url = first_url(&comment_output.stdout);
-    let view_output = runner.run(&issue_view::build_view_call(&ctx, args.id))?;
-    let view = issue_view::parse_view_output(&ctx, &view_output)?;
+    let view = issue_view::fetch_view_with_comments(runner, &ctx, args.id)?;
+    let url = comment_url
+        .or_else(|| posted_comment_url(&view, &body))
+        .unwrap_or_else(|| view.url.clone());
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
         IssueCommentPayload {
             provider: view.provider,
             number: view.number,
-            url: comment_url.unwrap_or(view.url),
+            url,
         },
         format,
         render_text,
@@ -106,6 +108,20 @@ fn first_url(stdout: &str) -> Option<String> {
         (url.starts_with("http://") || url.starts_with("https://") || url.starts_with("local://"))
             .then(|| url.to_string())
     })
+}
+
+fn posted_comment_url(view: &issue_view::IssueViewPayload, body: &str) -> Option<String> {
+    view.comments
+        .iter()
+        .rev()
+        .find(|comment| comment.body == body && !comment.url.is_empty())
+        .or_else(|| {
+            view.comments
+                .iter()
+                .rev()
+                .find(|comment| !comment.url.is_empty())
+        })
+        .map(|comment| comment.url.clone())
 }
 
 fn build_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall {
@@ -381,7 +397,7 @@ mod tests {
 
         #[test]
         fn happy_gitlab_inline_body_text_format() {
-            let runner = ScriptedRunner::with_stdout(vec!["", &gitlab_view_json(7)]);
+            let runner = ScriptedRunner::with_stdout(vec!["", &gitlab_view_json(7), "[]"]);
             let global = flags(Some(ProviderFlag::Gitlab), false);
             let code = run_with(
                 &runner,

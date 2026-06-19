@@ -8,6 +8,11 @@ versioning.
 
 ### Changed
 
+- `record open` now preserves the previous broad tracker-resume scan ceiling
+  when routed through `forge-cli issue list`, `record close` fails closed when
+  GitHub required-check state cannot be read, and `record post` / checkpoint
+  issue comments receive the new comment-level URL from `forge-cli issue
+  comment` instead of the parent issue URL.
 - **BREAKING:** Dropped the `-cli` suffix across this crate's identity and
   its JSON output contract. The crate, package, and library are now
   `plan-issue` / `nils-plan-issue` / `plan_issue`, and the CLI output
