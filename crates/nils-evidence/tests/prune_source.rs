@@ -67,6 +67,26 @@ fn write_record(
     (run_dir, record_path, digest)
 }
 
+fn write_nested_record(
+    source_out: &Path,
+    project: &str,
+    run_id: &str,
+    body: &str,
+) -> (PathBuf, PathBuf, String) {
+    let workflow_dir = source_out.join(project).join(run_id);
+    let record_dir = workflow_dir.join("skill-usage");
+    fs::create_dir_all(&record_dir).unwrap();
+    fs::write(
+        workflow_dir.join("issue-closeout.md"),
+        "keep workflow artifact",
+    )
+    .unwrap();
+    let record_path = record_dir.join("skill-usage.record.json");
+    fs::write(&record_path, body).unwrap();
+    let digest = format!("sha256:{}", sha256_hex(body.as_bytes()));
+    (record_dir, record_path, digest)
+}
+
 fn write_catalog(archive: &Path, digests: &[String]) {
     let rows = digests
         .iter()
@@ -196,6 +216,32 @@ fn prune_source_apply_deletes_only_archived_run_dirs() {
     assert!(
         s.source_out.join("graysurf__kit/notes").exists(),
         "non-record directories are never touched"
+    );
+}
+
+#[test]
+fn prune_source_apply_deletes_nested_record_dir_not_workflow_parent() {
+    let s = build_empty();
+    let workflow_dir = s
+        .source_out
+        .join("graysurf__kit/20260620-021848-issue-close");
+    let (record_dir, _, digest) = write_nested_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260620-021848-issue-close",
+        &record_json("issue-follow-up", "2026-06-20T02:18:48Z"),
+    );
+    write_catalog(&s.archive, &[digest]);
+
+    let report = prune_source::run(&args(&s.source_out, &s.archive, true, true)).unwrap();
+
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.deleted, 1);
+    assert!(!record_dir.exists(), "nested record directory is pruned");
+    assert!(workflow_dir.exists(), "workflow parent directory remains");
+    assert!(
+        workflow_dir.join("issue-closeout.md").exists(),
+        "sibling workflow artifacts remain"
     );
 }
 

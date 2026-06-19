@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use crate::validate;
 use crate::validate::hosts::{HostsConfig, validate_hosts_yaml};
 
+pub const SKILL_USAGE_RECORD_FILE: &str = "skill-usage.record.json";
+
 /// Resolution failures shared by `migrate` and `discover`. Callers map these
 /// onto their own command-scoped error codes.
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +59,66 @@ pub fn resolve_source_out(arg: Option<&Path>) -> Result<PathBuf, SourceError> {
         return Err(SourceError::SourceOutMissing(candidate));
     }
     Ok(candidate)
+}
+
+/// Enumerate `skill-usage.record.json` files below each agent-out project.
+///
+/// Records normally live at `<project>/<run>/skill-usage.record.json`, but some
+/// workflows nest them under a workflow-owned run directory, for example
+/// `<project>/<run>/skill-usage/skill-usage.record.json`. The traversal starts
+/// below each project root, follows only real directories, and accepts only real
+/// record files, so symlinked project/run trees and symlinked records are never
+/// included.
+pub fn enumerate_skill_usage_records(source_out: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(projects) = fs::read_dir(source_out) else {
+        return out;
+    };
+    for project in projects.flatten() {
+        let project_path = project.path();
+        if !is_dir_not_symlink(&project_path) {
+            continue;
+        }
+        let Ok(children) = fs::read_dir(&project_path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let child_path = child.path();
+            if is_dir_not_symlink(&child_path) {
+                collect_skill_usage_records(&child_path, &mut out);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn collect_skill_usage_records(dir: &Path, out: &mut Vec<PathBuf>) {
+    let candidate = dir.join(SKILL_USAGE_RECORD_FILE);
+    if is_regular_file_not_symlink(&candidate) {
+        out.push(candidate);
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_dir_not_symlink(&path) {
+            collect_skill_usage_records(&path, out);
+        }
+    }
+}
+
+fn is_dir_not_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn is_regular_file_not_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// Resolve the archive clone path.

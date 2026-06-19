@@ -371,7 +371,7 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
     let existing_digests = crate::catalog::existing_source_digests(&archive)
         .map_err(|e| MigrateError::Io(e.to_string()))?;
 
-    let record_paths = enumerate_records(&source_out);
+    let record_paths = source::enumerate_skill_usage_records(&source_out);
     let scanned = record_paths.len();
 
     let mut prepared = Vec::new();
@@ -1066,37 +1066,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    out
-}
-
-/// Enumerate `*/<ts>-skill-usage/skill-usage.record.json` files under the
-/// agent-out projects root. Globs ONLY this filename. Returns a sorted list
-/// for determinism.
-fn enumerate_records(source_out: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(projects) = fs::read_dir(source_out) else {
-        return out;
-    };
-    for project in projects.flatten() {
-        let project_path = project.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-        let Ok(runs) = fs::read_dir(&project_path) else {
-            continue;
-        };
-        for run in runs.flatten() {
-            let run_path = run.path();
-            if !run_path.is_dir() {
-                continue;
-            }
-            let candidate = run_path.join("skill-usage.record.json");
-            if candidate.is_file() {
-                out.push(candidate);
-            }
-        }
-    }
-    out.sort();
     out
 }
 

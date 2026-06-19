@@ -3,9 +3,9 @@
 //!
 //! This is the source-side counterpart to `evidence migrate`'s copy-only
 //! semantics. It never writes the archive. It reads `<archive>/catalog.json`,
-//! computes each local `skill-usage.record.json` digest, and only prunes a run
-//! directory when that digest is present in the archive catalog. Dry-run is the
-//! default; `--apply` removes the eligible run directories.
+//! computes each local `skill-usage.record.json` digest, and only prunes the
+//! record's containing directory when that digest is present in the archive
+//! catalog. Dry-run is the default; `--apply` removes the eligible directories.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -184,20 +184,12 @@ impl SourceRecordEntry {
 
 fn enumerate_records(source_out: &Path, repo: Option<&str>) -> Vec<SourceRecordEntry> {
     let mut out = Vec::new();
-    let Ok(projects) = fs::read_dir(source_out) else {
-        return out;
-    };
-    for project in projects.flatten() {
-        let project_path = project.path();
-        let Ok(project_meta) = fs::symlink_metadata(&project_path) else {
-            continue;
-        };
-        if !project_meta.file_type().is_dir() || project_meta.file_type().is_symlink() {
-            continue;
-        }
-        let Some(project_name) = project_path
-            .file_name()
-            .and_then(|name| name.to_str())
+    for record_path in source::enumerate_skill_usage_records(source_out) {
+        let Some(project_name) = record_path
+            .strip_prefix(source_out)
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .and_then(|name| name.as_os_str().to_str())
             .map(str::to_string)
         else {
             continue;
@@ -205,29 +197,14 @@ fn enumerate_records(source_out: &Path, repo: Option<&str>) -> Vec<SourceRecordE
         if !repo_matches(&project_name, repo) {
             continue;
         }
-        let Ok(runs) = fs::read_dir(&project_path) else {
+        let Some(run_dir) = record_path.parent().map(Path::to_path_buf) else {
             continue;
         };
-        for run in runs.flatten() {
-            let run_dir = run.path();
-            if !run_dir.is_dir() {
-                continue;
-            }
-            let Ok(meta) = fs::symlink_metadata(&run_dir) else {
-                continue;
-            };
-            if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
-                continue;
-            }
-            let record_path = run_dir.join("skill-usage.record.json");
-            if is_regular_file_not_symlink(&record_path) {
-                out.push(SourceRecordEntry {
-                    run_dir,
-                    record_path,
-                    project: project_name.clone(),
-                });
-            }
-        }
+        out.push(SourceRecordEntry {
+            run_dir,
+            record_path,
+            project: project_name,
+        });
     }
     out.sort_by(|a, b| a.record_path.cmp(&b.record_path));
     out
@@ -255,12 +232,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
-}
-
-fn is_regular_file_not_symlink(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink())
-        .unwrap_or(false)
 }
 
 fn emit(format: OutputFormat, report: &PruneSourceReport) -> i32 {

@@ -81,6 +81,14 @@ fn write_record(source_out: &Path, project: &str, ts: &str, body: &str) {
     fs::write(dir.join("skill-usage.record.json"), body).unwrap();
 }
 
+fn write_nested_record(source_out: &Path, project: &str, run_id: &str, body: &str) -> PathBuf {
+    let dir = source_out.join(project).join(run_id).join("skill-usage");
+    fs::create_dir_all(&dir).unwrap();
+    let record_path = dir.join("skill-usage.record.json");
+    fs::write(&record_path, body).unwrap();
+    record_path
+}
+
 /// Build a record body whose `linked_records` is the given JSON array literal,
 /// started on `started` (`YYYY-MM-DDThh:mm:ssZ`).
 fn record_json_with_links(skill: &str, started: &str, links_json: &str) -> String {
@@ -360,6 +368,30 @@ fn migrate_skips_and_reports_unresolvable_records_without_aborting() {
     assert!(
         !blocked.reason.is_empty(),
         "blocked entry must carry a reason"
+    );
+}
+
+#[test]
+fn migrate_enumerates_workflow_owned_nested_skill_usage_records() {
+    let s = build_empty_scenario();
+    let record_path = write_nested_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260620-021848-issue-close",
+        &record_json("issue-follow-up", "pass", "close an issue", true, false),
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("prepare");
+
+    assert_eq!(report.eligible, 1);
+    assert_eq!(report.blocked.len(), 0);
+    assert_eq!(
+        report.records[0].source_path,
+        record_path.display().to_string()
+    );
+    assert_eq!(
+        report.records[0].metadata.source.agent_out_path,
+        "graysurf__kit/20260620-021848-issue-close/skill-usage/skill-usage.record.json"
     );
 }
 
