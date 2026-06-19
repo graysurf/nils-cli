@@ -39,3 +39,4 @@ nils-api-grpc
 nils-api-websocket
 nils-api-test
 nils-agent-runtime
+nils-github-app-cli
