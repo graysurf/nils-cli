@@ -155,40 +155,9 @@ fn parse_prompt_fields(prompt: &str) -> HashMap<String, String> {
     out
 }
 
-fn gh_stub_script() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ -n "${PLAN_ISSUE_GH_LOG:-}" ]]; then
-  printf '%s\n' "$*" >> "$PLAN_ISSUE_GH_LOG"
-fi
-
-case "${1:-} ${2:-}" in
-  "issue view")
-    body_json="${PLAN_ISSUE_GH_BODY_JSON:-}"
-    if [[ -z "$body_json" ]]; then
-      body_json='{"body":""}'
-    fi
-    printf '%s\n' "$body_json"
-    ;;
-  "issue edit")
-    ;;
-  "issue comment")
-    ;;
-  "pr view")
-    printf '%s\n' '{"state":"MERGED","mergedAt":"2026-02-25T00:00:00Z"}'
-    ;;
-  *)
-    printf 'unsupported gh call: %s\n' "$*" >&2
-    exit 1
-    ;;
-esac
-"#
-}
-
-fn gh_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
+fn forge_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
     common::plan_issue_cmd_options()
-        .with_env_remove_prefix("PLAN_ISSUE_GH_")
+        .with_env_remove_prefix("FORGE_CLI_STUB_")
         .with_path_prepend(stub_dir)
         .with_envs(envs)
 }
@@ -422,7 +391,7 @@ fn write_subagent_prompts_groups_tasks_by_runtime_lane() {
 fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
     let tmp = TempDir::new().expect("temp dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", gh_stub_script());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
     let state_dir = tmp.path().join("state-dir");
     fs::create_dir_all(&state_dir).expect("create agent home");
@@ -482,13 +451,13 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
     );
 
     let issue_body = fs::read_to_string(&plan_issue_body).expect("read issue body");
-    let body_json = json!({ "body": issue_body.clone() }).to_string();
+    let body_json = json!(issue_body.clone()).to_string();
 
     let sprint_task_spec = tmp.path().join("sprint1-task-spec.tsv");
     let sprint_task_spec_s = sprint_task_spec.to_string_lossy().to_string();
     let prompts_out = tmp.path().join("sprint1-prompts");
     let prompts_out_s = prompts_out.to_string_lossy().to_string();
-    let log_path = tmp.path().join("gh.log");
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let start_out = common::run_plan_issue_with_options(
@@ -513,11 +482,11 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
             "auto",
             "--no-comment",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -555,7 +524,7 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
     assert!(prompt.contains("Execution Mode: per-sprint"), "{prompt}");
 
     let drift_body = issue_body.replace("Follow-up lane task", "Follow-up lane task DRIFT");
-    let drift_body_json = json!({ "body": drift_body }).to_string();
+    let drift_body_json = json!(drift_body).to_string();
     let drift_out = common::run_plan_issue_with_options(
         &[
             "--format",
@@ -578,11 +547,11 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
             "auto",
             "--no-comment",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &drift_body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &drift_body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -600,7 +569,7 @@ fn start_sprint_uses_issue_table_runtime_truth_and_rejects_drift() {
 
     let log = fs::read_to_string(&log_path).expect("read log");
     assert!(
-        log.contains("issue view 217 --repo sympoies/nils-cli --json body"),
+        log.contains("--repo sympoies/nils-cli issue view 217"),
         "{log}"
     );
 }

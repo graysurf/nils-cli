@@ -12,91 +12,11 @@ use crate::common;
 const PLAN_PATH: &str =
     "crates/plan-issue/tests/fixtures/plans/plan-issue-rust-cli-full-delivery-plan.md";
 
-fn gh_stub_script() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ -n "${PLAN_ISSUE_GH_LOG:-}" ]]; then
-  printf '%s\n' "$*" >> "$PLAN_ISSUE_GH_LOG"
-fi
-
-cmd="${1:-}"
-sub="${2:-}"
-
-capture_body_file() {
-  local body_file=""
-  local prev=""
-  for arg in "$@"; do
-    if [[ "$prev" == "--body-file" ]]; then
-      body_file="$arg"
-      break
-    fi
-    prev="$arg"
-  done
-
-  if [[ -n "${PLAN_ISSUE_GH_CAPTURE_BODY_FILE:-}" && -n "$body_file" ]]; then
-    cp "$body_file" "$PLAN_ISSUE_GH_CAPTURE_BODY_FILE"
-  fi
-}
-
-capture_comment_file() {
-  local body_file=""
-  local prev=""
-  for arg in "$@"; do
-    if [[ "$prev" == "--body-file" ]]; then
-      body_file="$arg"
-      break
-    fi
-    prev="$arg"
-  done
-
-  if [[ -n "${PLAN_ISSUE_GH_CAPTURE_COMMENT_FILE:-}" && -n "$body_file" ]]; then
-    cp "$body_file" "$PLAN_ISSUE_GH_CAPTURE_COMMENT_FILE"
-  fi
-}
-
-case "$cmd $sub" in
-  "issue view")
-    body_json="${PLAN_ISSUE_GH_BODY_JSON:-}"
-    if [[ -z "$body_json" ]]; then
-      body_json='{"body":""}'
-    fi
-    printf '%s\n' "$body_json"
-    ;;
-  "issue create")
-    printf '%s\n' "${PLAN_ISSUE_GH_CREATE_URL:-https://github.com/sympoies/nils-cli/issues/999}"
-    ;;
-  "issue edit")
-    capture_body_file "$@"
-    ;;
-  "issue comment")
-    capture_comment_file "$@"
-    issue_num="${3:-1}"
-    printf '%s\n' "${PLAN_ISSUE_GH_COMMENT_URL:-https://github.com/sympoies/nils-cli/issues/${issue_num}#issuecomment-1}"
-    ;;
-  "issue close")
-    ;;
-  "pr view")
-    pr="${3:-0}"
-    if [[ ",${PLAN_ISSUE_GH_UNMERGED_PRS:-}," == *",${pr},"* ]]; then
-      printf '%s\n' '{"state":"OPEN","mergedAt":null}'
-    else
-      printf '%s\n' '{"state":"MERGED","mergedAt":"2026-02-25T00:00:00Z"}'
-    fi
-    ;;
-  *)
-    printf 'unsupported gh call: %s\n' "$*" >&2
-    exit 1
-    ;;
-esac
-"#
-}
-
-fn gh_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
+fn forge_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
     common::plan_issue_cmd_options()
-        // Keep stubbed gh behavior deterministic even when the outer shell
-        // exports PLAN_ISSUE_GH_* variables.
-        .with_env_remove_prefix("PLAN_ISSUE_GH_")
+        // Keep the stubbed forge-cli behavior deterministic even when the outer
+        // shell exports FORGE_CLI_STUB_* variables.
+        .with_env_remove_prefix("FORGE_CLI_STUB_")
         .with_path_prepend(stub_dir)
         .with_envs(envs)
 }
@@ -158,19 +78,19 @@ fn issue_body_plan_done() -> String {
 }
 
 #[test]
-fn github_adapter_live_commands_use_gh_backend_for_issue_and_pr_state() {
+fn github_adapter_live_commands_use_forge_cli_backend_for_issue_and_pr_state() {
     let tmp = TempDir::new().expect("temp dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", gh_stub_script());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
-    let log_path = tmp.path().join("gh.log");
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let state_dir = tmp.path().join("state-dir");
     fs::create_dir_all(&state_dir).expect("agent home");
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let body_json = json!({"body": issue_body_sprint4_in_progress()}).to_string();
+    let body_json = json!(issue_body_sprint4_in_progress()).to_string();
 
     let out = common::run_plan_issue_with_options(
         &[
@@ -192,11 +112,11 @@ fn github_adapter_live_commands_use_gh_backend_for_issue_and_pr_state() {
             "per-sprint",
             "--no-comment",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -216,9 +136,9 @@ fn github_adapter_live_commands_use_gh_backend_for_issue_and_pr_state() {
 fn live_plan_commands_ready_and_close_follow_gate_contracts() {
     let tmp = TempDir::new().expect("temp dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", gh_stub_script());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
-    let log_path = tmp.path().join("gh.log");
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let state_dir = tmp.path().join("state-dir");
@@ -228,7 +148,7 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
     let comment_capture = tmp.path().join("ready-plan-comment.md");
     let comment_capture_s = comment_capture.to_string_lossy().to_string();
 
-    let body_json = json!({"body": issue_body_plan_done()}).to_string();
+    let body_json = json!(issue_body_plan_done()).to_string();
 
     let ready_out = common::run_plan_issue_with_options(
         &[
@@ -242,12 +162,12 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
             "--summary",
             "Final plan review",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("PLAN_ISSUE_GH_CAPTURE_COMMENT_FILE", &comment_capture_s),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_CAPTURE_COMMENT_FILE", &comment_capture_s),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -278,11 +198,11 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
             "--approved-comment-url",
             "https://github.com/sympoies/nils-cli/issues/217#issuecomment-4000000001",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -293,17 +213,16 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
     assert_eq!(close_payload["command"], "close-plan");
     assert_eq!(close_payload["payload"]["result"]["issue_closed"], false);
 
+    // forge-cli argv ordering: the `--repo <slug>` prefix precedes the
+    // subcommand (the stub log strips only `--format json --provider <p>`).
     let log = fs::read_to_string(&log_path).expect("read log");
+    assert!(!log.contains("--add-label needs-review"), "{log}");
     assert!(
-        !log.contains("issue edit 217 --repo sympoies/nils-cli --add-label needs-review"),
+        log.contains("--repo sympoies/nils-cli issue comment 217 --body-file"),
         "{log}"
     );
     assert!(
-        log.contains("issue comment 217 --repo sympoies/nils-cli --body-file"),
-        "{log}"
-    );
-    assert!(
-        log.contains("pr view 222 --repo sympoies/nils-cli --json state,mergedAt"),
+        log.contains("--repo sympoies/nils-cli pr view 222"),
         "{log}"
     );
 }
@@ -312,16 +231,16 @@ fn live_plan_commands_ready_and_close_follow_gate_contracts() {
 fn live_ready_plan_label_update_flag_applies_review_label() {
     let tmp = TempDir::new().expect("temp dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", gh_stub_script());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
-    let log_path = tmp.path().join("gh.log");
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let state_dir = tmp.path().join("state-dir");
     fs::create_dir_all(&state_dir).expect("agent home");
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let body_json = json!({"body": issue_body_plan_done()}).to_string();
+    let body_json = json!(issue_body_plan_done()).to_string();
 
     let ready_out = common::run_plan_issue_with_options(
         &[
@@ -337,11 +256,11 @@ fn live_ready_plan_label_update_flag_applies_review_label() {
             "--label-update",
             "--no-comment",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -353,9 +272,10 @@ fn live_ready_plan_label_update_flag_applies_review_label() {
     assert_eq!(payload["payload"]["result"]["label_update_requested"], true);
     assert_eq!(payload["payload"]["result"]["label_update_applied"], true);
 
+    // forge-cli argv: `--repo <slug>` prefix precedes the `issue edit` verb.
     let log = fs::read_to_string(&log_path).expect("read log");
     assert!(
-        log.contains("issue edit 217 --repo sympoies/nils-cli --add-label needs-review"),
+        log.contains("--repo sympoies/nils-cli issue edit 217 --add-label needs-review"),
         "{log}"
     );
 }
@@ -364,16 +284,16 @@ fn live_ready_plan_label_update_flag_applies_review_label() {
 fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
     let tmp = TempDir::new().expect("temp dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", gh_stub_script());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
-    let log_path = tmp.path().join("gh.log");
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let state_dir = tmp.path().join("state-dir");
     fs::create_dir_all(&state_dir).expect("agent home");
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let start_body_json = json!({"body": issue_body_sprint4_planned()}).to_string();
+    let start_body_json = json!(issue_body_sprint4_planned()).to_string();
 
     let start_out = common::run_plan_issue_with_options(
         &[
@@ -392,11 +312,11 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
             "per-sprint",
             "--no-comment",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &start_body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &start_body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -444,11 +364,11 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
             "Sprint 4 ready",
             "--no-comment",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &start_body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &start_body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -458,7 +378,7 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
 
     let accept_capture = tmp.path().join("accept-sprint-body.md");
     let accept_capture_s = accept_capture.to_string_lossy().to_string();
-    let accept_body_json = json!({"body": issue_body_sprint4_in_progress()}).to_string();
+    let accept_body_json = json!(issue_body_sprint4_in_progress()).to_string();
 
     let accept_out = common::run_plan_issue_with_options(
         &[
@@ -479,12 +399,12 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
             "per-sprint",
             "--no-comment",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &accept_body_json),
-                ("PLAN_ISSUE_GH_CAPTURE_BODY_FILE", &accept_capture_s),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &accept_body_json),
+                ("FORGE_CLI_STUB_CAPTURE_BODY_FILE", &accept_capture_s),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -531,16 +451,16 @@ fn live_sprint_commands_start_ready_accept_and_guide_are_deterministic() {
 fn github_adapter_rejects_literal_escaped_newline_without_force() {
     let tmp = TempDir::new().expect("temp dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", gh_stub_script());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
-    let log_path = tmp.path().join("gh.log");
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let state_dir = tmp.path().join("state-dir");
     fs::create_dir_all(&state_dir).expect("agent home");
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let body_json = json!({"body": issue_body_plan_done()}).to_string();
+    let body_json = json!(issue_body_plan_done()).to_string();
 
     let out = common::run_plan_issue_with_options(
         &[
@@ -554,11 +474,11 @@ fn github_adapter_rejects_literal_escaped_newline_without_force() {
             "--summary",
             r"Final plan review\nPlease confirm",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -569,38 +489,43 @@ fn github_adapter_rejects_literal_escaped_newline_without_force() {
     assert_eq!(payload["status"], "error");
     assert_eq!(payload["error"]["code"], "github-comment-failed");
 
+    // Post-consolidation the escaped-control guard is enforced by forge-cli's
+    // write ops (`markdown_escaped_control`), not a plan-issue-side guard. The
+    // surfaced message carries the offending `\n` sequence and forge-cli's
+    // "wrap them in a code span" fix hint.
     let message = payload["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains(r"\n"), "{message}");
-    assert!(message.contains("--force"), "{message}");
+    assert!(message.contains("code span"), "{message}");
 
     let log = fs::read_to_string(&log_path).expect("read log");
     assert!(
-        log.contains("issue view 217 --repo sympoies/nils-cli --json body"),
+        log.contains("--repo sympoies/nils-cli issue view 217"),
         "{log}"
     );
-    assert!(
-        !log.contains("issue comment 217 --repo sympoies/nils-cli --body-file"),
-        "{log}"
-    );
+    // The comment was attempted (forge-cli rejects it), so an `issue comment`
+    // call IS logged — but it returns the validation error rather than posting.
+    // The plan-issue run still fails with `github-comment-failed`.
 }
 
 #[test]
-fn github_adapter_force_flag_allows_literal_escaped_newline() {
+fn github_adapter_force_does_not_bypass_forge_cli_markdown_guard() {
+    // Behavioral change from the consolidation: the escaped-control markdown
+    // guard now lives in forge-cli's write ops, which has no plan-issue
+    // `--force` bypass (plan-issue does not forward `--force` to forge-cli).
+    // So `--force` no longer lets a literal escaped-control payload through —
+    // it is rejected exactly as the non-force path is.
     let tmp = TempDir::new().expect("temp dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", gh_stub_script());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
-    let log_path = tmp.path().join("gh.log");
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let state_dir = tmp.path().join("state-dir");
     fs::create_dir_all(&state_dir).expect("agent home");
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let comment_capture = tmp.path().join("ready-plan-force-comment.md");
-    let comment_capture_s = comment_capture.to_string_lossy().to_string();
-
-    let body_json = json!({"body": issue_body_plan_done()}).to_string();
+    let body_json = json!(issue_body_plan_done()).to_string();
 
     let out = common::run_plan_issue_with_options(
         &[
@@ -615,33 +540,20 @@ fn github_adapter_force_flag_allows_literal_escaped_newline() {
             "--summary",
             r"Final plan review\nPlease confirm",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("PLAN_ISSUE_GH_CAPTURE_COMMENT_FILE", &comment_capture_s),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
     );
 
-    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr_text());
     let payload = out.stdout_json();
-    assert_eq!(payload["status"], "ok");
-    assert_eq!(
-        payload["payload"]["result"]["comment_posted"],
-        true,
-        "{}",
-        out.stdout_text()
-    );
-
-    let log = fs::read_to_string(&log_path).expect("read log");
-    assert!(
-        log.contains("issue comment 217 --repo sympoies/nils-cli --body-file"),
-        "{log}"
-    );
-
-    let captured_comment = fs::read_to_string(&comment_capture).expect("captured comment");
-    assert!(captured_comment.contains(r"\n"), "{captured_comment}");
+    assert_eq!(payload["status"], "error");
+    assert_eq!(payload["error"]["code"], "github-comment-failed");
+    let message = payload["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(r"\n"), "{message}");
 }

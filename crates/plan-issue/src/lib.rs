@@ -1,10 +1,10 @@
+pub mod adapter;
 pub mod cli;
 pub mod commands;
 mod completion;
 pub mod dispatch_record;
 mod execute;
 mod forge_cli_adapter;
-mod github;
 pub mod issue_body;
 pub mod lifecycle_lock;
 pub mod lifecycle_record;

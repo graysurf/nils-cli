@@ -134,37 +134,9 @@ fn parse_task_spec_rows(tsv: &str) -> HashMap<String, SpecRow> {
     rows
 }
 
-fn gh_stub_script() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ -n "${PLAN_ISSUE_GH_LOG:-}" ]]; then
-  printf '%s\n' "$*" >> "$PLAN_ISSUE_GH_LOG"
-fi
-
-case "${1:-} ${2:-}" in
-  "issue view")
-    body_json="${PLAN_ISSUE_GH_BODY_JSON:-}"
-    if [[ -z "$body_json" ]]; then
-      body_json='{"body":""}'
-    fi
-    printf '%s\n' "$body_json"
-    ;;
-  "issue edit")
-    ;;
-  "issue comment")
-    ;;
-  *)
-    printf 'unsupported gh call: %s\n' "$*" >&2
-    exit 1
-    ;;
-esac
-"#
-}
-
-fn gh_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
+fn forge_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
     common::plan_issue_cmd_options()
-        .with_env_remove_prefix("PLAN_ISSUE_GH_")
+        .with_env_remove_prefix("FORGE_CLI_STUB_")
         .with_path_prepend(stub_dir)
         .with_envs(envs)
 }
@@ -173,7 +145,7 @@ fn gh_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
 fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
     let tmp = TempDir::new().expect("temp dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", gh_stub_script());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
     let state_dir = tmp.path().join("state-dir");
     fs::create_dir_all(&state_dir).expect("create agent home");
@@ -248,8 +220,8 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
     assert!(issue_s1t1.notes.contains("shared-pr-anchor=S1T1"));
     assert!(issue_s1t2.notes.contains("shared-pr-anchor=S1T1"));
 
-    let body_json = json!({ "body": issue_body }).to_string();
-    let log_path = tmp.path().join("gh.log");
+    let body_json = json!(issue_body).to_string();
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let sprint_task_spec = tmp.path().join("sprint1-task-spec.tsv");
@@ -279,11 +251,11 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
             "auto",
             "--no-comment",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -350,11 +322,11 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
             "--strategy",
             "auto",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -384,9 +356,9 @@ fn auto_single_lane_end_to_end_keeps_per_sprint_runtime_truth() {
     );
     assert!(!ready_comment.contains("pr-shared"), "{ready_comment}");
 
-    let log = fs::read_to_string(&log_path).expect("read gh log");
+    let log = fs::read_to_string(&log_path).expect("read forge-cli log");
     assert!(
-        log.contains("issue view 217 --repo sympoies/nils-cli --json body"),
+        log.contains("--repo sympoies/nils-cli issue view 217"),
         "{log}"
     );
 }
