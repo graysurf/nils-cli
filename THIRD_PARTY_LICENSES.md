@@ -3,8 +3,8 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `b8e78e4d69d06f7c3646d209c18033ede33c447134b7c9f6cd5fe2a8afbbe797`
-- Third-party crates (`source != null`): 463
+- Cargo.lock SHA256: `f94b519c626f01abcf62c8f94e4ded742e3891a41e970a45cc11fc77545a8fe9`
+- Third-party crates (`source != null`): 464
 - Workspace crates (`source == null`, excluded below): 43
 
 ## Notes
@@ -19,7 +19,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | --- | ---: |
 | MIT OR Apache-2.0 | 221 |
 | MIT | 87 |
-| Apache-2.0 OR MIT | 36 |
+| Apache-2.0 OR MIT | 37 |
 | Zlib OR Apache-2.0 OR MIT | 19 |
 | Unicode-3.0 | 18 |
 | MIT/Apache-2.0 | 17 |
@@ -217,7 +217,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | jni-sys-macros | 0.4.1 | MIT OR Apache-2.0 | crates.io |
 | jobserver | 0.1.34 | MIT OR Apache-2.0 | crates.io |
 | js-sys | 0.3.102 | MIT OR Apache-2.0 | crates.io |
-| jsonwebtoken | 9.3.1 | MIT | crates.io |
+| jsonwebtoken | 10.3.0 | MIT | crates.io |
 | kurbo | 0.13.1 | Apache-2.0 OR MIT | crates.io |
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 | crates.io |
 | leb128fmt | 0.1.0 | MIT OR Apache-2.0 | crates.io |
@@ -356,6 +356,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | shell-words | 1.1.1 | MIT/Apache-2.0 | crates.io |
 | shlex | 2.0.1 | MIT OR Apache-2.0 | crates.io |
 | signal-hook-registry | 1.4.8 | MIT OR Apache-2.0 | crates.io |
+| signature | 2.2.0 | Apache-2.0 OR MIT | crates.io |
 | simd-adler32 | 0.3.9 | MIT | crates.io |
 | simd_cesu8 | 1.1.1 | Apache-2.0 OR MIT | crates.io |
 | simdutf8 | 0.1.5 | MIT OR Apache-2.0 | crates.io |

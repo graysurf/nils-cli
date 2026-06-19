@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true, features = ["env"] }
 clap_complete = { workspace = true }
-jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
 nils-build-info = { version = "1.10.0", path = "../nils-build-info" }
 nils-common = { version = "1.10.0", path = "../nils-common", package = "nils-common" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
