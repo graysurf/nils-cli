@@ -2405,6 +2405,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-secrets"
+version = "1.9.6"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "nils-build-info",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-semantic-commit"
 version = "1.9.6"
 dependencies = [

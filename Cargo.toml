@@ -19,6 +19,7 @@ members = [
   "crates/image-processing",
   "crates/macos-agent",
   "crates/screen-record",
+  "crates/secrets",
   "crates/api-testing-core",
   "crates/api-rest",
   "crates/api-gql",
