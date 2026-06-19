@@ -72,7 +72,7 @@ pub fn command_supported(command: &Option<crate::cli::Command>) -> bool {
                     | IssueCommand::List(_)
                     | IssueCommand::Edit(_)
                     | IssueCommand::Comment(_)
-                    | IssueCommand::Close { .. }
+                    | IssueCommand::Close(_)
             )
         ),
         Some(Command::Pr(args)) => matches!(

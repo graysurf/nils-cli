@@ -2029,12 +2029,16 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__issue__close)
-            opts="-h --format --remote --provider --repo --store-root --dry-run --help <ID>"
+            opts="-h --reason --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --reason)
+                    COMPREPLY=($(compgen -W "completed not planned" -- "${cur}"))
+                    return 0
+                    ;;
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0

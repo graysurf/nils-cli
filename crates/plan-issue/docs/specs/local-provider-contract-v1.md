@@ -52,12 +52,11 @@ earlier design draft. The authoritative code locations are:
 
 | What | Where |
 | --- | --- |
-| `ProviderAdapter` trait (11 methods, `repo: &str`) | `crates/plan-issue/src/github.rs:10` (re-exported from `crates/plan-issue/src/provider.rs:24`) |
-| `PrMergeSummary` struct | `crates/plan-issue/src/github.rs:69` |
+| `ProviderAdapter` trait (11 methods, `repo: &str`) | `crates/plan-issue/src/adapter.rs` (re-exported from `crates/plan-issue/src/provider.rs:24`) |
+| `PrMergeSummary` struct | `crates/plan-issue/src/adapter.rs` |
 | `CloseReason` enum (`Completed` \| `NotPlanned`) | `crates/plan-issue/src/commands/plan.rs:9` |
-| `Provider` / `Repo` / `select_adapter` / `resolve_repo` | `crates/plan-issue/src/provider.rs:30,52,142,111` |
-| GitHub impl (`GhCliAdapter`, shells `gh`) | `crates/plan-issue/src/github.rs` |
-| GitLab impl (`ForgeCliAdapter`, shells `forge-cli`) | `crates/plan-issue/src/forge_cli_adapter.rs` |
+| `Provider` / `Repo` / `select_adapter` / `resolve_repo` | `crates/plan-issue/src/provider.rs` |
+| All providers impl (`ForgeCliAdapter`, shells `forge-cli --provider github\|gitlab\|local`) | `crates/plan-issue/src/forge_cli_adapter.rs` |
 | Provider-capability contract + third-provider recipe | `crates/plan-issue/docs/runbooks/provider-routing-runbook.md` §3, §5 |
 
 The trait takes `repo: &str` (the slug) and has no `provider()` method; call

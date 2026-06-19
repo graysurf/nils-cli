@@ -1,18 +1,20 @@
-//! GitLab-backed `ProviderAdapter` that routes through `forge-cli`'s
+//! `ProviderAdapter` that routes every provider op through `forge-cli`'s
 //! provider-neutral surface.
 //!
-//! Sprint 2 Task 2.2 wires the `record open` path (`create_issue`,
-//! `comment_issue`, `edit_issue_body`, `issue_evidence`, `edit_issue_labels`)
-//! through `forge-cli` subprocess calls. The remaining methods stay as
-//! `provider_not_implemented` stubs until Sprint 3 lands `record post / audit
-//! / close / link-pr` and Sprint 4 lands the dispatch family.
+//! This is the single live adapter for plan-issue: after the
+//! plan-issue → forge-cli consolidation
+//! (`docs/plans/2026-06-19-plan-issue-forge-cli-consolidation`) every provider
+//! — GitHub, GitLab, and the in-process Local backend — routes through this
+//! adapter, retiring the in-crate `gh` client. `forge-cli` becomes the single
+//! provider gateway and identity chokepoint.
 //!
 //! Subprocess details:
 //!
 //! - The adapter shells out to `forge-cli` (overridable via `FORGE_CLI_BIN`).
 //! - Every call passes `--format json --provider <provider> --repo <slug>`
-//!   (`gitlab`, or `local` for the in-process file-backed backend) so the
-//!   target is unambiguous, even when the cwd's git remote points elsewhere.
+//!   (`github`, `gitlab`, or `local` for the in-process file-backed backend)
+//!   so the target is unambiguous, even when the cwd's git remote points
+//!   elsewhere.
 //! - The v1 envelope (`{ok, schema_version, data}` for success or
 //!   `{ok:false, error:{code,message}}`) is parsed into a typed error message
 //!   carrying both the forge-cli error code and the argv that failed.
@@ -29,8 +31,8 @@ use nils_common::process as common_process;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::adapter::{PrMergeSummary, ProviderAdapter};
 use crate::commands::plan::CloseReason;
-use crate::github::{PrMergeSummary, ProviderAdapter};
 
 /// Runner abstraction so unit tests can inject scripted forge-cli responses.
 pub trait ForgeCliRunner {
@@ -66,17 +68,17 @@ impl ForgeCliRunner for ProcessForgeCliRunner {
 }
 
 /// Forge-routed `ProviderAdapter`. Carries the `--provider` string it emits so
-/// the same adapter serves both the GitLab backend and the in-process
-/// `Provider::Local` file-backed backend (`forge-cli --provider local`).
+/// the one adapter serves GitHub, GitLab, and the in-process `Provider::Local`
+/// file-backed backend (`forge-cli --provider github|gitlab|local`).
 pub struct ForgeCliAdapter {
-    /// `--provider` value forwarded to every forge-cli call (`gitlab` or
-    /// `local`). Local rides the same forge-cli rail; the store root is read by
-    /// forge-cli from `FORGE_CLI_LOCAL_STORE`.
+    /// `--provider` value forwarded to every forge-cli call (`github`,
+    /// `gitlab`, or `local`). Local rides the same forge-cli rail; the store
+    /// root is read by forge-cli from `FORGE_CLI_LOCAL_STORE`.
     provider: &'static str,
-    /// Mirrors `GhCliAdapter::force`. Sprint 2/3 trait methods do not consult
-    /// it because forge-cli's own markdown-validation gates already enforce
-    /// the same policy; this field is retained so the adapter can grow a
-    /// `--force` pass-through later without an API change.
+    /// Force flag. Trait methods do not consult it because forge-cli's own
+    /// markdown / local-path validation gates already enforce the same policy;
+    /// this field is retained so the adapter can grow a `--force` pass-through
+    /// later without an API change.
     #[allow(dead_code)]
     force: bool,
     runner: Box<dyn ForgeCliRunner + Send + Sync>,
@@ -86,6 +88,14 @@ impl ForgeCliAdapter {
     /// GitLab-backed adapter (emits `--provider gitlab`).
     pub fn new(force: bool) -> Self {
         Self::with_provider("gitlab", force, Box::new(ProcessForgeCliRunner))
+    }
+
+    /// GitHub-backed adapter (emits `--provider github`). Selected for GitHub
+    /// repos after the plan-issue → forge-cli consolidation retired the
+    /// in-crate `gh` client; identity is the inherited ambient token, exactly
+    /// as the prior `GhCliAdapter` behaved.
+    pub fn new_github(force: bool) -> Self {
+        Self::with_provider("github", force, Box::new(ProcessForgeCliRunner))
     }
 
     /// Local-backend adapter (emits `--provider local`). forge-cli reads the
@@ -116,6 +126,14 @@ impl ForgeCliAdapter {
     #[cfg(test)]
     pub fn with_runner_local(force: bool, runner: Box<dyn ForgeCliRunner + Send + Sync>) -> Self {
         Self::with_provider("local", force, runner)
+    }
+
+    /// Test-only constructor for the GitHub provider with a scripted runner.
+    /// Exercises the GitHub-specific argv branches (`--reason` on close,
+    /// `--required-only` on the merge-gate `pr checks` call).
+    #[cfg(test)]
+    pub fn with_runner_github(force: bool, runner: Box<dyn ForgeCliRunner + Send + Sync>) -> Self {
+        Self::with_provider("github", force, runner)
     }
 
     /// Run forge-cli with the given args, parse the v1 envelope, and return
@@ -324,17 +342,20 @@ impl ProviderAdapter for ForgeCliAdapter {
         &self,
         repo: &str,
         issue: u64,
-        _reason: CloseReason,
+        reason: CloseReason,
         close_comment: Option<&str>,
     ) -> Result<(), String> {
-        // GitLab `glab issue close` has no `--reason` or `--comment` flag,
-        // and `forge-cli issue close` mirrors that today. To preserve the
-        // "post a final comment + close" semantic that GitHub callers rely
-        // on, decompose into two atomic calls: `issue comment --body <c>`
-        // (only when a comment is supplied) then `issue close`. The
-        // `CloseReason` argument is intentionally dropped — GitLab has no
-        // native concept; both `Completed` and `NotPlanned` resolve to the
-        // same "closed" state.
+        // To preserve the "post a final comment + close" semantic that
+        // callers rely on, decompose into two atomic calls: `issue comment
+        // --body <c>` (only when a comment is supplied) then `issue close`.
+        //
+        // `CloseReason` handling is provider-specific:
+        // - GitHub: forge-cli's `issue close --reason completed|"not planned"`
+        //   accepts the reason, so pass it through to keep the
+        //   completed/not-planned distinction.
+        // - GitLab / Local: `glab issue close` has no `--reason` concept and
+        //   forge-cli silently ignores the flag on those providers, so the
+        //   reason resolves to the same "closed" state regardless.
         let issue_str = issue.to_string();
         if let Some(comment) = close_comment
             && !comment.trim().is_empty()
@@ -345,6 +366,13 @@ impl ProviderAdapter for ForgeCliAdapter {
         }
         let mut args = self.base_args(repo);
         args.extend(["issue", "close", &issue_str]);
+        if self.provider == "github" {
+            args.push("--reason");
+            args.push(match reason {
+                CloseReason::Completed => "completed",
+                CloseReason::NotPlanned => "not planned",
+            });
+        }
         self.run_envelope(&args).map(|_| ())
     }
 
@@ -385,39 +413,77 @@ impl ProviderAdapter for ForgeCliAdapter {
 
         let mut checks_args = self.base_args(repo);
         checks_args.extend(["pr", "checks", &pr_str]);
+        // GitHub gates on the REQUIRED-check subset: ask forge-cli for the
+        // required-only snapshot so the gating `state` / `required_count` /
+        // failing-check data reflect only required checks. GitLab / Local
+        // have no required-check concept, so they use the plain aggregate
+        // rollup and report zero required checks (see below).
+        let github = self.provider == "github";
+        if github {
+            checks_args.push("--required-only");
+        }
         // `pr checks` exits non-zero when the rollup is `failure` / `pending`
         // — that is information we want, not an error. The forge-cli error
         // path here would surface those as `Err`; today's pr_checks_gitlab
         // also already handles the "no pipeline" case (#485) returning
-        // empty success. For pr_merge_summary we just want the `state`
-        // field. If forge-cli errors, treat checks as `None`.
-        let checks = match self.run_envelope(&checks_args) {
-            Ok(checks_data) => checks_data
-                .get("state")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .filter(|s| !s.is_empty()),
-            Err(_) => None,
+        // empty success. If forge-cli errors, treat checks as `None`.
+        let checks_data = self.run_envelope(&checks_args).ok();
+
+        // Aggregate rollup state used by `checks` (informational) and the
+        // GitLab fallback. Under `--required-only` on GitHub this `state` is
+        // already the required-gating rollup.
+        let checks = checks_data
+            .as_ref()
+            .and_then(|d| d.get("state"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+
+        let (required_state, required_count, non_required_failures) = if github {
+            match checks_data.as_ref() {
+                // forge-cli's `pr checks --required-only` returns the gating
+                // `state` (success/failure/pending/...) and the number of
+                // required checks. `data.checks` carries every check with its
+                // `required` flag, from which we recover the non-required
+                // failure list (informational evidence; never blocks).
+                Some(data) => {
+                    let required_state = data
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .filter(|s| !s.is_empty());
+                    let required_count = data
+                        .get("required_count")
+                        .and_then(Value::as_u64)
+                        .and_then(|n| u32::try_from(n).ok());
+                    let non_required_failures = non_required_failure_names(data);
+                    (required_state, required_count, non_required_failures)
+                }
+                // `pr checks` failed to produce a usable snapshot: stay
+                // conservative and leave classification unknown (`None`), so
+                // the close gate falls back to the aggregate `checks` rollup.
+                None => (None, None, Vec::new()),
+            }
+        } else {
+            // GitLab / Local have no first-class required-check concept:
+            // pipeline jobs are reported as a single rolled-up status, or not
+            // at all. Report zero required checks — the same shape a GitHub
+            // branch without a required-check rule yields — so the
+            // closeout-comment `Required` column renders `none required` (via
+            // `required_check_label`) instead of `unknown`, and the close gate
+            // treats it as a clean resolve per the #502 "non-required failures
+            // never block close" contract. Tracked at sympoies/nils-cli#557.
+            (Some("success".to_string()), Some(0), Vec::new())
         };
-        // GitLab has no first-class required-check concept: pipeline
-        // jobs are either reported by `glab` as a single rolled-up
-        // status, or not at all. Report zero required checks — the
-        // same shape `pr_required_summary` returns for a GitHub branch
-        // without a required-check rule — so the closeout-comment
-        // `Required` column renders `none required` (via
-        // `required_check_label` at
-        // `lifecycle_record.rs:2154-2160`) instead of `unknown`, and
-        // the close gate in `lifecycle_record.rs:2446-2469` treats it
-        // as a clean resolve per the #502 "non-required failures
-        // never block close" contract. Tracked at sympoies/nils-cli#557.
+
         Ok(PrMergeSummary {
             state,
             merged,
             merge_sha,
             checks,
-            required_state: Some("success".to_string()),
-            required_count: Some(0),
-            non_required_failures: Vec::new(),
+            required_state,
+            required_count,
+            non_required_failures,
         })
     }
 
@@ -450,6 +516,42 @@ impl ProviderAdapter for ForgeCliAdapter {
             .collect();
         Ok(reshaped)
     }
+}
+
+/// Recover the failing non-required check names from a forge-cli
+/// `pr checks` payload's `data.checks` array. `data.checks` carries every
+/// check (required or not) with its `required` flag and normalized `state`,
+/// even under `--required-only` (which only narrows the gating counters), so
+/// the non-required failures the closeout comment surfaces can be derived
+/// without a second backend call. Sorted + deduped for stable rendering.
+fn non_required_failure_names(checks_data: &Value) -> Vec<String> {
+    let Some(items) = checks_data.get("checks").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = items
+        .iter()
+        .filter(|item| {
+            // Non-required checks only.
+            !item
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter(|item| {
+            let state = item
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase);
+            matches!(
+                state.as_deref(),
+                Some("failure" | "cancelled" | "timed_out" | "error")
+            )
+        })
+        .filter_map(|item| item.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]
@@ -511,6 +613,19 @@ mod tests {
         };
         (
             ForgeCliAdapter::with_runner_local(false, Box::new(proxy)),
+            runner,
+        )
+    }
+
+    fn adapter_with_github(
+        responses: Vec<&str>,
+    ) -> (ForgeCliAdapter, std::sync::Arc<RunnerHandle>) {
+        let runner = std::sync::Arc::new(RunnerHandle::new(responses));
+        let proxy = RunnerProxy {
+            inner: runner.clone(),
+        };
+        (
+            ForgeCliAdapter::with_runner_github(false, Box::new(proxy)),
             runner,
         )
     }
@@ -808,6 +923,55 @@ mod tests {
     }
 
     #[test]
+    fn close_issue_passes_reason_on_github_only() {
+        // GitHub: the close call carries `--reason completed` so the
+        // completed/not-planned distinction survives the forge-cli flip.
+        let (adapter, handle) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.issue.close.v1","data":{"provider":"github","number":7,"url":"u","state":"closed"}}"#,
+        ]);
+        adapter
+            .close_issue("o/r", 7, CloseReason::Completed, None)
+            .expect("github close completed");
+        let calls = handle.calls();
+        assert_eq!(calls.len(), 1, "expected only the close call");
+        let close = &calls[0];
+        assert!(close.windows(2).any(|w| w[0] == "issue" && w[1] == "close"));
+        let idx = close
+            .iter()
+            .position(|s| s == "--reason")
+            .expect("github close must carry --reason");
+        assert_eq!(close[idx + 1], "completed");
+
+        // GitHub NotPlanned maps to `not planned`.
+        let (adapter, handle) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.issue.close.v1","data":{"provider":"github","number":7,"url":"u","state":"closed"}}"#,
+        ]);
+        adapter
+            .close_issue("o/r", 7, CloseReason::NotPlanned, None)
+            .expect("github close not planned");
+        let calls = handle.calls();
+        let idx = calls[0]
+            .iter()
+            .position(|s| s == "--reason")
+            .expect("github close must carry --reason");
+        assert_eq!(calls[0][idx + 1], "not planned");
+
+        // GitLab: the reason is still dropped (degrade unchanged).
+        let (adapter, handle) = adapter_with(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.issue.close.v1","data":{"provider":"gitlab","number":7,"url":"u","state":"closed"}}"#,
+        ]);
+        adapter
+            .close_issue("g/p", 7, CloseReason::NotPlanned, None)
+            .expect("gitlab close");
+        let calls = handle.calls();
+        assert!(
+            !calls[0].iter().any(|s| s == "--reason"),
+            "gitlab close must not carry --reason: {:?}",
+            calls[0]
+        );
+    }
+
+    #[test]
     fn close_issue_blank_comment_skips_the_comment_call() {
         let (adapter, handle) = adapter_with(vec![
             r#"{
@@ -887,6 +1051,108 @@ mod tests {
         assert!(!summary.merged);
         assert!(summary.merge_sha.is_none());
         assert!(summary.checks.is_none(), "checks failure tolerated as None");
+    }
+
+    #[test]
+    fn pr_merge_summary_github_blocks_on_failing_required_check() {
+        // HIGHEST-PRIORITY correctness case: a GitHub PR whose REQUIRED check
+        // failed must report `required_state=failure` with a non-zero
+        // `required_count` so the `record close` merge gate refuses to pass.
+        // Before the consolidation fix the adapter hard-coded
+        // `required_state=success, required_count=0` and would have let this
+        // through as a false pass.
+        let (adapter, handle) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"github","number":7,"url":"u","state":"merged","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":"2025-01-01T00:00:00Z","merge_commit_sha":"deadbeef","labels":[]}}"#,
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.checks.v1","data":{"provider":"github","state":"failure","required_count":1,"success_count":0,"failed":[{"name":"ci-required"}],"pending":[],"checks":[{"name":"ci-required","state":"failure","required":true}]}}"#,
+        ]);
+        let summary = adapter.pr_merge_summary("o/r", 7).expect("merge summary");
+        assert_eq!(
+            summary.required_state.as_deref(),
+            Some("failure"),
+            "failing required check must surface as required_state=failure"
+        );
+        assert_eq!(summary.required_count, Some(1));
+        // The `pr checks` call must request the required-only gating subset.
+        let calls = handle.calls();
+        assert_eq!(calls.len(), 2);
+        let checks_call = &calls[1];
+        assert!(
+            checks_call
+                .windows(2)
+                .any(|w| w[0] == "pr" && w[1] == "checks"),
+            "{checks_call:?}"
+        );
+        assert!(
+            checks_call.iter().any(|s| s == "--required-only"),
+            "github merge-gate must pass --required-only: {checks_call:?}"
+        );
+    }
+
+    #[test]
+    fn pr_merge_summary_github_passes_with_clean_required_checks() {
+        let (adapter, _) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"github","number":7,"url":"u","state":"merged","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":"2025-01-01T00:00:00Z","merge_commit_sha":"deadbeef","labels":[]}}"#,
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.checks.v1","data":{"provider":"github","state":"success","required_count":2,"success_count":2,"failed":[],"pending":[],"checks":[{"name":"build","state":"success","required":true},{"name":"lint","state":"success","required":true}]}}"#,
+        ]);
+        let summary = adapter.pr_merge_summary("o/r", 7).expect("merge summary");
+        assert_eq!(summary.required_state.as_deref(), Some("success"));
+        assert_eq!(summary.required_count, Some(2));
+        assert!(summary.non_required_failures.is_empty());
+    }
+
+    #[test]
+    fn pr_merge_summary_github_reports_non_required_failures_without_blocking() {
+        // A non-required check failing is informational only: required_state
+        // stays success (gate passes) but the non-required failure name is
+        // surfaced for the closeout comment.
+        let (adapter, _) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"github","number":7,"url":"u","state":"merged","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":"2025-01-01T00:00:00Z","merge_commit_sha":"deadbeef","labels":[]}}"#,
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.checks.v1","data":{"provider":"github","state":"success","required_count":1,"success_count":1,"failed":[],"pending":[],"checks":[{"name":"build","state":"success","required":true},{"name":"optional-lint","state":"failure","required":false}]}}"#,
+        ]);
+        let summary = adapter.pr_merge_summary("o/r", 7).expect("merge summary");
+        assert_eq!(summary.required_state.as_deref(), Some("success"));
+        assert_eq!(summary.required_count, Some(1));
+        assert_eq!(
+            summary.non_required_failures,
+            vec!["optional-lint".to_string()]
+        );
+    }
+
+    #[test]
+    fn pr_merge_summary_github_zero_required_checks_passes() {
+        // A branch with no required-check rule reports required_count=0 and a
+        // success gating state — the `none required` closeout label and a clean
+        // gate, matching the GitLab parity behaviour.
+        let (adapter, _) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"github","number":7,"url":"u","state":"merged","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":"2025-01-01T00:00:00Z","merge_commit_sha":"deadbeef","labels":[]}}"#,
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.checks.v1","data":{"provider":"github","state":"success","required_count":0,"success_count":0,"failed":[],"pending":[],"checks":[]}}"#,
+        ]);
+        let summary = adapter.pr_merge_summary("o/r", 7).expect("merge summary");
+        assert_eq!(summary.required_state.as_deref(), Some("success"));
+        assert_eq!(summary.required_count, Some(0));
+        assert!(summary.non_required_failures.is_empty());
+    }
+
+    #[test]
+    fn pr_merge_summary_gitlab_keeps_zero_required_path() {
+        // GitLab has no required-check concept: required_state stays success
+        // with required_count=0 regardless of the pipeline rollup, so the
+        // closeout renders `none required` and the gate treats it as clean.
+        let (adapter, handle) = adapter_with(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"gitlab","number":7,"url":"u","state":"merged","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":"2025-01-01T00:00:00Z","merge_commit_sha":"deadbeef","labels":[]}}"#,
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.checks.v1","data":{"provider":"gitlab","state":"failure","required_count":1,"success_count":0,"failed":[{"name":"pipeline"}],"pending":[],"checks":[]}}"#,
+        ]);
+        let summary = adapter.pr_merge_summary("g/p", 7).expect("merge summary");
+        assert_eq!(summary.required_state.as_deref(), Some("success"));
+        assert_eq!(summary.required_count, Some(0));
+        assert!(summary.non_required_failures.is_empty());
+        // GitLab must NOT request --required-only (no required-check concept).
+        let calls = handle.calls();
+        assert!(
+            !calls[1].iter().any(|s| s == "--required-only"),
+            "gitlab merge-gate must not pass --required-only: {:?}",
+            calls[1]
+        );
     }
 
     #[test]

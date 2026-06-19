@@ -132,54 +132,9 @@ fn parse_task_spec_rows(tsv: &str) -> HashMap<String, SpecRow> {
     rows
 }
 
-fn gh_stub_script() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ -n "${PLAN_ISSUE_GH_LOG:-}" ]]; then
-  printf '%s\n' "$*" >> "$PLAN_ISSUE_GH_LOG"
-fi
-
-capture_body_file() {
-  local body_file=""
-  local prev=""
-  for arg in "$@"; do
-    if [[ "$prev" == "--body-file" ]]; then
-      body_file="$arg"
-      break
-    fi
-    prev="$arg"
-  done
-
-  if [[ -n "${PLAN_ISSUE_GH_CAPTURE_BODY_FILE:-}" && -n "$body_file" ]]; then
-    cp "$body_file" "$PLAN_ISSUE_GH_CAPTURE_BODY_FILE"
-  fi
-}
-
-case "${1:-} ${2:-}" in
-  "issue view")
-    body_json="${PLAN_ISSUE_GH_BODY_JSON:-}"
-    if [[ -z "$body_json" ]]; then
-      body_json='{"body":""}'
-    fi
-    printf '%s\n' "$body_json"
-    ;;
-  "issue edit")
-    capture_body_file "$@"
-    ;;
-  "issue comment")
-    ;;
-  *)
-    printf 'unsupported gh call: %s\n' "$*" >&2
-    exit 1
-    ;;
-esac
-"#
-}
-
-fn gh_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
+fn forge_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
     common::plan_issue_cmd_options()
-        .with_env_remove_prefix("PLAN_ISSUE_GH_")
+        .with_env_remove_prefix("FORGE_CLI_STUB_")
         .with_path_prepend(stub_dir)
         .with_envs(envs)
 }
@@ -188,13 +143,13 @@ fn gh_cmd_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
 fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
     let tmp = TempDir::new().expect("temp dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", gh_stub_script());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
     let state_dir = tmp.path().join("state-dir");
     fs::create_dir_all(&state_dir).expect("agent home");
     let state_dir_s = state_dir.to_string_lossy().to_string();
 
-    let log_path = tmp.path().join("gh.log");
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
     let capture_body = tmp.path().join("captured-start-sprint-body.md");
     let capture_body_s = capture_body.to_string_lossy().to_string();
@@ -254,7 +209,7 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
     );
 
     let issue_body = fs::read_to_string(&plan_issue_body).expect("read issue body");
-    let body_json = json!({ "body": issue_body.clone() }).to_string();
+    let body_json = json!(issue_body.clone()).to_string();
 
     let task_spec_out = tmp.path().join("sprint1-task-spec.tsv");
     let task_spec_out_s = task_spec_out.to_string_lossy().to_string();
@@ -282,12 +237,12 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
             "auto",
             "--no-comment",
         ],
-        gh_cmd_options(
+        forge_cmd_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_BODY_JSON", &body_json),
-                ("PLAN_ISSUE_GH_CAPTURE_BODY_FILE", &capture_body_s),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_CAPTURE_BODY_FILE", &capture_body_s),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),
@@ -343,17 +298,13 @@ fn live_start_sprint_uses_issue_table_runtime_truth_without_rewrite() {
     assert!(prompt.contains("Tasks: S1T1, S1T2"), "{prompt}");
     assert!(prompt.contains("Execution Mode: per-sprint"), "{prompt}");
 
-    let log = fs::read_to_string(&log_path).expect("read gh log");
+    // forge-cli argv: `--repo <slug>` prefix precedes the subcommand; no
+    // `--json` flag. The stub log strips only `--format json --provider <p>`.
+    let log = fs::read_to_string(&log_path).expect("read forge-cli log");
     assert!(
-        log.contains("issue view 217 --repo sympoies/nils-cli --json body"),
+        log.contains("--repo sympoies/nils-cli issue view 217"),
         "{log}"
     );
-    assert!(
-        !log.contains("issue edit 217 --repo sympoies/nils-cli --body-file"),
-        "{log}"
-    );
-    assert!(
-        !log.contains("issue comment 217 --repo sympoies/nils-cli --body-file"),
-        "{log}"
-    );
+    assert!(!log.contains("issue edit 217"), "{log}");
+    assert!(!log.contains("issue comment 217"), "{log}");
 }

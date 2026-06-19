@@ -29,39 +29,9 @@ fn v2_comment_body(role: &str, profile: &str, data: Value) -> String {
     )
 }
 
-fn live_record_gh_stub() -> &'static str {
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ -n "${PLAN_ISSUE_GH_LOG:-}" ]]; then
-  printf '%s\n' "$*" >> "$PLAN_ISSUE_GH_LOG"
-fi
-
-cmd="${1:-}"
-sub="${2:-}"
-case "$cmd $sub" in
-  "issue view")
-    if [[ -n "${PLAN_ISSUE_GH_VIEW_JSON_FILE:-}" ]]; then
-      cat "$PLAN_ISSUE_GH_VIEW_JSON_FILE"
-    else
-      printf '%s\n' "${PLAN_ISSUE_GH_VIEW_JSON:-{\"body\":\"\",\"comments\":[]}}"
-    fi
-    ;;
-  "issue create" | "issue edit" | "issue comment" | "issue close")
-    echo "provider mutation should have been blocked before gh: $*" >&2
-    exit 99
-    ;;
-  *)
-    echo "unsupported gh call: $*" >&2
-    exit 1
-    ;;
-esac
-"#
-}
-
 fn live_record_options(stub_dir: &Path, envs: &[(&str, &str)]) -> CmdOptions {
     common::plan_issue_cmd_options()
-        .with_env_remove_prefix("PLAN_ISSUE_GH_")
+        .with_env_remove_prefix("FORGE_CLI_STUB_")
         .with_path_prepend(stub_dir)
         .with_envs(envs)
 }
@@ -79,40 +49,6 @@ fn assert_comment_visible_prefix(body: &str, expected: &str) {
         !body.contains(&format!("```{PAYLOAD_FENCE_INFO}")),
         "payload must remain hidden:\n{body}"
     );
-}
-
-fn assert_provider_payload_privacy_error(
-    out: &nils_test_support::cmd::CmdOutput,
-    code: &str,
-    home_suggestion: &str,
-) {
-    assert_eq!(
-        out.code,
-        1,
-        "stdout={} stderr={}",
-        out.stdout_text(),
-        out.stderr_text()
-    );
-    let parsed = out.stdout_json();
-    assert_eq!(parsed["status"], "error");
-    assert_eq!(
-        parsed["error"]["code"],
-        code,
-        "stdout={} stderr={}",
-        out.stdout_text(),
-        out.stderr_text()
-    );
-    let message = parsed["error"]["message"].as_str().expect("message");
-    assert!(
-        message.contains("machine-local home path"),
-        "message should name local-path class: {message}"
-    );
-    assert!(
-        message.contains(home_suggestion),
-        "message should suggest $HOME-relative replacement: {message}"
-    );
-    assert!(!message.contains("/Users/dev"), "{message}");
-    assert!(!message.contains("/home/alice"), "{message}");
 }
 
 fn write_fixture_files(dir: &Path, body: &str, comments: &Value) {
@@ -274,8 +210,8 @@ fn record_post_state_summary_file_is_rendered_in_dry_run() {
 fn record_post_live_rejects_local_path_from_summary_file_before_provider_mutation() {
     let tmp = TempDir::new().expect("tempdir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", live_record_gh_stub());
-    let log_path = tmp.path().join("gh.log");
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let payload = tmp.path().join("state.json");
@@ -316,26 +252,40 @@ fn record_post_live_rejects_local_path_from_summary_file_before_provider_mutatio
             "--summary-file",
             summary.to_str().expect("summary str"),
         ],
-        live_record_options(stub.path(), &[("PLAN_ISSUE_GH_LOG", &log_s)]),
+        live_record_options(stub.path(), &[("FORGE_CLI_STUB_LOG", &log_s)]),
     );
 
-    assert_provider_payload_privacy_error(
-        &out,
-        "record-post-comment-post-failed",
-        "$HOME/Project/private/rendered.md",
+    // Post-consolidation the local-path privacy guard is enforced by forge-cli
+    // on the `issue comment` write (not a plan-issue-side pre-flight guard), so
+    // forge-cli IS invoked and rejects the rendered comment; the adapter
+    // surfaces forge-cli's `local_path_present` error through
+    // `record-post-comment-post-failed`. The adapter surfaces only
+    // `code: message`, so the message carries the generic class line; the
+    // per-path `$HOME/...` suggestion lives in forge-cli's unsurfaced `detail`.
+    assert_eq!(
+        out.code,
+        1,
+        "stdout={} stderr={}",
+        out.stdout_text(),
+        out.stderr_text()
     );
+    let parsed = out.stdout_json();
+    assert_eq!(parsed["status"], "error");
+    assert_eq!(parsed["error"]["code"], "record-post-comment-post-failed");
+    let message = parsed["error"]["message"].as_str().expect("message");
     assert!(
-        !log_path.exists(),
-        "gh must not run when final rendered comment is unsafe"
+        message.contains("machine-local home path"),
+        "message should name local-path class: {message}"
     );
+    assert!(!message.contains("/Users/dev"), "{message}");
 }
 
 #[test]
 fn record_post_live_rejects_summary_payload_carrier_before_provider_mutation() {
     let tmp = TempDir::new().expect("tempdir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", live_record_gh_stub());
-    let log_path = tmp.path().join("gh.log");
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let payload = tmp.path().join("state.json");
@@ -381,7 +331,7 @@ fn record_post_live_rejects_summary_payload_carrier_before_provider_mutation() {
             "--summary-file",
             summary.to_str().expect("summary str"),
         ],
-        live_record_options(stub.path(), &[("PLAN_ISSUE_GH_LOG", &log_s)]),
+        live_record_options(stub.path(), &[("FORGE_CLI_STUB_LOG", &log_s)]),
     );
 
     assert_eq!(out.code, 64, "stdout={}", out.stdout_text());
@@ -406,8 +356,8 @@ fn record_post_live_rejects_summary_payload_carrier_before_provider_mutation() {
 fn record_post_live_rejects_summary_payload_carrier_before_unclosed_details() {
     let tmp = TempDir::new().expect("tempdir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", live_record_gh_stub());
-    let log_path = tmp.path().join("gh.log");
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let payload = tmp.path().join("state.json");
@@ -455,7 +405,7 @@ fn record_post_live_rejects_summary_payload_carrier_before_unclosed_details() {
             "--summary-file",
             summary.to_str().expect("summary str"),
         ],
-        live_record_options(stub.path(), &[("PLAN_ISSUE_GH_LOG", &log_s)]),
+        live_record_options(stub.path(), &[("FORGE_CLI_STUB_LOG", &log_s)]),
     );
 
     assert_eq!(out.code, 64, "stdout={}", out.stdout_text());
@@ -1148,8 +1098,8 @@ fn record_repair_dashboard_renders_canonical_dashboard_from_body_and_comments() 
 fn record_repair_dashboard_live_rejects_local_path_in_rendered_dashboard_before_edit() {
     let tmp = TempDir::new().expect("tempdir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", live_record_gh_stub());
-    let log_path = tmp.path().join("gh.log");
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
+    let log_path = tmp.path().join("forge-cli.log");
     let log_s = log_path.to_string_lossy().to_string();
 
     let comments = json!([
@@ -1172,14 +1122,12 @@ fn record_repair_dashboard_live_rejects_local_path_in_rendered_dashboard_before_
             "created_at": "2026-05-23T10:00:00Z"
         }
     ]);
-    let view_json = json!({
-        "body": "## Current Dashboard\n\n- Status: stale\n",
-        "comments": comments
-    })
-    .to_string();
-    let view_json_path = tmp.path().join("issue-view.json");
-    fs::write(&view_json_path, &view_json).expect("write view json");
-    let view_json_path_s = view_json_path.to_string_lossy().to_string();
+    // The issue body is clean (`issue view` is a read with no guard); the local
+    // path rides in the state comment's `target_scope`, so the *rendered*
+    // dashboard carries it into the `issue edit` write — which forge-cli's
+    // `local_path_present` guard rejects.
+    let body_json = json!("## Current Dashboard\n\n- Status: stale\n").to_string();
+    let comments_json = comments.to_string();
 
     let out = common::run_plan_issue_with_options(
         &[
@@ -1195,20 +1143,41 @@ fn record_repair_dashboard_live_rejects_local_path_in_rendered_dashboard_before_
         live_record_options(
             stub.path(),
             &[
-                ("PLAN_ISSUE_GH_LOG", &log_s),
-                ("PLAN_ISSUE_GH_VIEW_JSON_FILE", &view_json_path_s),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_VIEW_COMMENTS_JSON", &comments_json),
             ],
         ),
     );
 
-    assert_provider_payload_privacy_error(
-        &out,
-        "record-repair-edit-failed",
-        "$HOME/Project/private/dashboard",
+    // Post-consolidation the local-path privacy guard is enforced by forge-cli
+    // on the `issue edit` write, surfaced through the adapter as the
+    // `record-repair-edit-failed` runtime error. The adapter surfaces only
+    // forge-cli's `code: message`, so the message carries the generic
+    // machine-local-home-path class line (the per-path `$HOME/...` suggestion
+    // lives in forge-cli's `detail`, which the adapter does not surface).
+    assert_eq!(
+        out.code,
+        1,
+        "stdout={} stderr={}",
+        out.stdout_text(),
+        out.stderr_text()
     );
-    let log = fs::read_to_string(&log_path).expect("read gh log");
+    let parsed = out.stdout_json();
+    assert_eq!(parsed["status"], "error");
+    assert_eq!(parsed["error"]["code"], "record-repair-edit-failed");
+    let message = parsed["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("machine-local home path"),
+        "message should name local-path class: {message}"
+    );
+    assert!(!message.contains("/Users/dev"), "{message}");
+
+    // `issue view` (read) ran; the `issue edit` write was attempted and
+    // rejected by forge-cli, so both verbs appear in the log.
+    let log = fs::read_to_string(&log_path).expect("read forge-cli log");
     assert!(log.contains("issue view 217"), "{log}");
-    assert!(!log.contains("issue edit 217"), "{log}");
+    assert!(log.contains("issue edit 217"), "{log}");
 }
 
 #[test]
@@ -2063,16 +2032,16 @@ fn record_post_state_fixture_returns_rendered_body_without_provider_call() {
     );
 }
 
-fn record_open_dry_run_gh_stub() -> &'static str {
+fn record_open_dry_run_forge_stub() -> &'static str {
     r#"#!/usr/bin/env bash
-echo "record_open_dry_run_gh_stub should not be called" >&2
+echo "record_open_dry_run_forge_stub should not be called" >&2
 exit 1
 "#
 }
 
 fn dry_run_cmd_options(stub_dir: &Path) -> CmdOptions {
     common::plan_issue_cmd_options()
-        .with_env_remove_prefix("PLAN_ISSUE_GH_")
+        .with_env_remove_prefix("FORGE_CLI_STUB_")
         .with_path_prepend(stub_dir)
 }
 
@@ -2081,7 +2050,7 @@ fn record_open_dry_run_returns_preview_without_gh_calls() {
     use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
 
     let stub = StubBinDir::new();
-    stub.write_exe("gh", record_open_dry_run_gh_stub());
+    stub.write_exe("forge-cli", record_open_dry_run_forge_stub());
 
     let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
     let bundle = repo.path().join("docs/plans/sample");
@@ -2260,7 +2229,7 @@ fn record_open_dry_run_resolves_relative_bundle() {
     use nils_test_support::git::{InitRepoOptions, init_repo_with};
 
     let stub = StubBinDir::new();
-    stub.write_exe("gh", record_open_dry_run_gh_stub());
+    stub.write_exe("forge-cli", record_open_dry_run_forge_stub());
 
     let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
     write_sample_bundle(&repo.path().join("docs/plans/sample"));
@@ -2323,7 +2292,7 @@ fn record_open_allow_dirty_permits_uncommitted_bundle() {
     use nils_test_support::git::{InitRepoOptions, init_repo_with};
 
     let stub = StubBinDir::new();
-    stub.write_exe("gh", record_open_dry_run_gh_stub());
+    stub.write_exe("forge-cli", record_open_dry_run_forge_stub());
 
     // The repo has history (initial commit), but the bundle files below are
     // never committed — the realistic "open a record before committing the
@@ -2408,7 +2377,7 @@ fn record_open_initial_state_task_ledger_defaults_to_open_fold() {
     use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
 
     let stub = StubBinDir::new();
-    stub.write_exe("gh", record_open_dry_run_gh_stub());
+    stub.write_exe("forge-cli", record_open_dry_run_forge_stub());
 
     let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
     let bundle = repo.path().join("docs/plans/sample");
@@ -2567,7 +2536,7 @@ fn record_open_dry_run_includes_labels_in_preview() {
     use nils_test_support::git::{InitRepoOptions, git, init_repo_with};
 
     let stub = StubBinDir::new();
-    stub.write_exe("gh", record_open_dry_run_gh_stub());
+    stub.write_exe("forge-cli", record_open_dry_run_forge_stub());
 
     let repo = init_repo_with(InitRepoOptions::new().with_branch("main"));
     let bundle = repo.path().join("docs/plans/sample");
@@ -2742,7 +2711,7 @@ fn record_post_live_refuses_when_lifecycle_lock_is_busy() {
     let tmp = TempDir::new().expect("tempdir");
     let state_dir = TempDir::new().expect("state-dir");
     let stub = StubBinDir::new();
-    stub.write_exe("gh", live_record_gh_stub());
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
 
     plan_issue::state::set_state_dir_override(Some(state_dir.path().to_path_buf()));
     let _busy_lock = plan_issue::lifecycle_lock::acquire_for_identity(

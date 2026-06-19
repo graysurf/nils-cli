@@ -855,15 +855,44 @@ pub enum IssueCommand {
     /// Append a comment to an issue.
     Comment(IssueCommentArgs),
     /// Close an issue.
-    Close {
-        /// Numeric id.
-        id: u64,
-    },
+    Close(IssueCloseArgs),
     /// Reopen a closed issue.
     Reopen {
         /// Numeric id.
         id: u64,
     },
+}
+
+/// `issue close` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct IssueCloseArgs {
+    /// Numeric issue id.
+    pub id: u64,
+    /// State reason recorded on close (GitHub only). `completed` marks the
+    /// issue done; `not planned` marks it abandoned. GitLab / Local have no
+    /// equivalent and silently ignore this flag.
+    #[arg(long, value_enum)]
+    pub reason: Option<CloseReasonFlag>,
+}
+
+/// `--reason` enum for `issue close`. GitHub-only; maps to
+/// `gh issue close --reason completed|"not planned"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CloseReasonFlag {
+    #[value(name = "completed")]
+    Completed,
+    #[value(name = "not planned")]
+    NotPlanned,
+}
+
+impl CloseReasonFlag {
+    /// Value forwarded to `gh issue close --reason <r>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloseReasonFlag::Completed => "completed",
+            CloseReasonFlag::NotPlanned => "not planned",
+        }
+    }
 }
 
 /// `activity` subtree.
@@ -1325,8 +1354,8 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             command: Some(IssueCommand::Comment(args)),
         })) => ops::issue_comment::run(&global, args, format),
         Some(Command::Issue(IssueArgs {
-            command: Some(IssueCommand::Close { id }),
-        })) => ops::issue_close::run(&global, id, format),
+            command: Some(IssueCommand::Close(args)),
+        })) => ops::issue_close::run(&global, args.id, args.reason, format),
         Some(Command::Issue(IssueArgs {
             command: Some(IssueCommand::Reopen { id }),
         })) => ops::issue_reopen::run(&global, id, format),
