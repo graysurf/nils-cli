@@ -7,6 +7,7 @@
 //!
 //! Command set:
 //! - `migrate`  — batch dry-run / apply of skill-usage rollups into the archive
+//! - `prune-source` — dry-run / apply cleanup of already-archived agent-out runs
 //! - `discover` — read-only scan of the agent-out tree for archivable records
 //! - `catalog`  — generate / filter the derived `evidence.catalog.v1`
 //! - `query`    — filtered read over archived rollups (cross-version aware)
@@ -168,6 +169,29 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Prune local agent-out source run directories whose raw records are
+    /// already archived. Dry-run by default; `--apply` deletes only run
+    /// directories whose `skill-usage.record.json` digest exists in the archive
+    /// catalog.
+    PruneSource {
+        /// Agent-out projects root. Defaults to `${AGENT_HOME}/out/projects`.
+        #[arg(long)]
+        source_out: Option<PathBuf>,
+        /// Archive clone path. Defaults as for `migrate`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Only inspect one repo (`<owner__repo>` slug or repo name).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Required safety scope: only prune records already present in the
+        /// archive catalog by `source_digest`.
+        #[arg(long)]
+        archived_only: bool,
+        /// Apply the source pruning. Without this flag the command runs in
+        /// dry-run mode.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Read-only scan of the agent-out tree for archivable records.
     Discover {
         /// Agent-out projects root. Defaults to `${AGENT_HOME}/out/projects`.
@@ -310,6 +334,20 @@ pub fn run() -> i32 {
             hosts,
             host,
             class: class.map(HostClass::from),
+            apply,
+            format,
+        }),
+        Command::PruneSource {
+            source_out,
+            archive,
+            repo,
+            archived_only,
+            apply,
+        } => crate::prune_source::dispatch(crate::prune_source::PruneSourceArgs {
+            source_out,
+            archive,
+            repo,
+            archived_only,
             apply,
             format,
         }),
@@ -599,6 +637,8 @@ mod tests {
             "catalog",
             "query",
             "search",
+            "purge",
+            "prune-source",
             "validate-hosts",
             "validate-local",
             "validate-record",

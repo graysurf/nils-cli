@@ -94,6 +94,20 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(prune-source)
+_arguments "${_arguments_options[@]}" : \
+'--source-out=[Agent-out projects root. Defaults to \`\${AGENT_HOME}/out/projects\`]:SOURCE_OUT:_files' \
+'--archive=[Archive clone path. Defaults as for \`migrate\`]:ARCHIVE:_files' \
+'--repo=[Only inspect one repo (\`<owner__repo>\` slug or repo name)]:REPO:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--archived-only[Required safety scope\: only prune records already present in the archive catalog by \`source_digest\`]' \
+'--apply[Apply the source pruning. Without this flag the command runs in dry-run mode]' \
+'(--format)--json[Hidden alias for \`--format json\` kept for symmetry with neighbouring CLIs]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (discover)
 _arguments "${_arguments_options[@]}" : \
 '--source-out=[Agent-out projects root. Defaults to \`\${AGENT_HOME}/out/projects\`]:SOURCE_OUT:_files' \
@@ -191,6 +205,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(prune-source)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (discover)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -232,6 +250,7 @@ _evidence_commands() {
 'validate-record:Validate an archived \`skill-usage.rollup.json\` document' \
 'migrate:Migrate skill-usage records out of the agent-out tree into the archive. Dry-run by default; use \`--apply\` to write, commit, and push' \
 'purge:Purge archived evidence for named hosts / host classes (the retention counterpart to \`migrate\`; e.g. employer \`delete-on-termination\`). Dry-run by default; \`--apply\` deletes, regenerates the catalog, commits, and pushes. A scope (\`--host\` and/or \`--class\`) is required — there is no implicit whole-archive purge' \
+'prune-source:Prune local agent-out source run directories whose raw records are already archived. Dry-run by default; \`--apply\` deletes only run directories whose \`skill-usage.record.json\` digest exists in the archive catalog' \
 'discover:Read-only scan of the agent-out tree for archivable records' \
 'catalog:Generate, write, or filter the derived archive catalog' \
 'query:Filtered read over archived rollups (cross-version aware)' \
@@ -264,6 +283,7 @@ _evidence__subcmd__help_commands() {
 'validate-record:Validate an archived \`skill-usage.rollup.json\` document' \
 'migrate:Migrate skill-usage records out of the agent-out tree into the archive. Dry-run by default; use \`--apply\` to write, commit, and push' \
 'purge:Purge archived evidence for named hosts / host classes (the retention counterpart to \`migrate\`; e.g. employer \`delete-on-termination\`). Dry-run by default; \`--apply\` deletes, regenerates the catalog, commits, and pushes. A scope (\`--host\` and/or \`--class\`) is required — there is no implicit whole-archive purge' \
+'prune-source:Prune local agent-out source run directories whose raw records are already archived. Dry-run by default; \`--apply\` deletes only run directories whose \`skill-usage.record.json\` digest exists in the archive catalog' \
 'discover:Read-only scan of the agent-out tree for archivable records' \
 'catalog:Generate, write, or filter the derived archive catalog' \
 'query:Filtered read over archived rollups (cross-version aware)' \
@@ -297,6 +317,11 @@ _evidence__subcmd__help__subcmd__help_commands() {
 _evidence__subcmd__help__subcmd__migrate_commands() {
     local commands; commands=()
     _describe -t commands 'evidence help migrate commands' commands "$@"
+}
+(( $+functions[_evidence__subcmd__help__subcmd__prune-source_commands] )) ||
+_evidence__subcmd__help__subcmd__prune-source_commands() {
+    local commands; commands=()
+    _describe -t commands 'evidence help prune-source commands' commands "$@"
 }
 (( $+functions[_evidence__subcmd__help__subcmd__purge_commands] )) ||
 _evidence__subcmd__help__subcmd__purge_commands() {
@@ -332,6 +357,11 @@ _evidence__subcmd__help__subcmd__validate-record_commands() {
 _evidence__subcmd__migrate_commands() {
     local commands; commands=()
     _describe -t commands 'evidence migrate commands' commands "$@"
+}
+(( $+functions[_evidence__subcmd__prune-source_commands] )) ||
+_evidence__subcmd__prune-source_commands() {
+    local commands; commands=()
+    _describe -t commands 'evidence prune-source commands' commands "$@"
 }
 (( $+functions[_evidence__subcmd__purge_commands] )) ||
 _evidence__subcmd__purge_commands() {

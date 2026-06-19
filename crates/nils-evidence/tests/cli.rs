@@ -66,6 +66,61 @@ fn write_rollup(
     fs::write(dir.join("skill-usage.rollup.json"), body).unwrap();
 }
 
+fn write_source_record(source_out: &Path, project: &str, run_id: &str, skill: &str) -> String {
+    let dir = source_out.join(project).join(run_id);
+    fs::create_dir_all(&dir).unwrap();
+    let body = format!(
+        r#"{{
+            "schema": "skill-usage.record.v1",
+            "producer": {{ "tool": "skill-usage", "nils_cli_version": "1.11.2" }},
+            "skill": "{skill}",
+            "started_at": "2026-06-20T01:00:00Z",
+            "ended_at": "2026-06-20T01:00:00Z",
+            "cwd": "/Users/tester/Project/kit",
+            "trigger": "user_explicit",
+            "intent": "intent",
+            "inputs": {{ "user_request_summary": "x", "referenced_files": [], "external_sources": [] }},
+            "outcome": {{ "status": "pass", "summary": "done" }},
+            "artifacts": [],
+            "linked_records": [],
+            "validation": [],
+            "failures": []
+        }}"#
+    );
+    fs::write(dir.join("skill-usage.record.json"), &body).unwrap();
+    format!("sha256:{}", sha256_hex(body.as_bytes()))
+}
+
+fn write_catalog_for_digests(archive: &Path, digests: &[String]) {
+    let rows = digests
+        .iter()
+        .map(|digest| serde_json::json!({ "source_digest": digest }))
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "schema_version": "evidence.catalog.v1",
+        "records": rows
+    });
+    fs::write(
+        archive.join("catalog.json"),
+        serde_json::to_string_pretty(&body).unwrap(),
+    )
+    .unwrap();
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn fixture_archive() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let archive = tmp.path().join("archive");
@@ -262,6 +317,41 @@ fn search_substring_over_intent_and_summary() {
     let hits2 = v2["data"]["hits"].as_array().unwrap();
     assert!(hits2.iter().all(|h| h["field"] == "outcome_summary"));
     assert!(hits2.len() >= 2);
+}
+
+#[test]
+fn prune_source_json_envelope_dry_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_out = tmp.path().join("out/projects");
+    let archive = tmp.path().join("archive");
+    fs::create_dir_all(&source_out).unwrap();
+    fs::create_dir_all(&archive).unwrap();
+    let digest = write_source_record(
+        &source_out,
+        "graysurf__kit",
+        "20260620-010000-skill-usage",
+        "deliver-pr",
+    );
+    write_catalog_for_digests(&archive, &[digest]);
+
+    let out = run(&[
+        "prune-source",
+        "--source-out",
+        &source_out.to_string_lossy(),
+        "--archive",
+        &arc(&archive),
+        "--archived-only",
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let v: Value = serde_json::from_str(out.stdout.trim()).expect("json");
+    assert_eq!(v["schema_version"], "cli.evidence.prune-source.v1");
+    assert_eq!(v["data"]["applied"], false);
+    assert_eq!(v["data"]["prunable"], 1);
+    assert_eq!(v["data"]["deleted"], 0);
+    assert_eq!(v["data"]["pruned"][0]["skill"], "deliver-pr");
 }
 
 #[test]
