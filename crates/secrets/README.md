@@ -43,13 +43,13 @@ secret canary string and assert it never appears on stdout/stderr.
 
 ## Exit codes
 
-| Code | Meaning |
-| ---- | ------- |
-| `0`  | success |
-| `1`  | runtime error |
-| `64` | command-line usage error |
+| Code | Meaning                                                       |
+| ---- | ------------------------------------------------------------- |
+| `0`  | success                                                       |
+| `1`  | runtime error                                                 |
+| `64` | command-line usage error                                      |
 | `65` | no store entry for the requested target / missing source file |
-| `69` | the store, `sops`, or `git` is unavailable |
+| `69` | the store, `sops`, or `git` is unavailable                    |
 
 ## Environment
 
