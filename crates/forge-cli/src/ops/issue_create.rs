@@ -23,7 +23,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::issue_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::validations::{no_local_path, title_length};
+use crate::validations::{no_escaped_control_markdown, no_local_path, title_length};
 
 const SCHEMA: &str = "issue.create";
 const SCHEMA_VERSION: u32 = 1;
@@ -67,8 +67,10 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     )?;
     title_length(&args.title)?;
     no_local_path(&args.title, "title")?;
+    no_escaped_control_markdown(&args.title)?;
     let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
     no_local_path(&body, "body")?;
+    no_escaped_control_markdown(&body)?;
     let body_tempfile = write_body_tempfile(&body)?;
     let body_path = body_tempfile.path().to_path_buf();
     let call = build_create_call(
@@ -496,6 +498,22 @@ mod tests {
             let err =
                 run_with(&runner, &global, a, OutputFormat::Json, |_| None).expect_err("missing");
             assert_eq!(err.kind(), "software_error");
+        }
+
+        #[test]
+        fn rejects_escaped_control_markdown_body() {
+            // Parity with the retired plan-issue `GhCliAdapter` markdown guard:
+            // an escaped-control payload (literal `\n` in prose) is rejected
+            // before any backend call. Covers the GitHub write path the
+            // consolidation flips plan-issue onto.
+            let runner = ScriptedRunner::with_stdout(Vec::new());
+            let global = flags(Some(ProviderFlag::Github), false);
+            let mut a = args("title");
+            a.body = Some("first line\\nsecond line".into());
+            let err = run_with(&runner, &global, a, OutputFormat::Json, |_| None)
+                .expect_err("escaped control body should be rejected");
+            assert_eq!(err.kind(), "markdown_escaped_control");
+            assert!(runner.captured.borrow().is_empty(), "no backend call");
         }
 
         #[test]

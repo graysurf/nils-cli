@@ -42,6 +42,7 @@ struct SubagentPromptView<'a> {
     lane_tasks: &'a str,
 }
 
+use crate::adapter::ProviderAdapter;
 use crate::cli::Cli;
 use crate::commands::build::{BuildPlanTaskSpecArgs, BuildTaskSpecArgs};
 use crate::commands::plan::{
@@ -58,7 +59,6 @@ use crate::commands::sprint::{
 };
 use crate::commands::{Command as CliCommand, SplitStrategy, SummaryArgs};
 use crate::dispatch_record::{self, DispatchRecord};
-use crate::github::ProviderAdapter;
 use crate::issue_body::{self, TaskRow};
 use crate::lifecycle_record::{self, DashboardInput};
 use crate::render::{self, SprintCommentInput, SprintCommentMode};
@@ -838,10 +838,9 @@ fn run_record_open(
         }));
     }
 
-    // Live mode. Sprint 2.2 routes `record open` through the provider-aware
-    // adapter selector so GitLab repos exercise `forge_cli_adapter::ForgeCliAdapter`
-    // (which shells out to `forge-cli`). GitHub repos keep using `GhCliAdapter`
-    // unchanged.
+    // Live mode. The provider-aware adapter selector routes `record open`
+    // through `forge_cli_adapter::ForgeCliAdapter` (which shells out to
+    // `forge-cli`) for every provider — GitHub, GitLab, and Local.
     let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
     let adapter = crate::provider::select_adapter(&repo_info, force);
     let repo = repo_info.slug.as_str();
@@ -6117,13 +6116,9 @@ fn resolve_repo_for_live(
     binary: BinaryFlavor,
     repo_override: Option<&str>,
 ) -> Result<String, CommandError> {
-    // Sprint 2.2: stop early-rejecting GitLab. Dispatchers that still default
-    // to `GhCliAdapter` would now silently shell out to `gh` against a GitLab
-    // slug and fail with gh's error — that path is acceptable as a transitional
-    // failure mode because Sprint 3 / Sprint 4 will refactor those dispatchers
-    // to use [`crate::provider::select_adapter`]. The `record open` dispatcher
-    // already routes through `resolve_repo_info_for_live` + `select_adapter`,
-    // so it lands the GitLab path correctly.
+    // Every provider routes through `forge_cli_adapter::ForgeCliAdapter` via
+    // [`crate::provider::select_adapter`], so a resolved slug of any provider
+    // is handled uniformly by the forge-cli subprocess rail.
     Ok(resolve_repo_info_for_live(binary, repo_override)?.slug)
 }
 
@@ -7004,7 +6999,7 @@ mod tests {
             &self,
             _repo: &str,
             _pr: u64,
-        ) -> Result<crate::github::PrMergeSummary, String> {
+        ) -> Result<crate::adapter::PrMergeSummary, String> {
             unreachable!("pr_merge_summary is not needed in this test")
         }
 
@@ -7103,7 +7098,7 @@ mod tests {
             &self,
             _repo: &str,
             _pr: u64,
-        ) -> Result<crate::github::PrMergeSummary, String> {
+        ) -> Result<crate::adapter::PrMergeSummary, String> {
             unreachable!("pr_merge_summary is not needed in this test")
         }
 
@@ -7322,7 +7317,7 @@ mod tests {
             &self,
             _repo: &str,
             _pr: u64,
-        ) -> Result<crate::github::PrMergeSummary, String> {
+        ) -> Result<crate::adapter::PrMergeSummary, String> {
             unreachable!("pr_merge_summary is not needed in this test")
         }
 

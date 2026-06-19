@@ -607,6 +607,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (close)
 _arguments "${_arguments_options[@]}" : \
+'--reason=[State reason recorded on close (GitHub only). \`completed\` marks the issue done; \`not planned\` marks it abandoned. GitLab / Local have no equivalent and silently ignore this flag]:REASON:(completed not planned)' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -616,7 +617,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':id -- Numeric id:_default' \
+':id -- Numeric issue id:_default' \
 && ret=0
 ;;
 (reopen)

@@ -9,19 +9,20 @@
 //! - [`resolve_repo`] derives a [`Repo`] from an explicit `--repo` flag and/or
 //!   the cwd's git remote.
 //! - [`select_adapter`] returns a `Box<dyn ProviderAdapter>` for the right
-//!   backend. GitHub keeps using [`crate::github::GhCliAdapter`]; GitLab gets
-//!   [`crate::forge_cli_adapter::ForgeCliAdapter`] which (in Sprint 2.1) is
-//!   only a stub that returns `provider_not_implemented` for every call.
+//!   backend. Every provider — GitHub, GitLab, and Local — routes through
+//!   [`crate::forge_cli_adapter::ForgeCliAdapter`], a `forge-cli` subprocess
+//!   wrapper. The trait itself lives in [`crate::adapter`].
 //!
-//! Sprint 2.2 fills in the GitLab branch by routing through `forge-cli`'s
-//! provider-neutral surface (`issue view --with-comments`, `pr view`,
-//! `pr comments`, etc. — landed in #494/#495/#496).
+//! GitHub was the last provider on the retired in-crate `gh` client; the
+//! plan-issue → forge-cli consolidation
+//! (`docs/plans/2026-06-19-plan-issue-forge-cli-consolidation`) flipped it onto
+//! `ForgeCliAdapter` so `forge-cli` is the single provider gateway.
 
 use std::fmt;
 
 use nils_common::git as common_git;
 
-pub use crate::github::ProviderAdapter;
+pub use crate::adapter::ProviderAdapter;
 
 /// Provider discriminator. Carried alongside the slug so the right adapter
 /// runs against the right backend.
@@ -165,13 +166,16 @@ pub fn resolve_repo(repo_override: Option<&str>) -> Result<Repo, String> {
 
 /// Pick the right adapter implementation for [`Repo`].
 ///
-/// In Sprint 2.1 the GitLab branch returns an [`crate::forge_cli_adapter::ForgeCliAdapter`]
-/// whose methods all return a `provider_not_implemented` error. Sprint 2.2
-/// fills in the actual GitLab calls (via `forge-cli` subprocesses) and wires
-/// this factory into the per-dispatcher adapter construction sites.
+/// Every provider routes through [`crate::forge_cli_adapter::ForgeCliAdapter`],
+/// a `forge-cli` subprocess wrapper. GitHub was the last provider on the
+/// retired in-crate `gh` client; the consolidation
+/// (`docs/plans/2026-06-19-plan-issue-forge-cli-consolidation`) flipped it onto
+/// `ForgeCliAdapter` so `forge-cli` is the single provider gateway and identity
+/// chokepoint. The adapter spawns `forge-cli` with `--provider github` and the
+/// ambient token is inherited verbatim, preserving the prior identity model.
 pub fn select_adapter(repo: &Repo, force: bool) -> Box<dyn ProviderAdapter> {
     match repo.provider {
-        Provider::GitHub => Box::new(crate::github::GhCliAdapter::new(force)),
+        Provider::GitHub => Box::new(crate::forge_cli_adapter::ForgeCliAdapter::new_github(force)),
         Provider::GitLab => Box::new(crate::forge_cli_adapter::ForgeCliAdapter::new(force)),
         Provider::Local => Box::new(crate::forge_cli_adapter::ForgeCliAdapter::new_local(force)),
     }

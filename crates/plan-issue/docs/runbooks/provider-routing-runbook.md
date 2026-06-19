@@ -11,32 +11,40 @@ the routing layer.
 
 ## 1. Routing strategy
 
-`plan-issue` keeps the GitHub branch on the in-tree `GhCliAdapter` (which
-shells out to `gh`) and routes the GitLab branch through `forge-cli` via a peer
-`ForgeCliAdapter` that shells out to `forge-cli issue …` / `forge-cli pr …`
-with `--output json` and parses the v1 envelope. Both implement the same
-`ProviderAdapter` trait, so call sites in `crates/plan-issue/src/execute.rs`
-are provider-neutral.
+`plan-issue` routes EVERY provider — GitHub, GitLab, and the in-process Local
+backend — through `forge-cli` via a single `ForgeCliAdapter` that shells out to
+`forge-cli issue …` / `forge-cli pr …` with `--format json` and parses the v1
+envelope. The adapter emits `--provider github|gitlab|local` so one
+implementation serves all backends. It implements the `ProviderAdapter` trait
+(defined in `crates/plan-issue/src/adapter.rs`), so the call sites in
+`crates/plan-issue/src/execute.rs` are provider-neutral.
 
-### Why subprocess to `forge-cli` (not library linkage or in-tree `glab`)
+GitHub was originally kept on an in-tree `GhCliAdapter` (a direct `gh` client)
+to preserve a zero-behaviour-change cut when the abstraction landed (#498). The
+plan-issue → forge-cli consolidation
+(`docs/plans/2026-06-19-plan-issue-forge-cli-consolidation`) flipped the GitHub
+arm onto `ForgeCliAdapter` and deleted `github.rs`, so `forge-cli` is now the
+single provider gateway and identity chokepoint. Identity is the inherited
+ambient token, exactly as `GhCliAdapter` behaved (`forge-cli` passes the parent
+environment to the spawned `gh`/`glab` child verbatim).
+
+### Why subprocess to `forge-cli` (not library linkage or in-tree clients)
 
 1. Routing through `forge-cli` is the workspace decision for cross-provider
    plumbing — `forge-cli` already owns provider detection, repo normalization,
    `iid` ↔ slug handling, pipeline status, and version probing. Re-implementing
    any of that inside `plan-issue` would duplicate logic and create a
    second source of provider truth.
-2. The subprocess + JSON envelope pattern is identical in shape to the
-   existing `GhCliAdapter` test surface (PATH-prepended stub binaries via
-   `nils-test-support::StubBinDir`), which keeps the test ergonomics
-   consistent across both adapters.
+2. The subprocess + JSON envelope pattern keeps the test ergonomics consistent:
+   integration tests PATH-prepend a `forge-cli` stub (via
+   `nils-test-support::StubBinDir`) that emits v1 envelopes.
 3. Process count is bounded — a `record open` is roughly five atomic ops, so
-   five extra `forge-cli` processes per run is acceptable for a CLI lifecycle
-   command. Today's GitHub path opens a comparable number of `gh` processes.
-4. Library linkage would still need the same upstream extensions in
+   five `forge-cli` processes per run is acceptable for a CLI lifecycle command.
+4. Library linkage would still need the same upstream capabilities in
    `forge-cli` (see §3) and would add a new workspace dependency edge.
-5. An in-tree `GlabCliAdapter` was rejected because it would duplicate
-   `forge-cli`'s GitLab adapter and re-implement pipeline status, MR iid
-   lookup, and version probing inside `plan-issue`.
+5. A single forge-cli rail also unifies the markdown / local-path egress guards
+   in one place (forge-cli's write-op validations) rather than duplicating them
+   per in-tree client.
 
 Library linkage stays available as a future fallback if subprocess overhead
 ever dominates wall time on a tracking-issue run. Because the trait boundary
@@ -98,16 +106,16 @@ listed as the authoritative contract reference; any regression here breaks
 ### 4.1 Trait shape
 
 The provider boundary is the `ProviderAdapter` trait, **defined** in
-`crates/plan-issue/src/github.rs` and re-exported from
-`crates/plan-issue/src/provider.rs` (`pub use crate::github::ProviderAdapter`).
+`crates/plan-issue/src/adapter.rs` and re-exported from
+`crates/plan-issue/src/provider.rs` (`pub use crate::adapter::ProviderAdapter`).
 The `Provider` / `Repo` routing types plus `select_adapter` / `resolve_repo`
 live in `provider.rs`. All lifecycle code paths in `execute.rs` go through the
 trait — no direct provider CLI shell-out should appear outside the adapter
-implementations. The trait takes `repo: &str` (the slug); call sites pass
+implementation. The trait takes `repo: &str` (the slug); call sites pass
 `&repo.slug` (see §4.4). There is no `provider()` method on the trait.
 
 ```rust
-// crates/plan-issue/src/github.rs — the provider boundary trait
+// crates/plan-issue/src/adapter.rs — the provider boundary trait
 pub trait ProviderAdapter {
     fn issue_body(&self, repo: &str, issue: u64) -> Result<String, String>;
     fn issue_evidence(&self, repo: &str, issue: u64) -> Result<(String, String), String>;
@@ -131,20 +139,23 @@ pub trait ProviderAdapter {
 
 // crates/plan-issue/src/provider.rs — routing types and adapter selection
 pub struct Repo { pub provider: Provider, pub slug: String, pub host: Option<String> }
-pub enum Provider { GitHub, GitLab }
+pub enum Provider { GitHub, GitLab, Local }
 
 pub fn select_adapter(repo: &Repo, force: bool) -> Box<dyn ProviderAdapter> {
     match repo.provider {
-        Provider::GitHub => Box::new(crate::github::GhCliAdapter::new(force)),
+        Provider::GitHub => Box::new(crate::forge_cli_adapter::ForgeCliAdapter::new_github(force)),
         Provider::GitLab => Box::new(crate::forge_cli_adapter::ForgeCliAdapter::new(force)),
+        Provider::Local => Box::new(crate::forge_cli_adapter::ForgeCliAdapter::new_local(force)),
     }
 }
 ```
 
-`GhCliAdapter` and `ForgeCliAdapter` are the two production implementations.
-The GitHub adapter shells out to `gh` directly (preserving the historical
-behaviour). The GitLab adapter shells out to `forge-cli` and parses the v1
-JSON envelope.
+`ForgeCliAdapter` is the single production implementation; it emits
+`--provider github|gitlab|local` so one adapter serves all backends. It shells
+out to `forge-cli` and parses the v1 JSON envelope. The retired `GhCliAdapter`
+(a direct `gh` client) was deleted by the consolidation; `forge-cli` itself
+still wraps `gh`/`glab`, so the GitHub behaviour is preserved through the
+forge-cli rail.
 
 ### 4.2 Repo resolution
 
@@ -178,18 +189,26 @@ returns `Err(format!("…"))` propagating the upstream `code` and `message` so
 
 ### 4.4 Behaviour preservation
 
-Existing GitHub callers must see no behaviour change. The routing layer
-preserves this by:
+The plan-issue → forge-cli consolidation
+(`docs/plans/2026-06-19-plan-issue-forge-cli-consolidation`) flipped the GitHub
+arm from the in-tree `GhCliAdapter` onto `ForgeCliAdapter` with three parity
+fixes that landed in the same release so GitHub behaviour is preserved:
 
-- Keeping `GhCliAdapter` unchanged for the GitHub branch.
-- Letting `select_adapter` return `GhCliAdapter` for `Provider::GitHub`,
-  exercising the same code path as before the routing work landed.
-- Wrapping the existing slug `String` in `Repo { provider: GitHub, slug,
-  host: None }`, so repo plumbing changes are limited to a mechanical
-  `&repo.slug` substitution at trait call sites.
+- `forge-cli issue close --reason completed|"not planned"` (GitHub arm) +
+  `ForgeCliAdapter::close_issue` passing the reason through, so the
+  completed/not-planned distinction survives the flip (GitLab/Local ignore it).
+- `ForgeCliAdapter::pr_merge_summary` calls `forge-cli pr checks --required-only`
+  and reads the real gating `state` / `required_count` / non-required failures,
+  so a failing required check still blocks the `record close` merge gate.
+- The escaped-control markdown guard re-homed into forge-cli's write ops
+  (`no_escaped_control_markdown`), alongside the existing local-path guard, so
+  both egress guards survive on the GitHub write path. Note: forge-cli's guards
+  have no plan-issue `--force` bypass — `--force` no longer suppresses them.
 
-The cwd auto-detect default (when `--repo` is omitted) matches `forge-cli`,
-which keeps existing GitHub-first command lines unchanged.
+Identity is unchanged: `forge-cli` passes the parent environment to the spawned
+`gh` child verbatim, so the inherited ambient token governs the call exactly as
+`GhCliAdapter` did. The cwd auto-detect default (when `--repo` is omitted)
+matches `forge-cli`, keeping existing GitHub-first command lines unchanged.
 
 ### 4.5 Validation checkpoints
 
@@ -200,13 +219,15 @@ shape changes, or a new adapter implementation lands:
    `crates/plan-issue/src/execute.rs` must go through a `ProviderAdapter`
    method — no direct `gh`, `glab`, or `forge-cli` invocation outside the
    adapter implementations.
-2. **Equivalent operation on both adapters.** Each trait method must have a
-   working implementation on both `GhCliAdapter` and `ForgeCliAdapter`, with
-   parity unit tests against fixtures.
-3. **Upstream `forge-cli` capabilities present.** The extensions listed in §3
-   must be available in the pinned `forge-cli` version used by the GitLab
-   branch. If any are missing, the GitLab path will fail at runtime and the
-   gap must be closed in `forge-cli` before the new operation is exposed.
+2. **Equivalent operation per provider.** Each trait method must work for every
+   provider the adapter emits (`github`, `gitlab`, `local`), with parity unit
+   tests (`forge_cli_adapter.rs` `ScriptedRunner` tests) asserting the per-
+   provider argv shape, plus the integration tests' PATH-prepended `forge-cli`
+   stub.
+3. **Upstream `forge-cli` capabilities present.** The capabilities listed in §3
+   must be available in the pinned `forge-cli` version. Because plan-issue and
+   forge-cli ship in one nils-cli release, a new plan-issue must not be paired
+   with an older installed forge-cli (e.g. one without `issue close --reason`).
 
 ## 5. Adding a third provider (codeberg, gitea, …)
 
@@ -220,9 +241,9 @@ When extending the routing layer to a third provider:
 3. Extend `resolve_repo` URL pattern matching to recognise the new provider's
    remote forms (`git@<host>:`, `https://<host>/`, `ssh://git@<host>/`,
    and any host-prefixed `--repo` slug).
-4. Add unit tests against fixtures covering each `ProviderAdapter` method on
-   the new adapter, mirroring the existing `GhCliAdapter` and
-   `ForgeCliAdapter` test layout.
+4. Add unit tests against fixtures covering each `ProviderAdapter` method for
+   the new provider, mirroring the existing `ForgeCliAdapter` `ScriptedRunner`
+   test layout.
 5. Run the §4.5 validation checkpoints. Confirm every trait method works,
    that upstream CLI capabilities listed in §3 have equivalents on the new
    provider, and that no `plan-issue` call site bypasses the trait.
