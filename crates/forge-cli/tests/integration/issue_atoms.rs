@@ -30,8 +30,11 @@ case "$1 $2" in
 {json}
 EOF
     ;;
-  "issue close"|"issue reopen"|"issue comment"|"issue edit")
+  "issue close"|"issue reopen"|"issue edit")
     :
+    ;;
+  api\ *)
+    echo "https://github.com/acme/widgets/issues/{number}#issuecomment-123"
     ;;
   "issue create")
     echo "creating issue..."
@@ -198,7 +201,10 @@ fn issue_comment_runs_comment_then_view_and_emits_url() {
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["schema_version"], "cli.forge-cli.issue.comment.v1");
     assert_eq!(env["data"]["number"], 11);
-    assert!(env["data"]["url"].as_str().unwrap().contains("/11"));
+    assert_eq!(
+        env["data"]["url"],
+        "https://github.com/acme/widgets/issues/11#issuecomment-123"
+    );
 }
 
 #[test]
