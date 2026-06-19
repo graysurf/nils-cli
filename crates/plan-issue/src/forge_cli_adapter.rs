@@ -230,6 +230,9 @@ impl ProviderAdapter for ForgeCliAdapter {
             .collect();
         let mut args = self.base_args(repo);
         args.extend(["issue", "list", "--state", "open"]);
+        if self.provider == "github" {
+            args.extend(["--limit", "200"]);
+        }
         for label in &trimmed_labels {
             args.push("--label");
             args.push(label);
@@ -422,12 +425,16 @@ impl ProviderAdapter for ForgeCliAdapter {
         if github {
             checks_args.push("--required-only");
         }
-        // `pr checks` exits non-zero when the rollup is `failure` / `pending`
-        // — that is information we want, not an error. The forge-cli error
-        // path here would surface those as `Err`; today's pr_checks_gitlab
-        // also already handles the "no pipeline" case (#485) returning
-        // empty success. If forge-cli errors, treat checks as `None`.
-        let checks_data = self.run_envelope(&checks_args).ok();
+        let checks_data = match self.run_envelope(&checks_args) {
+            Ok(data) => Some(data),
+            Err(err) if github => {
+                return Err(format!("forge-cli required checks read failed: {err}"));
+            }
+            // GitLab / Local have no required-check concept. Keep their
+            // historical degraded path so a missing optional pipeline snapshot
+            // does not block closeout after the view-side merge data is read.
+            Err(_) => None,
+        };
 
         // Aggregate rollup state used by `checks` (informational) and the
         // GitLab fallback. Under `--required-only` on GitHub this `state` is
@@ -459,9 +466,8 @@ impl ProviderAdapter for ForgeCliAdapter {
                     let non_required_failures = non_required_failure_names(data);
                     (required_state, required_count, non_required_failures)
                 }
-                // `pr checks` failed to produce a usable snapshot: stay
-                // conservative and leave classification unknown (`None`), so
-                // the close gate falls back to the aggregate `checks` rollup.
+                // The GitHub branch above fails closed on read errors, so this
+                // is only a defensive fallback for internally missing data.
                 None => (None, None, Vec::new()),
             }
         } else {
@@ -747,6 +753,35 @@ mod tests {
             .comment_issue("g/p", 7, Path::new("/tmp/body.md"))
             .expect("comment");
         assert_eq!(url, "https://x.com/g/p/-/issues/7#note_42");
+    }
+
+    #[test]
+    fn github_tracker_scan_preserves_legacy_200_issue_limit() {
+        let (adapter, handle) = adapter_with_github(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.list.v1",
+            "data": {
+                "provider": "github",
+                "items": [
+                    {"number": 42, "url": "https://github.com/o/r/issues/42", "state": "open", "title": "tracker", "labels": [], "author": null, "assignees": []}
+                ]
+            }
+        }"#,
+        ]);
+        let issues = adapter
+            .list_open_tracker_issues("o/r", &["type::plan".into(), "state::open".into()])
+            .expect("list issues");
+        assert_eq!(issues, vec![42]);
+
+        let calls = handle.calls();
+        assert_eq!(calls.len(), 1);
+        let argv = &calls[0];
+        let idx = argv
+            .iter()
+            .position(|s| s == "--limit")
+            .expect("github tracker scan must set --limit");
+        assert_eq!(argv[idx + 1], "200");
     }
 
     #[test]
@@ -1086,6 +1121,19 @@ mod tests {
             checks_call.iter().any(|s| s == "--required-only"),
             "github merge-gate must pass --required-only: {checks_call:?}"
         );
+    }
+
+    #[test]
+    fn pr_merge_summary_github_fails_closed_when_required_checks_cannot_be_read() {
+        let (adapter, _) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"github","number":7,"url":"u","state":"merged","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":"2025-01-01T00:00:00Z","merge_commit_sha":"deadbeef","labels":[]}}"#,
+            r#"{"ok":false,"schema_version":"cli.forge-cli.error.v1","error":{"code":"backend_error","message":"rate limited while reading required checks"}}"#,
+        ]);
+        let err = adapter
+            .pr_merge_summary("o/r", 7)
+            .expect_err("github required-check read errors must fail closed");
+        assert!(err.contains("required checks"), "{err}");
+        assert!(err.contains("rate limited"), "{err}");
     }
 
     #[test]

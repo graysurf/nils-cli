@@ -79,7 +79,8 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
-    let _ = runner.run(&call)?;
+    let comment_output = runner.run(&call)?;
+    let comment_url = first_url(&comment_output.stdout);
     let view_output = runner.run(&issue_view::build_view_call(&ctx, args.id))?;
     let view = issue_view::parse_view_output(&ctx, &view_output)?;
     Ok(emit_success(
@@ -87,17 +88,49 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         IssueCommentPayload {
             provider: view.provider,
             number: view.number,
-            url: view.url,
+            url: comment_url.unwrap_or(view.url),
         },
         format,
         render_text,
     ))
 }
 
+fn first_url(stdout: &str) -> Option<String> {
+    stdout.split_whitespace().find_map(|token| {
+        let url = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | ','
+            )
+        });
+        (url.starts_with("http://") || url.starts_with("https://") || url.starts_with("local://"))
+            .then(|| url.to_string())
+    })
+}
+
 fn build_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
-        Provider::GitHub | Provider::Local => vec![
+        Provider::GitHub => {
+            let endpoint = ctx
+                .repo
+                .as_deref()
+                .map(|repo| format!("repos/{repo}/issues/{id}/comments"))
+                .unwrap_or_else(|| format!("repos/{{owner}}/{{repo}}/issues/{id}/comments"));
+            let mut argv = vec![OsString::from("api")];
+            ctx.push_github_api_hostname(&mut argv);
+            argv.extend([
+                OsString::from(endpoint),
+                OsString::from("--method"),
+                OsString::from("POST"),
+                OsString::from("--raw-field"),
+                OsString::from(format!("body={body}")),
+                OsString::from("--jq"),
+                OsString::from(".html_url"),
+            ]);
+            argv
+        }
+        Provider::Local => vec![
             OsString::from("issue"),
             OsString::from("comment"),
             OsString::from(id.to_string()),
@@ -112,7 +145,9 @@ fn build_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall
             OsString::from(body),
         ],
     };
-    ctx.push_repo_override(&mut argv);
+    if ctx.provider != Provider::GitHub {
+        ctx.push_repo_override(&mut argv);
+    }
     BackendCall::new(program, argv)
 }
 
@@ -172,15 +207,19 @@ mod tests {
     }
 
     #[test]
-    fn build_comment_call_github_uses_issue_comment_body() {
+    fn build_comment_call_github_uses_api_comment_body() {
         let call = build_comment_call(&ctx(Provider::GitHub), 5, "hello");
         let plan = call.plan_argv();
-        assert_eq!(
-            plan[1..4],
-            ["issue".to_string(), "comment".to_string(), "5".to_string()]
+        assert_eq!(plan[1], "api");
+        assert!(
+            plan.iter()
+                .any(|s| s == "repos/{owner}/{repo}/issues/5/comments"),
+            "{plan:?}"
         );
-        let b = plan.iter().position(|s| s == "--body").unwrap();
-        assert_eq!(plan[b + 1], "hello");
+        let b = plan.iter().position(|s| s == "--raw-field").unwrap();
+        assert_eq!(plan[b + 1], "body=hello");
+        let jq = plan.iter().position(|s| s == "--jq").unwrap();
+        assert_eq!(plan[jq + 1], ".html_url");
     }
 
     #[test]
@@ -193,6 +232,15 @@ mod tests {
         );
         let m = plan.iter().position(|s| s == "--message").unwrap();
         assert_eq!(plan[m + 1], "hello");
+    }
+
+    #[test]
+    fn first_url_extracts_comment_link_from_stdout() {
+        assert_eq!(
+            first_url("https://github.com/acme/widgets/issues/7#issuecomment-1\n").as_deref(),
+            Some("https://github.com/acme/widgets/issues/7#issuecomment-1")
+        );
+        assert_eq!(first_url("commented").as_deref(), None);
     }
 
     #[test]
@@ -302,7 +350,10 @@ mod tests {
 
         #[test]
         fn happy_github_inline_body() {
-            let runner = ScriptedRunner::with_stdout(vec!["", &github_view_json(42)]);
+            let runner = ScriptedRunner::with_stdout(vec![
+                "https://github.com/o/r/issues/42#issuecomment-1",
+                &github_view_json(42),
+            ]);
             let global = flags(Some(ProviderFlag::Github), false);
             let code = run_with(
                 &runner,
@@ -315,7 +366,17 @@ mod tests {
             assert_eq!(code, exit::SUCCESS);
             let calls = runner.captured.borrow();
             assert_eq!(calls.len(), 2);
-            assert_eq!(calls[0][1..4], ["issue", "comment", "42"]);
+            assert_eq!(calls[0][1], "api");
+            assert!(
+                calls[0]
+                    .iter()
+                    .any(|s| s == "repos/{owner}/{repo}/issues/42/comments"),
+                "{:?}",
+                calls[0]
+            );
+            let body = calls[0].iter().position(|s| s == "--raw-field").unwrap();
+            assert_eq!(calls[0][body + 1], "body=nice work");
+            assert_eq!(calls[1][1..4], ["issue", "view", "42"]);
         }
 
         #[test]
@@ -337,7 +398,10 @@ mod tests {
         fn reads_body_from_file_and_proceeds() {
             let mut tmp = tempfile::NamedTempFile::new().unwrap();
             tmp.write_all(b"file body").unwrap();
-            let runner = ScriptedRunner::with_stdout(vec!["", &github_view_json(11)]);
+            let runner = ScriptedRunner::with_stdout(vec![
+                "https://github.com/o/r/issues/11#issuecomment-1",
+                &github_view_json(11),
+            ]);
             let global = flags(Some(ProviderFlag::Github), false);
             let code = run_with(
                 &runner,
