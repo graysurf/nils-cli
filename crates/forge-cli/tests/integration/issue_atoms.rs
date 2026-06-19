@@ -21,6 +21,17 @@ fn issue_view_stub(state: &str, number: u64) -> String {
     let json = format!(
         r#"{{"number":{number},"url":"https://github.com/acme/widgets/issues/{number}","state":"{state}","title":"t","body":"b","labels":[{{"name":"bug"}}],"assignees":[{{"login":"alice"}}]}}"#
     );
+    issue_view_stub_with_json(&json, number)
+}
+
+fn issue_view_stub_with_comments(state: &str, number: u64, comment_body: &str) -> String {
+    let json = format!(
+        r#"{{"number":{number},"url":"https://github.com/acme/widgets/issues/{number}","state":"{state}","title":"t","body":"b","labels":[{{"name":"bug"}}],"assignees":[{{"login":"alice"}}],"comments":[{{"author":{{"login":"alice"}},"body":"old","url":"https://github.com/acme/widgets/issues/{number}#issuecomment-110","createdAt":"2026-06-19T00:00:00Z"}},{{"author":{{"login":"alice"}},"body":{comment_body:?},"url":"https://github.com/acme/widgets/issues/{number}#issuecomment-111","createdAt":"2026-06-19T00:01:00Z"}}]}}"#
+    );
+    issue_view_stub_with_json(&json, number)
+}
+
+fn issue_view_stub_with_json(json: &str, number: u64) -> String {
     format!(
         r#"#!/bin/sh
 set -e
@@ -182,7 +193,7 @@ fn issue_reopen_runs_reopen_then_view_and_emits_open_state() {
 
 #[test]
 fn issue_comment_runs_comment_then_view_and_emits_url() {
-    let stub = StubEnv::new().gh_stub(&issue_view_stub("OPEN", 11));
+    let stub = StubEnv::new().gh_stub(&issue_view_stub_with_comments("OPEN", 11, "hello"));
     let out = run_forge_cli(
         &stub,
         &[

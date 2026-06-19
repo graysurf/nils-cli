@@ -110,6 +110,26 @@ pub fn build_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     build_view_call_with(ctx, id, false)
 }
 
+/// View call for mutation ops that need the post-action comment stream.
+pub fn build_view_with_comments_call(ctx: &ProviderContext, id: u64) -> BackendCall {
+    build_view_call_with(ctx, id, true)
+}
+
+pub fn fetch_view_with_comments<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    id: u64,
+) -> Result<IssueViewPayload, ForgeError> {
+    let output = runner.run(&build_view_with_comments_call(ctx, id))?;
+    let mut payload = parse_view_output_with(ctx, &output, true)?;
+    if ctx.provider == Provider::GitLab {
+        let comments_call = build_gitlab_notes_call(ctx, &payload)?;
+        let comments_output = runner.run(&comments_call)?;
+        payload.comments = parse_gitlab_notes(&comments_output, &payload.url)?;
+    }
+    Ok(payload)
+}
+
 fn build_view_call_with(ctx: &ProviderContext, id: u64, with_comments: bool) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let gh_fields = if with_comments {

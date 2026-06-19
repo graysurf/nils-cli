@@ -34,6 +34,8 @@ use serde_json::json;
 use crate::adapter::{PrMergeSummary, ProviderAdapter};
 use crate::commands::plan::CloseReason;
 
+const TRACKER_ISSUE_SCAN_LIMIT: &str = "200";
+
 /// Runner abstraction so unit tests can inject scripted forge-cli responses.
 pub trait ForgeCliRunner {
     fn run(&self, args: &[&str]) -> Result<String, String>;
@@ -229,10 +231,14 @@ impl ProviderAdapter for ForgeCliAdapter {
             .filter(|s| !s.is_empty())
             .collect();
         let mut args = self.base_args(repo);
-        args.extend(["issue", "list", "--state", "open"]);
-        if self.provider == "github" {
-            args.extend(["--limit", "200"]);
-        }
+        args.extend([
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            TRACKER_ISSUE_SCAN_LIMIT,
+        ]);
         for label in &trimmed_labels {
             args.push("--label");
             args.push(label);
@@ -425,11 +431,13 @@ impl ProviderAdapter for ForgeCliAdapter {
         if github {
             checks_args.push("--required-only");
         }
+        // A red required check still returns a successful forge-cli envelope
+        // with `state=failure`. An error envelope here means the required-check
+        // snapshot could not be read at all, so GitHub closeout must fail
+        // closed instead of proceeding with unknown required-check evidence.
         let checks_data = match self.run_envelope(&checks_args) {
             Ok(data) => Some(data),
-            Err(err) if github => {
-                return Err(format!("forge-cli required checks read failed: {err}"));
-            }
+            Err(err) if github => return Err(format!("forge-cli pr checks read failed: {err}")),
             // GitLab / Local have no required-check concept. Keep their
             // historical degraded path so a missing optional pipeline snapshot
             // does not block closeout after the view-side merge data is read.
@@ -447,29 +455,25 @@ impl ProviderAdapter for ForgeCliAdapter {
             .filter(|s| !s.is_empty());
 
         let (required_state, required_count, non_required_failures) = if github {
-            match checks_data.as_ref() {
-                // forge-cli's `pr checks --required-only` returns the gating
-                // `state` (success/failure/pending/...) and the number of
-                // required checks. `data.checks` carries every check with its
-                // `required` flag, from which we recover the non-required
-                // failure list (informational evidence; never blocks).
-                Some(data) => {
-                    let required_state = data
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .filter(|s| !s.is_empty());
-                    let required_count = data
-                        .get("required_count")
-                        .and_then(Value::as_u64)
-                        .and_then(|n| u32::try_from(n).ok());
-                    let non_required_failures = non_required_failure_names(data);
-                    (required_state, required_count, non_required_failures)
-                }
-                // The GitHub branch above fails closed on read errors, so this
-                // is only a defensive fallback for internally missing data.
-                None => (None, None, Vec::new()),
-            }
+            let data = checks_data.as_ref().ok_or_else(|| {
+                "forge-cli pr checks read failed: missing required-check snapshot".to_string()
+            })?;
+            // forge-cli's `pr checks --required-only` returns the gating
+            // `state` (success/failure/pending/...) and the number of
+            // required checks. `data.checks` carries every check with its
+            // `required` flag, from which we recover the non-required
+            // failure list (informational evidence; never blocks).
+            let required_state = data
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty());
+            let required_count = data
+                .get("required_count")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok());
+            let non_required_failures = non_required_failure_names(data);
+            (required_state, required_count, non_required_failures)
         } else {
             // GitLab / Local have no first-class required-check concept:
             // pipeline jobs are reported as a single rolled-up status, or not
@@ -662,6 +666,30 @@ mod tests {
         fn run(&self, args: &[&str]) -> Result<String, String> {
             self.inner.inner.lock().unwrap().run(args)
         }
+    }
+
+    #[test]
+    fn list_open_tracker_issues_uses_broad_resume_scan_limit() {
+        let (adapter, handle) = adapter_with(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.issue.list.v1","data":{"provider":"github","items":[]}}"#,
+        ]);
+        let items = adapter
+            .list_open_tracker_issues("g/p", &["plan".into(), "tracking".into()])
+            .expect("list open trackers");
+        assert!(items.is_empty());
+
+        let calls = handle.calls();
+        assert_eq!(calls.len(), 1);
+        let argv = &calls[0];
+        let limit_idx = argv
+            .iter()
+            .position(|s| s == "--limit")
+            .expect("record-open resume scan must pass an explicit limit");
+        assert_eq!(
+            argv[limit_idx + 1],
+            "200",
+            "record-open resume scan must preserve the previous broad scan ceiling"
+        );
     }
 
     #[test]
@@ -1073,19 +1101,21 @@ mod tests {
     }
 
     #[test]
-    fn pr_merge_summary_tolerates_checks_failure_by_returning_none() {
-        // `pr checks` exits non-zero when the rollup is failing — we want
-        // pr_merge_summary to keep going (returning checks=None) so callers
-        // can still see the view-side state + merge_sha.
-        let (adapter, _) = adapter_with(vec![
-            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"gitlab","number":7,"url":"u","state":"open","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":null,"merge_commit_sha":null,"labels":[]}}"#,
+    fn pr_merge_summary_github_fails_when_required_checks_cannot_be_read() {
+        // GitHub closeout must fail closed when the required-check read itself
+        // fails. Treating this as `None` hides auth/rate-limit/backend
+        // failures from `record close`.
+        let (adapter, _) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.pr.view.v1","data":{"provider":"github","number":7,"url":"u","state":"merged","draft":false,"title":"t","head":"x","base":"main","mergeable":"yes","merged_at":"2025-01-01T00:00:00Z","merge_commit_sha":"deadbeef","labels":[]}}"#,
             r#"{"ok":false,"schema_version":"cli.forge-cli.error.v1","error":{"code":"backend_error","message":"checks rollup failure"}}"#,
         ]);
-        let summary = adapter.pr_merge_summary("g/p", 7).expect("merge summary");
-        assert_eq!(summary.state, "open");
-        assert!(!summary.merged);
-        assert!(summary.merge_sha.is_none());
-        assert!(summary.checks.is_none(), "checks failure tolerated as None");
+        let err = adapter
+            .pr_merge_summary("o/r", 7)
+            .expect_err("required-check read failure must block closeout");
+        assert!(
+            err.contains("pr checks"),
+            "error should name the failed required-check read: {err}"
+        );
     }
 
     #[test]
