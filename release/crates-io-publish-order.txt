@@ -13,6 +13,7 @@ nils-git-cli
 nils-forge-cli
 nils-memo
 nils-screen-record
+nils-secrets
 nils-api-testing-core
 nils-cli-template
 nils-claude-cli
