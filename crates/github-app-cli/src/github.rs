@@ -2,6 +2,8 @@
 //! installation access tokens. All calls are blocking and authenticated with a
 //! short-lived App JWT (see [`crate::jwt`]).
 
+use std::time::Duration;
+
 use serde::Deserialize;
 
 use crate::error::CommandError;
@@ -48,6 +50,8 @@ impl Client {
     pub fn new(api_base: &str) -> Result<Self, CommandError> {
         let http = reqwest::blocking::Client::builder()
             .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| {
                 CommandError::unavailable("http-client", format!("build HTTP client: {e}"))
@@ -58,13 +62,20 @@ impl Client {
         })
     }
 
-    /// `GET /app/installations`.
+    /// `GET /app/installations`, following `Link: rel="next"` pagination so an
+    /// App with more than one page of installations is not silently truncated.
     pub fn list_installations(&self, jwt: &str) -> Result<Vec<Installation>, CommandError> {
-        let url = format!("{}/app/installations", self.api_base);
-        let resp = self.send(self.http.get(&url), jwt)?;
-        resp.json::<Vec<Installation>>().map_err(|e| {
-            CommandError::unavailable("decode", format!("decode installations response: {e}"))
-        })
+        let mut next = Some(format!("{}/app/installations?per_page=100", self.api_base));
+        let mut all = Vec::new();
+        while let Some(url) = next {
+            let resp = self.send(self.http.get(&url), jwt)?;
+            next = next_link(resp.headers());
+            let page = resp.json::<Vec<Installation>>().map_err(|e| {
+                CommandError::unavailable("decode", format!("decode installations response: {e}"))
+            })?;
+            all.extend(page);
+        }
+        Ok(all)
     }
 
     /// `POST /app/installations/{installation_id}/access_tokens`.
@@ -116,4 +127,56 @@ fn github_message(body: &str) -> Option<String> {
         .get("message")?
         .as_str()
         .map(str::to_string)
+}
+
+/// The `rel="next"` URL from a response's `Link` header, if any.
+fn next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    parse_next_link(link)
+}
+
+/// Parse a GitHub `Link` header value and return the `rel="next"` URL.
+///
+/// Example value: `<https://api.github.com/app/installations?page=2>; rel="next",
+/// <https://api.github.com/app/installations?page=5>; rel="last"`.
+fn parse_next_link(link: &str) -> Option<String> {
+    for part in link.split(',') {
+        let mut segments = part.split(';');
+        let url_segment = match segments.next() {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        if segments.any(|s| s.trim() == "rel=\"next\"") {
+            return Some(
+                url_segment
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parse_next_link_picks_the_next_rel() {
+        let header = "<https://api.github.com/app/installations?per_page=100&page=2>; rel=\"next\", \
+<https://api.github.com/app/installations?per_page=100&page=5>; rel=\"last\"";
+        assert_eq!(
+            parse_next_link(header).as_deref(),
+            Some("https://api.github.com/app/installations?per_page=100&page=2")
+        );
+    }
+
+    #[test]
+    fn parse_next_link_is_none_without_a_next_rel() {
+        let header = "<https://api.github.com/app/installations?page=1>; rel=\"prev\", \
+<https://api.github.com/app/installations?page=1>; rel=\"first\"";
+        assert!(parse_next_link(header).is_none());
+    }
 }
