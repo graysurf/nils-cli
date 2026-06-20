@@ -21,6 +21,13 @@ use crate::validations::{no_escaped_control_markdown, no_local_path};
 const SCHEMA: &str = "pr.review";
 const SCHEMA_VERSION: u32 = 1;
 
+/// Placeholder `review_url` used only to validate the generated issue mirror
+/// body *before* the PR comment is posted. The real URL is provider-returned
+/// (never user-controlled), so validating the user-controlled parts — the
+/// `--lens` values embedded in the mirror — against this placeholder is
+/// sufficient to catch a bad lens before any backend mutation.
+const MIRROR_URL_PENDING: &str = "<pending>";
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PrReviewPayload {
     pub provider: &'static str,
@@ -91,22 +98,41 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     no_local_path(&body, "review comment")?;
     no_escaped_control_markdown(&body)?;
 
+    // Resolve and validate the issue-mirror inputs BEFORE any backend mutation
+    // (validate-before-side-effect). The generated mirror body embeds
+    // user-controlled `--lens` values, so it must hit the same `no_local_path`
+    // and escaped-control guards the review body does — otherwise a bad lens
+    // either leaks a local path to the provider issue or fails only after the
+    // PR comment was already posted, leaving an outcome comment with no mirror.
+    let mirror_issue = if args.mirror_issue {
+        let issue_number = args.issue.ok_or_else(issue_required_err)?;
+        let preview = build_issue_mirror_body(
+            ctx.provider,
+            args.id,
+            args.decision,
+            &args.lenses,
+            MIRROR_URL_PENDING,
+        );
+        no_local_path(&preview, "issue mirror")?;
+        no_escaped_control_markdown(&preview)?;
+        Some(issue_number)
+    } else {
+        None
+    };
+
     let pr_call = build_pr_comment_call(&ctx, args.id, &body);
 
     if global.dry_run {
-        let issue_plan = if args.mirror_issue {
-            args.issue.map(|issue| {
-                let mirror_body = build_issue_mirror_body(
-                    args.id,
-                    args.decision,
-                    &args.lenses,
-                    "<pr-comment-url-unavailable-in-dry-run>",
-                );
-                build_issue_comment_call(&ctx, issue, &mirror_body).plan_argv()
-            })
-        } else {
-            None
-        };
+        let issue_plan = mirror_issue.map(|issue| {
+            let mirror_body = build_issue_mirror_body(
+                ctx.provider,
+                args.id,
+                args.decision,
+                &args.lenses,
+                "<pr-comment-url-unavailable-in-dry-run>",
+            );
+            build_issue_comment_call(&ctx, issue, &mirror_body).plan_argv()
+        });
         return Ok(emit_success(
             schema_version(),
             PrReviewDryRunPayload {
@@ -132,21 +158,31 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
+    // GitHub posts review outcomes through the issue-comments API, which accepts
+    // both issues and pull requests (every PR is an issue, but not every issue
+    // is a PR). Verify `<id>` is actually a pull request first, so a typo'd or
+    // non-PR number can't silently post a review outcome onto an unrelated
+    // issue. GitLab's `glab mr note` already fails on a non-MR id, so this guard
+    // is GitHub-only.
+    if ctx.provider == Provider::GitHub {
+        ensure_github_pull_request(runner, &ctx, args.id)?;
+    }
+
     let pr_output = runner.run(&pr_call)?;
     let pr_comment_url = first_url(&pr_output.stdout).unwrap_or_default();
 
-    let issue_comment_url = if args.mirror_issue {
-        let issue_number = args.issue.ok_or_else(|| {
-            ForgeError::validation(
-                schema_err(),
-                "issue_required",
-                "--mirror-issue requires --issue <ISSUE_NUMBER>",
-                None,
-            )
-        })?;
-        let mirror_body =
-            build_issue_mirror_body(args.id, args.decision, &args.lenses, &pr_comment_url);
-        no_escaped_control_markdown(&mirror_body)?;
+    let issue_comment_url = if let Some(issue_number) = mirror_issue {
+        // The mirror body's user-controlled content (lenses) was already
+        // validated up front against MIRROR_URL_PENDING; the only difference
+        // here is the provider-returned `pr_comment_url`, which is never
+        // user-controlled, so it needs no re-validation after the post.
+        let mirror_body = build_issue_mirror_body(
+            ctx.provider,
+            args.id,
+            args.decision,
+            &args.lenses,
+            &pr_comment_url,
+        );
         let issue_call = build_issue_comment_call(&ctx, issue_number, &mirror_body);
         let issue_output = runner.run(&issue_call)?;
         first_url(&issue_output.stdout)
@@ -175,12 +211,21 @@ fn build_pr_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendC
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => github_issue_comment_argv(ctx, id, body),
+        // `glab mr note create … --resolvable=false` posts the outcome as a
+        // non-resolvable note. The bare `glab mr note <id>` form creates a
+        // *resolvable* discussion, which `forge-cli pr merge`'s GitLab gate
+        // counts as an unresolved review thread — so a comments-only / approve
+        // `pr review` would otherwise block the next merge until a human
+        // resolves it. A review *outcome* is a status note, not a blocking
+        // thread, so it must be created non-resolvable.
         Provider::GitLab => vec![
             OsString::from("mr"),
             OsString::from("note"),
+            OsString::from("create"),
             OsString::from(id.to_string()),
             OsString::from("--message"),
             OsString::from(body),
+            OsString::from("--resolvable=false"),
         ],
         Provider::Local => vec![
             OsString::from("issue"),
@@ -242,6 +287,7 @@ fn github_issue_comment_argv(ctx: &ProviderContext, id: u64, body: &str) -> Vec<
 }
 
 fn build_issue_mirror_body(
+    provider: Provider,
     pr_number: u64,
     decision: PrReviewDecision,
     lenses: &[String],
@@ -252,10 +298,76 @@ fn build_issue_mirror_body(
     } else {
         lenses.join(", ")
     };
+    // GitLab Markdown references merge requests as `!<iid>` and issues as
+    // `#<iid>`; GitHub uses `#<number>` for pull requests. Pick the
+    // provider-correct sigil so the mirror links to the merge request, not an
+    // unrelated issue with the same number.
+    let pr_ref = match provider {
+        Provider::GitLab => format!("!{pr_number}"),
+        _ => format!("#{pr_number}"),
+    };
     format!(
-        "PR review outcome posted.\n\n- pr: #{pr_number}\n- decision: {decision}\n- lenses: {lenses}\n- review_url={pr_comment_url}\n",
+        "PR review outcome posted.\n\n- pr: {pr_ref}\n- decision: {decision}\n- lenses: {lenses}\n- review_url={pr_comment_url}\n",
         decision = decision.as_str(),
     )
+}
+
+/// Validation error raised when `--mirror-issue` is requested without the
+/// `--issue <ISSUE_NUMBER>` it mirrors into. Raised up front, before any
+/// backend mutation, so the failure can never leave a posted PR comment with no
+/// mirror.
+fn issue_required_err() -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "issue_required",
+        "--mirror-issue requires --issue <ISSUE_NUMBER>",
+        None,
+    )
+}
+
+/// Verify `<id>` resolves to a pull request on GitHub before posting a review
+/// outcome through the issue-comments API. Uses `run_raw` so a `Not Found`
+/// (the id is an issue or does not exist) becomes a `DATA 65` validation error
+/// rather than a generic backend failure; auth / launch failures still
+/// propagate as their own error kinds.
+fn ensure_github_pull_request<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    id: u64,
+) -> Result<(), ForgeError> {
+    let call = BackendCall::new(BackendProgram::Gh, github_pull_lookup_argv(ctx, id));
+    let probe = runner.run_raw(&call)?;
+    if probe.status_success {
+        return Ok(());
+    }
+    let detail = probe.stderr.trim();
+    Err(ForgeError::validation(
+        schema_err(),
+        "id_not_pull_request",
+        format!(
+            "#{id} is not a pull request on github; refusing to post a review outcome onto an issue or a missing number"
+        ),
+        (!detail.is_empty()).then(|| detail.to_string()),
+    ))
+}
+
+/// `gh api repos/{repo}/pulls/{id} --jq .number` — the read used to confirm
+/// `<id>` is a pull request. Mirrors [`github_issue_comment_argv`]'s endpoint
+/// shape (repo embedded in the path, hostname pushed for GitHub Enterprise).
+fn github_pull_lookup_argv(ctx: &ProviderContext, id: u64) -> Vec<OsString> {
+    let endpoint = ctx
+        .repo
+        .as_deref()
+        .map(|repo| format!("repos/{repo}/pulls/{id}"))
+        .unwrap_or_else(|| format!("repos/{{owner}}/{{repo}}/pulls/{id}"));
+    let mut argv = vec![OsString::from("api")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from(endpoint),
+        OsString::from("--jq"),
+        OsString::from(".number"),
+    ]);
+    argv
 }
 
 fn first_url(stdout: &str) -> Option<String> {
