@@ -383,22 +383,30 @@ backend mapping, validation rules, and output schema versions.
 - On GitHub, PR comments use the issue-comments API endpoint so JSON output can
   report the created comment URL directly: `data.pr_comment_url`. Because that
   endpoint accepts both issues and pull requests, the command first verifies
-  `<id>` is a pull request (`gh api repos/{repo}/pulls/{id}`) and fails with
-  `id_not_pull_request` (`DATA 65`) before posting if it is not — so a typo'd or
-  non-PR number can never silently post a review outcome onto an unrelated
-  issue. On GitLab, the command uses `glab mr note create … --resolvable=false`
-  so the outcome is a non-resolvable status note that does not register as an
-  unresolved MR discussion and block the next `forge-cli pr merge`; if the
-  backend prints a URL, it is surfaced as `data.pr_comment_url`.
+  `<id>` is a pull request (`gh api repos/{repo}/pulls/{id}`) before posting — so
+  a typo'd or non-PR number can never silently post a review outcome onto an
+  unrelated issue. Only a `404 Not Found` from that guard yields
+  `id_not_pull_request` (`DATA 65`); any other non-zero result (rate limit, 5xx,
+  forbidden/SSO) surfaces as a retryable `backend_error` (`RUNTIME 1`) since it
+  may have hit a valid PR. The guard read is also rendered in `--dry-run` output
+  as `data.guard_plan`. On GitLab, the command posts the outcome as a
+  non-resolvable status note (`glab mr note create … --resolvable=false`) so it
+  does not register as an unresolved MR discussion that blocks the next
+  `forge-cli pr merge`; on a `glab` build whose `mr note create` lacks
+  `--resolvable` it falls back to the bare `glab mr note <id>` form rather than
+  failing on an unknown flag. If the backend prints a URL, it is surfaced as
+  `data.pr_comment_url`.
 - With `--mirror-issue --issue <number>`, the command posts a compact issue
   activity comment linking to the PR review comment and reports
-  `data.issue_comment_url` when the backend returns one. The generated mirror
-  body references the PR/MR with the provider-correct sigil (`#<n>` on GitHub,
-  `!<n>` on GitLab). Its user-controlled `--lens` content is run through the
-  same `no_local_path` and `no_escaped_control_markdown` guards as the review
-  body, and that validation — plus the `--issue` requirement — is enforced
-  before any backend post, so a rejected mirror can never leave a posted review
-  outcome with no mirror.
+  `data.issue_comment_url` when the backend returns one. `--mirror-issue`
+  without `--issue` returns the `issue_required` (`DATA 65`) envelope at runtime
+  (the CLI does not impose a clap parse-time requirement, so JSON consumers can
+  branch on the error kind). The generated mirror body references the PR/MR with
+  the provider-correct sigil (`#<n>` on GitHub, `!<n>` on GitLab). Its
+  user-controlled `--lens` content is run through the same `no_local_path` and
+  `no_escaped_control_markdown` guards as the review body, and that validation —
+  plus the `--issue` requirement — is enforced before any backend post, so a
+  rejected mirror can never leave a posted review outcome with no mirror.
 - Output schema:
   `data = { provider, number, decision, pr_comment_url, issue_number,
   issue_comment_url, mirrored, lenses }`.

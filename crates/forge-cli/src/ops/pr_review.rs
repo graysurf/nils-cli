@@ -45,6 +45,10 @@ struct PrReviewDryRunPayload {
     provider: &'static str,
     number: u64,
     decision: &'static str,
+    /// GitHub-only PR-existence guard read that runs before the live post.
+    /// `None` on GitLab / Local. Surfaced so dry-run renders every backend
+    /// command the live run performs.
+    guard_plan: Option<Vec<String>>,
     plan: Vec<String>,
     issue_number: Option<u64>,
     issue_plan: Option<Vec<String>>,
@@ -120,9 +124,16 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         None
     };
 
-    let pr_call = build_pr_comment_call(&ctx, args.id, &body);
-
     if global.dry_run {
+        // dry-run must not touch a backend, so it cannot probe `glab` capability;
+        // render the preferred non-resolvable GitLab form (the live run only
+        // falls back to the bare form on an older `glab` that lacks the flag).
+        let pr_call = build_pr_comment_call(&ctx, args.id, &body, true);
+        // The GitHub PR-existence guard is a live backend read; surface it in the
+        // dry-run plan so wrappers inspecting dry-run output see every call.
+        let guard_plan = (ctx.provider == Provider::GitHub).then(|| {
+            BackendCall::new(BackendProgram::Gh, github_pull_lookup_argv(&ctx, args.id)).plan_argv()
+        });
         let issue_plan = mirror_issue.map(|issue| {
             let mirror_body = build_issue_mirror_body(
                 ctx.provider,
@@ -139,6 +150,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 provider: ctx.provider.as_str(),
                 number: args.id,
                 decision: args.decision.as_str(),
+                guard_plan,
                 plan: pr_call.plan_argv(),
                 issue_number: args.issue,
                 issue_plan,
@@ -147,6 +159,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             },
             format,
             |p| {
+                if let Some(guard) = p.guard_plan.as_ref() {
+                    println!("would verify pull request: {plan}", plan = guard.join(" "));
+                }
                 println!("would post review outcome: {plan}", plan = p.plan.join(" "));
                 if let Some(issue_plan) = p.issue_plan.as_ref() {
                     println!(
@@ -167,6 +182,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     if ctx.provider == Provider::GitHub {
         ensure_github_pull_request(runner, &ctx, args.id)?;
     }
+
+    // GitLab only: pick the review-note form based on whether this `glab` build
+    // supports `mr note create --resolvable` (older builds lack it).
+    let gitlab_resolvable_supported =
+        ctx.provider == Provider::GitLab && glab_supports_resolvable(runner);
+    let pr_call = build_pr_comment_call(&ctx, args.id, &body, gitlab_resolvable_supported);
 
     let pr_output = runner.run(&pr_call)?;
     let pr_comment_url = first_url(&pr_output.stdout).unwrap_or_default();
@@ -207,26 +228,16 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     ))
 }
 
-fn build_pr_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall {
+fn build_pr_comment_call(
+    ctx: &ProviderContext,
+    id: u64,
+    body: &str,
+    gitlab_resolvable_supported: bool,
+) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => github_issue_comment_argv(ctx, id, body),
-        // `glab mr note create … --resolvable=false` posts the outcome as a
-        // non-resolvable note. The bare `glab mr note <id>` form creates a
-        // *resolvable* discussion, which `forge-cli pr merge`'s GitLab gate
-        // counts as an unresolved review thread — so a comments-only / approve
-        // `pr review` would otherwise block the next merge until a human
-        // resolves it. A review *outcome* is a status note, not a blocking
-        // thread, so it must be created non-resolvable.
-        Provider::GitLab => vec![
-            OsString::from("mr"),
-            OsString::from("note"),
-            OsString::from("create"),
-            OsString::from(id.to_string()),
-            OsString::from("--message"),
-            OsString::from(body),
-            OsString::from("--resolvable=false"),
-        ],
+        Provider::GitLab => gitlab_review_note_argv(id, body, gitlab_resolvable_supported),
         Provider::Local => vec![
             OsString::from("issue"),
             OsString::from("comment"),
@@ -239,6 +250,37 @@ fn build_pr_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendC
         ctx.push_repo_override(&mut argv);
     }
     BackendCall::new(program, argv)
+}
+
+/// GitLab review-outcome note argv.
+///
+/// When the local `glab` build supports `mr note create --resolvable`, post the
+/// outcome as a *non-resolvable* status note (`mr note create … --resolvable=false`)
+/// so it does not register as an unresolved MR discussion that blocks
+/// `forge-cli pr merge`'s GitLab gate. Older `glab` builds lack that flag, so
+/// fall back to the bare `mr note <id>` form rather than failing every
+/// `pr review` with an unknown-flag error — the outcome is still posted, it just
+/// stays resolvable on those builds (no worse than before this guard existed).
+fn gitlab_review_note_argv(id: u64, body: &str, resolvable_supported: bool) -> Vec<OsString> {
+    if resolvable_supported {
+        vec![
+            OsString::from("mr"),
+            OsString::from("note"),
+            OsString::from("create"),
+            OsString::from(id.to_string()),
+            OsString::from("--message"),
+            OsString::from(body),
+            OsString::from("--resolvable=false"),
+        ]
+    } else {
+        vec![
+            OsString::from("mr"),
+            OsString::from("note"),
+            OsString::from(id.to_string()),
+            OsString::from("--message"),
+            OsString::from(body),
+        ]
+    }
 }
 
 fn build_issue_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall {
@@ -326,10 +368,13 @@ fn issue_required_err() -> ForgeError {
 }
 
 /// Verify `<id>` resolves to a pull request on GitHub before posting a review
-/// outcome through the issue-comments API. Uses `run_raw` so a `Not Found`
-/// (the id is an issue or does not exist) becomes a `DATA 65` validation error
-/// rather than a generic backend failure; auth / launch failures still
-/// propagate as their own error kinds.
+/// outcome through the issue-comments API. Uses `run_raw` so a `404 Not Found`
+/// (the id is an issue, or does not exist) becomes a `DATA 65`
+/// `id_not_pull_request` validation error. Auth and launch failures still
+/// propagate as their own error kinds via `run_raw`; any other non-zero result
+/// — rate limiting, a 5xx, a forbidden/SSO response, or a network error — could
+/// have hit a perfectly valid PR, so it surfaces as a retryable `backend_error`
+/// rather than a permanent `id_not_pull_request`.
 fn ensure_github_pull_request<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -341,14 +386,48 @@ fn ensure_github_pull_request<R: BackendRunner>(
         return Ok(());
     }
     let detail = probe.stderr.trim();
-    Err(ForgeError::validation(
+    if is_http_not_found(detail) {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "id_not_pull_request",
+            format!(
+                "#{id} is not a pull request on github; refusing to post a review outcome onto an issue or a missing number"
+            ),
+            (!detail.is_empty()).then(|| detail.to_string()),
+        ));
+    }
+    Err(ForgeError::backend_error(
         schema_err(),
-        "id_not_pull_request",
-        format!(
-            "#{id} is not a pull request on github; refusing to post a review outcome onto an issue or a missing number"
-        ),
+        format!("failed to verify github pull request #{id} before posting the review outcome"),
         (!detail.is_empty()).then(|| detail.to_string()),
     ))
+}
+
+/// True when `gh api` stderr indicates an HTTP 404 / Not Found — the only
+/// failure class that proves `<id>` is not a pull request.
+fn is_http_not_found(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("404") || lower.contains("not found")
+}
+
+/// Probe whether the local `glab` build's `mr note create` accepts
+/// `--resolvable`. Older builds lack it, so the review-note posting falls back
+/// to the bare `mr note <id>` form (see [`gitlab_review_note_argv`]). A failed
+/// probe is treated as "unsupported" so the safe bare-note form is used.
+fn glab_supports_resolvable<R: BackendRunner>(runner: &R) -> bool {
+    let call = BackendCall::new(
+        BackendProgram::Glab,
+        [
+            OsString::from("mr"),
+            OsString::from("note"),
+            OsString::from("create"),
+            OsString::from("--help"),
+        ],
+    );
+    match runner.run_raw(&call) {
+        Ok(out) => format!("{}{}", out.stdout, out.stderr).contains("--resolvable"),
+        Err(_) => false,
+    }
 }
 
 /// `gh api repos/{repo}/pulls/{id} --jq .number` — the read used to confirm

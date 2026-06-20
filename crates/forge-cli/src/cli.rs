@@ -438,8 +438,12 @@ pub struct PrReviewArgs {
     /// Issue number that should receive the optional activity mirror.
     #[arg(long, value_name = "ISSUE_NUMBER")]
     pub issue: Option<u64>,
-    /// Mirror a compact activity note to `--issue`.
-    #[arg(long = "mirror-issue", action = ArgAction::SetTrue, requires = "issue")]
+    /// Mirror a compact activity note to `--issue` (required; omitting it
+    /// returns the `issue_required` envelope at runtime).
+    // Deliberately no clap `requires = "issue"`: the op returns the documented
+    // `DATA 65` `issue_required` envelope at runtime so JSON consumers can
+    // branch on the error kind instead of hitting a clap parse-time error.
+    #[arg(long = "mirror-issue", action = ArgAction::SetTrue)]
     pub mirror_issue: bool,
 }
 

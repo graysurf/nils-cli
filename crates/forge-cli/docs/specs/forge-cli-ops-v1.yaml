@@ -256,16 +256,21 @@ operations:
     validations:
       - no_local_path # review comment body AND the generated issue mirror (lens values are user-controlled), validated before any post
       - no_escaped_control_markdown # review comment body AND the generated issue mirror, validated before any post
-    # Op-specific DATA 65 error kinds (both raised before any backend mutation):
-    #   issue_required       — --mirror-issue without --issue
-    #   id_not_pull_request  — GitHub <id> is not a pull request (an issue, or missing)
+    # Op-specific error kinds (both raised before any backend mutation):
+    #   issue_required (DATA 65)       — --mirror-issue without --issue
+    #   id_not_pull_request (DATA 65)  — GitHub <id> is not a pull request (the guard saw HTTP 404)
+    # A non-404 guard failure (rate limit, 5xx, forbidden/SSO) surfaces as backend_error (RUNTIME 1),
+    # not id_not_pull_request, since it may have hit a valid PR.
     backends:
       github:
-        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}", --jq, ".number"] } # PR-existence guard; <id> must be a pull request before posting
+        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}", --jq, ".number"] } # PR-existence guard; <id> must be a pull request before posting (also rendered in --dry-run as guard_plan)
         - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] }
         - { program: gh, argv: [api, "repos/{repo}/issues/{issue}/comments", --method, POST, --raw-field, "body=<generated mirror>", --jq, ".html_url"] } # only with --mirror-issue
       gitlab:
-        - { program: glab, argv: [mr, note, create, "{id}", --message, "{comment_or_file}", "--resolvable=false"] } # non-resolvable status note: does not block the merge gate
+        # Preferred non-resolvable status note (does not block the merge gate); chosen when `glab mr note create --help` advertises --resolvable.
+        - { program: glab, argv: [mr, note, create, "{id}", --message, "{comment_or_file}", "--resolvable=false"] }
+        # Fallback for a glab build that lacks --resolvable: bare (resolvable) note, avoiding an unknown-flag failure.
+        - { program: glab, argv: [mr, note, "{id}", --message, "{comment_or_file}"] }
         - { program: glab, argv: [issue, note, "{issue}", --message, "<generated mirror>"] } # only with --mirror-issue
       # local: provider_unsupported in v1; local PR mutation is not modelled.
     output:
