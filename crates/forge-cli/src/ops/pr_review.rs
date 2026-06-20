@@ -86,6 +86,17 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
+    // `--mirror-issue` requires `--issue`. Resolve this BEFORE reading the
+    // comment body so a missing `--issue` fails fast with `issue_required`
+    // rather than first blocking on stdin (`--comment-file -`) or surfacing a
+    // file-read `software_error`. (`--mirror-issue` carries no clap
+    // `requires = "issue"`, so this runtime guard is the only enforcement point.)
+    let mirror_issue_number = if args.mirror_issue {
+        Some(args.issue.ok_or_else(issue_required_err)?)
+    } else {
+        None
+    };
+
     let body = pr_comment::read_body_with_file_flag(
         args.comment.as_deref(),
         args.comment_file.as_deref(),
@@ -102,14 +113,13 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     no_local_path(&body, "review comment")?;
     no_escaped_control_markdown(&body)?;
 
-    // Resolve and validate the issue-mirror inputs BEFORE any backend mutation
-    // (validate-before-side-effect). The generated mirror body embeds
-    // user-controlled `--lens` values, so it must hit the same `no_local_path`
-    // and escaped-control guards the review body does — otherwise a bad lens
-    // either leaks a local path to the provider issue or fails only after the
-    // PR comment was already posted, leaving an outcome comment with no mirror.
-    let mirror_issue = if args.mirror_issue {
-        let issue_number = args.issue.ok_or_else(issue_required_err)?;
+    // Validate the generated issue-mirror body BEFORE any backend mutation
+    // (validate-before-side-effect). It embeds user-controlled `--lens` values,
+    // so it must hit the same `no_local_path` and escaped-control guards the
+    // review body does — otherwise a bad lens either leaks a local path to the
+    // provider issue or fails only after the PR comment was already posted,
+    // leaving an outcome comment with no mirror.
+    let mirror_issue = if let Some(issue_number) = mirror_issue_number {
         let preview = build_issue_mirror_body(
             ctx.provider,
             args.id,
@@ -254,33 +264,28 @@ fn build_pr_comment_call(
 
 /// GitLab review-outcome note argv.
 ///
-/// When the local `glab` build supports `mr note create --resolvable`, post the
-/// outcome as a *non-resolvable* status note (`mr note create … --resolvable=false`)
-/// so it does not register as an unresolved MR discussion that blocks
-/// `forge-cli pr merge`'s GitLab gate. Older `glab` builds lack that flag, so
-/// fall back to the bare `mr note <id>` form rather than failing every
-/// `pr review` with an unknown-flag error — the outcome is still posted, it just
-/// stays resolvable on those builds (no worse than before this guard existed).
+/// Always uses the `mr note create` subcommand, which reliably accepts
+/// `--message`. When the local `glab` build supports `--resolvable`, append
+/// `--resolvable=false` so the outcome is a *non-resolvable* status note that
+/// does not register as an unresolved MR discussion blocking
+/// `forge-cli pr merge`'s GitLab gate. On older builds that lack the flag, drop
+/// only `--resolvable=false` (the note stays resolvable there — no worse than
+/// before this guard existed); the `create` subcommand and `--message` are kept,
+/// since the bare `mr note <id>` parent form may not accept `--message` on those
+/// builds.
 fn gitlab_review_note_argv(id: u64, body: &str, resolvable_supported: bool) -> Vec<OsString> {
+    let mut argv = vec![
+        OsString::from("mr"),
+        OsString::from("note"),
+        OsString::from("create"),
+        OsString::from(id.to_string()),
+        OsString::from("--message"),
+        OsString::from(body),
+    ];
     if resolvable_supported {
-        vec![
-            OsString::from("mr"),
-            OsString::from("note"),
-            OsString::from("create"),
-            OsString::from(id.to_string()),
-            OsString::from("--message"),
-            OsString::from(body),
-            OsString::from("--resolvable=false"),
-        ]
-    } else {
-        vec![
-            OsString::from("mr"),
-            OsString::from("note"),
-            OsString::from(id.to_string()),
-            OsString::from("--message"),
-            OsString::from(body),
-        ]
+        argv.push(OsString::from("--resolvable=false"));
     }
+    argv
 }
 
 fn build_issue_comment_call(ctx: &ProviderContext, id: u64, body: &str) -> BackendCall {
@@ -387,11 +392,18 @@ fn ensure_github_pull_request<R: BackendRunner>(
     }
     let detail = probe.stderr.trim();
     if is_http_not_found(detail) {
+        // GitHub returns 404 for an inaccessible *private* PR (an
+        // under-scoped / un-SSO'd token) by design, so a 404 cannot be told
+        // apart from a genuine non-PR / missing id at this endpoint. Map it to
+        // the conservative `id_not_pull_request` (not a retryable backend error
+        // — a token-scope problem will not pass on retry) and name all three
+        // possibilities so the operator can tell which applies; the raw `gh`
+        // stderr is carried in the detail.
         return Err(ForgeError::validation(
             schema_err(),
             "id_not_pull_request",
             format!(
-                "#{id} is not a pull request on github; refusing to post a review outcome onto an issue or a missing number"
+                "#{id} could not be resolved as a pull request on github (HTTP 404); it is an issue, does not exist, or is a private PR the current token cannot access — refusing to post a review outcome"
             ),
             (!detail.is_empty()).then(|| detail.to_string()),
         ));

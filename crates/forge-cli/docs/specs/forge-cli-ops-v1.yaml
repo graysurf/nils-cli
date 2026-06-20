@@ -269,8 +269,8 @@ operations:
       gitlab:
         # Preferred non-resolvable status note (does not block the merge gate); chosen when `glab mr note create --help` advertises --resolvable.
         - { program: glab, argv: [mr, note, create, "{id}", --message, "{comment_or_file}", "--resolvable=false"] }
-        # Fallback for a glab build that lacks --resolvable: bare (resolvable) note, avoiding an unknown-flag failure.
-        - { program: glab, argv: [mr, note, "{id}", --message, "{comment_or_file}"] }
+        # Fallback for a glab build that lacks --resolvable: same `create` subcommand, just without the flag (the note stays resolvable). Keeps `create` because the bare `mr note <id>` parent form may not accept --message on those builds.
+        - { program: glab, argv: [mr, note, create, "{id}", --message, "{comment_or_file}"] }
         - { program: glab, argv: [issue, note, "{issue}", --message, "<generated mirror>"] } # only with --mirror-issue
       # local: provider_unsupported in v1; local PR mutation is not modelled.
     output:

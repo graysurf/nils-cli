@@ -393,9 +393,11 @@ backend mapping, validation rules, and output schema versions.
   non-resolvable status note (`glab mr note create … --resolvable=false`) so it
   does not register as an unresolved MR discussion that blocks the next
   `forge-cli pr merge`; on a `glab` build whose `mr note create` lacks
-  `--resolvable` it falls back to the bare `glab mr note <id>` form rather than
-  failing on an unknown flag. If the backend prints a URL, it is surfaced as
-  `data.pr_comment_url`.
+  `--resolvable` it drops only that flag (`glab mr note create … --message`,
+  which stays resolvable) rather than failing on an unknown flag — it keeps the
+  `create` subcommand because the bare `glab mr note <id>` parent form may not
+  accept `--message` on those builds. If the backend prints a URL, it is
+  surfaced as `data.pr_comment_url`.
 - With `--mirror-issue --issue <number>`, the command posts a compact issue
   activity comment linking to the PR review comment and reports
   `data.issue_comment_url` when the backend returns one. `--mirror-issue`
