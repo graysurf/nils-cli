@@ -267,10 +267,13 @@ operations:
         - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] }
         - { program: gh, argv: [api, "repos/{repo}/issues/{issue}/comments", --method, POST, --raw-field, "body=<generated mirror>", --jq, ".html_url"] } # only with --mirror-issue
       gitlab:
-        # Preferred non-resolvable status note (does not block the merge gate); chosen when `glab mr note create --help` advertises --resolvable.
+        # One `glab mr note create --help` probe selects the form (covers every glab version class):
+        #   advertises --resolvable        -> non-resolvable status note (does not block the merge gate)
         - { program: glab, argv: [mr, note, create, "{id}", --message, "{comment_or_file}", "--resolvable=false"] }
-        # Fallback for a glab build that lacks --resolvable: same `create` subcommand, just without the flag (the note stays resolvable). Keeps `create` because the bare `mr note <id>` parent form may not accept --message on those builds.
+        #   `create` exists, no --resolvable -> same subcommand without the flag (note stays resolvable)
         - { program: glab, argv: [mr, note, create, "{id}", --message, "{comment_or_file}"] }
+        #   no `create` subcommand          -> bare note form (the only form such builds support)
+        - { program: glab, argv: [mr, note, "{id}", --message, "{comment_or_file}"] }
         - { program: glab, argv: [issue, note, "{issue}", --message, "<generated mirror>"] } # only with --mirror-issue
       # local: provider_unsupported in v1; local PR mutation is not modelled.
     output:

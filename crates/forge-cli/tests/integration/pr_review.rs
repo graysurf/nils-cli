@@ -63,21 +63,50 @@ esac
     )
 }
 
-// Older glab: `mr note create --help` does NOT list `--resolvable`, so the live
-// path must fall back to `mr note create <id> --message` (the `create`
-// subcommand still accepts `--message`) — NOT the bare `mr note <id>` form,
-// whose parent page may not accept `--message` on those builds.
-fn gitlab_older_glab_review_stub(capture: &str) -> String {
+// Mid glab: `mr note create` exists (its `--help` usage names it) but does NOT
+// advertise `--resolvable`, so the live path posts via `mr note create <id>
+// --message` (dropping only `--resolvable=false`).
+fn gitlab_create_no_resolvable_review_stub(capture: &str) -> String {
     format!(
         r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> {capture:?}
 case "$*" in
   *"mr note create"*"--help"*)
+    echo "  USAGE    glab mr note create [<id> | <branch>] [--flags]"
     echo "  -m --message    Comment or note message."
     echo "  --unique        Don't create a note if a note with the same body already exists."
     ;;
   "mr note create "*)
+    echo "https://gitlab.com/acme/widgets/-/merge_requests/44#note_440"
+    ;;
+  "issue note "*)
+    echo "https://gitlab.com/acme/widgets/-/issues/101#note_1010"
+    ;;
+  *)
+    echo "stub: unexpected glab command: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    )
+}
+
+// Old glab: `mr note` has NO `create` subcommand, so `mr note create --help`
+// falls through to the parent `mr note` help (no `mr note create` usage line,
+// no `--resolvable`). The live path must post via the bare `mr note <id>` form.
+fn gitlab_no_create_review_stub(capture: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+case "$*" in
+  *"mr note create"*"--help"*)
+    echo "  Creates a comment by default. Use --resolve or --unresolve."
+    echo "  USAGE    glab mr note [<id> | <branch>] [--flags]"
+    echo "  -m --message    Comment or note message."
+    ;;
+  "mr note "*)
     echo "https://gitlab.com/acme/widgets/-/merge_requests/44#note_440"
     ;;
   "issue note "*)
@@ -574,14 +603,14 @@ fn pr_review_mirror_issue_without_issue_reports_issue_required() {
 }
 
 #[test]
-fn pr_review_gitlab_falls_back_when_resolvable_unsupported() {
-    // On a glab build whose `mr note create` lacks `--resolvable`, the command
-    // must fall back to `mr note create <id> --message` (dropping only
-    // `--resolvable=false`) — the `create` subcommand reliably accepts
-    // `--message`, whereas the bare `mr note <id>` parent form may not.
+fn pr_review_gitlab_uses_create_without_flag_when_resolvable_unsupported() {
+    // glab where `mr note create` exists but lacks `--resolvable`: post via
+    // `mr note create <id> --message`, dropping only `--resolvable=false`.
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("glab-args.log");
-    let stub = stub.glab_stub(&gitlab_older_glab_review_stub(&capture.to_string_lossy()));
+    let stub = stub.glab_stub(&gitlab_create_no_resolvable_review_stub(
+        &capture.to_string_lossy(),
+    ));
 
     let out = run_forge_cli(
         &stub,
@@ -609,15 +638,62 @@ fn pr_review_gitlab_falls_back_when_resolvable_unsupported() {
     let calls = fs::read_to_string(capture).expect("read captured calls");
     assert!(
         calls.contains("mr note create --help"),
-        "should probe glab --resolvable support: {calls}"
+        "should probe glab note form: {calls}"
     );
     assert!(
         calls.contains("mr note create 44"),
-        "should post via the `mr note create <id>` fallback: {calls}"
+        "should post via the `mr note create <id>` form: {calls}"
     );
     assert!(
         !calls.contains("--resolvable"),
         "must not pass --resolvable on a glab build that lacks it: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_gitlab_uses_bare_form_when_no_create_subcommand() {
+    // Old glab without a `mr note create` subcommand: the probe sees no
+    // `mr note create` usage, so the command posts via the bare `mr note <id>`
+    // form rather than invoking a `create` subcommand that does not exist.
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("glab-args.log");
+    let stub = stub.glab_stub(&gitlab_no_create_review_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--comment",
+            "Status: pass",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["provider"], "gitlab");
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert!(
+        calls.contains("mr note create --help"),
+        "should probe glab note form: {calls}"
+    );
+    assert!(
+        calls.contains("mr note 44"),
+        "should post via the bare `mr note <id>` form: {calls}"
+    );
+    assert!(
+        !calls.contains("mr note create 44"),
+        "must not invoke a `create` subcommand that does not exist: {calls}"
     );
 }
 
