@@ -1,6 +1,6 @@
 [package]
 name = "nils-github-app-cli"
-version = "1.11.2"
+version = "1.12.0"
 edition.workspace = true
 license.workspace = true
 
@@ -23,12 +23,12 @@ clap_complete = { workspace = true }
 # `default-features = false`. Pick the pure-Rust backend (no C toolchain) to
 # match reqwest's rustls choice and keep cross-platform release builds simple.
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
-nils-build-info = { version = "1.11.2", path = "../nils-build-info" }
-nils-common = { version = "1.11.2", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.12.0", path = "../nils-build-info" }
+nils-common = { version = "1.12.0", path = "../nils-common", package = "nils-common" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "1.11.2", path = "../nils-test-support" }
+nils-test-support = { version = "1.12.0", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
