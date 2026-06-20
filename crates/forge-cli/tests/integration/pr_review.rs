@@ -64,8 +64,9 @@ esac
 }
 
 // Older glab: `mr note create --help` does NOT list `--resolvable`, so the live
-// path must fall back to the bare `mr note <id>` form rather than passing an
-// unknown flag.
+// path must fall back to `mr note create <id> --message` (the `create`
+// subcommand still accepts `--message`) — NOT the bare `mr note <id>` form,
+// whose parent page may not accept `--message` on those builds.
 fn gitlab_older_glab_review_stub(capture: &str) -> String {
     format!(
         r#"#!/bin/sh
@@ -76,7 +77,7 @@ case "$*" in
     echo "  -m --message    Comment or note message."
     echo "  --unique        Don't create a note if a note with the same body already exists."
     ;;
-  "mr note "*)
+  "mr note create "*)
     echo "https://gitlab.com/acme/widgets/-/merge_requests/44#note_440"
     ;;
   "issue note "*)
@@ -575,8 +576,9 @@ fn pr_review_mirror_issue_without_issue_reports_issue_required() {
 #[test]
 fn pr_review_gitlab_falls_back_when_resolvable_unsupported() {
     // On a glab build whose `mr note create` lacks `--resolvable`, the command
-    // must fall back to the bare `mr note <id>` form instead of passing an
-    // unknown flag that would fail every GitLab `pr review`.
+    // must fall back to `mr note create <id> --message` (dropping only
+    // `--resolvable=false`) — the `create` subcommand reliably accepts
+    // `--message`, whereas the bare `mr note <id>` parent form may not.
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("glab-args.log");
     let stub = stub.glab_stub(&gitlab_older_glab_review_stub(&capture.to_string_lossy()));
@@ -610,15 +612,43 @@ fn pr_review_gitlab_falls_back_when_resolvable_unsupported() {
         "should probe glab --resolvable support: {calls}"
     );
     assert!(
-        calls.contains("mr note 44"),
-        "should post via the bare `mr note <id>` fallback: {calls}"
-    );
-    assert!(
-        !calls.contains("mr note create 44"),
-        "must not post via the create form when --resolvable is unsupported: {calls}"
+        calls.contains("mr note create 44"),
+        "should post via the `mr note create <id>` fallback: {calls}"
     );
     assert!(
         !calls.contains("--resolvable"),
         "must not pass --resolvable on a glab build that lacks it: {calls}"
     );
+}
+
+#[test]
+fn pr_review_mirror_issue_without_issue_checks_before_reading_body() {
+    // `issue_required` must fire before the comment body is read, so a missing
+    // `--issue` fails fast with DATA 65 instead of blocking on stdin
+    // (`--comment-file -`) or surfacing a file-read `software_error` first.
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\necho should-not-run >&2\nexit 99\n");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--mirror-issue",
+            "--comment-file",
+            "/this/path/does/not/exist",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "issue_required");
 }
