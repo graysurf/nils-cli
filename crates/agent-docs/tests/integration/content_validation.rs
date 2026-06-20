@@ -132,7 +132,9 @@ fn audit_product_filter_excludes_other_product_required_doc() {
         "json",
     ]);
     assert!(claude.success(), "stderr: {}", claude.stderr);
-    assert_eq!(claude.json()["problems"], 0);
+    let claude_json = claude.json();
+    assert_eq!(claude_json["product"], "claude");
+    assert_eq!(claude_json["problems"], 0);
 
     let codex = env.run(&[
         "audit",
@@ -151,6 +153,7 @@ fn audit_product_filter_excludes_other_product_required_doc() {
     );
     let codex_json = codex.json();
     assert_eq!(codex_json["schema_version"], "agent-docs.audit.v2");
+    assert_eq!(codex_json["product"], "codex");
     let codex_docs = codex_json["documents"].as_array().unwrap();
     assert_eq!(codex_docs.len(), 1);
     assert_eq!(codex_docs[0]["products"], serde_json::json!(["codex"]));

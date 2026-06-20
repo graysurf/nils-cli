@@ -369,6 +369,76 @@ fn product_render_rejects_home_prompt_leaf_symlink() {
 
 #[cfg(unix)]
 #[test]
+fn product_render_rejects_symlinked_home_prompt_output_root() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+    write(&root.join("AGENT_HOME.md"), "Codex home prompt\n");
+
+    let outside = tmp.path().join("outside-codex");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(root.join("build")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("build/codex")).unwrap();
+
+    let out = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_ne!(
+        out.code,
+        0,
+        "render should reject a symlinked output root: stdout:\n{}\nstderr:\n{}",
+        out.stdout_text(),
+        out.stderr_text()
+    );
+    assert!(
+        out.stderr_text().contains("symlink"),
+        "stderr should explain the symlink refusal: {}",
+        out.stderr_text()
+    );
+    assert!(
+        !outside.join("AGENT_HOME.md").exists(),
+        "home prompt was written through a symlinked output root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn home_prompt_render_rejects_symlinked_default_output_root() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+    write(&root.join("AGENT_HOME.md"), "Neutral home prompt\n");
+
+    let outside = tmp.path().join("outside-neutral");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(root.join("build")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("build/neutral")).unwrap();
+
+    let out = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "home-prompt",
+    ]);
+    assert_ne!(
+        out.code,
+        0,
+        "home-prompt render should reject a symlinked output root: stdout:\n{}\nstderr:\n{}",
+        out.stdout_text(),
+        out.stderr_text()
+    );
+    assert!(
+        out.stderr_text().contains("symlink"),
+        "stderr should explain the symlink refusal: {}",
+        out.stderr_text()
+    );
+    assert!(
+        !outside.join("AGENT_HOME.md").exists(),
+        "home prompt was written through a symlinked output root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn product_render_removes_stale_home_prompt_symlink_without_deleting_target() {
     let tmp = TempDir::new().unwrap();
     let root = fixture(&tmp);

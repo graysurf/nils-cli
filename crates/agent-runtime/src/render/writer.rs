@@ -73,7 +73,8 @@ pub fn write_product(
     manifests: Arc<ManifestSet>,
     product: &str,
 ) -> Result<RenderReport> {
-    let output_root = root.path().join("build").join(product);
+    let output_root = default_product_output_root(root, product);
+    reject_unsafe_default_output_root(root, &output_root)?;
     write_product_to(root, manifests, product, &output_root)
 }
 
@@ -109,8 +110,66 @@ pub fn write_home_prompt(
     product: &str,
     require_source: bool,
 ) -> Result<HomePromptReport> {
-    let output_root = root.path().join("build").join(product);
+    let output_root = default_product_output_root(root, product);
+    reject_unsafe_default_output_root(root, &output_root)?;
     write_home_prompt_to(root, product, &output_root, require_source)
+}
+
+fn default_product_output_root(root: &SourceRoot, product: &str) -> PathBuf {
+    root.path().join("build").join(product)
+}
+
+fn reject_unsafe_default_output_root(root: &SourceRoot, output_root: &Path) -> Result<()> {
+    let source_root = root.path();
+    let build_root = source_root.join("build");
+    reject_existing_symlink(&build_root, "default render build directory")?;
+    reject_existing_symlink(output_root, "default render output root")?;
+
+    if let Some(canonical_build_root) = canonicalize_if_exists(&build_root)? {
+        if !canonical_build_root.starts_with(source_root) {
+            return Err(anyhow!(
+                "default render build directory {} resolves outside the source root \
+                 ({} not under {}) — refusing to write",
+                build_root.display(),
+                canonical_build_root.display(),
+                source_root.display(),
+            ));
+        }
+
+        if let Some(canonical_output_root) = canonicalize_if_exists(output_root)?
+            && !canonical_output_root.starts_with(&canonical_build_root)
+        {
+            return Err(anyhow!(
+                "default render output root {} resolves outside the build directory \
+                 ({} not under {}) — refusing to write",
+                output_root.display(),
+                canonical_output_root.display(),
+                canonical_build_root.display(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_existing_symlink(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "{label} {} is a symlink; refusing to use it as a render root",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("stat {label} {}", path.display())),
+    }
+}
+
+fn canonicalize_if_exists(path: &Path) -> Result<Option<PathBuf>> {
+    match path.canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("canonicalize {}", path.display())),
+    }
 }
 
 fn write_home_prompt_to(

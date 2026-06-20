@@ -456,6 +456,7 @@ pub struct SkillCheck {
 pub struct AuditReport {
     pub schema_version: &'static str,
     pub target: AuditTarget,
+    pub product: Option<Product>,
     pub strict: bool,
     pub docs_home: PathBuf,
     pub project_path: PathBuf,

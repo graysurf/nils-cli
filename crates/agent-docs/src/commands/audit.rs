@@ -51,6 +51,7 @@ pub fn run_audit(
     Ok(AuditReport {
         schema_version: AuditReport::SCHEMA_VERSION,
         target,
+        product,
         strict,
         docs_home: roots.docs_home.clone(),
         project_path: roots.project_path.clone(),

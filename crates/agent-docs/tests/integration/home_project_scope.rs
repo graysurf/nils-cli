@@ -89,6 +89,37 @@ fn home_project_scope_entry_is_skipped_for_an_unrelated_repo() {
 }
 
 #[test]
+fn require_declared_intent_rejects_home_project_scope_entry_for_an_unrelated_repo() {
+    let docs_home =
+        test_git::init_repo_with(test_git::InitRepoOptions::new().with_initial_commit());
+    fs::write(docs_home.path().join("AGENT_DOCS.toml"), HOME_CATALOG).unwrap();
+
+    let project = test_git::init_repo_with(test_git::InitRepoOptions::new().with_initial_commit());
+
+    let out = preflight(
+        docs_home.path(),
+        project.path(),
+        &["--require-declared-intent", "--format", "json"],
+    );
+    assert_eq!(
+        out.code, 65,
+        "docs-home project-scope intent leaked into an unrelated repo: stdout:\n{}\nstderr:\n{}",
+        out.stdout, out.stderr
+    );
+    let json = out.json();
+    assert_eq!(json["schema_version"], "cli.agent-docs.preflight.v2");
+    assert_eq!(json["error"]["details"]["intent"], "project-dev");
+    assert!(
+        json["error"]["details"]["available_intents"]
+            .as_array()
+            .expect("available intents")
+            .is_empty(),
+        "available intents should be scoped to the unrelated project: {}",
+        out.stdout
+    );
+}
+
+#[test]
 fn home_project_scope_entry_applies_within_the_docs_home_repo() {
     // docs-home and the project are the SAME repo: the project-scope entry is a
     // requirement of this very repository and must apply.
@@ -143,6 +174,36 @@ fn home_validation_contract_is_skipped_for_an_unrelated_repo() {
     assert_eq!(
         validation["commands"].as_array().expect("commands").len(),
         0
+    );
+}
+
+#[test]
+fn require_declared_intent_rejects_home_validation_contract_for_an_unrelated_repo() {
+    let docs_home =
+        test_git::init_repo_with(test_git::InitRepoOptions::new().with_initial_commit());
+    fs::write(
+        docs_home.path().join("AGENT_DOCS.toml"),
+        HOME_VALIDATION_CATALOG,
+    )
+    .unwrap();
+
+    let project = test_git::init_repo_with(test_git::InitRepoOptions::new().with_initial_commit());
+
+    let out = preflight(
+        docs_home.path(),
+        project.path(),
+        &["--require-declared-intent", "--format", "json"],
+    );
+    assert_eq!(
+        out.code, 65,
+        "docs-home validation intent leaked into an unrelated repo: stdout:\n{}\nstderr:\n{}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.json()["error"]["details"]["available_intents"]
+            .as_array()
+            .expect("available intents")
+            .is_empty()
     );
 }
 

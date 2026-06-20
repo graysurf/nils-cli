@@ -165,6 +165,9 @@ pub fn render_explain_intents(
 fn render_audit_text(report: &AuditReport) -> String {
     let mut lines = Vec::new();
     lines.push(format!("AUDIT: {}", report.target));
+    if let Some(product) = report.product {
+        lines.push(format!("product: {product}"));
+    }
     lines.push(format!("docs_home: {}", report.docs_home.display()));
     lines.push(format!("project_path: {}", report.project_path.display()));
     lines.push(String::new());
