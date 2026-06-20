@@ -31,6 +31,9 @@ _evidence() {
             evidence,migrate)
                 cmd="evidence__migrate"
                 ;;
+            evidence,prune-source)
+                cmd="evidence__prune__source"
+                ;;
             evidence,purge)
                 cmd="evidence__purge"
                 ;;
@@ -64,6 +67,9 @@ _evidence() {
             evidence__help,migrate)
                 cmd="evidence__help__migrate"
                 ;;
+            evidence__help,prune-source)
+                cmd="evidence__help__prune__source"
+                ;;
             evidence__help,purge)
                 cmd="evidence__help__purge"
                 ;;
@@ -89,7 +95,7 @@ _evidence() {
 
     case "${cmd}" in
         evidence)
-            opts="-h -V --format --json --help --version validate-hosts validate-local validate-record migrate purge discover catalog query search completion help"
+            opts="-h -V --format --json --help --version validate-hosts validate-local validate-record migrate purge prune-source discover catalog query search completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -185,7 +191,7 @@ _evidence() {
             return 0
             ;;
         evidence__help)
-            opts="validate-hosts validate-local validate-record migrate purge discover catalog query search completion help"
+            opts="validate-hosts validate-local validate-record migrate purge prune-source discover catalog query search completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -255,6 +261,20 @@ _evidence() {
             return 0
             ;;
         evidence__help__migrate)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        evidence__help__prune__source)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -388,6 +408,36 @@ _evidence() {
                     return 0
                     ;;
                 --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        evidence__prune__source)
+            opts="-h --source-out --archive --repo --archived-only --apply --format --json --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --source-out)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --archive)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

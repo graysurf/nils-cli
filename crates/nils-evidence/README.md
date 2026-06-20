@@ -13,8 +13,15 @@ skill-usage records. Depends on the shared `nils-scrub` crate for redaction.
   `git push`es** to the archive clone's configured upstream — `--apply`
   publishes to the remote, and fails the run if `git push` errors. Raw records
   are never written.
+- `evidence prune-source --archived-only [--repo <slug-or-name>] [--apply]` —
+  dry-run by default; removes local agent-out run directories only when their
+  raw `skill-usage.record.json` digest already appears in the archive catalog.
+  This cleans source scratch space without deleting anything from the archive.
 - `evidence discover` — read-only scan of the agent-out tree; classifies
   skill-runs eligible / blocked / unknown.
+- `evidence purge --host <fqdn> | --class <personal|employer> [--apply]` —
+  dry-run by default; deletes archived evidence from the archive for an
+  explicit retention scope. This does not clean local agent-out source records.
 - `evidence query [--skill --outcome --repo --host --org --since --until]` —
   filtered list over the derived catalog.
 - `evidence search <term>` — full-text substring match over intent + outcome

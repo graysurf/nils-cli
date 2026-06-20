@@ -13,6 +13,9 @@
 //! rollups carry no provider refs to fetch — so `search` is a simple
 //! catalog-row substring matcher rather than a clone of `plan-archive`'s
 //! full-text-over-snapshots search.
+//! Source-side cleanup is deliberately split into `prune-source`, which removes
+//! only local agent-out run directories whose raw record digest is already
+//! present in the archive catalog.
 //!
 //! See the validated design at
 //! `agent-runtime-kit:issue-352-delivery/evidence-subsystem-spec.json`.
@@ -22,6 +25,7 @@ pub mod cli;
 pub mod completion;
 pub mod discover;
 pub mod migrate;
+pub mod prune_source;
 pub mod purge;
 pub mod query;
 pub mod record;

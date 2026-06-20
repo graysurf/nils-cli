@@ -1,7 +1,7 @@
 //! `evidence discover` — read-only scan of the agent-out tree for archivable
 //! skill-usage records.
 //!
-//! Classifies each `*/<ts>-skill-usage/skill-usage.record.json` as:
+//! Classifies each source `skill-usage.record.json` as:
 //! - `eligible`: parseable and not yet archived (no matching `source_digest`
 //!   in the archive catalog);
 //! - `blocked`: present in the archive catalog already (would be skipped by
@@ -12,7 +12,7 @@
 //! shape, but the "source" is the agent-out tree (globbing only
 //! `skill-usage.record.json`) rather than a plan-folder root.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
 use serde::Serialize;
@@ -114,7 +114,7 @@ pub fn run(args: &DispatchArgs) -> Result<DiscoverReport, DiscoverError> {
     let mut blocked = 0;
     let mut unknown = 0;
 
-    for record_path in enumerate_records(&source_out) {
+    for record_path in source::enumerate_skill_usage_records(&source_out) {
         let source_path = record_path.display().to_string();
         let raw = match std::fs::read(&record_path) {
             Ok(b) => b,
@@ -180,34 +180,6 @@ pub fn run(args: &DispatchArgs) -> Result<DiscoverReport, DiscoverError> {
         },
         candidates,
     })
-}
-
-fn enumerate_records(source_out: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(projects) = std::fs::read_dir(source_out) else {
-        return out;
-    };
-    for project in projects.flatten() {
-        let project_path = project.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-        let Ok(runs) = std::fs::read_dir(&project_path) else {
-            continue;
-        };
-        for run in runs.flatten() {
-            let run_path = run.path();
-            if !run_path.is_dir() {
-                continue;
-            }
-            let candidate = run_path.join("skill-usage.record.json");
-            if candidate.is_file() {
-                out.push(candidate);
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
