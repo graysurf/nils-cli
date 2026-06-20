@@ -35,6 +35,7 @@ _agent-docs() {
 _arguments "${_arguments_options[@]}" : \
 '--target=[Audit scope target]:TARGET:(home project all)' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--product=[Filter catalog documents by product]:PRODUCT:(codex claude)' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
@@ -47,6 +48,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--intent=[Intent to resolve (for example project-dev)]:INTENT:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--product=[Filter documents and validation by product]:PRODUCT:(codex claude)' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
@@ -73,6 +75,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--intent=[Intent to explain; omit to list available intents]:INTENT:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--product=[Filter documents and validation by product]:PRODUCT:(codex claude)' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
@@ -83,6 +86,7 @@ _arguments "${_arguments_options[@]}" : \
 (list)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format]:FORMAT:(text json)' \
+'--product=[Filter documents and validation by product]:PRODUCT:(codex claude)' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \

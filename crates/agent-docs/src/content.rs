@@ -120,6 +120,7 @@ mod tests {
             context: Context::parse("project-dev").unwrap(),
             scope: Scope::Project,
             path: PathBuf::from("DEVELOPMENT.md"),
+            products: Vec::new(),
             required: true,
             when: When::Always,
             when_raw: "always".to_string(),

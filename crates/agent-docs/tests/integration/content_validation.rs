@@ -75,3 +75,87 @@ fn audit_flags_invalid_required_doc() {
         strict.stdout
     );
 }
+
+#[test]
+fn preflight_product_filter_excludes_other_product_required_doc() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CODEX.md\"\nrequired = true\nproduct = \"codex\"\n",
+    );
+
+    let claude = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--product",
+        "claude",
+        "--strict",
+        "--format",
+        "json",
+    ]);
+    assert!(claude.success(), "stderr: {}", claude.stderr);
+    assert_eq!(claude.json()["summary"]["required_total"], 0);
+
+    let codex = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--product",
+        "codex",
+        "--strict",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        codex.code, 1,
+        "stdout:\n{}\nstderr:\n{}",
+        codex.stdout, codex.stderr
+    );
+    assert_eq!(codex.json()["summary"]["missing_required"], 1);
+}
+
+#[test]
+fn audit_product_filter_excludes_other_product_required_doc() {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"CODEX.md\"\nrequired = true\nproduct = \"codex\"\n",
+    );
+
+    let claude = env.run(&[
+        "audit",
+        "--target",
+        "project",
+        "--product",
+        "claude",
+        "--strict",
+        "--format",
+        "json",
+    ]);
+    assert!(claude.success(), "stderr: {}", claude.stderr);
+    let claude_json = claude.json();
+    assert_eq!(claude_json["product"], "claude");
+    assert_eq!(claude_json["problems"], 0);
+
+    let codex = env.run(&[
+        "audit",
+        "--target",
+        "project",
+        "--product",
+        "codex",
+        "--strict",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        codex.code, 1,
+        "stdout:\n{}\nstderr:\n{}",
+        codex.stdout, codex.stderr
+    );
+    let codex_json = codex.json();
+    assert_eq!(codex_json["schema_version"], "agent-docs.audit.v2");
+    assert_eq!(codex_json["product"], "codex");
+    let codex_docs = codex_json["documents"].as_array().unwrap();
+    assert_eq!(codex_docs.len(), 1);
+    assert_eq!(codex_docs[0]["products"], serde_json::json!(["codex"]));
+    assert_eq!(codex_json["problems"], 1);
+}

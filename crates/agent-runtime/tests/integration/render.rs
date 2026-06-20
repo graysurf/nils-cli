@@ -211,6 +211,256 @@ fn render_against_fixture_writes_expected_skill_md_and_cache() {
 }
 
 #[test]
+fn render_writes_product_home_prompt_and_neutral_home_target() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    write(
+        &root.join("AGENT_HOME.md"),
+        r#"# Shared
+{% if product == "codex" %}Codex delegation policy{% elif product == "claude" %}Claude native policy{% else %}Neutral fallback policy{% endif %}
+"#,
+    );
+    let root_str = root.to_str().unwrap();
+
+    let codex = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(codex.code, 0, "stderr: {}", codex.stderr_text());
+    let codex_home = fs::read_to_string(root.join("build/codex/AGENT_HOME.md"))
+        .expect("codex home prompt missing");
+    assert!(
+        codex_home.contains("Codex delegation policy"),
+        "{codex_home}"
+    );
+    assert!(!codex_home.contains("Claude native policy"), "{codex_home}");
+    assert!(
+        !codex_home.contains("Neutral fallback policy"),
+        "{codex_home}"
+    );
+
+    let claude = run(&["render", "--source-root", root_str, "--product", "claude"]);
+    assert_eq!(claude.code, 0, "stderr: {}", claude.stderr_text());
+    let claude_home = fs::read_to_string(root.join("build/claude/AGENT_HOME.md"))
+        .expect("claude home prompt missing");
+    assert!(
+        claude_home.contains("Claude native policy"),
+        "{claude_home}"
+    );
+    assert!(
+        !claude_home.contains("Codex delegation policy"),
+        "{claude_home}"
+    );
+
+    let neutral = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "home-prompt",
+    ]);
+    assert_eq!(neutral.code, 0, "stderr: {}", neutral.stderr_text());
+    let neutral_home = fs::read_to_string(root.join("build/neutral/AGENT_HOME.md"))
+        .expect("neutral home prompt missing");
+    assert!(
+        neutral_home.contains("Neutral fallback policy"),
+        "{neutral_home}"
+    );
+    assert!(
+        !neutral_home.contains("Codex delegation policy"),
+        "{neutral_home}"
+    );
+    assert!(
+        !neutral_home.contains("Claude native policy"),
+        "{neutral_home}"
+    );
+
+    let neutral_golden = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "home-prompt",
+        "--update-golden",
+    ]);
+    assert_eq!(
+        neutral_golden.code,
+        0,
+        "stderr: {}",
+        neutral_golden.stderr_text()
+    );
+    let neutral_golden_home = fs::read_to_string(root.join("tests/golden/neutral/AGENT_HOME.md"))
+        .expect("neutral golden home prompt missing");
+    assert!(
+        neutral_golden_home.contains("Neutral fallback policy"),
+        "{neutral_golden_home}"
+    );
+
+    let invalid = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "home-prompt",
+        "--product",
+        "gemini",
+    ]);
+    assert_eq!(invalid.code, 2, "stderr: {}", invalid.stderr_text());
+    assert!(
+        invalid.stderr_text().contains("unknown product `gemini`"),
+        "{}",
+        invalid.stderr_text()
+    );
+    assert!(
+        invalid
+            .stderr_text()
+            .contains("expected codex, claude, or neutral"),
+        "{}",
+        invalid.stderr_text()
+    );
+}
+
+#[test]
+fn product_render_removes_stale_home_prompt_when_source_disappears() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+    let source = root.join("AGENT_HOME.md");
+    write(&source, "Codex home prompt\n");
+
+    let first = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(first.code, 0, "stderr: {}", first.stderr_text());
+    let output = root.join("build/codex/AGENT_HOME.md");
+    assert!(output.exists(), "home prompt was not rendered");
+
+    fs::remove_file(source).unwrap();
+    let second = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(second.code, 0, "stderr: {}", second.stderr_text());
+    assert!(!output.exists(), "stale home prompt was not removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn product_render_rejects_home_prompt_leaf_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+    write(&root.join("AGENT_HOME.md"), "Codex home prompt\n");
+
+    let output = root.join("build/codex/AGENT_HOME.md");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    let outside = tmp.path().join("outside-home.md");
+    write(&outside, "outside original\n");
+    std::os::unix::fs::symlink(&outside, &output).unwrap();
+
+    let out = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_ne!(
+        out.code,
+        0,
+        "render should reject a leaf symlink: stdout:\n{}\nstderr:\n{}",
+        out.stdout_text(),
+        out.stderr_text()
+    );
+    assert!(
+        out.stderr_text().contains("symlink"),
+        "stderr should explain the symlink refusal: {}",
+        out.stderr_text()
+    );
+    let outside_body = fs::read_to_string(outside).unwrap();
+    assert_eq!(outside_body, "outside original\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn product_render_rejects_symlinked_home_prompt_output_root() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+    write(&root.join("AGENT_HOME.md"), "Codex home prompt\n");
+
+    let outside = tmp.path().join("outside-codex");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(root.join("build")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("build/codex")).unwrap();
+
+    let out = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_ne!(
+        out.code,
+        0,
+        "render should reject a symlinked output root: stdout:\n{}\nstderr:\n{}",
+        out.stdout_text(),
+        out.stderr_text()
+    );
+    assert!(
+        out.stderr_text().contains("symlink"),
+        "stderr should explain the symlink refusal: {}",
+        out.stderr_text()
+    );
+    assert!(
+        !outside.join("AGENT_HOME.md").exists(),
+        "home prompt was written through a symlinked output root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn home_prompt_render_rejects_symlinked_default_output_root() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+    write(&root.join("AGENT_HOME.md"), "Neutral home prompt\n");
+
+    let outside = tmp.path().join("outside-neutral");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(root.join("build")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("build/neutral")).unwrap();
+
+    let out = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "home-prompt",
+    ]);
+    assert_ne!(
+        out.code,
+        0,
+        "home-prompt render should reject a symlinked output root: stdout:\n{}\nstderr:\n{}",
+        out.stdout_text(),
+        out.stderr_text()
+    );
+    assert!(
+        out.stderr_text().contains("symlink"),
+        "stderr should explain the symlink refusal: {}",
+        out.stderr_text()
+    );
+    assert!(
+        !outside.join("AGENT_HOME.md").exists(),
+        "home prompt was written through a symlinked output root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn product_render_removes_stale_home_prompt_symlink_without_deleting_target() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+
+    let output = root.join("build/codex/AGENT_HOME.md");
+    let sibling = root.join("build/codex/sibling.md");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    write(&sibling, "keep sibling\n");
+    std::os::unix::fs::symlink("sibling.md", &output).unwrap();
+
+    let out = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    assert!(
+        fs::symlink_metadata(&output).is_err(),
+        "stale home prompt symlink was not removed"
+    );
+    let sibling_body = fs::read_to_string(sibling).unwrap();
+    assert_eq!(sibling_body, "keep sibling\n");
+}
+
+#[test]
 fn render_re_run_is_cache_hit_and_produces_identical_output() {
     let tmp = TempDir::new().unwrap();
     let root = fixture(&tmp);
@@ -257,6 +507,7 @@ fn render_against_missing_source_root_exits_two() {
 fn render_with_update_golden_copies_rendered_files_into_tests_golden() {
     let tmp = TempDir::new().unwrap();
     let root = fixture(&tmp);
+    write(&root.join("AGENT_HOME.md"), "Product-specific Codex\n");
     let root_str = root.to_str().unwrap();
     let out = run(&[
         "render",
@@ -270,6 +521,9 @@ fn render_with_update_golden_copies_rendered_files_into_tests_golden() {
     let golden = root.join("tests/golden/codex/skills/market/favorites/expected/SKILL.md");
     let body = fs::read_to_string(&golden).expect("golden SKILL.md missing");
     assert!(body.contains("# /market-favorites"), "{body}");
+    let home = root.join("tests/golden/codex/AGENT_HOME.md");
+    let home_body = fs::read_to_string(&home).expect("golden AGENT_HOME.md missing");
+    assert!(home_body.contains("Product-specific Codex"), "{home_body}");
 }
 
 #[test]

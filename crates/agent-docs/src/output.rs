@@ -42,7 +42,7 @@ pub fn render_undeclared_intent_error(
                 "available_intents": available_intents,
             }));
             let envelope: Envelope<()> =
-                Envelope::failure(schema_version_for("agent-docs", "preflight", 1), error);
+                Envelope::failure(schema_version_for("agent-docs", "preflight", 2), error);
             serde_json::to_string_pretty(&envelope)
                 .context("failed to serialize undeclared-intent error")
         }
@@ -165,6 +165,9 @@ pub fn render_explain_intents(
 fn render_audit_text(report: &AuditReport) -> String {
     let mut lines = Vec::new();
     lines.push(format!("AUDIT: {}", report.target));
+    if let Some(product) = report.product {
+        lines.push(format!("product: {product}"));
+    }
     lines.push(format!("docs_home: {}", report.docs_home.display()));
     lines.push(format!("project_path: {}", report.project_path.display()));
     lines.push(String::new());

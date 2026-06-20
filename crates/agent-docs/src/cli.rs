@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::model::{AuditTarget, FallbackMode, OutputFormat, Scope};
+use crate::model::{AuditTarget, FallbackMode, OutputFormat, Product, Scope};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -84,6 +84,9 @@ pub struct AuditArgs {
 
     #[arg(long, help = "Exit non-zero when the audit finds problems")]
     pub strict: bool,
+
+    #[arg(long, value_enum, help = "Filter catalog documents by product")]
+    pub product: Option<Product>,
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +108,9 @@ pub struct PreflightArgs {
 
     #[arg(long, help = "Exit non-zero when required docs are unsatisfied")]
     pub strict: bool,
+
+    #[arg(long, value_enum, help = "Filter documents and validation by product")]
+    pub product: Option<Product>,
 
     #[arg(
         long,
@@ -155,6 +161,9 @@ pub struct ExplainArgs {
         help = "Output format"
     )]
     pub format: OutputFormat,
+
+    #[arg(long, value_enum, help = "Filter documents and validation by product")]
+    pub product: Option<Product>,
 }
 
 #[derive(Debug, Args)]
@@ -166,6 +175,9 @@ pub struct ListArgs {
         help = "Output format"
     )]
     pub format: OutputFormat,
+
+    #[arg(long, value_enum, help = "Filter documents and validation by product")]
+    pub product: Option<Product>,
 }
 
 #[derive(Debug, Args)]

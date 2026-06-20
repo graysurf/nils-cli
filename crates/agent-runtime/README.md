@@ -24,7 +24,8 @@ binary name (`agent-runtime`) for installed-binary invocations.
 
 Core runtime-kit operations:
 
-- `render` — render `core/` + `targets/<product>/` into `build/<product>/`.
+- `render` — render `core/` + `targets/<product>/` into `build/<product>/`;
+  `--target home-prompt` renders only `AGENT_HOME.md`.
 - `install` — activate rendered output against a product's runtime home.
 - `uninstall` — remove installed renderer output from a product's runtime home.
 - `doctor` — diagnose host setup, runtime roots, and required CLI floors.

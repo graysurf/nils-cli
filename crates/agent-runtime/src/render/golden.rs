@@ -7,7 +7,7 @@
 //! touch anything outside the active product's subtree.
 
 use crate::render::manifest::ManifestSet;
-use crate::render::writer::{RenderReport, sandboxed_join};
+use crate::render::writer::{HOME_PROMPT_FILE, HomePromptReport, RenderReport, sandboxed_join};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -69,7 +69,27 @@ pub fn update_golden(
             .with_context(|| format!("create_dir_all {}", dst_dir.display()))?;
         copy_tree(&src_dir, &dst_dir, &mut copied)?;
     }
+    let home_prompt = sandboxed_join(&report.output_root, HOME_PROMPT_FILE)?;
+    if home_prompt.exists() {
+        let dst = golden_root.join("AGENT_HOME.md");
+        fs::copy(&home_prompt, &dst)
+            .with_context(|| format!("copy {} -> {}", home_prompt.display(), dst.display()))?;
+        copied.push((home_prompt, dst));
+    }
     Ok(copied)
+}
+
+pub fn update_home_prompt(source_root: &Path, report: &HomePromptReport) -> Result<PathBuf> {
+    let golden_root = source_root
+        .join("tests")
+        .join("golden")
+        .join(&report.product);
+    fs::create_dir_all(&golden_root)
+        .with_context(|| format!("create_dir_all {}", golden_root.display()))?;
+    let dst = golden_root.join(HOME_PROMPT_FILE);
+    fs::copy(&report.output_path, &dst)
+        .with_context(|| format!("copy {} -> {}", report.output_path.display(), dst.display()))?;
+    Ok(dst)
 }
 
 fn touched_skill_ids(report: &RenderReport) -> std::collections::BTreeSet<String> {

@@ -74,6 +74,7 @@ A catalog declares two array-of-tables sections:
 context  = "project-dev"            # free-form intent identifier
 scope    = "project"                # home | project | global
 path     = "DEVELOPMENT.md"         # relative to the scope root
+product  = "codex"                  # optional: codex | claude | ["codex", "claude"]
 required = true                     # default: false
 when     = "path-exists:Cargo.toml" # default: always (see grammar below)
 marker   = "## Validation"          # optional: content must contain this string
@@ -84,6 +85,7 @@ notes    = "why this document matters"
 [[validation]]
 context     = "project-dev"
 commands    = ["bash scripts/ci/all.sh"]   # run before declaring done
+product     = ["codex", "claude"]          # optional product filter
 marker      = "target/.agent-validation-ok" # optional finish-line marker
 description = "Run the full check stack before delivery."
 ```
@@ -100,6 +102,13 @@ description = "Run the full check stack before delivery."
 Contexts are free-form identifiers (ASCII alphanumerics plus `-_./`) declared
 by the catalog; they are not compiled in. `preflight --intent X` resolves every
 document and validation entry whose `context` equals `X`.
+
+### Products
+
+`product` is optional on both `[[document]]` and `[[validation]]`. It accepts a
+single product string or a non-empty list of product strings. Supported values
+are `codex` and `claude`. Unscoped entries apply to every product; scoped
+entries are included only when the requested `--product` matches.
 
 ### `when` grammar
 
@@ -131,14 +140,15 @@ overrides a docs-home entry that resolves to the same path.
 ## `preflight --intent X` JSON contract
 
 `agent-docs preflight --intent <X> --format json` emits the
-`agent-docs.preflight.v1` shape. This is the **cross-repo contract** consumed by
+`agent-docs.preflight.v2` shape. This is the **cross-repo contract** consumed by
 agent-runtime-kit hooks (start-of-task awareness injection and the finish-line
-validation gate). The fields below are stable within the `v1` schema:
+validation gate). The fields below are stable within the `v2` schema:
 
 ```json
 {
-  "schema_version": "agent-docs.preflight.v1",
+  "schema_version": "agent-docs.preflight.v2",
   "intent": "project-dev",
+  "product": "codex",
   "strict": false,
   "docs_home": "/abs/docs-home",
   "project_path": "/abs/project",
@@ -148,6 +158,7 @@ validation gate). The fields below are stable within the `v1` schema:
       "context": "project-dev",
       "scope": "project",
       "path": "/abs/project/DEVELOPMENT.md",
+      "products": ["codex"],
       "declared_required": true,
       "required": true,
       "when": "path-exists:Cargo.toml || path-exists:package.json",
@@ -182,6 +193,11 @@ validation gate). The fields below are stable within the `v1` schema:
 
 Field notes:
 
+- `product` is `null` when no `--product` filter was supplied. With
+  `--product codex|claude`, documents and validation contracts with a matching
+  catalog `product` field are included; unscoped entries are always included.
+- `documents[].products` is empty for include-all entries, or lists the scoped
+  product names from the catalog.
 - `documents[].content` is the full document body, emitted so a hook can inject
   the doc without re-reading the file. It is present only for resolved, present
   documents (omitted for missing ones).
@@ -197,8 +213,25 @@ explicitly expect the intent to exist. Without the flag, an unknown intent keeps
 the compatibility behavior above: exit `0`, `documents=[]`, and
 `validation.declared=false`. With the flag, `preflight` exits `65` when the
 requested intent is not declared by any applicable document entry or validation
-contract. Optional documents and documents skipped by `when` still count as a
-declared intent; so do validation-only intents.
+contract before product filtering. Optional documents, product-filtered
+documents, and documents skipped by `when` still count as a declared intent; so
+do validation-only intents.
+
+## Rust API note
+
+Product-aware resolution is exposed through new resolver entrypoints such as
+`resolve_intent_for_product`, `resolve_intent_with_catalog_for_product`,
+`resolve_all_documents_for_product`, and
+`all_validation_contracts_for_product`. The pre-existing resolver functions
+remain available and behave as unfiltered calls.
+
+The product dimension is also part of the public model types used by this crate:
+catalog entries carry `products`, resolved documents report the catalog
+products that matched, and preflight reports include the selected `product`.
+Rust callers that construct those structs directly should update their literals
+for the v2 product model; CLI JSON consumers should treat
+`agent-docs.preflight.v2` and `agent-docs.audit.v2` as the product-aware
+contract boundaries.
 
 In text mode, the guarded failure is written to stderr:
 
@@ -210,7 +243,7 @@ In JSON mode, the guarded failure uses the shared CLI error envelope:
 
 ```json
 {
-  "schema_version": "cli.agent-docs.preflight.v1",
+  "schema_version": "cli.agent-docs.preflight.v2",
   "ok": false,
   "error": {
     "code": "undeclared-intent",
@@ -230,11 +263,11 @@ non-doc code was edited, and there is no evidence the commands ran.
 
 ## `audit` JSON
 
-`agent-docs audit --format json` emits `agent-docs.audit.v1`:
+`agent-docs audit --format json` emits `agent-docs.audit.v2`:
 
 ```json
 {
-  "schema_version": "agent-docs.audit.v1",
+  "schema_version": "agent-docs.audit.v2",
   "target": "all",
   "strict": false,
   "docs_home": "/abs/docs-home",

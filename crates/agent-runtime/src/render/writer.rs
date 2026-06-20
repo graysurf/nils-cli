@@ -18,6 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use nils_markdown::Engine;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -26,6 +27,8 @@ pub const SKILL_TEMPLATE_FILE: &str = "SKILL.md.tera";
 /// dir. Mirrors [`SKILL_TEMPLATE_FILE`]; the rendered output lands at the
 /// product's `render_to` (e.g. `agents/<name>.toml`).
 pub const AGENT_TEMPLATE_FILE: &str = "AGENT.md.tera";
+pub const HOME_PROMPT_FILE: &str = "AGENT_HOME.md";
+pub const NEUTRAL_HOME_PRODUCT: &str = "neutral";
 const TERA_EXT: &str = "tera";
 
 /// One file under a skill source directory. The path is relative to the
@@ -52,6 +55,13 @@ pub struct RenderReport {
     pub skipped: Vec<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct HomePromptReport {
+    pub product: String,
+    pub output_path: PathBuf,
+    pub rendered: bool,
+}
+
 /// Render every skill declared for `product` from manifests rooted at
 /// `root` into the default `<source-root>/build/<product>/` tree.
 ///
@@ -63,7 +73,8 @@ pub fn write_product(
     manifests: Arc<ManifestSet>,
     product: &str,
 ) -> Result<RenderReport> {
-    let output_root = root.path().join("build").join(product);
+    let output_root = default_product_output_root(root, product);
+    reject_unsafe_default_output_root(root, &output_root)?;
     write_product_to(root, manifests, product, &output_root)
 }
 
@@ -90,7 +101,154 @@ pub(crate) fn write_product_to(
     report.rendered.extend(agents.rendered);
     report.cached.extend(agents.cached);
     report.skipped.extend(agents.skipped);
+    write_home_prompt_to(root, product, output_root, false)?;
     Ok(report)
+}
+
+pub fn write_home_prompt(
+    root: &SourceRoot,
+    product: &str,
+    require_source: bool,
+) -> Result<HomePromptReport> {
+    let output_root = default_product_output_root(root, product);
+    reject_unsafe_default_output_root(root, &output_root)?;
+    write_home_prompt_to(root, product, &output_root, require_source)
+}
+
+fn default_product_output_root(root: &SourceRoot, product: &str) -> PathBuf {
+    root.path().join("build").join(product)
+}
+
+fn reject_unsafe_default_output_root(root: &SourceRoot, output_root: &Path) -> Result<()> {
+    let source_root = root.path();
+    let build_root = source_root.join("build");
+    reject_existing_symlink(&build_root, "default render build directory")?;
+    reject_existing_symlink(output_root, "default render output root")?;
+
+    if let Some(canonical_build_root) = canonicalize_if_exists(&build_root)? {
+        if !canonical_build_root.starts_with(source_root) {
+            return Err(anyhow!(
+                "default render build directory {} resolves outside the source root \
+                 ({} not under {}) — refusing to write",
+                build_root.display(),
+                canonical_build_root.display(),
+                source_root.display(),
+            ));
+        }
+
+        if let Some(canonical_output_root) = canonicalize_if_exists(output_root)?
+            && !canonical_output_root.starts_with(&canonical_build_root)
+        {
+            return Err(anyhow!(
+                "default render output root {} resolves outside the build directory \
+                 ({} not under {}) — refusing to write",
+                output_root.display(),
+                canonical_output_root.display(),
+                canonical_build_root.display(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_existing_symlink(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "{label} {} is a symlink; refusing to use it as a render root",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("stat {label} {}", path.display())),
+    }
+}
+
+fn canonicalize_if_exists(path: &Path) -> Result<Option<PathBuf>> {
+    match path.canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("canonicalize {}", path.display())),
+    }
+}
+
+fn write_home_prompt_to(
+    root: &SourceRoot,
+    product: &str,
+    output_root: &Path,
+    require_source: bool,
+) -> Result<HomePromptReport> {
+    let source = root.path().join(HOME_PROMPT_FILE);
+    let output_root = output_root.to_path_buf();
+    let output_path = output_root.join(HOME_PROMPT_FILE);
+    if !source.exists() {
+        if require_source {
+            return Err(anyhow!(
+                "home prompt source {} is missing",
+                source.display()
+            ));
+        }
+        remove_stale_home_prompt(&output_root, &output_path)?;
+        return Ok(HomePromptReport {
+            product: product.to_string(),
+            output_path,
+            rendered: false,
+        });
+    }
+
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("create_dir_all {}", output_root.display()))?;
+    let canonical_source_root = root.path().to_path_buf();
+    let canonical_output_root = output_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize output root {}", output_root.display()))?;
+    let source = canonicalize_under(&canonical_source_root, &source)?;
+    let body = fs::read_to_string(&source)
+        .with_context(|| format!("read home prompt {}", source.display()))?;
+    let rendered = render_home_prompt_template(product, &body)?;
+    let output_path = guard_write_under(&canonical_output_root, &output_path)?;
+    reject_leaf_symlink(&output_path)?;
+    fs::write(&output_path, rendered.as_bytes())
+        .with_context(|| format!("write {}", output_path.display()))?;
+
+    Ok(HomePromptReport {
+        product: product.to_string(),
+        output_path,
+        rendered: true,
+    })
+}
+
+fn remove_stale_home_prompt(output_root: &Path, output_path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(output_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("stat stale home prompt {}", output_path.display()));
+        }
+    };
+    let canonical_output_root = output_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize output root {}", output_root.display()))?;
+    let guarded_output = guard_write_under(&canonical_output_root, output_path)?;
+    if !metadata.file_type().is_symlink() {
+        let canonical_output = guarded_output
+            .canonicalize()
+            .with_context(|| format!("canonicalize stale home prompt {}", output_path.display()))?;
+        if !canonical_output.starts_with(&canonical_output_root) {
+            return Err(anyhow!(
+                "stale home prompt output {} resolves outside the build root \
+                 ({} not under {}) — refusing to remove",
+                output_path.display(),
+                canonical_output.display(),
+                canonical_output_root.display(),
+            ));
+        }
+    }
+    fs::remove_file(&guarded_output)
+        .with_context(|| format!("remove stale home prompt {}", guarded_output.display()))?;
+    prune_empty_dirs_upward(output_root, &canonical_output_root, HOME_PROMPT_FILE);
+    Ok(())
 }
 
 /// Render every skill declared for `product` into `output_root`. This is
@@ -749,6 +907,14 @@ fn render_agent_template(
         .with_context(|| format!("render agent {}", agent.id))
 }
 
+fn render_home_prompt_template(product: &str, template_body: &str) -> Result<String> {
+    let mut engine = Engine::builder().build();
+    let vars = serde_json::json!({ "product": product });
+    engine
+        .render_str(template_body, &vars)
+        .context("render home prompt")
+}
+
 struct ManifestBytes {
     skills: Vec<u8>,
     plugins: Vec<u8>,
@@ -983,6 +1149,18 @@ pub(crate) fn guard_write_under(canonical_base: &Path, candidate: &Path) -> Resu
         )
     })?;
     Ok(canonical_parent.join(file_name))
+}
+
+fn reject_leaf_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "render output {} is a symlink; refusing to follow a leaf symlink",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("stat render output {}", path.display())),
+    }
 }
 
 /// Join `relative` onto `base` after rejecting any `..` segments. Used

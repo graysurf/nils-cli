@@ -70,7 +70,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__audit)
-            opts="-h --target --format --strict --docs-home --project-path --worktree-fallback --help"
+            opts="-h --target --format --strict --product --docs-home --project-path --worktree-fallback --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -82,6 +82,10 @@ _agent-docs() {
                     ;;
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --product)
+                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
                     return 0
                     ;;
                 --docs-home)
@@ -130,7 +134,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__explain)
-            opts="-h --intent --format --docs-home --project-path --worktree-fallback --help"
+            opts="-h --intent --format --product --docs-home --project-path --worktree-fallback --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -142,6 +146,10 @@ _agent-docs() {
                     ;;
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --product)
+                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
                     return 0
                     ;;
                 --docs-home)
@@ -194,7 +202,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__list)
-            opts="-h --format --docs-home --project-path --worktree-fallback --help"
+            opts="-h --format --product --docs-home --project-path --worktree-fallback --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -202,6 +210,10 @@ _agent-docs() {
             case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --product)
+                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
                     return 0
                     ;;
                 --docs-home)
@@ -224,7 +236,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__preflight)
-            opts="-h --intent --format --strict --require-declared-intent --docs-home --project-path --worktree-fallback --help"
+            opts="-h --intent --format --strict --product --require-declared-intent --docs-home --project-path --worktree-fallback --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -236,6 +248,10 @@ _agent-docs() {
                     ;;
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --product)
+                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
                     return 0
                     ;;
                 --docs-home)

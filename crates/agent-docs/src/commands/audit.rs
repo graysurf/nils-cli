@@ -8,13 +8,14 @@ use crate::config::load_catalog_from_roots;
 use crate::env::{self, ResolvedRoots, SymlinkWiring};
 use crate::model::{
     AuditReport, AuditTarget, ConfigLoadError, DocumentStatus, FallbackMode, LoadedCatalog,
-    ResolvedDocument, SkillCheck, SkillPolicy, WiringCheck,
+    Product, ResolvedDocument, SkillCheck, SkillPolicy, WiringCheck,
 };
 use crate::resolver;
 
 pub fn run_audit(
     target: AuditTarget,
     roots: &ResolvedRoots,
+    product: Option<Product>,
     strict: bool,
     fallback_mode: FallbackMode,
 ) -> Result<AuditReport, ConfigLoadError> {
@@ -27,7 +28,13 @@ pub fn run_audit(
         wiring.push(symlink_wiring_check(roots));
     }
 
-    let documents = resolver::resolve_documents_for_target(roots, target, fallback_mode, &catalog);
+    let documents = resolver::resolve_documents_for_target_for_product(
+        roots,
+        target,
+        product,
+        fallback_mode,
+        &catalog,
+    );
     let skill_policy = effective_skill_policy(target, &catalog);
     let skills = skill_checks(roots, skill_policy);
 
@@ -44,6 +51,7 @@ pub fn run_audit(
     Ok(AuditReport {
         schema_version: AuditReport::SCHEMA_VERSION,
         target,
+        product,
         strict,
         docs_home: roots.docs_home.clone(),
         project_path: roots.project_path.clone(),

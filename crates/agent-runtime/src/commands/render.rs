@@ -12,6 +12,8 @@ const DEFAULT_PRODUCT: &str = "codex";
 pub enum RenderTarget {
     /// Render product skills into `build/<product>/`.
     Product,
+    /// Render only the home prompt into `build/<product-or-neutral>/AGENT_HOME.md`.
+    HomePrompt,
     /// Render the shared support matrix into `build/shared/SUPPORT_MATRIX.md`.
     SupportMatrix,
 }
@@ -25,9 +27,13 @@ pub struct RenderArgs {
     /// Render target. Defaults to the product skill tree.
     #[arg(long, value_enum, default_value_t = RenderTarget::Product)]
     pub target: RenderTarget,
-    /// Product to render (`codex` or `claude`). Used when `--target product`.
-    /// Defaults to `codex`.
-    #[arg(long, default_value = DEFAULT_PRODUCT)]
+    /// Product to render (`codex` or `claude`). Defaults to `codex` for
+    /// product renders and to the neutral fallback for `--target home-prompt`.
+    #[arg(
+        long,
+        default_value = DEFAULT_PRODUCT,
+        default_value_if("target", "home-prompt", Some(writer::NEUTRAL_HOME_PRODUCT))
+    )]
     pub product: String,
     /// Rewrite golden outputs from the just-rendered build tree. Product
     /// renders update `tests/golden/<product>/.../expected/`; shared target
@@ -57,6 +63,26 @@ pub fn run(args: RenderArgs) -> anyhow::Result<u8> {
         return Ok(0);
     }
 
+    if args.target == RenderTarget::HomePrompt {
+        let product = home_prompt_product(&args.product)?;
+        let report = writer::write_home_prompt(&root, product, true)?;
+        eprintln!(
+            "agent-runtime render: target=home-prompt product={} output={} rendered={}",
+            report.product,
+            report.output_path.display(),
+            report.rendered,
+        );
+        if args.update_golden {
+            let copied = golden::update_home_prompt(root.path(), &report)?;
+            eprintln!(
+                "agent-runtime render: update-golden copied {} into tests/golden/{}/",
+                copied.display(),
+                report.product,
+            );
+        }
+        return Ok(0);
+    }
+
     let manifests = Arc::new(manifest::load_all(&root)?);
     let report = writer::write_product(&root, manifests.clone(), &args.product)?;
     eprintln!(
@@ -76,4 +102,12 @@ pub fn run(args: RenderArgs) -> anyhow::Result<u8> {
         );
     }
     Ok(0)
+}
+
+fn home_prompt_product(product: &str) -> anyhow::Result<&str> {
+    match product {
+        value @ ("codex" | "claude") => Ok(value),
+        value if value == writer::NEUTRAL_HOME_PRODUCT => Ok(value),
+        value => anyhow::bail!("unknown product `{value}`; expected codex, claude, or neutral"),
+    }
 }
