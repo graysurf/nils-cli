@@ -104,6 +104,7 @@ fn pr_help_lists_every_v1_subcommand() {
         "list",
         "edit",
         "comment",
+        "review",
         "ready",
         "merge",
         "close",

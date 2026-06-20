@@ -22,7 +22,7 @@ use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload, 
 use crate::cli::{BINARY, GlobalFlags, PrReviewThreadResolveArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
-use crate::ops::pr_comment::read_body;
+use crate::ops::pr_comment::read_body_with_file_flag;
 use crate::ops::pr_review_threads;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::no_local_path;
@@ -73,7 +73,11 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
     // Resolve the optional reply note. An empty note (e.g. blank file) is
     // treated as "no note" so an accidental empty body doesn't post a comment.
-    let note = read_body(args.note.as_deref(), args.note_file.as_deref())?;
+    let note = read_body_with_file_flag(
+        args.note.as_deref(),
+        args.note_file.as_deref(),
+        "--note-file",
+    )?;
     let note = if note.trim().is_empty() {
         None
     } else {

@@ -142,6 +142,14 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
 }
 
 pub(crate) fn read_body(inline: Option<&str>, file: Option<&str>) -> Result<String, ForgeError> {
+    read_body_with_file_flag(inline, file, "--body-file")
+}
+
+pub(crate) fn read_body_with_file_flag(
+    inline: Option<&str>,
+    file: Option<&str>,
+    file_flag: &str,
+) -> Result<String, ForgeError> {
     if let Some(s) = inline {
         return Ok(s.to_string());
     }
@@ -162,7 +170,7 @@ pub(crate) fn read_body(inline: Option<&str>, file: Option<&str>) -> Result<Stri
     fs::read_to_string(path).map_err(|e| {
         ForgeError::software(
             schema_err(),
-            format!("failed to read --body-file '{path}'"),
+            format!("failed to read {file_flag} '{path}'"),
             Some(e.to_string()),
         )
     })
