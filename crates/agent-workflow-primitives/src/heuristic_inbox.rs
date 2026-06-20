@@ -4335,6 +4335,10 @@ mod tests {
         repo
     }
 
+    fn force_default_forge_cli(lock: &GlobalStateLock) -> EnvGuard {
+        EnvGuard::set(lock, "FORGE_CLI_BIN", "forge-cli")
+    }
+
     #[test]
     fn deliver_branch_prefix_tracks_kind() {
         assert_eq!(records_branch(DeliverKind::Docs, "x"), "docs/x");
@@ -4390,6 +4394,7 @@ mod tests {
             "AGENT_HOME",
             &repo.path().join(".agent-home").to_string_lossy(),
         );
+        let _forge_cli_bin = force_default_forge_cli(&lock);
         let runner = ScriptedRunner {
             repo_root: repo.path().to_path_buf(),
             source_status: format!("?? {REC_REL}\n"),
@@ -4433,6 +4438,7 @@ mod tests {
             "AGENT_HOME",
             &repo.path().join(".agent-home").to_string_lossy(),
         );
+        let _forge_cli_bin = force_default_forge_cli(&lock);
         let runner = ScriptedRunner {
             repo_root: repo.path().to_path_buf(),
             source_status: format!("?? {REC_REL}\n"),
@@ -4468,6 +4474,7 @@ mod tests {
         let repo = seed_repo();
         let agent_home = repo.path().join(".agent-home");
         let _agent_home = EnvGuard::set(&lock, "AGENT_HOME", &agent_home.to_string_lossy());
+        let _forge_cli_bin = force_default_forge_cli(&lock);
         let default_slug = default_records_slug();
         let default_branch = records_branch(DeliverKind::Docs, &default_slug);
         fs::create_dir_all(managed_worktree_path(repo.path(), &default_slug))
@@ -4509,6 +4516,7 @@ mod tests {
         let repo = seed_repo();
         let agent_home = repo.path().join(".agent-home");
         let _agent_home = EnvGuard::set(&lock, "AGENT_HOME", &agent_home.to_string_lossy());
+        let _forge_cli_bin = force_default_forge_cli(&lock);
         fs::create_dir_all(managed_worktree_path(repo.path(), "fixed-slug"))
             .expect("existing worktree path");
         let runner = ScriptedRunner {
@@ -4541,6 +4549,7 @@ mod tests {
         let repo = seed_repo();
         let agent_home = repo.path().join(".agent-home");
         let _agent_home = EnvGuard::set(&lock, "AGENT_HOME", &agent_home.to_string_lossy());
+        let _forge_cli_bin = force_default_forge_cli(&lock);
         let runner = ScriptedRunner {
             repo_root: repo.path().to_path_buf(),
             source_status: format!("?? {REC_REL}\n"),
@@ -4576,6 +4585,7 @@ mod tests {
         let repo = seed_repo();
         let agent_home = repo.path().join(".agent-home");
         let _agent_home = EnvGuard::set(&lock, "AGENT_HOME", &agent_home.to_string_lossy());
+        let _forge_cli_bin = force_default_forge_cli(&lock);
         fs::create_dir_all(managed_worktree_path(repo.path(), "fixed-slug"))
             .expect("existing empty worktree path");
         let runner = ScriptedRunner {
@@ -4608,6 +4618,7 @@ mod tests {
             "AGENT_HOME",
             &repo.path().join(".agent-home").to_string_lossy(),
         );
+        let _forge_cli_bin = force_default_forge_cli(&lock);
         let runner = ScriptedRunner {
             repo_root: repo.path().to_path_buf(),
             source_status: format!("?? {REC_REL}\n"),
@@ -4642,6 +4653,7 @@ mod tests {
             "AGENT_HOME",
             &repo.path().join(".agent-home").to_string_lossy(),
         );
+        let _forge_cli_bin = force_default_forge_cli(&lock);
         let runner = ScriptedRunner {
             repo_root: repo.path().to_path_buf(),
             source_status: format!("?? {REC_REL}\n"),
@@ -4675,6 +4687,7 @@ mod tests {
             "AGENT_HOME",
             &repo.path().join(".agent-home").to_string_lossy(),
         );
+        let _forge_cli_bin = force_default_forge_cli(&lock);
         let runner = ScriptedRunner {
             repo_root: repo.path().to_path_buf(),
             source_status: format!("?? {REC_REL}\n"),

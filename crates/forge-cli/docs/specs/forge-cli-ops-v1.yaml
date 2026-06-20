@@ -242,6 +242,39 @@ operations:
       github: { program: gh,   argv: [pr, comment, "{id}", --body, "{body_or_file}"] }
       gitlab: { program: glab, argv: [mr, note,    "{id}", --message, "{body_or_file}"] }
 
+  - id: pr.review
+    schema_version: cli.forge-cli.pr.review.v1
+    summary: Post an already-rendered review outcome to a PR/MR and optionally mirror issue activity.
+    inputs:
+      - { name: <id>,             type: integer, required: true }
+      - { name: --decision,       type: enum<comments-only|approve|request-changes>, default: comments-only }
+      - { name: --comment,        type: string,  required: false }
+      - { name: --comment-file,   type: path,    required: false }
+      - { name: --lens,           type: list<string>, default: [] }
+      - { name: --issue,          type: integer, required: false }
+      - { name: --mirror-issue,   type: bool,    default: false }
+    validations:
+      - no_local_path # review comment body
+      - no_escaped_control_markdown # review comment body and generated issue mirror
+    backends:
+      github:
+        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] }
+        - { program: gh, argv: [api, "repos/{repo}/issues/{issue}/comments", --method, POST, --raw-field, "body=<generated mirror>", --jq, ".html_url"] } # only with --mirror-issue
+      gitlab:
+        - { program: glab, argv: [mr, note, "{id}", --message, "{comment_or_file}"] }
+        - { program: glab, argv: [issue, note, "{issue}", --message, "<generated mirror>"] } # only with --mirror-issue
+      # local: provider_unsupported in v1; local PR mutation is not modelled.
+    output:
+      data:
+        provider: enum<github|gitlab>
+        number: integer
+        decision: enum<comments-only|approve|request-changes>
+        pr_comment_url: string
+        issue_number: integer?
+        issue_comment_url: string?
+        mirrored: bool
+        lenses: list<string>
+
   - id: pr.ready
     schema_version: cli.forge-cli.pr.ready.v1
     summary: Promote a draft PR/MR to ready-for-review.

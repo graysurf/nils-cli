@@ -394,6 +394,55 @@ pub struct PrCommentArgs {
     pub body_file: Option<String>,
 }
 
+/// Review outcome decision recorded by `pr review`.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[clap(rename_all = "kebab-case")]
+pub enum PrReviewDecision {
+    /// Post an informational review outcome comment only.
+    CommentsOnly,
+    /// Record an approval outcome in the posted review comment.
+    Approve,
+    /// Record a request-changes outcome in the posted review comment.
+    RequestChanges,
+}
+
+impl PrReviewDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommentsOnly => "comments-only",
+            Self::Approve => "approve",
+            Self::RequestChanges => "request-changes",
+        }
+    }
+}
+
+/// `pr review` arguments. This is a provider posting primitive: callers pass
+/// an already-rendered review outcome comment; forge-cli posts it and can
+/// mirror a compact activity note to an issue.
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewArgs {
+    /// Numeric PR / MR id.
+    pub id: u64,
+    /// Outcome decision to record in the comment metadata.
+    #[arg(long, value_enum, default_value_t = PrReviewDecision::CommentsOnly)]
+    pub decision: PrReviewDecision,
+    /// Review outcome comment body. Mutually exclusive with `--comment-file`.
+    #[arg(long, conflicts_with = "comment_file")]
+    pub comment: Option<String>,
+    /// Read review outcome comment body from a file. Use `-` for stdin.
+    #[arg(long = "comment-file", value_name = "PATH")]
+    pub comment_file: Option<String>,
+    /// Review lens name to include in output and issue mirror metadata.
+    #[arg(long = "lens", value_name = "LENS")]
+    pub lenses: Vec<String>,
+    /// Issue number that should receive the optional activity mirror.
+    #[arg(long, value_name = "ISSUE_NUMBER")]
+    pub issue: Option<u64>,
+    /// Mirror a compact activity note to `--issue`.
+    #[arg(long = "mirror-issue", action = ArgAction::SetTrue, requires = "issue")]
+    pub mirror_issue: bool,
+}
+
 /// `pr comments` arguments.
 #[derive(Args, Debug, Clone)]
 pub struct PrCommentsArgs {
@@ -695,6 +744,8 @@ pub enum PrCommand {
     Edit(PrEditArgs),
     /// Append a comment to a PR / MR.
     Comment(PrCommentArgs),
+    /// Post a review outcome comment and optionally mirror it to an issue.
+    Review(PrReviewArgs),
     /// List the issue-style comment stream attached to a PR / MR.
     Comments(PrCommentsArgs),
     /// Promote a draft PR / MR to ready-for-review.
@@ -1286,6 +1337,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Comment(args)),
         })) => ops::pr_comment::run(&global, args, format),
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Review(args)),
+        })) => ops::pr_review::run(&global, args, format),
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Comments(args)),
         })) => ops::pr_comments::run(&global, args, format),
