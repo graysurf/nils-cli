@@ -78,3 +78,26 @@ fn init_prefills_rust_example_when_cargo_toml_present() {
         out.stdout
     );
 }
+
+#[test]
+fn init_inherited_comments_preserve_product_scope() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CODEX.md\"\nproduct = \"codex\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"codex-check\"]\nproduct = [\"codex\", \"claude\"]\n",
+    );
+
+    let out = env.run(&["init", "--print"]);
+    assert!(out.success(), "stderr: {}", out.stderr);
+    assert!(
+        out.stdout
+            .contains("document: context=project-dev scope=home path=CODEX.md product=[\"codex\"]"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("validation: context=project-dev product=[\"codex\", \"claude\"]"),
+        "{}",
+        out.stdout
+    );
+}

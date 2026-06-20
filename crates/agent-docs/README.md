@@ -74,6 +74,7 @@ A catalog declares two array-of-tables sections:
 context  = "project-dev"            # free-form intent identifier
 scope    = "project"                # home | project | global
 path     = "DEVELOPMENT.md"         # relative to the scope root
+product  = "codex"                  # optional: codex | claude | ["codex", "claude"]
 required = true                     # default: false
 when     = "path-exists:Cargo.toml" # default: always (see grammar below)
 marker   = "## Validation"          # optional: content must contain this string
@@ -84,6 +85,7 @@ notes    = "why this document matters"
 [[validation]]
 context     = "project-dev"
 commands    = ["bash scripts/ci/all.sh"]   # run before declaring done
+product     = ["codex", "claude"]          # optional product filter
 marker      = "target/.agent-validation-ok" # optional finish-line marker
 description = "Run the full check stack before delivery."
 ```
@@ -100,6 +102,13 @@ description = "Run the full check stack before delivery."
 Contexts are free-form identifiers (ASCII alphanumerics plus `-_./`) declared
 by the catalog; they are not compiled in. `preflight --intent X` resolves every
 document and validation entry whose `context` equals `X`.
+
+### Products
+
+`product` is optional on both `[[document]]` and `[[validation]]`. It accepts a
+single product string or a non-empty list of product strings. Supported values
+are `codex` and `claude`. Unscoped entries apply to every product; scoped
+entries are included only when the requested `--product` matches.
 
 ### `when` grammar
 
@@ -221,7 +230,8 @@ catalog entries carry `products`, resolved documents report the catalog
 products that matched, and preflight reports include the selected `product`.
 Rust callers that construct those structs directly should update their literals
 for the v2 product model; CLI JSON consumers should treat
-`schema_version = "agent-docs.preflight.v2"` as the contract boundary.
+`agent-docs.preflight.v2` and `agent-docs.audit.v2` as the product-aware
+contract boundaries.
 
 In text mode, the guarded failure is written to stderr:
 
@@ -253,11 +263,11 @@ non-doc code was edited, and there is no evidence the commands ran.
 
 ## `audit` JSON
 
-`agent-docs audit --format json` emits `agent-docs.audit.v1`:
+`agent-docs audit --format json` emits `agent-docs.audit.v2`:
 
 ```json
 {
-  "schema_version": "agent-docs.audit.v1",
+  "schema_version": "agent-docs.audit.v2",
   "target": "all",
   "strict": false,
   "docs_home": "/abs/docs-home",

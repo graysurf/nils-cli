@@ -89,19 +89,31 @@ fn render_stub(roots: &ResolvedRoots) -> String {
 fn render_inherited(out: &mut String, home: &ScopeCatalog) {
     for entry in &home.documents {
         out.push_str(&format!(
-            "#   document: context={} scope={} path={} required={} when=\"{}\"\n",
+            "#   document: context={} scope={} path={}{} required={} when=\"{}\"\n",
             entry.context,
             entry.scope,
             entry.path.display(),
+            format_products(&entry.products),
             entry.required,
             entry.when_raw,
         ));
     }
     for validation in &home.validations {
         out.push_str(&format!(
-            "#   validation: context={} commands={:?}\n",
-            validation.context, validation.commands,
+            "#   validation: context={}{} commands={:?}\n",
+            validation.context,
+            format_products(&validation.products),
+            validation.commands,
         ));
+    }
+}
+
+fn format_products(products: &[crate::model::Product]) -> String {
+    if products.is_empty() {
+        String::new()
+    } else {
+        let values: Vec<&str> = products.iter().map(|product| product.as_str()).collect();
+        format!(" product={values:?}")
     }
 }
 

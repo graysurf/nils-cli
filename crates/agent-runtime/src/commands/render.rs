@@ -108,6 +108,6 @@ fn home_prompt_product(product: &str) -> anyhow::Result<&str> {
     match product {
         value @ ("codex" | "claude") => Ok(value),
         value if value == writer::NEUTRAL_HOME_PRODUCT => Ok(value),
-        value => anyhow::bail!("unknown product `{value}`; expected codex or claude"),
+        value => anyhow::bail!("unknown product `{value}`; expected codex, claude, or neutral"),
     }
 }

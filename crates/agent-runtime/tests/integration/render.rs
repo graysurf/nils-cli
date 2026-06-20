@@ -308,6 +308,13 @@ fn render_writes_product_home_prompt_and_neutral_home_target() {
         "{}",
         invalid.stderr_text()
     );
+    assert!(
+        invalid
+            .stderr_text()
+            .contains("expected codex, claude, or neutral"),
+        "{}",
+        invalid.stderr_text()
+    );
 }
 
 #[test]
@@ -327,6 +334,60 @@ fn product_render_removes_stale_home_prompt_when_source_disappears() {
     let second = run(&["render", "--source-root", root_str, "--product", "codex"]);
     assert_eq!(second.code, 0, "stderr: {}", second.stderr_text());
     assert!(!output.exists(), "stale home prompt was not removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn product_render_rejects_home_prompt_leaf_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+    write(&root.join("AGENT_HOME.md"), "Codex home prompt\n");
+
+    let output = root.join("build/codex/AGENT_HOME.md");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    let outside = tmp.path().join("outside-home.md");
+    write(&outside, "outside original\n");
+    std::os::unix::fs::symlink(&outside, &output).unwrap();
+
+    let out = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_ne!(
+        out.code,
+        0,
+        "render should reject a leaf symlink: stdout:\n{}\nstderr:\n{}",
+        out.stdout_text(),
+        out.stderr_text()
+    );
+    assert!(
+        out.stderr_text().contains("symlink"),
+        "stderr should explain the symlink refusal: {}",
+        out.stderr_text()
+    );
+    let outside_body = fs::read_to_string(outside).unwrap();
+    assert_eq!(outside_body, "outside original\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn product_render_removes_stale_home_prompt_symlink_without_deleting_target() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+
+    let output = root.join("build/codex/AGENT_HOME.md");
+    let sibling = root.join("build/codex/sibling.md");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    write(&sibling, "keep sibling\n");
+    std::os::unix::fs::symlink("sibling.md", &output).unwrap();
+
+    let out = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    assert!(
+        fs::symlink_metadata(&output).is_err(),
+        "stale home prompt symlink was not removed"
+    );
+    let sibling_body = fs::read_to_string(sibling).unwrap();
+    assert_eq!(sibling_body, "keep sibling\n");
 }
 
 #[test]

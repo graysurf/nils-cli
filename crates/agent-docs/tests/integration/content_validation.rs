@@ -149,5 +149,10 @@ fn audit_product_filter_excludes_other_product_required_doc() {
         "stdout:\n{}\nstderr:\n{}",
         codex.stdout, codex.stderr
     );
-    assert_eq!(codex.json()["problems"], 1);
+    let codex_json = codex.json();
+    assert_eq!(codex_json["schema_version"], "agent-docs.audit.v2");
+    let codex_docs = codex_json["documents"].as_array().unwrap();
+    assert_eq!(codex_docs.len(), 1);
+    assert_eq!(codex_docs[0]["products"], serde_json::json!(["codex"]));
+    assert_eq!(codex_json["problems"], 1);
 }

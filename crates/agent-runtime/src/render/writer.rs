@@ -18,6 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use nils_markdown::Engine;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -147,6 +148,7 @@ fn write_home_prompt_to(
         .with_context(|| format!("read home prompt {}", source.display()))?;
     let rendered = render_home_prompt_template(product, &body)?;
     let output_path = guard_write_under(&canonical_output_root, &output_path)?;
+    reject_leaf_symlink(&output_path)?;
     fs::write(&output_path, rendered.as_bytes())
         .with_context(|| format!("write {}", output_path.display()))?;
 
@@ -158,26 +160,34 @@ fn write_home_prompt_to(
 }
 
 fn remove_stale_home_prompt(output_root: &Path, output_path: &Path) -> Result<()> {
-    if fs::symlink_metadata(output_path).is_err() {
-        return Ok(());
-    }
+    let metadata = match fs::symlink_metadata(output_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("stat stale home prompt {}", output_path.display()));
+        }
+    };
     let canonical_output_root = output_root
         .canonicalize()
         .with_context(|| format!("canonicalize output root {}", output_root.display()))?;
-    let canonical_output = output_path
-        .canonicalize()
-        .with_context(|| format!("canonicalize stale home prompt {}", output_path.display()))?;
-    if !canonical_output.starts_with(&canonical_output_root) {
-        return Err(anyhow!(
-            "stale home prompt output {} resolves outside the build root \
-             ({} not under {}) — refusing to remove",
-            output_path.display(),
-            canonical_output.display(),
-            canonical_output_root.display(),
-        ));
+    let guarded_output = guard_write_under(&canonical_output_root, output_path)?;
+    if !metadata.file_type().is_symlink() {
+        let canonical_output = guarded_output
+            .canonicalize()
+            .with_context(|| format!("canonicalize stale home prompt {}", output_path.display()))?;
+        if !canonical_output.starts_with(&canonical_output_root) {
+            return Err(anyhow!(
+                "stale home prompt output {} resolves outside the build root \
+                 ({} not under {}) — refusing to remove",
+                output_path.display(),
+                canonical_output.display(),
+                canonical_output_root.display(),
+            ));
+        }
     }
-    fs::remove_file(&canonical_output)
-        .with_context(|| format!("remove stale home prompt {}", canonical_output.display()))?;
+    fs::remove_file(&guarded_output)
+        .with_context(|| format!("remove stale home prompt {}", guarded_output.display()))?;
     prune_empty_dirs_upward(output_root, &canonical_output_root, HOME_PROMPT_FILE);
     Ok(())
 }
@@ -1080,6 +1090,18 @@ pub(crate) fn guard_write_under(canonical_base: &Path, candidate: &Path) -> Resu
         )
     })?;
     Ok(canonical_parent.join(file_name))
+}
+
+fn reject_leaf_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "render output {} is a symlink; refusing to follow a leaf symlink",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("stat render output {}", path.display())),
+    }
 }
 
 /// Join `relative` onto `base` after rejecting any `..` segments. Used

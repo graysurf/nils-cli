@@ -477,17 +477,17 @@ pub fn all_validation_contracts_for_product(
 /// The distinct intents that apply to the current project after scope
 /// filtering, sorted.
 pub fn declared_intents(
-    roots: &ResolvedRoots,
-    fallback_mode: FallbackMode,
+    _roots: &ResolvedRoots,
+    _fallback_mode: FallbackMode,
     catalog: &LoadedCatalog,
 ) -> Vec<String> {
     let mut intents: Vec<String> = Vec::new();
-    for document in resolve_all_documents(roots, fallback_mode, catalog) {
-        push_unique_intent(&mut intents, document.context.as_str());
-    }
-    for contract in all_validation_contracts(roots, catalog) {
-        if contract.declared {
-            push_unique_intent(&mut intents, contract.context.as_str());
+    for scope_catalog in catalog.in_load_order() {
+        for document in &scope_catalog.documents {
+            push_unique_intent(&mut intents, document.context.as_str());
+        }
+        for validation in &scope_catalog.validations {
+            push_unique_intent(&mut intents, validation.context.as_str());
         }
     }
     intents.sort();

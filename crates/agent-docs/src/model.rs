@@ -468,7 +468,7 @@ pub struct AuditReport {
 }
 
 impl AuditReport {
-    pub const SCHEMA_VERSION: &'static str = "agent-docs.audit.v1";
+    pub const SCHEMA_VERSION: &'static str = "agent-docs.audit.v2";
 
     pub fn has_problems(&self) -> bool {
         self.problems > 0
