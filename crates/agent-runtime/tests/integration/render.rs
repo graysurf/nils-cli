@@ -211,6 +211,125 @@ fn render_against_fixture_writes_expected_skill_md_and_cache() {
 }
 
 #[test]
+fn render_writes_product_home_prompt_and_neutral_home_target() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    write(
+        &root.join("AGENT_HOME.md"),
+        r#"# Shared
+{% if product == "codex" %}Codex delegation policy{% elif product == "claude" %}Claude native policy{% else %}Neutral fallback policy{% endif %}
+"#,
+    );
+    let root_str = root.to_str().unwrap();
+
+    let codex = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(codex.code, 0, "stderr: {}", codex.stderr_text());
+    let codex_home = fs::read_to_string(root.join("build/codex/AGENT_HOME.md"))
+        .expect("codex home prompt missing");
+    assert!(
+        codex_home.contains("Codex delegation policy"),
+        "{codex_home}"
+    );
+    assert!(!codex_home.contains("Claude native policy"), "{codex_home}");
+    assert!(
+        !codex_home.contains("Neutral fallback policy"),
+        "{codex_home}"
+    );
+
+    let claude = run(&["render", "--source-root", root_str, "--product", "claude"]);
+    assert_eq!(claude.code, 0, "stderr: {}", claude.stderr_text());
+    let claude_home = fs::read_to_string(root.join("build/claude/AGENT_HOME.md"))
+        .expect("claude home prompt missing");
+    assert!(
+        claude_home.contains("Claude native policy"),
+        "{claude_home}"
+    );
+    assert!(
+        !claude_home.contains("Codex delegation policy"),
+        "{claude_home}"
+    );
+
+    let neutral = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "home-prompt",
+    ]);
+    assert_eq!(neutral.code, 0, "stderr: {}", neutral.stderr_text());
+    let neutral_home = fs::read_to_string(root.join("build/neutral/AGENT_HOME.md"))
+        .expect("neutral home prompt missing");
+    assert!(
+        neutral_home.contains("Neutral fallback policy"),
+        "{neutral_home}"
+    );
+    assert!(
+        !neutral_home.contains("Codex delegation policy"),
+        "{neutral_home}"
+    );
+    assert!(
+        !neutral_home.contains("Claude native policy"),
+        "{neutral_home}"
+    );
+
+    let neutral_golden = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "home-prompt",
+        "--update-golden",
+    ]);
+    assert_eq!(
+        neutral_golden.code,
+        0,
+        "stderr: {}",
+        neutral_golden.stderr_text()
+    );
+    let neutral_golden_home = fs::read_to_string(root.join("tests/golden/neutral/AGENT_HOME.md"))
+        .expect("neutral golden home prompt missing");
+    assert!(
+        neutral_golden_home.contains("Neutral fallback policy"),
+        "{neutral_golden_home}"
+    );
+
+    let invalid = run(&[
+        "render",
+        "--source-root",
+        root_str,
+        "--target",
+        "home-prompt",
+        "--product",
+        "gemini",
+    ]);
+    assert_eq!(invalid.code, 2, "stderr: {}", invalid.stderr_text());
+    assert!(
+        invalid.stderr_text().contains("unknown product `gemini`"),
+        "{}",
+        invalid.stderr_text()
+    );
+}
+
+#[test]
+fn product_render_removes_stale_home_prompt_when_source_disappears() {
+    let tmp = TempDir::new().unwrap();
+    let root = fixture(&tmp);
+    let root_str = root.to_str().unwrap();
+    let source = root.join("AGENT_HOME.md");
+    write(&source, "Codex home prompt\n");
+
+    let first = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(first.code, 0, "stderr: {}", first.stderr_text());
+    let output = root.join("build/codex/AGENT_HOME.md");
+    assert!(output.exists(), "home prompt was not rendered");
+
+    fs::remove_file(source).unwrap();
+    let second = run(&["render", "--source-root", root_str, "--product", "codex"]);
+    assert_eq!(second.code, 0, "stderr: {}", second.stderr_text());
+    assert!(!output.exists(), "stale home prompt was not removed");
+}
+
+#[test]
 fn render_re_run_is_cache_hit_and_produces_identical_output() {
     let tmp = TempDir::new().unwrap();
     let root = fixture(&tmp);
@@ -257,6 +376,7 @@ fn render_against_missing_source_root_exits_two() {
 fn render_with_update_golden_copies_rendered_files_into_tests_golden() {
     let tmp = TempDir::new().unwrap();
     let root = fixture(&tmp);
+    write(&root.join("AGENT_HOME.md"), "Product-specific Codex\n");
     let root_str = root.to_str().unwrap();
     let out = run(&[
         "render",
@@ -270,6 +390,9 @@ fn render_with_update_golden_copies_rendered_files_into_tests_golden() {
     let golden = root.join("tests/golden/codex/skills/market/favorites/expected/SKILL.md");
     let body = fs::read_to_string(&golden).expect("golden SKILL.md missing");
     assert!(body.contains("# /market-favorites"), "{body}");
+    let home = root.join("tests/golden/codex/AGENT_HOME.md");
+    let home_body = fs::read_to_string(&home).expect("golden AGENT_HOME.md missing");
+    assert!(home_body.contains("Product-specific Codex"), "{home_body}");
 }
 
 #[test]

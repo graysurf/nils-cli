@@ -140,6 +140,7 @@ const STUB_HEADER: &str = "\
 # context  = \"project-dev\"           # the intent that needs this document
 # scope    = \"project\"               # home | project | global
 # path     = \"DEVELOPMENT.md\"        # relative to the scope root
+# product  = \"codex\"                 # optional: codex | claude | [\"codex\", \"claude\"]
 # required = true                     # default: false
 # when     = \"path-exists:Cargo.toml\" # default: always (see grammar below)
 # marker   = \"## Validation\"         # optional: content must contain this string
@@ -149,6 +150,7 @@ const STUB_HEADER: &str = "\
 # [[validation]]
 # context     = \"project-dev\"
 # commands    = [\"bash scripts/ci/all.sh\"]  # run before declaring done
+# product     = \"codex\"              # optional: filter this validation to a product
 # marker      = \"target/.agent-validation-ok\" # optional finish-line marker
 # description = \"Run the full check stack before delivery.\"
 #

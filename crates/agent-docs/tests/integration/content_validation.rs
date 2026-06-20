@@ -75,3 +75,79 @@ fn audit_flags_invalid_required_doc() {
         strict.stdout
     );
 }
+
+#[test]
+fn preflight_product_filter_excludes_other_product_required_doc() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CODEX.md\"\nrequired = true\nproduct = \"codex\"\n",
+    );
+
+    let claude = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--product",
+        "claude",
+        "--strict",
+        "--format",
+        "json",
+    ]);
+    assert!(claude.success(), "stderr: {}", claude.stderr);
+    assert_eq!(claude.json()["summary"]["required_total"], 0);
+
+    let codex = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--product",
+        "codex",
+        "--strict",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        codex.code, 1,
+        "stdout:\n{}\nstderr:\n{}",
+        codex.stdout, codex.stderr
+    );
+    assert_eq!(codex.json()["summary"]["missing_required"], 1);
+}
+
+#[test]
+fn audit_product_filter_excludes_other_product_required_doc() {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"CODEX.md\"\nrequired = true\nproduct = \"codex\"\n",
+    );
+
+    let claude = env.run(&[
+        "audit",
+        "--target",
+        "project",
+        "--product",
+        "claude",
+        "--strict",
+        "--format",
+        "json",
+    ]);
+    assert!(claude.success(), "stderr: {}", claude.stderr);
+    assert_eq!(claude.json()["problems"], 0);
+
+    let codex = env.run(&[
+        "audit",
+        "--target",
+        "project",
+        "--product",
+        "codex",
+        "--strict",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        codex.code, 1,
+        "stdout:\n{}\nstderr:\n{}",
+        codex.stdout, codex.stderr
+    );
+    assert_eq!(codex.json()["problems"], 1);
+}

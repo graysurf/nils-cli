@@ -70,14 +70,19 @@ fn dispatch(cli: Cli) -> i32 {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
-            let report =
-                match commands::audit::run_audit(args.target, &roots, args.strict, fallback_mode) {
-                    Ok(report) => report,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        return config_error_exit_code(&err);
-                    }
-                };
+            let report = match commands::audit::run_audit(
+                args.target,
+                &roots,
+                args.product,
+                args.strict,
+                fallback_mode,
+            ) {
+                Ok(report) => report,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return config_error_exit_code(&err);
+                }
+            };
             let exit_code = if args.strict && report.has_problems() {
                 EXIT_STRICT
             } else {
@@ -101,28 +106,28 @@ fn dispatch(cli: Cli) -> i32 {
                     return config_error_exit_code(&err);
                 }
             };
-            let report = resolver::resolve_intent_with_catalog(
+            let report = resolver::resolve_intent_with_catalog_for_product(
                 &intent,
                 &roots,
+                args.product,
                 args.strict,
                 fallback_mode,
                 true,
                 &catalog,
             );
-            if args.require_declared_intent
-                && report.documents.is_empty()
-                && !report.validation.declared
-            {
+            if args.require_declared_intent {
                 let available_intents = resolver::declared_intents(&roots, fallback_mode, &catalog);
-                return print_failure_rendered(
-                    args.format,
-                    render_undeclared_intent_error(
+                if !available_intents.iter().any(|name| name == intent.as_str()) {
+                    return print_failure_rendered(
                         args.format,
-                        intent.as_str(),
-                        &available_intents,
-                    ),
-                    EXIT_DATA,
-                );
+                        render_undeclared_intent_error(
+                            args.format,
+                            intent.as_str(),
+                            &available_intents,
+                        ),
+                        EXIT_DATA,
+                    );
+                }
             }
             let exit_code = if args.strict && report.has_unsatisfied_required() {
                 EXIT_STRICT
@@ -166,9 +171,10 @@ fn dispatch(cli: Cli) -> i32 {
                         Ok(intent) => intent,
                         Err(code) => return code,
                     };
-                    let report = resolver::resolve_intent_with_catalog(
+                    let report = resolver::resolve_intent_with_catalog_for_product(
                         &intent,
                         &roots,
+                        args.product,
                         false,
                         fallback_mode,
                         false,
@@ -182,7 +188,7 @@ fn dispatch(cli: Cli) -> i32 {
                     print_rendered(render_explain_intent(args.format, &payload), EXIT_OK)
                 }
                 None => {
-                    let intents = resolver::available_intents(&catalog);
+                    let intents = resolver::available_intents_for_product(args.product, &catalog);
                     let payload = ExplainIntents { intents: &intents };
                     print_rendered(render_explain_intents(args.format, &payload), EXIT_OK)
                 }
@@ -200,9 +206,15 @@ fn dispatch(cli: Cli) -> i32 {
                     return config_error_exit_code(&err);
                 }
             };
-            let documents = resolver::resolve_all_documents(&roots, fallback_mode, &catalog);
-            let validations = resolver::all_validation_contracts(&roots, &catalog);
-            let intents = resolver::available_intents(&catalog);
+            let documents = resolver::resolve_all_documents_for_product(
+                &roots,
+                args.product,
+                fallback_mode,
+                &catalog,
+            );
+            let validations =
+                resolver::all_validation_contracts_for_product(&roots, args.product, &catalog);
+            let intents = resolver::available_intents_for_product(args.product, &catalog);
             let report = ListReport {
                 docs_home: roots.docs_home.clone(),
                 project_path: roots.project_path.clone(),

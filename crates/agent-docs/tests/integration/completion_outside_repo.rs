@@ -12,6 +12,24 @@ fn completion_export_succeeds_outside_git_repo() {
         stdout.contains("#compdef agent-docs"),
         "missing zsh completion header: {stdout}"
     );
+    assert!(
+        stdout.contains("--product") && stdout.contains("codex claude"),
+        "missing product completion choices: {stdout}"
+    );
+}
+
+#[test]
+fn bash_completion_exports_product_choices_outside_git_repo() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let options = cmd::CmdOptions::default().with_cwd(temp.path());
+    let output = cmd::run_resolved("agent-docs", &["completion", "bash"], &options);
+
+    assert_eq!(output.code, 0, "expected exit code 0, got: {output:?}");
+    let stdout = output.stdout_text();
+    assert!(
+        stdout.contains("--product") && stdout.contains("codex claude"),
+        "missing product completion choices: {stdout}"
+    );
 }
 
 #[test]

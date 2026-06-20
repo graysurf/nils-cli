@@ -121,3 +121,34 @@ fn valid_catalog_loads_documents_as_data() {
     assert_eq!(docs[0]["context"], "task-tools");
     assert_eq!(docs[0]["scope"], "home");
 }
+
+#[test]
+fn product_field_accepts_string_and_list_forms() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CODEX.md\"\nproduct = \"codex\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"codex-check\"]\nproduct = [\"codex\", \"claude\"]\n",
+    );
+    env.write_home_doc("CODEX.md", "# Codex\n");
+
+    let out = env.run(&["list", "--format", "json"]);
+    assert!(out.success(), "stderr: {}", out.stderr);
+    let json = out.json();
+    assert_eq!(json["documents"][0]["products"][0], "codex");
+    assert_eq!(json["validations"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn invalid_product_field_is_a_precise_error() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"BAD.md\"\nproduct = \"vscode\"\n",
+    );
+
+    let out = env.run(&["list"]);
+    assert_eq!(out.code, EXIT_CONFIG, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("document[0].product") && out.stderr.contains("unsupported product"),
+        "stderr: {}",
+        out.stderr
+    );
+}

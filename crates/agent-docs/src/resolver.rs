@@ -17,7 +17,7 @@ use crate::content;
 use crate::env::ResolvedRoots;
 use crate::model::{
     AuditTarget, ConfigLoadError, Context, DocumentEntry, DocumentSource, DocumentStatus,
-    DocumentValidation, FallbackMode, LoadedCatalog, PreflightReport, ResolveSummary,
+    DocumentValidation, FallbackMode, LoadedCatalog, PreflightReport, Product, ResolveSummary,
     ResolvedDocument, Scope, ScopeCatalog, ValidationContract,
 };
 use crate::paths::{normalize_path, normalize_root_path};
@@ -31,10 +31,22 @@ pub fn resolve_intent(
     fallback_mode: FallbackMode,
     emit_content: bool,
 ) -> Result<PreflightReport, ConfigLoadError> {
+    resolve_intent_for_product(intent, roots, None, strict, fallback_mode, emit_content)
+}
+
+pub fn resolve_intent_for_product(
+    intent: &Context,
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    strict: bool,
+    fallback_mode: FallbackMode,
+    emit_content: bool,
+) -> Result<PreflightReport, ConfigLoadError> {
     let catalog = load_catalog_from_roots(roots)?;
-    Ok(resolve_intent_with_catalog(
+    Ok(resolve_intent_with_catalog_for_product(
         intent,
         roots,
+        product,
         strict,
         fallback_mode,
         emit_content,
@@ -50,15 +62,41 @@ pub fn resolve_intent_with_catalog(
     emit_content: bool,
     catalog: &LoadedCatalog,
 ) -> PreflightReport {
-    let documents = resolve_documents(roots, fallback_mode, emit_content, catalog, &mut |entry| {
-        entry.context == *intent
-    });
-    let validation = resolve_validation_contract(intent, roots, catalog);
+    resolve_intent_with_catalog_for_product(
+        intent,
+        roots,
+        None,
+        strict,
+        fallback_mode,
+        emit_content,
+        catalog,
+    )
+}
+
+pub fn resolve_intent_with_catalog_for_product(
+    intent: &Context,
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    strict: bool,
+    fallback_mode: FallbackMode,
+    emit_content: bool,
+    catalog: &LoadedCatalog,
+) -> PreflightReport {
+    let documents = resolve_documents(
+        roots,
+        product,
+        fallback_mode,
+        emit_content,
+        catalog,
+        &mut |entry| entry.context == *intent,
+    );
+    let validation = resolve_validation_contract_for_product(intent, roots, product, catalog);
     let summary = ResolveSummary::from_documents(&documents);
 
     PreflightReport {
         schema_version: PreflightReport::SCHEMA_VERSION,
         intent: intent.clone(),
+        product,
         strict,
         docs_home: roots.docs_home.clone(),
         project_path: roots.project_path.clone(),
@@ -77,9 +115,24 @@ pub fn resolve_documents_for_target(
     fallback_mode: FallbackMode,
     catalog: &LoadedCatalog,
 ) -> Vec<ResolvedDocument> {
-    resolve_documents(roots, fallback_mode, false, catalog, &mut |entry| {
-        target.includes_scope(entry.scope)
-    })
+    resolve_documents_for_target_for_product(roots, target, None, fallback_mode, catalog)
+}
+
+pub fn resolve_documents_for_target_for_product(
+    roots: &ResolvedRoots,
+    target: AuditTarget,
+    product: Option<Product>,
+    fallback_mode: FallbackMode,
+    catalog: &LoadedCatalog,
+) -> Vec<ResolvedDocument> {
+    resolve_documents(
+        roots,
+        product,
+        fallback_mode,
+        false,
+        catalog,
+        &mut |entry| target.includes_scope(entry.scope),
+    )
 }
 
 /// Resolve every declared document (for `list`).
@@ -88,11 +141,21 @@ pub fn resolve_all_documents(
     fallback_mode: FallbackMode,
     catalog: &LoadedCatalog,
 ) -> Vec<ResolvedDocument> {
-    resolve_documents(roots, fallback_mode, false, catalog, &mut |_| true)
+    resolve_all_documents_for_product(roots, None, fallback_mode, catalog)
+}
+
+pub fn resolve_all_documents_for_product(
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    fallback_mode: FallbackMode,
+    catalog: &LoadedCatalog,
+) -> Vec<ResolvedDocument> {
+    resolve_documents(roots, product, fallback_mode, false, catalog, &mut |_| true)
 }
 
 fn resolve_documents(
     roots: &ResolvedRoots,
+    product: Option<Product>,
     fallback_mode: FallbackMode,
     emit_content: bool,
     catalog: &LoadedCatalog,
@@ -105,6 +168,9 @@ fn resolve_documents(
     for scope_catalog in catalog.in_load_order() {
         for entry in &scope_catalog.documents {
             if !accept(entry) {
+                continue;
+            }
+            if !matches_product(&entry.products, product) {
                 continue;
             }
             // A `scope = "project"` entry declared in the *home* (docs-home)
@@ -167,6 +233,7 @@ fn resolve_entry(
         context: entry.context.clone(),
         scope: entry.scope,
         path,
+        products: entry.products.clone(),
         declared_required: entry.required,
         required,
         when: entry.when_raw.clone(),
@@ -277,6 +344,15 @@ pub fn resolve_validation_contract(
     roots: &ResolvedRoots,
     catalog: &LoadedCatalog,
 ) -> ValidationContract {
+    resolve_validation_contract_for_product(intent, roots, None, catalog)
+}
+
+pub fn resolve_validation_contract_for_product(
+    intent: &Context,
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    catalog: &LoadedCatalog,
+) -> ValidationContract {
     let mut commands: Vec<String> = Vec::new();
     let mut marker: Option<String> = None;
     let mut description: Option<String> = None;
@@ -295,6 +371,9 @@ pub fn resolve_validation_contract(
         }
         for validation in &scope_catalog.validations {
             if validation.context != *intent {
+                continue;
+            }
+            if !matches_product(&validation.products, product) {
                 continue;
             }
             declared = true;
@@ -321,17 +400,34 @@ pub fn resolve_validation_contract(
     }
 }
 
+fn matches_product(products: &[Product], requested: Option<Product>) -> bool {
+    products.is_empty() || requested.is_none_or(|product| products.contains(&product))
+}
+
 /// The distinct intents declared anywhere in the catalog, sorted.
 pub fn available_intents(catalog: &LoadedCatalog) -> Vec<String> {
+    available_intents_for_product(None, catalog)
+}
+
+pub fn available_intents_for_product(
+    product: Option<Product>,
+    catalog: &LoadedCatalog,
+) -> Vec<String> {
     let mut intents: Vec<String> = Vec::new();
     for scope_catalog in catalog.in_load_order() {
         for entry in &scope_catalog.documents {
+            if !matches_product(&entry.products, product) {
+                continue;
+            }
             let name = entry.context.as_str().to_string();
             if !intents.contains(&name) {
                 intents.push(name);
             }
         }
         for validation in &scope_catalog.validations {
+            if !matches_product(&validation.products, product) {
+                continue;
+            }
             let name = validation.context.as_str().to_string();
             if !intents.contains(&name) {
                 intents.push(name);
@@ -347,18 +443,30 @@ pub fn all_validation_contracts(
     roots: &ResolvedRoots,
     catalog: &LoadedCatalog,
 ) -> Vec<ValidationContract> {
+    all_validation_contracts_for_product(roots, None, catalog)
+}
+
+pub fn all_validation_contracts_for_product(
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    catalog: &LoadedCatalog,
+) -> Vec<ValidationContract> {
     let mut seen: Vec<String> = Vec::new();
     let mut contracts = Vec::new();
     for scope_catalog in catalog.in_load_order() {
         for validation in &scope_catalog.validations {
+            if !matches_product(&validation.products, product) {
+                continue;
+            }
             let name = validation.context.as_str().to_string();
             if seen.contains(&name) {
                 continue;
             }
             seen.push(name);
-            contracts.push(resolve_validation_contract(
+            contracts.push(resolve_validation_contract_for_product(
                 &validation.context,
                 roots,
+                product,
                 catalog,
             ));
         }

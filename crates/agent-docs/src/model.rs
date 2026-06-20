@@ -80,6 +80,40 @@ impl fmt::Display for Scope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Product {
+    Codex,
+    Claude,
+}
+
+impl Product {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    pub const fn supported_values() -> &'static [&'static str] {
+        &["codex", "claude"]
+    }
+
+    pub fn from_config_value(value: &str) -> Option<Self> {
+        match value {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Product {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutputFormat {
@@ -301,6 +335,7 @@ pub struct ResolvedDocument {
     pub context: Context,
     pub scope: Scope,
     pub path: PathBuf,
+    pub products: Vec<Product>,
     /// Whether the catalog marked the entry `required = true`.
     pub declared_required: bool,
     /// Whether the entry is required for this run (`declared_required` AND the
@@ -379,6 +414,7 @@ impl ResolveSummary {
 pub struct PreflightReport {
     pub schema_version: &'static str,
     pub intent: Context,
+    pub product: Option<Product>,
     pub strict: bool,
     pub docs_home: PathBuf,
     pub project_path: PathBuf,
@@ -389,7 +425,7 @@ pub struct PreflightReport {
 }
 
 impl PreflightReport {
-    pub const SCHEMA_VERSION: &'static str = "agent-docs.preflight.v1";
+    pub const SCHEMA_VERSION: &'static str = "agent-docs.preflight.v2";
 
     pub fn has_unsatisfied_required(&self) -> bool {
         !self.summary.all_satisfied()
@@ -448,6 +484,7 @@ pub struct DocumentEntry {
     pub context: Context,
     pub scope: Scope,
     pub path: PathBuf,
+    pub products: Vec<Product>,
     pub required: bool,
     pub when: When,
     /// The raw `when` string as written in the catalog (for display / audit).
@@ -460,6 +497,7 @@ pub struct DocumentEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ValidationEntry {
     pub context: Context,
+    pub products: Vec<Product>,
     pub commands: Vec<String>,
     pub marker: Option<String>,
     pub description: Option<String>,

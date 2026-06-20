@@ -42,7 +42,7 @@ pub fn render_undeclared_intent_error(
                 "available_intents": available_intents,
             }));
             let envelope: Envelope<()> =
-                Envelope::failure(schema_version_for("agent-docs", "preflight", 1), error);
+                Envelope::failure(schema_version_for("agent-docs", "preflight", 2), error);
             serde_json::to_string_pretty(&envelope)
                 .context("failed to serialize undeclared-intent error")
         }

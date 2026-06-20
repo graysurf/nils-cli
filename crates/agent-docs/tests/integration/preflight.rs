@@ -23,7 +23,7 @@ fn preflight_json_shape_is_versioned_and_complete() {
     assert!(out.success(), "stderr: {}", out.stderr);
     let json = out.json();
 
-    assert_eq!(json["schema_version"], "agent-docs.preflight.v1");
+    assert_eq!(json["schema_version"], "agent-docs.preflight.v2");
     assert_eq!(json["intent"], "project-dev");
     assert!(json["docs_home"].is_string());
     assert!(json["project_path"].is_string());
@@ -60,6 +60,125 @@ fn preflight_text_summarizes_without_dumping_content() {
     assert!(out.stdout.contains("PREFLIGHT: intent=project-dev"));
     assert!(out.stdout.contains("validation contract"));
     assert!(out.stdout.contains("cargo test --workspace"));
+}
+
+#[test]
+fn preflight_product_filters_documents_and_validation_contracts() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"SHARED.md\"\nrequired = true\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CODEX.md\"\nrequired = true\nproduct = \"codex\"\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CLAUDE.md\"\nrequired = true\nproduct = \"claude\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"shared-check\"]\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"codex-check\"]\nproduct = \"codex\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"claude-check\"]\nproduct = \"claude\"\n",
+    );
+    env.write_home_doc("SHARED.md", "# Shared\n");
+    env.write_home_doc("CODEX.md", "# Codex\n");
+    env.write_home_doc("CLAUDE.md", "# Claude\n");
+
+    let codex = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--product",
+        "codex",
+        "--format",
+        "json",
+    ]);
+    assert!(codex.success(), "stderr: {}", codex.stderr);
+    let codex_json = codex.json();
+    assert_eq!(codex_json["schema_version"], "agent-docs.preflight.v2");
+    assert_eq!(codex_json["product"], "codex");
+    let codex_docs = codex_json["documents"].as_array().unwrap();
+    assert_eq!(codex_docs.len(), 2, "{codex_json}");
+    assert!(
+        codex_docs
+            .iter()
+            .any(|doc| doc["path"].as_str().unwrap().ends_with("SHARED.md"))
+    );
+    assert!(
+        codex_docs
+            .iter()
+            .any(|doc| doc["path"].as_str().unwrap().ends_with("CODEX.md"))
+    );
+    assert!(
+        !codex_docs
+            .iter()
+            .any(|doc| doc["path"].as_str().unwrap().ends_with("CLAUDE.md"))
+    );
+    let codex_commands = codex_json["validation"]["commands"].as_array().unwrap();
+    assert!(codex_commands.iter().any(|cmd| cmd == "shared-check"));
+    assert!(codex_commands.iter().any(|cmd| cmd == "codex-check"));
+    assert!(!codex_commands.iter().any(|cmd| cmd == "claude-check"));
+
+    let claude = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--product",
+        "claude",
+        "--format",
+        "json",
+    ]);
+    assert!(claude.success(), "stderr: {}", claude.stderr);
+    let claude_json = claude.json();
+    assert_eq!(claude_json["product"], "claude");
+    let claude_docs = claude_json["documents"].as_array().unwrap();
+    assert_eq!(claude_docs.len(), 2, "{claude_json}");
+    assert!(
+        claude_docs
+            .iter()
+            .any(|doc| doc["path"].as_str().unwrap().ends_with("SHARED.md"))
+    );
+    assert!(
+        claude_docs
+            .iter()
+            .any(|doc| doc["path"].as_str().unwrap().ends_with("CLAUDE.md"))
+    );
+    assert!(
+        !claude_docs
+            .iter()
+            .any(|doc| doc["path"].as_str().unwrap().ends_with("CODEX.md"))
+    );
+    let claude_commands = claude_json["validation"]["commands"].as_array().unwrap();
+    assert!(claude_commands.iter().any(|cmd| cmd == "shared-check"));
+    assert!(claude_commands.iter().any(|cmd| cmd == "claude-check"));
+    assert!(!claude_commands.iter().any(|cmd| cmd == "codex-check"));
+
+    let unset = env.run(&["preflight", "--intent", "project-dev", "--format", "json"]);
+    assert!(unset.success(), "stderr: {}", unset.stderr);
+    let unset_json = unset.json();
+    assert!(unset_json["product"].is_null(), "{unset_json}");
+    assert_eq!(unset_json["documents"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        unset_json["validation"]["commands"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn require_declared_intent_checks_before_product_filtering() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CODEX.md\"\nproduct = \"codex\"\n",
+    );
+    env.write_home_doc("CODEX.md", "# Codex\n");
+
+    let out = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--product",
+        "claude",
+        "--require-declared-intent",
+        "--format",
+        "json",
+    ]);
+
+    assert!(out.success(), "stderr: {}", out.stderr);
+    let json = out.json();
+    assert_eq!(json["product"], "claude");
+    assert_eq!(json["documents"].as_array().unwrap().len(), 0);
+    assert_eq!(json["validation"]["declared"], false);
 }
 
 #[test]
@@ -134,7 +253,7 @@ fn preflight_require_declared_intent_rejects_unknown_json() {
         out.stderr
     );
     let json = out.json();
-    assert_eq!(json["schema_version"], "cli.agent-docs.preflight.v1");
+    assert_eq!(json["schema_version"], "cli.agent-docs.preflight.v2");
     assert_eq!(json["ok"], false);
     assert_eq!(json["error"]["code"], "undeclared-intent");
     assert_eq!(json["error"]["details"]["intent"], "no-such-intent");

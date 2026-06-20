@@ -26,6 +26,8 @@ pub const SKILL_TEMPLATE_FILE: &str = "SKILL.md.tera";
 /// dir. Mirrors [`SKILL_TEMPLATE_FILE`]; the rendered output lands at the
 /// product's `render_to` (e.g. `agents/<name>.toml`).
 pub const AGENT_TEMPLATE_FILE: &str = "AGENT.md.tera";
+pub const HOME_PROMPT_FILE: &str = "AGENT_HOME.md";
+pub const NEUTRAL_HOME_PRODUCT: &str = "neutral";
 const TERA_EXT: &str = "tera";
 
 /// One file under a skill source directory. The path is relative to the
@@ -50,6 +52,13 @@ pub struct RenderReport {
     pub rendered: Vec<String>,
     pub cached: Vec<String>,
     pub skipped: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct HomePromptReport {
+    pub product: String,
+    pub output_path: PathBuf,
+    pub rendered: bool,
 }
 
 /// Render every skill declared for `product` from manifests rooted at
@@ -90,7 +99,87 @@ pub(crate) fn write_product_to(
     report.rendered.extend(agents.rendered);
     report.cached.extend(agents.cached);
     report.skipped.extend(agents.skipped);
+    write_home_prompt_to(root, product, output_root, false)?;
     Ok(report)
+}
+
+pub fn write_home_prompt(
+    root: &SourceRoot,
+    product: &str,
+    require_source: bool,
+) -> Result<HomePromptReport> {
+    let output_root = root.path().join("build").join(product);
+    write_home_prompt_to(root, product, &output_root, require_source)
+}
+
+fn write_home_prompt_to(
+    root: &SourceRoot,
+    product: &str,
+    output_root: &Path,
+    require_source: bool,
+) -> Result<HomePromptReport> {
+    let source = root.path().join(HOME_PROMPT_FILE);
+    let output_root = output_root.to_path_buf();
+    let output_path = output_root.join(HOME_PROMPT_FILE);
+    if !source.exists() {
+        if require_source {
+            return Err(anyhow!(
+                "home prompt source {} is missing",
+                source.display()
+            ));
+        }
+        remove_stale_home_prompt(&output_root, &output_path)?;
+        return Ok(HomePromptReport {
+            product: product.to_string(),
+            output_path,
+            rendered: false,
+        });
+    }
+
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("create_dir_all {}", output_root.display()))?;
+    let canonical_source_root = root.path().to_path_buf();
+    let canonical_output_root = output_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize output root {}", output_root.display()))?;
+    let source = canonicalize_under(&canonical_source_root, &source)?;
+    let body = fs::read_to_string(&source)
+        .with_context(|| format!("read home prompt {}", source.display()))?;
+    let rendered = render_home_prompt_template(product, &body)?;
+    let output_path = guard_write_under(&canonical_output_root, &output_path)?;
+    fs::write(&output_path, rendered.as_bytes())
+        .with_context(|| format!("write {}", output_path.display()))?;
+
+    Ok(HomePromptReport {
+        product: product.to_string(),
+        output_path,
+        rendered: true,
+    })
+}
+
+fn remove_stale_home_prompt(output_root: &Path, output_path: &Path) -> Result<()> {
+    if fs::symlink_metadata(output_path).is_err() {
+        return Ok(());
+    }
+    let canonical_output_root = output_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize output root {}", output_root.display()))?;
+    let canonical_output = output_path
+        .canonicalize()
+        .with_context(|| format!("canonicalize stale home prompt {}", output_path.display()))?;
+    if !canonical_output.starts_with(&canonical_output_root) {
+        return Err(anyhow!(
+            "stale home prompt output {} resolves outside the build root \
+             ({} not under {}) — refusing to remove",
+            output_path.display(),
+            canonical_output.display(),
+            canonical_output_root.display(),
+        ));
+    }
+    fs::remove_file(&canonical_output)
+        .with_context(|| format!("remove stale home prompt {}", canonical_output.display()))?;
+    prune_empty_dirs_upward(output_root, &canonical_output_root, HOME_PROMPT_FILE);
+    Ok(())
 }
 
 /// Render every skill declared for `product` into `output_root`. This is
@@ -747,6 +836,14 @@ fn render_agent_template(
     engine
         .render_str(template_body, &vars)
         .with_context(|| format!("render agent {}", agent.id))
+}
+
+fn render_home_prompt_template(product: &str, template_body: &str) -> Result<String> {
+    let mut engine = Engine::builder().build();
+    let vars = serde_json::json!({ "product": product });
+    engine
+        .render_str(template_body, &vars)
+        .context("render home prompt")
 }
 
 struct ManifestBytes {

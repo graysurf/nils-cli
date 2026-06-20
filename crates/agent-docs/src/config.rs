@@ -5,17 +5,18 @@ use toml::Value;
 
 use crate::env::ResolvedRoots;
 use crate::model::{
-    ConfigErrorLocation, ConfigLoadError, Context, DocumentEntry, LoadedCatalog, Scope,
+    ConfigErrorLocation, ConfigLoadError, Context, DocumentEntry, LoadedCatalog, Product, Scope,
     ScopeCatalog, SkillPolicy, ValidationEntry, When,
 };
 use crate::predicate::parse_when;
 
 pub const CONFIG_FILE_NAME: &str = "AGENT_DOCS.toml";
 
-const ALLOWED_DOCUMENT_FIELDS: [&str; 8] = [
+const ALLOWED_DOCUMENT_FIELDS: [&str; 9] = [
     "context",
     "scope",
     "path",
+    "product",
     "required",
     "when",
     "marker",
@@ -23,7 +24,8 @@ const ALLOWED_DOCUMENT_FIELDS: [&str; 8] = [
     "notes",
 ];
 
-const ALLOWED_VALIDATION_FIELDS: [&str; 4] = ["context", "commands", "marker", "description"];
+const ALLOWED_VALIDATION_FIELDS: [&str; 5] =
+    ["context", "commands", "product", "marker", "description"];
 
 const ALLOWED_SKILLS_FIELDS: [&str; 3] = ["enforce_name_prefix", "allowed_prefixes", "dir"];
 
@@ -156,6 +158,7 @@ fn parse_documents(
         let scope = parse_scope(file_path, index, table)?;
         validate_scope_for_source(source_scope, scope, file_path, index)?;
         let path = parse_path(file_path, index, table)?;
+        let products = parse_products(file_path, "document", index, table)?;
         let required = parse_bool(file_path, index, table, "required")?.unwrap_or(false);
         let (when, when_raw) = parse_when_field(file_path, index, table)?;
         let marker = parse_opt_string(file_path, "document", index, table, "marker")?;
@@ -166,6 +169,7 @@ fn parse_documents(
             context,
             scope,
             path,
+            products,
             required,
             when,
             when_raw,
@@ -207,11 +211,13 @@ fn parse_validations(
         )?;
         let context = parse_context(file_path, "validation", index, table)?;
         let commands = parse_commands(file_path, index, table)?;
+        let products = parse_products(file_path, "validation", index, table)?;
         let marker = parse_opt_string(file_path, "validation", index, table, "marker")?;
         let description = parse_opt_string(file_path, "validation", index, table, "description")?;
 
         validations.push(ValidationEntry {
             context,
+            products,
             commands,
             marker,
             description,
@@ -219,6 +225,85 @@ fn parse_validations(
     }
 
     Ok(validations)
+}
+
+fn parse_products(
+    file_path: &Path,
+    section: &'static str,
+    index: usize,
+    table: &toml::map::Map<String, Value>,
+) -> Result<Vec<Product>, ConfigLoadError> {
+    let Some(value) = table.get("product") else {
+        return Ok(Vec::new());
+    };
+
+    let mut products = match value {
+        Value::String(raw) => vec![parse_product(file_path, section, index, raw)?],
+        Value::Array(items) => {
+            if items.is_empty() {
+                return Err(ConfigLoadError::validation(
+                    file_path.to_path_buf(),
+                    section,
+                    index,
+                    "product",
+                    "`product` must list at least one product when using array form",
+                ));
+            }
+            let mut parsed = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(raw) = item.as_str() else {
+                    return Err(ConfigLoadError::validation(
+                        file_path.to_path_buf(),
+                        section,
+                        index,
+                        "product",
+                        format!(
+                            "invalid product entry: expected string, found {}",
+                            value_type(item)
+                        ),
+                    ));
+                };
+                parsed.push(parse_product(file_path, section, index, raw)?);
+            }
+            parsed
+        }
+        other => {
+            return Err(ConfigLoadError::validation(
+                file_path.to_path_buf(),
+                section,
+                index,
+                "product",
+                format!(
+                    "invalid type for `product`: expected string or array of strings, found {}",
+                    value_type(other)
+                ),
+            ));
+        }
+    };
+    products.sort();
+    products.dedup();
+    Ok(products)
+}
+
+fn parse_product(
+    file_path: &Path,
+    section: &'static str,
+    index: usize,
+    raw: &str,
+) -> Result<Product, ConfigLoadError> {
+    Product::from_config_value(raw.trim()).ok_or_else(|| {
+        ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            section,
+            index,
+            "product",
+            format!(
+                "unsupported product `{}`; allowed: {}",
+                raw.trim(),
+                Product::supported_values().join(", ")
+            ),
+        )
+    })
 }
 
 fn parse_skill_policy(
