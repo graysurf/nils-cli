@@ -254,14 +254,18 @@ operations:
       - { name: --issue,          type: integer, required: false }
       - { name: --mirror-issue,   type: bool,    default: false }
     validations:
-      - no_local_path # review comment body
-      - no_escaped_control_markdown # review comment body and generated issue mirror
+      - no_local_path # review comment body AND the generated issue mirror (lens values are user-controlled), validated before any post
+      - no_escaped_control_markdown # review comment body AND the generated issue mirror, validated before any post
+    # Op-specific DATA 65 error kinds (both raised before any backend mutation):
+    #   issue_required       — --mirror-issue without --issue
+    #   id_not_pull_request  — GitHub <id> is not a pull request (an issue, or missing)
     backends:
       github:
+        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}", --jq, ".number"] } # PR-existence guard; <id> must be a pull request before posting
         - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] }
         - { program: gh, argv: [api, "repos/{repo}/issues/{issue}/comments", --method, POST, --raw-field, "body=<generated mirror>", --jq, ".html_url"] } # only with --mirror-issue
       gitlab:
-        - { program: glab, argv: [mr, note, "{id}", --message, "{comment_or_file}"] }
+        - { program: glab, argv: [mr, note, create, "{id}", --message, "{comment_or_file}", "--resolvable=false"] } # non-resolvable status note: does not block the merge gate
         - { program: glab, argv: [issue, note, "{issue}", --message, "<generated mirror>"] } # only with --mirror-issue
       # local: provider_unsupported in v1; local PR mutation is not modelled.
     output:

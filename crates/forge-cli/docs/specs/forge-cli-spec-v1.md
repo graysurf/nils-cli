@@ -111,7 +111,7 @@ Parity matrix (v1):
 | `pr list`                                   | `gh pr list --json …`                                                                       | `glab mr list -F json`                                      | exact                                  |
 | `pr edit <id>`                              | `gh pr edit <id> …`                                                                         | `glab mr update <id> …`                                     | exact                                  |
 | `pr comment <id>`                           | `gh pr comment <id> --body …`                                                               | `glab mr note <id> --message …`                             | exact                                  |
-| `pr review <id>`                            | `gh api repos/{repo}/issues/{id}/comments` (`html_url`)                                     | `glab mr note <id> --message …`                             | outcome posting; optional issue mirror |
+| `pr review <id>`                            | `gh api …/pulls/{id}` guard then `gh api …/issues/{id}/comments` (`html_url`)               | `glab mr note create <id> --message … --resolvable=false`   | outcome posting; optional issue mirror |
 | `pr ready <id>`                             | `gh pr ready <id>`                                                                          | `glab mr update <id> --ready`                               | exact                                  |
 | `pr review-threads list <id>`               | `gh api graphql` (`reviewThreads` connection)                                               | `glab api …/merge_requests/<iid>/discussions`               | normalized thread state                |
 | `pr review-threads resolve <id> --thread …` | `gh api graphql` (`addPullRequestReviewThreadReply` then `resolveReviewThread`)             | unsupported in v1                                           | GitHub-only seam                       |
@@ -381,12 +381,24 @@ backend mapping, validation rules, and output schema versions.
 - `--decision` is recorded in the envelope and generated issue mirror body
   only. It does not call provider-native approve/request-changes APIs in v1.
 - On GitHub, PR comments use the issue-comments API endpoint so JSON output can
-  report the created comment URL directly:
-  `data.pr_comment_url`. On GitLab, the command uses `glab mr note`; if the
+  report the created comment URL directly: `data.pr_comment_url`. Because that
+  endpoint accepts both issues and pull requests, the command first verifies
+  `<id>` is a pull request (`gh api repos/{repo}/pulls/{id}`) and fails with
+  `id_not_pull_request` (`DATA 65`) before posting if it is not — so a typo'd or
+  non-PR number can never silently post a review outcome onto an unrelated
+  issue. On GitLab, the command uses `glab mr note create … --resolvable=false`
+  so the outcome is a non-resolvable status note that does not register as an
+  unresolved MR discussion and block the next `forge-cli pr merge`; if the
   backend prints a URL, it is surfaced as `data.pr_comment_url`.
 - With `--mirror-issue --issue <number>`, the command posts a compact issue
   activity comment linking to the PR review comment and reports
-  `data.issue_comment_url` when the backend returns one.
+  `data.issue_comment_url` when the backend returns one. The generated mirror
+  body references the PR/MR with the provider-correct sigil (`#<n>` on GitHub,
+  `!<n>` on GitLab). Its user-controlled `--lens` content is run through the
+  same `no_local_path` and `no_escaped_control_markdown` guards as the review
+  body, and that validation — plus the `--issue` requirement — is enforced
+  before any backend post, so a rejected mirror can never leave a posted review
+  outcome with no mirror.
 - Output schema:
   `data = { provider, number, decision, pr_comment_url, issue_number,
   issue_comment_url, mirrored, lenses }`.

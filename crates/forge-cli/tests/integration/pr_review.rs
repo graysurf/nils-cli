@@ -18,6 +18,9 @@ if [ "$1" != "api" ]; then
   exit 99
 fi
 case "$2" in
+  repos/acme/widgets/pulls/44)
+    echo "44"
+    ;;
   repos/acme/widgets/issues/44/comments)
     echo "https://github.com/acme/widgets/pull/44#issuecomment-440"
     ;;
@@ -113,6 +116,11 @@ fn pr_review_posts_outcome_and_mirrors_issue_activity() {
     assert_eq!(env["data"]["lenses"][1], "red-team");
 
     let calls = fs::read_to_string(capture).expect("read captured calls");
+    // The PR-existence guard verifies `<id>` is a pull request before posting.
+    assert!(
+        calls.contains("repos/acme/widgets/pulls/44"),
+        "PR-existence lookup missing: {calls}"
+    );
     assert!(
         calls.contains("repos/acme/widgets/issues/44/comments"),
         "PR comment call missing: {calls}"
@@ -120,6 +128,11 @@ fn pr_review_posts_outcome_and_mirrors_issue_activity() {
     assert!(
         calls.contains("repos/acme/widgets/issues/101/comments"),
         "issue mirror call missing: {calls}"
+    );
+    // GitHub PRs are referenced with `#<number>` in the mirror body.
+    assert!(
+        calls.contains("pr: #44"),
+        "mirror body should reference the PR as #44: {calls}"
     );
     assert!(
         calls.contains("review_url=https://github.com/acme/widgets/pull/44#issuecomment-440"),
@@ -170,9 +183,157 @@ fn pr_review_posts_gitlab_outcome_and_issue_mirror() {
     );
 
     let calls = fs::read_to_string(capture).expect("read captured calls");
-    assert!(calls.contains("mr note 44"), "{calls}");
+    // The review outcome note must be created non-resolvable so a comments-only
+    // or approve review does not leave an unresolved MR discussion that blocks
+    // the next `forge-cli pr merge`.
+    assert!(calls.contains("mr note create 44"), "{calls}");
+    assert!(calls.contains("--resolvable=false"), "{calls}");
     assert!(calls.contains("issue note 101"), "{calls}");
     assert!(calls.contains("--repo acme/widgets"), "{calls}");
+    // GitLab merge requests are referenced with `!<iid>`, not `#<iid>`.
+    assert!(
+        calls.contains("pr: !44"),
+        "mirror body should reference the MR as !44: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_rejects_non_pull_request_id_before_posting() {
+    // When `<id>` is not a pull request (the GitHub issues-comments API would
+    // otherwise silently post the outcome onto an unrelated issue), the guard
+    // must reject before posting anything.
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let body = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+case "$2" in
+  repos/acme/widgets/pulls/44)
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1
+    ;;
+  *)
+    echo "stub: should not post on a non-PR id: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+        capture = capture.to_string_lossy()
+    );
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--comment",
+            "Status: pass",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "id_not_pull_request");
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert!(
+        calls.contains("repos/acme/widgets/pulls/44"),
+        "PR-existence lookup should run: {calls}"
+    );
+    assert!(
+        !calls.contains("issues/44/comments"),
+        "no review outcome should be posted when the id is not a PR: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_rejects_lens_local_path_in_mirror_before_backend_call() {
+    // A `--lens` value carrying a machine-local path is embedded into the
+    // generated issue mirror body, so it must hit the same `no_local_path`
+    // guard the review body does — and before any backend mutation.
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\necho should-not-run >&2\nexit 99\n");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--comment",
+            "Status: pass",
+            "--lens",
+            "/Users/terry/project/secret.txt",
+            "--issue",
+            "101",
+            "--mirror-issue",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "local_path_present");
+}
+
+#[test]
+fn pr_review_rejects_lens_escaped_control_in_mirror_before_backend_call() {
+    // A `--lens` value carrying a literal escaped control is embedded into the
+    // generated issue mirror body. The escaped-control guard must run before
+    // the PR comment is posted, so a bad lens never leaves a posted outcome
+    // with no mirror.
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\necho should-not-run >&2\nexit 99\n");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--comment",
+            "Status: pass",
+            "--lens",
+            "foo\\nbar",
+            "--issue",
+            "101",
+            "--mirror-issue",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "markdown_escaped_control");
 }
 
 #[test]
