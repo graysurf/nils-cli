@@ -28,6 +28,23 @@ const SCHEMA_VERSION: u32 = 1;
 /// sufficient to catch a bad lens before any backend mutation.
 const MIRROR_URL_PENDING: &str = "<pending>";
 
+/// Which `glab` review-note form to emit for a GitLab `pr review`, resolved by
+/// probing the local `glab` build (see [`glab_note_form`]). Covers every glab
+/// version class so the GitLab path works whether or not `mr note create` and
+/// its `--resolvable` flag exist. Irrelevant for GitHub / Local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlabNoteForm {
+    /// `mr note create … --resolvable=false` — non-resolvable status note
+    /// (modern glab; does not register on the merge gate).
+    CreateResolvable,
+    /// `mr note create … --message` — `create` exists but lacks `--resolvable`
+    /// (the note stays resolvable; no worse than before this guard).
+    Create,
+    /// bare `mr note <id> --message` — this glab has no `mr note create`
+    /// subcommand at all.
+    BareNote,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PrReviewPayload {
     pub provider: &'static str,
@@ -136,9 +153,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
     if global.dry_run {
         // dry-run must not touch a backend, so it cannot probe `glab` capability;
-        // render the preferred non-resolvable GitLab form (the live run only
-        // falls back to the bare form on an older `glab` that lacks the flag).
-        let pr_call = build_pr_comment_call(&ctx, args.id, &body, true);
+        // render the preferred non-resolvable GitLab form (the live run may pick
+        // a more compatible form on older `glab`).
+        let pr_call = build_pr_comment_call(&ctx, args.id, &body, GlabNoteForm::CreateResolvable);
         // The GitHub PR-existence guard is a live backend read; surface it in the
         // dry-run plan so wrappers inspecting dry-run output see every call.
         let guard_plan = (ctx.provider == Provider::GitHub).then(|| {
@@ -193,11 +210,15 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ensure_github_pull_request(runner, &ctx, args.id)?;
     }
 
-    // GitLab only: pick the review-note form based on whether this `glab` build
-    // supports `mr note create --resolvable` (older builds lack it).
-    let gitlab_resolvable_supported =
-        ctx.provider == Provider::GitLab && glab_supports_resolvable(runner);
-    let pr_call = build_pr_comment_call(&ctx, args.id, &body, gitlab_resolvable_supported);
+    // GitLab only: probe which `mr note` form this `glab` build supports
+    // (create+resolvable / create-only / bare). For GitHub / Local the form is
+    // unused, so skip the probe and pass the default.
+    let glab_form = if ctx.provider == Provider::GitLab {
+        glab_note_form(runner)
+    } else {
+        GlabNoteForm::CreateResolvable
+    };
+    let pr_call = build_pr_comment_call(&ctx, args.id, &body, glab_form);
 
     let pr_output = runner.run(&pr_call)?;
     let pr_comment_url = first_url(&pr_output.stdout).unwrap_or_default();
@@ -242,12 +263,12 @@ fn build_pr_comment_call(
     ctx: &ProviderContext,
     id: u64,
     body: &str,
-    gitlab_resolvable_supported: bool,
+    glab_form: GlabNoteForm,
 ) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub => github_issue_comment_argv(ctx, id, body),
-        Provider::GitLab => gitlab_review_note_argv(id, body, gitlab_resolvable_supported),
+        Provider::GitLab => gitlab_review_note_argv(id, body, glab_form),
         Provider::Local => vec![
             OsString::from("issue"),
             OsString::from("comment"),
@@ -262,27 +283,25 @@ fn build_pr_comment_call(
     BackendCall::new(program, argv)
 }
 
-/// GitLab review-outcome note argv.
+/// GitLab review-outcome note argv, selected by the probed [`GlabNoteForm`]:
 ///
-/// Always uses the `mr note create` subcommand, which reliably accepts
-/// `--message`. When the local `glab` build supports `--resolvable`, append
-/// `--resolvable=false` so the outcome is a *non-resolvable* status note that
-/// does not register as an unresolved MR discussion blocking
-/// `forge-cli pr merge`'s GitLab gate. On older builds that lack the flag, drop
-/// only `--resolvable=false` (the note stays resolvable there — no worse than
-/// before this guard existed); the `create` subcommand and `--message` are kept,
-/// since the bare `mr note <id>` parent form may not accept `--message` on those
-/// builds.
-fn gitlab_review_note_argv(id: u64, body: &str, resolvable_supported: bool) -> Vec<OsString> {
-    let mut argv = vec![
-        OsString::from("mr"),
-        OsString::from("note"),
-        OsString::from("create"),
-        OsString::from(id.to_string()),
-        OsString::from("--message"),
-        OsString::from(body),
-    ];
-    if resolvable_supported {
+/// - `CreateResolvable` → `mr note create … --resolvable=false` (modern glab):
+///   a non-resolvable status note that does not register as an unresolved MR
+///   discussion blocking `forge-cli pr merge`'s GitLab gate.
+/// - `Create` → `mr note create … --message` (`create` exists, no
+///   `--resolvable`): the note stays resolvable, but `create` reliably accepts
+///   `--message`.
+/// - `BareNote` → `mr note <id> --message` (no `create` subcommand): the only
+///   form such builds support.
+fn gitlab_review_note_argv(id: u64, body: &str, form: GlabNoteForm) -> Vec<OsString> {
+    let mut argv = vec![OsString::from("mr"), OsString::from("note")];
+    if matches!(form, GlabNoteForm::Create | GlabNoteForm::CreateResolvable) {
+        argv.push(OsString::from("create"));
+    }
+    argv.push(OsString::from(id.to_string()));
+    argv.push(OsString::from("--message"));
+    argv.push(OsString::from(body));
+    if matches!(form, GlabNoteForm::CreateResolvable) {
         argv.push(OsString::from("--resolvable=false"));
     }
     argv
@@ -422,11 +441,20 @@ fn is_http_not_found(stderr: &str) -> bool {
     lower.contains("404") || lower.contains("not found")
 }
 
-/// Probe whether the local `glab` build's `mr note create` accepts
-/// `--resolvable`. Older builds lack it, so the review-note posting falls back
-/// to the bare `mr note <id>` form (see [`gitlab_review_note_argv`]). A failed
-/// probe is treated as "unsupported" so the safe bare-note form is used.
-fn glab_supports_resolvable<R: BackendRunner>(runner: &R) -> bool {
+/// Resolve which GitLab review-note form this `glab` build supports with a
+/// single `glab mr note create --help` probe, distinguishing all three version
+/// classes:
+///
+/// - output advertises `--resolvable` → [`GlabNoteForm::CreateResolvable`].
+/// - output names the `mr note create` subcommand (its own usage line) but has
+///   no `--resolvable` → [`GlabNoteForm::Create`].
+/// - neither (an absent `create` subcommand makes `glab` print the parent
+///   `mr note` help, which names no `mr note create`) → [`GlabNoteForm::BareNote`].
+///
+/// A failed probe (e.g. `glab` missing) is treated as `BareNote`, the most
+/// broadly-supported form. An absent subcommand still exits 0, so the decision
+/// is made from the help text, not the exit status.
+fn glab_note_form<R: BackendRunner>(runner: &R) -> GlabNoteForm {
     let call = BackendCall::new(
         BackendProgram::Glab,
         [
@@ -436,9 +464,16 @@ fn glab_supports_resolvable<R: BackendRunner>(runner: &R) -> bool {
             OsString::from("--help"),
         ],
     );
-    match runner.run_raw(&call) {
-        Ok(out) => format!("{}{}", out.stdout, out.stderr).contains("--resolvable"),
-        Err(_) => false,
+    let text = match runner.run_raw(&call) {
+        Ok(out) => format!("{}{}", out.stdout, out.stderr),
+        Err(_) => return GlabNoteForm::BareNote,
+    };
+    if text.contains("--resolvable") {
+        GlabNoteForm::CreateResolvable
+    } else if text.contains("mr note create") {
+        GlabNoteForm::Create
+    } else {
+        GlabNoteForm::BareNote
     }
 }
 

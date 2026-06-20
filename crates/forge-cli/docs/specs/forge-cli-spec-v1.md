@@ -389,14 +389,15 @@ backend mapping, validation rules, and output schema versions.
   `id_not_pull_request` (`DATA 65`); any other non-zero result (rate limit, 5xx,
   forbidden/SSO) surfaces as a retryable `backend_error` (`RUNTIME 1`) since it
   may have hit a valid PR. The guard read is also rendered in `--dry-run` output
-  as `data.guard_plan`. On GitLab, the command posts the outcome as a
-  non-resolvable status note (`glab mr note create … --resolvable=false`) so it
-  does not register as an unresolved MR discussion that blocks the next
-  `forge-cli pr merge`; on a `glab` build whose `mr note create` lacks
-  `--resolvable` it drops only that flag (`glab mr note create … --message`,
-  which stays resolvable) rather than failing on an unknown flag — it keeps the
-  `create` subcommand because the bare `glab mr note <id>` parent form may not
-  accept `--message` on those builds. If the backend prints a URL, it is
+  as `data.guard_plan`. On GitLab, a single `glab mr note create --help` probe
+  selects the review-note form across every `glab` version class: when
+  `--resolvable` is advertised it posts a non-resolvable status note
+  (`glab mr note create … --resolvable=false`) so it does not register as an
+  unresolved MR discussion that blocks the next `forge-cli pr merge`; when the
+  `create` subcommand exists but lacks `--resolvable` it drops only that flag
+  (`glab mr note create … --message`, which stays resolvable); and when the build
+  has no `mr note create` subcommand at all it uses the bare
+  `glab mr note <id> --message` form. If the backend prints a URL, it is
   surfaced as `data.pr_comment_url`.
 - With `--mirror-issue --issue <number>`, the command posts a compact issue
   activity comment linking to the PR review comment and reports

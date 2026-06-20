@@ -66,7 +66,7 @@ in `crates/*/src`.
 | `cliclick` | Probed by `macos-agent` preflight as an alternate input backend | `brew install cliclick` |
 | `im-select` | Required by `macos-agent input-source *` and macOS real E2E keyboard/input-source setup | `brew install im-select` |
 | `openvpn` | Optional `forge-cli inbox --gitlab-vpn-check openvpn` readiness dependency probe; `forge-cli` never starts or stops VPN | `brew install openvpn` |
-| `glab` `mr note create --resolvable` | `forge-cli pr review` on GitLab posts a non-resolvable status note when this flag is present (probed via `--help`); on older `glab` it drops only `--resolvable=false` and still posts via `glab mr note create … --message` (the note stays resolvable and can register on the `pr merge` thread gate) | `brew upgrade glab` |
+| `glab` `mr note create --resolvable` | `forge-cli pr review` on GitLab probes `glab mr note create --help` and picks the most capable note form: with `--resolvable` it posts a non-resolvable status note; with `create` but no `--resolvable` it drops only that flag; with no `create` subcommand it uses the bare `glab mr note <id>` form. Only the first avoids registering on the `pr merge` thread gate | `brew upgrade glab` |
 | `docker-compose` | Fallback backend for `docker-tools compose down` when Docker Compose v2 is unavailable | `brew install docker-compose` |
 
 ## 3. Development and Validation Toolchain
