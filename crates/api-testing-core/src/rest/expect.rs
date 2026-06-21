@@ -1,3 +1,5 @@
+use anyhow::Context;
+
 use crate::Result;
 use crate::rest::runner::RestExecutedRequest;
 use crate::rest::schema::RestRequest;
@@ -11,12 +13,9 @@ pub fn evaluate_main_response(request: &RestRequest, executed: &RestExecutedRequ
         }
 
         if let Some(expr) = &expect.jq {
-            let body_json: Option<serde_json::Value> =
-                serde_json::from_slice(&executed.response.body).ok();
-            let ok = body_json
-                .and_then(|json| crate::jq::eval_exit_status(&json, expr).ok())
-                .unwrap_or(false);
-            if !ok {
+            let body_json: serde_json::Value = serde_json::from_slice(&executed.response.body)
+                .context("expect.jq requires a JSON response body")?;
+            if !crate::jq::eval_exit_status(&body_json, expr).unwrap_or(false) {
                 anyhow::bail!("expect.jq failed: {expr}");
             }
         }
@@ -51,6 +50,18 @@ mod tests {
         }
     }
 
+    fn executed_with_raw_body(status: u16, body: &[u8], content_type: &str) -> RestExecutedRequest {
+        RestExecutedRequest {
+            method: "GET".to_string(),
+            url: "http://localhost:6700/health".to_string(),
+            response: crate::http::HttpResponse {
+                status,
+                body: body.to_vec(),
+                content_type: Some(content_type.to_string()),
+            },
+        }
+    }
+
     #[test]
     fn rest_expect_status_mismatch_fails() {
         let request = crate::rest::schema::parse_rest_request_json(serde_json::json!({
@@ -78,6 +89,29 @@ mod tests {
         let executed = executed_with(200, serde_json::json!({"ok": false}));
         let err = evaluate_main_response(&request, &executed).unwrap_err();
         assert!(err.to_string().contains("expect.jq failed"));
+    }
+
+    #[test]
+    fn rest_expect_jq_non_json_body_reports_parse_error() {
+        let request = crate::rest::schema::parse_rest_request_json(serde_json::json!({
+            "method": "GET",
+            "path": "/health",
+            "expect": { "status": 200, "jq": ".ok == true" }
+        }))
+        .unwrap();
+        // A non-JSON response body (e.g. an HTML error page) is a system error,
+        // not an assertion failure. It must not be reported as `expect.jq failed`.
+        let executed = executed_with_raw_body(200, b"<html>not json</html>", "text/html");
+        let err = evaluate_main_response(&request, &executed).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("expect.jq requires a JSON response body"),
+            "expected a JSON-body parse error, got: {message}"
+        );
+        assert!(
+            !message.contains("expect.jq failed"),
+            "a non-JSON body must not be conflated with a jq assertion failure: {message}"
+        );
     }
 
     #[test]
