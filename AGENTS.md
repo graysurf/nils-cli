@@ -41,6 +41,9 @@
 
 - In Rust tests, prefer `pretty_assertions::{assert_eq, assert_ne}` for clearer
   diffs.
+- New crates use `jiff` for date/time (`jiff = { workspace = true }`); `chrono`
+  / `time` are grandfathered in existing crates only. See
+  `docs/runbooks/new-cli-crate-development-standard.md`.
 - Every user-facing CLI must expose root `-V, --version`.
 - For clap-based CLIs, set `#[command(version)]` on the root `Parser`.
 - `--help` output should show `-V, --version`.
