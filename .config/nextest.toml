@@ -5,5 +5,14 @@
 # So with `--profile ci` this becomes:
 #   target/nextest/ci/junit.xml
 
+[profile.ci]
+# Retry a test that fails then passes, instead of failing the whole run. The
+# workspace has a few tests that are reliable in isolation but flake under
+# full-workspace parallelism (see issue #934); without retries a single such
+# flake spuriously reds the `test` / `test_macos` gate and blocks merge.
+# nextest still reports flaky-passes distinctly, so flakes stay visible. This
+# is mitigation; the root-cause isolation fix is tracked in #934.
+retries = 2
+
 [profile.ci.junit]
 path = "junit.xml"
