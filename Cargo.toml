@@ -55,6 +55,10 @@ version = "1.13.0"
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "string"] }
+# Pinned EXACT on purpose: clap_complete's generated completion-script output can
+# change between releases, which would break the completion-matrix CI baseline
+# (completion-freshness/flag-parity audits). Bump deliberately and regenerate the
+# completion assets rather than letting this float to `^4.6`.
 clap_complete = "=4.6.5"
 directories = "6"
 indexmap = { version = "2", features = ["serde"] }
