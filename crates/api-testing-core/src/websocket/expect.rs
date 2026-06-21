@@ -100,6 +100,31 @@ mod tests {
     }
 
     #[test]
+    fn websocket_expect_jq_non_json_text_reports_parse_error() {
+        // A non-JSON received text is a system error, not an assertion failure.
+        // It must surface as a JSON-parse error, not be conflated with `jq failed`
+        // (parity with the gRPC and REST evaluators).
+        let err = evaluate_text_expect(
+            &WebsocketExpect {
+                jq: Some(".ok == true".to_string()),
+                text_contains: None,
+            },
+            "plain-text-not-json",
+            "test",
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("jq requires a JSON response text"),
+            "expected a JSON-text parse error, got: {message}"
+        );
+        assert!(
+            !message.contains("jq failed"),
+            "a non-JSON text must not be conflated with a jq assertion failure: {message}"
+        );
+    }
+
+    #[test]
     fn websocket_expect_rejects_missing_text_contains() {
         let err = evaluate_text_expect(
             &WebsocketExpect {
