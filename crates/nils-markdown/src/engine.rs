@@ -1,5 +1,5 @@
 use minijinja::value::Kwargs;
-use minijinja::{AutoEscape, Environment, Value};
+use minijinja::{AutoEscape, Environment, UndefinedBehavior, Value};
 use serde::Serialize;
 
 use crate::error::RenderError;
@@ -134,6 +134,7 @@ impl EngineBuilder {
         // strips one trailing `\n` by default; tera (and our golden
         // fixtures) keep it, so opt back in for byte-identical output.
         env.set_keep_trailing_newline(true);
+        env.set_undefined_behavior(UndefinedBehavior::Strict);
         crate::filters::install_defaults(&mut env);
         Self { env }
     }
@@ -316,6 +317,21 @@ mod tests {
             .unwrap();
         let err = engine
             .render_value("strict", &serde_json::json!({"value": [1, 2]}))
+            .unwrap_err();
+        match err {
+            RenderError::Render { name, .. } => assert_eq!(name, "strict"),
+            other => panic!("expected Render, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_top_level_field_errors() {
+        let mut engine = build();
+        engine
+            .register_template("strict", "Hello, {{ name }}!")
+            .unwrap();
+        let err = engine
+            .render_value("strict", &serde_json::json!({}))
             .unwrap_err();
         match err {
             RenderError::Render { name, .. } => assert_eq!(name, "strict"),

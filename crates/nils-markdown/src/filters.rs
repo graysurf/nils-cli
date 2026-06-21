@@ -14,9 +14,14 @@ use nils_common::markdown::canonicalize_table_cell;
 fn md_cell(value: Value) -> Result<Value, Error> {
     let rendered = match value.kind() {
         ValueKind::String => canonicalize_table_cell(value.as_str().unwrap_or_default()),
-        // minijinja represents JSON `null` as `None`; `Undefined`
-        // (a missing key) also renders to an empty cell.
-        ValueKind::None | ValueKind::Undefined => String::new(),
+        // JSON `null` remains an intentionally empty Markdown cell.
+        ValueKind::None => String::new(),
+        ValueKind::Undefined => {
+            return Err(Error::new(
+                ErrorKind::UndefinedError,
+                "md_cell(): undefined value",
+            ));
+        }
         ValueKind::Bool | ValueKind::Number => canonicalize_table_cell(&value.to_string()),
         _ => {
             return Err(Error::new(
@@ -40,10 +45,17 @@ mod tests {
     use super::*;
     use crate::Engine;
 
-    fn render(template: &str, value: serde_json::Value) -> String {
+    fn render_result(
+        template: &str,
+        value: serde_json::Value,
+    ) -> Result<String, crate::RenderError> {
         let mut e = Engine::builder().build();
         e.register_template("cell", template).unwrap();
-        e.render_value("cell", &value).unwrap()
+        e.render_value("cell", &value)
+    }
+
+    fn render(template: &str, value: serde_json::Value) -> String {
+        render_result(template, value).unwrap()
     }
 
     #[test]
@@ -71,6 +83,15 @@ mod tests {
     fn null_input_renders_empty() {
         let out = render("{{ value | md_cell }}", serde_json::json!({"value": null}));
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn undefined_input_errors() {
+        let err = render_result("{{ missing | md_cell }}", serde_json::json!({})).unwrap_err();
+        match err {
+            crate::RenderError::Render { name, .. } => assert_eq!(name, "cell"),
+            other => panic!("expected Render, got {other:?}"),
+        }
     }
 
     #[test]

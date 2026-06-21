@@ -13,6 +13,11 @@
 [advisories]
 # RUSTSEC vulnerability / unsound advisories fail the build. Add an entry here
 # only to consciously accept a specific advisory, always with a reason.
+# Unmaintained advisories are not part of this CI gate; keeping this explicit
+# prevents cargo-deny's broader default from expanding the policy by accident.
+unmaintained = "none"
+# Transitive unsound advisories are in scope, matching the workspace policy.
+unsound = "all"
 ignore = []
 
 [bans]
