@@ -8,18 +8,18 @@
 //! for skills that can't `exec` (a Plan 04 concern); we surface a clear
 //! typed error rather than guessing a literal path here.
 
-use super::HelperContext;
+use super::{HelperContext, HelperFn, HelperResult, helper_error};
 use crate::render::manifest::StateOutMode;
-use std::collections::HashMap;
+use minijinja::value::Kwargs;
+use minijinja::{Error, Value};
 use std::sync::Arc;
-use tera::{Function, Value};
 
-pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
-    move |args: &HashMap<String, Value>| -> tera::Result<Value> {
-        let domain = validated_arg(args, "domain", /* required */ true)?
+pub(crate) fn make(ctx: Arc<HelperContext>) -> impl HelperFn {
+    move |kwargs| -> HelperResult {
+        let domain = validated_arg(&kwargs, "domain", /* required */ true)?
             .expect("required arg returned None unexpectedly");
-        let topic = validated_arg(args, "topic", false)?;
-        let repo = validated_arg(args, "repo", false)?;
+        let topic = validated_arg(&kwargs, "topic", false)?;
+        let repo = validated_arg(&kwargs, "repo", false)?;
         match ctx.current_skill_state_out_mode {
             StateOutMode::Runtime => {
                 let mut cmd = format!("agent-out path-for --domain {domain}");
@@ -29,9 +29,9 @@ pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
                 if let Some(r) = repo {
                     cmd.push_str(&format!(" --repo {r}"));
                 }
-                Ok(Value::String(cmd))
+                Ok(Value::from(cmd))
             }
-            StateOutMode::Literal => Err(tera::Error::msg(format!(
+            StateOutMode::Literal => Err(helper_error(format!(
                 "state_out(): literal mode not yet wired for skill {skill:?} \
                  (Plan 04 lands literal-mode resolution)",
                 skill = ctx.current_skill_id
@@ -54,25 +54,26 @@ fn arg_charset_ok(s: &str) -> bool {
 }
 
 fn validated_arg(
-    args: &HashMap<String, Value>,
+    kwargs: &Kwargs,
     name: &'static str,
     required: bool,
-) -> tera::Result<Option<String>> {
-    let Some(raw) = args.get(name) else {
+) -> Result<Option<String>, Error> {
+    let raw: Option<Value> = kwargs.get(name)?;
+    let Some(raw) = raw else {
         if required {
-            return Err(tera::Error::msg(format!(
+            return Err(helper_error(format!(
                 "state_out(): required arg `{name}` (string)"
             )));
         }
         return Ok(None);
     };
     let value = raw.as_str().ok_or_else(|| {
-        tera::Error::msg(format!(
+        helper_error(format!(
             "state_out(): arg `{name}` must be a string, got {raw:?}"
         ))
     })?;
     if !arg_charset_ok(value) {
-        return Err(tera::Error::msg(format!(
+        return Err(helper_error(format!(
             "state_out(): arg `{name}` {value:?} contains characters outside \
              the allowed set [A-Za-z0-9._:/-]; the rendered command is \
              shell-executed downstream and must stay quote-free",

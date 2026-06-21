@@ -1,42 +1,38 @@
-use std::collections::HashMap;
-
+use minijinja::value::ValueKind;
+use minijinja::{Environment, Error, ErrorKind, Value};
 use nils_common::markdown::canonicalize_table_cell;
-use tera::{Filter, Tera, Value};
 
-/// Tera filter wrapping
+/// minijinja filter wrapping
 /// [`nils_common::markdown::canonicalize_table_cell`] so templates can
 /// emit safe table cells with `{{ value | md_cell }}`. The filter
 /// accepts strings (and stringifies numbers / bools) and escapes
 /// pipes / collapses embedded newlines using the exact rule shared
 /// with the rest of the workspace.
-struct MdCell;
-
-impl Filter for MdCell {
-    fn filter(&self, value: &Value, _args: &HashMap<String, Value>) -> tera::Result<Value> {
-        let rendered = match value {
-            Value::String(s) => canonicalize_table_cell(s),
-            Value::Null => String::new(),
-            Value::Bool(b) => canonicalize_table_cell(&b.to_string()),
-            Value::Number(n) => canonicalize_table_cell(&n.to_string()),
-            other => {
-                return Err(tera::Error::msg(format!(
-                    "md_cell(): expected a stringifiable value, got {other:?}"
-                )));
-            }
-        };
-        Ok(Value::String(rendered))
-    }
-
-    fn is_safe(&self) -> bool {
-        true
-    }
+///
+/// Auto-escape is disabled engine-wide, so no `safe`-marking is needed:
+/// the rendered string is emitted verbatim.
+fn md_cell(value: Value) -> Result<Value, Error> {
+    let rendered = match value.kind() {
+        ValueKind::String => canonicalize_table_cell(value.as_str().unwrap_or_default()),
+        // minijinja represents JSON `null` as `None`; `Undefined`
+        // (a missing key) also renders to an empty cell.
+        ValueKind::None | ValueKind::Undefined => String::new(),
+        ValueKind::Bool | ValueKind::Number => canonicalize_table_cell(&value.to_string()),
+        _ => {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("md_cell(): expected a stringifiable value, got {value:?}"),
+            ));
+        }
+    };
+    Ok(Value::from(rendered))
 }
 
-/// Install every workspace-default Tera filter on `tera`. Called from
-/// the [`crate::Engine`] builder so consumers don't have to remember
-/// to do it manually.
-pub(crate) fn install_defaults(tera: &mut Tera) {
-    tera.register_filter("md_cell", MdCell);
+/// Install every workspace-default filter on `env`. Called from the
+/// [`crate::Engine`] builder so consumers don't have to remember to do
+/// it manually.
+pub(crate) fn install_defaults(env: &mut Environment<'_>) {
+    env.add_filter("md_cell", md_cell);
 }
 
 #[cfg(test)]

@@ -5,28 +5,21 @@
 //! without a per-skill floor. Unknown names surface a typed error so
 //! drift audit's `cli_ref` rejection class fires loud and early.
 
-use super::HelperContext;
-use std::collections::HashMap;
+use super::{HelperContext, HelperFn, HelperResult, arg_str, helper_error, missing_arg};
+use minijinja::Value;
 use std::sync::Arc;
-use tera::{Function, Value};
 
-pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
-    move |args: &HashMap<String, Value>| -> tera::Result<Value> {
-        let raw = args
-            .get("name")
-            .ok_or_else(|| tera::Error::msg("cli_ref(): required arg `name` (string)"))?;
-        let name = raw.as_str().ok_or_else(|| {
-            tera::Error::msg(format!(
-                "cli_ref(): arg `name` must be a string, got {raw:?}"
-            ))
-        })?;
-        if let Some(floor) = ctx.current_skill_required_clis.get(name) {
-            return Ok(Value::String(format!("{name} ({floor})")));
+pub(crate) fn make(ctx: Arc<HelperContext>) -> impl HelperFn {
+    move |kwargs| -> HelperResult {
+        let name = arg_str(&kwargs, "name")?
+            .ok_or_else(|| missing_arg("cli_ref(): required arg `name` (string)"))?;
+        if let Some(floor) = ctx.current_skill_required_clis.get(&name) {
+            return Ok(Value::from(format!("{name} ({floor})")));
         }
-        if ctx.manifests.cli_tools.formulas.contains_key(name) {
-            return Ok(Value::String(name.to_string()));
+        if ctx.manifests.cli_tools.formulas.contains_key(&name) {
+            return Ok(Value::from(name));
         }
-        Err(tera::Error::msg(format!(
+        Err(helper_error(format!(
             "cli_ref(): unknown binary {name:?} \
              (not declared in skill {skill:?} required_clis, \
              not present in cli-tools.yaml formulas)",

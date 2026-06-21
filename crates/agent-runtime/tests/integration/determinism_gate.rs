@@ -92,18 +92,28 @@ fn nils_common_lib_denies_the_determinism_lints() {
     );
 }
 
+/// After the minijinja migration the render path no longer needs to
+/// silence `disallowed_types`. minijinja's helper API hands keyword
+/// arguments as a `minijinja::value::Kwargs` (not the
+/// `&HashMap<String, Value>` that Tera's `Function` trait forced), so
+/// the former `#![allow(clippy::disallowed_types)]` exemption in
+/// `helpers/mod.rs` was removed and the render subtree is now
+/// HashMap-free outright — a strictly stronger determinism posture.
+/// This asserts the exemption is gone, not present.
 #[test]
-fn helpers_mod_carries_the_only_sanctioned_disallowed_types_allow() {
-    assert_contains(
-        HELPERS_MOD_RS,
-        "#![allow(clippy::disallowed_types)]",
-        "crates/agent-runtime/src/render/helpers/mod.rs",
+fn helpers_mod_no_longer_needs_the_disallowed_types_allow() {
+    assert!(
+        !HELPERS_MOD_RS.contains("#![allow(clippy::disallowed_types"),
+        "crates/agent-runtime/src/render/helpers/mod.rs still carries a \
+         `disallowed_types` allow; the minijinja helper API no longer forces \
+         HashMap, so the render path must stay HashMap-free with no exemption"
     );
 }
 
-/// `helpers/mod.rs` is the only file under `src/render/` allowed to
-/// silence `disallowed_types`. Walk the render subtree and confirm no
-/// other file carries the inner attribute.
+/// No file under `src/render/` may silence `disallowed_types`. Walk the
+/// render subtree and confirm none carries the inner or outer attribute.
+/// (Before the minijinja migration `helpers/mod.rs` was the single
+/// sanctioned exception; that exemption is now gone.)
 ///
 /// `disallowed_methods` may be silenced anywhere off the render path
 /// (and the explicit exemption in `nils-common::fs::temp_path` does
@@ -115,13 +125,9 @@ fn render_subtree_has_no_unsanctioned_disallowed_types_allow() {
     use std::path::PathBuf;
 
     let render_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/render");
-    let helpers_mod = render_dir.join("helpers/mod.rs");
 
     let mut offenders: Vec<String> = Vec::new();
     walk_rust_files(&render_dir, &mut |path| {
-        if path == helpers_mod {
-            return;
-        }
         let body = fs::read_to_string(path).unwrap();
         if body.contains("#![allow(clippy::disallowed_types")
             || body.contains("#[allow(clippy::disallowed_types")
@@ -132,8 +138,8 @@ fn render_subtree_has_no_unsanctioned_disallowed_types_allow() {
 
     assert!(
         offenders.is_empty(),
-        "only `render/helpers/mod.rs` may silence `clippy::disallowed_types`; \
-         these files also carry the lint allow and would let a future \
+        "no file under `render/` may silence `clippy::disallowed_types`; \
+         these files carry the lint allow and would let a future \
          HashMap import slip through the determinism gate: {offenders:#?}"
     );
 }

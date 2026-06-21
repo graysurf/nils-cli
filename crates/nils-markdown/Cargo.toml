@@ -3,7 +3,7 @@ name = "nils-markdown"
 version = "1.13.0"
 edition.workspace = true
 license.workspace = true
-description = "Shared Tera-backed Markdown template layer for the nils-cli workspace."
+description = "Shared minijinja-backed Markdown template layer for the nils-cli workspace."
 repository = "https://github.com/sympoies/nils-cli"
 
 [lib]
@@ -35,12 +35,12 @@ test-support = ["dep:pretty_assertions"]
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 clap_complete = { workspace = true, optional = true }
+minijinja = { workspace = true }
 nils-build-info = { version = "1.13.0", path = "../nils-build-info", optional = true }
 nils-common = { version = "1.13.0", path = "../nils-common", package = "nils-common" }
 pretty_assertions = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tera = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

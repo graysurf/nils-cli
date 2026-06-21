@@ -1,9 +1,11 @@
+use minijinja::value::Kwargs;
+use minijinja::{AutoEscape, Environment, Value};
 use serde::Serialize;
-use tera::{Context, Tera};
 
 use crate::error::RenderError;
 
-/// Tera-backed Markdown rendering engine for the nils-cli workspace.
+/// minijinja-backed Markdown rendering engine for the nils-cli
+/// workspace.
 ///
 /// Engine is constructed via [`Engine::builder`] so the determinism
 /// posture (no auto-escape, no `now()`) is enforced in one place.
@@ -11,7 +13,7 @@ use crate::error::RenderError;
 /// consumer crates ship `.md.tera` assets through `include_str!`
 /// without filesystem lookups at runtime.
 pub struct Engine {
-    tera: Tera,
+    env: Environment<'static>,
 }
 
 impl Engine {
@@ -25,13 +27,14 @@ impl Engine {
     /// Register a template body under `name`. The body is parsed
     /// eagerly so syntax errors surface at registration time rather
     /// than render time. The check for `now()` calls is the only
-    /// content gate; everything else is delegated to Tera's parser.
+    /// content gate; everything else is delegated to minijinja's
+    /// parser.
     pub fn register_template(&mut self, name: &str, body: &str) -> Result<(), RenderError> {
         if contains_now_call(body) {
             return Err(RenderError::NonDeterministicTemplate { name: name.into() });
         }
-        self.tera
-            .add_raw_template(name, body)
+        self.env
+            .add_template_owned(name.to_string(), body.to_string())
             .map_err(|source| RenderError::TemplateParse {
                 name: name.into(),
                 source,
@@ -46,18 +49,22 @@ impl Engine {
         name: &str,
         view: &serde_json::Value,
     ) -> Result<String, RenderError> {
-        let context = Context::from_value(view.clone()).map_err(|source| RenderError::Render {
-            name: name.into(),
-            source,
-        })?;
-        self.render_context(name, &context)
+        let template = self
+            .env
+            .get_template(name)
+            .map_err(|_| RenderError::MissingTemplate { name: name.into() })?;
+        template
+            .render(Value::from_serialize(view))
+            .map_err(|source| RenderError::Render {
+                name: name.into(),
+                source,
+            })
     }
 
     /// Render a registered template against a typed view struct.
     /// Consumers prepare a flat [`serde::Serialize`] view in Rust and
     /// hand it to this method; the engine performs the
-    /// `serde_json::to_value` conversion and the Tera render in one
-    /// step.
+    /// `serde_json::to_value` conversion and the render in one step.
     pub fn render<T: Serialize>(&self, name: &str, view: &T) -> Result<String, RenderError> {
         let value =
             serde_json::to_value(view).map_err(|source| RenderError::Serialize { source })?;
@@ -68,8 +75,8 @@ impl Engine {
     /// registering it. The body is checked for `now()` calls and
     /// then rendered with the engine's registered helpers and the
     /// supplied view. This is the migration path for callers that
-    /// today use `Tera::render_str` directly and treat every render
-    /// as a fresh one-shot template.
+    /// today use one-shot template rendering and treat every render
+    /// as a fresh template.
     pub fn render_str<T: Serialize>(
         &mut self,
         body: &str,
@@ -85,55 +92,54 @@ impl Engine {
             name: INLINE_NAME.into(),
             source,
         })?;
-        self.tera
-            .render_str(body, &context)
+        self.env
+            .render_str(body, context)
             .map_err(|source| RenderError::Render {
                 name: INLINE_NAME.into(),
                 source,
             })
     }
 
-    /// Attach a domain-specific Tera function under `name`. This is
-    /// the consumer extension point for Task 1.4: nils-agent-runtime's
+    /// Attach a domain-specific function under `name`. This is the
+    /// consumer extension point: nils-agent-runtime's
     /// `cli_ref / script / skill_ref / state_out` helpers register
     /// here without `nils-markdown` knowing the consumer's domain.
+    ///
+    /// The function receives keyword arguments as a
+    /// [`minijinja::value::Kwargs`] and returns a
+    /// [`minijinja::Value`]. Templates invoke it with named args, e.g.
+    /// `{{ shout(v="ok") }}`.
     pub fn register_helper<F>(&mut self, name: &str, function: F)
     where
-        F: tera::Function + 'static,
+        F: Fn(Kwargs) -> Result<Value, minijinja::Error> + Send + Sync + 'static,
     {
-        self.tera.register_function(name, function);
-    }
-
-    fn render_context(&self, name: &str, context: &Context) -> Result<String, RenderError> {
-        if !self.tera.get_template_names().any(|n| n == name) {
-            return Err(RenderError::MissingTemplate { name: name.into() });
-        }
-        self.tera
-            .render(name, context)
-            .map_err(|source| RenderError::Render {
-                name: name.into(),
-                source,
-            })
+        self.env.add_function(name.to_string(), function);
     }
 }
 
-/// Builder for [`Engine`]. Holds the deterministic-Tera defaults so
+/// Builder for [`Engine`]. Holds the deterministic defaults so
 /// consumers cannot construct an engine with auto-escape or
 /// `now()`-enabled templates by accident.
 pub struct EngineBuilder {
-    tera: Tera,
+    env: Environment<'static>,
 }
 
 impl EngineBuilder {
     fn new() -> Self {
-        let mut tera = Tera::default();
-        tera.autoescape_on(vec![]);
-        crate::filters::install_defaults(&mut tera);
-        Self { tera }
+        let mut env = Environment::new();
+        // Disable auto-escape entirely: rendered Markdown must pass
+        // raw HTML (`<b>bold</b>`) and table syntax through verbatim.
+        env.set_auto_escape_callback(|_| AutoEscape::None);
+        // Preserve the template body's trailing newline. minijinja
+        // strips one trailing `\n` by default; tera (and our golden
+        // fixtures) keep it, so opt back in for byte-identical output.
+        env.set_keep_trailing_newline(true);
+        crate::filters::install_defaults(&mut env);
+        Self { env }
     }
 
     pub fn build(self) -> Engine {
-        Engine { tera: self.tera }
+        Engine { env: self.env }
     }
 }
 
@@ -143,18 +149,24 @@ impl Default for EngineBuilder {
     }
 }
 
-/// Serialize a view into a Tera [`Context`]. Tera requires the
-/// top-level value to be a JSON object; we allow null / empty
-/// callers (the nils-agent-runtime render path passes no view, the
-/// helpers carry every variable) and map them to an empty context.
-fn serialize_to_context<T: Serialize>(view: &T) -> Result<Context, tera::Error> {
-    let value = serde_json::to_value(view).map_err(tera::Error::json)?;
+/// Serialize a view into a minijinja render context. The top-level
+/// value must be a JSON object; we allow null / empty callers (the
+/// nils-agent-runtime render path passes no view, the helpers carry
+/// every variable) and map them to an empty context.
+fn serialize_to_context<T: Serialize>(view: &T) -> Result<Value, minijinja::Error> {
+    let value = serde_json::to_value(view).map_err(|e| {
+        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+    })?;
     match value {
-        serde_json::Value::Null => Ok(Context::new()),
-        serde_json::Value::Object(_) => Context::from_value(value),
-        other => Err(tera::Error::msg(format!(
-            "render_str view must serialize to a JSON object or null, got {other:?}"
-        ))),
+        serde_json::Value::Null => Ok(Value::from_serialize(serde_json::Map::<
+            String,
+            serde_json::Value,
+        >::new())),
+        serde_json::Value::Object(_) => Ok(Value::from_serialize(&value)),
+        other => Err(minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("render_str view must serialize to a JSON object or null, got {other:?}"),
+        )),
     }
 }
 
@@ -200,7 +212,7 @@ mod tests {
     #[test]
     fn build_yields_engine_with_no_templates() {
         let engine = build();
-        assert_eq!(engine.tera.get_template_names().count(), 0);
+        assert_eq!(engine.env.templates().count(), 0);
     }
 
     #[test]
@@ -281,7 +293,7 @@ mod tests {
                 let printed = format!("{source}");
                 assert!(
                     !printed.is_empty(),
-                    "tera error message should not be empty"
+                    "template error message should not be empty"
                 );
             }
             other => panic!("expected TemplateParse, got {other:?}"),
@@ -290,12 +302,20 @@ mod tests {
 
     #[test]
     fn render_runtime_error_surfaces_name() {
+        // minijinja's `upper` coerces a number to its string form
+        // (`42` -> `"42"`) instead of erroring, unlike tera, so the
+        // original `{{ value | upper }}`-on-a-number case no longer
+        // exercises a render error. The `md_cell` filter still rejects
+        // non-stringifiable values (arrays / maps), so we drive the
+        // same `RenderError::Render` path through that filter instead —
+        // the assertion (render fails and is reported by template name)
+        // is unchanged.
         let mut engine = build();
         engine
-            .register_template("strict", "{{ value | upper }}")
+            .register_template("strict", "{{ value | md_cell }}")
             .unwrap();
         let err = engine
-            .render_value("strict", &serde_json::json!({"value": 42}))
+            .render_value("strict", &serde_json::json!({"value": [1, 2]}))
             .unwrap_err();
         match err {
             RenderError::Render { name, .. } => assert_eq!(name, "strict"),
@@ -317,12 +337,14 @@ mod tests {
         let mut engine = build();
         engine.register_helper(
             "shout",
-            |args: &std::collections::HashMap<String, tera::Value>| -> tera::Result<tera::Value> {
-                let v = args
-                    .get("v")
-                    .and_then(|x| x.as_str())
-                    .ok_or_else(|| tera::Error::msg("shout(): required arg `v`"))?;
-                Ok(tera::Value::String(v.to_uppercase()))
+            |kwargs: Kwargs| -> Result<Value, minijinja::Error> {
+                let v: String = kwargs.get("v").map_err(|_| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::MissingArgument,
+                        "shout(): required arg `v`",
+                    )
+                })?;
+                Ok(Value::from(v.to_uppercase()))
             },
         );
         let out = engine
@@ -345,16 +367,17 @@ mod tests {
 
     #[test]
     fn register_helper_attaches_consumer_function() {
-        use std::collections::HashMap;
         let mut engine = build();
         engine.register_helper(
             "shout",
-            |args: &HashMap<String, tera::Value>| -> tera::Result<tera::Value> {
-                let v = args
-                    .get("v")
-                    .and_then(|x| x.as_str())
-                    .ok_or_else(|| tera::Error::msg("shout(): required arg `v`"))?;
-                Ok(tera::Value::String(v.to_uppercase()))
+            |kwargs: Kwargs| -> Result<Value, minijinja::Error> {
+                let v: String = kwargs.get("v").map_err(|_| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::MissingArgument,
+                        "shout(): required arg `v`",
+                    )
+                })?;
+                Ok(Value::from(v.to_uppercase()))
             },
         );
         engine
