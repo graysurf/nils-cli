@@ -14,10 +14,10 @@ Source: [`agent-runtime-kit/docs/source/inventory-target-architecture.md`
 
 Rust's `std::collections::HashMap` (and its `HashSet` sibling,
 `hash_map::DefaultHasher`, `hash_map::RandomState`) randomises
-iteration order, so a context fed to Tera via any of these would
-render the same source to different bytes on different processes
-(and on the same process across runs, when the underlying hasher
-seeds differ).
+iteration order, so a context fed to the render engine via any of
+these would render the same source to different bytes on different
+processes (and on the same process across runs, when the underlying
+hasher seeds differ).
 
 Enforcement:
 
@@ -30,22 +30,24 @@ Enforcement:
   attribute at the top of each crate's `lib.rs` makes a violation a
   build failure under `cargo clippy --all-targets -- -D warnings`.
 - The render code uses `IndexMap` (insertion-ordered) or `BTreeMap`
-  (key-sorted) for every map that crosses into Tera.
+  (key-sorted) for every map that crosses into the render engine.
 - Filesystem directory walks (`std::fs::read_dir`) sort their entries
   before consumption — the OS returns them in arbitrary order on
   most filesystems. The integration test in
   `tests/integration/render_determinism.rs` and the production walk
   in `render::golden::update_golden` both sort before iterating.
 
-Single exemption: `crates/agent-runtime/src/render/helpers/` —
-Tera's `Function` trait signature is
-`fn call(&self, args: &HashMap<String, Value>) -> Result<Value>`, so
-the helper closures cannot avoid the type. The module-level
-`#![allow(clippy::disallowed_types)]` in `helpers/mod.rs` scopes the
-silence to exactly those files; no other module under `src/render/`
-imports `HashMap`. The `allowlist_is_exact` integration test asserts
-this scope cannot drift silently — adding `#[allow(...)]` to another
-module fails the test.
+No exemption: the render path is HashMap-free outright. Previously
+`crates/agent-runtime/src/render/helpers/` carried a single
+`#![allow(clippy::disallowed_types)]` because Tera's `Function` trait
+signature forced `&HashMap<String, Value>` on every helper closure.
+The minijinja render engine instead hands helpers their keyword
+arguments as a `minijinja::value::Kwargs` bag, so that exemption was
+removed during the Tera→minijinja migration. The
+`render_subtree_has_no_unsanctioned_disallowed_types_allow`
+integration test asserts no module under `src/render/` silences
+`disallowed_types` — adding `#[allow(...)]` anywhere on the render
+path fails the test.
 
 ## Rule 2 — no wall-clock or monotonic time
 

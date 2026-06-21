@@ -2,21 +2,14 @@
 //! the product-native invocation name for the active product. Falls back
 //! to the canonical id when the per-product entry omits `name`.
 
-use super::HelperContext;
-use std::collections::HashMap;
+use super::{HelperContext, HelperFn, HelperResult, arg_str, helper_error, missing_arg};
+use minijinja::Value;
 use std::sync::Arc;
-use tera::{Function, Value};
 
-pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
-    move |args: &HashMap<String, Value>| -> tera::Result<Value> {
-        let raw = args
-            .get("id")
-            .ok_or_else(|| tera::Error::msg("skill_ref(): required arg `id` (string)"))?;
-        let id = raw.as_str().ok_or_else(|| {
-            tera::Error::msg(format!(
-                "skill_ref(): arg `id` must be a string, got {raw:?}"
-            ))
-        })?;
+pub(crate) fn make(ctx: Arc<HelperContext>) -> impl HelperFn {
+    move |kwargs| -> HelperResult {
+        let id = arg_str(&kwargs, "id")?
+            .ok_or_else(|| missing_arg("skill_ref(): required arg `id` (string)"))?;
         let skill = ctx
             .manifests
             .skills
@@ -24,18 +17,18 @@ pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
             .iter()
             .find(|s| s.id == id)
             .ok_or_else(|| {
-                tera::Error::msg(format!(
+                helper_error(format!(
                     "skill_ref(): no skill with id {id:?} in skills.yaml"
                 ))
             })?;
         let render = skill.products.get(&ctx.current_product).ok_or_else(|| {
-            tera::Error::msg(format!(
+            helper_error(format!(
                 "skill_ref(): skill {id:?} has no entry for product {product:?}",
                 product = ctx.current_product
             ))
         })?;
         let label = render.name.clone().unwrap_or_else(|| id.to_string());
-        Ok(Value::String(label))
+        Ok(Value::from(label))
     }
 }
 

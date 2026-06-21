@@ -1,4 +1,4 @@
-//! Tera helper functions registered against a per-skill render pass.
+//! minijinja helper functions registered against a per-skill render pass.
 //!
 //! Each helper is constructed from a shared [`HelperContext`] that captures
 //! everything required for resolution: the source root, the parsed manifest
@@ -6,16 +6,14 @@
 //! `state_out_mode`. Helpers are stateless beyond this snapshot, so two
 //! cold processes registering the same context produce identical output.
 //!
-//! Tera's `Function` trait signature forces `&HashMap<String, Value>` on
-//! us — that's the only sanctioned `HashMap` import inside `src/render/`
-//! and it stays scoped to this module (the context fed to Tera lives in
-//! [`IndexMap`] / `BTreeMap` per Resolved Decision #9). The crate-wide
-//! `clippy::disallowed_types` gate on `HashMap` is silenced exactly here
-//! and nowhere else.
-#![allow(clippy::disallowed_types)]
+//! Helpers take keyword arguments as a [`minijinja::value::Kwargs`] and
+//! return a [`minijinja::Value`]; the context fed to the renderer lives in
+//! [`IndexMap`] / `BTreeMap` per Resolved Decision #9.
 
 use crate::render::manifest::{ManifestSet, StateOutMode};
 use indexmap::IndexMap;
+use minijinja::value::Kwargs;
+use minijinja::{Error, ErrorKind, Value};
 use nils_markdown::Engine;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +22,44 @@ pub mod cli_ref;
 pub mod script;
 pub mod skill_ref;
 pub mod state_out;
+
+/// Result type every renderer helper returns.
+pub(crate) type HelperResult = Result<Value, Error>;
+
+/// Trait alias for the closure shape [`Engine::register_helper`] accepts:
+/// a keyword-argument bag in, a [`Value`] (or [`Error`]) out.
+pub(crate) trait HelperFn: Fn(Kwargs) -> HelperResult + Send + Sync + 'static {}
+
+impl<F> HelperFn for F where F: Fn(Kwargs) -> HelperResult + Send + Sync + 'static {}
+
+/// Build a helper rejection error. The renderer surfaces the helper's
+/// `Display` text in the render error chain, so callers carry the full
+/// `<helper>(): ...` message here.
+pub(crate) fn helper_error(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidOperation, message.into())
+}
+
+/// Build a missing-required-argument error.
+pub(crate) fn missing_arg(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::MissingArgument, message.into())
+}
+
+/// Read a string-typed keyword argument. Returns `Ok(None)` when the
+/// argument is absent (the caller decides whether that is fatal), `Ok(Some)`
+/// when present and a string, and an error when present but a non-string —
+/// mirroring the previous Tera helper behaviour exactly.
+pub(crate) fn arg_str(kwargs: &Kwargs, name: &str) -> Result<Option<String>, Error> {
+    let raw: Option<Value> = kwargs.get(name)?;
+    match raw {
+        None => Ok(None),
+        Some(value) => match value.as_str() {
+            Some(s) => Ok(Some(s.to_string())),
+            None => Err(helper_error(format!(
+                "arg `{name}` must be a string, got {value:?}"
+            ))),
+        },
+    }
+}
 
 /// Snapshot of the resolution context that all four helpers share for a
 /// single skill's render. Cloned via [`Arc`] into each helper closure.
@@ -187,21 +223,21 @@ mod test_support {
         }
     }
 
-    pub fn render(template: &str, ctx: HelperContext) -> tera::Result<String> {
+    pub fn render(template: &str, ctx: HelperContext) -> Result<String, Error> {
         let mut engine = Engine::builder().build();
         register_all(&mut engine, Arc::new(ctx));
         engine
             .render_str(template, &serde_json::Value::Null)
             .map_err(|err| match err {
                 nils_markdown::RenderError::Render { source, .. } => source,
-                other => tera::Error::msg(format!("{other}")),
+                other => Error::new(ErrorKind::InvalidOperation, other.to_string()),
             })
     }
 
-    /// Flatten a Tera error and its source chain into a single string so
-    /// rejection tests can assert against the originating helper message,
-    /// not Tera's outer `Failed to render '__tera_one_off'` wrapper.
-    pub fn format_err(err: &tera::Error) -> String {
+    /// Flatten a minijinja error and its source chain into a single string
+    /// so rejection tests can assert against the originating helper message,
+    /// not just the renderer's outer wrapper.
+    pub fn format_err(err: &Error) -> String {
         let mut out = err.to_string();
         let mut next: Option<&dyn std::error::Error> = std::error::Error::source(err);
         while let Some(cause) = next {

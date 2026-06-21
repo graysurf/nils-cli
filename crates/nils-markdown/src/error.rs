@@ -6,7 +6,7 @@ pub enum RenderError {
     TemplateParse {
         name: String,
         #[source]
-        source: tera::Error,
+        source: minijinja::Error,
     },
 
     #[error("template not registered: `{name}`")]
@@ -24,11 +24,11 @@ pub enum RenderError {
         source: serde_json::Error,
     },
 
-    #[error("tera render failed for `{name}`: {source}")]
+    #[error("template render failed for `{name}`: {source}")]
     Render {
         name: String,
         #[source]
-        source: tera::Error,
+        source: minijinja::Error,
     },
 }
 
@@ -55,10 +55,11 @@ mod tests {
 
     #[test]
     fn template_parse_error_renders_name_and_source() {
-        let tera_err = tera::Error::msg("syntax error at line 3");
+        let parse_err =
+            minijinja::Error::new(minijinja::ErrorKind::SyntaxError, "syntax error at line 3");
         let err = RenderError::TemplateParse {
             name: "dashboard".into(),
-            source: tera_err,
+            source: parse_err,
         };
         let printed = format!("{err}");
         assert!(printed.contains("dashboard"), "{printed}");
@@ -99,7 +100,10 @@ mod tests {
     fn render_runtime_error_renders_name() {
         let err = RenderError::Render {
             name: "lifecycle".into(),
-            source: tera::Error::msg("missing variable"),
+            source: minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                "missing variable",
+            ),
         };
         let printed = format!("{err}");
         assert!(printed.contains("lifecycle"), "{printed}");

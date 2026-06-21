@@ -21,26 +21,20 @@
 //!
 //! Render is read-only at this stage; no I/O happens here.
 
-use super::HelperContext;
-use std::collections::HashMap;
+use super::{HelperContext, HelperFn, HelperResult, arg_str, helper_error, missing_arg};
+use minijinja::{Error, Value};
 use std::path::Path;
 use std::sync::Arc;
-use tera::{Function, Value};
 
 const ALLOWED_PREFIXES: &[&str] = &["core/", "targets/", "manifests/"];
 
-pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
-    move |args: &HashMap<String, Value>| -> tera::Result<Value> {
-        let raw = args
-            .get("path")
-            .ok_or_else(|| tera::Error::msg("script(): required arg `path` (string)"))?;
-        let path = raw.as_str().ok_or_else(|| {
-            tera::Error::msg(format!(
-                "script(): arg `path` must be a string, got {raw:?}"
-            ))
-        })?;
+pub(crate) fn make(ctx: Arc<HelperContext>) -> impl HelperFn {
+    move |kwargs| -> HelperResult {
+        let path = arg_str(&kwargs, "path")?
+            .ok_or_else(|| missing_arg("script(): required arg `path` (string)"))?;
+        let path = path.as_str();
         if path.contains("..") {
-            return Err(tera::Error::msg(format!(
+            return Err(helper_error(format!(
                 "script(): arg `path` {path:?} must not contain `..` segments",
             )));
         }
@@ -48,18 +42,18 @@ pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
             .iter()
             .any(|prefix| path.starts_with(prefix))
         {
-            return Err(tera::Error::msg(format!(
+            return Err(helper_error(format!(
                 "script(): arg `path` {path:?} must start with one of {ALLOWED_PREFIXES:?}",
             )));
         }
         if let Some(runtime) = resolve_runtime_path(&ctx, path)? {
-            return Ok(Value::String(runtime));
+            return Ok(Value::from(runtime));
         }
         // Fallback: source-root-joined absolute path for non-skill
         // scripts. This is the v0.13 behaviour and remains until shared
         // scripts get a dedicated install lane.
         let resolved = ctx.source_root.join(path);
-        Ok(Value::String(resolved.to_string_lossy().into_owned()))
+        Ok(Value::from(resolved.to_string_lossy().into_owned()))
     }
 }
 
@@ -67,7 +61,7 @@ pub fn make(ctx: Arc<HelperContext>) -> impl Function + 'static {
 /// when the path lives under a known skill's source dir. Returns
 /// `Ok(None)` when no skill matches; the caller falls back to the
 /// source-root-joined form.
-fn resolve_runtime_path(ctx: &HelperContext, path: &str) -> tera::Result<Option<String>> {
+fn resolve_runtime_path(ctx: &HelperContext, path: &str) -> Result<Option<String>, Error> {
     let path_buf = Path::new(path);
     // Iterate every skill so a cross-skill reference (e.g.
     // `reporting.daily-brief` referencing `reporting.topic-radar`'s
@@ -85,7 +79,7 @@ fn resolve_runtime_path(ctx: &HelperContext, path: &str) -> tera::Result<Option<
             return Ok(None);
         }
         let Some(render) = skill.products.get(&ctx.current_product) else {
-            return Err(tera::Error::msg(format!(
+            return Err(helper_error(format!(
                 "script(): skill {id:?} does not declare product {product:?}; \
                  cannot resolve runtime path for {path:?}",
                 id = skill.id,
@@ -94,7 +88,7 @@ fn resolve_runtime_path(ctx: &HelperContext, path: &str) -> tera::Result<Option<
         };
         let render_to = Path::new(&render.render_to);
         let runtime_dir = render_to.parent().ok_or_else(|| {
-            tera::Error::msg(format!(
+            helper_error(format!(
                 "script(): render_to {render_to:?} for skill {id:?} has no parent dir",
                 id = skill.id,
                 render_to = render.render_to,
@@ -124,12 +118,12 @@ fn resolve_runtime_path(ctx: &HelperContext, path: &str) -> tera::Result<Option<
     Ok(None)
 }
 
-fn live_home_for<'a>(ctx: &'a HelperContext, product: &str) -> tera::Result<&'a str> {
+fn live_home_for<'a>(ctx: &'a HelperContext, product: &str) -> Result<&'a str, Error> {
     let roots = &ctx.manifests.runtime_roots.products;
     match product {
         "codex" => Ok(roots.codex.live_home.as_str()),
         "claude" => Ok(roots.claude.live_home.as_str()),
-        other => Err(tera::Error::msg(format!(
+        other => Err(helper_error(format!(
             "script(): unknown product {other:?}; supported: codex, claude",
         ))),
     }
