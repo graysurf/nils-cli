@@ -1,0 +1,47 @@
+# cargo-deny configuration for the nils-cli workspace.
+#
+# CI (`.github/workflows/ci.yml` -> `cargo-deny` job, mirrored by
+# `scripts/ci/cargo-deny-audit.sh`) runs:
+#
+#     cargo deny check advisories bans
+#
+# Scope is deliberately limited to (1) RUSTSEC security advisories and
+# (2) duplicate-version control to curb dependency bloat. License and source
+# policy are intentionally not configured here; see the dependency
+# maintainability sweep (#928) for the rationale.
+
+[advisories]
+# RUSTSEC vulnerability / unsound advisories fail the build. Add an entry here
+# only to consciously accept a specific advisory, always with a reason.
+ignore = []
+
+[bans]
+# Fail the build on a NEW duplicate crate version. This is a ratchet: the
+# `skip` list records the duplicates that exist today purely because of
+# in-progress upstream ecosystem transitions (the workspace sits on the newer
+# line while some transitive dependency still pulls the older one). It does not
+# block the current tree, but any *new* duplicate must be resolved or
+# consciously added here with a reason.
+multiple-versions = "deny"
+wildcards = "allow"
+skip = [
+    # RustCrypto 0.10 -> 0.11 generation split: the workspace is on the 0.11
+    # line (via sha2 0.11) while some transitive deps still pull the 0.10 gen.
+    { crate = "block-buffer@0.10.4", reason = "RustCrypto 0.10 generation; upstream transition" },
+    { crate = "cpufeatures@0.2.17", reason = "RustCrypto 0.10 generation; upstream transition" },
+    { crate = "crypto-common@0.1.7", reason = "RustCrypto 0.10 generation; upstream transition" },
+    { crate = "digest@0.10.7", reason = "RustCrypto 0.10 generation; upstream transition" },
+    # getrandom 0.2 / 0.3 / 0.4 coexist mid-transition across the ecosystem.
+    { crate = "getrandom@0.2.17", reason = "getrandom 0.2/0.3/0.4 ecosystem transition" },
+    { crate = "getrandom@0.3.4", reason = "getrandom 0.2/0.3/0.4 ecosystem transition" },
+    { crate = "r-efi@5.3.0", reason = "pulled by the older getrandom UEFI backend" },
+    # hashbrown / foldhash generation overlap.
+    { crate = "hashbrown@0.16.1", reason = "hashbrown 0.16/0.17 transition" },
+    { crate = "foldhash@0.1.5", reason = "foldhash 0.1/0.2 via hashbrown" },
+    # SVG stack: usvg/resvg pulls roxmltree 0.20; the workspace uses 0.21.
+    { crate = "roxmltree@0.20.0", reason = "usvg pulls 0.20; workspace on 0.21" },
+    # TLS stack pulls an older untrusted on one webpki path.
+    { crate = "untrusted@0.7.1", reason = "older untrusted via a TLS dependency path" },
+    # wasm bindgen for the image-webp decode path.
+    { crate = "wit-bindgen@0.51.0", reason = "image-webp wasm decode; upstream transition" },
+]

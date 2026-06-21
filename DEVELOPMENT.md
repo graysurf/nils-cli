@@ -230,6 +230,28 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `cargo test --workspace` (or `cargo nextest run --profile ci --workspace`
   plus `cargo test --workspace --doc` when `NILS_CLI_TEST_RUNNER=nextest`)
 
+## 4.1 Supply-chain audit (cargo-deny)
+
+A dedicated `cargo-deny` GitHub Actions job (`.github/workflows/ci.yml`) runs on
+every push and PR, independent of the Rust test jobs. Run the same gate locally
+with:
+
+```bash
+bash scripts/ci/cargo-deny-audit.sh   # cargo deny check advisories bans
+```
+
+It enforces two policies from the root `deny.toml`:
+
+- **advisories** — any RUSTSEC vulnerability / unsound advisory fails the build.
+- **bans** — `multiple-versions = "deny"`: a *new* duplicate crate version fails
+  the build. Duplicates that exist today only because of in-progress upstream
+  ecosystem transitions are recorded in the `deny.toml` `skip` list (a ratchet).
+
+Requires `cargo-deny` (`cargo install cargo-deny --locked` or `brew install
+cargo-deny`). When a new duplicate is unavoidable, add a `skip` entry with a
+`reason`; to temporarily accept an advisory, add an `ignore` entry with a
+`reason`.
+
 ## 5. Additional checks when completion assets change
 
 When completion/alias assets are changed, also run:

@@ -82,6 +82,7 @@ in `crates/*/src`.
 | `rg` (ripgrep) | Required by docs/CI audit scripts (for example `scripts/ci/docs-hygiene-audit.sh`) | `brew install ripgrep` |
 | `bash-completion` | Bash completion loading (optional) | `brew install bash-completion` |
 | `gh` | PR/release operations in GitHub-driven workflows | `brew install gh` |
+| `cargo-deny` | Supply-chain audit (`scripts/ci/cargo-deny-audit.sh` and the `cargo-deny` CI job): RUSTSEC advisories + duplicate-version bans per `deny.toml` | `cargo install cargo-deny --locked` |
 
 ## 4. Repository-Local Script Entry Points
 
