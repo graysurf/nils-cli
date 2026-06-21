@@ -40,6 +40,23 @@ jobs:
           echo "docs_only=${docs_only}" >> "$GITHUB_OUTPUT"
           echo "docs_only=${docs_only} (base=${base})"
 
+  cargo_deny:
+    name: cargo-deny (advisories + bans)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo-deny (RUSTSEC advisories + duplicate-version bans)
+        run: bash scripts/ci/cargo-deny-audit.sh
+
   test:
     needs: changes
     runs-on: ubuntu-24.04
