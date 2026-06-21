@@ -91,4 +91,13 @@ mod tests {
         let err = evaluate_main_response(&request, &executed).unwrap_err();
         assert!(format!("{err:#}").contains("expect.jq failed"));
     }
+
+    #[test]
+    fn grpc_expect_accepts_when_no_expect_block() {
+        // A gRPC request without an `expect` block carries no assertions and
+        // must succeed (parity with `websocket_expect_accepts_empty_when_no_expect`).
+        let request = base_request(None);
+        let executed = base_executed(serde_json::json!({"ok": true}));
+        evaluate_main_response(&request, &executed).unwrap();
+    }
 }
