@@ -62,6 +62,11 @@ clap = { version = "4", features = ["derive", "string"] }
 clap_complete = "=4.6.5"
 directories = "6"
 indexmap = { version = "2", features = ["serde"] }
+# Forward-standard datetime library: NEW crates and new date/time code use
+# `jiff` (not `chrono` / `time`). Existing chrono/time crates are grandfathered.
+# Already present in-tree transitively via the jaq stack, so this adds no build
+# cost. See docs/runbooks/new-cli-crate-development-standard.md.
+jiff = "0.2"
 pretty_assertions = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

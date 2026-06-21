@@ -67,6 +67,10 @@ For a new publishable CLI crate:
 - Crate must be listed in workspace `members` in root `Cargo.toml`.
 - Dependencies should use workspace/shared conventions when available (`[workspace.dependencies]`, local `nils-*` crates with explicit
   `version` + `path` + `package`).
+- Date/time handling MUST use `jiff` (`jiff = { workspace = true }`), not
+  `chrono` or `time`. `jiff` is the workspace's forward datetime standard;
+  the existing `chrono` / `time` crates are grandfathered, but new crates and
+  new date/time code use `jiff`.
 - Add a crate README that documents commands, options, output modes, and dependencies.
 
 For internal-only helper crates:
@@ -216,4 +220,5 @@ agent-docs preflight --intent project-dev --strict
 - [ ] Error envelope is machine-consumable in JSON mode.
 - [ ] No sensitive fields leak in JSON output.
 - [ ] Publish-readiness items are complete (or crate is explicitly internal-only).
+- [ ] Date/time handling uses `jiff` (not `chrono` / `time`).
 - [ ] Local validation passes and GitHub required checks are green.
