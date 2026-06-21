@@ -7,6 +7,12 @@ license.workspace = true
 description = "CLI crate for nils-agent-workflow-primitives in the nils-cli workspace."
 repository = "https://github.com/sympoies/nils-cli"
 
+[package.metadata.cargo-machete]
+# False positive: cargo-machete matches on the package name `nils-agent-out`, but
+# the crate is imported under its lib name `agent_out` (e.g. in heuristic_inbox.rs),
+# which machete does not resolve. The dependency is genuinely used.
+ignored = ["nils-agent-out"]
+
 [lib]
 name = "agent_workflow_primitives"
 path = "src/lib.rs"
