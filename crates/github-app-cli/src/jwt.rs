@@ -94,14 +94,30 @@ ran2RV5nH6M4OMqtZjoNgg==
 -----END PRIVATE KEY-----
 ";
 
-    // Regression: jsonwebtoken 10 splits its crypto backend into mutually
-    // exclusive `rust_crypto` / `aws_lc_rs` features and PANICS at runtime when
-    // signing if neither is selected under `default-features = false` (the
-    // v1.11.0 state that broke `github-app-cli token`). This signs a real
-    // RS256 JWT, so it fails closed if a future dependency change drops the
-    // crypto backend feature again.
+    // Public key matching `TEST_RSA_PEM`, used to verify the signature this crate
+    // produces — NOT a secret.
+    const TEST_RSA_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArCBU8oIiiSpi4vH4rjEn
+4DL7HHoRi1sfntgBMpHjg6KBQIL1NuDmHKJ7cwtksfThl/N4V29j/BcMu815+geE
+ITugwyn1BvcW11Fc+JV8+pjmr7f92N914L4sQ/tErVoI7wNVVDJ9GuPPQsta7TE3
+jObnmrneGmsn8LmNPQ/XdHEHV9kPYH3ByFVEP6RS7doTtlkRhEDUXQtFe47+hDaK
+en1kpZzu1LfF1ZhYsRQLC5+JoBIOC2BOe//F4wYS74PRTrq8lNBTUB0dyi8UFmmk
+H42Mwd2T8GS9wr1TPZbB9LVZzDi3AS1Bqcoc4ajHkBXUtwTSBX/RJFyW36LGwejH
+FwIDAQAB
+-----END PUBLIC KEY-----
+";
+
+    // Regression + backend contract: jsonwebtoken 10 splits its crypto backend
+    // into mutually exclusive `rust_crypto` / `aws_lc_rs` features and PANICS at
+    // runtime when signing if neither is selected under `default-features = false`
+    // (the state that once broke `github-app-cli token`). This crate selects the
+    // `aws_lc_rs` backend. The test mints a real RS256 App JWT and verifies the
+    // signature with the matching public key, so it fails closed if a dependency
+    // change drops the crypto backend or breaks RS256 signing.
     #[test]
-    fn app_jwt_signs_rs256_without_crypto_provider_panic() {
+    fn app_jwt_signs_and_verifies_rs256() {
+        use jsonwebtoken::{DecodingKey, Validation, decode};
+
         let token = app_jwt("4090218", TEST_RSA_PEM.as_bytes(), 1_000_000)
             .expect("RS256 signing must succeed with a crypto backend enabled");
         assert_eq!(
@@ -113,5 +129,19 @@ ran2RV5nH6M4OMqtZjoNgg==
             !token.split('.').nth(2).unwrap().is_empty(),
             "the signature segment must be non-empty"
         );
+
+        // Verify the signature round-trips with the matching public key, proving
+        // the backend emits a cryptographically valid RS256 signature (not just
+        // well-formed bytes). The test claims are backdated to 1970, so disable
+        // the expiry/audience checks and validate only the signature + algorithm.
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        let decoding = DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_PEM.as_bytes())
+            .expect("public key PEM must parse");
+        let decoded = decode::<serde_json::Value>(&token, &decoding, &validation)
+            .expect("a valid RS256 signature must verify with the matching public key");
+        assert_eq!(decoded.claims["iss"], "4090218");
+        assert_eq!(decoded.header.alg, Algorithm::RS256);
     }
 }
