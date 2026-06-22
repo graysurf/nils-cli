@@ -117,10 +117,12 @@ fn no_commits_in_range_still_prints_header() {
 }
 
 #[test]
-fn binary_numstat_treated_as_zero() {
+fn binary_only_author_is_hidden() {
     let repo = init_repo();
     let root = repo.path();
 
+    // Binary numstat is counted as zero lines, so an author who only touches a
+    // binary blob has no code changes and is dropped from the report.
     commit_with_author(
         root,
         "Binary",
@@ -129,13 +131,27 @@ fn binary_numstat_treated_as_zero() {
         "bin.dat",
         &[0u8, 159u8, 146u8, 150u8],
     );
+    // A real-code author keeps the table non-empty and proves the filter is
+    // selective rather than blanket-hiding everyone.
+    commit_with_author(
+        root,
+        "Coder",
+        "coder@example.com",
+        "2024-01-11",
+        "a.txt",
+        b"one\ntwo\n",
+    );
 
     let output = run_git_summary(root, &["2024-01-01", "2024-01-31"], &[]);
-    let line = format!(
+    let coder_line = format!(
         "{:<25} {:<40} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
-        "Binary", "bin@example.com", 0, 0, 0, 1, "2024-01-10", "2024-01-10"
+        "Coder", "coder@example.com", 2, 0, 2, 1, "2024-01-11", "2024-01-11"
     );
-    assert!(output.contains(&line), "missing binary row: {output}");
+    assert!(output.contains(&coder_line), "missing Coder row: {output}");
+    assert!(
+        !output.contains("Binary"),
+        "binary-only author has no code changes and must be hidden: {output}"
+    );
 }
 
 #[test]

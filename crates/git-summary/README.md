@@ -62,6 +62,11 @@ The summary table emits the following columns (in this order):
 Lockfile changes (`yarn.lock`, `package-lock.json`, `pnpm-lock.yaml`, any `*.lock`) are excluded
 from `Added`/`Deleted`/`Net` totals. Binary file diffs are counted as zero.
 
+Authors with no counted code changes (both `Added` and `Deleted` are `0`) are omitted from the
+table rather than shown as a `0/0/0` row. This drops lockfile-only and binary-only authors — even
+when they have commits in the range — along with bots whose commits do not match the author filter,
+so the report lists only authors who actually changed code.
+
 Example header (real output):
 
 ```text

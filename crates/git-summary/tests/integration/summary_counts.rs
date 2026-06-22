@@ -86,3 +86,116 @@ fn summary_counts_and_sorting() {
     let alice_pos = output.find(&alice_line).expect("alice row pos");
     assert!(bob_pos < alice_pos, "expected Bob before Alice: {output}");
 }
+
+#[test]
+fn summary_hides_authors_without_code_changes() {
+    let repo = init_repo();
+    let root = repo.path();
+
+    // Alice touches real code and should be listed.
+    commit_with_author(
+        root,
+        "Alice",
+        "alice@example.com",
+        "2024-01-05",
+        "a.txt",
+        "one\ntwo\nthree\n",
+    );
+    // Lockbot only ever bumps a lockfile, so it has no counted code changes
+    // (added == 0 && deleted == 0) and must not appear in the summary.
+    commit_with_author(
+        root,
+        "Lockbot",
+        "lockbot@example.com",
+        "2024-01-06",
+        "yarn.lock",
+        "lockline1\nlockline2\n",
+    );
+
+    let output = run_git_summary(root, &["2024-01-01", "2024-01-31"], &[]);
+
+    let alice_line = format!(
+        "{:<25} {:<40} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
+        "Alice", "alice@example.com", 3, 0, 3, 1, "2024-01-05", "2024-01-05"
+    );
+    assert!(output.contains(&alice_line), "missing Alice row: {output}");
+    assert!(
+        !output.contains("Lockbot"),
+        "Lockbot has no code changes and must be hidden: {output}"
+    );
+}
+
+#[test]
+fn summary_shows_deletion_only_author() {
+    let repo = init_repo();
+    let root = repo.path();
+
+    // Seed three lines, then have a distinct author delete two of them. The
+    // deleter has added == 0 but deleted > 0, so the `added == 0 && deleted
+    // == 0` guard must NOT hide them (this would regress under a `net == 0`
+    // or `net <= 0` filter).
+    commit_with_author(
+        root,
+        "Seed",
+        "seed@example.com",
+        "2024-01-05",
+        "shrink.txt",
+        "one\ntwo\nthree\n",
+    );
+    commit_with_author(
+        root,
+        "Deleter",
+        "deleter@example.com",
+        "2024-01-06",
+        "shrink.txt",
+        "one\n",
+    );
+
+    let output = run_git_summary(root, &["2024-01-01", "2024-01-31"], &[]);
+
+    let deleter_line = format!(
+        "{:<25} {:<40} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
+        "Deleter", "deleter@example.com", 0, 2, -2, 1, "2024-01-06", "2024-01-06"
+    );
+    assert!(
+        output.contains(&deleter_line),
+        "deletion-only author must still appear: {output}"
+    );
+}
+
+#[test]
+fn summary_shows_net_zero_churn_author() {
+    let repo = init_repo();
+    let root = repo.path();
+
+    // Add two lines, then remove them. Totals are added == 2, deleted == 2,
+    // net == 0. The author still has counted code changes, so they must
+    // appear (this would regress under a `net == 0` filter).
+    commit_with_author(
+        root,
+        "Churn",
+        "churn@example.com",
+        "2024-01-05",
+        "churn.txt",
+        "a\nb\n",
+    );
+    commit_with_author(
+        root,
+        "Churn",
+        "churn@example.com",
+        "2024-01-06",
+        "churn.txt",
+        "",
+    );
+
+    let output = run_git_summary(root, &["2024-01-01", "2024-01-31"], &[]);
+
+    let churn_line = format!(
+        "{:<25} {:<40} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
+        "Churn", "churn@example.com", 2, 2, 0, 2, "2024-01-05", "2024-01-06"
+    );
+    assert!(
+        output.contains(&churn_line),
+        "net-zero churn author must still appear: {output}"
+    );
+}
