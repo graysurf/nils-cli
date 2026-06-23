@@ -64,7 +64,9 @@ fn render_summary(log_args: &[String]) -> Result<()> {
             p.set_message(author.to_string());
         }
 
-        rows.push(collect_author_row(author, log_args)?);
+        if let Some(row) = collect_author_row(author, log_args)? {
+            rows.push(row);
+        }
 
         if let Some(p) = &progress {
             p.set_position((idx + 1) as u64);
@@ -107,7 +109,7 @@ fn collect_authors(log_args: &[String]) -> Result<Vec<String>> {
     Ok(authors)
 }
 
-fn collect_author_row(author: &str, log_args: &[String]) -> Result<Row> {
+fn collect_author_row(author: &str, log_args: &[String]) -> Result<Option<Row>> {
     let (name, email) = split_author(author);
     let short_email = truncate_email(&email);
 
@@ -122,8 +124,20 @@ fn collect_author_row(author: &str, log_args: &[String]) -> Result<Row> {
 
     let log = run_git(&args)?;
 
-    let (commits, first_commit, last_commit) = parse_commit_dates(&log);
     let (added, deleted) = parse_numstat_totals(&log);
+
+    // Skip authors with no counted code changes (added == 0 && deleted == 0).
+    // This intentionally drops lockfile-only and binary-only authors even when
+    // they have commits in range (lockfiles and binaries count as zero lines),
+    // as well as bots whose commits don't match the `--author` filter. The
+    // report is about code changes, so a non-zero commit count alone is not
+    // enough to be listed. Note this is `added == 0 && deleted == 0`, not
+    // `net == 0`: a deletion-only or add/delete-balanced author still appears.
+    if added == 0 && deleted == 0 {
+        return Ok(None);
+    }
+
+    let (commits, first_commit, last_commit) = parse_commit_dates(&log);
     let net = added - deleted;
 
     let line = format!(
@@ -131,7 +145,7 @@ fn collect_author_row(author: &str, log_args: &[String]) -> Result<Row> {
         name, short_email, added, deleted, net, commits, first_commit, last_commit
     );
 
-    Ok(Row { net, line })
+    Ok(Some(Row { net, line }))
 }
 
 fn split_author(author: &str) -> (String, String) {
