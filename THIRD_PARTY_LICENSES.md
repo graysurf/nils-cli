@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `63a1577c93e2b5b69ca9ae50e1a5aa4805492e7ac192ccc931209f229e1cc719`
+- Cargo.lock SHA256: `ba3dd56e29a392a2c2e93c248b7d071b8da42026b7ea297402182e0a487229a5`
 - Third-party crates (`source != null`): 443
 - Workspace crates (`source == null`, excluded below): 43
 
@@ -221,7 +221,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | lru-slab | 0.1.2 | MIT OR Apache-2.0 OR Zlib | crates.io |
 | matchers | 0.2.0 | MIT | crates.io |
 | memchr | 2.8.2 | Unlicense OR MIT | crates.io |
-| memmap2 | 0.9.10 | MIT OR Apache-2.0 | crates.io |
+| memmap2 | 0.9.11 | MIT OR Apache-2.0 | crates.io |
 | memo-map | 0.3.3 | Apache-2.0 | crates.io |
 | memoffset | 0.9.1 | MIT | crates.io |
 | mime | 0.3.17 | MIT OR Apache-2.0 | crates.io |
