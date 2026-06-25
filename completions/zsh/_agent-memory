@@ -94,6 +94,18 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(check)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--all[Check every memory scope (global, agents, personas)]' \
+'--strict[Promote warn-level findings to failures]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for convenience)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::scope -- Scope to check (default\: global):_files -/' \
+&& ret=0
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -125,6 +137,7 @@ _agent-memory_commands() {
 'resolve:Print global and per-agent paths' \
 'env:Emit shell exports for the resolved layout' \
 'doctor:Verify memory-store layout' \
+'check:Check structural integrity of a memory scope' \
 'completion:Print shell completion script' \
 'help:Print help' \
     )
@@ -134,6 +147,11 @@ _agent-memory_commands() {
 _agent-memory__subcmd__agents_commands() {
     local commands; commands=()
     _describe -t commands 'agent-memory agents commands' commands "$@"
+}
+(( $+functions[_agent-memory__subcmd__check_commands] )) ||
+_agent-memory__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-memory check commands' commands "$@"
 }
 (( $+functions[_agent-memory__subcmd__completion_commands] )) ||
 _agent-memory__subcmd__completion_commands() {

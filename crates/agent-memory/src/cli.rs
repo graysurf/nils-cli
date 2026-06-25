@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueHint};
+use nils_common::cli_contract::OutputFormat;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,6 +41,8 @@ pub enum Command {
     Env,
     /// Verify memory-store layout.
     Doctor,
+    /// Check structural integrity of a memory scope.
+    Check(CheckArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
     /// Print help.
@@ -58,6 +61,25 @@ pub struct IdArgs {
     /// Agent or persona ID.
     #[arg(value_name = "ID")]
     pub id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    /// Scope to check (default: global).
+    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath)]
+    pub scope: Option<String>,
+    /// Check every memory scope (global, agents, personas).
+    #[arg(long)]
+    pub all: bool,
+    /// Promote warn-level findings to failures.
+    #[arg(long)]
+    pub strict: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json` (kept for convenience).
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
