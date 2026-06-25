@@ -1,3 +1,4 @@
+mod check;
 mod cli;
 mod completion;
 
@@ -82,6 +83,7 @@ fn dispatch(cli: Cli) -> Result<i32, CliError> {
             Ok(EXIT_OK)
         }
         Command::Doctor => doctor(&layout),
+        Command::Check(args) => check::run(&layout, &args),
         Command::Completion(args) => Ok(completion::run(args.shell)),
         Command::Help => print_help(),
     }

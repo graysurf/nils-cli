@@ -31,11 +31,29 @@ agent-memory init-persona <id>
 agent-memory resolve <id>
 agent-memory env
 agent-memory doctor
+agent-memory check [SCOPE] [--all] [--strict] [--format text|json]
 agent-memory completion zsh
 ```
 
 `SCOPE` accepts `root`, `global`, `<id>`, `agents/<id>`, or `personas/<id>`.
 Bare IDs resolve to `agents/<id>`.
+
+## Structural check
+
+`doctor` verifies the store *layout*; `check` verifies a scope's *content
+integrity* (default scope `global`, `--all` to sweep every scope):
+
+- index/file parity — every note has a `MEMORY.md` entry and every index link
+  resolves to a file;
+- dangling `[[wikilinks]]` (warn — forward references are allowed);
+- note frontmatter schema — `name`, `description`, and `metadata.type` (one of
+  `user | feedback | project | reference`) are required; `metadata.node_type`
+  and `metadata.originSessionId` are expected (warn).
+
+`--format json` emits machine-readable findings (each carrying `{scope, kind,
+file, detail, severity}`, under a `schema_version` envelope; `--json` is a
+hidden alias). `--strict` promotes warnings to failures. A clean scope exits
+`0`; any error-level finding (or any finding under `--strict`) exits `1`.
 
 ## Output
 
