@@ -156,83 +156,43 @@ Local shell setup:
 4. Bash (optional): `source completions/bash/aliases.bash` (see [completions/bash/aliases.bash](completions/bash/aliases.bash))
 5. Dev-only: add [wrappers/](wrappers/) to your PATH (or symlink wrapper scripts into a bin directory).
 
-## Contributor checks
+## Local install from source
 
-Use [DEVELOPMENT.md](DEVELOPMENT.md) as the canonical checklist.
+Build release binaries into the default local bin directory:
 
-- Default local check: `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
-- Docs-only fast path: `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`
-- Full CI parity check, when needed locally:
-  `NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh`
-- Full coverage is enforced by CI for PRs; run
-  `NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh --with-coverage`
-  only for coverage/release/CI-debugging work.
-- Regenerate third-party license/notice artifacts after dependency or metadata changes:
-  - `bash scripts/generate-third-party-artifacts.sh --write`
-- Verify third-party artifacts are current (fails on drift):
-  - `bash scripts/generate-third-party-artifacts.sh --check`
+```bash
+./scripts/install-local-release-binaries.sh
+```
 
-## Local install (release)
+Install only a specific binary:
 
-- Build + install all workspace binaries into `~/.local/nils-cli/`:
-  - `./scripts/install-local-release-binaries.sh`
-- Install only a specific binary:
-  - `./scripts/install-local-release-binaries.sh --bin git-scope`
-- Add the install dir to `PATH` (example):
-  - `export PATH="$HOME/.local/nils-cli:$PATH"`
+```bash
+./scripts/install-local-release-binaries.sh --bin git-scope
+```
 
-## GitHub Releases (prebuilt binaries)
+The default destination is `~/.local/nils-cli/bin`; add it to `PATH` when needed:
 
-This repo can publish prebuilt tarballs via GitHub Releases for both:
+```bash
+export PATH="$HOME/.local/nils-cli/bin:$PATH"
+```
 
-- x86_64 (amd64)
-- aarch64 (arm64)
+## GitHub Releases
 
-To trigger a release build, push a tag like `v1.16.0`:
+Prebuilt release tarballs are published from `v*` tags after CI verifies the
+tagged commit. Download the matching `nils-cli-<tag>-<target>.tar.gz` asset from
+[GitHub Releases](https://github.com/sympoies/nils-cli/releases), extract it,
+and add `<extract_dir>/bin` to your `PATH`.
 
-- `git tag -a v1.16.0 -m "v1.16.0"`
-- `git push origin v1.16.0`
-
-Then download the matching `nils-cli-<tag>-<target>.tar.gz` asset, extract it, and add `<extract_dir>/bin` to your `PATH`.
-
-Release packaging contract: shipped artifacts must include `completions/zsh/`, `completions/bash/`, `completions/zsh/aliases.zsh`,
-`completions/bash/aliases.bash`, `THIRD_PARTY_LICENSES.md`, and `THIRD_PARTY_NOTICES.md`. After extracting release assets, follow the
-same setup flow from
+Release archives include the compiled binaries, shell completions, aliases,
+license file, and third-party license/notice artifacts. After extracting release
+assets, follow the same setup flow from
 ["Shell wrappers and completions"](#shell-wrappers-and-completions).
 
-## crates.io publishing (shared crates)
+## Development and maintainer workflows
 
-Use `scripts/publish-crates.sh` for crate publishing flow.
+Use [DEVELOPMENT.md](DEVELOPMENT.md) as the canonical contributor checklist for
+local setup, validation commands, generated artifacts, release maintenance, and
+crates.io publishing.
 
-- Default list + order: `release/crates-io-publish-order.txt`
-- Dry-run (recommended first):
-  - `scripts/publish-crates.sh --dry-run`
-- Real publish:
-  - `scripts/publish-crates.sh --publish`
-- Override target crates:
-  - `scripts/publish-crates.sh --crates "nils-term nils-common" --dry-run`
-
-In `--dry-run` mode, the script runs `cargo publish --dry-run` for every selected crate. In `--publish` mode, the script runs
-`dry-run -> publish` sequentially per crate (in your specified order). By default, `--publish` skips crates that are already published at
-the same version on crates.io.
-
-To query crates.io publish status (single/multi/all crates), use:
-
-- `scripts/crates-io-status.sh --all --format text`
-- `scripts/crates-io-status.sh --crates "nils-common nils-codex-cli" --version v0.3.1 --format json`
-- `scripts/crates-io-status.sh --crate nils-codex-cli --format both --json-out "$AGENT_HOME/out/codex-status.json"`
-
-`--version` checks that exact version; without `--version` the script checks each crate's current workspace version. Use `--fail-on-missing`
-for CI gates.
-
-GitHub Actions manual flow is also available at `.github/workflows/publish-crates.yml`:
-
-- Trigger via `workflow_dispatch`.
-- `mode=dry-run` runs checks only.
-- `mode=publish` requires repository secret `CARGO_REGISTRY_TOKEN`.
-
-## Adding a new CLI crate
-
-Use the canonical onboarding runbook:
-
-- [docs/runbooks/new-cli-crate-development-standard.md](docs/runbooks/new-cli-crate-development-standard.md)
+New CLI crate onboarding is documented in
+[docs/runbooks/new-cli-crate-development-standard.md](docs/runbooks/new-cli-crate-development-standard.md).

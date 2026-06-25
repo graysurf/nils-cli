@@ -263,20 +263,102 @@ Canonical completion policy and validation workflow:
 
 - `docs/runbooks/cli-completion-development-standard.md`
 
-## 6. Test conventions
+## 6. Generated artifacts
+
+Regenerate third-party license/notice artifacts after dependency or metadata
+changes:
+
+```bash
+bash scripts/generate-third-party-artifacts.sh --write
+```
+
+Verify the generated artifacts are current before delivery:
+
+```bash
+bash scripts/generate-third-party-artifacts.sh --check
+```
+
+The artifact contract is documented in
+`docs/specs/third-party-artifacts-contract-v1.md`.
+
+## 7. Test conventions
 
 - In Rust tests, prefer `pretty_assertions::{assert_eq, assert_ne}` for readable diffs.
 
-## 7. CLI version policy
+## 8. CLI version policy
 
 - Every user-facing CLI must expose root `-V, --version`.
 - For clap-based CLIs, set `#[command(version)]` on the root `Parser`.
 - `--help` output should show `-V, --version`.
 
-## 8. Local release install helper
+## 9. Local install, release, and publishing
 
-Build and install workspace binaries into `~/.local/nils-cli/`:
+### 9.1 Local release install helper
+
+Build and install workspace binaries into `~/.local/nils-cli/bin` by default:
 
 ```bash
 ./scripts/install-local-release-binaries.sh
 ```
+
+Install only one binary when you are smoke-checking a focused change:
+
+```bash
+./scripts/install-local-release-binaries.sh --bin git-scope
+```
+
+Add the install directory to `PATH` when needed:
+
+```bash
+export PATH="$HOME/.local/nils-cli/bin:$PATH"
+```
+
+### 9.2 GitHub release packaging
+
+Release tags matching `v*` trigger `.github/workflows/release.yml`. The workflow
+first verifies the tagged commit has green `test`, `test_macos`, and `coverage`
+checks, then builds release tarballs for Linux and macOS on x86_64 and aarch64.
+
+Release tarballs include:
+
+- release-default workspace binaries from `scripts/workspace-bins.sh`
+- `completions/zsh/` and `completions/bash/`
+- `README.md`, `LICENSE`, `THIRD_PARTY_LICENSES.md`, and `THIRD_PARTY_NOTICES.md`
+
+Use the repo-owned release skill for the normal bump, tag, GitHub Release, tap,
+and local Homebrew verification flow:
+
+```bash
+.agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh --version X.Y.Z
+```
+
+### 9.3 crates.io publishing
+
+Local crate publish dry-runs and direct publishes use `scripts/publish-crates.sh`.
+The default crate order is `release/crates-io-publish-order.txt`.
+
+```bash
+scripts/publish-crates.sh --dry-run
+scripts/publish-crates.sh --publish
+scripts/publish-crates.sh --crates "nils-term nils-common" --dry-run
+```
+
+GitHub workflow dispatch is available through `.github/workflows/publish-crates.yml`.
+In `publish` mode the workflow requires the repository secret
+`CARGO_REGISTRY_TOKEN`.
+
+Use the repo-owned dispatch helper when you want workflow dispatch with run
+reporting and post-run crates.io status snapshots:
+
+```bash
+.agents/skills/project-dispatch-crates-io-publish/scripts/publish-crates-io.sh --all --wait
+```
+
+To query crates.io publish status locally, use:
+
+```bash
+scripts/crates-io-status.sh --all --format text
+```
+
+Detailed status-script semantics live in
+`docs/runbooks/crates-io-status-script-runbook.md`.
