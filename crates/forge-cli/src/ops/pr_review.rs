@@ -50,6 +50,10 @@ pub struct PrReviewPayload {
     pub provider: &'static str,
     pub number: u64,
     pub decision: &'static str,
+    /// `true` when a native provider review event was submitted
+    /// (`--submit-review`); `false` when an outcome comment was posted. When
+    /// `true`, `pr_comment_url` holds the `#pullrequestreview-` object URL.
+    pub submitted_review: bool,
     pub pr_comment_url: String,
     pub issue_number: Option<u64>,
     pub issue_comment_url: Option<String>,
@@ -62,6 +66,9 @@ struct PrReviewDryRunPayload {
     provider: &'static str,
     number: u64,
     decision: &'static str,
+    /// `true` when the live run would submit a native review event
+    /// (`--submit-review`); `false` for the outcome-comment form.
+    submitted_review: bool,
     /// GitHub-only PR-existence guard read that runs before the live post.
     /// `None` on GitLab / Local. Surfaced so dry-run renders every backend
     /// command the live run performs.
@@ -103,6 +110,18 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
+    // Native review submission (the #pullrequestreview- object) is GitHub-only
+    // in v1. GitLab has no equivalent single review event with an approve /
+    // request-changes / comment verb, so `--submit-review` there would have no
+    // faithful mapping; it keeps the outcome-comment (mr note) form instead.
+    if args.submit_review && ctx.provider != Provider::GitHub {
+        return Err(ForgeError::provider_unsupported(
+            schema_err(),
+            "pr review --submit-review (native review event) is only supported on github in v1; gitlab/local keep the outcome-comment form",
+            None,
+        ));
+    }
+
     // `--mirror-issue` requires `--issue`. Resolve this BEFORE reading the
     // comment body so a missing `--issue` fails fast with `issue_required`
     // rather than first blocking on stdin (`--comment-file -`) or surfacing a
@@ -119,7 +138,13 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         args.comment_file.as_deref(),
         "--comment-file",
     )?;
-    if body.trim().is_empty() {
+    let body_present = !body.trim().is_empty();
+    // GitHub permits a body-less APPROVE review, so the empty-body guard is
+    // relaxed only for a native approve submission. Every other case — outcome
+    // comments, and native COMMENT / REQUEST_CHANGES reviews (GitHub requires a
+    // body for both) — still needs a body.
+    let body_required = !(args.submit_review && args.decision == PrReviewDecision::Approve);
+    if !body_present && body_required {
         return Err(ForgeError::validation(
             schema_err(),
             "body_missing_summary",
@@ -127,8 +152,10 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             None,
         ));
     }
-    no_local_path(&body, "review comment")?;
-    no_escaped_control_markdown(&body)?;
+    if body_present {
+        no_local_path(&body, "review comment")?;
+        no_escaped_control_markdown(&body)?;
+    }
 
     // Validate the generated issue-mirror body BEFORE any backend mutation
     // (validate-before-side-effect). It embeds user-controlled `--lens` values,
@@ -155,7 +182,13 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         // dry-run must not touch a backend, so it cannot probe `glab` capability;
         // render the preferred non-resolvable GitLab form (the live run may pick
         // a more compatible form on older `glab`).
-        let pr_call = build_pr_comment_call(&ctx, args.id, &body, GlabNoteForm::CreateResolvable);
+        let pr_call = build_review_post_call(
+            &ctx,
+            &args,
+            &body,
+            body_present,
+            GlabNoteForm::CreateResolvable,
+        );
         // The GitHub PR-existence guard is a live backend read; surface it in the
         // dry-run plan so wrappers inspecting dry-run output see every call.
         let guard_plan = (ctx.provider == Provider::GitHub).then(|| {
@@ -177,6 +210,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 provider: ctx.provider.as_str(),
                 number: args.id,
                 decision: args.decision.as_str(),
+                submitted_review: args.submit_review,
                 guard_plan,
                 plan: pr_call.plan_argv(),
                 issue_number: args.issue,
@@ -189,7 +223,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 if let Some(guard) = p.guard_plan.as_ref() {
                     println!("would verify pull request: {plan}", plan = guard.join(" "));
                 }
-                println!("would post review outcome: {plan}", plan = p.plan.join(" "));
+                let verb = if p.submitted_review {
+                    "would submit review event"
+                } else {
+                    "would post review outcome"
+                };
+                println!("{verb}: {plan}", plan = p.plan.join(" "));
                 if let Some(issue_plan) = p.issue_plan.as_ref() {
                     println!(
                         "would mirror issue activity: {plan}",
@@ -218,7 +257,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     } else {
         GlabNoteForm::CreateResolvable
     };
-    let pr_call = build_pr_comment_call(&ctx, args.id, &body, glab_form);
+    let pr_call = build_review_post_call(&ctx, &args, &body, body_present, glab_form);
 
     let pr_output = runner.run(&pr_call)?;
     let pr_comment_url = first_url(&pr_output.stdout).unwrap_or_default();
@@ -248,6 +287,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             provider: ctx.provider.as_str(),
             number: args.id,
             decision: args.decision.as_str(),
+            submitted_review: args.submit_review,
             pr_comment_url,
             issue_number: args.issue,
             issue_comment_url,
@@ -257,6 +297,32 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         format,
         render_text,
     ))
+}
+
+/// Build the primary "post the review" backend call for the chosen mode: a
+/// native GitHub review submission when `--submit-review` is set (the
+/// `#pullrequestreview-` object), otherwise the outcome-comment post. Used by
+/// both the dry-run plan and the live run so they never diverge. `glab_form` is
+/// only consulted on the GitLab comment path (native submission is GitHub-only,
+/// guarded earlier in `run_with`).
+fn build_review_post_call(
+    ctx: &ProviderContext,
+    args: &PrReviewArgs,
+    body: &str,
+    body_present: bool,
+    glab_form: GlabNoteForm,
+) -> BackendCall {
+    if args.submit_review {
+        let event = args.decision.to_github_event();
+        // A body-less APPROVE omits the body field entirely (GitHub allows it).
+        let body_opt = body_present.then_some(body);
+        BackendCall::new(
+            BackendProgram::Gh,
+            github_review_submit_argv(ctx, args.id, event, body_opt),
+        )
+    } else {
+        build_pr_comment_call(ctx, args.id, body, glab_form)
+    }
 }
 
 fn build_pr_comment_call(
@@ -346,6 +412,45 @@ fn github_issue_comment_argv(ctx: &ProviderContext, id: u64, body: &str) -> Vec<
         OsString::from("POST"),
         OsString::from("--raw-field"),
         OsString::from(format!("body={body}")),
+        OsString::from("--jq"),
+        OsString::from(".html_url"),
+    ]);
+    argv
+}
+
+/// `gh api repos/{repo}/pulls/{id}/reviews --method POST [--raw-field body=…]
+/// --raw-field event=<EVENT> --jq .html_url` — submit a native GitHub pull
+/// request review. The returned `html_url` is the `#pullrequestreview-<id>`
+/// object. `body` is `None` for a body-less APPROVE, which omits the field
+/// (GitHub rejects an empty body only for COMMENT / REQUEST_CHANGES, already
+/// guarded in `run_with`). The review is attributed to whatever identity the
+/// inherited `gh` token carries, so a reviewer-bot token yields a bot-authored
+/// review. Mirrors [`github_issue_comment_argv`]'s endpoint shape (repo in the
+/// path, hostname pushed for GitHub Enterprise).
+fn github_review_submit_argv(
+    ctx: &ProviderContext,
+    id: u64,
+    event: &str,
+    body: Option<&str>,
+) -> Vec<OsString> {
+    let endpoint = ctx
+        .repo
+        .as_deref()
+        .map(|repo| format!("repos/{repo}/pulls/{id}/reviews"))
+        .unwrap_or_else(|| format!("repos/{{owner}}/{{repo}}/pulls/{id}/reviews"));
+    let mut argv = vec![OsString::from("api")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.push(OsString::from(endpoint));
+    argv.extend([OsString::from("--method"), OsString::from("POST")]);
+    if let Some(body) = body {
+        argv.extend([
+            OsString::from("--raw-field"),
+            OsString::from(format!("body={body}")),
+        ]);
+    }
+    argv.extend([
+        OsString::from("--raw-field"),
+        OsString::from(format!("event={event}")),
         OsString::from("--jq"),
         OsString::from(".html_url"),
     ]);
@@ -518,21 +623,158 @@ fn schema_err() -> String {
 }
 
 fn render_text(payload: &PrReviewPayload) {
+    let action = if payload.submitted_review {
+        format!("submitted {decision} review", decision = payload.decision)
+    } else {
+        format!(
+            "posted {decision} review outcome",
+            decision = payload.decision
+        )
+    };
     if let Some(issue_url) = payload.issue_comment_url.as_deref() {
         println!(
-            "posted {decision} review outcome on {provider} #{number}: {pr_url}; mirrored issue activity: {issue_url}",
-            decision = payload.decision,
+            "{action} on {provider} #{number}: {pr_url}; mirrored issue activity: {issue_url}",
             provider = payload.provider,
             number = payload.number,
             pr_url = payload.pr_comment_url,
         );
     } else {
         println!(
-            "posted {decision} review outcome on {provider} #{number}: {pr_url}",
-            decision = payload.decision,
+            "{action} on {provider} #{number}: {pr_url}",
             provider = payload.provider,
             number = payload.number,
             pr_url = payload.pr_comment_url,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::DetectionSource;
+
+    fn ctx(repo: Option<&str>) -> ProviderContext {
+        ProviderContext {
+            provider: Provider::GitHub,
+            host: "github.com".into(),
+            source: DetectionSource::Flag,
+            repo: repo.map(str::to_string),
+        }
+    }
+
+    fn args(
+        decision: PrReviewDecision,
+        submit_review: bool,
+        comment: Option<&str>,
+    ) -> PrReviewArgs {
+        PrReviewArgs {
+            id: 44,
+            decision,
+            comment: comment.map(str::to_string),
+            comment_file: None,
+            lenses: Vec::new(),
+            issue: None,
+            mirror_issue: false,
+            submit_review,
+        }
+    }
+
+    fn joined(call: &BackendCall) -> String {
+        call.plan_argv().join(" ")
+    }
+
+    fn argv_joined(argv: &[OsString]) -> String {
+        argv.iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn decision_maps_to_github_review_event() {
+        assert_eq!(PrReviewDecision::CommentsOnly.to_github_event(), "COMMENT");
+        assert_eq!(PrReviewDecision::Approve.to_github_event(), "APPROVE");
+        assert_eq!(
+            PrReviewDecision::RequestChanges.to_github_event(),
+            "REQUEST_CHANGES"
+        );
+    }
+
+    #[test]
+    fn submit_argv_targets_reviews_endpoint_and_maps_event() {
+        let argv = github_review_submit_argv(
+            &ctx(Some("acme/widgets")),
+            44,
+            "REQUEST_CHANGES",
+            Some("nope"),
+        );
+        let joined = argv_joined(&argv);
+        assert!(
+            joined.contains("repos/acme/widgets/pulls/44/reviews"),
+            "{joined}"
+        );
+        assert!(joined.contains("--method POST"), "{joined}");
+        assert!(joined.contains("event=REQUEST_CHANGES"), "{joined}");
+        assert!(joined.contains("body=nope"), "{joined}");
+        assert!(joined.contains("--jq .html_url"), "{joined}");
+    }
+
+    #[test]
+    fn submit_argv_omits_body_field_when_none() {
+        let argv = github_review_submit_argv(&ctx(Some("acme/widgets")), 44, "APPROVE", None);
+        let joined = argv_joined(&argv);
+        assert!(joined.contains("event=APPROVE"), "{joined}");
+        assert!(
+            !joined.contains("body="),
+            "a body-less approve must omit the body field: {joined}"
+        );
+    }
+
+    #[test]
+    fn submit_argv_adds_hostname_for_enterprise_host() {
+        let mut ctx = ctx(Some("acme/widgets"));
+        ctx.host = "internal.ghe.com".into();
+        let argv = github_review_submit_argv(&ctx, 44, "COMMENT", Some("note"));
+        let strs: Vec<String> = argv
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let pos = strs
+            .iter()
+            .position(|s| s == "--hostname")
+            .expect("enterprise host must be passed to gh api");
+        assert_eq!(strs[pos + 1], "internal.ghe.com");
+    }
+
+    #[test]
+    fn build_review_post_call_uses_reviews_endpoint_when_submit_review() {
+        let call = build_review_post_call(
+            &ctx(Some("acme/widgets")),
+            &args(PrReviewDecision::Approve, true, Some("lgtm")),
+            "lgtm",
+            true,
+            GlabNoteForm::CreateResolvable,
+        );
+        assert_eq!(call.program, BackendProgram::Gh);
+        let joined = joined(&call);
+        assert!(joined.contains("pulls/44/reviews"), "{joined}");
+        assert!(joined.contains("event=APPROVE"), "{joined}");
+    }
+
+    #[test]
+    fn build_review_post_call_uses_issue_comment_when_not_submit_review() {
+        let call = build_review_post_call(
+            &ctx(Some("acme/widgets")),
+            &args(PrReviewDecision::Approve, false, Some("lgtm")),
+            "lgtm",
+            true,
+            GlabNoteForm::CreateResolvable,
+        );
+        let joined = joined(&call);
+        assert!(joined.contains("issues/44/comments"), "{joined}");
+        assert!(
+            !joined.contains("/reviews"),
+            "comment mode must not hit the reviews endpoint: {joined}"
         );
     }
 }

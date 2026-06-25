@@ -728,3 +728,238 @@ fn pr_review_mirror_issue_without_issue_checks_before_reading_body() {
     assert_eq!(env["ok"], false);
     assert_eq!(env["error"]["code"], "issue_required");
 }
+
+// `--submit-review`: create a native GitHub review object via
+// POST .../pulls/<id>/reviews (the #pullrequestreview- artifact) instead of an
+// issue comment. The guard call returns the PR number; the reviews endpoint
+// returns the review html_url.
+fn github_review_submit_stub(capture: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+if [ "$1" != "api" ]; then
+  echo "stub: unexpected gh command: $*" >&2
+  exit 99
+fi
+case "$2" in
+  repos/acme/widgets/pulls/44)
+    echo "44"
+    ;;
+  repos/acme/widgets/pulls/44/reviews)
+    echo "https://github.com/acme/widgets/pull/44#pullrequestreview-9900"
+    ;;
+  repos/acme/widgets/issues/101/comments)
+    echo "https://github.com/acme/widgets/issues/101#issuecomment-1010"
+    ;;
+  *)
+    echo "stub: unexpected gh api endpoint: $2" >&2
+    exit 99
+    ;;
+esac
+"#
+    )
+}
+
+#[test]
+fn pr_review_submit_native_review_event_on_github() {
+    // `--submit-review` must create a native GitHub review object via
+    // POST .../pulls/<id>/reviews, mapping --decision to the review `event`,
+    // and must NOT post an issue comment.
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_submit_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "request-changes",
+            "--submit-review",
+            "--comment",
+            "Needs another pass.",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.pr.review.v1");
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["provider"], "github");
+    assert_eq!(env["data"]["number"], 44);
+    assert_eq!(env["data"]["decision"], "request-changes");
+    assert_eq!(env["data"]["submitted_review"], true);
+    assert_eq!(
+        env["data"]["pr_comment_url"],
+        "https://github.com/acme/widgets/pull/44#pullrequestreview-9900"
+    );
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    // The PR-existence guard still runs before the native submit.
+    assert!(
+        calls.contains("repos/acme/widgets/pulls/44 --jq .number"),
+        "PR-existence guard missing: {calls}"
+    );
+    // Native review submission to the reviews endpoint, with the mapped event.
+    assert!(
+        calls.contains("repos/acme/widgets/pulls/44/reviews"),
+        "native review POST missing: {calls}"
+    );
+    assert!(calls.contains("--method POST"), "{calls}");
+    assert!(
+        calls.contains("event=REQUEST_CHANGES"),
+        "decision must map to the review event: {calls}"
+    );
+    assert!(calls.contains("body=Needs another pass."), "{calls}");
+    // It must NOT fall back to the issue-comment posting path.
+    assert!(
+        !calls.contains("issues/44/comments"),
+        "native review must not post an issue comment: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_submit_native_approve_allows_empty_body() {
+    // GitHub permits a body-less APPROVE review, so `--submit-review --decision
+    // approve` with no comment must submit event=APPROVE with no body field —
+    // the empty-body guard is relaxed only for native approve.
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_submit_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "approve",
+            "--submit-review",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["decision"], "approve");
+    assert_eq!(env["data"]["submitted_review"], true);
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert!(
+        calls.contains("repos/acme/widgets/pulls/44/reviews"),
+        "{calls}"
+    );
+    assert!(calls.contains("event=APPROVE"), "{calls}");
+    assert!(
+        !calls.contains("body="),
+        "a body-less approve must not send a body field: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_submit_review_rejects_gitlab() {
+    // Native review submission is GitHub-only in v1; GitLab must surface
+    // provider_unsupported (USAGE 64) before touching any backend.
+    let stub = StubEnv::new().glab_stub("#!/bin/sh\necho should-not-run >&2\nexit 99\n");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "approve",
+            "--submit-review",
+            "--comment",
+            "looks good",
+        ],
+    );
+
+    assert_eq!(out.code, 64, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "provider_unsupported");
+}
+
+#[test]
+fn pr_review_submit_native_dry_run_renders_review_submit() {
+    // dry-run must render the native review-submit POST (not the issue-comment
+    // post) and still include the GitHub PR-existence guard read.
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\necho should-not-run >&2\nexit 99\n");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "--dry-run",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "request-changes",
+            "--submit-review",
+            "--comment",
+            "Status: needs work",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.pr.review.v1");
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["submitted_review"], true);
+    let plan = env["data"]["plan"]
+        .as_array()
+        .expect("plan present")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        plan.contains("repos/acme/widgets/pulls/44/reviews"),
+        "plan should render the reviews POST: {plan}"
+    );
+    assert!(
+        plan.contains("event=REQUEST_CHANGES"),
+        "plan should render the mapped review event: {plan}"
+    );
+    let guard_plan = env["data"]["guard_plan"]
+        .as_array()
+        .expect("guard_plan present")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        guard_plan.contains("repos/acme/widgets/pulls/44"),
+        "guard_plan should render the PR-existence lookup: {guard_plan}"
+    );
+}

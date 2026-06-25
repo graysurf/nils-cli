@@ -253,18 +253,21 @@ operations:
       - { name: --lens,           type: list<string>, default: [] }
       - { name: --issue,          type: integer, required: false }
       - { name: --mirror-issue,   type: bool,    default: false }
+      - { name: --submit-review,  type: bool,    default: false } # GitHub-only: submit a native review event (#pullrequestreview-) instead of an outcome comment; --decision maps to event (comments-only->COMMENT, approve->APPROVE, request-changes->REQUEST_CHANGES); body required for COMMENT/REQUEST_CHANGES, optional for APPROVE
     validations:
       - no_local_path # review comment body AND the generated issue mirror (lens values are user-controlled), validated before any post
       - no_escaped_control_markdown # review comment body AND the generated issue mirror, validated before any post
-    # Op-specific error kinds (both raised before any backend mutation):
+    # Op-specific error kinds (all raised before any backend mutation):
     #   issue_required (DATA 65)       — --mirror-issue without --issue
     #   id_not_pull_request (DATA 65)  — GitHub <id> is not a pull request (the guard saw HTTP 404)
+    #   provider_unsupported (USAGE 64) — --submit-review on gitlab/local (native review event is GitHub-only in v1)
     # A non-404 guard failure (rate limit, 5xx, forbidden/SSO) surfaces as backend_error (RUNTIME 1),
     # not id_not_pull_request, since it may have hit a valid PR.
     backends:
       github:
         - { program: gh, argv: [api, "repos/{repo}/pulls/{id}", --jq, ".number"] } # PR-existence guard; <id> must be a pull request before posting (also rendered in --dry-run as guard_plan)
-        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] }
+        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] } # default (outcome comment)
+        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews", --method, POST, --raw-field, "body={comment_or_file}", --raw-field, "event={EVENT}", --jq, ".html_url"] } # with --submit-review (native review event); body field omitted for a body-less APPROVE; review authored by the inherited gh token's identity
         - { program: gh, argv: [api, "repos/{repo}/issues/{issue}/comments", --method, POST, --raw-field, "body=<generated mirror>", --jq, ".html_url"] } # only with --mirror-issue
       gitlab:
         # One `glab mr note create --help` probe selects the form (covers every glab version class):
@@ -281,6 +284,7 @@ operations:
         provider: enum<github|gitlab>
         number: integer
         decision: enum<comments-only|approve|request-changes>
+        submitted_review: bool # true when a native review event was submitted (--submit-review); then pr_comment_url is the #pullrequestreview- URL
         pr_comment_url: string
         issue_number: integer?
         issue_comment_url: string?
