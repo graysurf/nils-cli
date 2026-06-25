@@ -32,6 +32,11 @@ agent-memory resolve <id>
 agent-memory env
 agent-memory doctor
 agent-memory check [SCOPE] [--all] [--strict] [--format text|json]
+agent-memory add [SCOPE] --name <slug> --type <t> --description <text> \
+  [--title <text>] [--hook <text>] [--body <text>|-] [--body-file <path>] \
+  [--session-id <uuid>] [--format text|json]
+agent-memory list [SCOPE] [--type <t>] [--format text|json]
+agent-memory search <term> [SCOPE] [--all] [--format text|json]
 agent-memory completion zsh
 ```
 
@@ -54,6 +59,26 @@ integrity* (default scope `global`, `--all` to sweep every scope):
 file, detail, severity}`, under a `schema_version` envelope; `--json` is a
 hidden alias). `--strict` promotes warnings to failures. A clean scope exits
 `0`; any error-level finding (or any finding under `--strict`) exits `1`.
+
+## Writing and querying notes
+
+`add` is the single guarded writer: it creates `<scope>/<slug>.md` with correct
+frontmatter and appends a matching `MEMORY.md` index line in one operation
+(rolling the note back if the index write fails), so the two never drift. It
+refuses a duplicate slug and validates `--type` against the enum;
+`metadata.originSessionId` is written only when `--session-id` is supplied. The
+body comes from `--body <text>`, `--body -` (stdin), or `--body-file <path>`.
+`check <scope>` is clean immediately after.
+
+`list --format json` emits one record per note
+(`{path, name, description, type, mtime}`, under a `schema_version` envelope);
+`--type <t>` filters by frontmatter type. The default text output (note
+filenames, including `MEMORY.md`) is unchanged.
+
+`search <term>` does a case-insensitive substring scan over note content
+(frontmatter — including the `description` — and the body) across a scope, or
+`--all` scopes, printing `scope/file:line: text`. It exits `0` when there are
+matches and `1` when there are none.
 
 ## Output
 

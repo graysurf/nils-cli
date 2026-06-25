@@ -15,9 +15,9 @@ use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use nils_common::fs::display_path;
 
 use crate::cli::CheckArgs;
+use crate::frontmatter::{self, VALID_TYPES};
 use crate::{CliError, EXIT_OK, EXIT_RUNTIME, Layout, markdown_files};
 
-const VALID_TYPES: [&str; 4] = ["user", "feedback", "project", "reference"];
 const SCHEMA_VERSION_COMMAND: &str = "check";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,7 +82,7 @@ struct ScopeReport {
 
 pub(crate) fn run(layout: &Layout, args: &CheckArgs) -> Result<i32, CliError> {
     let targets = if args.all {
-        all_scopes(layout)?
+        crate::memory_scopes(layout)?
     } else {
         let scope = args.scope.as_deref().unwrap_or("global");
         vec![resolve_target(layout, scope)?]
@@ -137,41 +137,6 @@ fn resolve_target(layout: &Layout, scope: &str) -> Result<(String, PathBuf), Cli
         return Ok((scope.to_string(), dir.join("memory")));
     }
     Ok((scope.to_string(), dir))
-}
-
-/// Enumerate every memory scope: global, each agent, and each persona's
-/// `memory/` directory.
-fn all_scopes(layout: &Layout) -> Result<Vec<(String, PathBuf)>, CliError> {
-    let mut scopes = Vec::new();
-
-    let global = layout.global_dir();
-    if global.is_dir() {
-        scopes.push(("global".to_string(), global));
-    }
-
-    for dir in named_child_dirs(&layout.agents_dir())? {
-        if let Some(name) = dir_name(&dir) {
-            scopes.push((format!("agents/{name}"), dir));
-        }
-    }
-
-    for dir in named_child_dirs(&layout.personas_dir())? {
-        let memory = dir.join("memory");
-        if memory.is_dir()
-            && let Some(name) = dir_name(&dir)
-        {
-            scopes.push((format!("personas/{name}"), memory));
-        }
-    }
-
-    Ok(scopes)
-}
-
-fn named_child_dirs(path: &Path) -> Result<Vec<PathBuf>, CliError> {
-    if !path.is_dir() {
-        return Ok(Vec::new());
-    }
-    crate::child_dirs(path)
 }
 
 fn dir_name(path: &Path) -> Option<String> {
@@ -291,7 +256,7 @@ fn extract_wikilinks(contents: &str) -> Vec<String> {
 }
 
 fn check_frontmatter(scope: &str, file: &str, contents: &str, findings: &mut Vec<Finding>) {
-    let Some(frontmatter) = parse_frontmatter(contents) else {
+    let Some(frontmatter) = frontmatter::parse(contents) else {
         findings.push(Finding::error(
             scope,
             "frontmatter-missing",
@@ -347,80 +312,6 @@ fn check_frontmatter(scope: &str, file: &str, contents: &str, findings: &mut Vec
             file.to_string(),
             "missing expected field: metadata.originSessionId",
         ));
-    }
-}
-
-#[derive(Default)]
-struct Frontmatter {
-    name: Option<String>,
-    description: Option<String>,
-    node_type: Option<String>,
-    typ: Option<String>,
-    origin_session_id: Option<String>,
-}
-
-/// Parse the leading `---` fenced YAML block. Only the flat scalar fields the
-/// schema cares about are read; nested values live under a 2-space `metadata:`
-/// map. Returns `None` when the file has no frontmatter block at all.
-fn parse_frontmatter(contents: &str) -> Option<Frontmatter> {
-    let mut lines = contents.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
-    }
-
-    let mut frontmatter = Frontmatter::default();
-    let mut in_metadata = false;
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            break;
-        }
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let key = key.trim();
-        let value = strip_quotes(value.trim());
-        if line.starts_with(char::is_whitespace) {
-            if in_metadata {
-                match key {
-                    "node_type" => frontmatter.node_type = non_empty(value),
-                    "type" => frontmatter.typ = non_empty(value),
-                    "originSessionId" => frontmatter.origin_session_id = non_empty(value),
-                    _ => {}
-                }
-            }
-        } else {
-            in_metadata = key == "metadata";
-            match key {
-                "name" => frontmatter.name = non_empty(value),
-                "description" => frontmatter.description = non_empty(value),
-                _ => {}
-            }
-        }
-    }
-    Some(frontmatter)
-}
-
-fn strip_quotes(value: &str) -> &str {
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return &value[1..value.len() - 1];
-        }
-    }
-    value
-}
-
-fn non_empty(value: &str) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
     }
 }
 

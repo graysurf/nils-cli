@@ -1,19 +1,23 @@
+mod add;
 mod check;
 mod cli;
 mod completion;
+mod frontmatter;
+mod search;
 
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use serde_json::json;
 
-use cli::{Cli, Command, IdArgs, ScopeArgs};
+use cli::{Cli, Command, IdArgs, ListArgs, ScopeArgs};
 
-use nils_common::cli_contract::exit;
+use nils_common::cli_contract::{OutputFormat, exit, schema_version_for};
 use nils_common::fs::display_path;
 
 const EXIT_OK: i32 = exit::SUCCESS;
@@ -84,6 +88,8 @@ fn dispatch(cli: Cli) -> Result<i32, CliError> {
         }
         Command::Doctor => doctor(&layout),
         Command::Check(args) => check::run(&layout, &args),
+        Command::Add(args) => add::run(&layout, &args),
+        Command::Search(args) => search::run(&layout, &args),
         Command::Completion(args) => Ok(completion::run(args.shell)),
         Command::Help => print_help(),
     }
@@ -176,13 +182,111 @@ fn non_empty_env(name: &str) -> Option<OsString> {
     env::var_os(name).filter(|value| !value.is_empty())
 }
 
-fn list_scope(layout: &Layout, args: &ScopeArgs) -> Result<i32, CliError> {
-    let path = layout.resolve_scope(args.scope.as_deref().or(Some("global")));
+fn dir_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+fn file_mtime_secs(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Enumerate every memory scope that holds notes: global, each agent, and each
+/// persona's `memory/` directory. Shared by `check --all` and `search --all`.
+pub(crate) fn memory_scopes(layout: &Layout) -> Result<Vec<(String, PathBuf)>, CliError> {
+    let mut scopes = Vec::new();
+
+    let global = layout.global_dir();
+    if global.is_dir() {
+        scopes.push(("global".to_string(), global));
+    }
+
+    let agents = layout.agents_dir();
+    if agents.is_dir() {
+        for dir in child_dirs(&agents)? {
+            if let Some(name) = dir_name(&dir) {
+                scopes.push((format!("agents/{name}"), dir));
+            }
+        }
+    }
+
+    let personas = layout.personas_dir();
+    if personas.is_dir() {
+        for dir in child_dirs(&personas)? {
+            let memory = dir.join("memory");
+            if memory.is_dir()
+                && let Some(name) = dir_name(&dir)
+            {
+                scopes.push((format!("personas/{name}"), memory));
+            }
+        }
+    }
+
+    Ok(scopes)
+}
+
+fn list_scope(layout: &Layout, args: &ListArgs) -> Result<i32, CliError> {
+    let scope = args.scope.as_deref().unwrap_or("global");
+    let path = layout.resolve_scope(Some(scope));
     require_dir(&path)?;
 
-    for file in markdown_files(&path)? {
-        if let Some(name) = file.file_name() {
-            println!("{}", name.to_string_lossy());
+    let format = if args.json {
+        OutputFormat::Json
+    } else {
+        args.format
+    };
+    let type_filter = args.r#type.as_deref();
+    let files = markdown_files(&path)?;
+
+    if format.is_json() {
+        let mut notes = Vec::new();
+        for file in &files {
+            let Some(name) = dir_name(file) else { continue };
+            if name == "MEMORY.md" {
+                continue;
+            }
+            let contents = fs::read_to_string(file).unwrap_or_default();
+            let frontmatter = frontmatter::parse(&contents).unwrap_or_default();
+            if let Some(filter) = type_filter
+                && frontmatter.typ.as_deref() != Some(filter)
+            {
+                continue;
+            }
+            notes.push(json!({
+                "path": display_path(file),
+                "name": frontmatter.name,
+                "description": frontmatter.description,
+                "type": frontmatter.typ,
+                "mtime": file_mtime_secs(file),
+            }));
+        }
+        let doc = json!({
+            "schema_version": schema_version_for("agent-memory", "list", 1),
+            "scope": scope,
+            "notes": notes,
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&doc).expect("list report should serialize")
+        );
+    } else {
+        for file in &files {
+            let Some(name) = dir_name(file) else { continue };
+            if let Some(filter) = type_filter {
+                if name == "MEMORY.md" {
+                    continue;
+                }
+                let contents = fs::read_to_string(file).unwrap_or_default();
+                let frontmatter = frontmatter::parse(&contents).unwrap_or_default();
+                if frontmatter.typ.as_deref() != Some(filter) {
+                    continue;
+                }
+            }
+            println!("{name}");
         }
     }
     Ok(EXIT_OK)
