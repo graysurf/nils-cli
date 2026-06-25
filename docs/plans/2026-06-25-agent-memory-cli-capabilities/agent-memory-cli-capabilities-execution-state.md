@@ -3,7 +3,7 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: ready; tracking issue not yet opened
+- Status: tracking issue open (#940); Sprint 1 ready
 - Target scope: add four structural / scaffolding subcommands (`check`, `add`,
   `list --json`/`--type`, `search`) to the `nils-agent-memory` crate in
   `sympoies/nils-cli`, per the frozen `graysurf/agent-memory`
@@ -20,10 +20,13 @@
 - Plan document:
   `docs/plans/2026-06-25-agent-memory-cli-capabilities/agent-memory-cli-capabilities-plan.md`
 - Direct source-doc execution waiver: not applicable.
-- Tracking issue: pending (set by `record open`).
-- Source snapshot: pending (set by `record open`).
-- Plan snapshot: pending (set by `record open`).
-- Initial state snapshot: pending (set by `record open`).
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/940>
+- Source snapshot:
+  <https://github.com/sympoies/nils-cli/issues/940#issuecomment-4796671780>
+- Plan snapshot:
+  <https://github.com/sympoies/nils-cli/issues/940#issuecomment-4796672142>
+- Initial state snapshot:
+  <https://github.com/sympoies/nils-cli/issues/940#issuecomment-4796672556>
 
 ## Validation Plan
 
@@ -68,8 +71,9 @@
 
 | Command | Status | Summary | Artifact |
 | --- | --- | --- | --- |
-| `plan-tooling validate --file docs/plans/2026-06-25-agent-memory-cli-capabilities/agent-memory-cli-capabilities-plan.md --format text --explain` | pending | Plan-source bundle validation. | local |
-| `bash scripts/ci/plan-bundle-validate.sh --strict --file docs/plans/2026-06-25-agent-memory-cli-capabilities/agent-memory-cli-capabilities-plan.md` | pending | Repository strict plan-bundle validation. | local |
-| `plan-issue --repo sympoies/nils-cli --format json --dry-run record open --profile tracking ...` | pending | Dry-run issue body / labels / lifecycle comments. | local |
-| `plan-issue --repo sympoies/nils-cli --format json record open --profile tracking ...` | pending | Live tracker open + source/plan/state snapshots. | provider |
+| `plan-tooling validate --file docs/plans/2026-06-25-agent-memory-cli-capabilities/agent-memory-cli-capabilities-plan.md --format text --explain` | pass | Plan valid; 0 errors. | local |
+| `bash scripts/ci/plan-bundle-validate.sh --strict --file docs/plans/2026-06-25-agent-memory-cli-capabilities/agent-memory-cli-capabilities-plan.md` | pass | Strict plan-bundle validation passed. | local |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Docs placement, hygiene, markdown lint, plan-bundle, CLI contract passed. | local |
+| `plan-issue --repo sympoies/nils-cli --format json --dry-run record open --profile tracking ...` | pass | Dry-run rendered the intended issue body, labels, and source/plan/state comments; no local paths. | local |
+| `plan-issue --repo sympoies/nils-cli --format json record open --profile tracking ...` | pass | Opened tracker #940 and posted source, plan, and initial state snapshots. | <https://github.com/sympoies/nils-cli/issues/940> |
 | `plan-issue --format json record audit --profile tracking --expect-visible ...` | pending | Read-back audit of provider-visible records. | local/provider |
