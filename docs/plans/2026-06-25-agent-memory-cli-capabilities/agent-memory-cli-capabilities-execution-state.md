@@ -3,7 +3,9 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: tracking issue open (#940); Sprint 1 ready
+- Status: tracking issue open (#940); Sprint 1 `check` implemented (commit
+  `532ac65`), tests green + local-fast clean; PR pending. Task 1.5 deferred to
+  post-release (cross-repo, gated on a released nils-cli with `check`).
 - Target scope: add four structural / scaffolding subcommands (`check`, `add`,
   `list --json`/`--type`, `search`) to the `nils-agent-memory` crate in
   `sympoies/nils-cli`, per the frozen `graysurf/agent-memory`
@@ -11,10 +13,12 @@
 - Execution window: Sprint 1 (`check` MVP + collapse the skill bash) -> Sprint 2
   (`add` atomic writer) -> Sprint 3 (`list --json`/`search`, docs, delivery,
   optional release), serial.
-- Current task: Sprint 1 ready.
-- Next task: Sprint 1 Task 1.1 - define the `check` command surface.
+- Current task: Sprint 1 Tasks 1.1-1.4 complete; open the Sprint 1 PR next.
+- Next task: open the `check` PR (with test-first evidence), then Sprint 2
+  (`add`).
 - Last updated: 2026-06-25
-- Branch/commit/PR: branch `feat/agent-memory-cli-capabilities`; no PR yet.
+- Branch/commit/PR: branch `feat/agent-memory-cli-capabilities`; commits
+  `8ee7767` + `a8ea4e4` (bundle), `532ac65` (Sprint 1 `check`); no PR yet.
 - Source document:
   `docs/plans/2026-06-25-agent-memory-cli-capabilities/agent-memory-cli-capabilities-discussion-source.md`
 - Plan document:
@@ -46,11 +50,11 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | todo | Define the `check` command surface | pending | Scope + `--all`/`--json`/`--strict`; confirm vs `doctor --strict`. |
-| 1.2 | todo | Implement the structural checks | pending | Index/file parity, dangling `[[links]]`, broken index links. |
-| 1.3 | todo | Implement frontmatter schema validation | pending | Required name/description/type+enum; warn-level node_type/originSessionId. |
-| 1.4 | todo | JSON output, exit codes, and report | pending | `--json` records; `--strict` promotes warnings; exit 0/1/64. |
-| 1.5 | todo | Collapse review-global-memory.sh onto the command | pending | Cross-repo (graysurf/agent-memory); gated on a released nils-cli. |
+| 1.1 | done | Define the `check` command surface | `532ac65` cli.rs | `--all`/`--strict` + canonical `--format` with hidden `--json` alias (per CLI output contract). |
+| 1.2 | done | Implement the structural checks | `532ac65` check.rs | Index/file parity, dangling `[[links]]` (warn), broken index links. |
+| 1.3 | done | Implement frontmatter schema validation | `532ac65` check.rs | Required name/description/metadata.type+enum; warn-level node_type/originSessionId; hand-parsed (no new dep). |
+| 1.4 | done | JSON output, exit codes, and report | `532ac65` check.rs | `--format json` findings under `cli.agent-memory.check.v1`; `--strict` promotes; exit 0/1/64. |
+| 1.5 | deferred | Collapse review-global-memory.sh onto the command | pending | Cross-repo (graysurf/agent-memory); gated on a released nils-cli with `check`. |
 | 2.1 | todo | Define `add` and write the note file | pending | Frontmatter writer; enum + duplicate-slug refusal. |
 | 2.2 | todo | Atomic index-line append | pending | `check` clean after `add`; no half-writes. |
 | 3.1 | todo | `list --json` and `--type` | pending | Stable JSON; default output unchanged. |
@@ -66,6 +70,14 @@
   `review-global-memory` skill bash, authored the frozen contract
   (`graysurf/agent-memory` `docs/cli-contract-proposed.md`), and chose L2 plan
   tracking for all four proposals.
+- 2026-06-25: Implemented Sprint 1 `check` test-first (RED captured, then 11
+  integration tests green). Calibrated against the live store before coding:
+  dropped a `name`-equals-filename check (kebab `name:` vs snake filenames
+  differ in 19/30 notes) and made dangling `[[wikilinks]]` warn-level (the
+  harness blesses forward references). Adopted the workspace CLI output contract
+  (`--format`/hidden `--json`, `schema_version`) after the contract lint flagged
+  the initial bare `--json`. `check --all` is clean on the live store (exit 0).
+  Committed `532ac65`.
 
 ## Validation
 
@@ -76,4 +88,9 @@
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Docs placement, hygiene, markdown lint, plan-bundle, CLI contract passed. | local |
 | `plan-issue --repo sympoies/nils-cli --format json --dry-run record open --profile tracking ...` | pass | Dry-run rendered the intended issue body, labels, and source/plan/state comments; no local paths. | local |
 | `plan-issue --repo sympoies/nils-cli --format json record open --profile tracking ...` | pass | Opened tracker #940 and posted source, plan, and initial state snapshots. | <https://github.com/sympoies/nils-cli/issues/940> |
-| `plan-issue --format json record audit --profile tracking --expect-visible ...` | pending | Read-back audit of provider-visible records. | local/provider |
+| `plan-issue --format json record audit --profile tracking --expect-visible ...` | pass | Read-back clean: recognized_count 3, missing_required [], visible.overall_pass true. | <https://github.com/sympoies/nils-cli/issues/940> |
+| `cargo test -p nils-agent-memory` | pass | 38 tests pass (11 new `check` integration tests). | local |
+| `cargo clippy -p nils-agent-memory --all-targets -- -D warnings` | pass | No warnings. | local |
+| `bash scripts/ci/cli-output-contract-lint.sh --strict` | pass | `--json` is a hidden alias for `--format json`. | local |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Docs + package checks (fmt, clippy, nextest, doctests) clean. | local |
+| `agent-memory check --all --format json` (live store) | pass | 3 scopes clean, exit 0, `schema_version cli.agent-memory.check.v1`. | local |
