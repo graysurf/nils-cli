@@ -23,7 +23,7 @@ pub enum Command {
     Path(ScopeArgs),
     /// List markdown files in a scope.
     #[command(alias = "ls")]
-    List(ScopeArgs),
+    List(ListArgs),
     /// Print MEMORY.md from a scope.
     #[command(alias = "idx")]
     Index(ScopeArgs),
@@ -43,6 +43,10 @@ pub enum Command {
     Doctor,
     /// Check structural integrity of a memory scope.
     Check(CheckArgs),
+    /// Create a note and its index entry atomically.
+    Add(AddArgs),
+    /// Search note bodies and descriptions in a scope.
+    Search(SearchArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
     /// Print help.
@@ -74,6 +78,78 @@ pub struct CheckArgs {
     /// Promote warn-level findings to failures.
     #[arg(long)]
     pub strict: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json` (kept for convenience).
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Scope to list (default: global).
+    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath)]
+    pub scope: Option<String>,
+    /// Filter by frontmatter type (user|feedback|project|reference).
+    #[arg(long, value_name = "TYPE")]
+    pub r#type: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json` (kept for convenience).
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// Scope to write into (default: global).
+    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath)]
+    pub scope: Option<String>,
+    /// Note slug (becomes `<slug>.md` and the frontmatter `name`).
+    #[arg(long, value_name = "SLUG")]
+    pub name: String,
+    /// Note type (user|feedback|project|reference).
+    #[arg(long, value_name = "TYPE")]
+    pub r#type: String,
+    /// One-line description for the frontmatter.
+    #[arg(long, value_name = "TEXT")]
+    pub description: String,
+    /// Index title (defaults to the slug).
+    #[arg(long, value_name = "TEXT")]
+    pub title: Option<String>,
+    /// Index hook text (defaults to the description).
+    #[arg(long, value_name = "TEXT")]
+    pub hook: Option<String>,
+    /// Read the note body from a file.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath, conflicts_with = "body")]
+    pub body_file: Option<String>,
+    /// Note body text, or `-` to read from stdin.
+    #[arg(long, value_name = "TEXT")]
+    pub body: Option<String>,
+    /// Stamp `metadata.originSessionId` with this value.
+    #[arg(long, value_name = "UUID")]
+    pub session_id: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json` (kept for convenience).
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// Term to find (matched in note bodies and descriptions).
+    #[arg(value_name = "TERM")]
+    pub term: String,
+    /// Scope to search (default: global).
+    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath)]
+    pub scope: Option<String>,
+    /// Search every memory scope (global, agents, personas).
+    #[arg(long)]
+    pub all: bool,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,

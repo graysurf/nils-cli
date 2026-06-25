@@ -452,3 +452,270 @@ fn check_all_sweeps_agent_scopes() {
         out.stdout_text()
     );
 }
+
+// ---- `add` command ------------------------------------------------------
+
+/// Seed a writable `global` scope with an empty index.
+fn seed_writable_global(root: &Path) {
+    fs::create_dir_all(root.join("global")).expect("global dir");
+    fs::create_dir_all(root.join("agents")).expect("agents dir");
+    fs::create_dir_all(root.join("personas")).expect("personas dir");
+    fs::write(root.join("global/MEMORY.md"), "# Memory index\n\n").expect("memory");
+}
+
+#[test]
+fn add_creates_note_and_index_then_check_is_clean() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_writable_global(tmp.path());
+
+    let out = run(
+        tmp.path(),
+        &[
+            "add",
+            "global",
+            "--name",
+            "new-note",
+            "--type",
+            "feedback",
+            "--description",
+            "desc text",
+            "--hook",
+            "hook text",
+            "--body",
+            "Body with content.",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+
+    let note = fs::read_to_string(tmp.path().join("global/new-note.md")).expect("note file");
+    assert!(note.contains("name: new-note"), "{note}");
+    assert!(note.contains("type: feedback"), "{note}");
+    assert!(note.contains("node_type: memory"), "{note}");
+    assert!(note.contains("Body with content."), "{note}");
+
+    let index = fs::read_to_string(tmp.path().join("global/MEMORY.md")).expect("index");
+    assert!(
+        index.contains("- [new-note](new-note.md) — hook text"),
+        "{index}"
+    );
+
+    // Parity must be intact after add.
+    let check = run(tmp.path(), &["check", "global"]);
+    assert_eq!(check.code, 0, "stderr={}", check.stderr_text());
+}
+
+#[test]
+fn add_refuses_duplicate_slug() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_writable_global(tmp.path());
+
+    let first = run(
+        tmp.path(),
+        &[
+            "add",
+            "global",
+            "--name",
+            "dup",
+            "--type",
+            "user",
+            "--description",
+            "x",
+        ],
+    );
+    assert_eq!(first.code, 0, "stderr={}", first.stderr_text());
+
+    let second = run(
+        tmp.path(),
+        &[
+            "add",
+            "global",
+            "--name",
+            "dup",
+            "--type",
+            "user",
+            "--description",
+            "y",
+        ],
+    );
+    assert_eq!(second.code, 1, "stderr={}", second.stderr_text());
+    assert!(second.stderr_text().contains("already exists"));
+}
+
+#[test]
+fn add_rejects_invalid_type() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_writable_global(tmp.path());
+
+    let out = run(
+        tmp.path(),
+        &[
+            "add",
+            "global",
+            "--name",
+            "bad",
+            "--type",
+            "bogus",
+            "--description",
+            "x",
+        ],
+    );
+    assert_eq!(out.code, 64, "stderr={}", out.stderr_text());
+    assert!(out.stderr_text().contains("invalid type"));
+}
+
+#[test]
+fn add_omits_session_id_when_not_supplied() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_writable_global(tmp.path());
+
+    let out = run(
+        tmp.path(),
+        &[
+            "add",
+            "global",
+            "--name",
+            "hand",
+            "--type",
+            "reference",
+            "--description",
+            "x",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+    let note = fs::read_to_string(tmp.path().join("global/hand.md")).expect("note");
+    assert!(!note.contains("originSessionId"), "{note}");
+}
+
+// ---- `list --json` / `--type` -------------------------------------------
+
+#[test]
+fn list_json_emits_frontmatter_fields() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_check_scope(tmp.path());
+
+    let out = run(tmp.path(), &["list", "global", "--json"]);
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+    let stdout = out.stdout_text();
+    assert!(
+        stdout.contains("\"schema_version\":\"cli.agent-memory.list.v1\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"name\":\"alpha-note\""), "{stdout}");
+    assert!(stdout.contains("\"type\":\"user\""), "{stdout}");
+    assert!(stdout.contains("\"mtime\":"), "{stdout}");
+    // MEMORY.md is not a note.
+    assert!(!stdout.contains("MEMORY.md"), "{stdout}");
+}
+
+#[test]
+fn list_type_filters_in_text_mode() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_check_scope(tmp.path());
+
+    let out = run(tmp.path(), &["list", "global", "--type", "feedback"]);
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+    let stdout = out.stdout_text();
+    assert!(stdout.contains("beta.md"), "{stdout}");
+    assert!(!stdout.contains("alpha.md"), "{stdout}");
+    assert!(!stdout.contains("MEMORY.md"), "{stdout}");
+}
+
+#[test]
+fn list_default_output_is_unchanged() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_check_scope(tmp.path());
+
+    let out = run(tmp.path(), &["list", "global"]);
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+    assert_eq!(out.stdout_text(), "MEMORY.md\nalpha.md\nbeta.md\n");
+}
+
+// ---- `search` command ---------------------------------------------------
+
+fn note_with(name: &str, ty: &str, description: &str, body: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: \"{description}\"\nmetadata:\n  node_type: memory\n  type: {ty}\n  originSessionId: 00000000-0000-0000-0000-000000000000\n---\n\n{body}\n"
+    )
+}
+
+#[test]
+fn search_matches_both_body_and_description() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let global = tmp.path().join("global");
+    fs::create_dir_all(&global).expect("global");
+    fs::create_dir_all(tmp.path().join("agents")).expect("agents");
+    fs::create_dir_all(tmp.path().join("personas")).expect("personas");
+    fs::write(
+        global.join("bodyonly.md"),
+        note_with(
+            "bodyonly",
+            "user",
+            "plain description",
+            "Contains unique_body_token here.",
+        ),
+    )
+    .expect("bodyonly");
+    fs::write(
+        global.join("desconly.md"),
+        note_with(
+            "desconly",
+            "user",
+            "has unique_desc_token inside",
+            "Plain body.",
+        ),
+    )
+    .expect("desconly");
+    fs::write(
+        global.join("MEMORY.md"),
+        "# Memory index\n\n- [bodyonly](bodyonly.md) — b\n- [desconly](desconly.md) — d\n",
+    )
+    .expect("memory");
+
+    let body_hit = run(tmp.path(), &["search", "unique_body_token", "global"]);
+    assert_eq!(body_hit.code, 0, "stderr={}", body_hit.stderr_text());
+    assert!(
+        body_hit.stdout_text().contains("bodyonly.md"),
+        "{}",
+        body_hit.stdout_text()
+    );
+
+    let desc_hit = run(tmp.path(), &["search", "unique_desc_token", "global"]);
+    assert_eq!(desc_hit.code, 0, "stderr={}", desc_hit.stderr_text());
+    assert!(
+        desc_hit.stdout_text().contains("desconly.md"),
+        "{}",
+        desc_hit.stdout_text()
+    );
+
+    let no_hit = run(tmp.path(), &["search", "zzzz_no_match", "global"]);
+    assert_eq!(no_hit.code, 1, "stderr={}", no_hit.stderr_text());
+}
+
+#[test]
+fn search_all_covers_agent_scopes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_writable_global(tmp.path());
+    let codex = tmp.path().join("agents/codex");
+    fs::create_dir_all(&codex).expect("codex");
+    fs::write(codex.join("MEMORY.md"), "# Memory index (codex)\n\n").expect("codex memory");
+    fs::write(
+        codex.join("found.md"),
+        note_with("found", "user", "d", "Body with crossscopeterm inside."),
+    )
+    .expect("found");
+
+    let out = run(tmp.path(), &["search", "crossscopeterm", "--all"]);
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+    assert!(
+        out.stdout_text().contains("agents/codex"),
+        "{}",
+        out.stdout_text()
+    );
+    assert!(
+        out.stdout_text().contains("found.md"),
+        "{}",
+        out.stdout_text()
+    );
+}

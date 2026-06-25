@@ -37,9 +37,13 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (list)
 _arguments "${_arguments_options[@]}" : \
-'-h[Print help]' \
-'--help[Print help]' \
-'::scope -- Scope to resolve:_files -/' \
+'--type=[Filter by frontmatter type (user|feedback|project|reference)]:TYPE:_default' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for convenience)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::scope -- Scope to list (default\: global):_files -/' \
 && ret=0
 ;;
 (index)
@@ -106,6 +110,36 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '::scope -- Scope to check (default\: global):_files -/' \
 && ret=0
 ;;
+(add)
+_arguments "${_arguments_options[@]}" : \
+'--name=[Note slug (becomes \`<slug>.md\` and the frontmatter \`name\`)]:SLUG:_default' \
+'--type=[Note type (user|feedback|project|reference)]:TYPE:_default' \
+'--description=[One-line description for the frontmatter]:TEXT:_default' \
+'--title=[Index title (defaults to the slug)]:TEXT:_default' \
+'--hook=[Index hook text (defaults to the description)]:TEXT:_default' \
+'(--body)--body-file=[Read the note body from a file]:PATH:_files' \
+'--body=[Note body text, or \`-\` to read from stdin]:TEXT:_default' \
+'--session-id=[Stamp \`metadata.originSessionId\` with this value]:UUID:_default' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for convenience)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::scope -- Scope to write into (default\: global):_files -/' \
+&& ret=0
+;;
+(search)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--all[Search every memory scope (global, agents, personas)]' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for convenience)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':term -- Term to find (matched in note bodies and descriptions):_default' \
+'::scope -- Scope to search (default\: global):_files -/' \
+&& ret=0
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -138,10 +172,17 @@ _agent-memory_commands() {
 'env:Emit shell exports for the resolved layout' \
 'doctor:Verify memory-store layout' \
 'check:Check structural integrity of a memory scope' \
+'add:Create a note and its index entry atomically' \
+'search:Search note bodies and descriptions in a scope' \
 'completion:Print shell completion script' \
 'help:Print help' \
     )
     _describe -t commands 'agent-memory commands' commands "$@"
+}
+(( $+functions[_agent-memory__subcmd__add_commands] )) ||
+_agent-memory__subcmd__add_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-memory add commands' commands "$@"
 }
 (( $+functions[_agent-memory__subcmd__agents_commands] )) ||
 _agent-memory__subcmd__agents_commands() {
@@ -207,6 +248,11 @@ _agent-memory__subcmd__personas_commands() {
 _agent-memory__subcmd__resolve_commands() {
     local commands; commands=()
     _describe -t commands 'agent-memory resolve commands' commands "$@"
+}
+(( $+functions[_agent-memory__subcmd__search_commands] )) ||
+_agent-memory__subcmd__search_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-memory search commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_agent-memory" ]; then
