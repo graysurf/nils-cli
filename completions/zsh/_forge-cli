@@ -165,6 +165,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--mirror-issue[Mirror a compact activity note to \`--issue\` (required; omitting it returns the \`issue_required\` envelope at runtime)]' \
+'--submit-review[Submit a native provider review event instead of posting an outcome comment. On GitHub this POSTs \`.../pulls/<id>/reviews\`, creating the \`#pullrequestreview-\` object; \`--decision\` maps to the review event (comments-only→COMMENT, approve→APPROVE, request-changes→REQUEST_CHANGES). The review is authored by the invoking token'\''s identity (e.g. a reviewer bot via FORGE_BOT_PROFILE). A body is required for COMMENT and REQUEST_CHANGES and optional for APPROVE. GitHub-only in v1]' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \

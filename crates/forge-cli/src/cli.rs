@@ -414,6 +414,16 @@ impl PrReviewDecision {
             Self::RequestChanges => "request-changes",
         }
     }
+
+    /// GitHub pull-request review `event` for this decision, used by
+    /// `pr review --submit-review` to create a native review object.
+    pub fn to_github_event(self) -> &'static str {
+        match self {
+            Self::CommentsOnly => "COMMENT",
+            Self::Approve => "APPROVE",
+            Self::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
 }
 
 /// `pr review` arguments. This is a provider posting primitive: callers pass
@@ -445,6 +455,15 @@ pub struct PrReviewArgs {
     // branch on the error kind instead of hitting a clap parse-time error.
     #[arg(long = "mirror-issue", action = ArgAction::SetTrue)]
     pub mirror_issue: bool,
+    /// Submit a native provider review event instead of posting an outcome
+    /// comment. On GitHub this POSTs `.../pulls/<id>/reviews`, creating the
+    /// `#pullrequestreview-` object; `--decision` maps to the review event
+    /// (comments-only→COMMENT, approve→APPROVE, request-changes→REQUEST_CHANGES).
+    /// The review is authored by the invoking token's identity (e.g. a reviewer
+    /// bot via FORGE_BOT_PROFILE). A body is required for COMMENT and
+    /// REQUEST_CHANGES and optional for APPROVE. GitHub-only in v1.
+    #[arg(long = "submit-review", action = ArgAction::SetTrue)]
+    pub submit_review: bool,
 }
 
 /// `pr comments` arguments.
