@@ -3,9 +3,10 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: tracking issue open (#940); Sprint 1 `check` implemented (commit
-  `532ac65`), tests green + local-fast clean; PR pending. Task 1.5 deferred to
-  post-release (cross-repo, gated on a released nils-cli with `check`).
+- Status: tracking issue open (#940); Sprint 1 `check` delivered as PR #941
+  (open, ready, all CI green, author graysurf) — awaiting merge. Task 1.5
+  deferred to post-release (cross-repo, gated on a released nils-cli with
+  `check`).
 - Target scope: add four structural / scaffolding subcommands (`check`, `add`,
   `list --json`/`--type`, `search`) to the `nils-agent-memory` crate in
   `sympoies/nils-cli`, per the frozen `graysurf/agent-memory`
@@ -13,12 +14,13 @@
 - Execution window: Sprint 1 (`check` MVP + collapse the skill bash) -> Sprint 2
   (`add` atomic writer) -> Sprint 3 (`list --json`/`search`, docs, delivery,
   optional release), serial.
-- Current task: Sprint 1 Tasks 1.1-1.4 complete; open the Sprint 1 PR next.
-- Next task: open the `check` PR (with test-first evidence), then Sprint 2
-  (`add`).
+- Current task: Sprint 1 PR #941 open + green; awaiting merge.
+- Next task: merge #941, then Sprint 2 (`add`); Task 1.5 after a release.
 - Last updated: 2026-06-25
 - Branch/commit/PR: branch `feat/agent-memory-cli-capabilities`; commits
-  `8ee7767` + `a8ea4e4` (bundle), `532ac65` (Sprint 1 `check`); no PR yet.
+  `8ee7767` + `a8ea4e4` (bundle), `532ac65` (`check`), `69d3127` (ledger),
+  `15bca42` (completion regen); PR
+  <https://github.com/sympoies/nils-cli/pull/941>.
 - Source document:
   `docs/plans/2026-06-25-agent-memory-cli-capabilities/agent-memory-cli-capabilities-discussion-source.md`
 - Plan document:
@@ -78,6 +80,14 @@
   (`--format`/hidden `--json`, `schema_version`) after the contract lint flagged
   the initial bare `--json`. `check --all` is clean on the live store (exit 0).
   Committed `532ac65`.
+- 2026-06-25: Opened PR #941 (graysurf, via forge-cli routing). First CI run
+  failed `test`/`test_macos` on the completion-freshness audit — adding a
+  subcommand staled the committed `completions/{bash,zsh}/agent-memory`
+  snapshots, which `--local-fast` does not regenerate (it only tests changed
+  packages). Regenerated both from the binary, audit passed, committed
+  `15bca42`, re-pushed. Second run all green (12 success / 1 skipped); promoted
+  the PR to ready. LESSON: any new nils-cli subcommand requires a completion
+  regen + full-suite check, not just `--local-fast`.
 
 ## Validation
 
@@ -94,3 +104,5 @@
 | `bash scripts/ci/cli-output-contract-lint.sh --strict` | pass | `--json` is a hidden alias for `--format json`. | local |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Docs + package checks (fmt, clippy, nextest, doctests) clean. | local |
 | `agent-memory check --all --format json` (live store) | pass | 3 scopes clean, exit 0, `schema_version cli.agent-memory.check.v1`. | local |
+| `bash scripts/ci/completion-freshness-audit.sh --strict --bin agent-memory` | pass | After regenerating committed completions for `check` (`15bca42`). | local |
+| PR #941 CI (test, test_macos, coverage, Analyze x3, cargo-deny, CodeQL) | pass | 12 success / 1 skipped after the completion regen. | <https://github.com/sympoies/nils-cli/pull/941> |
