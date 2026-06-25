@@ -3,10 +3,7 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: tracking issue open (#940); Sprint 1 `check` delivered as PR #941
-  (open, ready, all CI green, author graysurf) — awaiting merge. Task 1.5
-  deferred to post-release (cross-repo, gated on a released nils-cli with
-  `check`).
+- Status: complete; tracking issue closed
 - Target scope: add four structural / scaffolding subcommands (`check`, `add`,
   `list --json`/`--type`, `search`) to the `nils-agent-memory` crate in
   `sympoies/nils-cli`, per the frozen `graysurf/agent-memory`
@@ -14,13 +11,14 @@
 - Execution window: Sprint 1 (`check` MVP + collapse the skill bash) -> Sprint 2
   (`add` atomic writer) -> Sprint 3 (`list --json`/`search`, docs, delivery,
   optional release), serial.
-- Current task: Sprint 1 PR #941 open + green; awaiting merge.
-- Next task: merge #941, then Sprint 2 (`add`); Task 1.5 after a release.
+- Current task: closeout — all implementation merged; closing tracker #940.
+- Next task: post-release follow-up — Task 1.5 (collapse the skill bash onto
+  `agent-memory check`) once a nils-cli release ships these commands.
 - Last updated: 2026-06-25
-- Branch/commit/PR: branch `feat/agent-memory-cli-capabilities`; commits
-  `8ee7767` + `a8ea4e4` (bundle), `532ac65` (`check`), `69d3127` (ledger),
-  `15bca42` (completion regen); PR
-  <https://github.com/sympoies/nils-cli/pull/941>.
+- Branch/commit/PR: delivered via PR
+  <https://github.com/sympoies/nils-cli/pull/941> (`check`, squash `3aa91b2`)
+  and PR <https://github.com/sympoies/nils-cli/pull/942>
+  (`add`/`list`/`search`, squash `279cd55`); both merged to `main`.
 - Source document:
   `docs/plans/2026-06-25-agent-memory-cli-capabilities/agent-memory-cli-capabilities-discussion-source.md`
 - Plan document:
@@ -57,13 +55,13 @@
 | 1.3 | done | Implement frontmatter schema validation | `532ac65` check.rs | Required name/description/metadata.type+enum; warn-level node_type/originSessionId; hand-parsed (no new dep). |
 | 1.4 | done | JSON output, exit codes, and report | `532ac65` check.rs | `--format json` findings under `cli.agent-memory.check.v1`; `--strict` promotes; exit 0/1/64. |
 | 1.5 | deferred | Collapse review-global-memory.sh onto the command | pending | Cross-repo (graysurf/agent-memory); gated on a released nils-cli with `check`. |
-| 2.1 | todo | Define `add` and write the note file | pending | Frontmatter writer; enum + duplicate-slug refusal. |
-| 2.2 | todo | Atomic index-line append | pending | `check` clean after `add`; no half-writes. |
-| 3.1 | todo | `list --json` and `--type` | pending | Stable JSON; default output unchanged. |
-| 3.2 | todo | `agent-memory search` | pending | Body + description match across scopes. |
-| 3.3 | todo | Docs, help text, and completion | pending | Update crate docs + memory-repo README; no private paths. |
-| 3.4 | todo | Validate and deliver the nils-cli PR(s) | pending | local-fast + provider checks; link PRs to tracker. |
-| 3.5 | todo | Release and runtime-surface follow-up | pending | Release if needed to unblock 1.5; else record deferral. |
+| 2.1 | done | Define `add` and write the note file | `279cd55` add.rs | Frontmatter writer; type-enum + duplicate-slug refusal; originSessionId only when supplied. |
+| 2.2 | done | Atomic index-line append | `279cd55` add.rs | Temp+rename note then index; note rolled back on index failure; `check` clean after `add` (test). |
+| 3.1 | done | `list --json` and `--type` | `279cd55` lib.rs | `{path,name,description,type,mtime}` under `cli.agent-memory.list.v1`; default text unchanged. |
+| 3.2 | done | `agent-memory search` | `279cd55` search.rs | Case-insensitive scan of frontmatter+body; scope or `--all`; exit 0/1. |
+| 3.3 | done | Docs, help text, and completion | `279cd55` README/completions | Both crate READMEs + regenerated bash/zsh completions; cross-repo memory README aligned post-release. |
+| 3.4 | done | Validate and deliver the nils-cli PR(s) | PRs #941, #942 | local-fast + full CI green; both linked to #940 and merged. |
+| 3.5 | deferred | Release and runtime-surface follow-up | pending | Release not auto-fired (bumps homebrew tap + version-pin); deferred with 1.5 as a post-release follow-up. |
 
 ## Session Log
 
@@ -88,6 +86,14 @@
   `15bca42`, re-pushed. Second run all green (12 success / 1 skipped); promoted
   the PR to ready. LESSON: any new nils-cli subcommand requires a completion
   regen + full-suite check, not just `--local-fast`.
+- 2026-06-25: Merged #941, then implemented Sprint 2+3 (`add`, `list
+  --json`/`--type`, `search`) on a fresh branch off the merged `main`,
+  extracting a shared `frontmatter` module + `memory_scopes` helper reused by
+  `check`. 47 tests green; regenerated completions up front (applying the
+  Sprint 1 lesson). Delivered as PR #942; self-gated CI to green (repo has 0
+  required checks, so `pr deliver`'s wait is instant — used create -> watch ->
+  merge instead), merged squash `279cd55`. All four capabilities now on `main`.
+  Tasks 1.5 + 3.5 deferred as a post-release, cross-repo follow-up.
 
 ## Validation
 
@@ -106,3 +112,6 @@
 | `agent-memory check --all --format json` (live store) | pass | 3 scopes clean, exit 0, `schema_version cli.agent-memory.check.v1`. | local |
 | `bash scripts/ci/completion-freshness-audit.sh --strict --bin agent-memory` | pass | After regenerating committed completions for `check` (`15bca42`). | local |
 | PR #941 CI (test, test_macos, coverage, Analyze x3, cargo-deny, CodeQL) | pass | 12 success / 1 skipped after the completion regen. | <https://github.com/sympoies/nils-cli/pull/941> |
+| `cargo test -p nils-agent-memory` (Sprint 2+3) | pass | 47 tests pass (9 new add/list/search integration tests). | local |
+| `bash scripts/ci/completion-freshness-audit.sh --strict --bin agent-memory` (Sprint 2+3) | pass | Completions regenerated for add/list/search. | local |
+| PR #942 CI (test, test_macos, coverage, Analyze x3, cargo-deny, CodeQL) | pass | 11 checks pass; merged squash `279cd55`. | <https://github.com/sympoies/nils-cli/pull/942> |
