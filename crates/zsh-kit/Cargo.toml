@@ -1,6 +1,6 @@
 [package]
 name = "nils-zsh-kit"
-version = "1.14.0"
+version = "1.15.0"
 edition.workspace = true
 license.workspace = true
 
@@ -15,12 +15,12 @@ path = "src/main.rs"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.14.0", path = "../nils-build-info" }
-nils-common = { version = "1.14.0", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.15.0", path = "../nils-build-info" }
+nils-common = { version = "1.15.0", path = "../nils-common", package = "nils-common" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "1.14.0", path = "../nils-test-support" }
+nils-test-support = { version = "1.15.0", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
