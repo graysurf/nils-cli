@@ -16,7 +16,12 @@ fn codex_cli_bin() -> PathBuf {
 }
 
 fn run(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutput {
-    let mut options = CmdOptions::default();
+    let mut options = CmdOptions::default().with_env_remove_many(&[
+        "CODEX_AUTO_REFRESH_ENABLED",
+        "CODEX_AUTH_REMOTE_SSH",
+        "CODEX_AUTH_REMOTE_NAME",
+        "CODEX_AUTH_REMOTE_REFRESH",
+    ]);
     for (key, path) in envs {
         let value = path.to_string_lossy();
         options = options.with_env(key, value.as_ref());

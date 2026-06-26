@@ -11,6 +11,7 @@ ENVIRONMENT:
   CODEX_CLI_MODEL, CODEX_CLI_REASONING, CODEX_ALLOW_DANGEROUS_ENABLED
   CODEX_SECRET_DIR, CODEX_AUTH_FILE, CODEX_SECRET_CACHE_DIR
   CODEX_AUTO_REFRESH_ENABLED, CODEX_AUTO_REFRESH_MIN_DAYS
+  CODEX_AUTH_REMOTE_SSH, CODEX_AUTH_REMOTE_NAME, CODEX_AUTH_REMOTE_REFRESH
   CODEX_CHATGPT_BASE_URL, CODEX_OAUTH_CLIENT_ID
   CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED, CODEX_RATE_LIMITS_WATCH_MAX_ROUNDS, CODEX_RATE_LIMITS_WATCH_INTERVAL_SECONDS
   CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS, CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS, CODEX_RATE_LIMITS_CACHE_TTL
@@ -231,6 +232,9 @@ pub enum AuthRemoteCommand {
         /// Write the pulled auth payload into CODEX_AUTH_FILE
         #[arg(long = "write-active")]
         write_active: bool,
+        /// Ask the remote authority to refresh the named secret before export
+        #[arg(long = "refresh")]
+        refresh: bool,
     },
     /// Export remote auth payload for SSH transport
     #[command(hide = true)]

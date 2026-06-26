@@ -93,6 +93,7 @@ Stable (safe for strict parsing):
     (`true` when an existing target file is replaced)
   - `auth remove`: `target_file`, `removed`
   - `auth refresh`: `target_file`, `refreshed`, `synced`, `refreshed_at`
+    - remote-authority mode may additionally include `remote_sync`, `remote_ssh`, and `remote_name`
   - `auth auto-refresh`: `enabled`, `refreshed`, `skipped`, `failed`, `min_age_days`, `targets[*]`
   - `auth status`: `authenticated`, `prompt_segment_authenticated`, `auth_kind`,
     `reason`, `exists`, `readable`, `parse_ok`, credential presence booleans
@@ -379,6 +380,29 @@ Informational (do not hard-depend for schema validation):
 }
 ```
 
+### auth refresh (remote-authority success)
+
+When `CODEX_AUTH_REMOTE_SSH` and `CODEX_AUTH_REMOTE_NAME` are configured, default
+active-auth refresh delegates to `auth remote pull` internally and still emits
+an `auth refresh` envelope.
+
+```json
+{
+  "schema_version": "codex-cli.auth.v1",
+  "command": "auth refresh",
+  "ok": true,
+  "result": {
+    "target_file": "$HOME/.agents/auth.json",
+    "refreshed": true,
+    "synced": false,
+    "refreshed_at": "2026-02-11T03:20:11Z",
+    "remote_sync": true,
+    "remote_ssh": "g14",
+    "remote_name": "team"
+  }
+}
+```
+
 ### auth auto-refresh (success with per-target outcomes)
 
 ```json
@@ -465,7 +489,9 @@ Informational (do not hard-depend for schema validation):
 
 `auth remote pull` fetches the remote payload over SSH, strips any `refresh_token`
 material, writes the sanitized payload to `CODEX_AUTH_FILE`, and emits only
-metadata in the JSON envelope.
+metadata in the JSON envelope. Pull exports the remote authority's current
+payload by default; callers must pass `--refresh` to ask the authority to
+refresh before exporting.
 
 ```json
 {

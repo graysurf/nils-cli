@@ -1,3 +1,4 @@
+use crate::auth::remote;
 use nils_common::shell::{SingleQuoteEscapeStyle, quote_posix_single_with_style};
 
 pub fn show() -> i32 {
@@ -44,6 +45,21 @@ pub fn show() -> i32 {
         "CODEX_AUTO_REFRESH_MIN_DAYS={}",
         snapshot.auto_refresh_min_days
     );
+    println!(
+        "{}={}",
+        remote::ENV_AUTH_REMOTE_SSH,
+        std::env::var(remote::ENV_AUTH_REMOTE_SSH).unwrap_or_default()
+    );
+    println!(
+        "{}={}",
+        remote::ENV_AUTH_REMOTE_NAME,
+        std::env::var(remote::ENV_AUTH_REMOTE_NAME).unwrap_or_default()
+    );
+    println!(
+        "{}={}",
+        remote::ENV_AUTH_REMOTE_REFRESH,
+        std::env::var(remote::ENV_AUTH_REMOTE_REFRESH).unwrap_or_default()
+    );
 
     0
 }
@@ -88,9 +104,39 @@ pub fn set(key: &str, value: &str) -> i32 {
             println!("export CODEX_ALLOW_DANGEROUS_ENABLED={}", lowered);
             0
         }
+        "remote-ssh" | "remote_ssh" | "CODEX_AUTH_REMOTE_SSH" => {
+            println!(
+                "export {}={}",
+                remote::ENV_AUTH_REMOTE_SSH,
+                quote_posix_single_with_style(value, SingleQuoteEscapeStyle::DoubleQuoteBoundary)
+            );
+            0
+        }
+        "remote-name" | "remote_name" | "CODEX_AUTH_REMOTE_NAME" => {
+            println!(
+                "export {}={}",
+                remote::ENV_AUTH_REMOTE_NAME,
+                quote_posix_single_with_style(value, SingleQuoteEscapeStyle::DoubleQuoteBoundary)
+            );
+            0
+        }
+        "remote-refresh" | "remote_refresh" | "CODEX_AUTH_REMOTE_REFRESH" => {
+            let lowered = value.trim().to_ascii_lowercase();
+            if lowered != "true" && lowered != "false" {
+                eprintln!(
+                    "codex-cli config: remote-refresh must be true|false (got: {})",
+                    value
+                );
+                return 64;
+            }
+            println!("export {}={}", remote::ENV_AUTH_REMOTE_REFRESH, lowered);
+            0
+        }
         _ => {
             eprintln!("codex-cli config: unknown key: {key}");
-            eprintln!("codex-cli config: keys: model|reasoning|ephemeral|dangerous");
+            eprintln!(
+                "codex-cli config: keys: model|reasoning|ephemeral|dangerous|remote-ssh|remote-name|remote-refresh"
+            );
             64
         }
     }

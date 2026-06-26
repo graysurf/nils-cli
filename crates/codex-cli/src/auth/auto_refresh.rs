@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::auth;
 use crate::auth::output::{self, AuthAutoRefreshResult, AuthAutoRefreshTargetResult};
+use crate::auth::remote;
 use crate::paths;
 use crate::provider_profile::CODEX_PROVIDER_PROFILE;
 use nils_common::env as shared_env;
@@ -26,7 +27,25 @@ pub fn run_with_json(output_json: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    if !is_configured() {
+    let remote_config = match remote::configured_pull_from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            if output_json {
+                output::emit_error(
+                    "auth auto-refresh",
+                    err.code,
+                    err.message,
+                    Some(err.details),
+                )?;
+            } else {
+                eprintln!("{}", err.message);
+            }
+            return Ok(64);
+        }
+    };
+    let remote_configured = remote_config.is_some();
+
+    if !is_configured(remote_configured) {
         if output_json {
             output::emit_result("auth auto-refresh", zero_result(true, 0))?;
         }
@@ -83,7 +102,8 @@ pub fn run_with_json(output_json: bool) -> Result<i32> {
     if let Some(auth_file) = auth_file.as_ref() {
         targets.push(auth_file.clone());
     }
-    if let Some(secret_dir) = paths::resolve_secret_dir()
+    if !remote_configured
+        && let Some(secret_dir) = paths::resolve_secret_dir()
         && let Ok(entries) = std::fs::read_dir(&secret_dir)
     {
         for entry in entries.flatten() {
@@ -100,8 +120,10 @@ pub fn run_with_json(output_json: bool) -> Result<i32> {
     let mut target_results: Vec<AuthAutoRefreshTargetResult> = Vec::new();
 
     for target in targets {
-        if !target.is_file() {
-            if auth_file.as_ref().map(|p| p == &target).unwrap_or(false) {
+        let target_is_auth = auth_file.as_ref().map(|p| p == &target).unwrap_or(false);
+        let missing_remote_auth = target_is_auth && remote_configured && !target.is_file();
+        if !target.is_file() && !missing_remote_auth {
+            if target_is_auth {
                 skipped += 1;
                 target_results.push(AuthAutoRefreshTargetResult {
                     target_file: target.display().to_string(),
@@ -123,9 +145,14 @@ pub fn run_with_json(output_json: bool) -> Result<i32> {
         }
 
         let timestamp_path = timestamp_path(&target)?;
-        match should_refresh(&target, &timestamp_path, now_epoch, min_seconds) {
+        let decision = if missing_remote_auth {
+            RefreshDecision::Refresh
+        } else {
+            should_refresh(&target, &timestamp_path, now_epoch, min_seconds)
+        };
+        match decision {
             RefreshDecision::Refresh => {
-                let rc = if auth_file.as_ref().map(|p| p == &target).unwrap_or(false) {
+                let rc = if target_is_auth {
                     if output_json {
                         auth::refresh::run_silent(&[])?
                     } else {
@@ -221,7 +248,11 @@ fn zero_result(enabled: bool, min_age_days: i64) -> AuthAutoRefreshResult {
     }
 }
 
-fn is_configured() -> bool {
+fn is_configured(remote_configured: bool) -> bool {
+    if remote_configured && paths::resolve_auth_file().is_some() {
+        return true;
+    }
+
     let mut candidates = Vec::new();
     if let Some(auth_file) = paths::resolve_auth_file() {
         candidates.push(auth_file);
