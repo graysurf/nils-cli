@@ -234,7 +234,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ssh=[SSH host alias for the token authority]:host:_default' \
 '--name=[Remote stored secret name]:name:_default' \
 '(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
-'--access-only[Import access/id/account fields only; never import refresh_token]' \
+'--access-only[Import access/id/account fields only; write only a local refresh_token placeholder]' \
 '--write-active[Write the pulled auth payload into CODEX_AUTH_FILE]' \
 '--refresh[Ask the remote authority to refresh the named secret before export]' \
 '-h[Print help]' \
