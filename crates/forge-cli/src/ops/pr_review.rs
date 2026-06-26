@@ -425,7 +425,13 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     };
     let (pr_comment_url, review_threads) = if thread_specs.is_empty() {
         let pr_call = build_review_post_call(&ctx, &args, &body, body_present, glab_form);
-        let pr_output = runner.run(&pr_call)?;
+        let pr_output = runner.run(&pr_call).map_err(|err| {
+            if args.submit_review && ctx.provider == Provider::GitHub {
+                map_github_native_review_submit_error(args.decision, err)
+            } else {
+                err
+            }
+        })?;
         (first_url(&pr_output.stdout).unwrap_or_default(), Vec::new())
     } else {
         submit_github_review_with_threads(
@@ -705,10 +711,45 @@ fn submit_github_review_with_threads<R: BackendRunner>(
         body,
     )) {
         Ok(output) => output,
-        Err(err) => return Err(cleanup_pending_github_review(runner, ctx, &pending, err)),
+        Err(err) => {
+            let err = map_github_native_review_submit_error(decision, err);
+            return Err(cleanup_pending_github_review(runner, ctx, &pending, err));
+        }
     };
     let review_url = parse_submitted_review_url(&submit_output).unwrap_or(pending.url);
     Ok((review_url, review_threads))
+}
+
+fn map_github_native_review_submit_error(
+    decision: PrReviewDecision,
+    err: ForgeError,
+) -> ForgeError {
+    let detail = err.detail().unwrap_or_default();
+    if !is_http_unprocessable_entity(detail) {
+        return err;
+    }
+
+    let raw_detail = detail.trim();
+    let mut detail_parts = vec![
+        "GitHub rejected the native review submission with HTTP 422.".to_string(),
+        "GitHub App bot identities can comment on pull requests but may not be eligible to approve them as reviewers.".to_string(),
+        "Suggested next action: confirm the PR is ready for review, switch reviewer identity, or omit --submit-review to post an outcome comment with submitted_review=false.".to_string(),
+        format!("raw_backend_error_kind={kind}", kind = err.kind()),
+        format!("raw_backend_error_message={message}", message = err.message()),
+    ];
+    if !raw_detail.is_empty() {
+        detail_parts.push(format!("raw_backend_error_detail={raw_detail}"));
+    }
+
+    ForgeError::runtime_failure(
+        schema_err(),
+        "github_native_review_rejected",
+        format!(
+            "github rejected native {decision} review submission; retry with an eligible reviewer identity or omit --submit-review for an outcome comment fallback",
+            decision = decision.as_str(),
+        ),
+        Some(detail_parts.join("; ")),
+    )
 }
 
 fn github_owner_name(ctx: &ProviderContext) -> Result<(&str, &str), ForgeError> {
@@ -1221,6 +1262,11 @@ fn ensure_github_pull_request<R: BackendRunner>(
 fn is_http_not_found(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     lower.contains("404") || lower.contains("not found")
+}
+
+fn is_http_unprocessable_entity(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("http 422") || lower.contains("unprocessable entity")
 }
 
 /// Resolve which GitLab review-note form this `glab` build supports with a

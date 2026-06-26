@@ -769,6 +769,35 @@ esac
     )
 }
 
+fn github_review_submit_approval_422_stub(capture: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+if [ "$1" != "api" ]; then
+  echo "stub: unexpected gh command: $*" >&2
+  exit 99
+fi
+case "$2" in
+  repos/acme/widgets/pulls/44)
+    echo "44"
+    ;;
+  repos/acme/widgets/pulls/44/reviews)
+    cat >&2 <<'ERR'
+gh: Unprocessable Entity (HTTP 422)
+{{"message":"Validation Failed","errors":[{{"resource":"PullRequestReview","code":"custom","message":"Only users with explicit access can approve pull requests"}}]}}
+ERR
+    exit 1
+    ;;
+  *)
+    echo "stub: unexpected gh api endpoint: $2" >&2
+    exit 99
+    ;;
+esac
+"#
+    )
+}
+
 fn github_review_thread_submit_stub(capture: &str) -> String {
     format!(
         r#"#!/bin/sh
@@ -1625,6 +1654,69 @@ fn pr_review_submit_native_approve_allows_empty_body() {
     assert!(
         !calls.contains("body="),
         "a body-less approve must not send a body field: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_submit_native_approve_422_is_actionable() {
+    // GitHub can reject native approval for identities that can comment but are
+    // not eligible reviewers, including GitHub App bot identities. Surface that
+    // as a typed native-review failure instead of an opaque backend_error.
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_submit_approval_422_stub(
+        &capture.to_string_lossy(),
+    ));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "approve",
+            "--submit-review",
+            "--comment",
+            "Looks good.",
+        ],
+    );
+
+    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "github_native_review_rejected");
+    assert!(
+        env["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("native approve review"),
+        "{}",
+        env["error"]["message"]
+    );
+    let detail = env["error"]["details"]["detail"]
+        .as_str()
+        .expect("detail is preserved");
+    assert!(detail.contains("HTTP 422"), "{detail}");
+    assert!(detail.contains("GitHub App bot"), "{detail}");
+    assert!(detail.contains("omit --submit-review"), "{detail}");
+    assert!(detail.contains("switch reviewer identity"), "{detail}");
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert!(
+        calls.contains("repos/acme/widgets/pulls/44/reviews"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("issues/44/comments"),
+        "typed failure must not silently post a fallback comment: {calls}"
     );
 }
 

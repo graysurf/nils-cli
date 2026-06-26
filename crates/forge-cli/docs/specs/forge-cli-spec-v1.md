@@ -397,6 +397,11 @@ backend mapping, validation rules, and output schema versions.
   omits the `body` field). The same PR-existence guard runs first, and the
   reviews POST is rendered in `--dry-run` as `data.plan`. `--submit-review` on
   GitLab / Local returns `provider_unsupported` (`USAGE 64`).
+  If GitHub rejects the native review submission with HTTP 422, the command
+  returns `github_native_review_rejected` (`RUNTIME 1`) and preserves the raw
+  backend detail plus retry guidance; this covers identities that can comment
+  but are not eligible to submit an approval review, such as some GitHub App bot
+  identities.
 - With `--thread-file <path>` (GitHub-only in v1), the command creates
   resolvable review threads for actionable findings. The file must be a JSON
   array of entries shaped like
