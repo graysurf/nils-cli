@@ -4,6 +4,8 @@ use std::path::Path;
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use pretty_assertions::assert_eq;
 
+/// Runs `agent-memory` with an isolated memory home, synthetic `HOME`, and no
+/// ambient `XDG_CONFIG_HOME`.
 fn run(root: &Path, args: &[&str]) -> CmdOutput {
     let options = CmdOptions::new()
         .with_env("AGENT_MEMORY_HOME", &root.to_string_lossy())
@@ -30,6 +32,7 @@ fn no_args_and_help_print_usage() {
     assert!(help.stdout_text().contains("Usage: agent-memory <COMMAND>"));
 }
 
+/// Seeds the minimal store layout used by path, list, and init tests.
 fn seed_layout(root: &Path) {
     fs::create_dir_all(root.join("global")).expect("global dir");
     fs::create_dir_all(root.join("agents")).expect("agents dir");
@@ -172,7 +175,8 @@ fn invalid_id_returns_usage_error() {
 
 // ---- `check` command ----------------------------------------------------
 
-/// Build a well-formed note body with full frontmatter.
+/// Build a well-formed note fixture with the frontmatter required by
+/// `check` and `list` tests.
 fn note(name: &str, ty: &str, body: &str) -> String {
     format!(
         "---\nname: {name}\ndescription: \"summary for {name}\"\nmetadata:\n  node_type: memory\n  type: {ty}\n  originSessionId: 00000000-0000-0000-0000-000000000000\n---\n\n{body}\n"
@@ -455,7 +459,7 @@ fn check_all_sweeps_agent_scopes() {
 
 // ---- `add` command ------------------------------------------------------
 
-/// Seed a writable `global` scope with an empty index.
+/// Seed a writable `global` scope with an empty index for add/write tests.
 fn seed_writable_global(root: &Path) {
     fs::create_dir_all(root.join("global")).expect("global dir");
     fs::create_dir_all(root.join("agents")).expect("agents dir");
@@ -634,6 +638,8 @@ fn list_default_output_is_unchanged() {
 
 // ---- `search` command ---------------------------------------------------
 
+/// Build a note fixture whose description and body can be searched
+/// independently.
 fn note_with(name: &str, ty: &str, description: &str, body: &str) -> String {
     format!(
         "---\nname: {name}\ndescription: \"{description}\"\nmetadata:\n  node_type: memory\n  type: {ty}\n  originSessionId: 00000000-0000-0000-0000-000000000000\n---\n\n{body}\n"
