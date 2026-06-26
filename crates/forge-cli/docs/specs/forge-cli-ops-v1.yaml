@@ -258,7 +258,7 @@ operations:
     validations:
       - no_local_path # review comment body, thread spec bodies/paths, AND the generated issue mirror (lens values are user-controlled), validated before any post
       - no_escaped_control_markdown # review comment body, thread spec bodies/paths, AND the generated issue mirror, validated before any post
-    # Op-specific pre-mutation error kinds:
+    # Op-specific error kinds:
     #   issue_required (DATA 65)       — --mirror-issue without --issue
     #   id_not_pull_request (DATA 65)  — GitHub <id> is not a pull request (the guard saw HTTP 404)
     #   invalid_review_thread_spec (DATA 65) — malformed, oversized, or locally invalid thread spec fields

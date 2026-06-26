@@ -933,6 +933,55 @@ esac
     )
 }
 
+fn github_review_thread_approval_422_on_submit_stub(capture: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+if [ "$1" != "api" ]; then
+  echo "stub: unexpected gh command: $*" >&2
+  exit 99
+fi
+case "$2" in
+  repos/acme/widgets/pulls/44)
+    echo "44"
+    ;;
+  graphql)
+    case "$*" in
+      *"repository(owner:"*)
+        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kwDOabc","url":"https://github.com/acme/widgets/pull/44"}}}}}}}}'
+        ;;
+      *"addPullRequestReview(input:"*)
+        printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
+        ;;
+      *"addPullRequestReviewThread(input:"*)
+        printf '%s\n' '{{"data":{{"addPullRequestReviewThread":{{"thread":{{"id":"PRRT_kwDOthread","path":"src/lib.rs","line":42,"subjectType":"LINE","comments":{{"nodes":[{{"url":"https://github.com/acme/widgets/pull/44#discussion_r42"}}]}}}}}}}}}}'
+        ;;
+      *"submitPullRequestReview(input:"*)
+        cat >&2 <<'ERR'
+gh: Unprocessable Entity (HTTP 422)
+{{"message":"Validation Failed","errors":[{{"resource":"PullRequestReview","code":"custom","message":"Only users with explicit access can approve pull requests"}}]}}
+ERR
+        exit 1
+        ;;
+      *"deletePullRequestReview(input:"*)
+        printf '%s\n' '{{"data":{{"deletePullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
+        ;;
+      *)
+        echo "stub: unexpected graphql payload: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  *)
+    echo "stub: unexpected gh api endpoint: $2" >&2
+    exit 99
+    ;;
+esac
+"#
+    )
+}
+
 #[test]
 fn pr_review_thread_file_creates_resolvable_github_review_thread() {
     let stub = StubEnv::new();
@@ -1471,6 +1520,73 @@ fn pr_review_thread_file_cleans_up_pending_review_after_submit_failure() {
 }
 
 #[test]
+fn pr_review_thread_file_submit_422_is_actionable_and_cleans_up() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let thread_file = stub.tempdir.path().join("review-threads.json");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&github_review_thread_approval_422_on_submit_stub(
+        &capture.to_string_lossy(),
+    ));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "approve",
+            "--submit-review",
+            "--comment",
+            "Summary body",
+            "--thread-file",
+            thread_file.to_str().expect("utf8 path"),
+        ],
+    );
+
+    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "github_native_review_rejected");
+    let detail = env["error"]["details"]["detail"]
+        .as_str()
+        .expect("detail is preserved");
+    assert!(detail.contains("HTTP 422"), "{detail}");
+    assert!(detail.contains("raw_backend_error_detail="), "{detail}");
+    assert!(
+        detail.contains("Only users with explicit access can approve pull requests"),
+        "{detail}"
+    );
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert!(calls.contains("addPullRequestReview(input:"), "{calls}");
+    assert!(
+        calls.contains("addPullRequestReviewThread(input:"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("submitPullRequestReview(input:"),
+        "submit should have been attempted after thread creation: {calls}"
+    );
+    assert!(
+        calls.contains("deletePullRequestReview(input:"),
+        "pending review cleanup mutation should run after submit failure: {calls}"
+    );
+}
+
+#[test]
 fn pr_review_thread_file_rejects_without_submit_review() {
     let stub = StubEnv::new().gh_stub("#!/bin/sh\necho should-not-run >&2\nexit 99\n");
     let thread_file = stub.tempdir.path().join("review-threads.json");
@@ -1708,6 +1824,11 @@ fn pr_review_submit_native_approve_422_is_actionable() {
     assert!(detail.contains("GitHub App bot"), "{detail}");
     assert!(detail.contains("omit --submit-review"), "{detail}");
     assert!(detail.contains("switch reviewer identity"), "{detail}");
+    assert!(detail.contains("raw_backend_error_detail="), "{detail}");
+    assert!(
+        detail.contains("Only users with explicit access can approve pull requests"),
+        "{detail}"
+    );
 
     let calls = fs::read_to_string(capture).expect("read captured calls");
     assert!(
