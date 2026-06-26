@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use crate::auth;
 use crate::auth::output::{self, AuthRemotePullResult};
@@ -36,6 +36,13 @@ pub struct RemotePullFailure {
     pub message: String,
     pub details: Option<Value>,
     pub exit_code: i32,
+}
+
+struct RemoteExportSuccess {
+    output: Output,
+    refresh_attempted: bool,
+    refresh_fallback: bool,
+    refresh_error_code: Option<String>,
 }
 
 pub fn pull_with_json(
@@ -157,45 +164,11 @@ pub fn pull_access_only_to_active(
     name: &str,
     refresh: bool,
 ) -> Result<std::result::Result<AuthRemotePullResult, RemotePullFailure>> {
-    let mut command = Command::new("ssh");
-    command
-        .arg(ssh_host)
-        .arg("codex-cli")
-        .arg("auth")
-        .arg("remote")
-        .arg("export")
-        .arg("--name")
-        .arg(name)
-        .arg("--access-only");
-    if refresh {
-        command.arg("--refresh");
-    }
-
-    let remote_output = match command.output() {
-        Ok(output) => output,
-        Err(err) => {
-            return Ok(Err(RemotePullFailure {
-                code: "ssh-exec-failed",
-                message: format!("codex-remote-pull: failed to run ssh: {err}"),
-                details: None,
-                exit_code: 1,
-            }));
-        }
+    let remote_export = match run_remote_export_with_fallback(ssh_host, name, refresh) {
+        Ok(success) => success,
+        Err(failure) => return Ok(Err(failure)),
     };
-
-    if !remote_output.status.success() {
-        let exit_code = remote_output.status.code().unwrap_or(1);
-        return Ok(Err(RemotePullFailure {
-            code: "remote-export-failed",
-            message: format!("codex-remote-pull: remote export failed (exit {exit_code})"),
-            details: Some(serde_json::json!({
-                "ssh": ssh_host,
-                "name": name,
-                "exit_code": exit_code,
-            })),
-            exit_code: 1,
-        }));
-    }
+    let remote_output = remote_export.output;
 
     let imported: Value = match serde_json::from_slice(&remote_output.stdout) {
         Ok(value) => value,
@@ -264,7 +237,88 @@ pub fn pull_access_only_to_active(
         auth_file: auth_file.display().to_string(),
         has_oauth_access_token: has_oauth_access_token(&imported),
         has_oauth_refresh_token: has_real_oauth_refresh_token(&imported),
+        remote_refresh_attempted: remote_export.refresh_attempted.then_some(true),
+        remote_refresh_fallback: remote_export.refresh_fallback.then_some(true),
+        remote_refresh_error_code: remote_export.refresh_error_code,
     }))
+}
+
+fn run_remote_export_with_fallback(
+    ssh_host: &str,
+    name: &str,
+    refresh: bool,
+) -> std::result::Result<RemoteExportSuccess, RemotePullFailure> {
+    match run_remote_export(ssh_host, name, refresh) {
+        Ok(output) if output.status.success() => Ok(RemoteExportSuccess {
+            output,
+            refresh_attempted: refresh,
+            refresh_fallback: false,
+            refresh_error_code: None,
+        }),
+        Ok(output) => {
+            let primary_failure = remote_export_status_failure(ssh_host, name, &output);
+            if !refresh {
+                return Err(primary_failure);
+            }
+
+            match run_remote_export(ssh_host, name, false) {
+                Ok(fallback_output) if fallback_output.status.success() => {
+                    Ok(RemoteExportSuccess {
+                        output: fallback_output,
+                        refresh_attempted: true,
+                        refresh_fallback: true,
+                        refresh_error_code: Some(primary_failure.code.to_string()),
+                    })
+                }
+                Ok(_) | Err(_) => Err(primary_failure),
+            }
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+fn run_remote_export(
+    ssh_host: &str,
+    name: &str,
+    refresh: bool,
+) -> std::result::Result<Output, RemotePullFailure> {
+    let mut command = Command::new("ssh");
+    command
+        .arg(ssh_host)
+        .arg("codex-cli")
+        .arg("auth")
+        .arg("remote")
+        .arg("export")
+        .arg("--name")
+        .arg(name)
+        .arg("--access-only");
+    if refresh {
+        command.arg("--refresh");
+    }
+
+    match command.output() {
+        Ok(output) => Ok(output),
+        Err(err) => Err(RemotePullFailure {
+            code: "ssh-exec-failed",
+            message: format!("codex-remote-pull: failed to run ssh: {err}"),
+            details: None,
+            exit_code: 1,
+        }),
+    }
+}
+
+fn remote_export_status_failure(ssh_host: &str, name: &str, output: &Output) -> RemotePullFailure {
+    let exit_code = output.status.code().unwrap_or(1);
+    RemotePullFailure {
+        code: "remote-export-failed",
+        message: format!("codex-remote-pull: remote export failed (exit {exit_code})"),
+        details: Some(serde_json::json!({
+            "ssh": ssh_host,
+            "name": name,
+            "exit_code": exit_code,
+        })),
+        exit_code: 1,
+    }
 }
 
 pub fn export(name: &str, access_only: bool, refresh: bool) -> Result<i32> {

@@ -52,6 +52,10 @@ fn stderr(output: &CmdOutput) -> String {
     output.stderr_text()
 }
 
+fn stdout(output: &CmdOutput) -> String {
+    output.stdout_text()
+}
+
 fn assert_exit(output: &CmdOutput, code: i32) {
     assert_eq!(output.code, code);
 }
@@ -148,6 +152,81 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
     assert!(captured_args.contains("--name team"));
     assert!(captured_args.contains("--access-only"));
     assert!(!captured_args.contains("--refresh"));
+}
+
+#[test]
+fn auth_refresh_remote_refresh_falls_back_to_active_export_when_remote_refresh_fails() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let stubs = dir.path().join("stubs");
+    fs::create_dir_all(&stubs).expect("stubs dir");
+
+    let auth_file = dir.path().join("auth.json");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&cache).expect("cache dir");
+    fs::write(&auth_file, r#"{"tokens":{"access_token":"stale-local"}}"#).expect("write auth");
+
+    let args_file = dir.path().join("ssh-args.txt");
+    write_exe(
+        &stubs,
+        "ssh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$SSH_ARGS_FILE"
+if [[ "$*" == *"--refresh"* ]]; then
+  printf '%s\n' "codex-remote-export: refresh failed for team.json" >&2
+  exit 3
+fi
+printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
+"#,
+    );
+
+    let remote_payload = format!(
+        r#"{{"tokens":{{"access_token":"{}","id_token":"{}","account_id":"acct_001"}},"last_refresh":"2025-01-20T12:34:56Z"}}"#,
+        ACCESS_TOKEN, ID_TOKEN
+    );
+    let output = run_with_path_prepend(
+        &["auth", "refresh", "--format", "json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_CACHE_DIR", &cache),
+        ],
+        &[
+            ("CODEX_AUTH_REMOTE_SSH", "auth-host"),
+            ("CODEX_AUTH_REMOTE_NAME", "team"),
+            ("CODEX_AUTH_REMOTE_REFRESH", "true"),
+            ("REMOTE_AUTH_PAYLOAD", &remote_payload),
+            ("SSH_ARGS_FILE", args_file.to_str().expect("args path")),
+        ],
+        &stubs,
+    );
+
+    assert_exit(&output, 0);
+
+    let captured_args = fs::read_to_string(&args_file).expect("read ssh args");
+    let calls: Vec<&str> = captured_args.lines().collect();
+    assert_eq!(calls.len(), 2, "expected refresh attempt and fallback");
+    assert!(calls[0].contains("--refresh"));
+    assert!(!calls[1].contains("--refresh"));
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json envelope");
+    assert_eq!(payload["command"], "auth refresh");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["remote_sync"], true);
+    assert_eq!(payload["result"]["remote_refresh_attempted"], true);
+    assert_eq!(payload["result"]["remote_refresh_fallback"], true);
+    assert_eq!(
+        payload["result"]["remote_refresh_error_code"],
+        "remote-export-failed"
+    );
+
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(&auth_file).expect("read auth file"))
+            .expect("applied auth json");
+    assert_eq!(applied["tokens"]["access_token"], ACCESS_TOKEN);
+    assert_eq!(
+        applied["tokens"]["refresh_token"],
+        ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
+    );
 }
 
 #[test]
