@@ -286,6 +286,9 @@ fn run_with_mode(args: &[String], output_mode: RefreshOutputMode) -> Result<i32>
                 remote_sync: None,
                 remote_ssh: None,
                 remote_name: None,
+                remote_refresh_attempted: None,
+                remote_refresh_fallback: None,
+                remote_refresh_error_code: None,
             },
         )?;
     } else if output_text {
@@ -336,6 +339,9 @@ fn run_remote_refresh(
                 remote_sync: Some(true),
                 remote_ssh: Some(config.ssh.clone()),
                 remote_name: Some(config.name.clone()),
+                remote_refresh_attempted: pull.remote_refresh_attempted,
+                remote_refresh_fallback: pull.remote_refresh_fallback,
+                remote_refresh_error_code: pull.remote_refresh_error_code,
             },
         )?;
     } else if output_text {

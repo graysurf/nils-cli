@@ -48,6 +48,12 @@ pub struct AuthRefreshResult {
     pub remote_ssh: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_refresh_attempted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_refresh_fallback: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_refresh_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +128,12 @@ pub struct AuthRemotePullResult {
     pub auth_file: String,
     pub has_oauth_access_token: bool,
     pub has_oauth_refresh_token: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_refresh_attempted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_refresh_fallback: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_refresh_error_code: Option<String>,
 }
 
 pub fn emit_result<T: Serialize>(command: &str, result: T) -> Result<()> {
