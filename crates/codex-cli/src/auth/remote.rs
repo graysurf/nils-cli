@@ -292,6 +292,12 @@ pub fn export(name: &str, access_only: bool, refresh: bool) -> Result<i32> {
             eprintln!("codex-remote-export: refresh failed for {secret_name}");
             return Ok(rc);
         }
+        if let Err(err) = sync_matching_active_from_secret(&target) {
+            eprintln!(
+                "codex-remote-export: failed to sync refreshed secret into matching active auth: {err}"
+            );
+            return Ok(6);
+        }
     }
 
     if !target.is_file() {
@@ -309,6 +315,49 @@ pub fn export(name: &str, access_only: bool, refresh: bool) -> Result<i32> {
 
     println!("{}", serde_json::to_string(&value)?);
     Ok(0)
+}
+
+fn sync_matching_active_from_secret(secret_file: &Path) -> Result<bool> {
+    let Some(auth_file) = paths::resolve_auth_file() else {
+        return Ok(false);
+    };
+    if !auth_file.is_file() || !secret_file.is_file() {
+        return Ok(false);
+    }
+
+    let Some(secret_key) = auth::identity_key_from_auth_file(secret_file)
+        .ok()
+        .flatten()
+    else {
+        return Ok(false);
+    };
+    let Some(active_key) = auth::identity_key_from_auth_file(&auth_file).ok().flatten() else {
+        return Ok(false);
+    };
+    if active_key != secret_key {
+        return Ok(false);
+    }
+
+    let active_hash = fs::sha256_file(&auth_file)?;
+    let secret_hash = fs::sha256_file(secret_file)?;
+    if active_hash == secret_hash {
+        write_active_timestamp_from_auth(&auth_file)?;
+        return Ok(false);
+    }
+
+    let contents = std::fs::read(secret_file)?;
+    fs::write_atomic(&auth_file, &contents, fs::SECRET_FILE_MODE)?;
+    write_active_timestamp_from_auth(&auth_file)?;
+    Ok(true)
+}
+
+fn write_active_timestamp_from_auth(auth_file: &Path) -> Result<()> {
+    let Some(timestamp_path) = paths::resolve_secret_timestamp_path(auth_file) else {
+        return Ok(());
+    };
+    let iso = auth::last_refresh_from_auth_file(auth_file).unwrap_or(None);
+    fs::write_timestamp(&timestamp_path, iso.as_deref())?;
+    Ok(())
 }
 
 fn usage_error(output_json: bool, code: &str, message: &str) -> Result<i32> {
@@ -473,7 +522,29 @@ fn is_valid_secret_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_secret_name, is_valid_ssh_host, sanitize_access_only};
+    use super::{
+        is_valid_secret_name, is_valid_ssh_host, sanitize_access_only,
+        sync_matching_active_from_secret,
+    };
+    use nils_test_support::{EnvGuard, GlobalStateLock};
+
+    const HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
+    const PAYLOAD_ALPHA: &str = "eyJzdWIiOiJ1c2VyXzEyMyIsImVtYWlsIjoiYWxwaGFAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoidXNlcl8xMjMiLCJlbWFpbCI6ImFscGhhQGV4YW1wbGUuY29tIn19";
+    const PAYLOAD_BETA: &str = "eyJzdWIiOiJ1c2VyXzQ1NiIsImVtYWlsIjoiYmV0YUBleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyXzQ1NiIsImVtYWlsIjoiYmV0YUBleGFtcGxlLmNvbSJ9fQ";
+
+    fn token(payload: &str) -> String {
+        format!("{HEADER}.{payload}.sig")
+    }
+
+    fn auth_json(payload: &str, refresh_token: &str, last_refresh: &str) -> String {
+        format!(
+            r#"{{"tokens":{{"access_token":"{}","id_token":"{}","refresh_token":"{}","account_id":"acct_001"}},"last_refresh":"{}"}}"#,
+            token(payload),
+            token(payload),
+            refresh_token,
+            last_refresh
+        )
+    }
 
     #[test]
     fn remote_sanitize_access_only_keeps_only_access_fields() {
@@ -523,5 +594,67 @@ mod tests {
         assert!(!is_valid_secret_name("a;bad"));
         assert!(!is_valid_secret_name("a$bad"));
         assert!(!is_valid_secret_name("a`bad"));
+    }
+
+    #[test]
+    fn remote_sync_matching_active_from_secret_updates_same_identity() {
+        let lock = GlobalStateLock::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let auth_file = dir.path().join("auth.json");
+        let secret_file = dir.path().join("gamania.json");
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("cache");
+
+        let active = auth_json(PAYLOAD_ALPHA, "refresh_old", "2025-01-19T12:34:56Z");
+        let refreshed = auth_json(PAYLOAD_ALPHA, "refresh_new", "2025-01-20T12:34:56Z");
+        std::fs::write(&auth_file, active).expect("active auth");
+        std::fs::write(&secret_file, &refreshed).expect("secret");
+
+        let _auth = EnvGuard::set(
+            &lock,
+            "CODEX_AUTH_FILE",
+            auth_file.to_string_lossy().as_ref(),
+        );
+        let _cache = EnvGuard::set(
+            &lock,
+            "CODEX_SECRET_CACHE_DIR",
+            cache_dir.to_string_lossy().as_ref(),
+        );
+
+        assert!(sync_matching_active_from_secret(&secret_file).expect("sync"));
+
+        assert_eq!(
+            std::fs::read_to_string(&auth_file).expect("read active"),
+            refreshed
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.join("auth.json.timestamp")).expect("read timestamp"),
+            "2025-01-20T12:34:56Z"
+        );
+    }
+
+    #[test]
+    fn remote_sync_matching_active_from_secret_skips_different_identity() {
+        let lock = GlobalStateLock::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let auth_file = dir.path().join("auth.json");
+        let secret_file = dir.path().join("gamania.json");
+
+        let active = auth_json(PAYLOAD_BETA, "refresh_beta", "2025-01-19T12:34:56Z");
+        let refreshed = auth_json(PAYLOAD_ALPHA, "refresh_new", "2025-01-20T12:34:56Z");
+        std::fs::write(&auth_file, &active).expect("active auth");
+        std::fs::write(&secret_file, refreshed).expect("secret");
+
+        let _auth = EnvGuard::set(
+            &lock,
+            "CODEX_AUTH_FILE",
+            auth_file.to_string_lossy().as_ref(),
+        );
+
+        assert!(!sync_matching_active_from_secret(&secret_file).expect("sync"));
+        assert_eq!(
+            std::fs::read_to_string(&auth_file).expect("read active"),
+            active
+        );
     }
 }
