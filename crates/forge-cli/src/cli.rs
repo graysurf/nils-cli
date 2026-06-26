@@ -465,8 +465,9 @@ pub struct PrReviewArgs {
     #[arg(long = "submit-review", action = ArgAction::SetTrue)]
     pub submit_review: bool,
     /// Create resolvable GitHub review threads from a JSON array of actionable
-    /// findings. Requires `--submit-review`; omit this for summary-only
-    /// reviews. Repair findings, then resolve via `pr review-threads resolve`.
+    /// findings (max 50 threads; 16 KiB body each). Requires `--submit-review`;
+    /// omit this for summary-only reviews. Repair findings, then resolve via
+    /// `pr review-threads resolve`.
     #[arg(long = "thread-file", value_name = "PATH")]
     pub thread_file: Option<String>,
 }

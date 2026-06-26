@@ -25,6 +25,9 @@ cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --comment-
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --comment-file review.md --thread-file review-threads.json --format json
 ```
 
+`--thread-file` is for actionable findings only: max 50 threads, 16 KiB body
+each. Put non-blocking notes in the review body.
+
 `forge-cli` does NOT introduce a `--json` boolean flag. Use
 `--format text|json` exclusively.
 

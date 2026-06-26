@@ -158,7 +158,7 @@ request-changes\:"Record a request-changes outcome in the posted review comment"
 '--comment-file=[Read review outcome comment body from a file. Use \`-\` for stdin]:PATH:_default' \
 '*--lens=[Review lens name to include in output and issue mirror metadata]:LENS:_default' \
 '--issue=[Issue number that should receive the optional activity mirror]:ISSUE_NUMBER:_default' \
-'--thread-file=[Create resolvable GitHub review threads from a JSON array of actionable findings. Requires \`--submit-review\`; omit this for summary-only reviews. Repair findings, then resolve via \`pr review-threads resolve\`]:PATH:_default' \
+'--thread-file=[Create resolvable GitHub review threads from a JSON array of actionable findings (max 50 threads; 16 KiB body each). Requires \`--submit-review\`; omit this for summary-only reviews. Repair findings, then resolve via \`pr review-threads resolve\`]:PATH:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \

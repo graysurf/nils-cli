@@ -5,7 +5,7 @@
 //! rendered review outcome, and forge-cli posts it to the PR/MR plus an
 //! optional compact issue activity mirror.
 
-use std::ffi::OsString;
+use std::{ffi::OsString, fs, io::Read};
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,10 @@ use crate::validations::{no_escaped_control_markdown, no_local_path};
 
 const SCHEMA: &str = "pr.review";
 const SCHEMA_VERSION: u32 = 1;
+const REVIEW_THREAD_FILE_MAX_BYTES: u64 = 256 * 1024;
+const REVIEW_THREAD_MAX_COUNT: usize = 50;
+const REVIEW_THREAD_PATH_MAX_BYTES: usize = 1024;
+const REVIEW_THREAD_BODY_MAX_BYTES: usize = 16 * 1024;
 
 /// Placeholder `review_url` used only to validate the generated issue mirror
 /// body *before* the PR comment is posted. The real URL is provider-returned
@@ -499,11 +503,50 @@ fn build_review_post_call(
 }
 
 fn read_review_thread_specs(path: &str) -> Result<Vec<PreparedReviewThreadSpec>, ForgeError> {
-    let raw = pr_comment::read_body_with_file_flag(None, Some(path), "--thread-file")?;
+    let raw = read_review_thread_file_bounded(path)?;
     parse_review_thread_specs(&raw)
 }
 
+fn read_review_thread_file_bounded(path: &str) -> Result<String, ForgeError> {
+    let mut raw = String::new();
+    let read_limit = REVIEW_THREAD_FILE_MAX_BYTES + 1;
+    if path == "-" {
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock().take(read_limit);
+        reader.read_to_string(&mut raw).map_err(|e| {
+            ForgeError::software(
+                schema_err(),
+                "failed to read --thread-file from stdin",
+                Some(e.to_string()),
+            )
+        })?;
+        return Ok(raw);
+    }
+
+    let file = fs::File::open(path).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            format!("failed to read --thread-file '{path}'"),
+            Some(e.to_string()),
+        )
+    })?;
+    let mut reader = file.take(read_limit);
+    reader.read_to_string(&mut raw).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            format!("failed to read --thread-file '{path}'"),
+            Some(e.to_string()),
+        )
+    })?;
+    Ok(raw)
+}
+
 fn parse_review_thread_specs(raw: &str) -> Result<Vec<PreparedReviewThreadSpec>, ForgeError> {
+    if raw.len() > REVIEW_THREAD_FILE_MAX_BYTES as usize {
+        return Err(review_thread_spec_err(format!(
+            "--thread-file must be at most {REVIEW_THREAD_FILE_MAX_BYTES} bytes"
+        )));
+    }
     let specs: Vec<ReviewThreadSpec> = serde_json::from_str(raw).map_err(|e| {
         ForgeError::validation(
             schema_err(),
@@ -516,6 +559,11 @@ fn parse_review_thread_specs(raw: &str) -> Result<Vec<PreparedReviewThreadSpec>,
         return Err(review_thread_spec_err(
             "--thread-file must contain at least one review thread spec",
         ));
+    }
+    if specs.len() > REVIEW_THREAD_MAX_COUNT {
+        return Err(review_thread_spec_err(format!(
+            "--thread-file must contain at most {REVIEW_THREAD_MAX_COUNT} review thread specs"
+        )));
     }
     specs
         .into_iter()
@@ -534,9 +582,19 @@ fn prepare_review_thread_spec(
             "thread spec #{index} needs path and body"
         )));
     }
+    if path.len() > REVIEW_THREAD_PATH_MAX_BYTES {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} path must be at most {REVIEW_THREAD_PATH_MAX_BYTES} bytes"
+        )));
+    }
     if spec.body.trim().is_empty() {
         return Err(review_thread_spec_err(format!(
             "thread spec #{index} needs path and body"
+        )));
+    }
+    if spec.body.len() > REVIEW_THREAD_BODY_MAX_BYTES {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} body must be at most {REVIEW_THREAD_BODY_MAX_BYTES} bytes"
         )));
     }
     no_local_path(&path, "review thread path")?;

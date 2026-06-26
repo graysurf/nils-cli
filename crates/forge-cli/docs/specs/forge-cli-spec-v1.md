@@ -403,8 +403,10 @@ backend mapping, validation rules, and output schema versions.
   `{ "path": "src/lib.rs", "line": 42, "side": "RIGHT", "body": "..." }`.
   `side` defaults to `RIGHT`; `startLine` / `startSide` are accepted for ranged
   comments; omitting `line` creates a file-level thread (`subjectType=FILE`),
-  while line comments use `subjectType=LINE`. `--thread-file` requires
-  `--submit-review`; omit it for a summary-only review. A live GitHub run first
+  while line comments use `subjectType=LINE`. The thread file is capped at
+  256 KiB, 50 specs, 1024-byte paths, and 16 KiB bodies; put lower-priority
+  findings in the summary body or split them into a later review. `--thread-file`
+  requires `--submit-review`; omit it for a summary-only review. A live GitHub run first
   looks up the PR node id, creates a pending review, adds each thread with
   `addPullRequestReviewThread`, then publishes the review with
   `submitPullRequestReview`. JSON output includes
@@ -415,7 +417,7 @@ backend mapping, validation rules, and output schema versions.
   fails after the pending review is created, the command attempts a best-effort
   `deletePullRequestReview` cleanup before returning the original failure; if
   cleanup also fails, error details include the pending review id/url and cleanup
-  failure. Malformed specs return
+  failure. Malformed or oversized specs return
   `invalid_review_thread_spec` (`DATA 65`); `--thread-file` without
   `--submit-review` returns `thread_file_requires_submit_review` (`DATA 65`);
   GitLab / Local return `provider_unsupported` (`USAGE 64`) before any backend

@@ -254,16 +254,18 @@ operations:
       - { name: --issue,          type: integer, required: false }
       - { name: --mirror-issue,   type: bool,    default: false }
       - { name: --submit-review,  type: bool,    default: false } # GitHub-only: submit a native review event (#pullrequestreview-) instead of an outcome comment; --decision maps to event (comments-only->COMMENT, approve->APPROVE, request-changes->REQUEST_CHANGES); body required for COMMENT/REQUEST_CHANGES, optional for APPROVE
-      - { name: --thread-file,    type: path,    required: false } # GitHub-only JSON array of actionable review-thread specs; requires --submit-review. Use only for findings that should be repaired then resolved via pr review-threads resolve.
+      - { name: --thread-file,    type: path,    required: false } # GitHub-only JSON array of actionable review-thread specs; requires --submit-review; max 256 KiB, 50 specs, 1024-byte paths, 16 KiB bodies. Use only for findings that should be repaired then resolved via pr review-threads resolve.
     validations:
       - no_local_path # review comment body, thread spec bodies/paths, AND the generated issue mirror (lens values are user-controlled), validated before any post
       - no_escaped_control_markdown # review comment body, thread spec bodies/paths, AND the generated issue mirror, validated before any post
-    # Op-specific error kinds (all raised before any backend mutation):
+    # Op-specific pre-mutation error kinds:
     #   issue_required (DATA 65)       — --mirror-issue without --issue
     #   id_not_pull_request (DATA 65)  — GitHub <id> is not a pull request (the guard saw HTTP 404)
-    #   invalid_review_thread_spec (DATA 65) — malformed --thread-file JSON or an unmappable spec
+    #   invalid_review_thread_spec (DATA 65) — malformed, oversized, or locally invalid thread spec fields
     #   thread_file_requires_submit_review (DATA 65) — --thread-file without --submit-review
     #   provider_unsupported (USAGE 64) — --submit-review or --thread-file on gitlab/local (native review/thread creation is GitHub-only in v1)
+    # Provider diff-mapping failures from addPullRequestReviewThread surface as backend_error (RUNTIME 1)
+    # after best-effort pending-review cleanup.
     # A non-404 guard failure (rate limit, 5xx, forbidden/SSO) surfaces as backend_error (RUNTIME 1),
     # not id_not_pull_request, since it may have hit a valid PR.
     backends:

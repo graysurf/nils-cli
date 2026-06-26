@@ -5,9 +5,10 @@
 //! code under test never reaches the real internet.
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
@@ -112,6 +113,37 @@ pub fn run_forge_cli_in(stub: &StubEnv, args: &[&str], cwd: Option<&Path>) -> Cm
         cmd.current_dir(dir);
     }
     let output = cmd.output().expect("spawn forge-cli");
+    CmdOutput {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Run `forge-cli` with controlled stdin.
+pub fn run_forge_cli_with_stdin(stub: &StubEnv, args: &[&str], stdin: &str) -> CmdOutput {
+    let mut cmd = Command::new(forge_cli_bin());
+    cmd.args(args);
+    for key in SCRUBBED_ENV {
+        cmd.env_remove(key);
+    }
+    cmd.env("XDG_CONFIG_HOME", stub.tempdir.path().join("xdg-config"));
+    for (k, v) in &stub.envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn forge-cli");
+    {
+        let mut child_stdin = child.stdin.take().expect("child stdin");
+        child_stdin
+            .write_all(stdin.as_bytes())
+            .expect("write forge-cli stdin");
+    }
+    let output = child.wait_with_output().expect("wait forge-cli");
     CmdOutput {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
