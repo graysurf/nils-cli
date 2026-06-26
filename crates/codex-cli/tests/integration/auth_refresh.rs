@@ -10,6 +10,7 @@ const ACCESS_TOKEN: &str = "remote-access-token";
 const ID_TOKEN: &str = "remote-id-token";
 const HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
 const PAYLOAD_ALPHA: &str = "eyJzdWIiOiJ1c2VyXzEyMyIsImVtYWlsIjoiYWxwaGFAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoidXNlcl8xMjMiLCJlbWFpbCI6ImFscGhhQGV4YW1wbGUuY29tIn19";
+const ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER: &str = "codex-remote-access-only-placeholder";
 
 fn token(payload: &str) -> String {
     format!("{HEADER}.{payload}.sig")
@@ -136,7 +137,10 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
     assert_eq!(applied["tokens"]["access_token"], ACCESS_TOKEN);
     assert_eq!(applied["tokens"]["id_token"], ID_TOKEN);
     assert_eq!(applied["tokens"]["account_id"], "acct_001");
-    assert!(applied["tokens"].get("refresh_token").is_none());
+    assert_eq!(
+        applied["tokens"]["refresh_token"],
+        ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
+    );
 
     let captured_args = fs::read_to_string(&args_file).expect("read ssh args");
     assert!(captured_args.contains("auth-host"));

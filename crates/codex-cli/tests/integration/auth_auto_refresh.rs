@@ -6,6 +6,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER: &str = "codex-remote-access-only-placeholder";
+
 fn codex_cli_bin() -> PathBuf {
     bin::resolve("codex-cli")
 }
@@ -320,7 +322,10 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
         serde_json::from_str(&fs::read_to_string(&auth_file).expect("read auth file"))
             .expect("applied auth json");
     assert_eq!(applied["tokens"]["access_token"], "remote-access-token");
-    assert!(applied["tokens"].get("refresh_token").is_none());
+    assert_eq!(
+        applied["tokens"]["refresh_token"],
+        ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
+    );
 
     let captured_args = fs::read_to_string(&args_file).expect("read ssh args");
     assert!(captured_args.contains("auth-host"));

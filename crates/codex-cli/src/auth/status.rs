@@ -142,8 +142,8 @@ pub fn inspect_active_auth() -> ActiveAuthStatus {
 
     let has_oauth_access_token = has_non_empty_string(&value, &["tokens", "access_token"])
         || has_non_empty_string(&value, &["access_token"]);
-    let has_oauth_refresh_token = has_non_empty_string(&value, &["tokens", "refresh_token"])
-        || has_non_empty_string(&value, &["refresh_token"]);
+    let has_oauth_refresh_token = has_real_refresh_token(&value, &["tokens", "refresh_token"])
+        || has_real_refresh_token(&value, &["refresh_token"]);
     let has_api_key = has_non_empty_string(&value, &["OPENAI_API_KEY"])
         || has_non_empty_string(&value, &["api_key"])
         || has_non_empty_string(&value, &["openai_api_key"])
@@ -236,6 +236,12 @@ fn has_non_empty_string(value: &Value, path: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+fn has_real_refresh_token(value: &Value, path: &[&str]) -> bool {
+    json::string_at(value, path)
+        .map(|value| auth::is_real_refresh_token(value.trim()))
+        .unwrap_or(false)
+}
+
 fn inspect_matching_secret(auth_file: &Path) -> (Option<String>, Option<SecretMatchMode>) {
     let Some(secret_dir) = paths::resolve_secret_dir() else {
         return (None, None);
@@ -308,7 +314,8 @@ fn print_text_status(status: &ActiveAuthStatus) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthKind, AuthStatusReason, has_non_empty_string};
+    use super::{AuthKind, AuthStatusReason, has_non_empty_string, has_real_refresh_token};
+    use crate::auth::ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -321,6 +328,24 @@ mod tests {
         assert!(!has_non_empty_string(&value, &["a", "blank"]));
         assert!(!has_non_empty_string(&value, &["a", "null"]));
         assert!(!has_non_empty_string(&value, &["a", "missing"]));
+    }
+
+    #[test]
+    fn has_real_refresh_token_rejects_access_only_placeholder() {
+        let value = json!({
+            "tokens": {
+                "refresh_token": ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
+            },
+            "real": {
+                "refresh_token": "refresh-secret"
+            }
+        });
+
+        assert!(!has_real_refresh_token(
+            &value,
+            &["tokens", "refresh_token"]
+        ));
+        assert!(has_real_refresh_token(&value, &["real", "refresh_token"]));
     }
 
     #[test]

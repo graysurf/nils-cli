@@ -225,6 +225,7 @@ pub fn pull_access_only_to_active(
         }));
     }
     ensure_last_refresh(&mut imported);
+    ensure_access_only_refresh_placeholder(&mut imported);
 
     let auth_file = match paths::resolve_auth_file() {
         Some(path) => path,
@@ -262,8 +263,7 @@ pub fn pull_access_only_to_active(
         write_active: true,
         auth_file: auth_file.display().to_string(),
         has_oauth_access_token: has_oauth_access_token(&imported),
-        has_oauth_refresh_token: has_non_empty_string(&imported, &["tokens", "refresh_token"])
-            || has_non_empty_string(&imported, &["refresh_token"]),
+        has_oauth_refresh_token: has_real_oauth_refresh_token(&imported),
     }))
 }
 
@@ -492,9 +492,36 @@ fn ensure_last_refresh(value: &mut Value) {
     }
 }
 
+fn ensure_access_only_refresh_placeholder(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let tokens = object
+        .entry("tokens")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(tokens_object) = tokens.as_object_mut() else {
+        return;
+    };
+    tokens_object.insert(
+        "refresh_token".to_string(),
+        Value::String(auth::ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER.to_string()),
+    );
+}
+
 fn has_oauth_access_token(value: &Value) -> bool {
     has_non_empty_string(value, &["tokens", "access_token"])
         || has_non_empty_string(value, &["access_token"])
+}
+
+fn has_real_oauth_refresh_token(value: &Value) -> bool {
+    has_real_refresh_token(value, &["tokens", "refresh_token"])
+        || has_real_refresh_token(value, &["refresh_token"])
+}
+
+fn has_real_refresh_token(value: &Value, path: &[&str]) -> bool {
+    json::string_at(value, path)
+        .map(|value| auth::is_real_refresh_token(&value))
+        .unwrap_or(false)
 }
 
 fn has_non_empty_string(value: &Value, path: &[&str]) -> bool {
