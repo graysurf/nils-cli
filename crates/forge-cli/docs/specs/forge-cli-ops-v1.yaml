@@ -258,12 +258,13 @@ operations:
     validations:
       - no_local_path # review comment body, thread spec bodies/paths, AND the generated issue mirror (lens values are user-controlled), validated before any post
       - no_escaped_control_markdown # review comment body, thread spec bodies/paths, AND the generated issue mirror, validated before any post
-    # Op-specific pre-mutation error kinds:
+    # Op-specific error kinds:
     #   issue_required (DATA 65)       — --mirror-issue without --issue
     #   id_not_pull_request (DATA 65)  — GitHub <id> is not a pull request (the guard saw HTTP 404)
     #   invalid_review_thread_spec (DATA 65) — malformed, oversized, or locally invalid thread spec fields
     #   thread_file_requires_submit_review (DATA 65) — --thread-file without --submit-review
     #   provider_unsupported (USAGE 64) — --submit-review or --thread-file on gitlab/local (native review/thread creation is GitHub-only in v1)
+    #   github_native_review_rejected (RUNTIME 1) — GitHub rejected native review submission with HTTP 422; retry with an eligible reviewer identity or omit --submit-review for an outcome comment fallback
     # Provider diff-mapping failures from addPullRequestReviewThread surface as backend_error (RUNTIME 1)
     # after best-effort pending-review cleanup.
     # A non-404 guard failure (rate limit, 5xx, forbidden/SSO) surfaces as backend_error (RUNTIME 1),
