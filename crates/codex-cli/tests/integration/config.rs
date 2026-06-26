@@ -49,6 +49,9 @@ fn config_show_prints_effective_values() {
             ("CODEX_PROMPT_SEGMENT_ENABLED", "true"),
             ("CODEX_AUTO_REFRESH_ENABLED", "true"),
             ("CODEX_AUTO_REFRESH_MIN_DAYS", "9"),
+            ("CODEX_AUTH_REMOTE_SSH", "g14"),
+            ("CODEX_AUTH_REMOTE_NAME", "gamania"),
+            ("CODEX_AUTH_REMOTE_REFRESH", "false"),
         ],
     );
     assert_exit(&output, 0);
@@ -63,6 +66,9 @@ fn config_show_prints_effective_values() {
     assert!(out.contains("CODEX_PROMPT_SEGMENT_ENABLED=true\n"));
     assert!(out.contains("CODEX_AUTO_REFRESH_ENABLED=true\n"));
     assert!(out.contains("CODEX_AUTO_REFRESH_MIN_DAYS=9\n"));
+    assert!(out.contains("CODEX_AUTH_REMOTE_SSH=g14\n"));
+    assert!(out.contains("CODEX_AUTH_REMOTE_NAME=gamania\n"));
+    assert!(out.contains("CODEX_AUTH_REMOTE_REFRESH=false\n"));
 }
 
 #[test]
@@ -115,6 +121,27 @@ fn config_set_ephemeral_prints_export_for_true() {
     let output = run(&["config", "set", "ephemeral", "true"], &[]);
     assert_exit(&output, 0);
     assert_eq!(stdout(&output), "export CODEX_CLI_EPHEMERAL_ENABLED=true\n");
+}
+
+#[test]
+fn config_set_remote_ssh_prints_export() {
+    let output = run(&["config", "set", "remote-ssh", "g14"], &[]);
+    assert_exit(&output, 0);
+    assert_eq!(stdout(&output), "export CODEX_AUTH_REMOTE_SSH='g14'\n");
+}
+
+#[test]
+fn config_set_remote_name_prints_export() {
+    let output = run(&["config", "set", "remote-name", "gamania"], &[]);
+    assert_exit(&output, 0);
+    assert_eq!(stdout(&output), "export CODEX_AUTH_REMOTE_NAME='gamania'\n");
+}
+
+#[test]
+fn config_set_remote_refresh_prints_export_for_false() {
+    let output = run(&["config", "set", "remote-refresh", "false"], &[]);
+    assert_exit(&output, 0);
+    assert_eq!(stdout(&output), "export CODEX_AUTH_REMOTE_REFRESH=false\n");
 }
 
 #[test]

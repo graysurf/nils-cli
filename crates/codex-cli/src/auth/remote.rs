@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Utc;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,15 +8,42 @@ use crate::auth;
 use crate::auth::output::{self, AuthRemotePullResult};
 use crate::json;
 use crate::paths;
+use nils_common::env as shared_env;
 use nils_common::fs;
 
 const COMMAND_PULL: &str = "auth remote pull";
+pub const ENV_AUTH_REMOTE_SSH: &str = "CODEX_AUTH_REMOTE_SSH";
+pub const ENV_AUTH_REMOTE_NAME: &str = "CODEX_AUTH_REMOTE_NAME";
+pub const ENV_AUTH_REMOTE_REFRESH: &str = "CODEX_AUTH_REMOTE_REFRESH";
+
+#[derive(Debug, Clone)]
+pub struct ConfiguredRemotePull {
+    pub ssh: String,
+    pub name: String,
+    pub refresh: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteEnvError {
+    pub code: &'static str,
+    pub message: String,
+    pub details: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemotePullFailure {
+    pub code: &'static str,
+    pub message: String,
+    pub details: Option<Value>,
+    pub exit_code: i32,
+}
 
 pub fn pull_with_json(
     ssh_host: Option<&str>,
     name: Option<&str>,
     access_only: bool,
     write_active: bool,
+    refresh: bool,
     output_json: bool,
 ) -> Result<i32> {
     let Some(ssh_host) = ssh_host else {
@@ -61,99 +89,9 @@ pub fn pull_with_json(
         );
     }
 
-    let remote_output = Command::new("ssh")
-        .arg(ssh_host)
-        .arg("codex-cli")
-        .arg("auth")
-        .arg("remote")
-        .arg("export")
-        .arg("--name")
-        .arg(name)
-        .arg("--access-only")
-        .arg("--refresh")
-        .output();
-
-    let remote_output = match remote_output {
-        Ok(output) => output,
-        Err(err) => {
-            return runtime_error(
-                output_json,
-                "ssh-exec-failed",
-                format!("codex-remote-pull: failed to run ssh: {err}"),
-                None,
-            );
-        }
-    };
-
-    if !remote_output.status.success() {
-        let exit_code = remote_output.status.code().unwrap_or(1);
-        return runtime_error(
-            output_json,
-            "remote-export-failed",
-            format!("codex-remote-pull: remote export failed (exit {exit_code})"),
-            Some(serde_json::json!({
-                "ssh": ssh_host,
-                "name": name,
-                "exit_code": exit_code,
-            })),
-        );
-    }
-
-    let imported: Value = match serde_json::from_slice(&remote_output.stdout) {
-        Ok(value) => value,
-        Err(_) => {
-            return runtime_error(
-                output_json,
-                "remote-export-invalid-json",
-                "codex-remote-pull: remote export returned invalid JSON",
-                Some(serde_json::json!({
-                    "ssh": ssh_host,
-                    "name": name,
-                })),
-            );
-        }
-    };
-    let imported = sanitize_access_only(imported);
-
-    let auth_file = match paths::resolve_auth_file() {
-        Some(path) => path,
-        None => {
-            return runtime_error(
-                output_json,
-                "auth-file-not-configured",
-                "codex-remote-pull: CODEX_AUTH_FILE is not configured",
-                None,
-            );
-        }
-    };
-
-    if let Err(err) = write_active_auth(&auth_file, &imported) {
-        return runtime_error(
-            output_json,
-            err.code(),
-            format!(
-                "codex-remote-pull: failed to write active auth {}: {}",
-                auth_file.display(),
-                err.source()
-            ),
-            Some(serde_json::json!({
-                "auth_file": auth_file.display().to_string(),
-                "phase": err.phase(),
-                "auth_written": err.auth_written(),
-            })),
-        );
-    }
-
-    let result = AuthRemotePullResult {
-        ssh: ssh_host.to_string(),
-        name: name.to_string(),
-        access_only,
-        write_active,
-        auth_file: auth_file.display().to_string(),
-        has_oauth_access_token: has_non_empty_string(&imported, &["tokens", "access_token"])
-            || has_non_empty_string(&imported, &["access_token"]),
-        has_oauth_refresh_token: has_non_empty_string(&imported, &["tokens", "refresh_token"])
-            || has_non_empty_string(&imported, &["refresh_token"]),
+    let result = match pull_access_only_to_active(ssh_host, name, refresh)? {
+        Ok(result) => result,
+        Err(err) => return emit_pull_failure(output_json, err),
     };
 
     if output_json {
@@ -161,13 +99,172 @@ pub fn pull_with_json(
     } else {
         println!(
             "codex-remote-pull: pulled access-only auth '{}' from {} into {}",
-            name,
-            ssh_host,
-            auth_file.display()
+            name, ssh_host, result.auth_file
         );
     }
 
     Ok(0)
+}
+
+pub fn configured_pull_from_env()
+-> std::result::Result<Option<ConfiguredRemotePull>, RemoteEnvError> {
+    let ssh = env_non_empty(ENV_AUTH_REMOTE_SSH);
+    let name = env_non_empty(ENV_AUTH_REMOTE_NAME);
+
+    if ssh.is_none() && name.is_none() {
+        return Ok(None);
+    }
+
+    let Some(ssh) = ssh else {
+        return Err(remote_env_error(
+            "remote-ssh-missing",
+            format!(
+                "codex-refresh: {ENV_AUTH_REMOTE_SSH} is required when {ENV_AUTH_REMOTE_NAME} is set"
+            ),
+        ));
+    };
+    let Some(name) = name else {
+        return Err(remote_env_error(
+            "remote-name-missing",
+            format!(
+                "codex-refresh: {ENV_AUTH_REMOTE_NAME} is required when {ENV_AUTH_REMOTE_SSH} is set"
+            ),
+        ));
+    };
+
+    if !is_valid_ssh_host(&ssh) {
+        return Err(remote_env_error(
+            "remote-ssh-invalid",
+            format!("codex-refresh: invalid {ENV_AUTH_REMOTE_SSH}"),
+        ));
+    }
+    if !is_valid_secret_name(&name) {
+        return Err(remote_env_error(
+            "remote-name-invalid",
+            format!("codex-refresh: invalid {ENV_AUTH_REMOTE_NAME}"),
+        ));
+    }
+
+    Ok(Some(ConfiguredRemotePull {
+        ssh,
+        name,
+        refresh: shared_env::env_truthy(ENV_AUTH_REMOTE_REFRESH),
+    }))
+}
+
+pub fn pull_access_only_to_active(
+    ssh_host: &str,
+    name: &str,
+    refresh: bool,
+) -> Result<std::result::Result<AuthRemotePullResult, RemotePullFailure>> {
+    let mut command = Command::new("ssh");
+    command
+        .arg(ssh_host)
+        .arg("codex-cli")
+        .arg("auth")
+        .arg("remote")
+        .arg("export")
+        .arg("--name")
+        .arg(name)
+        .arg("--access-only");
+    if refresh {
+        command.arg("--refresh");
+    }
+
+    let remote_output = match command.output() {
+        Ok(output) => output,
+        Err(err) => {
+            return Ok(Err(RemotePullFailure {
+                code: "ssh-exec-failed",
+                message: format!("codex-remote-pull: failed to run ssh: {err}"),
+                details: None,
+                exit_code: 1,
+            }));
+        }
+    };
+
+    if !remote_output.status.success() {
+        let exit_code = remote_output.status.code().unwrap_or(1);
+        return Ok(Err(RemotePullFailure {
+            code: "remote-export-failed",
+            message: format!("codex-remote-pull: remote export failed (exit {exit_code})"),
+            details: Some(serde_json::json!({
+                "ssh": ssh_host,
+                "name": name,
+                "exit_code": exit_code,
+            })),
+            exit_code: 1,
+        }));
+    }
+
+    let imported: Value = match serde_json::from_slice(&remote_output.stdout) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(Err(RemotePullFailure {
+                code: "remote-export-invalid-json",
+                message: "codex-remote-pull: remote export returned invalid JSON".to_string(),
+                details: Some(serde_json::json!({
+                    "ssh": ssh_host,
+                    "name": name,
+                })),
+                exit_code: 1,
+            }));
+        }
+    };
+    let mut imported = sanitize_access_only(imported);
+    if !has_oauth_access_token(&imported) {
+        return Ok(Err(RemotePullFailure {
+            code: "remote-export-missing-access-token",
+            message: "codex-remote-pull: remote export did not include an OAuth access token"
+                .to_string(),
+            details: Some(serde_json::json!({
+                "ssh": ssh_host,
+                "name": name,
+            })),
+            exit_code: 1,
+        }));
+    }
+    ensure_last_refresh(&mut imported);
+
+    let auth_file = match paths::resolve_auth_file() {
+        Some(path) => path,
+        None => {
+            return Ok(Err(RemotePullFailure {
+                code: "auth-file-not-configured",
+                message: "codex-remote-pull: CODEX_AUTH_FILE is not configured".to_string(),
+                details: None,
+                exit_code: 1,
+            }));
+        }
+    };
+
+    if let Err(err) = write_active_auth(&auth_file, &imported) {
+        return Ok(Err(RemotePullFailure {
+            code: err.code(),
+            message: format!(
+                "codex-remote-pull: failed to write active auth {}: {}",
+                auth_file.display(),
+                err.source()
+            ),
+            details: Some(serde_json::json!({
+                "auth_file": auth_file.display().to_string(),
+                "phase": err.phase(),
+                "auth_written": err.auth_written(),
+            })),
+            exit_code: 1,
+        }));
+    }
+
+    Ok(Ok(AuthRemotePullResult {
+        ssh: ssh_host.to_string(),
+        name: name.to_string(),
+        access_only: true,
+        write_active: true,
+        auth_file: auth_file.display().to_string(),
+        has_oauth_access_token: has_oauth_access_token(&imported),
+        has_oauth_refresh_token: has_non_empty_string(&imported, &["tokens", "refresh_token"])
+            || has_non_empty_string(&imported, &["refresh_token"]),
+    }))
 }
 
 pub fn export(name: &str, access_only: bool, refresh: bool) -> Result<i32> {
@@ -223,19 +320,32 @@ fn usage_error(output_json: bool, code: &str, message: &str) -> Result<i32> {
     Ok(64)
 }
 
-fn runtime_error(
-    output_json: bool,
-    code: &str,
-    message: impl Into<String>,
-    details: Option<Value>,
-) -> Result<i32> {
-    let message = message.into();
+fn emit_pull_failure(output_json: bool, failure: RemotePullFailure) -> Result<i32> {
     if output_json {
-        output::emit_error(COMMAND_PULL, code, message, details)?;
+        output::emit_error(COMMAND_PULL, failure.code, failure.message, failure.details)?;
     } else {
-        eprintln!("{message}");
+        eprintln!("{}", failure.message);
     }
-    Ok(1)
+    Ok(failure.exit_code)
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|value| {
+        let value = value.trim().to_string();
+        if value.is_empty() { None } else { Some(value) }
+    })
+}
+
+fn remote_env_error(code: &'static str, message: String) -> RemoteEnvError {
+    RemoteEnvError {
+        code,
+        message,
+        details: serde_json::json!({
+            "ssh_env": ENV_AUTH_REMOTE_SSH,
+            "name_env": ENV_AUTH_REMOTE_NAME,
+            "refresh_env": ENV_AUTH_REMOTE_REFRESH,
+        }),
+    }
 }
 
 enum ActiveAuthWriteError {
@@ -319,6 +429,23 @@ fn sanitize_access_only(mut value: Value) -> Value {
     }
 
     Value::Object(sanitized)
+}
+
+fn ensure_last_refresh(value: &mut Value) {
+    if json::string_at(value, &["last_refresh"]).is_some() {
+        return;
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "last_refresh".to_string(),
+            Value::String(Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        );
+    }
+}
+
+fn has_oauth_access_token(value: &Value) -> bool {
+    has_non_empty_string(value, &["tokens", "access_token"])
+        || has_non_empty_string(value, &["access_token"])
 }
 
 fn has_non_empty_string(value: &Value, path: &[&str]) -> bool {

@@ -154,11 +154,13 @@ fn handle_auth_remote(args: &cli::AuthRemoteArgs) -> i32 {
             name,
             access_only,
             write_active,
+            refresh,
         }) => auth::remote::pull_with_json(
             ssh.as_deref(),
             name.as_deref(),
             *access_only,
             *write_active,
+            *refresh,
             output.is_json(),
         )
         .unwrap_or(1),

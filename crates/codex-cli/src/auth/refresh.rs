@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::auth::output::{self, AuthRefreshResult};
+use crate::auth::remote;
 use crate::json;
 use crate::paths;
 
@@ -42,6 +43,23 @@ fn run_with_mode(args: &[String], output_mode: RefreshOutputMode) -> Result<i32>
         Some(path) => path,
         None => return Ok(64),
     };
+
+    if args.is_empty() {
+        match remote::configured_pull_from_env() {
+            Ok(Some(config)) => {
+                return run_remote_refresh(&target_file, &config, output_mode);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                if output_json {
+                    output::emit_error("auth refresh", err.code, err.message, Some(err.details))?;
+                } else if output_text {
+                    eprintln!("{}", err.message);
+                }
+                return Ok(64);
+            }
+        }
+    }
 
     if !target_file.is_file() {
         if output_json {
@@ -265,11 +283,70 @@ fn run_with_mode(args: &[String], output_mode: RefreshOutputMode) -> Result<i32>
                 refreshed: true,
                 synced,
                 refreshed_at: Some(now_iso),
+                remote_sync: None,
+                remote_ssh: None,
+                remote_name: None,
             },
         )?;
     } else if output_text {
         println!("codex: refreshed {} at {}", target_file.display(), now_iso);
     }
+    Ok(0)
+}
+
+fn run_remote_refresh(
+    target_file: &Path,
+    config: &remote::ConfiguredRemotePull,
+    output_mode: RefreshOutputMode,
+) -> Result<i32> {
+    let output_json = output_mode == RefreshOutputMode::Json;
+    let output_text = output_mode == RefreshOutputMode::Text;
+
+    let pull = match remote::pull_access_only_to_active(&config.ssh, &config.name, config.refresh)?
+    {
+        Ok(result) => result,
+        Err(err) => {
+            let exit_code = err.exit_code;
+            if output_json {
+                let mut details = err.details.unwrap_or_else(|| serde_json::json!({}));
+                if let Some(object) = details.as_object_mut() {
+                    object.insert("remote_sync".to_string(), serde_json::Value::Bool(true));
+                }
+                output::emit_error("auth refresh", err.code, err.message, Some(details))?;
+            } else if output_text {
+                eprintln!("codex-refresh: remote sync failed: {}", err.message);
+            }
+            return Ok(exit_code);
+        }
+    };
+
+    let refreshed_at = crate::auth::last_refresh_from_auth_file(Path::new(&pull.auth_file))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+
+    if output_json {
+        output::emit_result(
+            "auth refresh",
+            AuthRefreshResult {
+                target_file: pull.auth_file,
+                refreshed: true,
+                synced: false,
+                refreshed_at: Some(refreshed_at),
+                remote_sync: Some(true),
+                remote_ssh: Some(config.ssh.clone()),
+                remote_name: Some(config.name.clone()),
+            },
+        )?;
+    } else if output_text {
+        println!(
+            "codex-refresh: remote-refreshed {} from {}/{}",
+            target_file.display(),
+            config.ssh,
+            config.name
+        );
+    }
+
     Ok(0)
 }
 

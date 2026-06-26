@@ -61,13 +61,18 @@ Agent flag notes:
   target exists, interactive mode prompts for overwrite, while non-interactive and JSON mode require `--yes` to overwrite.
 - `remove [--yes] <secret|secret.json>`: Remove a secret file from `CODEX_SECRET_DIR`. Secret names are normalized to `.json`; interactive
   mode prompts for confirmation, while non-interactive and JSON mode require `--yes`.
-- `refresh [secret.json]`: Refresh OAuth tokens.
-- `auto-refresh`: Refresh stale tokens across auth + secrets.
+- `refresh [secret.json]`: Refresh OAuth tokens. With `CODEX_AUTH_REMOTE_SSH` and `CODEX_AUTH_REMOTE_NAME` set, the default active-auth
+  refresh delegates to the remote token authority and imports access-only auth; explicit `secret.json` targets still use local
+  `refresh_token`.
+- `auto-refresh`: Refresh stale tokens across auth + secrets. In remote-authority mode it refreshes only the active auth file through remote
+  access-only sync and does not overwrite local secret files.
 - `status`: Report active auth readiness without exposing token or API-key material.
 - `current`: Show which secret matches `CODEX_AUTH_FILE`.
 - `sync`: Sync `CODEX_AUTH_FILE` back into matching secrets.
-- `remote pull --ssh <host> --name <secret> --access-only --write-active`: Pull access-only auth from a remote token authority over SSH and
-  write it to `CODEX_AUTH_FILE`. The local file never receives `refresh_token`; the remote authority remains the only refresh-token writer.
+- `remote pull --ssh <host> --name <secret> --access-only --write-active [--refresh]`: Pull access-only auth from a remote token authority
+  over SSH and write it to `CODEX_AUTH_FILE`. The local file never receives `refresh_token`; the remote authority remains the only
+  refresh-token writer. `--refresh` explicitly asks the remote authority to refresh the named secret before export; without it, pull only
+  exports the authority's current access/id/account fields.
 
 Auth examples:
 
@@ -80,6 +85,8 @@ Auth examples:
 - `codex-cli auth status --format json`: Check active auth readiness for automation.
 - Import auth-host's current access-only `team` auth into the active local auth file:
   `codex-cli auth remote pull --ssh auth-host --name team --access-only --write-active`
+- Configure a replica to delegate default active-auth refresh to `g14`:
+  `eval "$(codex-cli config set remote-ssh g14)" && eval "$(codex-cli config set remote-name team)"`
 
 ### diag
 
@@ -135,6 +142,11 @@ Auth examples:
 - `CODEX_AUTO_REFRESH_ENABLED`: enable token refresh behavior for `auth auto-refresh` and `diag rate-limits` retry-on-401 paths
   (default: `false`; leave unset/false on multi-machine setups unless one machine intentionally owns refresh).
 - `CODEX_AUTO_REFRESH_MIN_DAYS`: `auth auto-refresh` minimum token age threshold (default: `5`).
+- `CODEX_AUTH_REMOTE_SSH`: SSH host alias for a remote Codex token authority. When paired with `CODEX_AUTH_REMOTE_NAME`, default
+  `auth refresh` delegates to remote access-only sync instead of reading local `refresh_token`.
+- `CODEX_AUTH_REMOTE_NAME`: remote authority secret name used by delegated active-auth refresh.
+- `CODEX_AUTH_REMOTE_REFRESH`: when truthy, delegated remote refresh asks the authority to refresh before exporting. Default is unset/false;
+  leave false when the authority's own timer owns freshness.
 
 ## Dependencies
 

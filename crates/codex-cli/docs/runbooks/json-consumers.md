@@ -5,7 +5,7 @@
 This runbook covers service consumption of `codex-cli` JSON output for:
 
 - `diag rate-limits` (single/all/async)
-- `auth login|use|save|remove|refresh|auto-refresh|status|current|sync`
+- `auth login|use|save|remove|refresh|auto-refresh|status|current|sync|remote pull`
 - `prompt-segment status`
 
 Shared baseline guidance:
@@ -33,6 +33,8 @@ Codex-specific contract source:
 - `auth remove` confirmation failure code:
   - `remove-confirmation-required`
 - `auth status` exits `0` for unauthenticated states and reports the machine-readable reason in `result.reason`.
+- `auth refresh` may report `result.remote_sync=true` with `remote_ssh` and `remote_name` when default active-auth refresh delegates to a
+  configured remote token authority; in that mode `synced=false` because local secret files are not overwritten with access-only auth.
 - `prompt-segment status` exits `0` for non-rendering states and reports the machine-readable reason in `result.reason`.
 - `auth current` secret-dir resolution failure codes:
   - `secret-dir-not-configured`
@@ -59,5 +61,6 @@ codex-cli auth remove --format json --yes team-alpha.json
 codex-cli auth auto-refresh --format json
 codex-cli auth status --format json
 codex-cli auth current --format json
+codex-cli auth remote pull --ssh g14 --name team --access-only --write-active --format json
 codex-cli prompt-segment status --format json
 ```

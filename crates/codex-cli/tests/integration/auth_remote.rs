@@ -229,13 +229,175 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
     assert!(captured_args.contains("codex-cli auth remote export"));
     assert!(captured_args.contains("--name team"));
     assert!(captured_args.contains("--access-only"));
-    assert!(captured_args.contains("--refresh"));
+    assert!(!captured_args.contains("--refresh"));
 
     let timestamp = cache.join("auth.json.timestamp");
     assert_eq!(
         fs::read_to_string(&timestamp).expect("read timestamp"),
         "2025-01-20T12:34:56Z"
     );
+}
+
+#[test]
+fn auth_remote_pull_persists_fallback_last_refresh_when_remote_omits_it() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let stubs = dir.path().join("stubs");
+    fs::create_dir_all(&stubs).expect("stubs dir");
+
+    let auth_file = dir.path().join("auth.json");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&cache).expect("cache dir");
+
+    write_exe(
+        &stubs,
+        "ssh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
+"#,
+    );
+
+    let remote_payload = format!(
+        r#"{{"tokens":{{"access_token":"{}","id_token":"{}","account_id":"acct_001"}}}}"#,
+        token(PAYLOAD_ALPHA),
+        token(PAYLOAD_ALPHA)
+    );
+    let output = run_with_path_prepend(
+        &[
+            "auth",
+            "remote",
+            "pull",
+            "--ssh",
+            "auth-host",
+            "--name",
+            "team",
+            "--access-only",
+            "--write-active",
+        ],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_CACHE_DIR", &cache),
+        ],
+        &[("REMOTE_AUTH_PAYLOAD", &remote_payload)],
+        &stubs,
+    );
+
+    assert_exit(&output, 0);
+
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(&auth_file).expect("read auth file"))
+            .expect("applied auth json");
+    let last_refresh = applied["last_refresh"]
+        .as_str()
+        .expect("fallback last_refresh");
+    assert!(last_refresh.ends_with('Z'));
+    assert_eq!(
+        fs::read_to_string(cache.join("auth.json.timestamp")).expect("read timestamp"),
+        last_refresh
+    );
+}
+
+#[test]
+fn auth_remote_pull_rejects_payload_without_oauth_access_token() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let stubs = dir.path().join("stubs");
+    fs::create_dir_all(&stubs).expect("stubs dir");
+
+    let auth_file = dir.path().join("auth.json");
+
+    write_exe(
+        &stubs,
+        "ssh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
+"#,
+    );
+
+    let remote_payload = r#"{"tokens":{"id_token":"remote-id-token","account_id":"acct_001"},"last_refresh":"2025-01-20T12:34:56Z"}"#;
+    let output = run_with_path_prepend(
+        &[
+            "auth",
+            "remote",
+            "pull",
+            "--ssh",
+            "auth-host",
+            "--name",
+            "team",
+            "--access-only",
+            "--write-active",
+            "--json",
+        ],
+        &[("CODEX_AUTH_FILE", &auth_file)],
+        &[("REMOTE_AUTH_PAYLOAD", remote_payload)],
+        &stubs,
+    );
+
+    assert_exit(&output, 1);
+    assert!(
+        !auth_file.exists(),
+        "invalid remote payload should not write active auth"
+    );
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json envelope");
+    assert_eq!(payload["schema_version"], "codex-cli.auth.v1");
+    assert_eq!(payload["command"], "auth remote pull");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(
+        payload["error"]["code"],
+        "remote-export-missing-access-token"
+    );
+}
+
+#[test]
+fn auth_remote_pull_refresh_flag_requests_remote_refresh_before_export() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let stubs = dir.path().join("stubs");
+    fs::create_dir_all(&stubs).expect("stubs dir");
+
+    let auth_file = dir.path().join("auth.json");
+    let args_file = dir.path().join("ssh-args.txt");
+
+    write_exe(
+        &stubs,
+        "ssh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" > "$SSH_ARGS_FILE"
+printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
+"#,
+    );
+
+    let remote_payload = auth_json(
+        PAYLOAD_ALPHA,
+        "acct_001",
+        "remote_refresh_secret",
+        "2025-01-20T12:34:56Z",
+    );
+    let output = run_with_path_prepend(
+        &[
+            "auth",
+            "remote",
+            "pull",
+            "--ssh",
+            "auth-host",
+            "--name",
+            "team",
+            "--access-only",
+            "--write-active",
+            "--refresh",
+        ],
+        &[("CODEX_AUTH_FILE", &auth_file)],
+        &[
+            ("REMOTE_AUTH_PAYLOAD", &remote_payload),
+            ("SSH_ARGS_FILE", args_file.to_str().expect("args path")),
+        ],
+        &stubs,
+    );
+
+    assert_exit(&output, 0);
+    let captured_args = fs::read_to_string(&args_file).expect("read ssh args");
+    assert!(captured_args.contains("--refresh"));
 }
 
 #[test]

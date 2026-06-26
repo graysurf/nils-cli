@@ -236,6 +236,7 @@ _arguments "${_arguments_options[@]}" : \
 '(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
 '--access-only[Import access/id/account fields only; never import refresh_token]' \
 '--write-active[Write the pulled auth payload into CODEX_AUTH_FILE]' \
+'--refresh[Ask the remote authority to refresh the named secret before export]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0

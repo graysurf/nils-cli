@@ -776,7 +776,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__auth__remote__pull)
-            opts="-h --format --json --ssh --name --access-only --write-active --help"
+            opts="-h --format --json --ssh --name --access-only --write-active --refresh --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

@@ -29,12 +29,21 @@ fn codex_cli_bin() -> PathBuf {
     bin::resolve("codex-cli")
 }
 
+fn isolated_options() -> CmdOptions {
+    CmdOptions::default().with_env_remove_many(&[
+        "CODEX_AUTO_REFRESH_ENABLED",
+        "CODEX_AUTH_REMOTE_SSH",
+        "CODEX_AUTH_REMOTE_NAME",
+        "CODEX_AUTH_REMOTE_REFRESH",
+    ])
+}
+
 fn run(args: &[&str], envs: &[(&str, &Path)]) -> CmdOutput {
     run_with(args, envs, &[])
 }
 
 fn run_with(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutput {
-    let mut options = CmdOptions::default();
+    let mut options = isolated_options();
     for (key, path) in envs {
         let value = path.to_string_lossy();
         options = options.with_env(key, value.as_ref());
@@ -52,7 +61,7 @@ fn run_with_path_prepend(
     vars: &[(&str, &str)],
     path_prepend: &Path,
 ) -> CmdOutput {
-    let mut options = CmdOptions::default().with_path_prepend(path_prepend);
+    let mut options = isolated_options().with_path_prepend(path_prepend);
     for (key, path) in envs {
         let value = path.to_string_lossy();
         options = options.with_env(key, value.as_ref());
@@ -810,6 +819,58 @@ fn auth_json_contract_refresh_missing_token_is_structured() {
     assert_eq!(payload["command"], "auth refresh");
     assert_eq!(payload["ok"], false);
     assert_eq!(payload["error"]["code"], "refresh-token-missing");
+}
+
+#[test]
+fn auth_json_contract_refresh_remote_sync_success_is_structured() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let stubs = dir.path().join("stubs");
+    fs::create_dir_all(&stubs).expect("stubs dir");
+
+    let auth_file = dir.path().join("auth.json");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&cache).expect("cache dir");
+    fs::write(&auth_file, r#"{"tokens":{"access_token":"stale-local"}}"#).expect("write auth");
+
+    write_exe(
+        &stubs,
+        "ssh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
+"#,
+    );
+
+    let remote_payload = r#"{"tokens":{"access_token":"remote-access-secret","id_token":"remote-id-secret","account_id":"acct_001"},"last_refresh":"2025-01-20T12:34:56Z"}"#;
+    let output = run_with_path_prepend(
+        &["auth", "refresh", "--json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_CACHE_DIR", &cache),
+        ],
+        &[
+            ("CODEX_AUTH_REMOTE_SSH", "auth-host"),
+            ("CODEX_AUTH_REMOTE_NAME", "team"),
+            ("REMOTE_AUTH_PAYLOAD", remote_payload),
+        ],
+        &stubs,
+    );
+    assert_eq!(output.code, 0);
+
+    let raw = stdout(&output);
+    assert!(!raw.contains("remote-access-secret"));
+    assert!(!raw.contains("remote-id-secret"));
+
+    let payload: Value = serde_json::from_str(&raw).expect("json");
+    assert_eq!(payload["schema_version"], "codex-cli.auth.v1");
+    assert_eq!(payload["command"], "auth refresh");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["refreshed"], true);
+    assert_eq!(payload["result"]["synced"], false);
+    assert_eq!(payload["result"]["refreshed_at"], "2025-01-20T12:34:56Z");
+    assert_eq!(payload["result"]["remote_sync"], true);
+    assert_eq!(payload["result"]["remote_ssh"], "auth-host");
+    assert_eq!(payload["result"]["remote_name"], "team");
 }
 
 #[test]

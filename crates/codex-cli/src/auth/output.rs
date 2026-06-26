@@ -42,6 +42,12 @@ pub struct AuthRefreshResult {
     pub synced: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refreshed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_sync: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_ssh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
