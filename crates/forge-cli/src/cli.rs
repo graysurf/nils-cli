@@ -464,6 +464,11 @@ pub struct PrReviewArgs {
     /// REQUEST_CHANGES and optional for APPROVE. GitHub-only in v1.
     #[arg(long = "submit-review", action = ArgAction::SetTrue)]
     pub submit_review: bool,
+    /// Create resolvable GitHub review threads from a JSON array of actionable
+    /// findings. Requires `--submit-review`; omit this for summary-only
+    /// reviews. Repair findings, then resolve via `pr review-threads resolve`.
+    #[arg(long = "thread-file", value_name = "PATH")]
+    pub thread_file: Option<String>,
 }
 
 /// `pr comments` arguments.
@@ -1703,6 +1708,31 @@ mod tests {
             parse(&["pr", "review-threads", "7"]).is_err(),
             "bare `review-threads <id>` must be rejected; use `list <id>`",
         );
+    }
+
+    #[test]
+    fn pr_review_thread_file_parses() {
+        let cli = parse(&[
+            "pr",
+            "review",
+            "7",
+            "--submit-review",
+            "--comment",
+            "summary",
+            "--thread-file",
+            "review-threads.json",
+        ])
+        .expect("review thread-file parses");
+        match cli.command {
+            Some(Command::Pr(PrArgs {
+                command: Some(PrCommand::Review(args)),
+            })) => {
+                assert_eq!(args.id, 7);
+                assert!(args.submit_review);
+                assert_eq!(args.thread_file.as_deref(), Some("review-threads.json"));
+            }
+            other => panic!("expected pr review, got {other:?}"),
+        }
     }
 
     #[test]

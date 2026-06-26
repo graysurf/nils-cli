@@ -3528,7 +3528,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__review)
-            opts="-h --decision --comment --comment-file --lens --issue --mirror-issue --submit-review --format --remote --provider --repo --store-root --dry-run --help <ID>"
+            opts="-h --decision --comment --comment-file --lens --issue --mirror-issue --submit-review --thread-file --format --remote --provider --repo --store-root --dry-run --help <ID>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3551,6 +3551,10 @@ _forge-cli() {
                     return 0
                     ;;
                 --issue)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --thread-file)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

@@ -22,6 +22,7 @@ cargo run -p nils-forge-cli -- auth status --format json
 cargo run -p nils-forge-cli -- label audit --catalog labels.yaml --format json
 cargo run -p nils-forge-cli -- pr deliver --kind feature --dry-run --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --comment-file review.md --mirror-issue --issue 456 --format json
+cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --comment-file review.md --thread-file review-threads.json --format json
 ```
 
 `forge-cli` does NOT introduce a `--json` boolean flag. Use
