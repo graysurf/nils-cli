@@ -379,6 +379,7 @@ fn resolve_target(args: &[String], output_json: bool) -> Result<Option<PathBuf>>
 fn refresh_token_from_json(value: &Value) -> Option<String> {
     json::string_at(value, &["tokens", "refresh_token"])
         .or_else(|| json::string_at(value, &["refresh_token"]))
+        .filter(|value| crate::auth::is_real_refresh_token(value.trim()))
 }
 
 fn merge_tokens(base: &Value, refresh: &Value, now_iso: &str) -> Result<Value> {
@@ -572,6 +573,16 @@ mod tests {
     #[test]
     fn auth_refresh_refresh_token_from_json_none_when_missing() {
         let value = serde_json::json!({ "tokens": { "access_token": "a1" } });
+        assert!(refresh_token_from_json(&value).is_none());
+    }
+
+    #[test]
+    fn auth_refresh_refresh_token_from_json_ignores_access_only_placeholder() {
+        let value = serde_json::json!({
+            "tokens": {
+                "refresh_token": crate::auth::ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
+            }
+        });
         assert!(refresh_token_from_json(&value).is_none());
     }
 

@@ -226,7 +226,7 @@ pub enum AuthRemoteCommand {
         /// Remote stored secret name
         #[arg(long = "name", value_name = "name")]
         name: Option<String>,
-        /// Import access/id/account fields only; never import refresh_token
+        /// Import access/id/account fields only; write only a local refresh_token placeholder
         #[arg(long = "access-only")]
         access_only: bool,
         /// Write the pulled auth payload into CODEX_AUTH_FILE

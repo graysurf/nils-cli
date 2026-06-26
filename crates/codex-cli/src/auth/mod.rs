@@ -13,6 +13,8 @@ pub mod use_secret;
 use anyhow::Result;
 use std::path::Path;
 
+pub const ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER: &str = "codex-remote-access-only-placeholder";
+
 pub fn identity_from_auth_file(path: &Path) -> Result<Option<String>> {
     crate::runtime::auth::identity_from_auth_file(path).map_err(anyhow::Error::from)
 }
@@ -42,6 +44,10 @@ pub fn normalize_secret_file_name(target: &str) -> String {
         return target.to_string();
     }
     format!("{target}.json")
+}
+
+pub fn is_real_refresh_token(value: &str) -> bool {
+    !value.is_empty() && value != ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
 }
 
 #[cfg(test)]

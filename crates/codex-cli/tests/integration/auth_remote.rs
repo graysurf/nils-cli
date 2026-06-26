@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 const HEADER: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0";
 const PAYLOAD_ALPHA: &str = "eyJzdWIiOiJ1c2VyXzEyMyIsImVtYWlsIjoiYWxwaGFAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoidXNlcl8xMjMiLCJlbWFpbCI6ImFscGhhQGV4YW1wbGUuY29tIn19";
+const ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER: &str = "codex-remote-access-only-placeholder";
 
 fn token(payload: &str) -> String {
     format!("{HEADER}.{payload}.sig")
@@ -140,7 +141,7 @@ fn auth_remote_export_access_only_strips_refresh_token() {
 }
 
 #[test]
-fn auth_remote_pull_access_only_writes_active_without_refresh_token() {
+fn auth_remote_pull_access_only_writes_active_with_placeholder_refresh_token() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let stubs = dir.path().join("stubs");
     fs::create_dir_all(&stubs).expect("stubs dir");
@@ -218,7 +219,10 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
     assert!(applied["tokens"]["access_token"].is_string());
     assert!(applied["tokens"]["id_token"].is_string());
     assert_eq!(applied["tokens"]["account_id"], "acct_001");
-    assert!(applied["tokens"].get("refresh_token").is_none());
+    assert_eq!(
+        applied["tokens"]["refresh_token"],
+        ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
+    );
     assert!(applied["tokens"].get("api_key").is_none());
     assert!(applied.get("refresh_token").is_none());
     assert!(applied.get("OPENAI_API_KEY").is_none());
@@ -618,5 +622,8 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
     let applied: Value =
         serde_json::from_str(&fs::read_to_string(&auth_file).expect("read auth file"))
             .expect("applied auth json");
-    assert!(applied["tokens"].get("refresh_token").is_none());
+    assert_eq!(
+        applied["tokens"]["refresh_token"],
+        ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
+    );
 }
