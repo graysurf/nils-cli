@@ -2,11 +2,19 @@
 //! provider posting primitive: it posts an already-rendered review outcome and
 //! optionally mirrors a compact activity note to an issue.
 
-use std::fs;
+use std::{fs, path::Path};
 
 use pretty_assertions::assert_eq;
 
 use super::support::{StubEnv, parse_envelope, run_forge_cli};
+
+fn assert_backend_not_invoked(capture: &Path) {
+    let calls = fs::read_to_string(capture).unwrap_or_default();
+    assert!(
+        calls.trim().is_empty(),
+        "backend should not be invoked before validation failure: {calls}"
+    );
+}
 
 fn github_review_stub(capture: &str) -> String {
     format!(
@@ -803,6 +811,53 @@ esac
     )
 }
 
+fn github_review_thread_fail_after_pending_stub(capture: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+if [ "$1" != "api" ]; then
+  echo "stub: unexpected gh command: $*" >&2
+  exit 99
+fi
+case "$2" in
+  repos/acme/widgets/pulls/44)
+    echo "44"
+    ;;
+  graphql)
+    case "$*" in
+      *"repository(owner:"*)
+        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kwDOabc","url":"https://github.com/acme/widgets/pull/44"}}}}}}}}'
+        ;;
+      *"addPullRequestReview(input:"*)
+        printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
+        ;;
+      *"addPullRequestReviewThread(input:"*)
+        echo "could not map review thread to diff" >&2
+        exit 42
+        ;;
+      *"deletePullRequestReview(input:"*)
+        printf '%s\n' '{{"data":{{"deletePullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
+        ;;
+      *"submitPullRequestReview(input:"*)
+        echo "submit should not run after thread failure" >&2
+        exit 99
+        ;;
+      *)
+        echo "stub: unexpected graphql payload: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  *)
+    echo "stub: unexpected gh api endpoint: $2" >&2
+    exit 99
+    ;;
+esac
+"#
+    )
+}
+
 #[test]
 fn pr_review_thread_file_creates_resolvable_github_review_thread() {
     let stub = StubEnv::new();
@@ -977,6 +1032,171 @@ fn pr_review_thread_file_rejects_malformed_json() {
     assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
     assert_eq!(env["ok"], false);
     assert_eq!(env["error"]["code"], "invalid_review_thread_spec");
+}
+
+#[test]
+fn pr_review_thread_file_mirror_issue_without_issue_checks_before_reading_thread_file() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_thread_submit_stub(
+        &capture.to_string_lossy(),
+    ));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--submit-review",
+            "--comment",
+            "Summary body",
+            "--mirror-issue",
+            "--thread-file",
+            "/this/path/does/not/exist",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "issue_required");
+    assert_backend_not_invoked(&capture);
+}
+
+#[test]
+fn pr_review_thread_file_rejects_privacy_guard_violations_before_backend() {
+    let cases = [
+        (
+            r#"[{"path":"/Users/terry/project/secret.rs","line":42,"body":"Thread body"}]"#,
+            "local_path_present",
+        ),
+        (
+            r#"[{"path":"src/lib.rs","line":42,"body":"See /Users/terry/secret.txt"}]"#,
+            "local_path_present",
+        ),
+        (
+            r#"[{"path":"src/lib.rs\\n","line":42,"body":"Thread body"}]"#,
+            "markdown_escaped_control",
+        ),
+        (
+            r#"[{"path":"src/lib.rs","line":42,"body":"Line one\\nline two"}]"#,
+            "markdown_escaped_control",
+        ),
+    ];
+
+    for (idx, (thread_spec, expected_kind)) in cases.iter().enumerate() {
+        let stub = StubEnv::new();
+        let capture = stub.tempdir.path().join("gh-args.log");
+        let thread_file = stub
+            .tempdir
+            .path()
+            .join(format!("review-threads-{idx}.json"));
+        fs::write(&thread_file, thread_spec).expect("write thread specs");
+        let stub = stub.gh_stub(&github_review_thread_submit_stub(
+            &capture.to_string_lossy(),
+        ));
+
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+                "pr",
+                "review",
+                "44",
+                "--decision",
+                "comments-only",
+                "--submit-review",
+                "--comment",
+                "Summary body",
+                "--thread-file",
+                thread_file.to_str().expect("utf8 path"),
+            ],
+        );
+
+        assert_eq!(
+            out.code, 65,
+            "case {idx} stdout={}\nstderr={}",
+            out.stdout, out.stderr
+        );
+        let env = parse_envelope(&out.stdout);
+        assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+        assert_eq!(env["ok"], false);
+        assert_eq!(env["error"]["code"], *expected_kind);
+        assert_backend_not_invoked(&capture);
+    }
+}
+
+#[test]
+fn pr_review_thread_file_cleans_up_pending_review_after_thread_failure() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let thread_file = stub.tempdir.path().join("review-threads.json");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&github_review_thread_fail_after_pending_stub(
+        &capture.to_string_lossy(),
+    ));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--submit-review",
+            "--comment",
+            "Summary body",
+            "--thread-file",
+            thread_file.to_str().expect("utf8 path"),
+        ],
+    );
+
+    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["error"]["code"], "backend_error");
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert!(calls.contains("addPullRequestReview(input:"), "{calls}");
+    assert!(
+        calls.contains("addPullRequestReviewThread(input:"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("deletePullRequestReview(input:"),
+        "pending review cleanup mutation should run after thread failure: {calls}"
+    );
+    assert!(
+        !calls.contains("submitPullRequestReview(input:"),
+        "failed pending review must not be submitted: {calls}"
+    );
 }
 
 #[test]

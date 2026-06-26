@@ -411,7 +411,11 @@ backend mapping, validation rules, and output schema versions.
   `data.review_threads[] = { id, url, path, line, subject_type }`, where `id` is
   the `PRRT_...` handle consumed by `pr review-threads resolve`. Dry-run output
   includes `data.target_plan`, `data.thread_plan[]`, `data.submit_plan`, and
-  `data.planned_review_threads`. Malformed specs return
+  `data.planned_review_threads`. If any thread mutation or final review submit
+  fails after the pending review is created, the command attempts a best-effort
+  `deletePullRequestReview` cleanup before returning the original failure; if
+  cleanup also fails, error details include the pending review id/url and cleanup
+  failure. Malformed specs return
   `invalid_review_thread_spec` (`DATA 65`); `--thread-file` without
   `--submit-review` returns `thread_file_requires_submit_review` (`DATA 65`);
   GitLab / Local return `provider_unsupported` (`USAGE 64`) before any backend

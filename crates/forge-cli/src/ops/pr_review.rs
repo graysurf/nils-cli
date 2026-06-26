@@ -32,6 +32,7 @@ const GITHUB_REVIEW_TARGET_QUERY: &str = "query($owner: String!, $name: String!,
 const GITHUB_ADD_PENDING_REVIEW_MUTATION: &str = "mutation($pullRequestId: ID!) { addPullRequestReview(input: {pullRequestId: $pullRequestId}) { pullRequestReview { id url } } }";
 const GITHUB_ADD_REVIEW_THREAD_MUTATION: &str = "mutation($reviewId: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide!, $startLine: Int, $startSide: DiffSide, $subjectType: PullRequestReviewThreadSubjectType!) { addPullRequestReviewThread(input: {pullRequestReviewId: $reviewId, path: $path, body: $body, line: $line, side: $side, startLine: $startLine, startSide: $startSide, subjectType: $subjectType}) { thread { id path line subjectType comments(first: 1) { nodes { url } } } } }";
 const GITHUB_SUBMIT_REVIEW_MUTATION: &str = "mutation($reviewId: ID!, $event: PullRequestReviewEvent!, $body: String) { submitPullRequestReview(input: {pullRequestReviewId: $reviewId, event: $event, body: $body}) { pullRequestReview { url } } }";
+const GITHUB_DELETE_PENDING_REVIEW_MUTATION: &str = "mutation($reviewId: ID!) { deletePullRequestReview(input: {pullRequestReviewId: $reviewId}) { pullRequestReview { id url } } }";
 
 /// Which `glab` review-note form to emit for a GitLab `pr review`, resolved by
 /// probing the local `glab` build (see [`glab_note_form`]). Covers every glab
@@ -230,21 +231,22 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             None,
         ));
     }
-    let thread_specs = if let Some(path) = args.thread_file.as_deref() {
-        read_review_thread_specs(path)?
-    } else {
-        Vec::new()
-    };
 
     // `--mirror-issue` requires `--issue`. Resolve this BEFORE reading the
-    // comment body so a missing `--issue` fails fast with `issue_required`
-    // rather than first blocking on stdin (`--comment-file -`) or surfacing a
-    // file-read `software_error`. (`--mirror-issue` carries no clap
-    // `requires = "issue"`, so this runtime guard is the only enforcement point.)
+    // comment body or thread-file so a missing `--issue` fails fast with
+    // `issue_required` rather than first blocking on stdin (`--comment-file -`
+    // / `--thread-file -`) or surfacing a file-read `software_error`.
+    // (`--mirror-issue` carries no clap `requires = "issue"`, so this runtime
+    // guard is the only enforcement point.)
     let mirror_issue_number = if args.mirror_issue {
         Some(args.issue.ok_or_else(issue_required_err)?)
     } else {
         None
+    };
+    let thread_specs = if let Some(path) = args.thread_file.as_deref() {
+        read_review_thread_specs(path)?
+    } else {
+        Vec::new()
     };
 
     let body = pr_comment::read_body_with_file_flag(
@@ -623,20 +625,30 @@ fn submit_github_review_with_threads<R: BackendRunner>(
 
     let mut review_threads = Vec::with_capacity(specs.len());
     for spec in specs {
-        let output = runner.run(&build_github_add_review_thread_call(
+        let output = match runner.run(&build_github_add_review_thread_call(
             ctx,
             &pending.review_id,
             spec,
-        ))?;
-        review_threads.push(parse_created_review_thread(&output, spec)?);
+        )) {
+            Ok(output) => output,
+            Err(err) => return Err(cleanup_pending_github_review(runner, ctx, &pending, err)),
+        };
+        let thread = match parse_created_review_thread(&output, spec) {
+            Ok(thread) => thread,
+            Err(err) => return Err(cleanup_pending_github_review(runner, ctx, &pending, err)),
+        };
+        review_threads.push(thread);
     }
 
-    let submit_output = runner.run(&build_github_submit_review_call(
+    let submit_output = match runner.run(&build_github_submit_review_call(
         ctx,
         &pending.review_id,
         decision.to_github_event(),
         body,
-    ))?;
+    )) {
+        Ok(output) => output,
+        Err(err) => return Err(cleanup_pending_github_review(runner, ctx, &pending, err)),
+    };
     let review_url = parse_submitted_review_url(&submit_output).unwrap_or(pending.url);
     Ok((review_url, review_threads))
 }
@@ -755,6 +767,91 @@ fn build_github_submit_review_call(
         argv.extend([OsString::from("-f"), OsString::from(format!("body={body}"))]);
     }
     BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn build_github_delete_pending_review_call(ctx: &ProviderContext, review_id: &str) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_DELETE_PENDING_REVIEW_MUTATION}")),
+        OsString::from("-f"),
+        OsString::from(format!("reviewId={review_id}")),
+    ]);
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn cleanup_pending_github_review<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pending: &GitHubPendingReview,
+    cause: ForgeError,
+) -> ForgeError {
+    match runner.run(&build_github_delete_pending_review_call(
+        ctx,
+        &pending.review_id,
+    )) {
+        Ok(_) => cause,
+        Err(cleanup_err) => with_cleanup_detail(cause, pending, cleanup_err),
+    }
+}
+
+fn with_cleanup_detail(
+    cause: ForgeError,
+    pending: &GitHubPendingReview,
+    cleanup_err: ForgeError,
+) -> ForgeError {
+    let cleanup_detail = format!(
+        "pending_review_id={id}; pending_review_url={url}; cleanup_error_kind={cleanup_kind}; cleanup_error_message={cleanup_message}; cleanup_error_detail={cleanup_detail}",
+        id = pending.review_id,
+        url = pending.url,
+        cleanup_kind = cleanup_err.kind(),
+        cleanup_message = cleanup_err.message(),
+        cleanup_detail = cleanup_err.detail().unwrap_or(""),
+    );
+    let merged_detail = match cause.detail() {
+        Some(detail) if !detail.is_empty() => format!("{detail}; {cleanup_detail}"),
+        _ => cleanup_detail,
+    };
+    match cause {
+        ForgeError::NotImplemented {
+            schema_version,
+            message,
+        } => ForgeError::not_implemented(schema_version, message),
+        ForgeError::BackendUnavailable {
+            schema_version,
+            kind,
+            message,
+            ..
+        } => ForgeError::unavailable(schema_version, kind, message, Some(merged_detail)),
+        ForgeError::BackendError {
+            schema_version,
+            message,
+            ..
+        } => ForgeError::backend_error(schema_version, message, Some(merged_detail)),
+        ForgeError::ProviderUnsupported {
+            schema_version,
+            message,
+            ..
+        } => ForgeError::provider_unsupported(schema_version, message, Some(merged_detail)),
+        ForgeError::SoftwareError {
+            schema_version,
+            message,
+            ..
+        } => ForgeError::software(schema_version, message, Some(merged_detail)),
+        ForgeError::Validation {
+            schema_version,
+            kind,
+            message,
+            ..
+        } => ForgeError::validation(schema_version, kind, message, Some(merged_detail)),
+        ForgeError::RuntimeFailure {
+            schema_version,
+            kind,
+            message,
+            ..
+        } => ForgeError::runtime_failure(schema_version, kind, message, Some(merged_detail)),
+    }
 }
 
 fn parse_github_review_target(

@@ -275,6 +275,7 @@ operations:
         - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReview>", -f, "pullRequestId={pull_request_id}"] } # with --thread-file: create a pending review
         - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReviewThread>", -f, "reviewId={review_id}", -f, "path={path}", -f, "body={thread_body}", -F, "line={line}", -f, "side={LEFT|RIGHT}", -f, "subjectType={LINE|FILE}"] } # repeated for each actionable thread spec; returns PRRT_* id and comment URL
         - { program: gh, argv: [api, graphql, -f, "query=<submitPullRequestReview>", -f, "reviewId={review_id}", -f, "event={EVENT}", -f, "body={comment_or_file}"] } # publishes the pending review created for --thread-file
+        - { program: gh, argv: [api, graphql, -f, "query=<deletePullRequestReview>", -f, "reviewId={review_id}"] } # best-effort cleanup only when a --thread-file run fails after pending review creation and before publish
         - { program: gh, argv: [api, "repos/{repo}/issues/{issue}/comments", --method, POST, --raw-field, "body=<generated mirror>", --jq, ".html_url"] } # only with --mirror-issue
       gitlab:
         # One `glab mr note create --help` probe selects the form (covers every glab version class):
