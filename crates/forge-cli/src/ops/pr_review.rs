@@ -5,10 +5,10 @@
 //! rendered review outcome, and forge-cli posts it to the PR/MR plus an
 //! optional compact issue activity mirror.
 
-use std::ffi::OsString;
+use std::{ffi::OsString, fs, io::Read};
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, ProcessRunner};
 use crate::cli::{BINARY, GlobalFlags, PrReviewArgs, PrReviewDecision};
@@ -20,6 +20,10 @@ use crate::validations::{no_escaped_control_markdown, no_local_path};
 
 const SCHEMA: &str = "pr.review";
 const SCHEMA_VERSION: u32 = 1;
+const REVIEW_THREAD_FILE_MAX_BYTES: u64 = 256 * 1024;
+const REVIEW_THREAD_MAX_COUNT: usize = 50;
+const REVIEW_THREAD_PATH_MAX_BYTES: usize = 1024;
+const REVIEW_THREAD_BODY_MAX_BYTES: usize = 16 * 1024;
 
 /// Placeholder `review_url` used only to validate the generated issue mirror
 /// body *before* the PR comment is posted. The real URL is provider-returned
@@ -27,6 +31,12 @@ const SCHEMA_VERSION: u32 = 1;
 /// `--lens` values embedded in the mirror — against this placeholder is
 /// sufficient to catch a bad lens before any backend mutation.
 const MIRROR_URL_PENDING: &str = "<pending>";
+
+const GITHUB_REVIEW_TARGET_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { id url } } }";
+const GITHUB_ADD_PENDING_REVIEW_MUTATION: &str = "mutation($pullRequestId: ID!) { addPullRequestReview(input: {pullRequestId: $pullRequestId}) { pullRequestReview { id url } } }";
+const GITHUB_ADD_REVIEW_THREAD_MUTATION: &str = "mutation($reviewId: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide!, $startLine: Int, $startSide: DiffSide, $subjectType: PullRequestReviewThreadSubjectType!) { addPullRequestReviewThread(input: {pullRequestReviewId: $reviewId, path: $path, body: $body, line: $line, side: $side, startLine: $startLine, startSide: $startSide, subjectType: $subjectType}) { thread { id path line subjectType comments(first: 1) { nodes { url } } } } }";
+const GITHUB_SUBMIT_REVIEW_MUTATION: &str = "mutation($reviewId: ID!, $event: PullRequestReviewEvent!, $body: String) { submitPullRequestReview(input: {pullRequestReviewId: $reviewId, event: $event, body: $body}) { pullRequestReview { url } } }";
+const GITHUB_DELETE_PENDING_REVIEW_MUTATION: &str = "mutation($reviewId: ID!) { deletePullRequestReview(input: {pullRequestReviewId: $reviewId}) { pullRequestReview { id url } } }";
 
 /// Which `glab` review-note form to emit for a GitLab `pr review`, resolved by
 /// probing the local `glab` build (see [`glab_note_form`]). Covers every glab
@@ -59,6 +69,8 @@ pub struct PrReviewPayload {
     pub issue_comment_url: Option<String>,
     pub mirrored: bool,
     pub lenses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_threads: Vec<CreatedReviewThread>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -78,6 +90,91 @@ struct PrReviewDryRunPayload {
     issue_plan: Option<Vec<String>>,
     mirror_issue: bool,
     lenses: Vec<String>,
+    planned_review_threads: usize,
+    target_plan: Option<Vec<String>>,
+    thread_plan: Vec<Vec<String>>,
+    submit_plan: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ReviewThreadDiffSide {
+    Left,
+    #[default]
+    Right,
+}
+
+impl ReviewThreadDiffSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "LEFT",
+            Self::Right => "RIGHT",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ReviewThreadSubjectType {
+    Line,
+    File,
+}
+
+impl ReviewThreadSubjectType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Line => "LINE",
+            Self::File => "FILE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct ReviewThreadSpec {
+    path: String,
+    body: String,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    side: Option<ReviewThreadDiffSide>,
+    #[serde(default, alias = "startLine")]
+    start_line: Option<u32>,
+    #[serde(default, alias = "startSide")]
+    start_side: Option<ReviewThreadDiffSide>,
+    #[serde(default, alias = "subjectType")]
+    subject_type: Option<ReviewThreadSubjectType>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PreparedReviewThreadSpec {
+    path: String,
+    body: String,
+    line: Option<u32>,
+    side: ReviewThreadDiffSide,
+    start_line: Option<u32>,
+    start_side: Option<ReviewThreadDiffSide>,
+    subject_type: ReviewThreadSubjectType,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CreatedReviewThread {
+    pub id: String,
+    pub url: String,
+    pub path: String,
+    pub line: Option<u32>,
+    pub subject_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GitHubReviewTarget {
+    pull_request_id: String,
+    url: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GitHubPendingReview {
+    review_id: String,
+    url: String,
 }
 
 pub fn run(
@@ -110,6 +207,23 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
+    let thread_specs_requested = args.thread_file.is_some();
+    if thread_specs_requested && !args.submit_review {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "thread_file_requires_submit_review",
+            "--thread-file requires --submit-review on github; omit --thread-file for a summary-only review",
+            None,
+        ));
+    }
+    if thread_specs_requested && ctx.provider != Provider::GitHub {
+        return Err(ForgeError::provider_unsupported(
+            schema_err(),
+            "pr review --thread-file creates resolvable review threads on github only in v1; omit --thread-file for a summary-only review",
+            None,
+        ));
+    }
+
     // Native review submission (the #pullrequestreview- object) is GitHub-only
     // in v1. GitLab has no equivalent single review event with an approve /
     // request-changes / comment verb, so `--submit-review` there would have no
@@ -123,14 +237,20 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     }
 
     // `--mirror-issue` requires `--issue`. Resolve this BEFORE reading the
-    // comment body so a missing `--issue` fails fast with `issue_required`
-    // rather than first blocking on stdin (`--comment-file -`) or surfacing a
-    // file-read `software_error`. (`--mirror-issue` carries no clap
-    // `requires = "issue"`, so this runtime guard is the only enforcement point.)
+    // comment body or thread-file so a missing `--issue` fails fast with
+    // `issue_required` rather than first blocking on stdin (`--comment-file -`
+    // / `--thread-file -`) or surfacing a file-read `software_error`.
+    // (`--mirror-issue` carries no clap `requires = "issue"`, so this runtime
+    // guard is the only enforcement point.)
     let mirror_issue_number = if args.mirror_issue {
         Some(args.issue.ok_or_else(issue_required_err)?)
     } else {
         None
+    };
+    let thread_specs = if let Some(path) = args.thread_file.as_deref() {
+        read_review_thread_specs(path)?
+    } else {
+        Vec::new()
     };
 
     let body = pr_comment::read_body_with_file_flag(
@@ -182,13 +302,40 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         // dry-run must not touch a backend, so it cannot probe `glab` capability;
         // render the preferred non-resolvable GitLab form (the live run may pick
         // a more compatible form on older `glab`).
-        let pr_call = build_review_post_call(
-            &ctx,
-            &args,
-            &body,
-            body_present,
-            GlabNoteForm::CreateResolvable,
-        );
+        let thread_plan = thread_specs
+            .iter()
+            .map(|spec| {
+                build_github_add_review_thread_call(&ctx, "<pending-review-id>", spec).plan_argv()
+            })
+            .collect::<Vec<_>>();
+        let (pr_call, target_plan, submit_plan) = if thread_specs.is_empty() {
+            (
+                build_review_post_call(
+                    &ctx,
+                    &args,
+                    &body,
+                    body_present,
+                    GlabNoteForm::CreateResolvable,
+                ),
+                None,
+                None,
+            )
+        } else {
+            let (owner, name) = github_owner_name(&ctx)?;
+            (
+                build_github_pending_review_call(&ctx, "<pull-request-id>"),
+                Some(build_github_review_target_call(&ctx, owner, name, args.id).plan_argv()),
+                Some(
+                    build_github_submit_review_call(
+                        &ctx,
+                        "<pending-review-id>",
+                        args.decision.to_github_event(),
+                        body_present.then_some(body.as_str()),
+                    )
+                    .plan_argv(),
+                ),
+            )
+        };
         // The GitHub PR-existence guard is a live backend read; surface it in the
         // dry-run plan so wrappers inspecting dry-run output see every call.
         let guard_plan = (ctx.provider == Provider::GitHub).then(|| {
@@ -217,11 +364,21 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 issue_plan,
                 mirror_issue: args.mirror_issue,
                 lenses: args.lenses.clone(),
+                planned_review_threads: thread_specs.len(),
+                target_plan,
+                thread_plan,
+                submit_plan,
             },
             format,
             |p| {
                 if let Some(guard) = p.guard_plan.as_ref() {
                     println!("would verify pull request: {plan}", plan = guard.join(" "));
+                }
+                if let Some(target) = p.target_plan.as_ref() {
+                    println!(
+                        "would look up pull request node: {plan}",
+                        plan = target.join(" ")
+                    );
                 }
                 let verb = if p.submitted_review {
                     "would submit review event"
@@ -229,6 +386,15 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                     "would post review outcome"
                 };
                 println!("{verb}: {plan}", plan = p.plan.join(" "));
+                for thread_plan in &p.thread_plan {
+                    println!(
+                        "would create review thread: {plan}",
+                        plan = thread_plan.join(" ")
+                    );
+                }
+                if let Some(submit_plan) = p.submit_plan.as_ref() {
+                    println!("would publish review: {plan}", plan = submit_plan.join(" "));
+                }
                 if let Some(issue_plan) = p.issue_plan.as_ref() {
                     println!(
                         "would mirror issue activity: {plan}",
@@ -257,10 +423,20 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     } else {
         GlabNoteForm::CreateResolvable
     };
-    let pr_call = build_review_post_call(&ctx, &args, &body, body_present, glab_form);
-
-    let pr_output = runner.run(&pr_call)?;
-    let pr_comment_url = first_url(&pr_output.stdout).unwrap_or_default();
+    let (pr_comment_url, review_threads) = if thread_specs.is_empty() {
+        let pr_call = build_review_post_call(&ctx, &args, &body, body_present, glab_form);
+        let pr_output = runner.run(&pr_call)?;
+        (first_url(&pr_output.stdout).unwrap_or_default(), Vec::new())
+    } else {
+        submit_github_review_with_threads(
+            runner,
+            &ctx,
+            args.id,
+            args.decision,
+            body_present.then_some(body.as_str()),
+            &thread_specs,
+        )?
+    };
 
     let issue_comment_url = if let Some(issue_number) = mirror_issue {
         // The mirror body's user-controlled content (lenses) was already
@@ -293,6 +469,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             issue_comment_url,
             mirrored: args.mirror_issue,
             lenses: args.lenses,
+            review_threads,
         },
         format,
         render_text,
@@ -323,6 +500,506 @@ fn build_review_post_call(
     } else {
         build_pr_comment_call(ctx, args.id, body, glab_form)
     }
+}
+
+fn read_review_thread_specs(path: &str) -> Result<Vec<PreparedReviewThreadSpec>, ForgeError> {
+    let raw = read_review_thread_file_bounded(path)?;
+    parse_review_thread_specs(&raw)
+}
+
+fn read_review_thread_file_bounded(path: &str) -> Result<String, ForgeError> {
+    let mut raw = String::new();
+    let read_limit = REVIEW_THREAD_FILE_MAX_BYTES + 1;
+    if path == "-" {
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock().take(read_limit);
+        reader.read_to_string(&mut raw).map_err(|e| {
+            ForgeError::software(
+                schema_err(),
+                "failed to read --thread-file from stdin",
+                Some(e.to_string()),
+            )
+        })?;
+        return Ok(raw);
+    }
+
+    let file = fs::File::open(path).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            format!("failed to read --thread-file '{path}'"),
+            Some(e.to_string()),
+        )
+    })?;
+    let mut reader = file.take(read_limit);
+    reader.read_to_string(&mut raw).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            format!("failed to read --thread-file '{path}'"),
+            Some(e.to_string()),
+        )
+    })?;
+    Ok(raw)
+}
+
+fn parse_review_thread_specs(raw: &str) -> Result<Vec<PreparedReviewThreadSpec>, ForgeError> {
+    if raw.len() > REVIEW_THREAD_FILE_MAX_BYTES as usize {
+        return Err(review_thread_spec_err(format!(
+            "--thread-file must be at most {REVIEW_THREAD_FILE_MAX_BYTES} bytes"
+        )));
+    }
+    let specs: Vec<ReviewThreadSpec> = serde_json::from_str(raw).map_err(|e| {
+        ForgeError::validation(
+            schema_err(),
+            "invalid_review_thread_spec",
+            "--thread-file must be a JSON array of review thread specs",
+            Some(e.to_string()),
+        )
+    })?;
+    if specs.is_empty() {
+        return Err(review_thread_spec_err(
+            "--thread-file must contain at least one review thread spec",
+        ));
+    }
+    if specs.len() > REVIEW_THREAD_MAX_COUNT {
+        return Err(review_thread_spec_err(format!(
+            "--thread-file must contain at most {REVIEW_THREAD_MAX_COUNT} review thread specs"
+        )));
+    }
+    specs
+        .into_iter()
+        .enumerate()
+        .map(|(idx, spec)| prepare_review_thread_spec(idx + 1, spec))
+        .collect()
+}
+
+fn prepare_review_thread_spec(
+    index: usize,
+    spec: ReviewThreadSpec,
+) -> Result<PreparedReviewThreadSpec, ForgeError> {
+    let path = spec.path.trim().to_string();
+    if path.is_empty() {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} needs path and body"
+        )));
+    }
+    if path.len() > REVIEW_THREAD_PATH_MAX_BYTES {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} path must be at most {REVIEW_THREAD_PATH_MAX_BYTES} bytes"
+        )));
+    }
+    if spec.body.trim().is_empty() {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} needs path and body"
+        )));
+    }
+    if spec.body.len() > REVIEW_THREAD_BODY_MAX_BYTES {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} body must be at most {REVIEW_THREAD_BODY_MAX_BYTES} bytes"
+        )));
+    }
+    no_local_path(&path, "review thread path")?;
+    no_local_path(&spec.body, "review thread body")?;
+    no_escaped_control_markdown(&path)?;
+    no_escaped_control_markdown(&spec.body)?;
+
+    let side = spec.side.unwrap_or_default();
+    let subject_type = spec.subject_type.unwrap_or(if spec.line.is_some() {
+        ReviewThreadSubjectType::Line
+    } else {
+        ReviewThreadSubjectType::File
+    });
+    if matches!(subject_type, ReviewThreadSubjectType::Line) && spec.line.is_none() {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} needs line for a LINE review thread"
+        )));
+    }
+    if matches!(subject_type, ReviewThreadSubjectType::Line) && spec.line == Some(0) {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} line must be greater than zero"
+        )));
+    }
+    if matches!(subject_type, ReviewThreadSubjectType::File) && spec.line.is_some() {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} uses subjectType FILE and must omit line"
+        )));
+    }
+    if spec.start_line == Some(0) {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} startLine must be greater than zero"
+        )));
+    }
+    if spec.start_line.is_some() && spec.line.is_none() {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} uses startLine and must also include line"
+        )));
+    }
+    if spec.start_side.is_some() && spec.start_line.is_none() {
+        return Err(review_thread_spec_err(format!(
+            "thread spec #{index} uses startSide and must also include startLine"
+        )));
+    }
+    let start_side = spec.start_line.map(|_| spec.start_side.unwrap_or(side));
+
+    Ok(PreparedReviewThreadSpec {
+        path,
+        body: spec.body,
+        line: spec.line,
+        side,
+        start_line: spec.start_line,
+        start_side,
+        subject_type,
+    })
+}
+
+fn review_thread_spec_err(message: impl Into<String>) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "invalid_review_thread_spec",
+        message.into(),
+        Some(
+            "expected JSON array entries like {\"path\":\"src/lib.rs\",\"line\":42,\"side\":\"RIGHT\",\"body\":\"...\"}; omit line or set subjectType=FILE for file-level threads".to_string(),
+        ),
+    )
+}
+
+fn submit_github_review_with_threads<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+    decision: PrReviewDecision,
+    body: Option<&str>,
+    specs: &[PreparedReviewThreadSpec],
+) -> Result<(String, Vec<CreatedReviewThread>), ForgeError> {
+    let (owner, name) = github_owner_name(ctx)?;
+    let target_output = runner.run(&build_github_review_target_call(ctx, owner, name, number))?;
+    let target = parse_github_review_target(&target_output)?;
+    let _target_url = target.url;
+
+    let pending_output = runner.run(&build_github_pending_review_call(
+        ctx,
+        &target.pull_request_id,
+    ))?;
+    let pending = parse_github_pending_review(&pending_output)?;
+
+    let mut review_threads = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let output = match runner.run(&build_github_add_review_thread_call(
+            ctx,
+            &pending.review_id,
+            spec,
+        )) {
+            Ok(output) => output,
+            Err(err) => return Err(cleanup_pending_github_review(runner, ctx, &pending, err)),
+        };
+        let thread = match parse_created_review_thread(&output, spec) {
+            Ok(thread) => thread,
+            Err(err) => return Err(cleanup_pending_github_review(runner, ctx, &pending, err)),
+        };
+        review_threads.push(thread);
+    }
+
+    let submit_output = match runner.run(&build_github_submit_review_call(
+        ctx,
+        &pending.review_id,
+        decision.to_github_event(),
+        body,
+    )) {
+        Ok(output) => output,
+        Err(err) => return Err(cleanup_pending_github_review(runner, ctx, &pending, err)),
+    };
+    let review_url = parse_submitted_review_url(&submit_output).unwrap_or(pending.url);
+    Ok((review_url, review_threads))
+}
+
+fn github_owner_name(ctx: &ProviderContext) -> Result<(&str, &str), ForgeError> {
+    let Some(repo) = ctx.repo.as_deref() else {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "repo_required",
+            "pr review --thread-file requires --repo owner/name or a recognised GitHub remote",
+            None,
+        ));
+    };
+    repo.split_once('/').ok_or_else(|| {
+        ForgeError::validation(
+            schema_err(),
+            "repo_required",
+            "pr review --thread-file requires a repo slug shaped as owner/name",
+            Some(format!("repo={repo}")),
+        )
+    })
+}
+
+fn build_github_review_target_call(
+    ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_REVIEW_TARGET_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("owner={owner}")),
+        OsString::from("-f"),
+        OsString::from(format!("name={name}")),
+        OsString::from("-F"),
+        OsString::from(format!("number={number}")),
+    ]);
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn build_github_pending_review_call(ctx: &ProviderContext, pull_request_id: &str) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_ADD_PENDING_REVIEW_MUTATION}")),
+        OsString::from("-f"),
+        OsString::from(format!("pullRequestId={pull_request_id}")),
+    ]);
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn build_github_add_review_thread_call(
+    ctx: &ProviderContext,
+    review_id: &str,
+    spec: &PreparedReviewThreadSpec,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_ADD_REVIEW_THREAD_MUTATION}")),
+        OsString::from("-f"),
+        OsString::from(format!("reviewId={review_id}")),
+        OsString::from("-f"),
+        OsString::from(format!("path={path}", path = spec.path)),
+        OsString::from("-f"),
+        OsString::from(format!("body={body}", body = spec.body)),
+        OsString::from("-f"),
+        OsString::from(format!("side={side}", side = spec.side.as_str())),
+        OsString::from("-f"),
+        OsString::from(format!(
+            "subjectType={subject_type}",
+            subject_type = spec.subject_type.as_str()
+        )),
+    ]);
+    if let Some(line) = spec.line {
+        argv.extend([OsString::from("-F"), OsString::from(format!("line={line}"))]);
+    }
+    if let Some(start_line) = spec.start_line {
+        argv.extend([
+            OsString::from("-F"),
+            OsString::from(format!("startLine={start_line}")),
+        ]);
+    }
+    if let Some(start_side) = spec.start_side {
+        argv.extend([
+            OsString::from("-f"),
+            OsString::from(format!("startSide={}", start_side.as_str())),
+        ]);
+    }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn build_github_submit_review_call(
+    ctx: &ProviderContext,
+    review_id: &str,
+    event: &str,
+    body: Option<&str>,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_SUBMIT_REVIEW_MUTATION}")),
+        OsString::from("-f"),
+        OsString::from(format!("reviewId={review_id}")),
+        OsString::from("-f"),
+        OsString::from(format!("event={event}")),
+    ]);
+    if let Some(body) = body {
+        argv.extend([OsString::from("-f"), OsString::from(format!("body={body}"))]);
+    }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn build_github_delete_pending_review_call(ctx: &ProviderContext, review_id: &str) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_DELETE_PENDING_REVIEW_MUTATION}")),
+        OsString::from("-f"),
+        OsString::from(format!("reviewId={review_id}")),
+    ]);
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn cleanup_pending_github_review<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pending: &GitHubPendingReview,
+    cause: ForgeError,
+) -> ForgeError {
+    match runner.run(&build_github_delete_pending_review_call(
+        ctx,
+        &pending.review_id,
+    )) {
+        Ok(_) => cause,
+        Err(cleanup_err) => with_cleanup_detail(cause, pending, cleanup_err),
+    }
+}
+
+fn with_cleanup_detail(
+    cause: ForgeError,
+    pending: &GitHubPendingReview,
+    cleanup_err: ForgeError,
+) -> ForgeError {
+    let cleanup_detail = format!(
+        "pending_review_id={id}; pending_review_url={url}; cleanup_error_kind={cleanup_kind}; cleanup_error_message={cleanup_message}; cleanup_error_detail={cleanup_detail}",
+        id = pending.review_id,
+        url = pending.url,
+        cleanup_kind = cleanup_err.kind(),
+        cleanup_message = cleanup_err.message(),
+        cleanup_detail = cleanup_err.detail().unwrap_or(""),
+    );
+    let merged_detail = match cause.detail() {
+        Some(detail) if !detail.is_empty() => format!("{detail}; {cleanup_detail}"),
+        _ => cleanup_detail,
+    };
+    match cause {
+        ForgeError::NotImplemented {
+            schema_version,
+            message,
+        } => ForgeError::not_implemented(schema_version, message),
+        ForgeError::BackendUnavailable {
+            schema_version,
+            kind,
+            message,
+            ..
+        } => ForgeError::unavailable(schema_version, kind, message, Some(merged_detail)),
+        ForgeError::BackendError {
+            schema_version,
+            message,
+            ..
+        } => ForgeError::backend_error(schema_version, message, Some(merged_detail)),
+        ForgeError::ProviderUnsupported {
+            schema_version,
+            message,
+            ..
+        } => ForgeError::provider_unsupported(schema_version, message, Some(merged_detail)),
+        ForgeError::SoftwareError {
+            schema_version,
+            message,
+            ..
+        } => ForgeError::software(schema_version, message, Some(merged_detail)),
+        ForgeError::Validation {
+            schema_version,
+            kind,
+            message,
+            ..
+        } => ForgeError::validation(schema_version, kind, message, Some(merged_detail)),
+        ForgeError::RuntimeFailure {
+            schema_version,
+            kind,
+            message,
+            ..
+        } => ForgeError::runtime_failure(schema_version, kind, message, Some(merged_detail)),
+    }
+}
+
+fn parse_github_review_target(
+    output: &crate::backend::BackendSuccess,
+) -> Result<GitHubReviewTarget, ForgeError> {
+    let value = parse_graphql_json(output, "pull request lookup response")?;
+    Ok(GitHubReviewTarget {
+        pull_request_id: required_pointer_str(&value, "/data/repository/pullRequest/id")?,
+        url: required_pointer_str(&value, "/data/repository/pullRequest/url")?,
+    })
+}
+
+fn parse_github_pending_review(
+    output: &crate::backend::BackendSuccess,
+) -> Result<GitHubPendingReview, ForgeError> {
+    let value = parse_graphql_json(output, "pending review response")?;
+    Ok(GitHubPendingReview {
+        review_id: required_pointer_str(&value, "/data/addPullRequestReview/pullRequestReview/id")?,
+        url: required_pointer_str(&value, "/data/addPullRequestReview/pullRequestReview/url")?,
+    })
+}
+
+fn parse_created_review_thread(
+    output: &crate::backend::BackendSuccess,
+    spec: &PreparedReviewThreadSpec,
+) -> Result<CreatedReviewThread, ForgeError> {
+    let value = parse_graphql_json(output, "review thread response")?;
+    let line =
+        optional_pointer_u32(&value, "/data/addPullRequestReviewThread/thread/line").or(spec.line);
+    Ok(CreatedReviewThread {
+        id: required_pointer_str(&value, "/data/addPullRequestReviewThread/thread/id")?,
+        url: optional_pointer_str(
+            &value,
+            "/data/addPullRequestReviewThread/thread/comments/nodes/0/url",
+        )
+        .unwrap_or_default(),
+        path: optional_pointer_str(&value, "/data/addPullRequestReviewThread/thread/path")
+            .unwrap_or_else(|| spec.path.clone()),
+        line,
+        subject_type: optional_pointer_str(
+            &value,
+            "/data/addPullRequestReviewThread/thread/subjectType",
+        )
+        .unwrap_or_else(|| spec.subject_type.as_str().to_string()),
+    })
+}
+
+fn parse_submitted_review_url(output: &crate::backend::BackendSuccess) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).ok()?;
+    optional_pointer_str(
+        &value,
+        "/data/submitPullRequestReview/pullRequestReview/url",
+    )
+}
+
+fn parse_graphql_json(
+    output: &crate::backend::BackendSuccess,
+    label: &str,
+) -> Result<serde_json::Value, ForgeError> {
+    serde_json::from_str(output.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            format!("github {label} is invalid JSON"),
+            Some(e.to_string()),
+        )
+    })
+}
+
+fn required_pointer_str(value: &serde_json::Value, pointer: &str) -> Result<String, ForgeError> {
+    optional_pointer_str(value, pointer).ok_or_else(|| {
+        ForgeError::software(
+            schema_err(),
+            "github review-thread response is missing an expected field",
+            Some(format!("missing={pointer}; response={value:?}")),
+        )
+    })
+}
+
+fn optional_pointer_str(value: &serde_json::Value, pointer: &str) -> Option<String> {
+    value
+        .pointer(pointer)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn optional_pointer_u32(value: &serde_json::Value, pointer: &str) -> Option<u32> {
+    value
+        .pointer(pointer)
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 fn build_pr_comment_call(
@@ -676,6 +1353,7 @@ mod tests {
             issue: None,
             mirror_issue: false,
             submit_review,
+            thread_file: None,
         }
     }
 
@@ -775,6 +1453,53 @@ mod tests {
         assert!(
             !joined.contains("/reviews"),
             "comment mode must not hit the reviews endpoint: {joined}"
+        );
+    }
+
+    #[test]
+    fn parse_review_thread_specs_defaults_line_thread() {
+        let specs = parse_review_thread_specs(
+            r#"[{"path":"src/lib.rs","line":42,"body":"Add regression coverage."}]"#,
+        )
+        .expect("valid line thread spec");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].path, "src/lib.rs");
+        assert_eq!(specs[0].line, Some(42));
+        assert_eq!(specs[0].side, ReviewThreadDiffSide::Right);
+        assert_eq!(specs[0].subject_type, ReviewThreadSubjectType::Line);
+    }
+
+    #[test]
+    fn parse_review_thread_specs_defaults_file_thread_without_line() {
+        let specs = parse_review_thread_specs(
+            r#"[{"path":"src/lib.rs","body":"File-level actionable finding."}]"#,
+        )
+        .expect("valid file thread spec");
+        assert_eq!(specs[0].line, None);
+        assert_eq!(specs[0].subject_type, ReviewThreadSubjectType::File);
+    }
+
+    #[test]
+    fn parse_review_thread_specs_rejects_line_zero() {
+        let err =
+            parse_review_thread_specs(r#"[{"path":"src/lib.rs","line":0,"body":"Bad line."}]"#)
+                .expect_err("line zero rejected");
+        assert_eq!(err.kind(), "invalid_review_thread_spec");
+    }
+
+    #[test]
+    fn add_review_thread_call_renders_file_subject_type() {
+        let spec = parse_review_thread_specs(
+            r#"[{"path":"src/lib.rs","body":"File-level actionable finding."}]"#,
+        )
+        .expect("valid file thread spec")
+        .remove(0);
+        let call = build_github_add_review_thread_call(&ctx(Some("acme/widgets")), "PRR_1", &spec);
+        let joined = joined(&call);
+        assert!(joined.contains("subjectType=FILE"), "{joined}");
+        assert!(
+            !joined.contains("line="),
+            "file-level thread must not send a line variable: {joined}"
         );
     }
 }
