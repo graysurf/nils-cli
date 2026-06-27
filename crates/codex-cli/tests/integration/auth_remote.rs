@@ -71,7 +71,11 @@ fn run_with_path_prepend(
     vars: &[(&str, &str)],
     path_prepend: &Path,
 ) -> CmdOutput {
-    let options = with_env_options(CmdOptions::default().with_path_prepend(path_prepend), envs, vars);
+    let options = with_env_options(
+        CmdOptions::default().with_path_prepend(path_prepend),
+        envs,
+        vars,
+    );
     let bin = codex_cli_bin();
     cmd::run_with(&bin, args, &options)
 }
