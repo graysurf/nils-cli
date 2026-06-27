@@ -1,6 +1,6 @@
 [package]
 name = "nils-codex-cli"
-version = "1.19.1"
+version = "1.19.2"
 edition.workspace = true
 license.workspace = true
 
@@ -19,14 +19,14 @@ anyhow = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.19.1", path = "../nils-build-info" }
+nils-build-info = { version = "1.19.2", path = "../nils-build-info" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-nils-term = { version = "1.19.1", path = "../nils-term", package = "nils-term" }
-nils-common = { version = "1.19.1", path = "../nils-common", package = "nils-common" }
+nils-term = { version = "1.19.2", path = "../nils-term", package = "nils-term" }
+nils-common = { version = "1.19.2", path = "../nils-common", package = "nils-common" }
 
 [dev-dependencies]
-nils-test-support = { version = "1.19.1", path = "../nils-test-support" }
+nils-test-support = { version = "1.19.2", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
