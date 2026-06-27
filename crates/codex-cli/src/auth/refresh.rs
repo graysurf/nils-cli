@@ -383,9 +383,12 @@ fn resolve_target(args: &[String], output_json: bool) -> Result<Option<PathBuf>>
 }
 
 fn refresh_token_from_json(value: &Value) -> Option<String> {
-    json::string_at(value, &["tokens", "refresh_token"])
-        .or_else(|| json::string_at(value, &["refresh_token"]))
-        .filter(|value| crate::auth::is_real_refresh_token(value.trim()))
+    real_refresh_token_at(value, &["tokens", "refresh_token"])
+        .or_else(|| real_refresh_token_at(value, &["refresh_token"]))
+}
+
+fn real_refresh_token_at(value: &Value, path: &[&str]) -> Option<String> {
+    json::string_at(value, path).filter(|value| crate::auth::is_real_refresh_token(value.trim()))
 }
 
 fn merge_tokens(base: &Value, refresh: &Value, now_iso: &str) -> Result<Value> {
@@ -590,6 +593,18 @@ mod tests {
             }
         });
         assert!(refresh_token_from_json(&value).is_none());
+    }
+
+    #[test]
+    fn auth_refresh_refresh_token_from_json_falls_back_after_nested_placeholder() {
+        let value = serde_json::json!({
+            "refresh_token": "top",
+            "tokens": {
+                "refresh_token": crate::auth::ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
+            }
+        });
+        let token = refresh_token_from_json(&value).expect("top-level fallback token");
+        assert_eq!(token, "top");
     }
 
     #[test]

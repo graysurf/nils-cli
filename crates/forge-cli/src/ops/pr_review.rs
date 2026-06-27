@@ -242,6 +242,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     if let Some(command) = args.command.clone() {
         return match command {
             PrReviewCommand::Validate(validate_args) => {
+                let validate_args = validate_args_with_parent_fallbacks(&args, validate_args);
                 run_validate_with(runner, global, validate_args, format, remote_url_lookup)
             }
         };
@@ -637,6 +638,23 @@ fn run_validate_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             );
         },
     ))
+}
+
+fn validate_args_with_parent_fallbacks(
+    parent: &PrReviewArgs,
+    mut validate_args: PrReviewValidateArgs,
+) -> PrReviewValidateArgs {
+    if validate_args.id.is_none() {
+        validate_args.id = parent.id;
+    }
+    if validate_args.comment.is_none() && validate_args.comment_file.is_none() {
+        validate_args.comment = parent.comment.clone();
+        validate_args.comment_file = parent.comment_file.clone();
+    }
+    if validate_args.thread_file.is_none() {
+        validate_args.thread_file = parent.thread_file.clone();
+    }
+    validate_args
 }
 
 /// Build the primary "post the review" backend call for the chosen mode: a

@@ -121,6 +121,23 @@ fn pr_help_lists_every_v1_subcommand() {
 }
 
 #[test]
+fn pr_review_help_distinguishes_thread_file_posting_and_validate() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(&stub, &["pr", "review", "--help"]);
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    for expected in [
+        "Requires --submit-review when posting",
+        "may be inherited by `validate` without posting",
+    ] {
+        assert!(
+            out.stdout.contains(expected),
+            "pr review --help missing {expected}: stdout={}",
+            out.stdout
+        );
+    }
+}
+
+#[test]
 fn pr_review_threads_missing_subcommand_preserves_json_error_envelope() {
     let stub = StubEnv::new();
     let out = run_forge_cli(&stub, &["--format", "json", "pr", "review-threads"]);
