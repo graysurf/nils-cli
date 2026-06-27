@@ -5,8 +5,9 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::UNIX_EPOCH;
 
 use chrono::Local;
 use clap::Parser;
@@ -16,10 +17,14 @@ use clap::error::ErrorKind;
 // `agent_out::project_slug_*` API.
 use nils_common::slug::sanitize_path_label;
 pub use nils_common::slug::{project_slug_from_owner_repo, project_slug_from_remote_url};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
-use cli::{AuditArgs, AuditFormat, Cli, Command, PathForArgs, ProjectArgs, ProjectFormat};
+use cli::{
+    AuditArgs, AuditFormat, CleanupApplyArgs, CleanupFormat, CleanupPlanArgs, Cli, Command,
+    PathForArgs, ProjectArgs, ProjectFormat,
+};
 
 use nils_common::cli_contract::exit;
 use nils_common::fs::display_path;
@@ -28,15 +33,23 @@ const EXIT_OK: i32 = exit::SUCCESS;
 const EXIT_AUDIT_VIOLATIONS: i32 = exit::RUNTIME;
 const EXIT_RUNTIME: i32 = exit::RUNTIME;
 const EXIT_USAGE: i32 = exit::USAGE;
+const EXIT_DATA: i32 = exit::DATA;
 
 const PROJECT_SCHEMA_VERSION: &str = "cli.agent-out.project.v1";
 const PATH_FOR_SCHEMA_VERSION: &str = "cli.agent-out.path-for.v1";
 const AUDIT_SCHEMA_VERSION: &str = "cli.agent-out.audit.v1";
+const CLEANUP_PLAN_SCHEMA_VERSION: &str = "cli.agent-out.cleanup.plan.v1";
+const CLEANUP_APPLY_SCHEMA_VERSION: &str = "cli.agent-out.cleanup.apply.v1";
 const PROJECT_COMMAND: &str = "agent-out project";
 const PATH_FOR_COMMAND: &str = "agent-out path-for";
 const AUDIT_COMMAND: &str = "agent-out audit";
+const CLEANUP_PLAN_COMMAND: &str = "agent-out cleanup plan";
+const CLEANUP_APPLY_COMMAND: &str = "agent-out cleanup apply";
 
 const CANONICAL_PROJECT_ROOT: &str = "projects";
+const RELEASE_CACHE_ROOT: &str = "nils-versions";
+const SKILL_USAGE_MARKER: &str = "skill-usage.record.json";
+const TEST_FIRST_MARKER: &str = "test-first-evidence.json";
 const ALLOWLISTED_TOOL_ROOTS: &[&str] = &[
     "agent-browser",
     "api-test-runner",
@@ -97,6 +110,10 @@ fn dispatch(cli: Cli) -> i32 {
         Command::PathFor(args) => run_path_for(args),
         Command::Project(args) => run_project(args),
         Command::Audit(args) => run_audit(args),
+        Command::Cleanup(args) => match args.command {
+            cli::CleanupCommand::Plan(args) => run_cleanup_plan(args),
+            cli::CleanupCommand::Apply(args) => run_cleanup_apply(args),
+        },
         Command::Completion(args) => completion::run(args.shell),
     }
 }
@@ -151,6 +168,56 @@ fn run_audit(args: AuditArgs) -> i32 {
                 print_json_success(AUDIT_SCHEMA_VERSION, AUDIT_COMMAND, &report)
                     .unwrap_or_else(render_json_failure)
             }
+        }
+    }
+}
+
+fn run_cleanup_plan(args: CleanupPlanArgs) -> i32 {
+    let plan = match build_cleanup_plan(&args) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return render_error(
+                CLEANUP_PLAN_SCHEMA_VERSION,
+                CLEANUP_PLAN_COMMAND,
+                args.format,
+                err,
+            );
+        }
+    };
+
+    match args.format {
+        CleanupFormat::Text => {
+            println!("{}", render_cleanup_plan_text(&plan));
+            EXIT_OK
+        }
+        CleanupFormat::Json => {
+            print_json_success(CLEANUP_PLAN_SCHEMA_VERSION, CLEANUP_PLAN_COMMAND, &plan)
+                .unwrap_or_else(render_json_failure)
+        }
+    }
+}
+
+fn run_cleanup_apply(args: CleanupApplyArgs) -> i32 {
+    let report = match apply_cleanup_plan(&args) {
+        Ok(report) => report,
+        Err(err) => {
+            return render_error(
+                CLEANUP_APPLY_SCHEMA_VERSION,
+                CLEANUP_APPLY_COMMAND,
+                args.format,
+                err,
+            );
+        }
+    };
+
+    match args.format {
+        CleanupFormat::Text => {
+            println!("{}", render_cleanup_apply_text(&report));
+            EXIT_OK
+        }
+        CleanupFormat::Json => {
+            print_json_success(CLEANUP_APPLY_SCHEMA_VERSION, CLEANUP_APPLY_COMMAND, &report)
+                .unwrap_or_else(render_json_failure)
         }
     }
 }
@@ -228,6 +295,12 @@ impl JsonFormat for AuditFormat {
     }
 }
 
+impl JsonFormat for CleanupFormat {
+    fn is_json(&self) -> bool {
+        *self == CleanupFormat::Json
+    }
+}
+
 #[derive(Debug)]
 struct CliError {
     code: &'static str,
@@ -252,6 +325,15 @@ impl CliError {
             message: message.into(),
             details,
             exit_code: EXIT_RUNTIME,
+        }
+    }
+
+    fn data(code: &'static str, message: impl Into<String>, details: Option<Value>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details,
+            exit_code: EXIT_DATA,
         }
     }
 }
@@ -536,6 +618,103 @@ pub struct AuditEntry {
     pub reason: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupCategory {
+    AllowedRoot,
+    Cache,
+    TopLevelNoncanonical,
+    EvidenceSource,
+    ProjectArtifact,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupAction {
+    Delete,
+    Preserve,
+    NeedsPolicy,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CleanupItem {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub category: CleanupCategory,
+    pub action: CleanupAction,
+    pub reason: String,
+    pub size_bytes: u64,
+    pub mtime_unix: Option<i64>,
+    pub contains_skill_usage: bool,
+    pub contains_test_first_evidence: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CleanupPlan {
+    pub agent_home: String,
+    pub out_root: String,
+    pub out_root_exists: bool,
+    pub include_projects: bool,
+    pub items: Vec<CleanupItem>,
+    pub summary: CleanupSummary,
+    pub plan_digest: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct CleanupSummary {
+    pub total: usize,
+    pub delete: usize,
+    pub preserve: usize,
+    pub needs_policy: usize,
+    pub delete_bytes: u64,
+    pub preserve_bytes: u64,
+    pub needs_policy_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CleanupApplyReport {
+    pub agent_home: String,
+    pub out_root: String,
+    pub plan_digest: String,
+    pub applied: bool,
+    pub entries: Vec<CleanupApplyEntry>,
+    pub summary: CleanupApplySummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CleanupApplyEntry {
+    pub path: String,
+    pub action: String,
+    pub status: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct CleanupApplySummary {
+    pub deleted: usize,
+    pub skipped: usize,
+    pub delete_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct CleanupPlanEnvelope {
+    schema_version: String,
+    command: String,
+    ok: bool,
+    result: CleanupPlan,
+}
+
+#[derive(Serialize)]
+struct CleanupPlanDigestInput<'a> {
+    agent_home: &'a str,
+    out_root: &'a str,
+    out_root_exists: bool,
+    include_projects: bool,
+    items: &'a [CleanupItem],
+    summary: &'a CleanupSummary,
+}
+
 fn build_audit_report(args: &AuditArgs) -> Result<AuditReport, CliError> {
     let agent_home = resolve_agent_home(args.agent_home.as_deref())?;
     let out_root = agent_home.join("out");
@@ -635,6 +814,204 @@ fn build_audit_report(args: &AuditArgs) -> Result<AuditReport, CliError> {
     })
 }
 
+fn build_cleanup_plan(args: &CleanupPlanArgs) -> Result<CleanupPlan, CliError> {
+    let agent_home = resolve_agent_home(args.agent_home.as_deref())?;
+    let out_root = agent_home.join("out");
+    let mut items = Vec::new();
+
+    if !out_root.exists() {
+        let mut plan = CleanupPlan {
+            agent_home: display_path(&agent_home),
+            out_root: display_path(&out_root),
+            out_root_exists: false,
+            include_projects: args.include_projects,
+            items,
+            summary: CleanupSummary::default(),
+            plan_digest: String::new(),
+        };
+        plan.plan_digest = compute_cleanup_plan_digest(&plan)?;
+        return Ok(plan);
+    }
+
+    if !out_root.is_dir() {
+        return Err(CliError::runtime(
+            "out-root-not-directory",
+            format!("{} is not a directory", out_root.display()),
+            Some(json!({ "out_root": display_path(&out_root) })),
+        ));
+    }
+
+    let allowlisted: BTreeSet<&str> = ALLOWLISTED_TOOL_ROOTS.iter().copied().collect();
+    let mut entries = read_sorted_children(&out_root, "cleanup-read-failed")?;
+
+    for path in entries.drain(..) {
+        let name = path_name(&path);
+        let kind = entry_kind(&path);
+        let markers = marker_flags(&path)?;
+        let size_bytes = path_size_bytes(&path)?;
+        let mtime_unix = path_mtime_unix(&path);
+
+        if name == CANONICAL_PROJECT_ROOT && path.is_dir() {
+            items.push(CleanupItem {
+                name,
+                path: display_path(&path),
+                kind,
+                category: CleanupCategory::AllowedRoot,
+                action: CleanupAction::Preserve,
+                reason: "canonical project-scoped artifact root".to_string(),
+                size_bytes,
+                mtime_unix,
+                contains_skill_usage: markers.skill_usage,
+                contains_test_first_evidence: markers.test_first_evidence,
+            });
+            if args.include_projects {
+                items.extend(build_project_cleanup_items(&path)?);
+            }
+        } else if allowlisted.contains(name.as_str()) && path.is_dir() {
+            items.push(CleanupItem {
+                name,
+                path: display_path(&path),
+                kind,
+                category: CleanupCategory::AllowedRoot,
+                action: CleanupAction::Preserve,
+                reason: "preserved tool/workflow artifact root".to_string(),
+                size_bytes,
+                mtime_unix,
+                contains_skill_usage: markers.skill_usage,
+                contains_test_first_evidence: markers.test_first_evidence,
+            });
+        } else if markers.has_evidence() {
+            items.push(CleanupItem {
+                name,
+                path: display_path(&path),
+                kind,
+                category: CleanupCategory::EvidenceSource,
+                action: CleanupAction::Preserve,
+                reason: "contains retained evidence markers; use evidence migrate/prune-source"
+                    .to_string(),
+                size_bytes,
+                mtime_unix,
+                contains_skill_usage: markers.skill_usage,
+                contains_test_first_evidence: markers.test_first_evidence,
+            });
+        } else if name == RELEASE_CACHE_ROOT {
+            items.push(CleanupItem {
+                name,
+                path: display_path(&path),
+                kind,
+                category: CleanupCategory::Cache,
+                action: CleanupAction::Delete,
+                reason: "released nils-cli binary cache; safe to recreate from release assets"
+                    .to_string(),
+                size_bytes,
+                mtime_unix,
+                contains_skill_usage: markers.skill_usage,
+                contains_test_first_evidence: markers.test_first_evidence,
+            });
+        } else {
+            items.push(CleanupItem {
+                name,
+                path: display_path(&path),
+                kind,
+                category: CleanupCategory::TopLevelNoncanonical,
+                action: CleanupAction::Delete,
+                reason: "top-level noncanonical entry without retained evidence markers"
+                    .to_string(),
+                size_bytes,
+                mtime_unix,
+                contains_skill_usage: false,
+                contains_test_first_evidence: false,
+            });
+        }
+    }
+
+    let summary = cleanup_summary(&items);
+    let mut plan = CleanupPlan {
+        agent_home: display_path(&agent_home),
+        out_root: display_path(&out_root),
+        out_root_exists: true,
+        include_projects: args.include_projects,
+        items,
+        summary,
+        plan_digest: String::new(),
+    };
+    plan.plan_digest = compute_cleanup_plan_digest(&plan)?;
+    Ok(plan)
+}
+
+fn build_project_cleanup_items(projects_root: &Path) -> Result<Vec<CleanupItem>, CliError> {
+    let mut items = Vec::new();
+    if !projects_root.is_dir() {
+        return Ok(items);
+    }
+
+    for project_dir in read_sorted_children(projects_root, "cleanup-read-failed")? {
+        if !project_dir.is_dir() {
+            continue;
+        }
+        for run_dir in read_sorted_children(&project_dir, "cleanup-read-failed")? {
+            let markers = marker_flags(&run_dir)?;
+            let action = if markers.has_evidence() {
+                CleanupAction::Preserve
+            } else {
+                CleanupAction::NeedsPolicy
+            };
+            let (category, reason) = if markers.has_evidence() {
+                (
+                    CleanupCategory::EvidenceSource,
+                    "contains retained evidence markers; use evidence migrate/prune-source"
+                        .to_string(),
+                )
+            } else {
+                (
+                    CleanupCategory::ProjectArtifact,
+                    "canonical project artifact without a retention policy; review before deleting"
+                        .to_string(),
+                )
+            };
+
+            items.push(CleanupItem {
+                name: path_name(&run_dir),
+                path: display_path(&run_dir),
+                kind: entry_kind(&run_dir),
+                category,
+                action,
+                reason,
+                size_bytes: path_size_bytes(&run_dir)?,
+                mtime_unix: path_mtime_unix(&run_dir),
+                contains_skill_usage: markers.skill_usage,
+                contains_test_first_evidence: markers.test_first_evidence,
+            });
+        }
+    }
+    Ok(items)
+}
+
+fn cleanup_summary(items: &[CleanupItem]) -> CleanupSummary {
+    let mut summary = CleanupSummary {
+        total: items.len(),
+        ..CleanupSummary::default()
+    };
+    for item in items {
+        match item.action {
+            CleanupAction::Delete => {
+                summary.delete += 1;
+                summary.delete_bytes = summary.delete_bytes.saturating_add(item.size_bytes);
+            }
+            CleanupAction::Preserve => {
+                summary.preserve += 1;
+                summary.preserve_bytes = summary.preserve_bytes.saturating_add(item.size_bytes);
+            }
+            CleanupAction::NeedsPolicy => {
+                summary.needs_policy += 1;
+                summary.needs_policy_bytes =
+                    summary.needs_policy_bytes.saturating_add(item.size_bytes);
+            }
+        }
+    }
+    summary
+}
+
 fn entry_kind(path: &Path) -> String {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => "symlink".to_string(),
@@ -643,6 +1020,461 @@ fn entry_kind(path: &Path) -> String {
         Ok(_) => "other".to_string(),
         Err(_) => "unknown".to_string(),
     }
+}
+
+fn path_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn read_sorted_children(path: &Path, code: &'static str) -> Result<Vec<PathBuf>, CliError> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path).map_err(|err| {
+        CliError::runtime(
+            code,
+            format!("failed to read {}: {err}", path.display()),
+            Some(json!({ "path": display_path(path) })),
+        )
+    })? {
+        let entry = entry.map_err(|err| {
+            CliError::runtime(
+                code,
+                format!("failed to read entry under {}: {err}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            )
+        })?;
+        entries.push(entry.path());
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+#[derive(Default)]
+struct MarkerFlags {
+    skill_usage: bool,
+    test_first_evidence: bool,
+}
+
+impl MarkerFlags {
+    fn has_evidence(&self) -> bool {
+        self.skill_usage || self.test_first_evidence
+    }
+
+    fn merge(&mut self, other: MarkerFlags) {
+        self.skill_usage |= other.skill_usage;
+        self.test_first_evidence |= other.test_first_evidence;
+    }
+}
+
+fn marker_flags(path: &Path) -> Result<MarkerFlags, CliError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(MarkerFlags::default()),
+        Err(err) => {
+            return Err(CliError::runtime(
+                "cleanup-stat-failed",
+                format!("failed to inspect {}: {err}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            ));
+        }
+    };
+
+    let mut flags = MarkerFlags::default();
+    match path.file_name().and_then(|value| value.to_str()) {
+        Some(SKILL_USAGE_MARKER) => flags.skill_usage = true,
+        Some(TEST_FIRST_MARKER) => flags.test_first_evidence = true,
+        _ => {}
+    }
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        for child in read_sorted_children(path, "cleanup-read-failed")? {
+            flags.merge(marker_flags(&child)?);
+            if flags.has_evidence() && flags.skill_usage && flags.test_first_evidence {
+                break;
+            }
+        }
+    }
+
+    Ok(flags)
+}
+
+fn path_size_bytes(path: &Path) -> Result<u64, CliError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(CliError::runtime(
+                "cleanup-stat-failed",
+                format!("failed to inspect {}: {err}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            ));
+        }
+    };
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let mut total = 0_u64;
+        for child in read_sorted_children(path, "cleanup-read-failed")? {
+            total = total.saturating_add(path_size_bytes(&child)?);
+        }
+        Ok(total)
+    } else {
+        Ok(metadata.len())
+    }
+}
+
+fn path_mtime_unix(path: &Path) -> Option<i64> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => Some(duration.as_secs() as i64),
+        Err(err) => Some(-(err.duration().as_secs() as i64)),
+    }
+}
+
+fn compute_cleanup_plan_digest(plan: &CleanupPlan) -> Result<String, CliError> {
+    let digest_input = CleanupPlanDigestInput {
+        agent_home: &plan.agent_home,
+        out_root: &plan.out_root,
+        out_root_exists: plan.out_root_exists,
+        include_projects: plan.include_projects,
+        items: &plan.items,
+        summary: &plan.summary,
+    };
+    let bytes = serde_json::to_vec(&digest_input).map_err(|err| {
+        CliError::runtime(
+            "cleanup-digest-failed",
+            format!("failed to compute cleanup plan digest: {err}"),
+            None,
+        )
+    })?;
+    let digest = Sha256::digest(bytes);
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("sha256:{hex}"))
+}
+
+fn apply_cleanup_plan(args: &CleanupApplyArgs) -> Result<CleanupApplyReport, CliError> {
+    let plan_text = fs::read_to_string(&args.plan_file).map_err(|err| {
+        CliError::data(
+            "cleanup-plan-read-failed",
+            format!("failed to read {}: {err}", args.plan_file.display()),
+            Some(json!({ "plan_file": display_path(&args.plan_file) })),
+        )
+    })?;
+    let envelope: CleanupPlanEnvelope = serde_json::from_str(&plan_text).map_err(|err| {
+        CliError::data(
+            "cleanup-plan-invalid-json",
+            format!("failed to parse cleanup plan json: {err}"),
+            Some(json!({ "plan_file": display_path(&args.plan_file) })),
+        )
+    })?;
+    if envelope.schema_version != CLEANUP_PLAN_SCHEMA_VERSION
+        || envelope.command != CLEANUP_PLAN_COMMAND
+        || !envelope.ok
+    {
+        return Err(CliError::data(
+            "cleanup-plan-invalid",
+            "plan file is not a successful agent-out cleanup plan envelope",
+            Some(json!({
+                "schema_version": envelope.schema_version,
+                "command": envelope.command,
+                "ok": envelope.ok
+            })),
+        ));
+    }
+
+    let plan = envelope.result;
+    let computed_digest = compute_cleanup_plan_digest(&plan)?;
+    if computed_digest != plan.plan_digest {
+        return Err(CliError::data(
+            "cleanup-plan-digest-invalid",
+            "plan digest does not match plan contents",
+            Some(json!({
+                "plan_digest": plan.plan_digest,
+                "computed_digest": computed_digest
+            })),
+        ));
+    }
+    if args.confirm_digest != plan.plan_digest {
+        return Err(CliError::data(
+            "cleanup-digest-mismatch",
+            "confirmed digest does not match the cleanup plan",
+            Some(json!({
+                "confirm_digest": args.confirm_digest,
+                "plan_digest": plan.plan_digest
+            })),
+        ));
+    }
+
+    let agent_home = resolve_agent_home(args.agent_home.as_deref())?;
+    let expected_agent_home = display_path(&agent_home);
+    if expected_agent_home != plan.agent_home {
+        return Err(CliError::data(
+            "cleanup-agent-home-mismatch",
+            "plan agent_home does not match the resolved agent home",
+            Some(json!({
+                "agent_home": expected_agent_home,
+                "plan_agent_home": plan.agent_home
+            })),
+        ));
+    }
+    let expected_out_root = display_path(&agent_home.join("out"));
+    if expected_out_root != plan.out_root {
+        return Err(CliError::data(
+            "cleanup-out-root-mismatch",
+            "plan out_root does not match the resolved agent home",
+            Some(json!({
+                "out_root": expected_out_root,
+                "plan_out_root": plan.out_root
+            })),
+        ));
+    }
+    let out_root = PathBuf::from(&plan.out_root);
+    validate_cleanup_plan_path(&out_root, &plan.out_root)?;
+    let mut entries = Vec::new();
+    let mut summary = CleanupApplySummary::default();
+
+    for item in plan
+        .items
+        .iter()
+        .filter(|item| item.action == CleanupAction::Delete)
+    {
+        let path = PathBuf::from(&item.path);
+        validate_cleanup_plan_path(&path, &item.path)?;
+        if !path.starts_with(&out_root) {
+            return Err(CliError::data(
+                "cleanup-path-outside-out-root",
+                "plan contains a delete path outside out_root",
+                Some(json!({ "path": item.path, "out_root": plan.out_root })),
+            ));
+        }
+
+        if !matches!(
+            item.category,
+            CleanupCategory::Cache | CleanupCategory::TopLevelNoncanonical
+        ) {
+            entries.push(CleanupApplyEntry {
+                path: item.path.clone(),
+                action: "delete".to_string(),
+                status: "skipped".to_string(),
+                reason: "delete action is allowed only for cache or top-level noncanonical items"
+                    .to_string(),
+            });
+            summary.skipped += 1;
+            continue;
+        }
+
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                entries.push(CleanupApplyEntry {
+                    path: item.path.clone(),
+                    action: "delete".to_string(),
+                    status: "skipped".to_string(),
+                    reason: "path no longer exists".to_string(),
+                });
+                summary.skipped += 1;
+                continue;
+            }
+            Err(err) => {
+                return Err(CliError::runtime(
+                    "cleanup-stat-failed",
+                    format!("failed to inspect {}: {err}", path.display()),
+                    Some(json!({ "path": display_path(&path) })),
+                ));
+            }
+        };
+        validate_cleanup_delete_target(&path, &out_root, &metadata)?;
+        validate_cleanup_delete_eligibility(item, &path, &out_root)?;
+
+        let markers = marker_flags(&path)?;
+        if markers.has_evidence() {
+            entries.push(CleanupApplyEntry {
+                path: item.path.clone(),
+                action: "delete".to_string(),
+                status: "skipped".to_string(),
+                reason: "evidence marker appeared after the plan was created".to_string(),
+            });
+            summary.skipped += 1;
+            continue;
+        }
+
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&path).map_err(|err| {
+                CliError::runtime(
+                    "cleanup-delete-failed",
+                    format!("failed to delete {}: {err}", path.display()),
+                    Some(json!({ "path": display_path(&path) })),
+                )
+            })?;
+        } else {
+            fs::remove_file(&path).map_err(|err| {
+                CliError::runtime(
+                    "cleanup-delete-failed",
+                    format!("failed to delete {}: {err}", path.display()),
+                    Some(json!({ "path": display_path(&path) })),
+                )
+            })?;
+        }
+
+        entries.push(CleanupApplyEntry {
+            path: item.path.clone(),
+            action: "delete".to_string(),
+            status: "deleted".to_string(),
+            reason: item.reason.clone(),
+        });
+        summary.deleted += 1;
+        summary.delete_bytes = summary.delete_bytes.saturating_add(item.size_bytes);
+    }
+
+    Ok(CleanupApplyReport {
+        agent_home: plan.agent_home,
+        out_root: plan.out_root,
+        plan_digest: plan.plan_digest,
+        applied: true,
+        entries,
+        summary,
+    })
+}
+
+fn validate_cleanup_plan_path(path: &Path, raw: &str) -> Result<(), CliError> {
+    if !path.is_absolute() {
+        return Err(CliError::data(
+            "cleanup-path-outside-out-root",
+            "cleanup plan paths must be absolute",
+            Some(json!({ "path": raw })),
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(CliError::data(
+            "cleanup-path-outside-out-root",
+            "cleanup plan paths must not contain parent-directory components",
+            Some(json!({ "path": raw })),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cleanup_delete_target(
+    path: &Path,
+    out_root: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), CliError> {
+    let canonical_out_root = fs::canonicalize(out_root).map_err(|err| {
+        CliError::runtime(
+            "cleanup-out-root-canonicalize-failed",
+            format!("failed to resolve {}: {err}", out_root.display()),
+            Some(json!({ "out_root": display_path(out_root) })),
+        )
+    })?;
+    let containment_path = if metadata.file_type().is_symlink() {
+        let parent = path.parent().ok_or_else(|| {
+            CliError::data(
+                "cleanup-path-outside-out-root",
+                "cleanup plan path has no parent directory",
+                Some(json!({ "path": display_path(path) })),
+            )
+        })?;
+        fs::canonicalize(parent).map_err(|err| {
+            CliError::runtime(
+                "cleanup-parent-canonicalize-failed",
+                format!("failed to resolve {}: {err}", parent.display()),
+                Some(json!({ "path": display_path(path), "parent": display_path(parent) })),
+            )
+        })?
+    } else {
+        fs::canonicalize(path).map_err(|err| {
+            CliError::runtime(
+                "cleanup-target-canonicalize-failed",
+                format!("failed to resolve {}: {err}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            )
+        })?
+    };
+
+    if !containment_path.starts_with(&canonical_out_root) {
+        return Err(CliError::data(
+            "cleanup-path-outside-out-root",
+            "plan contains a delete path that resolves outside out_root",
+            Some(json!({
+                "path": display_path(path),
+                "resolved_path": display_path(&containment_path),
+                "out_root": display_path(out_root),
+                "resolved_out_root": display_path(&canonical_out_root)
+            })),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_cleanup_delete_eligibility(
+    item: &CleanupItem,
+    path: &Path,
+    out_root: &Path,
+) -> Result<(), CliError> {
+    let relative = path.strip_prefix(out_root).map_err(|_| {
+        CliError::data(
+            "cleanup-path-outside-out-root",
+            "plan contains a delete path outside out_root",
+            Some(json!({ "path": item.path, "out_root": display_path(out_root) })),
+        )
+    })?;
+    if relative.components().count() != 1 {
+        return Err(CliError::data(
+            "cleanup-delete-shape-invalid",
+            "cleanup apply only deletes direct children of out_root",
+            Some(json!({
+                "path": item.path,
+                "out_root": display_path(out_root),
+                "category": item.category
+            })),
+        ));
+    }
+
+    let name = relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let allowlisted: BTreeSet<&str> = ALLOWLISTED_TOOL_ROOTS.iter().copied().collect();
+    match item.category {
+        CleanupCategory::Cache if name == RELEASE_CACHE_ROOT => {}
+        CleanupCategory::Cache => {
+            return Err(CliError::data(
+                "cleanup-delete-shape-invalid",
+                "cache delete candidates must be the nils-versions top-level root",
+                Some(json!({ "path": item.path, "category": item.category })),
+            ));
+        }
+        CleanupCategory::TopLevelNoncanonical => {
+            if name == CANONICAL_PROJECT_ROOT
+                || allowlisted.contains(name)
+                || name == RELEASE_CACHE_ROOT
+            {
+                return Err(CliError::data(
+                    "cleanup-delete-shape-invalid",
+                    "top-level noncanonical delete candidates must not be canonical or allowlisted roots",
+                    Some(json!({ "path": item.path, "category": item.category })),
+                ));
+            }
+        }
+        _ => {
+            return Err(CliError::data(
+                "cleanup-delete-shape-invalid",
+                "cleanup apply refuses delete actions outside reviewed delete categories",
+                Some(json!({ "path": item.path, "category": item.category })),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn render_audit_text(report: &AuditReport) -> String {
@@ -681,6 +1513,90 @@ fn render_audit_text(report: &AuditReport) -> String {
         report.summary.allowed_roots, report.summary.violations
     ));
     lines.join("\n")
+}
+
+fn render_cleanup_plan_text(plan: &CleanupPlan) -> String {
+    let mut lines = vec![
+        format!("agent_home: {}", plan.agent_home),
+        format!("out_root: {}", plan.out_root),
+        format!("out_root_exists: {}", plan.out_root_exists),
+        format!("include_projects: {}", plan.include_projects),
+        format!("plan_digest: {}", plan.plan_digest),
+        "items:".to_string(),
+    ];
+
+    if plan.items.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for item in &plan.items {
+            lines.push(format!(
+                "  - {} ({}, category={}, action={}, size={}): {}",
+                item.path,
+                item.kind,
+                cleanup_category_label(item.category),
+                cleanup_action_label(item.action),
+                item.size_bytes,
+                item.reason
+            ));
+        }
+    }
+
+    lines.push(format!(
+        "summary: total={} delete={} preserve={} needs_policy={} delete_bytes={} preserve_bytes={} needs_policy_bytes={}",
+        plan.summary.total,
+        plan.summary.delete,
+        plan.summary.preserve,
+        plan.summary.needs_policy,
+        plan.summary.delete_bytes,
+        plan.summary.preserve_bytes,
+        plan.summary.needs_policy_bytes
+    ));
+    lines.join("\n")
+}
+
+fn render_cleanup_apply_text(report: &CleanupApplyReport) -> String {
+    let mut lines = vec![
+        format!("agent_home: {}", report.agent_home),
+        format!("out_root: {}", report.out_root),
+        format!("plan_digest: {}", report.plan_digest),
+        format!("applied: {}", report.applied),
+        "entries:".to_string(),
+    ];
+
+    if report.entries.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for entry in &report.entries {
+            lines.push(format!(
+                "  - {} ({}, {}): {}",
+                entry.path, entry.action, entry.status, entry.reason
+            ));
+        }
+    }
+
+    lines.push(format!(
+        "summary: deleted={} skipped={} delete_bytes={}",
+        report.summary.deleted, report.summary.skipped, report.summary.delete_bytes
+    ));
+    lines.join("\n")
+}
+
+fn cleanup_action_label(action: CleanupAction) -> &'static str {
+    match action {
+        CleanupAction::Delete => "delete",
+        CleanupAction::Preserve => "preserve",
+        CleanupAction::NeedsPolicy => "needs-policy",
+    }
+}
+
+fn cleanup_category_label(category: CleanupCategory) -> &'static str {
+    match category {
+        CleanupCategory::AllowedRoot => "allowed-root",
+        CleanupCategory::Cache => "cache",
+        CleanupCategory::TopLevelNoncanonical => "top-level-noncanonical",
+        CleanupCategory::EvidenceSource => "evidence-source",
+        CleanupCategory::ProjectArtifact => "project-artifact",
+    }
 }
 
 fn render_project_env(result: &ProjectResult) -> String {

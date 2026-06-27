@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Generate and audit canonical AGENT_HOME/out artifact paths.",
     long_about = "Generate canonical project-scoped AGENT_HOME/out run directories and audit existing out entries for workflow artifact hygiene.",
-    after_help = "EXAMPLES:\n  agent-out project --topic browser-qa --mkdir\n  agent-out path-for --domain projects --topic release-notes --mkdir\n  agent-out project --repo . --topic release-notes --format json\n  agent-out audit --strict\n  agent-out completion zsh\n\nENVIRONMENT:\n  AGENT_HOME  Default agent home root when --agent-home is omitted.\n  AGENT_OUT_PATH, AGENT_OUT_ROOT, AGENT_OUT_PROJECT_SLUG, AGENT_OUT_TOPIC, AGENT_OUT_RUN_ID, AGENT_OUT_DOMAIN  Exported by --format env.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data",
+    after_help = "EXAMPLES:\n  agent-out project --topic browser-qa --mkdir\n  agent-out path-for --domain projects --topic release-notes --mkdir\n  agent-out project --repo . --topic release-notes --format json\n  agent-out audit --strict\n  agent-out cleanup plan --include-projects --format json\n  agent-out cleanup apply --plan-file cleanup-plan.json --confirm-digest sha256:...\n  agent-out completion zsh\n\nENVIRONMENT:\n  AGENT_HOME  Default agent home root when --agent-home is omitted.\n  AGENT_OUT_PATH, AGENT_OUT_ROOT, AGENT_OUT_PROJECT_SLUG, AGENT_OUT_TOPIC, AGENT_OUT_RUN_ID, AGENT_OUT_DOMAIN  Exported by --format env.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -25,6 +25,8 @@ pub enum Command {
     Project(ProjectArgs),
     /// Audit top-level AGENT_HOME/out entries.
     Audit(AuditArgs),
+    /// Plan or apply safe AGENT_HOME/out cleanup.
+    Cleanup(CleanupArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
 }
@@ -102,6 +104,54 @@ pub struct AuditArgs {
     pub format: AuditFormat,
 }
 
+#[derive(Debug, Args)]
+pub struct CleanupArgs {
+    #[command(subcommand)]
+    pub command: CleanupCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CleanupCommand {
+    /// Build a dry-run cleanup plan.
+    Plan(CleanupPlanArgs),
+    /// Apply delete candidates from a reviewed cleanup plan.
+    Apply(CleanupApplyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CleanupPlanArgs {
+    /// Agent home root. Defaults to AGENT_HOME.
+    #[arg(long = "agent-home", value_name = "PATH", value_hint = ValueHint::DirPath)]
+    pub agent_home: Option<PathBuf>,
+
+    /// Include canonical projects/<repo>/<run> entries as preserve/needs-policy rows.
+    #[arg(long)]
+    pub include_projects: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = CleanupFormat::Text)]
+    pub format: CleanupFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct CleanupApplyArgs {
+    /// Cleanup plan JSON file produced by `agent-out cleanup plan --format json`.
+    #[arg(long = "plan-file", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub plan_file: PathBuf,
+
+    /// Required plan digest confirmation from the reviewed plan.
+    #[arg(long = "confirm-digest", value_name = "SHA256")]
+    pub confirm_digest: String,
+
+    /// Agent home guard. Defaults to AGENT_HOME; rejects plans for a different home.
+    #[arg(long = "agent-home", value_name = "PATH", value_hint = ValueHint::DirPath)]
+    pub agent_home: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = CleanupFormat::Text)]
+    pub format: CleanupFormat,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum ProjectFormat {
@@ -113,6 +163,13 @@ pub enum ProjectFormat {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum AuditFormat {
+    Text,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CleanupFormat {
     Text,
     Json,
 }
