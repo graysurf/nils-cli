@@ -177,8 +177,7 @@ fn handle_barrier_connection(
     let _ = stream.read(&mut buf);
 
     let (lock, cv) = &**state;
-    let seen = lock.lock().expect("seen lock");
-    let mut seen = seen;
+    let mut seen = lock.lock().expect("seen lock");
     *seen += 1;
     cv.notify_all();
     let ready = cv
