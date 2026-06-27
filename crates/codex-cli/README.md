@@ -139,7 +139,8 @@ Auth examples:
 - `CODEX_PROMPT_SEGMENT_TTL`: prompt-segment cache TTL override (default: `3m`; supports `s|m|h|d|w` suffixes or raw seconds).
 - `CODEX_PROMPT_SEGMENT_ZSH_ESCAPE_ENABLED`: escape `%` as `%%` for zsh prompt expansion when a Starship adapter embeds output in `PROMPT`
   (default: `false`; set `true` only for zsh prompt adapters).
-- `CODEX_AUTO_REFRESH_ENABLED`: enable token refresh behavior for `auth auto-refresh` and `diag rate-limits` retry-on-401 paths
+- `CODEX_AUTO_REFRESH_ENABLED`: enable token refresh behavior for `auth auto-refresh`, `diag rate-limits`, and prompt-segment
+  retry-on-401 paths
   (default: `false`; leave unset/false on multi-machine setups unless one machine intentionally owns refresh).
 - `CODEX_AUTO_REFRESH_MIN_DAYS`: `auth auto-refresh` minimum token age threshold (default: `5`).
 - `CODEX_AUTH_REMOTE_SSH`: SSH host alias for a remote Codex token authority. When paired with `CODEX_AUTH_REMOTE_NAME`, default

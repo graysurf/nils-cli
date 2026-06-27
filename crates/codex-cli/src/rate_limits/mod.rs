@@ -415,6 +415,7 @@ fn collect_json_result_for_secret(
     let usage_request = UsageRequest {
         target_file: target_file.to_path_buf(),
         refresh_on_401: refresh_on_401_enabled(no_refresh_auth),
+        suppress_auth_refresh_output: false,
         base_url,
         connect_timeout_seconds: connect_timeout,
         max_time_seconds: max_time,
@@ -1296,6 +1297,7 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
     let usage_request = UsageRequest {
         target_file: target_file.to_path_buf(),
         refresh_on_401: refresh_on_401_enabled(no_refresh_auth),
+        suppress_auth_refresh_output: false,
         base_url,
         connect_timeout_seconds: connect_timeout,
         max_time_seconds: max_time,
@@ -1790,6 +1792,7 @@ fn run_single_mode(
     let usage_request = UsageRequest {
         target_file: target_file.clone(),
         refresh_on_401: refresh_on_401_enabled(args.no_refresh_auth),
+        suppress_auth_refresh_output: false,
         base_url,
         connect_timeout_seconds: connect_timeout,
         max_time_seconds: max_time,
@@ -2084,6 +2087,7 @@ fn single_one_line(
     let usage_request = UsageRequest {
         target_file: target_file.to_path_buf(),
         refresh_on_401: refresh_on_401_enabled(no_refresh_auth),
+        suppress_auth_refresh_output: false,
         base_url,
         connect_timeout_seconds: connect_timeout,
         max_time_seconds: max_time,
