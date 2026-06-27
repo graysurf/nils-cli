@@ -454,6 +454,10 @@ walk_help_path() {
   run_command "$HELP_TIMEOUT_SECONDS" "$CURRENT_REPO_ROOT" "${cmd[@]}"
   if (( RUN_CODE != 0 )); then
     local stderr_compact="${RUN_STDERR//$'\n'/ }"
+    local max_stderr_compact_length=500
+    if (( ${#stderr_compact} > max_stderr_compact_length )); then
+      stderr_compact="${stderr_compact:0:max_stderr_compact_length}... [truncated]"
+    fi
     HELP_FAILURES["$path_key"]="\`$(command_display_for_path "$path_key")\` failed (exit ${RUN_CODE}): ${stderr_compact}"
     return 0
   fi
