@@ -329,6 +329,24 @@ zsh_context_marker() {
   printf '%s' "curcontext=\"\${curcontext%:*:*}:${binary}-${joined}-command-\$line[1]:\""
 }
 
+zsh_context_prefix() {
+  local binary="$1"
+  shift
+  local -a parents=( "$@" )
+
+  if (( ${#parents[@]} == 0 )); then
+    printf '%s' "curcontext=\"\${curcontext%:*:*}:${binary}-command-\$line["
+    return 0
+  fi
+
+  local joined="${parents[0]}"
+  local idx
+  for (( idx = 1; idx < ${#parents[@]}; idx++ )); do
+    joined+="-${parents[$idx]}"
+  done
+  printf '%s' "curcontext=\"\${curcontext%:*:*}:${binary}-${joined}-command-\$line["
+}
+
 zsh_leaf_block() {
   local script_text="$1"
   local binary="$2"
@@ -364,10 +382,20 @@ zsh_leaf_block() {
 
   local marker
   marker="$(zsh_context_marker "$binary" "${parents[@]}")"
-  if [[ "$script_text" != *"$marker"* ]]; then
-    return 1
+  if [[ "$script_text" == *"$marker"* ]]; then
+    local from_marker="${script_text#*"$marker"}"
+  else
+    # clap_complete may use a non-1 positional offset when a command has an
+    # optional positional before a nested subcommand, e.g. `pr review [id]
+    # validate`. Match the context prefix and let the leaf case find the exact
+    # subcommand block instead of assuming `$line[1]`.
+    local marker_prefix
+    marker_prefix="$(zsh_context_prefix "$binary" "${parents[@]}")"
+    if [[ "$script_text" != *"$marker_prefix"* ]]; then
+      return 1
+    fi
+    local from_marker="${script_text#*"$marker_prefix"}"
   fi
-  local from_marker="${script_text#*"$marker"}"
   local leaf_marker="(${leaf})"
   if [[ "$from_marker" != *"$leaf_marker"* ]]; then
     return 1
