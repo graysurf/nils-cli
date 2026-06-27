@@ -93,11 +93,17 @@ parse_required_bins() {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
       return s
     }
+    function strip_inline_code(s) {
+      if (s ~ /^`[^`]+`$/) {
+        sub(/^`/, "", s)
+        sub(/`$/, "", s)
+      }
+      return s
+    }
     {
-      bin = trim($2)
-      obligation = trim($3)
-      if (bin ~ /^`[^`]+`$/ && obligation == "`required`") {
-        gsub(/`/, "", bin)
+      bin = strip_inline_code(trim($2))
+      obligation = strip_inline_code(trim($3))
+      if (bin != "" && obligation == "required") {
         print bin
       }
     }
