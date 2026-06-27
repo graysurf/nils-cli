@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::UNIX_EPOCH;
@@ -646,6 +647,8 @@ pub struct CleanupItem {
     pub reason: String,
     pub size_bytes: u64,
     pub mtime_unix: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
     pub contains_skill_usage: bool,
     pub contains_test_first_evidence: bool,
 }
@@ -695,6 +698,19 @@ pub struct CleanupApplySummary {
     pub deleted: usize,
     pub skipped: usize,
     pub delete_bytes: u64,
+}
+
+struct CleanupValidatedDelete {
+    path: PathBuf,
+    display_path: String,
+    reason: String,
+    size_bytes: u64,
+    metadata: fs::Metadata,
+}
+
+enum CleanupApplyDecision {
+    Delete(Box<CleanupValidatedDelete>),
+    Skip { path: String, reason: String },
 }
 
 #[derive(Deserialize)]
@@ -819,6 +835,7 @@ fn build_cleanup_plan(args: &CleanupPlanArgs) -> Result<CleanupPlan, CliError> {
     let out_root = agent_home.join("out");
     let mut items = Vec::new();
 
+    reject_cleanup_out_root_symlink_if_exists(&out_root)?;
     if !out_root.exists() {
         let mut plan = CleanupPlan {
             agent_home: display_path(&agent_home),
@@ -847,9 +864,6 @@ fn build_cleanup_plan(args: &CleanupPlanArgs) -> Result<CleanupPlan, CliError> {
     for path in entries.drain(..) {
         let name = path_name(&path);
         let kind = entry_kind(&path);
-        let markers = marker_flags(&path)?;
-        let size_bytes = path_size_bytes(&path)?;
-        let mtime_unix = path_mtime_unix(&path);
 
         if name == CANONICAL_PROJECT_ROOT && path.is_dir() {
             items.push(CleanupItem {
@@ -859,10 +873,11 @@ fn build_cleanup_plan(args: &CleanupPlanArgs) -> Result<CleanupPlan, CliError> {
                 category: CleanupCategory::AllowedRoot,
                 action: CleanupAction::Preserve,
                 reason: "canonical project-scoped artifact root".to_string(),
-                size_bytes,
-                mtime_unix,
-                contains_skill_usage: markers.skill_usage,
-                contains_test_first_evidence: markers.test_first_evidence,
+                size_bytes: path_shallow_size_bytes(&path)?,
+                mtime_unix: path_mtime_unix(&path),
+                content_digest: None,
+                contains_skill_usage: false,
+                contains_test_first_evidence: false,
             });
             if args.include_projects {
                 items.extend(build_project_cleanup_items(&path)?);
@@ -875,53 +890,63 @@ fn build_cleanup_plan(args: &CleanupPlanArgs) -> Result<CleanupPlan, CliError> {
                 category: CleanupCategory::AllowedRoot,
                 action: CleanupAction::Preserve,
                 reason: "preserved tool/workflow artifact root".to_string(),
-                size_bytes,
-                mtime_unix,
-                contains_skill_usage: markers.skill_usage,
-                contains_test_first_evidence: markers.test_first_evidence,
-            });
-        } else if markers.has_evidence() {
-            items.push(CleanupItem {
-                name,
-                path: display_path(&path),
-                kind,
-                category: CleanupCategory::EvidenceSource,
-                action: CleanupAction::Preserve,
-                reason: "contains retained evidence markers; use evidence migrate/prune-source"
-                    .to_string(),
-                size_bytes,
-                mtime_unix,
-                contains_skill_usage: markers.skill_usage,
-                contains_test_first_evidence: markers.test_first_evidence,
-            });
-        } else if name == RELEASE_CACHE_ROOT {
-            items.push(CleanupItem {
-                name,
-                path: display_path(&path),
-                kind,
-                category: CleanupCategory::Cache,
-                action: CleanupAction::Delete,
-                reason: "released nils-cli binary cache; safe to recreate from release assets"
-                    .to_string(),
-                size_bytes,
-                mtime_unix,
-                contains_skill_usage: markers.skill_usage,
-                contains_test_first_evidence: markers.test_first_evidence,
-            });
-        } else {
-            items.push(CleanupItem {
-                name,
-                path: display_path(&path),
-                kind,
-                category: CleanupCategory::TopLevelNoncanonical,
-                action: CleanupAction::Delete,
-                reason: "top-level noncanonical entry without retained evidence markers"
-                    .to_string(),
-                size_bytes,
-                mtime_unix,
+                size_bytes: path_shallow_size_bytes(&path)?,
+                mtime_unix: path_mtime_unix(&path),
+                content_digest: None,
                 contains_skill_usage: false,
                 contains_test_first_evidence: false,
             });
+        } else {
+            let markers = marker_flags(&path)?;
+            let size_bytes = path_size_bytes(&path)?;
+            let mtime_unix = path_mtime_unix(&path);
+
+            if markers.has_evidence() {
+                items.push(CleanupItem {
+                    name,
+                    path: display_path(&path),
+                    kind,
+                    category: CleanupCategory::EvidenceSource,
+                    action: CleanupAction::Preserve,
+                    reason: "contains retained evidence markers; use evidence migrate/prune-source"
+                        .to_string(),
+                    size_bytes,
+                    mtime_unix,
+                    content_digest: None,
+                    contains_skill_usage: markers.skill_usage,
+                    contains_test_first_evidence: markers.test_first_evidence,
+                });
+            } else if name == RELEASE_CACHE_ROOT {
+                items.push(CleanupItem {
+                    name,
+                    path: display_path(&path),
+                    kind,
+                    category: CleanupCategory::Cache,
+                    action: CleanupAction::Delete,
+                    reason: "released nils-cli binary cache; safe to recreate from release assets"
+                        .to_string(),
+                    size_bytes,
+                    mtime_unix,
+                    content_digest: Some(path_content_digest(&path)?),
+                    contains_skill_usage: markers.skill_usage,
+                    contains_test_first_evidence: markers.test_first_evidence,
+                });
+            } else {
+                items.push(CleanupItem {
+                    name,
+                    path: display_path(&path),
+                    kind,
+                    category: CleanupCategory::TopLevelNoncanonical,
+                    action: CleanupAction::NeedsPolicy,
+                    reason: "top-level noncanonical entry requires review before deletion"
+                        .to_string(),
+                    size_bytes,
+                    mtime_unix,
+                    content_digest: None,
+                    contains_skill_usage: false,
+                    contains_test_first_evidence: false,
+                });
+            }
         }
     }
 
@@ -979,6 +1004,7 @@ fn build_project_cleanup_items(projects_root: &Path) -> Result<Vec<CleanupItem>,
                 reason,
                 size_bytes: path_size_bytes(&run_dir)?,
                 mtime_unix: path_mtime_unix(&run_dir),
+                content_digest: None,
                 contains_skill_usage: markers.skill_usage,
                 contains_test_first_evidence: markers.test_first_evidence,
             });
@@ -1124,6 +1150,127 @@ fn path_size_bytes(path: &Path) -> Result<u64, CliError> {
     }
 }
 
+fn path_shallow_size_bytes(path: &Path) -> Result<u64, CliError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        CliError::runtime(
+            "cleanup-stat-failed",
+            format!("failed to inspect {}: {err}", path.display()),
+            Some(json!({ "path": display_path(path) })),
+        )
+    })?;
+    Ok(metadata.len())
+}
+
+fn path_content_digest(path: &Path) -> Result<String, CliError> {
+    let mut hasher = Sha256::new();
+    update_content_digest_record(
+        &mut hasher,
+        b"domain",
+        b"agent-out.cleanup.content_digest.v2",
+    );
+    update_path_content_digest(&mut hasher, path, path)?;
+    let digest = hasher.finalize();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("sha256:{hex}"))
+}
+
+fn update_content_digest_record(hasher: &mut Sha256, tag: &[u8], payload: &[u8]) {
+    hasher.update((tag.len() as u64).to_le_bytes());
+    hasher.update(tag);
+    hasher.update((payload.len() as u64).to_le_bytes());
+    hasher.update(payload);
+}
+
+fn update_content_digest_u64(hasher: &mut Sha256, tag: &[u8], value: u64) {
+    update_content_digest_record(hasher, tag, &value.to_le_bytes());
+}
+
+fn update_path_content_digest(
+    hasher: &mut Sha256,
+    root: &Path,
+    path: &Path,
+) -> Result<(), CliError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        CliError::runtime(
+            "cleanup-stat-failed",
+            format!("failed to inspect {}: {err}", path.display()),
+            Some(json!({ "path": display_path(path) })),
+        )
+    })?;
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    update_content_digest_record(hasher, b"path", &path_digest_bytes(relative));
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        update_content_digest_record(hasher, b"type", b"dir");
+        let children = read_sorted_children(path, "cleanup-read-failed")?;
+        update_content_digest_u64(hasher, b"children", children.len() as u64);
+        for child in children {
+            update_path_content_digest(hasher, root, &child)?;
+        }
+    } else if metadata.file_type().is_symlink() {
+        update_content_digest_record(hasher, b"type", b"symlink");
+        let target = fs::read_link(path).map_err(|err| {
+            CliError::runtime(
+                "cleanup-readlink-failed",
+                format!("failed to read symlink {}: {err}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            )
+        })?;
+        update_content_digest_record(hasher, b"target", &path_digest_bytes(&target));
+    } else {
+        update_content_digest_record(hasher, b"type", b"file");
+        update_content_digest_u64(hasher, b"content_len", metadata.len());
+        let mut file = fs::File::open(path).map_err(|err| {
+            CliError::runtime(
+                "cleanup-read-failed",
+                format!("failed to read {}: {err}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            )
+        })?;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = file.read(&mut buffer).map_err(|err| {
+                CliError::runtime(
+                    "cleanup-read-failed",
+                    format!("failed to read {}: {err}", path.display()),
+                    Some(json!({ "path": display_path(path) })),
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+
+    Ok(())
+}
+
+fn path_digest_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        display_path(path).into_bytes()
+    }
+}
+
 fn path_mtime_unix(path: &Path) -> Option<i64> {
     let metadata = fs::symlink_metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
@@ -1235,8 +1382,9 @@ fn apply_cleanup_plan(args: &CleanupApplyArgs) -> Result<CleanupApplyReport, Cli
     }
     let out_root = PathBuf::from(&plan.out_root);
     validate_cleanup_plan_path(&out_root, &plan.out_root)?;
-    let mut entries = Vec::new();
-    let mut summary = CleanupApplySummary::default();
+    reject_cleanup_out_root_symlink_if_exists(&out_root)?;
+    let mut decisions = Vec::new();
+    let mut delete_paths = BTreeSet::new();
 
     for item in plan
         .items
@@ -1252,32 +1400,15 @@ fn apply_cleanup_plan(args: &CleanupApplyArgs) -> Result<CleanupApplyReport, Cli
                 Some(json!({ "path": item.path, "out_root": plan.out_root })),
             ));
         }
-
-        if !matches!(
-            item.category,
-            CleanupCategory::Cache | CleanupCategory::TopLevelNoncanonical
-        ) {
-            entries.push(CleanupApplyEntry {
-                path: item.path.clone(),
-                action: "delete".to_string(),
-                status: "skipped".to_string(),
-                reason: "delete action is allowed only for cache or top-level noncanonical items"
-                    .to_string(),
-            });
-            summary.skipped += 1;
-            continue;
-        }
+        validate_cleanup_delete_eligibility(item, &path, &out_root)?;
 
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                entries.push(CleanupApplyEntry {
+                decisions.push(CleanupApplyDecision::Skip {
                     path: item.path.clone(),
-                    action: "delete".to_string(),
-                    status: "skipped".to_string(),
                     reason: "path no longer exists".to_string(),
                 });
-                summary.skipped += 1;
                 continue;
             }
             Err(err) => {
@@ -1288,47 +1419,86 @@ fn apply_cleanup_plan(args: &CleanupApplyArgs) -> Result<CleanupApplyReport, Cli
                 ));
             }
         };
-        validate_cleanup_delete_target(&path, &out_root, &metadata)?;
-        validate_cleanup_delete_eligibility(item, &path, &out_root)?;
+        let delete_identity = validate_cleanup_delete_target(&path, &out_root, &metadata)?;
+        if !delete_paths.insert(delete_identity) {
+            return Err(CliError::data(
+                "cleanup-delete-duplicate",
+                "cleanup plan contains duplicate delete paths",
+                Some(json!({ "path": item.path })),
+            ));
+        }
 
         let markers = marker_flags(&path)?;
         if markers.has_evidence() {
-            entries.push(CleanupApplyEntry {
+            decisions.push(CleanupApplyDecision::Skip {
                 path: item.path.clone(),
-                action: "delete".to_string(),
-                status: "skipped".to_string(),
                 reason: "evidence marker appeared after the plan was created".to_string(),
             });
-            summary.skipped += 1;
             continue;
         }
 
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            fs::remove_dir_all(&path).map_err(|err| {
-                CliError::runtime(
-                    "cleanup-delete-failed",
-                    format!("failed to delete {}: {err}", path.display()),
-                    Some(json!({ "path": display_path(&path) })),
-                )
-            })?;
-        } else {
-            fs::remove_file(&path).map_err(|err| {
-                CliError::runtime(
-                    "cleanup-delete-failed",
-                    format!("failed to delete {}: {err}", path.display()),
-                    Some(json!({ "path": display_path(&path) })),
-                )
-            })?;
+        if !cleanup_item_metadata_matches(item, &path)? {
+            decisions.push(CleanupApplyDecision::Skip {
+                path: item.path.clone(),
+                reason: "path metadata changed after the plan was created".to_string(),
+            });
+            continue;
         }
 
-        entries.push(CleanupApplyEntry {
-            path: item.path.clone(),
-            action: "delete".to_string(),
-            status: "deleted".to_string(),
-            reason: item.reason.clone(),
-        });
-        summary.deleted += 1;
-        summary.delete_bytes = summary.delete_bytes.saturating_add(item.size_bytes);
+        decisions.push(CleanupApplyDecision::Delete(Box::new(
+            CleanupValidatedDelete {
+                path,
+                display_path: item.path.clone(),
+                reason: item.reason.clone(),
+                size_bytes: item.size_bytes,
+                metadata,
+            },
+        )));
+    }
+
+    let mut entries = Vec::new();
+    let mut summary = CleanupApplySummary::default();
+
+    for decision in decisions {
+        match decision {
+            CleanupApplyDecision::Skip { path, reason } => {
+                entries.push(CleanupApplyEntry {
+                    path,
+                    action: "delete".to_string(),
+                    status: "skipped".to_string(),
+                    reason,
+                });
+                summary.skipped += 1;
+            }
+            CleanupApplyDecision::Delete(delete) => {
+                if delete.metadata.is_dir() && !delete.metadata.file_type().is_symlink() {
+                    fs::remove_dir_all(&delete.path).map_err(|err| {
+                        CliError::runtime(
+                            "cleanup-delete-failed",
+                            format!("failed to delete {}: {err}", delete.path.display()),
+                            Some(json!({ "path": display_path(&delete.path) })),
+                        )
+                    })?;
+                } else {
+                    fs::remove_file(&delete.path).map_err(|err| {
+                        CliError::runtime(
+                            "cleanup-delete-failed",
+                            format!("failed to delete {}: {err}", delete.path.display()),
+                            Some(json!({ "path": display_path(&delete.path) })),
+                        )
+                    })?;
+                }
+
+                entries.push(CleanupApplyEntry {
+                    path: delete.display_path,
+                    action: "delete".to_string(),
+                    status: "deleted".to_string(),
+                    reason: delete.reason,
+                });
+                summary.deleted += 1;
+                summary.delete_bytes = summary.delete_bytes.saturating_add(delete.size_bytes);
+            }
+        }
     }
 
     Ok(CleanupApplyReport {
@@ -1362,11 +1532,25 @@ fn validate_cleanup_plan_path(path: &Path, raw: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+fn reject_cleanup_out_root_symlink_if_exists(out_root: &Path) -> Result<(), CliError> {
+    let Ok(metadata) = fs::symlink_metadata(out_root) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::data(
+            "cleanup-out-root-symlink-unsupported",
+            "cleanup out_root must be a real directory, not a symlink",
+            Some(json!({ "out_root": display_path(out_root) })),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_cleanup_delete_target(
     path: &Path,
     out_root: &Path,
     metadata: &fs::Metadata,
-) -> Result<(), CliError> {
+) -> Result<PathBuf, CliError> {
     let canonical_out_root = fs::canonicalize(out_root).map_err(|err| {
         CliError::runtime(
             "cleanup-out-root-canonicalize-failed",
@@ -1374,7 +1558,7 @@ fn validate_cleanup_delete_target(
             Some(json!({ "out_root": display_path(out_root) })),
         )
     })?;
-    let containment_path = if metadata.file_type().is_symlink() {
+    let (containment_path, delete_identity) = if metadata.file_type().is_symlink() {
         let parent = path.parent().ok_or_else(|| {
             CliError::data(
                 "cleanup-path-outside-out-root",
@@ -1382,21 +1566,30 @@ fn validate_cleanup_delete_target(
                 Some(json!({ "path": display_path(path) })),
             )
         })?;
-        fs::canonicalize(parent).map_err(|err| {
+        let canonical_parent = fs::canonicalize(parent).map_err(|err| {
             CliError::runtime(
                 "cleanup-parent-canonicalize-failed",
                 format!("failed to resolve {}: {err}", parent.display()),
                 Some(json!({ "path": display_path(path), "parent": display_path(parent) })),
             )
-        })?
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            CliError::data(
+                "cleanup-path-outside-out-root",
+                "cleanup plan path has no file name",
+                Some(json!({ "path": display_path(path) })),
+            )
+        })?;
+        (canonical_parent.clone(), canonical_parent.join(file_name))
     } else {
-        fs::canonicalize(path).map_err(|err| {
+        let canonical_path = fs::canonicalize(path).map_err(|err| {
             CliError::runtime(
                 "cleanup-target-canonicalize-failed",
                 format!("failed to resolve {}: {err}", path.display()),
                 Some(json!({ "path": display_path(path) })),
             )
-        })?
+        })?;
+        (canonical_path.clone(), canonical_path)
     };
 
     if !containment_path.starts_with(&canonical_out_root) {
@@ -1412,7 +1605,7 @@ fn validate_cleanup_delete_target(
         ));
     }
 
-    Ok(())
+    Ok(delete_identity)
 }
 
 fn validate_cleanup_delete_eligibility(
@@ -1443,9 +1636,16 @@ fn validate_cleanup_delete_eligibility(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("");
-    let allowlisted: BTreeSet<&str> = ALLOWLISTED_TOOL_ROOTS.iter().copied().collect();
     match item.category {
-        CleanupCategory::Cache if name == RELEASE_CACHE_ROOT => {}
+        CleanupCategory::Cache if name == RELEASE_CACHE_ROOT => {
+            if item.content_digest.is_none() {
+                return Err(CliError::data(
+                    "cleanup-delete-content-digest-required",
+                    "cache delete candidates require content_digest; regenerate the cleanup plan",
+                    Some(json!({ "path": item.path, "category": item.category })),
+                ));
+            }
+        }
         CleanupCategory::Cache => {
             return Err(CliError::data(
                 "cleanup-delete-shape-invalid",
@@ -1454,16 +1654,11 @@ fn validate_cleanup_delete_eligibility(
             ));
         }
         CleanupCategory::TopLevelNoncanonical => {
-            if name == CANONICAL_PROJECT_ROOT
-                || allowlisted.contains(name)
-                || name == RELEASE_CACHE_ROOT
-            {
-                return Err(CliError::data(
-                    "cleanup-delete-shape-invalid",
-                    "top-level noncanonical delete candidates must not be canonical or allowlisted roots",
-                    Some(json!({ "path": item.path, "category": item.category })),
-                ));
-            }
+            return Err(CliError::data(
+                "cleanup-delete-shape-invalid",
+                "top-level noncanonical delete candidates require a policy decision before apply",
+                Some(json!({ "path": item.path, "category": item.category })),
+            ));
         }
         _ => {
             return Err(CliError::data(
@@ -1475,6 +1670,18 @@ fn validate_cleanup_delete_eligibility(
     }
 
     Ok(())
+}
+
+fn cleanup_item_metadata_matches(item: &CleanupItem, path: &Path) -> Result<bool, CliError> {
+    if path_size_bytes(path)? != item.size_bytes || path_mtime_unix(path) != item.mtime_unix {
+        return Ok(false);
+    }
+
+    if let Some(expected_digest) = &item.content_digest {
+        return Ok(path_content_digest(path)? == *expected_digest);
+    }
+
+    Ok(true)
 }
 
 fn render_audit_text(report: &AuditReport) -> String {
@@ -1746,6 +1953,19 @@ mod tests {
             nils_common::slug::is_local_fallback_slug(&slug),
             "is_local_fallback_slug must recognize local_project_slug output: {slug}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_digest_bytes_preserves_non_utf8_unix_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_vec(vec![0xff]));
+        let second = PathBuf::from(OsString::from_vec(vec![0xfe]));
+
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(path_digest_bytes(&first), path_digest_bytes(&second));
     }
 
     #[test]
