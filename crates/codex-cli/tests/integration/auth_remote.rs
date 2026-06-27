@@ -44,8 +44,11 @@ fn codex_cli_bin() -> PathBuf {
     bin::resolve("codex-cli")
 }
 
-fn run(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutput {
-    let mut options = CmdOptions::default();
+fn with_env_options(
+    mut options: CmdOptions,
+    envs: &[(&str, &Path)],
+    vars: &[(&str, &str)],
+) -> CmdOptions {
     for (key, path) in envs {
         let value = path.to_string_lossy();
         options = options.with_env(key, value.as_ref());
@@ -53,6 +56,11 @@ fn run(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutpu
     for (key, value) in vars {
         options = options.with_env(key, value);
     }
+    options
+}
+
+fn run(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutput {
+    let options = with_env_options(CmdOptions::default(), envs, vars);
     let bin = codex_cli_bin();
     cmd::run_with(&bin, args, &options)
 }
@@ -63,14 +71,11 @@ fn run_with_path_prepend(
     vars: &[(&str, &str)],
     path_prepend: &Path,
 ) -> CmdOutput {
-    let mut options = CmdOptions::default().with_path_prepend(path_prepend);
-    for (key, path) in envs {
-        let value = path.to_string_lossy();
-        options = options.with_env(key, value.as_ref());
-    }
-    for (key, value) in vars {
-        options = options.with_env(key, value);
-    }
+    let options = with_env_options(
+        CmdOptions::default().with_path_prepend(path_prepend),
+        envs,
+        vars,
+    );
     let bin = codex_cli_bin();
     cmd::run_with(&bin, args, &options)
 }
