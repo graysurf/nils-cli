@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const POLL_INTERVAL_MS: u64 = 25;
+
 fn codex_cli_bin() -> PathBuf {
     bin::resolve("codex-cli")
 }
@@ -85,7 +87,7 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool 
         {
             return true;
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
     false
 }
@@ -95,7 +97,7 @@ fn collect_requests_for(server: &TestServer, timeout: Duration) -> Vec<RecordedR
     let mut requests = Vec::new();
     while Instant::now() < deadline {
         requests.extend(server.take_requests());
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
     requests.extend(server.take_requests());
     requests
