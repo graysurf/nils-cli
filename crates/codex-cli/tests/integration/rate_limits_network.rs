@@ -16,8 +16,12 @@ fn codex_cli_bin() -> PathBuf {
     bin::resolve("codex-cli")
 }
 
-fn run(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutput {
-    let mut options = CmdOptions::default().with_env_remove_many(&[
+fn build_cmd_options(
+    base: CmdOptions,
+    envs: &[(&str, &Path)],
+    vars: &[(&str, &str)],
+) -> CmdOptions {
+    let mut options = base.with_env_remove_many(&[
         "CODEX_AUTO_REFRESH_ENABLED",
         "CODEX_AUTH_REMOTE_SSH",
         "CODEX_AUTH_REMOTE_NAME",
@@ -30,6 +34,11 @@ fn run(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutpu
     for (key, value) in vars {
         options = options.with_env(key, value);
     }
+    options
+}
+
+fn run(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutput {
+    let options = build_cmd_options(CmdOptions::default(), envs, vars);
     let bin = codex_cli_bin();
     cmd::run_with(&bin, args, &options)
 }
@@ -40,21 +49,11 @@ fn run_with_path_prepend(
     vars: &[(&str, &str)],
     path_prepend: &Path,
 ) -> CmdOutput {
-    let mut options = CmdOptions::default()
-        .with_path_prepend(path_prepend)
-        .with_env_remove_many(&[
-            "CODEX_AUTO_REFRESH_ENABLED",
-            "CODEX_AUTH_REMOTE_SSH",
-            "CODEX_AUTH_REMOTE_NAME",
-            "CODEX_AUTH_REMOTE_REFRESH",
-        ]);
-    for (key, path) in envs {
-        let value = path.to_string_lossy();
-        options = options.with_env(key, value.as_ref());
-    }
-    for (key, value) in vars {
-        options = options.with_env(key, value);
-    }
+    let options = build_cmd_options(
+        CmdOptions::default().with_path_prepend(path_prepend),
+        envs,
+        vars,
+    );
     let bin = codex_cli_bin();
     cmd::run_with(&bin, args, &options)
 }
@@ -177,8 +176,7 @@ fn handle_barrier_connection(
     let _ = stream.read(&mut buf);
 
     let (lock, cv) = &**state;
-    let seen = lock.lock().expect("seen lock");
-    let mut seen = seen;
+    let mut seen = lock.lock().expect("seen lock");
     *seen += 1;
     cv.notify_all();
     let ready = cv
