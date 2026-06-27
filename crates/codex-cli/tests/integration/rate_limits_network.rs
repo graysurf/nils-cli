@@ -1,6 +1,7 @@
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOptions, CmdOutput};
 use nils_test_support::http::{HttpResponse, LoopbackServer};
+use nils_test_support::write_exe;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs;
@@ -22,6 +23,31 @@ fn run(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutpu
         "CODEX_AUTH_REMOTE_NAME",
         "CODEX_AUTH_REMOTE_REFRESH",
     ]);
+    for (key, path) in envs {
+        let value = path.to_string_lossy();
+        options = options.with_env(key, value.as_ref());
+    }
+    for (key, value) in vars {
+        options = options.with_env(key, value);
+    }
+    let bin = codex_cli_bin();
+    cmd::run_with(&bin, args, &options)
+}
+
+fn run_with_path_prepend(
+    args: &[&str],
+    envs: &[(&str, &Path)],
+    vars: &[(&str, &str)],
+    path_prepend: &Path,
+) -> CmdOutput {
+    let mut options = CmdOptions::default()
+        .with_path_prepend(path_prepend)
+        .with_env_remove_many(&[
+            "CODEX_AUTO_REFRESH_ENABLED",
+            "CODEX_AUTH_REMOTE_SSH",
+            "CODEX_AUTH_REMOTE_NAME",
+            "CODEX_AUTH_REMOTE_REFRESH",
+        ]);
     for (key, path) in envs {
         let value = path.to_string_lossy();
         options = options.with_env(key, value.as_ref());
@@ -439,6 +465,81 @@ fn rate_limits_single_401_refreshes_auth_when_enabled() {
             .filter(|request| request.method == "GET" && request.path == "/wham/usage")
             .count(),
         2
+    );
+}
+
+#[test]
+fn rate_limits_single_401_uses_remote_authority_for_secret_target() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let stubs = dir.path().join("stubs");
+    fs::create_dir_all(&stubs).expect("stubs dir");
+
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    write_secret(&secrets, "alpha.json", Some("stale-token"));
+
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&cache_root).expect("cache root");
+
+    let args_file = dir.path().join("ssh-args.txt");
+    write_exe(
+        &stubs,
+        "ssh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" > "$SSH_ARGS_FILE"
+printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
+"#,
+    );
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/wham/usage", HttpResponse::new(401, ""));
+
+    let remote_payload = r#"{"tokens":{"access_token":"remote-access-token","id_token":"remote-id-token","account_id":"acct_001"},"last_refresh":"2025-01-20T12:34:56Z"}"#;
+    let output = run_with_path_prepend(
+        &["diag", "rate-limits", "--json", "alpha.json"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_AUTO_REFRESH_ENABLED", "true"),
+            ("CODEX_AUTH_REMOTE_SSH", "auth-host"),
+            ("CODEX_AUTH_REMOTE_NAME", "gamania"),
+            ("CODEX_AUTH_REMOTE_REFRESH", "true"),
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+            ("REMOTE_AUTH_PAYLOAD", remote_payload),
+            ("SSH_ARGS_FILE", args_file.to_str().expect("args path")),
+        ],
+        &stubs,
+    );
+
+    assert_exit(&output, 3);
+    assert!(!stderr(&output).contains("failed to read refresh token"));
+
+    let captured_args = fs::read_to_string(&args_file).expect("read ssh args");
+    assert!(captured_args.contains("--name alpha"));
+    assert!(!captured_args.contains("--name gamania"));
+    assert!(captured_args.contains("--refresh"));
+
+    let requests = server.take_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "GET" && request.path == "/wham/usage")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests[0].header_value("authorization").as_deref(),
+        Some("Bearer stale-token")
+    );
+    assert_eq!(
+        requests[1].header_value("authorization").as_deref(),
+        Some("Bearer remote-access-token")
     );
 }
 

@@ -61,9 +61,9 @@ Agent flag notes:
   target exists, interactive mode prompts for overwrite, while non-interactive and JSON mode require `--yes` to overwrite.
 - `remove [--yes] <secret|secret.json>`: Remove a secret file from `CODEX_SECRET_DIR`. Secret names are normalized to `.json`; interactive
   mode prompts for confirmation, while non-interactive and JSON mode require `--yes`.
-- `refresh [secret.json]`: Refresh OAuth tokens. With `CODEX_AUTH_REMOTE_SSH` and `CODEX_AUTH_REMOTE_NAME` set, the default active-auth
-  refresh delegates to the remote token authority and imports access-only auth; explicit `secret.json` targets still use local
-  `refresh_token`.
+- `refresh [secret.json]`: Refresh OAuth tokens. With `CODEX_AUTH_REMOTE_SSH` set, the default active-auth refresh delegates to the
+  remote token authority and imports access-only auth. When the active auth matches a stored secret, that matched secret name is preferred
+  over `CODEX_AUTH_REMOTE_NAME`; explicit `secret.json` targets still use local `refresh_token`.
 - `auto-refresh`: Refresh stale tokens across auth + secrets. In remote-authority mode it refreshes only the active auth file through remote
   access-only sync and does not overwrite local secret files.
 - `status`: Report active auth readiness without exposing token or API-key material.

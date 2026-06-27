@@ -21,7 +21,11 @@ fn codex_cli_bin() -> PathBuf {
 }
 
 fn run(args: &[&str], envs: &[(&str, &Path)]) -> CmdOutput {
-    let mut options = CmdOptions::default();
+    let mut options = CmdOptions::default().with_env_remove_many(&[
+        "CODEX_AUTH_REMOTE_SSH",
+        "CODEX_AUTH_REMOTE_NAME",
+        "CODEX_AUTH_REMOTE_REFRESH",
+    ]);
     for (key, path) in envs {
         let value = path.to_string_lossy();
         options = options.with_env(key, value.as_ref());
@@ -36,7 +40,13 @@ fn run_with_path_prepend(
     vars: &[(&str, &str)],
     path_prepend: &Path,
 ) -> CmdOutput {
-    let mut options = CmdOptions::default().with_path_prepend(path_prepend);
+    let mut options = CmdOptions::default()
+        .with_path_prepend(path_prepend)
+        .with_env_remove_many(&[
+            "CODEX_AUTH_REMOTE_SSH",
+            "CODEX_AUTH_REMOTE_NAME",
+            "CODEX_AUTH_REMOTE_REFRESH",
+        ]);
     for (key, path) in envs {
         let value = path.to_string_lossy();
         options = options.with_env(key, value.as_ref());
@@ -218,6 +228,80 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
         payload["result"]["remote_refresh_error_code"],
         "remote-export-failed"
     );
+
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(&auth_file).expect("read auth file"))
+            .expect("applied auth json");
+    assert_eq!(applied["tokens"]["access_token"], ACCESS_TOKEN);
+    assert_eq!(
+        applied["tokens"]["refresh_token"],
+        ACCESS_ONLY_REFRESH_TOKEN_PLACEHOLDER
+    );
+}
+
+#[test]
+fn auth_refresh_remote_uses_active_matching_secret_name_over_default() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let stubs = dir.path().join("stubs");
+    fs::create_dir_all(&stubs).expect("stubs dir");
+
+    let auth_file = dir.path().join("auth.json");
+    let cache = dir.path().join("cache");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&cache).expect("cache dir");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+
+    let sym_auth = format!(
+        r#"{{"tokens":{{"access_token":"stale-sym","id_token":"{}","refresh_token":"stale-refresh","account_id":"acct_sym"}},"last_refresh":"2025-01-19T12:34:56Z"}}"#,
+        token(PAYLOAD_ALPHA)
+    );
+    fs::write(&auth_file, &sym_auth).expect("write auth");
+    fs::write(secrets.join("sym.json"), &sym_auth).expect("write sym secret");
+
+    let args_file = dir.path().join("ssh-args.txt");
+    write_exe(
+        &stubs,
+        "ssh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" > "$SSH_ARGS_FILE"
+printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
+"#,
+    );
+
+    let remote_payload = format!(
+        r#"{{"tokens":{{"access_token":"{}","id_token":"{}","account_id":"acct_sym"}},"last_refresh":"2025-01-20T12:34:56Z"}}"#,
+        ACCESS_TOKEN, ID_TOKEN
+    );
+    let output = run_with_path_prepend(
+        &["auth", "refresh", "--format", "json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_CACHE_DIR", &cache),
+            ("CODEX_SECRET_DIR", &secrets),
+        ],
+        &[
+            ("CODEX_AUTH_REMOTE_SSH", "auth-host"),
+            ("CODEX_AUTH_REMOTE_NAME", "gamania"),
+            ("CODEX_AUTH_REMOTE_REFRESH", "true"),
+            ("REMOTE_AUTH_PAYLOAD", &remote_payload),
+            ("SSH_ARGS_FILE", args_file.to_str().expect("args path")),
+        ],
+        &stubs,
+    );
+
+    assert_exit(&output, 0);
+
+    let captured_args = fs::read_to_string(&args_file).expect("read ssh args");
+    assert!(captured_args.contains("--name sym"));
+    assert!(!captured_args.contains("--name gamania"));
+    assert!(captured_args.contains("--refresh"));
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json envelope");
+    assert_eq!(payload["command"], "auth refresh");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["remote_sync"], true);
+    assert_eq!(payload["result"]["remote_name"], "sym");
 
     let applied: Value =
         serde_json::from_str(&fs::read_to_string(&auth_file).expect("read auth file"))

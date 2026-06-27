@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::auth::remote;
 use crate::json;
 use crate::paths;
 
@@ -25,8 +26,9 @@ pub fn fetch_usage(request: &UsageRequest) -> Result<UsageResponse> {
     let mut response = send_request(request, &access_token, account_id.as_deref())?;
 
     if response.status == 401 && request.refresh_on_401 {
-        refresh_target(&request.target_file);
-        if let Ok((access_token, account_id)) = read_tokens(&request.target_file) {
+        let refreshed_tokens =
+            refresh_target(&request.target_file).or_else(|| read_tokens(&request.target_file).ok());
+        if let Some((access_token, account_id)) = refreshed_tokens {
             response = send_request(request, &access_token, account_id.as_deref())?;
         }
     }
@@ -64,10 +66,14 @@ pub fn fetch_usage(request: &UsageRequest) -> Result<UsageResponse> {
 
 pub fn read_tokens(target_file: &Path) -> Result<(String, Option<String>)> {
     let value = json::read_json(target_file)?;
-    let access_token = json::string_at(&value, &["tokens", "access_token"])
+    read_tokens_from_value(&value)
+}
+
+fn read_tokens_from_value(value: &Value) -> Result<(String, Option<String>)> {
+    let access_token = json::string_at(value, &["tokens", "access_token"])
         .ok_or_else(|| anyhow::anyhow!("missing access_token"))?;
-    let account_id = json::string_at(&value, &["tokens", "account_id"])
-        .or_else(|| json::string_at(&value, &["account_id"]));
+    let account_id = json::string_at(value, &["tokens", "account_id"])
+        .or_else(|| json::string_at(value, &["account_id"]));
     Ok((access_token, account_id))
 }
 
@@ -104,12 +110,12 @@ fn send_request(
     Ok(HttpResponse { status, body, url })
 }
 
-fn refresh_target(target_file: &Path) {
+fn refresh_target(target_file: &Path) -> Option<(String, Option<String>)> {
     if let Some(auth_file) = paths::resolve_auth_file()
         && auth_file == target_file
     {
         let _ = crate::auth::refresh::run(&[]);
-        return;
+        return read_tokens(target_file).ok();
     }
 
     if let Some(secret_dir) = paths::resolve_secret_dir()
@@ -117,9 +123,17 @@ fn refresh_target(target_file: &Path) {
     {
         let path = secret_dir.join(file_name);
         if path == target_file {
+            if let Ok(Some(payload)) = remote::export_access_only_for_target_from_env(target_file)
+                && let Ok(tokens) = read_tokens_from_value(&payload.auth)
+            {
+                return Some(tokens);
+            }
             let _ = crate::auth::refresh::run(&[file_name.to_string()]);
+            return read_tokens(target_file).ok();
         }
     }
+
+    None
 }
 
 struct HttpResponse {

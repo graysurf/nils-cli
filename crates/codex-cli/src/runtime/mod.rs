@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use nils_common::env as shared_env;
 use nils_common::provider_runtime;
 
+use crate::auth as codex_auth;
+use crate::auth::remote::{ENV_AUTH_REMOTE_NAME, ENV_AUTH_REMOTE_SSH};
 use crate::provider_profile::CODEX_PROVIDER_PROFILE;
 
 pub use nils_common::provider_runtime::ExecOptions;
@@ -61,9 +63,23 @@ pub fn exec_dangerous_with_options(
     stderr: &mut impl Write,
     options: ExecOptions,
 ) -> i32 {
+    if prompt.is_empty() {
+        return provider_runtime::exec::exec_dangerous_with_options(
+            &CODEX_PROVIDER_PROFILE,
+            prompt,
+            caller,
+            stderr,
+            options,
+        );
+    }
+    if !require_allow_dangerous(Some(caller), stderr) {
+        return 1;
+    }
+
     let effective_options = ExecOptions {
         ephemeral: options.ephemeral || shared_env::env_truthy("CODEX_CLI_EPHEMERAL_ENABLED"),
     };
+    refresh_remote_auth_before_exec();
     provider_runtime::exec::exec_dangerous_with_options(
         &CODEX_PROVIDER_PROFILE,
         prompt,
@@ -71,4 +87,20 @@ pub fn exec_dangerous_with_options(
         stderr,
         effective_options,
     )
+}
+
+fn refresh_remote_auth_before_exec() {
+    if std::env::var(ENV_AUTH_REMOTE_SSH)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+        && std::env::var(ENV_AUTH_REMOTE_NAME)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+    {
+        return;
+    }
+
+    let _ = codex_auth::refresh::run_silent(&[]);
 }

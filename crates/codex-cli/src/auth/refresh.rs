@@ -45,7 +45,7 @@ fn run_with_mode(args: &[String], output_mode: RefreshOutputMode) -> Result<i32>
     };
 
     if args.is_empty() {
-        match remote::configured_pull_from_env() {
+        match remote::configured_pull_for_target_from_env(&target_file) {
             Ok(Some(config)) => {
                 return run_remote_refresh(&target_file, &config, output_mode);
             }
