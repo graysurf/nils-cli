@@ -19,7 +19,7 @@ pub use nils_common::slug::{project_slug_from_owner_repo, project_slug_from_remo
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use cli::{AuditArgs, AuditFormat, Cli, Command, ProjectArgs, ProjectFormat};
+use cli::{AuditArgs, AuditFormat, Cli, Command, PathForArgs, ProjectArgs, ProjectFormat};
 
 use nils_common::cli_contract::exit;
 use nils_common::fs::display_path;
@@ -30,8 +30,10 @@ const EXIT_RUNTIME: i32 = exit::RUNTIME;
 const EXIT_USAGE: i32 = exit::USAGE;
 
 const PROJECT_SCHEMA_VERSION: &str = "cli.agent-out.project.v1";
+const PATH_FOR_SCHEMA_VERSION: &str = "cli.agent-out.path-for.v1";
 const AUDIT_SCHEMA_VERSION: &str = "cli.agent-out.audit.v1";
 const PROJECT_COMMAND: &str = "agent-out project";
+const PATH_FOR_COMMAND: &str = "agent-out path-for";
 const AUDIT_COMMAND: &str = "agent-out audit";
 
 const CANONICAL_PROJECT_ROOT: &str = "projects";
@@ -92,9 +94,17 @@ pub fn project_dir_for_current_repo(topic: &str, mkdir: bool) -> Result<ProjectR
 
 fn dispatch(cli: Cli) -> i32 {
     match cli.command {
+        Command::PathFor(args) => run_path_for(args),
         Command::Project(args) => run_project(args),
         Command::Audit(args) => run_audit(args),
         Command::Completion(args) => completion::run(args.shell),
+    }
+}
+
+fn run_path_for(args: PathForArgs) -> i32 {
+    match build_path_for_result(&args) {
+        Ok(result) => render_path_for_success(args.format, &result),
+        Err(err) => render_error(PATH_FOR_SCHEMA_VERSION, PATH_FOR_COMMAND, args.format, err),
     }
 }
 
@@ -141,6 +151,23 @@ fn run_audit(args: AuditArgs) -> i32 {
                 print_json_success(AUDIT_SCHEMA_VERSION, AUDIT_COMMAND, &report)
                     .unwrap_or_else(render_json_failure)
             }
+        }
+    }
+}
+
+fn render_path_for_success(format: ProjectFormat, result: &PathForResult) -> i32 {
+    match format {
+        ProjectFormat::Path => {
+            println!("{}", result.path);
+            EXIT_OK
+        }
+        ProjectFormat::Json => {
+            print_json_success(PATH_FOR_SCHEMA_VERSION, PATH_FOR_COMMAND, result)
+                .unwrap_or_else(render_json_failure)
+        }
+        ProjectFormat::Env => {
+            println!("{}", render_path_for_env(result));
+            EXIT_OK
         }
     }
 }
@@ -241,6 +268,19 @@ pub struct ProjectResult {
     pub created: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PathForResult {
+    pub path: String,
+    pub agent_home: String,
+    pub out_root: String,
+    pub repo: String,
+    pub project_slug: String,
+    pub domain: String,
+    pub topic: String,
+    pub run_id: String,
+    pub created: bool,
+}
+
 #[derive(Debug)]
 struct ProjectPathInput {
     agent_home: PathBuf,
@@ -263,6 +303,67 @@ fn build_project_result(args: &ProjectArgs) -> Result<ProjectResult, CliError> {
         mkdir: args.mkdir,
     };
     build_project_path(input)
+}
+
+fn build_path_for_result(args: &PathForArgs) -> Result<PathForResult, CliError> {
+    let agent_home = resolve_agent_home(args.agent_home.as_deref())?;
+    let (repo, explicit_repo_slug) =
+        resolve_path_for_repo(args.repo.as_deref(), args.repo_slug.as_deref())?;
+    let domain = sanitize_topic(&args.domain);
+    let topic = path_for_topic(&domain, args.topic.as_deref());
+    let project = build_project_path(ProjectPathInput {
+        agent_home,
+        repo,
+        explicit_repo_slug,
+        topic,
+        timestamp: current_timestamp(),
+        mkdir: args.mkdir,
+    })?;
+
+    Ok(PathForResult {
+        path: project.path,
+        agent_home: project.agent_home,
+        out_root: project.out_root,
+        repo: project.repo,
+        project_slug: project.project_slug,
+        domain,
+        topic: project.topic,
+        run_id: project.run_id,
+        created: project.created,
+    })
+}
+
+fn resolve_path_for_repo(
+    repo_arg: Option<&str>,
+    repo_slug_arg: Option<&str>,
+) -> Result<(PathBuf, Option<String>), CliError> {
+    if let Some(slug) = repo_slug_arg {
+        let repo = resolve_repo(repo_arg.map(Path::new))?;
+        return Ok((repo, Some(slug.to_string())));
+    }
+
+    if let Some(repo) = repo_arg {
+        let path = Path::new(repo);
+        if path.exists() {
+            return Ok((absolute_path(path)?, None));
+        }
+
+        if project_slug_from_owner_repo(repo).is_some() {
+            return Ok((resolve_repo(None)?, Some(repo.to_string())));
+        }
+
+        return Ok((absolute_path(path)?, None));
+    }
+
+    Ok((resolve_repo(None)?, None))
+}
+
+fn path_for_topic(domain: &str, topic: Option<&str>) -> String {
+    match topic {
+        Some(topic) if domain == CANONICAL_PROJECT_ROOT => sanitize_topic(topic),
+        Some(topic) => sanitize_topic(&format!("{domain}-{topic}")),
+        None => domain.to_string(),
+    }
 }
 
 fn build_project_path(input: ProjectPathInput) -> Result<ProjectResult, CliError> {
@@ -589,6 +690,21 @@ fn render_project_env(result: &ProjectResult) -> String {
         ("AGENT_OUT_PROJECT_SLUG", result.project_slug.as_str()),
         ("AGENT_OUT_TOPIC", result.topic.as_str()),
         ("AGENT_OUT_RUN_ID", result.run_id.as_str()),
+    ]
+    .into_iter()
+    .map(|(key, value)| format!("{key}={}", shell_quote(value)))
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn render_path_for_env(result: &PathForResult) -> String {
+    [
+        ("AGENT_OUT_PATH", result.path.as_str()),
+        ("AGENT_OUT_ROOT", result.out_root.as_str()),
+        ("AGENT_OUT_PROJECT_SLUG", result.project_slug.as_str()),
+        ("AGENT_OUT_TOPIC", result.topic.as_str()),
+        ("AGENT_OUT_RUN_ID", result.run_id.as_str()),
+        ("AGENT_OUT_DOMAIN", result.domain.as_str()),
     ]
     .into_iter()
     .map(|(key, value)| format!("{key}={}", shell_quote(value)))
