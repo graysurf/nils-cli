@@ -37,6 +37,31 @@ Slug precedence:
 2. Git `origin` remote under `--repo` or the current directory becomes `owner__repo`.
 3. Local fallback becomes `local__<basename>-<short-hash>`.
 
+### `path-for`
+
+Compatibility allocator for rendered `state_out(...)` helper calls that emit
+`agent-out path-for --domain ...`. It returns the same canonical project-scoped
+run directory shape as `project` while accepting the older domain/topic flags:
+
+```bash
+agent-out path-for --domain projects --topic "daily brief" --mkdir
+agent-out path-for --domain tools --repo sympoies/nils-cli --format json
+agent-out path-for --domain projects --topic "project retro" --format env
+```
+
+Options:
+
+- `--domain <DOMAIN>`: required compatibility domain; sanitized for path safety.
+- `--topic <TOPIC>`: optional artifact topic. For `--domain projects`, the
+  topic is used directly. For other domains, the topic becomes
+  `<domain>-<topic>`.
+- `--repo <PATH_OR_OWNER/REPO>`: existing paths are used for slug discovery;
+  owner/repo-looking values are treated as explicit slugs.
+- `--repo-slug <OWNER/REPO>`: explicit slug source; overrides slug discovery.
+- `--agent-home <PATH>`: agent home root; defaults to `AGENT_HOME`.
+- `--mkdir`: create the generated directory.
+- `--format path|json|env`: output mode; default is `path`.
+
 ### `audit`
 
 Scan top-level entries under `$AGENT_HOME/out/` and separate canonical or allowlisted roots from noncanonical ad hoc entries.
@@ -84,6 +109,7 @@ Human-readable mode is the default. Primary command output goes to stdout; error
 JSON output is opt-in and uses versioned envelopes:
 
 - `cli.agent-out.project.v1`
+- `cli.agent-out.path-for.v1`
 - `cli.agent-out.audit.v1`
 
 Example:

@@ -232,6 +232,98 @@ fn project_uses_agent_home_environment_when_flag_is_absent() {
 }
 
 #[test]
+fn path_for_supports_state_out_projects_topic_contract() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let repo = init_repo_main();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/sympoies/nils-cli.git",
+        ],
+    );
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let repo_arg = repo.path().to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "path-for",
+            "--domain",
+            "projects",
+            "--topic",
+            "daily-brief",
+            "--repo",
+            &repo_arg,
+            "--agent-home",
+            &agent_home_arg,
+        ],
+        &[],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let path = output.stdout_text();
+    let path = path.trim();
+    assert!(
+        path.starts_with(&format!(
+            "{}/out/projects/sympoies__nils-cli/",
+            agent_home.display()
+        )),
+        "unexpected path: {path}"
+    );
+    assert!(
+        path.ends_with("-daily-brief"),
+        "topic was not preserved in path: {path}"
+    );
+    assert!(
+        !Path::new(path).exists(),
+        "--mkdir was not passed, path should not exist"
+    );
+}
+
+#[test]
+fn path_for_accepts_repo_slug_in_repo_flag_and_creates_directory() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "path-for",
+            "--domain",
+            "tools",
+            "--repo",
+            "sympoies/nils-cli",
+            "--agent-home",
+            &agent_home_arg,
+            "--mkdir",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["schema_version"], "cli.agent-out.path-for.v1");
+    assert_eq!(value["command"], "agent-out path-for");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["result"]["domain"], "tools");
+    assert_eq!(value["result"]["project_slug"], "sympoies__nils-cli");
+    assert_eq!(value["result"]["topic"], "tools");
+    assert_eq!(value["result"]["created"], true);
+    let path = value["result"]["path"].as_str().expect("path");
+    assert!(
+        Path::new(path).is_dir(),
+        "expected --mkdir to create {path}"
+    );
+}
+
+#[test]
 fn audit_separates_allowlisted_roots_from_violations() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let agent_home = tmp.path().join("agent-home");
