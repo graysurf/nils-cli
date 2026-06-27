@@ -1,3 +1,4 @@
+use nils_test_support::GlobalStateLock;
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOptions, CmdOutput};
 use nils_test_support::write_exe;
@@ -264,6 +265,7 @@ fn auth_auto_refresh_normalizes_fractional_last_refresh() {
 
 #[test]
 fn auth_auto_refresh_remote_mode_refreshes_active_auth_only() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let stubs = dir.path().join("stubs");
     fs::create_dir_all(&stubs).expect("stubs dir");
@@ -337,6 +339,7 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
 
 #[test]
 fn auth_auto_refresh_remote_mode_recreates_missing_active_auth_despite_recent_timestamp() {
+    let _lock = GlobalStateLock::new();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let stubs = dir.path().join("stubs");
     fs::create_dir_all(&stubs).expect("stubs dir");

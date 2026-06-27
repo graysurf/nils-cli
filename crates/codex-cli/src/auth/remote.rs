@@ -38,6 +38,12 @@ pub struct RemotePullFailure {
     pub exit_code: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct RemoteAccessOnlyPayload {
+    pub auth: Value,
+    pub config: ConfiguredRemotePull,
+}
+
 struct RemoteExportSuccess {
     output: Output,
     refresh_attempted: bool,
@@ -115,6 +121,18 @@ pub fn pull_with_json(
 
 pub fn configured_pull_from_env()
 -> std::result::Result<Option<ConfiguredRemotePull>, RemoteEnvError> {
+    configured_pull_from_env_for_name(None)
+}
+
+pub fn configured_pull_for_target_from_env(
+    target_file: &Path,
+) -> std::result::Result<Option<ConfiguredRemotePull>, RemoteEnvError> {
+    configured_pull_from_env_for_name(infer_secret_name_for_target(target_file))
+}
+
+fn configured_pull_from_env_for_name(
+    inferred_name: Option<String>,
+) -> std::result::Result<Option<ConfiguredRemotePull>, RemoteEnvError> {
     let ssh = env_non_empty(ENV_AUTH_REMOTE_SSH);
     let name = env_non_empty(ENV_AUTH_REMOTE_NAME);
 
@@ -130,7 +148,7 @@ pub fn configured_pull_from_env()
             ),
         ));
     };
-    let Some(name) = name else {
+    let Some(name) = inferred_name.or(name) else {
         return Err(remote_env_error(
             "remote-name-missing",
             format!(
@@ -159,6 +177,32 @@ pub fn configured_pull_from_env()
     }))
 }
 
+pub fn export_access_only_for_target_from_env(
+    target_file: &Path,
+) -> Result<Option<RemoteAccessOnlyPayload>> {
+    let Some(config) = configured_pull_for_target_from_env(target_file)
+        .map_err(|err| anyhow::anyhow!(err.message))?
+    else {
+        return Ok(None);
+    };
+
+    let remote_export =
+        match run_remote_export_with_fallback(&config.ssh, &config.name, config.refresh) {
+            Ok(success) => success,
+            Err(failure) => anyhow::bail!(failure.message),
+        };
+
+    let mut imported = sanitize_remote_output(&remote_export.output, &config.ssh, &config.name)
+        .map_err(|failure| anyhow::anyhow!(failure.message))?;
+    ensure_last_refresh(&mut imported);
+    ensure_access_only_refresh_placeholder(&mut imported);
+
+    Ok(Some(RemoteAccessOnlyPayload {
+        auth: imported,
+        config,
+    }))
+}
+
 pub fn pull_access_only_to_active(
     ssh_host: &str,
     name: &str,
@@ -168,35 +212,10 @@ pub fn pull_access_only_to_active(
         Ok(success) => success,
         Err(failure) => return Ok(Err(failure)),
     };
-    let remote_output = remote_export.output;
-
-    let imported: Value = match serde_json::from_slice(&remote_output.stdout) {
+    let mut imported = match sanitize_remote_output(&remote_export.output, ssh_host, name) {
         Ok(value) => value,
-        Err(_) => {
-            return Ok(Err(RemotePullFailure {
-                code: "remote-export-invalid-json",
-                message: "codex-remote-pull: remote export returned invalid JSON".to_string(),
-                details: Some(serde_json::json!({
-                    "ssh": ssh_host,
-                    "name": name,
-                })),
-                exit_code: 1,
-            }));
-        }
+        Err(failure) => return Ok(Err(failure)),
     };
-    let mut imported = sanitize_access_only(imported);
-    if !has_oauth_access_token(&imported) {
-        return Ok(Err(RemotePullFailure {
-            code: "remote-export-missing-access-token",
-            message: "codex-remote-pull: remote export did not include an OAuth access token"
-                .to_string(),
-            details: Some(serde_json::json!({
-                "ssh": ssh_host,
-                "name": name,
-            })),
-            exit_code: 1,
-        }));
-    }
     ensure_last_refresh(&mut imported);
     ensure_access_only_refresh_placeholder(&mut imported);
 
@@ -241,6 +260,41 @@ pub fn pull_access_only_to_active(
         remote_refresh_fallback: remote_export.refresh_fallback.then_some(true),
         remote_refresh_error_code: remote_export.refresh_error_code,
     }))
+}
+
+fn sanitize_remote_output(
+    output: &Output,
+    ssh_host: &str,
+    name: &str,
+) -> std::result::Result<Value, RemotePullFailure> {
+    let imported: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(RemotePullFailure {
+                code: "remote-export-invalid-json",
+                message: "codex-remote-pull: remote export returned invalid JSON".to_string(),
+                details: Some(serde_json::json!({
+                    "ssh": ssh_host,
+                    "name": name,
+                })),
+                exit_code: 1,
+            });
+        }
+    };
+    let imported = sanitize_access_only(imported);
+    if !has_oauth_access_token(&imported) {
+        return Err(RemotePullFailure {
+            code: "remote-export-missing-access-token",
+            message: "codex-remote-pull: remote export did not include an OAuth access token"
+                .to_string(),
+            details: Some(serde_json::json!({
+                "ssh": ssh_host,
+                "name": name,
+            })),
+            exit_code: 1,
+        });
+    }
+    Ok(imported)
 }
 
 fn run_remote_export_with_fallback(
@@ -439,6 +493,72 @@ fn env_non_empty(name: &str) -> Option<String> {
     })
 }
 
+fn infer_secret_name_for_target(target_file: &Path) -> Option<String> {
+    if let Some(secret_dir) = paths::resolve_secret_dir()
+        && let Some(file_name) = target_file.file_name().and_then(|name| name.to_str())
+        && secret_dir.join(file_name) == target_file
+    {
+        return secret_name_from_file_name(file_name);
+    }
+
+    if let Some(auth_file) = paths::resolve_auth_file()
+        && auth_file == target_file
+    {
+        return matching_secret_name_for_auth(target_file);
+    }
+
+    None
+}
+
+fn matching_secret_name_for_auth(auth_file: &Path) -> Option<String> {
+    let secret_dir = paths::resolve_secret_dir()?;
+    let mut secret_files = std::fs::read_dir(&secret_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    secret_files.sort();
+
+    if let Ok(auth_hash) = fs::sha256_file(auth_file) {
+        for secret_file in &secret_files {
+            if fs::sha256_file(secret_file).ok().as_deref() == Some(auth_hash.as_str())
+                && let Some(name) = secret_file.file_name().and_then(|value| value.to_str())
+                && let Some(secret_name) = secret_name_from_file_name(name)
+            {
+                return Some(secret_name);
+            }
+        }
+    }
+
+    let auth_key = auth::identity_key_from_auth_file(auth_file)
+        .ok()
+        .flatten()?;
+    for secret_file in &secret_files {
+        if auth::identity_key_from_auth_file(secret_file)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(auth_key.as_str())
+            && let Some(name) = secret_file.file_name().and_then(|value| value.to_str())
+            && let Some(secret_name) = secret_name_from_file_name(name)
+        {
+            return Some(secret_name);
+        }
+    }
+
+    None
+}
+
+fn secret_name_from_file_name(file_name: &str) -> Option<String> {
+    let secret_name = file_name.strip_suffix(".json")?;
+    if is_valid_secret_name(secret_name) {
+        Some(secret_name.to_string())
+    } else {
+        None
+    }
+}
+
 fn remote_env_error(code: &'static str, message: String) -> RemoteEnvError {
     RemoteEnvError {
         code,
@@ -604,8 +724,8 @@ fn is_valid_secret_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_valid_secret_name, is_valid_ssh_host, sanitize_access_only,
-        sync_matching_active_from_secret,
+        infer_secret_name_for_target, is_valid_secret_name, is_valid_ssh_host,
+        sanitize_access_only, sync_matching_active_from_secret,
     };
     use nils_test_support::{EnvGuard, GlobalStateLock};
 
@@ -675,6 +795,24 @@ mod tests {
         assert!(!is_valid_secret_name("a;bad"));
         assert!(!is_valid_secret_name("a$bad"));
         assert!(!is_valid_secret_name("a`bad"));
+    }
+
+    #[test]
+    fn remote_infers_secret_name_for_secret_file_target() {
+        let lock = GlobalStateLock::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).expect("secrets dir");
+        let _secret_dir = EnvGuard::set(
+            &lock,
+            "CODEX_SECRET_DIR",
+            secrets.to_string_lossy().as_ref(),
+        );
+
+        assert_eq!(
+            infer_secret_name_for_target(&secrets.join("sym.json")).as_deref(),
+            Some("sym")
+        );
     }
 
     #[test]

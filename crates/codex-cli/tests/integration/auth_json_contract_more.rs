@@ -32,7 +32,11 @@ fn run(args: &[&str], envs: &[(&str, &Path)]) -> CmdOutput {
 }
 
 fn run_with(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutput {
-    let mut options = CmdOptions::default();
+    let mut options = CmdOptions::default().with_env_remove_many(&[
+        "CODEX_AUTH_REMOTE_SSH",
+        "CODEX_AUTH_REMOTE_NAME",
+        "CODEX_AUTH_REMOTE_REFRESH",
+    ]);
     for (key, path) in envs {
         options = options.with_env(key, path.to_string_lossy().as_ref());
     }
