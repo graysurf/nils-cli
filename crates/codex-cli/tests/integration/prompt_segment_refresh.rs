@@ -203,7 +203,7 @@ fn prompt_segment_refresh_updates_cache_and_prints() {
 
 #[test]
 fn prompt_segment_stale_cache_triggers_background_refresh() {
-    const STALE_CACHE_AGE_SECONDS: u64 = 10;
+    const STALE_CACHE_AGE_SECONDS: i64 = 10;
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
