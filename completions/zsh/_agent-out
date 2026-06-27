@@ -62,6 +62,43 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(cleanup)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_agent-out__subcmd__cleanup_commands" \
+"*::: :->cleanup" \
+&& ret=0
+
+    case $state in
+    (cleanup)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-out-cleanup-command-$line[1]:"
+        case $line[1] in
+            (plan)
+_arguments "${_arguments_options[@]}" : \
+'--agent-home=[Agent home root. Defaults to AGENT_HOME]:PATH:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--include-projects[Include canonical projects/<repo>/<run> entries as preserve/needs-policy rows]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(apply)
+_arguments "${_arguments_options[@]}" : \
+'--plan-file=[Cleanup plan JSON file produced by \`agent-out cleanup plan --format json\`]:PATH:_files' \
+'--confirm-digest=[Required plan digest confirmation from the reviewed plan]:SHA256:_default' \
+'--agent-home=[Agent home guard. Defaults to AGENT_HOME; rejects plans for a different home]:PATH:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -80,6 +117,7 @@ _agent-out_commands() {
 'path-for:Compatibility allocator for rendered state_out artifact paths' \
 'project:Generate a canonical project-scoped artifact directory path' \
 'audit:Audit top-level AGENT_HOME/out entries' \
+'cleanup:Plan or apply safe AGENT_HOME/out cleanup' \
 'completion:Print shell completion script' \
     )
     _describe -t commands 'agent-out commands' commands "$@"
@@ -88,6 +126,24 @@ _agent-out_commands() {
 _agent-out__subcmd__audit_commands() {
     local commands; commands=()
     _describe -t commands 'agent-out audit commands' commands "$@"
+}
+(( $+functions[_agent-out__subcmd__cleanup_commands] )) ||
+_agent-out__subcmd__cleanup_commands() {
+    local commands; commands=(
+'plan:Build a dry-run cleanup plan' \
+'apply:Apply delete candidates from a reviewed cleanup plan' \
+    )
+    _describe -t commands 'agent-out cleanup commands' commands "$@"
+}
+(( $+functions[_agent-out__subcmd__cleanup__subcmd__apply_commands] )) ||
+_agent-out__subcmd__cleanup__subcmd__apply_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-out cleanup apply commands' commands "$@"
+}
+(( $+functions[_agent-out__subcmd__cleanup__subcmd__plan_commands] )) ||
+_agent-out__subcmd__cleanup__subcmd__plan_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-out cleanup plan commands' commands "$@"
 }
 (( $+functions[_agent-out__subcmd__completion_commands] )) ||
 _agent-out__subcmd__completion_commands() {

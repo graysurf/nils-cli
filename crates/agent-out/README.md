@@ -93,6 +93,45 @@ and explicit tool/workflow roots already documented in nils-cli or agent-runtime
 
 New top-level roots should be added deliberately when they become a stable tool contract.
 
+### `cleanup`
+
+Build and apply reviewed cleanup plans for `$AGENT_HOME/out/`.
+
+`cleanup plan` is dry-run only:
+
+```bash
+agent-out cleanup plan --format json
+agent-out cleanup plan --include-projects --format json > cleanup-plan.json
+```
+
+Plan classification is conservative:
+
+- `nils-versions` is a `cache` delete candidate because it can be recreated
+  from release assets.
+- top-level noncanonical entries without retained evidence markers are delete
+  candidates.
+- any directory containing `skill-usage.record.json` or
+  `test-first-evidence.json` is preserved; use `evidence migrate` and
+  `evidence prune-source --archived-only` for `skill-usage` source cleanup.
+- `projects/<repo>/<run>` entries are included only with `--include-projects`;
+  runs without evidence markers are reported as `needs-policy`, not deleted.
+
+`cleanup apply` requires a reviewed plan file and exact digest confirmation:
+
+```bash
+agent-out cleanup apply \
+  --plan-file cleanup-plan.json \
+  --confirm-digest sha256:<digest> \
+  --agent-home "$AGENT_HOME" \
+  --format json
+```
+
+Apply deletes only `delete` items from the plan, rejects digest mismatches,
+requires the resolved agent home to match the plan, rejects parent-directory or
+out-of-root delete paths, and re-checks evidence markers immediately before
+deletion. If `--agent-home` is omitted, `AGENT_HOME` is still required so the
+plan has a live runtime-root boundary.
+
 ### `completion`
 
 Print generated shell completions:
@@ -111,6 +150,8 @@ JSON output is opt-in and uses versioned envelopes:
 - `cli.agent-out.project.v1`
 - `cli.agent-out.path-for.v1`
 - `cli.agent-out.audit.v1`
+- `cli.agent-out.cleanup.plan.v1`
+- `cli.agent-out.cleanup.apply.v1`
 
 Example:
 
@@ -137,6 +178,7 @@ Example:
 - `0`: success
 - `1`: runtime failure, or audit violations when `audit --strict` is used
 - `64`: usage/configuration error, including missing `AGENT_HOME`
+- `65`: invalid cleanup plan data, including digest mismatches
 
 ## Docs
 
