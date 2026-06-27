@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HELP_TIMEOUT_SECONDS=5
-COMPLETION_TIMEOUT_SECONDS=30
-MAX_COMMAND_DEPTH=6
+# Default limits for command probing. Allow env overrides for CI tuning/debugging.
+# Keep conservative defaults to balance reliability and runtime in typical CI runs.
+HELP_TIMEOUT_SECONDS="${HELP_TIMEOUT_SECONDS:-5}"
+COMPLETION_TIMEOUT_SECONDS="${COMPLETION_TIMEOUT_SECONDS:-30}"
+MAX_COMMAND_DEPTH="${MAX_COMMAND_DEPTH:-6}"
 ROOT_KEY="__ROOT__"
 PATH_SEP=$'\x1f'
 
