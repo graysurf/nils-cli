@@ -265,8 +265,7 @@ operations:
     #   thread_file_requires_submit_review (DATA 65) — --thread-file without --submit-review
     #   provider_unsupported (USAGE 64) — --submit-review or --thread-file on gitlab/local (native review/thread creation is GitHub-only in v1)
     #   github_native_review_rejected (RUNTIME 1) — GitHub rejected native review submission with HTTP 422; retry with an eligible reviewer identity or omit --submit-review for an outcome comment fallback
-    # Provider diff-mapping failures from addPullRequestReviewThread surface as backend_error (RUNTIME 1)
-    # after best-effort pending-review cleanup.
+    #   github_review_thread_rejected (RUNTIME 1) — GitHub rejected addPullRequestReviewThread for one spec; detail preserves the raw backend error plus spec index/path/line after best-effort pending-review cleanup.
     # A non-404 guard failure (rate limit, 5xx, forbidden/SSO) surfaces as backend_error (RUNTIME 1),
     # not id_not_pull_request, since it may have hit a valid PR.
     backends:
@@ -302,6 +301,45 @@ operations:
         mirrored: bool
         lenses: list<string>
         review_threads?: list<{ id: string, url: string, path: string, line?: integer, subject_type: enum<LINE|FILE> }>
+
+  - id: pr.review.validate
+    schema_version: cli.forge-cli.pr.review.validate.v1
+    summary: Validate review summary and review-thread specs before posting provider-visible review activity.
+    inputs:
+      - { name: <id>,           type: integer, required: false } # required with --check-diff
+      - { name: --comment,      type: string,  required: false }
+      - { name: --comment-file, type: path,    required: false }
+      - { name: --thread-file,  type: path,    required: false }
+      - { name: --check-diff,   type: bool,    default: false } # GitHub-only in v1; validates thread paths/lines against live PR diff
+    validations:
+      - no_local_path # review comment body plus thread spec bodies/paths
+      - no_escaped_control_markdown # review comment body plus thread spec bodies/paths
+    # Op-specific error kinds:
+    #   invalid_review_thread_spec (DATA 65) — malformed, oversized, or locally invalid thread spec fields
+    #   review_validate_id_required (DATA 65) — --check-diff without <id>
+    #   review_thread_file_not_changed (DATA 65) — a thread spec path is absent from the live GitHub PR file list
+    #   review_thread_line_not_in_diff (DATA 65) — a line thread points at a line that is not commentable on the requested diff side
+    #   review_thread_range_not_in_diff (DATA 65) — a ranged thread is reversed or spans multiple diff hunks
+    #   provider_unsupported (USAGE 64) — --check-diff on gitlab/local (live diff-coordinate validation is GitHub-only in v1)
+    dry_run:
+      offline: true
+      plan_field: diff_plan
+      note: "With --check-diff, emits the planned GitHub PR files argv and leaves review_threads.diff_checked=false."
+    backends:
+      github:
+        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/files", --paginate] } # only with --check-diff
+      # gitlab/local: local schema/privacy validation only; --check-diff returns provider_unsupported.
+    output:
+      data:
+        provider: enum<github|gitlab|local>
+        number: integer?
+        check_diff: bool
+        diff_plan: list<string>? # dry-run only when --check-diff is set
+        comment: { present: bool, bytes: integer, lines: integer }
+        review_threads:
+          count: integer
+          diff_checked: bool
+          specs: list<{ index: integer, path: string, line?: integer, side: enum<LEFT|RIGHT>, start_line?: integer, start_side?: enum<LEFT|RIGHT>, subject_type: enum<LINE|FILE>, body_bytes: integer }>
 
   - id: pr.ready
     schema_version: cli.forge-cli.pr.ready.v1

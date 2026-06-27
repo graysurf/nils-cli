@@ -22,11 +22,15 @@ cargo run -p nils-forge-cli -- auth status --format json
 cargo run -p nils-forge-cli -- label audit --catalog labels.yaml --format json
 cargo run -p nils-forge-cli -- pr deliver --kind feature --dry-run --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --comment-file review.md --mirror-issue --issue 456 --format json
+cargo run -p nils-forge-cli -- pr review validate --comment-file review.md --thread-file review-threads.json --format json
+cargo run -p nils-forge-cli -- pr review validate 123 --check-diff --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --comment-file review.md --thread-file review-threads.json --format json
 ```
 
 `--thread-file` is for actionable findings only: max 50 threads, 16 KiB body
-each. Put non-blocking notes in the review body.
+each. Use `pr review validate` for local schema/privacy checks, and add
+`--check-diff` with a PR id when you want GitHub changed-file/line validation
+before posting. Put non-blocking notes in the review body.
 
 `forge-cli` does NOT introduce a `--json` boolean flag. Use
 `--format text|json` exclusively.

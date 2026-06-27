@@ -62,7 +62,7 @@ pub fn resolve_slug(repo: Option<&str>) -> String {
 /// `pr deliver` macro. The dispatcher rejects unsupported commands up front via
 /// [`unsupported_command`] so they never spawn a backend binary.
 pub fn command_supported(command: &Option<crate::cli::Command>) -> bool {
-    use crate::cli::{Command, IssueCommand, PrCommand};
+    use crate::cli::{Command, IssueCommand, PrCommand, PrReviewCommand};
     match command {
         Some(Command::Issue(args)) => matches!(
             &args.command,
@@ -77,7 +77,15 @@ pub fn command_supported(command: &Option<crate::cli::Command>) -> bool {
         ),
         Some(Command::Pr(args)) => matches!(
             &args.command,
-            Some(PrCommand::View { .. } | PrCommand::Comments(_) | PrCommand::Checks(_))
+            Some(
+                PrCommand::View { .. }
+                    | PrCommand::Comments(_)
+                    | PrCommand::Checks(_)
+                    | PrCommand::Review(crate::cli::PrReviewArgs {
+                        command: Some(PrReviewCommand::Validate(_)),
+                        ..
+                    })
+            )
         ),
         // Activity owns its own provider seam and returns an activity-specific
         // `provider_unsupported` for Local until a file-backed implementation

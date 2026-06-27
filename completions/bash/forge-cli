@@ -217,6 +217,9 @@ _forge-cli() {
             forge__cli__help__pr,wait-checks)
                 cmd="forge__cli__help__pr__wait__checks"
                 ;;
+            forge__cli__help__pr__review,validate)
+                cmd="forge__cli__help__pr__review__validate"
+                ;;
             forge__cli__help__pr__review__threads,list)
                 cmd="forge__cli__help__pr__review__threads__list"
                 ;;
@@ -430,6 +433,9 @@ _forge-cli() {
             forge__cli__pr__help,wait-checks)
                 cmd="forge__cli__pr__help__wait__checks"
                 ;;
+            forge__cli__pr__help__review,validate)
+                cmd="forge__cli__pr__help__review__validate"
+                ;;
             forge__cli__pr__help__review__threads,list)
                 cmd="forge__cli__pr__help__review__threads__list"
                 ;;
@@ -438,6 +444,18 @@ _forge-cli() {
                 ;;
             forge__cli__pr__help__review__threads,resolve)
                 cmd="forge__cli__pr__help__review__threads__resolve"
+                ;;
+            forge__cli__pr__review,help)
+                cmd="forge__cli__pr__review__help"
+                ;;
+            forge__cli__pr__review,validate)
+                cmd="forge__cli__pr__review__validate"
+                ;;
+            forge__cli__pr__review__help,help)
+                cmd="forge__cli__pr__review__help__help"
+                ;;
+            forge__cli__pr__review__help,validate)
+                cmd="forge__cli__pr__review__help__validate"
                 ;;
             forge__cli__pr__review__threads,help)
                 cmd="forge__cli__pr__review__threads__help"
@@ -1496,7 +1514,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__help__pr__review)
-            opts=""
+            opts="validate"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1552,6 +1570,20 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__help__pr__review__threads__resolve)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__help__pr__review__validate)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3290,7 +3322,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__help__review)
-            opts=""
+            opts="validate"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3346,6 +3378,20 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__help__review__threads__resolve)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__help__review__validate)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3528,7 +3574,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__review)
-            opts="-h --decision --comment --comment-file --lens --issue --mirror-issue --submit-review --thread-file --format --remote --provider --repo --store-root --dry-run --help <ID>"
+            opts="-h --decision --comment --comment-file --lens --issue --mirror-issue --submit-review --thread-file --format --remote --provider --repo --store-root --dry-run --help [ID] validate help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3785,6 +3831,94 @@ _forge-cli() {
                     return 0
                     ;;
                 --note-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --remote)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider)
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__review__help)
+            opts="validate help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__review__help__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__review__help__validate)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__review__validate)
+            opts="-h --comment --comment-file --thread-file --check-diff --format --remote --provider --repo --store-root --dry-run --help [ID]"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --comment)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --comment-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --thread-file)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

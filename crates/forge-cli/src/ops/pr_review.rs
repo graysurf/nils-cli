@@ -5,13 +5,15 @@
 //! rendered review outcome, and forge-cli posts it to the PR/MR plus an
 //! optional compact issue activity mirror.
 
-use std::{ffi::OsString, fs, io::Read};
+use std::{collections::HashMap, ffi::OsString, fs, io::Read};
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, ProcessRunner};
-use crate::cli::{BINARY, GlobalFlags, PrReviewArgs, PrReviewDecision};
+use crate::cli::{
+    BINARY, GlobalFlags, PrReviewArgs, PrReviewCommand, PrReviewDecision, PrReviewValidateArgs,
+};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_comment;
@@ -96,6 +98,43 @@ struct PrReviewDryRunPayload {
     submit_plan: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct PrReviewValidatePayload {
+    provider: &'static str,
+    number: Option<u64>,
+    check_diff: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff_plan: Option<Vec<String>>,
+    comment: ReviewCommentValidation,
+    review_threads: ReviewThreadValidation,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ReviewCommentValidation {
+    present: bool,
+    bytes: usize,
+    lines: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ReviewThreadValidation {
+    count: usize,
+    diff_checked: bool,
+    specs: Vec<ReviewThreadSpecPreview>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ReviewThreadSpecPreview {
+    index: usize,
+    path: String,
+    line: Option<u32>,
+    side: &'static str,
+    start_line: Option<u32>,
+    start_side: Option<&'static str>,
+    subject_type: &'static str,
+    body_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum ReviewThreadDiffSide {
@@ -156,6 +195,13 @@ struct PreparedReviewThreadSpec {
     subject_type: ReviewThreadSubjectType,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubPrFile {
+    filename: String,
+    #[serde(default)]
+    patch: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CreatedReviewThread {
     pub id: String,
@@ -193,6 +239,14 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
+    if let Some(command) = args.command.clone() {
+        return match command {
+            PrReviewCommand::Validate(validate_args) => {
+                run_validate_with(runner, global, validate_args, format, remote_url_lookup)
+            }
+        };
+    }
+
     let ctx = detect(
         global.provider_hint(),
         &global.remote,
@@ -206,6 +260,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             None,
         ));
     }
+    let id = args.id.ok_or_else(review_id_required_err)?;
 
     let thread_specs_requested = args.thread_file.is_some();
     if thread_specs_requested && !args.submit_review {
@@ -286,7 +341,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     let mirror_issue = if let Some(issue_number) = mirror_issue_number {
         let preview = build_issue_mirror_body(
             ctx.provider,
-            args.id,
+            id,
             args.decision,
             &args.lenses,
             MIRROR_URL_PENDING,
@@ -312,6 +367,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             (
                 build_review_post_call(
                     &ctx,
+                    id,
                     &args,
                     &body,
                     body_present,
@@ -324,7 +380,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             let (owner, name) = github_owner_name(&ctx)?;
             (
                 build_github_pending_review_call(&ctx, "<pull-request-id>"),
-                Some(build_github_review_target_call(&ctx, owner, name, args.id).plan_argv()),
+                Some(build_github_review_target_call(&ctx, owner, name, id).plan_argv()),
                 Some(
                     build_github_submit_review_call(
                         &ctx,
@@ -339,12 +395,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         // The GitHub PR-existence guard is a live backend read; surface it in the
         // dry-run plan so wrappers inspecting dry-run output see every call.
         let guard_plan = (ctx.provider == Provider::GitHub).then(|| {
-            BackendCall::new(BackendProgram::Gh, github_pull_lookup_argv(&ctx, args.id)).plan_argv()
+            BackendCall::new(BackendProgram::Gh, github_pull_lookup_argv(&ctx, id)).plan_argv()
         });
         let issue_plan = mirror_issue.map(|issue| {
             let mirror_body = build_issue_mirror_body(
                 ctx.provider,
-                args.id,
+                id,
                 args.decision,
                 &args.lenses,
                 "<pr-comment-url-unavailable-in-dry-run>",
@@ -355,7 +411,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             schema_version(),
             PrReviewDryRunPayload {
                 provider: ctx.provider.as_str(),
-                number: args.id,
+                number: id,
                 decision: args.decision.as_str(),
                 submitted_review: args.submit_review,
                 guard_plan,
@@ -412,7 +468,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     // issue. GitLab's `glab mr note` already fails on a non-MR id, so this guard
     // is GitHub-only.
     if ctx.provider == Provider::GitHub {
-        ensure_github_pull_request(runner, &ctx, args.id)?;
+        ensure_github_pull_request(runner, &ctx, id)?;
     }
 
     // GitLab only: probe which `mr note` form this `glab` build supports
@@ -424,7 +480,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         GlabNoteForm::CreateResolvable
     };
     let (pr_comment_url, review_threads) = if thread_specs.is_empty() {
-        let pr_call = build_review_post_call(&ctx, &args, &body, body_present, glab_form);
+        let pr_call = build_review_post_call(&ctx, id, &args, &body, body_present, glab_form);
         let pr_output = runner.run(&pr_call).map_err(|err| {
             if args.submit_review && ctx.provider == Provider::GitHub {
                 map_github_native_review_submit_error(args.decision, err)
@@ -437,7 +493,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         submit_github_review_with_threads(
             runner,
             &ctx,
-            args.id,
+            id,
             args.decision,
             body_present.then_some(body.as_str()),
             &thread_specs,
@@ -451,7 +507,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         // user-controlled, so it needs no re-validation after the post.
         let mirror_body = build_issue_mirror_body(
             ctx.provider,
-            args.id,
+            id,
             args.decision,
             &args.lenses,
             &pr_comment_url,
@@ -467,7 +523,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         schema_version(),
         PrReviewPayload {
             provider: ctx.provider.as_str(),
-            number: args.id,
+            number: id,
             decision: args.decision.as_str(),
             submitted_review: args.submit_review,
             pr_comment_url,
@@ -482,6 +538,107 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     ))
 }
 
+fn run_validate_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    args: PrReviewValidateArgs,
+    format: OutputFormat,
+    remote_url_lookup: F,
+) -> Result<i32, ForgeError> {
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
+    if args.check_diff && ctx.provider != Provider::GitHub {
+        return Err(ForgeError::provider_unsupported(
+            schema_err(),
+            "pr review validate --check-diff is GitHub-only in v1",
+            None,
+        ));
+    }
+    let check_diff_id = if args.check_diff {
+        let id = args.id.ok_or_else(review_validate_id_required_err)?;
+        let _ = github_owner_name(&ctx)?;
+        Some(id)
+    } else {
+        None
+    };
+
+    let thread_specs = if let Some(path) = args.thread_file.as_deref() {
+        read_review_thread_specs(path)?
+    } else {
+        Vec::new()
+    };
+    let body = pr_comment::read_body_with_file_flag(
+        args.comment.as_deref(),
+        args.comment_file.as_deref(),
+        "--comment-file",
+    )?;
+    let body_present = !body.trim().is_empty();
+    if body_present {
+        no_local_path(&body, "review comment")?;
+        no_escaped_control_markdown(&body)?;
+    }
+
+    let mut diff_plan = None;
+    let diff_checked = args.check_diff && !global.dry_run;
+    if let Some(id) = check_diff_id {
+        let call = build_github_pr_files_call(&ctx, id)?;
+        if global.dry_run {
+            diff_plan = Some(call.plan_argv());
+        } else {
+            validate_review_threads_against_github_diff(runner, &ctx, id, &thread_specs)?;
+        }
+    }
+
+    let payload = PrReviewValidatePayload {
+        provider: ctx.provider.as_str(),
+        number: args.id,
+        check_diff: args.check_diff,
+        diff_plan,
+        comment: ReviewCommentValidation {
+            present: body_present,
+            bytes: body.len(),
+            lines: body.lines().count(),
+        },
+        review_threads: ReviewThreadValidation {
+            count: thread_specs.len(),
+            diff_checked,
+            specs: thread_specs
+                .iter()
+                .enumerate()
+                .map(|(idx, spec)| ReviewThreadSpecPreview {
+                    index: idx + 1,
+                    path: spec.path.clone(),
+                    line: spec.line,
+                    side: spec.side.as_str(),
+                    start_line: spec.start_line,
+                    start_side: spec.start_side.map(ReviewThreadDiffSide::as_str),
+                    subject_type: spec.subject_type.as_str(),
+                    body_bytes: spec.body.len(),
+                })
+                .collect(),
+        },
+    };
+
+    Ok(emit_success(
+        schema_version_for(BINARY, "pr.review.validate", 1),
+        payload,
+        format,
+        |p| {
+            println!(
+                "review validation ok: provider={provider} comment_present={comment_present} review_threads={threads} diff_checked={diff_checked}",
+                provider = p.provider,
+                comment_present = p.comment.present,
+                threads = p.review_threads.count,
+                diff_checked = p.review_threads.diff_checked,
+            );
+        },
+    ))
+}
+
 /// Build the primary "post the review" backend call for the chosen mode: a
 /// native GitHub review submission when `--submit-review` is set (the
 /// `#pullrequestreview-` object), otherwise the outcome-comment post. Used by
@@ -490,6 +647,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 /// guarded earlier in `run_with`).
 fn build_review_post_call(
     ctx: &ProviderContext,
+    id: u64,
     args: &PrReviewArgs,
     body: &str,
     body_present: bool,
@@ -501,10 +659,10 @@ fn build_review_post_call(
         let body_opt = body_present.then_some(body);
         BackendCall::new(
             BackendProgram::Gh,
-            github_review_submit_argv(ctx, args.id, event, body_opt),
+            github_review_submit_argv(ctx, id, event, body_opt),
         )
     } else {
-        build_pr_comment_call(ctx, args.id, body, glab_form)
+        build_pr_comment_call(ctx, id, body, glab_form)
     }
 }
 
@@ -668,6 +826,274 @@ fn review_thread_spec_err(message: impl Into<String>) -> ForgeError {
     )
 }
 
+fn validate_review_threads_against_github_diff<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+    specs: &[PreparedReviewThreadSpec],
+) -> Result<(), ForgeError> {
+    let files_output = runner.run(&build_github_pr_files_call(ctx, number)?)?;
+    let files = parse_github_pr_files(&files_output.stdout)?;
+    let by_path = files
+        .iter()
+        .map(|file| (file.filename.as_str(), file))
+        .collect::<HashMap<_, _>>();
+
+    for (idx, spec) in specs.iter().enumerate() {
+        let index = idx + 1;
+        let Some(file) = by_path.get(spec.path.as_str()) else {
+            return Err(review_thread_file_not_changed_err(index, spec));
+        };
+        if matches!(spec.subject_type, ReviewThreadSubjectType::File) {
+            continue;
+        }
+
+        let patch = file.patch.as_deref().unwrap_or_default();
+        let hunks = commentable_hunks_by_side(patch);
+        if let Some(line) = spec.line
+            && find_commentable_line(&hunks, spec.side, line).is_none()
+        {
+            return Err(review_thread_line_not_in_diff_err(
+                index, spec, line, spec.side,
+            ));
+        }
+        if let Some(start_line) = spec.start_line {
+            let start_side = spec.start_side.unwrap_or(spec.side);
+            if find_commentable_line(&hunks, start_side, start_line).is_none() {
+                return Err(review_thread_line_not_in_diff_err(
+                    index, spec, start_line, start_side,
+                ));
+            }
+            let end_line = spec.line.expect("start_line requires line");
+            if !range_is_commentable_in_single_hunk(
+                &hunks, start_side, start_line, spec.side, end_line,
+            ) {
+                return Err(review_thread_range_not_in_diff_err(
+                    index, spec, start_line, start_side, end_line, spec.side,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_github_pr_files(raw: &str) -> Result<Vec<GitHubPrFile>, ForgeError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Ok(files) = serde_json::from_str::<Vec<GitHubPrFile>>(trimmed) {
+        return Ok(files);
+    }
+
+    let mut files = Vec::new();
+    for (idx, line) in trimmed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let line = line.trim();
+        if line.starts_with('[') {
+            let mut page = serde_json::from_str::<Vec<GitHubPrFile>>(line).map_err(|e| {
+                ForgeError::software(
+                    schema_err(),
+                    "github pull request files response is invalid JSON",
+                    Some(format!("line={}; error={e}", idx + 1)),
+                )
+            })?;
+            files.append(&mut page);
+        } else {
+            let file = serde_json::from_str::<GitHubPrFile>(line).map_err(|e| {
+                ForgeError::software(
+                    schema_err(),
+                    "github pull request files response is invalid JSON",
+                    Some(format!("line={}; error={e}", idx + 1)),
+                )
+            })?;
+            files.push(file);
+        }
+    }
+    Ok(files)
+}
+
+#[derive(Debug, Default)]
+struct CommentableHunk {
+    left_positions: HashMap<u32, usize>,
+    right_positions: HashMap<u32, usize>,
+}
+
+impl CommentableHunk {
+    fn position(&self, side: ReviewThreadDiffSide, line: u32) -> Option<usize> {
+        match side {
+            ReviewThreadDiffSide::Left => self.left_positions.get(&line).copied(),
+            ReviewThreadDiffSide::Right => self.right_positions.get(&line).copied(),
+        }
+    }
+}
+
+fn commentable_hunks_by_side(patch: &str) -> Vec<CommentableHunk> {
+    let mut hunks = Vec::new();
+    let mut current_hunk = None::<CommentableHunk>;
+    let mut old_line = None::<u32>;
+    let mut new_line = None::<u32>;
+    let mut diff_position = 0usize;
+
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            if let Some(hunk) = current_hunk.take() {
+                hunks.push(hunk);
+            }
+            if let Some((old_start, new_start)) = parse_hunk_header(line) {
+                current_hunk = Some(CommentableHunk::default());
+                old_line = Some(old_start);
+                new_line = Some(new_start);
+                diff_position = 0;
+            } else {
+                old_line = None;
+                new_line = None;
+            }
+            continue;
+        }
+
+        let (Some(old_current), Some(new_current)) = (old_line, new_line) else {
+            continue;
+        };
+        let Some(hunk) = current_hunk.as_mut() else {
+            continue;
+        };
+        match line.as_bytes().first().copied() {
+            Some(b' ') => {
+                // GitHub review threads use LEFT for deletions and RIGHT for
+                // additions or unchanged context lines.
+                hunk.right_positions.insert(new_current, diff_position);
+                old_line = old_current.checked_add(1);
+                new_line = new_current.checked_add(1);
+                diff_position += 1;
+            }
+            Some(b'-') => {
+                hunk.left_positions.insert(old_current, diff_position);
+                old_line = old_current.checked_add(1);
+                diff_position += 1;
+            }
+            Some(b'+') => {
+                hunk.right_positions.insert(new_current, diff_position);
+                new_line = new_current.checked_add(1);
+                diff_position += 1;
+            }
+            Some(b'\\') => {}
+            _ => {}
+        }
+    }
+
+    if let Some(hunk) = current_hunk {
+        hunks.push(hunk);
+    }
+    hunks
+}
+
+fn find_commentable_line(
+    hunks: &[CommentableHunk],
+    side: ReviewThreadDiffSide,
+    line: u32,
+) -> Option<(usize, usize)> {
+    hunks
+        .iter()
+        .enumerate()
+        .find_map(|(hunk_index, hunk)| hunk.position(side, line).map(|pos| (hunk_index, pos)))
+}
+
+fn range_is_commentable_in_single_hunk(
+    hunks: &[CommentableHunk],
+    start_side: ReviewThreadDiffSide,
+    start_line: u32,
+    end_side: ReviewThreadDiffSide,
+    end_line: u32,
+) -> bool {
+    hunks.iter().any(|hunk| {
+        let Some(start_pos) = hunk.position(start_side, start_line) else {
+            return false;
+        };
+        let Some(end_pos) = hunk.position(end_side, end_line) else {
+            return false;
+        };
+        start_pos <= end_pos
+    })
+}
+
+fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
+    let mut parts = line.split_whitespace();
+    (parts.next()? == "@@").then_some(())?;
+    let old_span = parts.next()?.strip_prefix('-')?;
+    let new_span = parts.next()?.strip_prefix('+')?;
+    Some((parse_hunk_start(old_span)?, parse_hunk_start(new_span)?))
+}
+
+fn parse_hunk_start(span: &str) -> Option<u32> {
+    span.split(',').next()?.parse().ok()
+}
+
+fn review_thread_file_not_changed_err(index: usize, spec: &PreparedReviewThreadSpec) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "review_thread_file_not_changed",
+        format!(
+            "thread spec #{index} path '{path}' is not present in the pull request diff",
+            path = spec.path
+        ),
+        Some(format!(
+            "thread_spec_index={index}; thread_spec_path={path}; suggestion=omit --thread-file for this finding or use a file-level thread on a changed file",
+            path = spec.path,
+        )),
+    )
+}
+
+fn review_thread_line_not_in_diff_err(
+    index: usize,
+    spec: &PreparedReviewThreadSpec,
+    line: u32,
+    side: ReviewThreadDiffSide,
+) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "review_thread_line_not_in_diff",
+        format!(
+            "thread spec #{index} line {line} on {side} side is not commentable in the pull request diff for '{path}'",
+            side = side.as_str(),
+            path = spec.path,
+        ),
+        Some(format!(
+            "thread_spec_index={index}; thread_spec_path={path}; thread_spec_line={line}; thread_spec_side={side}; suggestion=rerun with a line from the changed diff hunk, omit line for a file-level thread, or keep the finding in the review summary body",
+            path = spec.path,
+            side = side.as_str(),
+        )),
+    )
+}
+
+fn review_thread_range_not_in_diff_err(
+    index: usize,
+    spec: &PreparedReviewThreadSpec,
+    start_line: u32,
+    start_side: ReviewThreadDiffSide,
+    end_line: u32,
+    end_side: ReviewThreadDiffSide,
+) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "review_thread_range_not_in_diff",
+        format!(
+            "thread spec #{index} range {start_line} on {start_side} side to {end_line} on {end_side} side is not a valid single-hunk pull request diff range",
+            start_side = start_side.as_str(),
+            end_side = end_side.as_str(),
+        ),
+        Some(format!(
+            "thread_spec_index={index}; thread_spec_path={path}; thread_spec_start_line={start_line}; thread_spec_start_side={start_side}; thread_spec_line={end_line}; thread_spec_side={end_side}; suggestion=keep ranged review threads inside one changed diff hunk with start before end, use a single-line thread, or keep the finding in the review summary body",
+            path = spec.path,
+            start_side = start_side.as_str(),
+            end_side = end_side.as_str(),
+        )),
+    )
+}
+
 fn submit_github_review_with_threads<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -688,14 +1114,17 @@ fn submit_github_review_with_threads<R: BackendRunner>(
     let pending = parse_github_pending_review(&pending_output)?;
 
     let mut review_threads = Vec::with_capacity(specs.len());
-    for spec in specs {
+    for (idx, spec) in specs.iter().enumerate() {
         let output = match runner.run(&build_github_add_review_thread_call(
             ctx,
             &pending.review_id,
             spec,
         )) {
             Ok(output) => output,
-            Err(err) => return Err(cleanup_pending_github_review(runner, ctx, &pending, err)),
+            Err(err) => {
+                let err = map_github_review_thread_error(idx + 1, spec, err);
+                return Err(cleanup_pending_github_review(runner, ctx, &pending, err));
+            }
         };
         let thread = match parse_created_review_thread(&output, spec) {
             Ok(thread) => thread,
@@ -718,6 +1147,42 @@ fn submit_github_review_with_threads<R: BackendRunner>(
     };
     let review_url = parse_submitted_review_url(&submit_output).unwrap_or(pending.url);
     Ok((review_url, review_threads))
+}
+
+fn map_github_review_thread_error(
+    index: usize,
+    spec: &PreparedReviewThreadSpec,
+    err: ForgeError,
+) -> ForgeError {
+    let raw_detail = err.detail().unwrap_or_default();
+    if !is_http_unprocessable_entity(raw_detail) {
+        return err;
+    }
+
+    let detail = [
+        "GitHub rejected the review thread mutation with HTTP 422.".to_string(),
+        format!("thread_spec_index={index}"),
+        format!("thread_spec_path={}", spec.path),
+        spec.line
+            .map(|line| format!("thread_spec_line={line}"))
+            .unwrap_or_else(|| "thread_spec_line=".to_string()),
+        format!("thread_spec_side={}", spec.side.as_str()),
+        format!("thread_spec_subject_type={}", spec.subject_type.as_str()),
+        "suggestion=run pr review validate <id> --check-diff before posting, use a changed diff line or valid same-hunk range, omit line for a file-level thread, or keep the finding in the review summary body".to_string(),
+        format!("raw_backend_error_kind={}", err.kind()),
+        format!("raw_backend_error_message={}", err.message()),
+        format!("raw_backend_error_detail={raw_detail}"),
+    ]
+    .join("; ");
+
+    ForgeError::runtime_failure(
+        schema_err(),
+        "github_review_thread_rejected",
+        format!(
+            "github rejected review thread creation for thread spec #{index}; check that the requested path and line are commentable in the pull request diff"
+        ),
+        Some(detail),
+    )
 }
 
 fn map_github_native_review_submit_error(
@@ -790,6 +1255,22 @@ fn build_github_review_target_call(
         OsString::from(format!("number={number}")),
     ]);
     BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn build_github_pr_files_call(
+    ctx: &ProviderContext,
+    number: u64,
+) -> Result<BackendCall, ForgeError> {
+    let (owner, name) = github_owner_name(ctx)?;
+    let endpoint = format!("repos/{owner}/{name}/pulls/{number}/files");
+    let mut argv = vec![OsString::from("api"), OsString::from(endpoint)];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("--paginate"),
+        OsString::from("--jq"),
+        OsString::from(".[] | {filename, patch}"),
+    ]);
+    Ok(BackendCall::new(BackendProgram::Gh, argv))
 }
 
 fn build_github_pending_review_call(ctx: &ProviderContext, pull_request_id: &str) -> BackendCall {
@@ -1214,6 +1695,24 @@ fn issue_required_err() -> ForgeError {
     )
 }
 
+fn review_id_required_err() -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "id_required",
+        "pr review requires a pull request id; use `pr review validate` for validation-only preflight",
+        None,
+    )
+}
+
+fn review_validate_id_required_err() -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "review_validate_id_required",
+        "pr review validate --check-diff requires a pull request id",
+        None,
+    )
+}
+
 /// Verify `<id>` resolves to a pull request on GitHub before posting a review
 /// outcome through the issue-comments API. Uses `run_raw` so a `404 Not Found`
 /// (the id is an issue, or does not exist) becomes a `DATA 65`
@@ -1391,7 +1890,8 @@ mod tests {
         comment: Option<&str>,
     ) -> PrReviewArgs {
         PrReviewArgs {
-            id: 44,
+            command: None,
+            id: Some(44),
             decision,
             comment: comment.map(str::to_string),
             comment_file: None,
@@ -1474,6 +1974,7 @@ mod tests {
     fn build_review_post_call_uses_reviews_endpoint_when_submit_review() {
         let call = build_review_post_call(
             &ctx(Some("acme/widgets")),
+            44,
             &args(PrReviewDecision::Approve, true, Some("lgtm")),
             "lgtm",
             true,
@@ -1489,6 +1990,7 @@ mod tests {
     fn build_review_post_call_uses_issue_comment_when_not_submit_review() {
         let call = build_review_post_call(
             &ctx(Some("acme/widgets")),
+            44,
             &args(PrReviewDecision::Approve, false, Some("lgtm")),
             "lgtm",
             true,

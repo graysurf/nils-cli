@@ -426,13 +426,41 @@ impl PrReviewDecision {
     }
 }
 
+/// `pr review` subcommands that do not post provider-visible review activity.
+#[derive(Subcommand, Debug, Clone)]
+pub enum PrReviewCommand {
+    /// Validate review summary and thread specs before posting.
+    Validate(PrReviewValidateArgs),
+}
+
+/// `pr review validate` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewValidateArgs {
+    /// Numeric PR id. Required with `--check-diff`.
+    pub id: Option<u64>,
+    /// Review outcome comment body. Mutually exclusive with `--comment-file`.
+    #[arg(long, conflicts_with = "comment_file")]
+    pub comment: Option<String>,
+    /// Read review outcome comment body from a file. Use `-` for stdin.
+    #[arg(long = "comment-file", value_name = "PATH")]
+    pub comment_file: Option<String>,
+    /// Validate a JSON array of actionable review-thread specs.
+    #[arg(long = "thread-file", value_name = "PATH")]
+    pub thread_file: Option<String>,
+    /// Check thread path / line coordinates against the live GitHub PR diff.
+    #[arg(long = "check-diff", action = ArgAction::SetTrue)]
+    pub check_diff: bool,
+}
+
 /// `pr review` arguments. This is a provider posting primitive: callers pass
 /// an already-rendered review outcome comment; forge-cli posts it and can
 /// mirror a compact activity note to an issue.
 #[derive(Args, Debug, Clone)]
 pub struct PrReviewArgs {
+    #[command(subcommand)]
+    pub command: Option<PrReviewCommand>,
     /// Numeric PR / MR id.
-    pub id: u64,
+    pub id: Option<u64>,
     /// Outcome decision to record in the comment metadata.
     #[arg(long, value_enum, default_value_t = PrReviewDecision::CommentsOnly)]
     pub decision: PrReviewDecision,
@@ -1728,10 +1756,40 @@ mod tests {
             Some(Command::Pr(PrArgs {
                 command: Some(PrCommand::Review(args)),
             })) => {
-                assert_eq!(args.id, 7);
+                assert_eq!(args.id, Some(7));
                 assert!(args.submit_review);
                 assert_eq!(args.thread_file.as_deref(), Some("review-threads.json"));
             }
+            other => panic!("expected pr review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_review_validate_subcommand_parses() {
+        let cli = parse(&[
+            "pr",
+            "review",
+            "validate",
+            "7",
+            "--check-diff",
+            "--comment",
+            "summary",
+            "--thread-file",
+            "review-threads.json",
+        ])
+        .expect("review validate parses");
+        match cli.command {
+            Some(Command::Pr(PrArgs {
+                command: Some(PrCommand::Review(args)),
+            })) => match args.command {
+                Some(PrReviewCommand::Validate(validate)) => {
+                    assert_eq!(validate.id, Some(7));
+                    assert!(validate.check_diff);
+                    assert_eq!(validate.comment.as_deref(), Some("summary"));
+                    assert_eq!(validate.thread_file.as_deref(), Some("review-threads.json"));
+                }
+                other => panic!("expected pr review validate, got {other:?}"),
+            },
             other => panic!("expected pr review, got {other:?}"),
         }
     }

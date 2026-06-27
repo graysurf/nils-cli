@@ -170,8 +170,62 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':id -- Numeric PR / MR id:_default' \
+'::id -- Numeric PR / MR id:_default' \
+":: :_forge-cli__subcmd__pr__subcmd__review_commands" \
+"*::: :->review" \
 && ret=0
+
+    case $state in
+    (review)
+        words=($line[2] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-pr-review-command-$line[2]:"
+        case $line[2] in
+            (validate)
+_arguments "${_arguments_options[@]}" : \
+'(--comment-file)--comment=[Review outcome comment body. Mutually exclusive with \`--comment-file\`]:COMMENT:_default' \
+'--comment-file=[Read review outcome comment body from a file. Use \`-\` for stdin]:PATH:_default' \
+'--thread-file=[Validate a JSON array of actionable review-thread specs]:PATH:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--check-diff[Check thread path / line coordinates against the live GitHub PR diff]' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::id -- Numeric PR id. Required with `--check-diff`:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__pr__subcmd__review__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-pr-review-help-command-$line[1]:"
+        case $line[1] in
+            (validate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
 ;;
 (comments)
 _arguments "${_arguments_options[@]}" : \
@@ -451,7 +505,23 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (review)
 _arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__pr__subcmd__help__subcmd__review_commands" \
+"*::: :->review" \
 && ret=0
+
+    case $state in
+    (review)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-pr-help-review-command-$line[1]:"
+        case $line[1] in
+            (validate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 ;;
 (comments)
 _arguments "${_arguments_options[@]}" : \
@@ -1375,7 +1445,23 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (review)
 _arguments "${_arguments_options[@]}" : \
+":: :_forge-cli__subcmd__help__subcmd__pr__subcmd__review_commands" \
+"*::: :->review" \
 && ret=0
+
+    case $state in
+    (review)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:forge-cli-help-pr-review-command-$line[1]:"
+        case $line[1] in
+            (validate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 ;;
 (comments)
 _arguments "${_arguments_options[@]}" : \
@@ -2014,8 +2100,15 @@ _forge-cli__subcmd__help__subcmd__pr__subcmd__ready_commands() {
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__review_commands] )) ||
 _forge-cli__subcmd__help__subcmd__pr__subcmd__review_commands() {
-    local commands; commands=()
+    local commands; commands=(
+'validate:Validate review summary and thread specs before posting' \
+    )
     _describe -t commands 'forge-cli help pr review commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__review__subcmd__validate_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__review__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr review validate commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__review-threads_commands] )) ||
 _forge-cli__subcmd__help__subcmd__pr__subcmd__review-threads_commands() {
@@ -2441,8 +2534,15 @@ _forge-cli__subcmd__pr__subcmd__help__subcmd__ready_commands() {
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__review_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__help__subcmd__review_commands() {
-    local commands; commands=()
+    local commands; commands=(
+'validate:Validate review summary and thread specs before posting' \
+    )
     _describe -t commands 'forge-cli pr help review commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__review__subcmd__validate_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__review__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help review validate commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__review-threads_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__help__subcmd__review-threads_commands() {
@@ -2500,8 +2600,34 @@ _forge-cli__subcmd__pr__subcmd__ready_commands() {
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__review_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__review_commands() {
-    local commands; commands=()
+    local commands; commands=(
+'validate:Validate review summary and thread specs before posting' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
     _describe -t commands 'forge-cli pr review commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__review__subcmd__help_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__review__subcmd__help_commands() {
+    local commands; commands=(
+'validate:Validate review summary and thread specs before posting' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'forge-cli pr review help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__review__subcmd__help__subcmd__help_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__review__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr review help help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__review__subcmd__help__subcmd__validate_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__review__subcmd__help__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr review help validate commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__review__subcmd__validate_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__review__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr review validate commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__review-threads_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__review-threads_commands() {

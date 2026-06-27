@@ -116,6 +116,7 @@ Parity matrix (v1):
 | `pr edit <id>`                              | `gh pr edit <id> …`                                                                                                                          | `glab mr update <id> …`                                     | exact                                                                                                                    |
 | `pr comment <id>`                           | `gh pr comment <id> --body …`                                                                                                                | `glab mr note <id> --message …`                             | exact                                                                                                                    |
 | `pr review <id>`                            | guard `gh api …/pulls/{id}`, then outcome comment, native review, or GraphQL pending review + review thread(s) + submit with `--thread-file` | `glab mr note create <id> --message … --resolvable=false`   | outcome comment, native review event, or resolvable review threads (`--thread-file`, GitHub-only); optional issue mirror |
+| `pr review validate [id]`                   | local review body/thread-file validation; with `--check-diff`, `gh api repos/{repo}/pulls/{id}/files`                                        | local validation only; `--check-diff` unsupported in v1     | schema/privacy preflight plus optional GitHub diff-coordinate validation                                                 |
 | `pr ready <id>`                             | `gh pr ready <id>`                                                                                                                           | `glab mr update <id> --ready`                               | exact                                                                                                                    |
 | `pr review-threads list <id>`               | `gh api graphql` (`reviewThreads` connection)                                                                                                | `glab api …/merge_requests/<iid>/discussions`               | normalized thread state                                                                                                  |
 | `pr review-threads resolve <id> --thread …` | `gh api graphql` (`addPullRequestReviewThreadReply` then `resolveReviewThread`)                                                              | unsupported in v1                                           | GitHub-only seam                                                                                                         |
@@ -169,7 +170,7 @@ GitLab capability status:
 - Binary: `forge-cli`.
 - Library entry: `crates/forge-cli/src/lib.rs`.
 - Wrapper (Homebrew formula bin): `wrappers/forge-cli`.
-- Completions: `completions/_forge-cli`, `completions/forge-cli.bash`.
+- Completions: `completions/zsh/_forge-cli`, `completions/bash/forge-cli`.
 
 Command tree:
 
@@ -181,6 +182,12 @@ forge-cli
 │   ├── list
 │   ├── edit
 │   ├── comment
+│   ├── review
+│   │   └── validate
+│   ├── review-threads
+│   │   ├── list
+│   │   ├── resolve
+│   │   └── reply
 │   ├── ready
 │   ├── merge
 │   ├── close
@@ -418,12 +425,16 @@ backend mapping, validation rules, and output schema versions.
   `data.review_threads[] = { id, url, path, line, subject_type }`, where `id` is
   the `PRRT_...` handle consumed by `pr review-threads resolve`. Dry-run output
   includes `data.target_plan`, `data.thread_plan[]`, `data.submit_plan`, and
-  `data.planned_review_threads`. If any thread mutation or final review submit
-  fails after the pending review is created, the command attempts a best-effort
+  `data.planned_review_threads`. If GitHub rejects an individual thread mutation
+  with HTTP 422 because the path/line is not commentable on the diff, the command
+  returns `github_review_thread_rejected` (`RUNTIME 1`) with the raw backend
+  detail and the failed spec index/path/line after attempting pending-review
+  cleanup. If any other thread mutation or final review submit fails after the
+  pending review is created, the command attempts a best-effort
   `deletePullRequestReview` cleanup before returning the original failure; if
   cleanup also fails, error details include the pending review id/url and cleanup
-  failure. Malformed or oversized specs return
-  `invalid_review_thread_spec` (`DATA 65`); `--thread-file` without
+  failure. Malformed or oversized
+  specs return `invalid_review_thread_spec` (`DATA 65`); `--thread-file` without
   `--submit-review` returns `thread_file_requires_submit_review` (`DATA 65`);
   GitLab / Local return `provider_unsupported` (`USAGE 64`) before any backend
   call. Findings that cannot be mapped to a changed file/line should stay in
@@ -461,6 +472,36 @@ backend mapping, validation rules, and output schema versions.
 - Output schema:
   `data = { provider, number, decision, submitted_review, pr_comment_url,
   issue_number, issue_comment_url, mirrored, lenses, review_threads? }`.
+
+### `pr review validate`
+
+- The `pr review validate [id]` preflight surface emits
+  `cli.forge-cli.pr.review.validate.v1` and never posts provider-visible review
+  activity. It accepts `--comment <text>` / `--comment-file <path>` and
+  `--thread-file <path>` using the same body limits, JSON shape, local-path
+  guard, escaped-control guard, and size limits as `pr review`.
+- Without `--check-diff`, validation is local-only and works for GitHub, GitLab,
+  and Local provider contexts. This is the format/content dry-run path for
+  agents that want to validate `review-report.md` and `review-threads.json`
+  before a native review submission.
+- With `--check-diff`, an `id` is required and the command is GitHub-only in v1.
+  It fetches `gh api repos/{repo}/pulls/{id}/files --paginate`, parses each
+  patch hunk, and verifies every line thread maps to a changed line on the
+  requested `side` (`RIGHT` default, `LEFT` supported). Ranged threads must keep
+  their start and end coordinates in one patch hunk with start before end.
+  File-level threads only require the file to be part of the PR file list. A
+  missing file returns `review_thread_file_not_changed` (`DATA 65`); a
+  non-commentable line returns `review_thread_line_not_in_diff` (`DATA 65`); a
+  reversed or cross-hunk range returns `review_thread_range_not_in_diff`
+  (`DATA 65`). With global `--dry-run`, `--check-diff` does not invoke GitHub:
+  JSON output includes `data.diff_plan` and
+  `data.review_threads.diff_checked=false`.
+- JSON output includes
+  `data = { provider, number?, check_diff, comment, review_threads }`, where
+  `comment = { present, bytes, lines }` and
+  `review_threads = { count, diff_checked, specs[] }`. Each normalized
+  `specs[]` entry includes `{ index, path, line?, side, start_line?, start_side?,
+  subject_type, body_bytes }`.
 
 ### `pr review-threads resolve` / `pr review-threads reply`
 
