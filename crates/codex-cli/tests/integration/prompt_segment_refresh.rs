@@ -5,6 +5,7 @@ use nils_test_support::write_exe;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -251,6 +252,71 @@ fn prompt_segment_stale_cache_triggers_background_refresh() {
     assert!(
         wait_for_file_contains(&kv_path, "weekly_remaining=88", Duration::from_secs(3)),
         "expected background refresh to update cache kv"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prompt_segment_background_refresh_survives_prompt_shell_hup() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
+
+    let server = TestServer::new(|request| {
+        if request.method == "GET" && request.path == "/wham/usage" {
+            thread::sleep(Duration::from_millis(300));
+            return HttpResponse::new(200, wham_usage_ok_body());
+        }
+        HttpResponse::new(404, "")
+    })
+    .expect("server");
+
+    let fetched_at = now_epoch().saturating_sub(10).max(1);
+    write_prompt_segment_cache_kv(
+        &cache_root,
+        "alpha",
+        &format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n"
+        ),
+    );
+
+    let mut command = Command::new("/bin/bash");
+    command
+        .arg("-c")
+        .arg(
+            r#"
+set -uo pipefail
+output="$("$CODEX_CLI_BIN" prompt-segment --ttl 1s --time-format '%Y-%m-%dT%H:%MZ')"
+printf '%s\n' "$output"
+kill -HUP 0
+"#,
+        )
+        .env("CODEX_CLI_BIN", codex_cli_bin())
+        .env("CODEX_AUTH_FILE", auth_file.as_path())
+        .env("CODEX_SECRET_DIR", secrets.as_path())
+        .env("ZSH_CACHE_DIR", cache_root.as_path())
+        .env("CODEX_PROMPT_SEGMENT_ENABLED", "true")
+        .env("CODEX_CHATGPT_BASE_URL", server.url())
+        .env("CODEX_PROMPT_SEGMENT_STALE_SUFFIX", " (STALE)")
+        .env("CODEX_PROMPT_SEGMENT_REFRESH_MIN_SECONDS", "0")
+        .env("CODEX_PROMPT_SEGMENT_CURL_CONNECT_TIMEOUT_SECONDS", "1")
+        .env("CODEX_PROMPT_SEGMENT_CURL_MAX_TIME_SECONDS", "3")
+        .env("NO_COLOR", "1")
+        .env("TZ", "UTC")
+        .env_remove("STARSHIP_SESSION_KEY")
+        .env_remove("STARSHIP_SHELL")
+        .stdin(Stdio::null())
+        .process_group(0);
+
+    let output = command.output().expect("run prompt shell");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout, "alpha 5h:1% W:2% 2023-11-21T20:53Z (STALE)\n");
+
+    let kv_path = cache_file(&cache_root, "alpha");
+    assert!(
+        wait_for_file_contains(&kv_path, "weekly_remaining=88", Duration::from_secs(3)),
+        "expected detached background refresh to survive prompt shell HUP and update cache kv"
     );
 }
 

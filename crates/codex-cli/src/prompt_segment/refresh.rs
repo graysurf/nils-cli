@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -40,14 +40,25 @@ pub fn enqueue_background_refresh(target_file: &Path) {
         Err(_) => return,
     };
 
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = Command::new(exe);
     cmd.arg("prompt-segment").arg("--refresh");
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+    detach_background_refresh(&mut cmd);
 
     let _ = cmd.spawn();
 }
+
+#[cfg(unix)]
+fn detach_background_refresh(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach_background_refresh(_cmd: &mut Command) {}
 
 pub fn refresh_blocking(target_file: &Path) -> Option<prompt_segment_render::CacheEntry> {
     let cache_file = cache::cache_file_for_target(target_file).ok()?;
