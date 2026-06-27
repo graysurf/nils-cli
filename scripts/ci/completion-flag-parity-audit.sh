@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HELP_TIMEOUT_SECONDS=5
-COMPLETION_TIMEOUT_SECONDS=30
-MAX_COMMAND_DEPTH=6
+# Default limits for command probing. Allow env overrides for CI tuning/debugging.
+# Keep conservative defaults to balance reliability and runtime in typical CI runs.
+HELP_TIMEOUT_SECONDS="${HELP_TIMEOUT_SECONDS:-5}"
+COMPLETION_TIMEOUT_SECONDS="${COMPLETION_TIMEOUT_SECONDS:-30}"
+MAX_COMMAND_DEPTH="${MAX_COMMAND_DEPTH:-6}"
 ROOT_KEY="__ROOT__"
 PATH_SEP=$'\x1f'
 
@@ -93,11 +95,17 @@ parse_required_bins() {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
       return s
     }
+    function strip_inline_code(s) {
+      if (s ~ /^`[^`]+`$/) {
+        sub(/^`/, "", s)
+        sub(/`$/, "", s)
+      }
+      return s
+    }
     {
-      bin = trim($2)
-      obligation = trim($3)
-      if (bin ~ /^`[^`]+`$/ && obligation == "`required`") {
-        gsub(/`/, "", bin)
+      bin = strip_inline_code(trim($2))
+      obligation = strip_inline_code(trim($3))
+      if (bin != "" && obligation == "required") {
         print bin
       }
     }
@@ -439,6 +447,8 @@ walk_help_path() {
   local path_key="$1"
   local depth="$2"
 
+  # Record depth overflows as audit failures, but return success so traversal-style
+  # callers can continue and report all discovered issues in one run.
   if (( depth > MAX_COMMAND_DEPTH )); then
     HELP_FAILURES["$path_key"]="path depth exceeded safety limit (${MAX_COMMAND_DEPTH})"
     return 0
@@ -454,6 +464,10 @@ walk_help_path() {
   run_command "$HELP_TIMEOUT_SECONDS" "$CURRENT_REPO_ROOT" "${cmd[@]}"
   if (( RUN_CODE != 0 )); then
     local stderr_compact="${RUN_STDERR//$'\n'/ }"
+    local max_stderr_compact_length=500
+    if (( ${#stderr_compact} > max_stderr_compact_length )); then
+      stderr_compact="${stderr_compact:0:max_stderr_compact_length}... [truncated]"
+    fi
     HELP_FAILURES["$path_key"]="\`$(command_display_for_path "$path_key")\` failed (exit ${RUN_CODE}): ${stderr_compact}"
     return 0
   fi
