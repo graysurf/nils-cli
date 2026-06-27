@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const POLL_INTERVAL_MS: u64 = 25;
+
 fn codex_cli_bin() -> PathBuf {
     bin::resolve("codex-cli")
 }
@@ -85,7 +87,7 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool 
         {
             return true;
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
     false
 }
@@ -95,7 +97,7 @@ fn collect_requests_for(server: &TestServer, timeout: Duration) -> Vec<RecordedR
     let mut requests = Vec::new();
     while Instant::now() < deadline {
         requests.extend(server.take_requests());
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
     requests.extend(server.take_requests());
     requests
@@ -201,6 +203,8 @@ fn prompt_segment_refresh_updates_cache_and_prints() {
 
 #[test]
 fn prompt_segment_stale_cache_triggers_background_refresh() {
+    const STALE_CACHE_AGE_SECONDS: i64 = 10;
+
     let dir = tempfile::TempDir::new().expect("tempdir");
     let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
 
@@ -211,7 +215,7 @@ fn prompt_segment_stale_cache_triggers_background_refresh() {
         HttpResponse::new(200, wham_usage_ok_body()),
     );
 
-    let fetched_at = now_epoch().saturating_sub(10).max(1);
+    let fetched_at = now_epoch().saturating_sub(STALE_CACHE_AGE_SECONDS).max(1);
     write_prompt_segment_cache_kv(
         &cache_root,
         "alpha",
