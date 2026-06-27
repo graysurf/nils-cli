@@ -1397,6 +1397,108 @@ fn pr_review_validate_check_diff_dry_run_renders_diff_plan_without_backend() {
 }
 
 #[test]
+fn pr_review_validate_check_diff_uses_parent_pr_id() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let thread_file = stub.tempdir.path().join("review-threads.json");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {capture:?}\necho should-not-run >&2\nexit 99\n",
+        capture = capture.to_string_lossy()
+    ));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "--dry-run",
+            "pr",
+            "review",
+            "44",
+            "validate",
+            "--thread-file",
+            thread_file.to_str().expect("utf8 path"),
+            "--check-diff",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.pr.review.validate.v1");
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["number"], 44);
+    let diff_plan = env["data"]["diff_plan"]
+        .as_array()
+        .expect("diff_plan rendered")
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        diff_plan.contains("repos/acme/widgets/pulls/44/files"),
+        "{diff_plan}"
+    );
+    assert!(
+        !capture.exists(),
+        "dry-run validate must not invoke gh; captured {}",
+        capture.display()
+    );
+}
+
+#[test]
+fn pr_review_validate_inherits_parent_comment_and_thread_files() {
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\necho should-not-run >&2\nexit 99\n");
+    let review_file = stub.tempdir.path().join("review.md");
+    let thread_file = stub.tempdir.path().join("review-threads.json");
+    fs::write(&review_file, "Summary body").expect("write review");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
+    )
+    .expect("write thread specs");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "--comment-file",
+            review_file.to_str().expect("utf8 path"),
+            "--thread-file",
+            thread_file.to_str().expect("utf8 path"),
+            "validate",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.pr.review.validate.v1");
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["comment"]["present"], true);
+    assert_eq!(env["data"]["comment"]["bytes"], 12);
+    assert_eq!(env["data"]["review_threads"]["count"], 1);
+    assert_eq!(
+        env["data"]["review_threads"]["specs"][0]["path"],
+        "src/lib.rs"
+    );
+}
+
+#[test]
 fn pr_review_validate_check_diff_dry_run_requires_repo_before_diff_plan() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-args.log");
