@@ -40,6 +40,7 @@ fn rate_limits_client_fetch_usage_errors_include_body_preview() {
     let request = UsageRequest {
         target_file: target,
         refresh_on_401: false,
+        suppress_auth_refresh_output: false,
         base_url: server.url(),
         connect_timeout_seconds: 1,
         max_time_seconds: 3,
@@ -65,6 +66,7 @@ fn rate_limits_client_fetch_usage_errors_without_body_when_empty() {
     let request = UsageRequest {
         target_file: target,
         refresh_on_401: false,
+        suppress_auth_refresh_output: false,
         base_url: server.url(),
         connect_timeout_seconds: 1,
         max_time_seconds: 3,
@@ -89,6 +91,7 @@ fn rate_limits_client_fetch_usage_invalid_json_is_error() {
     let request = UsageRequest {
         target_file: target,
         refresh_on_401: false,
+        suppress_auth_refresh_output: false,
         base_url: server.url(),
         connect_timeout_seconds: 1,
         max_time_seconds: 3,
@@ -116,6 +119,7 @@ fn rate_limits_client_fetch_usage_refreshes_on_401_when_enabled() {
     let request = UsageRequest {
         target_file: target,
         refresh_on_401: true,
+        suppress_auth_refresh_output: false,
         base_url: server.url(),
         connect_timeout_seconds: 1,
         max_time_seconds: 3,

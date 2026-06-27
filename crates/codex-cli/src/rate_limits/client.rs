@@ -16,6 +16,7 @@ pub struct UsageResponse {
 pub struct UsageRequest {
     pub target_file: PathBuf,
     pub refresh_on_401: bool,
+    pub suppress_auth_refresh_output: bool,
     pub base_url: String,
     pub connect_timeout_seconds: u64,
     pub max_time_seconds: u64,
@@ -27,7 +28,8 @@ pub fn fetch_usage(request: &UsageRequest) -> Result<UsageResponse> {
 
     if response.status == 401 && request.refresh_on_401 {
         let refreshed_tokens =
-            refresh_target(&request.target_file).or_else(|| read_tokens(&request.target_file).ok());
+            refresh_target(&request.target_file, request.suppress_auth_refresh_output)
+                .or_else(|| read_tokens(&request.target_file).ok());
         if let Some((access_token, account_id)) = refreshed_tokens {
             response = send_request(request, &access_token, account_id.as_deref())?;
         }
@@ -110,11 +112,15 @@ fn send_request(
     Ok(HttpResponse { status, body, url })
 }
 
-fn refresh_target(target_file: &Path) -> Option<(String, Option<String>)> {
+fn refresh_target(target_file: &Path, suppress_output: bool) -> Option<(String, Option<String>)> {
     if let Some(auth_file) = paths::resolve_auth_file()
         && auth_file == target_file
     {
-        let _ = crate::auth::refresh::run(&[]);
+        let _ = if suppress_output {
+            crate::auth::refresh::run_silent(&[])
+        } else {
+            crate::auth::refresh::run(&[])
+        };
         return read_tokens(target_file).ok();
     }
 
@@ -128,7 +134,12 @@ fn refresh_target(target_file: &Path) -> Option<(String, Option<String>)> {
             {
                 return Some(tokens);
             }
-            let _ = crate::auth::refresh::run(&[file_name.to_string()]);
+            let args = [file_name.to_string()];
+            let _ = if suppress_output {
+                crate::auth::refresh::run_silent(&args)
+            } else {
+                crate::auth::refresh::run(&args)
+            };
             return read_tokens(target_file).ok();
         }
     }

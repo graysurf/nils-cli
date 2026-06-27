@@ -3,7 +3,9 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
+use nils_common::env as shared_env;
 
+use crate::provider_profile::CODEX_PROVIDER_PROFILE;
 use crate::rate_limits::cache;
 use crate::rate_limits::client::{UsageRequest, fetch_usage};
 use crate::rate_limits::render;
@@ -69,7 +71,8 @@ fn fetch_and_write_cache(target_file: &Path) -> anyhow::Result<prompt_segment_re
 
     let usage_request = UsageRequest {
         target_file: target_file.to_path_buf(),
-        refresh_on_401: false,
+        refresh_on_401: shared_env::env_truthy(CODEX_PROVIDER_PROFILE.env.auto_refresh_enabled),
+        suppress_auth_refresh_output: true,
         base_url,
         connect_timeout_seconds: connect_timeout,
         max_time_seconds: max_time,
