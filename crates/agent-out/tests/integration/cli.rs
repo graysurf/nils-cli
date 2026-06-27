@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use nils_test_support::git::{git, init_repo_main};
@@ -46,6 +47,8 @@ struct TestCleanupItem {
     reason: String,
     size_bytes: u64,
     mtime_unix: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_digest: Option<String>,
     contains_skill_usage: bool,
     contains_test_first_evidence: bool,
 }
@@ -91,6 +94,33 @@ fn recompute_cleanup_plan_digest(envelope: &mut Value) -> String {
     plan.plan_digest = format!("sha256:{hex}");
     envelope["result"] = serde_json::to_value(&plan).expect("plan value");
     plan.plan_digest
+}
+
+fn test_path_size_bytes(path: &Path) -> u64 {
+    let metadata = fs::symlink_metadata(path).expect("path metadata");
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let mut size = 0_u64;
+        let mut children = fs::read_dir(path)
+            .expect("read directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            size += test_path_size_bytes(&child);
+        }
+        return size;
+    }
+    metadata.len()
+}
+
+fn test_path_mtime_unix(path: &Path) -> i64 {
+    fs::symlink_metadata(path)
+        .expect("path metadata")
+        .modified()
+        .expect("path mtime")
+        .duration_since(UNIX_EPOCH)
+        .expect("path mtime after epoch")
+        .as_secs() as i64
 }
 
 #[test]
@@ -517,8 +547,8 @@ fn cleanup_plan_classifies_cache_temp_evidence_and_project_artifacts() {
     assert_eq!(value["schema_version"], "cli.agent-out.cleanup.plan.v1");
     assert_eq!(value["command"], "agent-out cleanup plan");
     assert_eq!(value["ok"], true);
-    assert_eq!(value["result"]["summary"]["delete"], 3);
-    assert_eq!(value["result"]["summary"]["needs_policy"], 1);
+    assert_eq!(value["result"]["summary"]["delete"], 1);
+    assert_eq!(value["result"]["summary"]["needs_policy"], 3);
     assert!(
         value["result"]["plan_digest"]
             .as_str()
@@ -529,6 +559,16 @@ fn cleanup_plan_classifies_cache_temp_evidence_and_project_artifacts() {
     let items = value["result"]["items"].as_array().expect("items");
     assert!(items.iter().any(|item| {
         item["name"] == "nils-versions" && item["category"] == "cache" && item["action"] == "delete"
+    }));
+    assert!(items.iter().any(|item| {
+        item["name"] == "loose.log"
+            && item["category"] == "top-level-noncanonical"
+            && item["action"] == "needs-policy"
+    }));
+    assert!(items.iter().any(|item| {
+        item["name"] == "scratch"
+            && item["category"] == "top-level-noncanonical"
+            && item["action"] == "needs-policy"
     }));
     assert!(items.iter().any(|item| {
         item["name"] == "evidence-run"
@@ -543,6 +583,51 @@ fn cleanup_plan_classifies_cache_temp_evidence_and_project_artifacts() {
             && item["category"] == "project-artifact"
             && item["action"] == "needs-policy"
     }));
+}
+
+#[test]
+fn cleanup_plan_uses_shallow_metadata_for_preserved_roots_without_include_projects() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    fs::create_dir_all(out.join("projects/owner__repo/20260627-evidence"))
+        .expect("project evidence run");
+    fs::write(
+        out.join("projects/owner__repo/20260627-evidence/skill-usage.record.json"),
+        "{}",
+    )
+    .expect("skill marker");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    let items = value["result"]["items"].as_array().expect("items");
+    let projects = items
+        .iter()
+        .find(|item| item["name"] == "projects")
+        .expect("projects root");
+    assert_eq!(projects["category"], "allowed-root");
+    assert_eq!(projects["action"], "preserve");
+    assert_eq!(projects["contains_skill_usage"], false);
+    assert_eq!(projects["contains_test_first_evidence"], false);
+    assert_eq!(
+        items.len(),
+        1,
+        "without --include-projects only the preserved root is listed"
+    );
 }
 
 #[test]
@@ -639,15 +724,15 @@ fn cleanup_apply_deletes_confirmed_candidates_and_preserves_evidence() {
     assert_eq!(apply.code, 0, "stderr={}", apply.stderr_text());
     let value = apply.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-out.cleanup.apply.v1");
-    assert_eq!(value["result"]["summary"]["deleted"], 2);
+    assert_eq!(value["result"]["summary"]["deleted"], 1);
     assert_eq!(value["result"]["summary"]["skipped"], 0);
     assert!(
         !out.join("nils-versions").exists(),
         "cache should be deleted"
     );
     assert!(
-        !out.join("loose.log").exists(),
-        "loose file should be deleted"
+        out.join("loose.log").is_file(),
+        "loose top-level reports require policy before deletion"
     );
     assert!(
         out.join("evidence-run/test-first-evidence.json").is_file(),
@@ -655,13 +740,54 @@ fn cleanup_apply_deletes_confirmed_candidates_and_preserves_evidence() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn cleanup_apply_skips_path_when_evidence_marker_appears_after_plan() {
+fn cleanup_plan_rejects_symlinked_out_root() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let external = tmp.path().join("external-out");
+    fs::create_dir_all(&agent_home).expect("agent home");
+    fs::create_dir_all(external.join("nils-versions")).expect("external cache");
+    std::os::unix::fs::symlink(&external, agent_home.join("out")).expect("out symlink");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(plan.code, 65, "stderr={}", plan.stderr_text());
+    let value = plan.stdout_json();
+    assert_eq!(
+        value["error"]["code"],
+        "cleanup-out-root-symlink-unsupported"
+    );
+    assert!(
+        external.join("nils-versions").is_dir(),
+        "external symlink target must be preserved"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_apply_rejects_symlinked_out_root_before_deleting() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let agent_home = tmp.path().join("agent-home");
     let out = agent_home.join("out");
-    fs::create_dir_all(out.join("scratch")).expect("scratch");
-    fs::write(out.join("scratch/debug.log"), "debug").expect("scratch file");
+    let external = tmp.path().join("external-out");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "binary").expect("cache file");
+    fs::create_dir_all(external.join("nils-versions/v1.19.2")).expect("external cache");
+    fs::write(external.join("nils-versions/v1.19.2/agent-out"), "binary")
+        .expect("external cache file");
 
     let agent_home_arg = agent_home.to_string_lossy().to_string();
     let plan = run(
@@ -684,7 +810,375 @@ fn cleanup_apply_skips_path_when_evidence_marker_appears_after_plan() {
         .to_string();
     let plan_file = tmp.path().join("cleanup-plan.json");
     fs::write(&plan_file, plan.stdout_text()).expect("plan file");
-    fs::write(out.join("scratch/skill-usage.record.json"), "{}").expect("late marker");
+    fs::remove_dir_all(&out).expect("remove real out root");
+    std::os::unix::fs::symlink(&external, &out).expect("out symlink");
+    let plan_file_arg = plan_file.to_string_lossy().to_string();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "apply",
+            "--plan-file",
+            &plan_file_arg,
+            "--confirm-digest",
+            &digest,
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(apply.code, 65, "stderr={}", apply.stderr_text());
+    let value = apply.stdout_json();
+    assert_eq!(
+        value["error"]["code"],
+        "cleanup-out-root-symlink-unsupported"
+    );
+    assert!(
+        external.join("nils-versions/v1.19.2/agent-out").is_file(),
+        "external symlink target must not be deleted"
+    );
+}
+
+#[test]
+fn cleanup_apply_skips_path_when_metadata_changes_after_plan() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "old").expect("cache file");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
+    let plan_value = plan.stdout_json();
+    let digest = plan_value["result"]["plan_digest"]
+        .as_str()
+        .expect("plan_digest")
+        .to_string();
+    let plan_file = tmp.path().join("cleanup-plan.json");
+    fs::write(&plan_file, plan.stdout_text()).expect("plan file");
+    fs::write(
+        out.join("nils-versions/v1.19.2/agent-out"),
+        "newer unreviewed binary payload",
+    )
+    .expect("changed cache file");
+    let plan_file_arg = plan_file.to_string_lossy().to_string();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "apply",
+            "--plan-file",
+            &plan_file_arg,
+            "--confirm-digest",
+            &digest,
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(apply.code, 0, "stderr={}", apply.stderr_text());
+    let value = apply.stdout_json();
+    assert_eq!(value["result"]["summary"]["deleted"], 0);
+    assert_eq!(value["result"]["summary"]["skipped"], 1);
+    assert_eq!(
+        value["result"]["entries"][0]["reason"],
+        "path metadata changed after the plan was created"
+    );
+    assert!(
+        out.join("nils-versions/v1.19.2/agent-out").is_file(),
+        "stale plan must not delete newer cache contents"
+    );
+}
+
+#[test]
+fn cleanup_apply_skips_path_when_same_size_cache_content_changes_after_plan() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "old").expect("cache file");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
+    let mut envelope = plan.stdout_json();
+    assert!(
+        envelope["result"]["items"][0]["content_digest"]
+            .as_str()
+            .expect("content digest")
+            .starts_with("sha256:")
+    );
+    let cache_path = envelope["result"]["items"][0]["path"]
+        .as_str()
+        .expect("cache path")
+        .to_string();
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "new")
+        .expect("same-size changed cache file");
+    let current_cache_mtime = fs::symlink_metadata(&cache_path)
+        .expect("cache metadata")
+        .modified()
+        .expect("cache mtime")
+        .duration_since(UNIX_EPOCH)
+        .expect("cache mtime after epoch")
+        .as_secs() as i64;
+    envelope["result"]["items"][0]["mtime_unix"] = Value::from(current_cache_mtime);
+    let digest = recompute_cleanup_plan_digest(&mut envelope);
+    let plan_file = tmp.path().join("cleanup-plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_string_pretty(&envelope).expect("plan json"),
+    )
+    .expect("plan file");
+    let plan_file_arg = plan_file.to_string_lossy().to_string();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "apply",
+            "--plan-file",
+            &plan_file_arg,
+            "--confirm-digest",
+            &digest,
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(apply.code, 0, "stderr={}", apply.stderr_text());
+    let value = apply.stdout_json();
+    assert_eq!(value["result"]["summary"]["deleted"], 0);
+    assert_eq!(value["result"]["summary"]["skipped"], 1);
+    assert_eq!(
+        value["result"]["entries"][0]["reason"],
+        "path metadata changed after the plan was created"
+    );
+    assert!(
+        out.join("nils-versions/v1.19.2/agent-out").is_file(),
+        "same-size stale cache contents must be preserved"
+    );
+}
+
+#[test]
+fn cleanup_apply_skips_cache_tree_with_ambiguous_unframed_digest_stream() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    let cache = out.join("nils-versions");
+    fs::create_dir_all(&cache).expect("cache");
+    fs::write(cache.join("0"), "a").expect("cache file");
+    fs::write(cache.join("b"), "").expect("cache file");
+    fs::write(cache.join("xc"), "DATA").expect("cache file");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
+    let mut envelope = plan.stdout_json();
+    assert!(
+        envelope["result"]["items"][0]["content_digest"]
+            .as_str()
+            .expect("content digest")
+            .starts_with("sha256:")
+    );
+    let cache_path = envelope["result"]["items"][0]["path"]
+        .as_str()
+        .expect("cache path")
+        .to_string();
+    let planned_size = envelope["result"]["items"][0]["size_bytes"]
+        .as_u64()
+        .expect("planned cache size");
+
+    fs::remove_file(cache.join("b")).expect("remove old cache file");
+    fs::remove_file(cache.join("xc")).expect("remove old cache file");
+    fs::write(cache.join("0"), "").expect("changed cache file");
+    fs::write(cache.join("ab"), "x").expect("changed cache file");
+    fs::write(cache.join("c"), "DATA").expect("changed cache file");
+
+    let cache_path = Path::new(&cache_path);
+    assert_eq!(test_path_size_bytes(cache_path), planned_size);
+    envelope["result"]["items"][0]["mtime_unix"] = Value::from(test_path_mtime_unix(cache_path));
+    let digest = recompute_cleanup_plan_digest(&mut envelope);
+    let plan_file = tmp.path().join("cleanup-plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_string_pretty(&envelope).expect("plan json"),
+    )
+    .expect("plan file");
+    let plan_file_arg = plan_file.to_string_lossy().to_string();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "apply",
+            "--plan-file",
+            &plan_file_arg,
+            "--confirm-digest",
+            &digest,
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(apply.code, 0, "stderr={}", apply.stderr_text());
+    let value = apply.stdout_json();
+    assert_eq!(value["result"]["summary"]["deleted"], 0);
+    assert_eq!(value["result"]["summary"]["skipped"], 1);
+    assert!(
+        cache.join("ab").is_file() && cache.join("c").is_file(),
+        "ambiguous stale cache tree must be preserved"
+    );
+}
+
+#[test]
+fn cleanup_apply_rejects_cache_delete_plan_without_content_digest_before_deleting() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "old").expect("cache file");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
+    let mut envelope = plan.stdout_json();
+    envelope["result"]["items"][0]
+        .as_object_mut()
+        .expect("cache item")
+        .remove("content_digest");
+    let digest = recompute_cleanup_plan_digest(&mut envelope);
+    let plan_file = tmp.path().join("cleanup-plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_string_pretty(&envelope).expect("plan json"),
+    )
+    .expect("plan file");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "new")
+        .expect("same-size changed cache file");
+    let plan_file_arg = plan_file.to_string_lossy().to_string();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "apply",
+            "--plan-file",
+            &plan_file_arg,
+            "--confirm-digest",
+            &digest,
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(apply.code, 65, "stderr={}", apply.stderr_text());
+    let value = apply.stdout_json();
+    assert_eq!(
+        value["error"]["code"],
+        "cleanup-delete-content-digest-required"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("nils-versions/v1.19.2/agent-out")).expect("cache file"),
+        "new"
+    );
+}
+
+#[test]
+fn cleanup_apply_skips_path_when_evidence_marker_appears_after_plan() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "binary").expect("cache file");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
+    let plan_value = plan.stdout_json();
+    let digest = plan_value["result"]["plan_digest"]
+        .as_str()
+        .expect("plan_digest")
+        .to_string();
+    let plan_file = tmp.path().join("cleanup-plan.json");
+    fs::write(&plan_file, plan.stdout_text()).expect("plan file");
+    fs::write(
+        out.join("nils-versions/v1.19.2/skill-usage.record.json"),
+        "{}",
+    )
+    .expect("late marker");
     let plan_file_arg = plan_file.to_string_lossy().to_string();
 
     let apply = run(
@@ -713,8 +1207,269 @@ fn cleanup_apply_skips_path_when_evidence_marker_appears_after_plan() {
         "evidence marker appeared after the plan was created"
     );
     assert!(
-        out.join("scratch/skill-usage.record.json").is_file(),
+        out.join("nils-versions/v1.19.2/skill-usage.record.json")
+            .is_file(),
         "late evidence marker must be preserved"
+    );
+}
+
+#[test]
+fn cleanup_apply_rejects_duplicate_delete_paths_before_deleting() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "binary").expect("cache file");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
+    let mut envelope = plan.stdout_json();
+    let duplicate = envelope["result"]["items"][0].clone();
+    envelope["result"]["items"]
+        .as_array_mut()
+        .expect("items")
+        .push(duplicate);
+    let digest = recompute_cleanup_plan_digest(&mut envelope);
+    let plan_file = tmp.path().join("cleanup-plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_string_pretty(&envelope).expect("plan json"),
+    )
+    .expect("plan file");
+    let plan_file_arg = plan_file.to_string_lossy().to_string();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "apply",
+            "--plan-file",
+            &plan_file_arg,
+            "--confirm-digest",
+            &digest,
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(apply.code, 65, "stderr={}", apply.stderr_text());
+    let value = apply.stdout_json();
+    assert_eq!(value["error"]["code"], "cleanup-delete-duplicate");
+    assert!(
+        out.join("nils-versions/v1.19.2/agent-out").is_file(),
+        "duplicate delete plan must fail before deleting"
+    );
+}
+
+#[test]
+fn cleanup_apply_rejects_aliased_duplicate_delete_paths_before_deleting() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "binary").expect("cache file");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
+    let mut envelope = plan.stdout_json();
+    let mut duplicate = envelope["result"]["items"][0].clone();
+    let cache_path = duplicate["path"].as_str().expect("cache path").to_string();
+    duplicate["path"] = Value::String(format!("{cache_path}/."));
+    envelope["result"]["items"]
+        .as_array_mut()
+        .expect("items")
+        .push(duplicate);
+    let digest = recompute_cleanup_plan_digest(&mut envelope);
+    let plan_file = tmp.path().join("cleanup-plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_string_pretty(&envelope).expect("plan json"),
+    )
+    .expect("plan file");
+    let plan_file_arg = plan_file.to_string_lossy().to_string();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "apply",
+            "--plan-file",
+            &plan_file_arg,
+            "--confirm-digest",
+            &digest,
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(apply.code, 65, "stderr={}", apply.stderr_text());
+    let value = apply.stdout_json();
+    assert_eq!(value["error"]["code"], "cleanup-delete-duplicate");
+    assert!(
+        out.join("nils-versions/v1.19.2/agent-out").is_file(),
+        "aliased duplicate delete plan must fail before deleting"
+    );
+}
+
+#[test]
+fn cleanup_apply_prevalidates_all_delete_candidates_before_deleting() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "binary").expect("cache file");
+    fs::write(out.join("zzz.log"), "debug").expect("loose");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
+    let mut envelope = plan.stdout_json();
+    let plan_out = Path::new(
+        envelope["result"]["out_root"]
+            .as_str()
+            .expect("plan out_root"),
+    );
+    envelope["result"]["items"][1]["path"] = Value::String(
+        plan_out
+            .join("projects/owner__repo/20260627-report/report.md")
+            .to_string_lossy()
+            .to_string(),
+    );
+    envelope["result"]["items"][1]["action"] = Value::String("delete".to_string());
+    envelope["result"]["items"][1]["category"] =
+        Value::String("top-level-noncanonical".to_string());
+    let digest = recompute_cleanup_plan_digest(&mut envelope);
+    let plan_file = tmp.path().join("cleanup-plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_string_pretty(&envelope).expect("plan json"),
+    )
+    .expect("plan file");
+    let plan_file_arg = plan_file.to_string_lossy().to_string();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "apply",
+            "--plan-file",
+            &plan_file_arg,
+            "--confirm-digest",
+            &digest,
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(apply.code, 65, "stderr={}", apply.stderr_text());
+    let value = apply.stdout_json();
+    assert_eq!(value["error"]["code"], "cleanup-delete-shape-invalid");
+    assert!(
+        out.join("nils-versions/v1.19.2/agent-out").is_file(),
+        "apply must validate every delete candidate before deleting any path"
+    );
+}
+
+#[test]
+fn cleanup_apply_rejects_direct_top_level_noncanonical_delete_plan() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let agent_home = tmp.path().join("agent-home");
+    let out = agent_home.join("out");
+    fs::create_dir_all(&out).expect("out root");
+    fs::write(out.join("loose.log"), "debug").expect("loose");
+
+    let agent_home_arg = agent_home.to_string_lossy().to_string();
+    let plan = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "plan",
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
+    let mut envelope = plan.stdout_json();
+    envelope["result"]["items"][0]["action"] = Value::String("delete".to_string());
+    let digest = recompute_cleanup_plan_digest(&mut envelope);
+    let plan_file = tmp.path().join("cleanup-plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_string_pretty(&envelope).expect("plan json"),
+    )
+    .expect("plan file");
+    let plan_file_arg = plan_file.to_string_lossy().to_string();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "cleanup",
+            "apply",
+            "--plan-file",
+            &plan_file_arg,
+            "--confirm-digest",
+            &digest,
+            "--agent-home",
+            &agent_home_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(apply.code, 65, "stderr={}", apply.stderr_text());
+    let value = apply.stdout_json();
+    assert_eq!(value["error"]["code"], "cleanup-delete-shape-invalid");
+    assert!(
+        out.join("loose.log").is_file(),
+        "old top-level noncanonical delete plans must fail closed"
     );
 }
 
@@ -724,7 +1479,8 @@ fn cleanup_apply_rejects_parent_component_delete_path_with_matching_digest() {
     let agent_home = tmp.path().join("agent-home");
     let out = agent_home.join("out");
     fs::create_dir_all(&out).expect("out root");
-    fs::write(out.join("loose.log"), "debug").expect("loose");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "binary").expect("cache file");
     fs::write(agent_home.join("victim.log"), "do not delete").expect("victim");
 
     let agent_home_arg = agent_home.to_string_lossy().to_string();
@@ -778,23 +1534,19 @@ fn cleanup_apply_rejects_parent_component_delete_path_with_matching_digest() {
         "crafted parent-component path must not delete outside out"
     );
     assert!(
-        out.join("loose.log").is_file(),
+        out.join("nils-versions/v1.19.2/agent-out").is_file(),
         "apply must stop before delete"
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn cleanup_apply_rejects_intermediate_symlink_delete_path_outside_out_root() {
+fn cleanup_apply_rejects_nested_cache_delete_path_shape() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let agent_home = tmp.path().join("agent-home");
     let out = agent_home.join("out");
-    let outside = tmp.path().join("outside");
     fs::create_dir_all(&out).expect("out root");
-    fs::create_dir_all(&outside).expect("outside");
-    fs::write(out.join("loose.log"), "debug").expect("loose");
-    fs::write(outside.join("secret.log"), "do not delete").expect("outside file");
-    std::os::unix::fs::symlink(&outside, out.join("linkdir")).expect("symlink");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "binary").expect("cache file");
 
     let agent_home_arg = agent_home.to_string_lossy().to_string();
     let plan = run(
@@ -811,8 +1563,12 @@ fn cleanup_apply_rejects_intermediate_symlink_delete_path_outside_out_root() {
     );
     assert_eq!(plan.code, 0, "stderr={}", plan.stderr_text());
     let mut envelope = plan.stdout_json();
+    let cache_path = envelope["result"]["items"][0]["path"]
+        .as_str()
+        .expect("cache path")
+        .to_string();
     envelope["result"]["items"][0]["path"] =
-        Value::String(out.join("linkdir/secret.log").to_string_lossy().to_string());
+        Value::String(format!("{cache_path}/v1.19.2/agent-out"));
     let digest = recompute_cleanup_plan_digest(&mut envelope);
     let plan_file = tmp.path().join("cleanup-plan.json");
     fs::write(
@@ -841,10 +1597,10 @@ fn cleanup_apply_rejects_intermediate_symlink_delete_path_outside_out_root() {
 
     assert_eq!(apply.code, 65, "stderr={}", apply.stderr_text());
     let value = apply.stdout_json();
-    assert_eq!(value["error"]["code"], "cleanup-path-outside-out-root");
+    assert_eq!(value["error"]["code"], "cleanup-delete-shape-invalid");
     assert!(
-        outside.join("secret.log").is_file(),
-        "intermediate symlink must not delete outside out"
+        out.join("nils-versions/v1.19.2/agent-out").is_file(),
+        "intermediate delete path must not be deleted"
     );
 }
 
@@ -859,7 +1615,8 @@ fn cleanup_apply_rejects_nested_preserved_root_descendant_with_matching_digest()
         "report",
     )
     .expect("report");
-    fs::write(out.join("loose.log"), "debug").expect("loose");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "binary").expect("cache file");
 
     let agent_home_arg = agent_home.to_string_lossy().to_string();
     let plan = run(
@@ -931,7 +1688,8 @@ fn cleanup_apply_rejects_digest_mismatch() {
     let agent_home = tmp.path().join("agent-home");
     let out = agent_home.join("out");
     fs::create_dir_all(&out).expect("out root");
-    fs::write(out.join("loose.log"), "debug").expect("loose");
+    fs::create_dir_all(out.join("nils-versions/v1.19.2")).expect("cache");
+    fs::write(out.join("nils-versions/v1.19.2/agent-out"), "binary").expect("cache file");
 
     let agent_home_arg = agent_home.to_string_lossy().to_string();
     let plan = run(
@@ -972,7 +1730,10 @@ fn cleanup_apply_rejects_digest_mismatch() {
     let value = apply.stdout_json();
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "cleanup-digest-mismatch");
-    assert!(out.join("loose.log").is_file(), "apply must not delete");
+    assert!(
+        out.join("nils-versions/v1.19.2/agent-out").is_file(),
+        "apply must not delete"
+    );
 }
 
 #[test]

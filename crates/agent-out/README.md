@@ -106,13 +106,19 @@ agent-out cleanup plan --include-projects --format json > cleanup-plan.json
 
 Plan classification is conservative:
 
+- `$AGENT_HOME/out` must be a real directory; cleanup refuses symlinked out
+  roots instead of treating the symlink target as the deletion boundary.
 - `nils-versions` is a `cache` delete candidate because it can be recreated
   from release assets.
-- top-level noncanonical entries without retained evidence markers are delete
-  candidates.
+- top-level noncanonical entries without retained evidence markers are reported
+  as `needs-policy`; they are not deleted by default because documented
+  workflows may place reviewed reports directly under `$AGENT_HOME/out/`.
 - any directory containing `skill-usage.record.json` or
   `test-first-evidence.json` is preserved; use `evidence migrate` and
   `evidence prune-source --archived-only` for `skill-usage` source cleanup.
+- canonical and allowlisted preserved roots are listed with shallow metadata
+  unless children are explicitly requested; their marker booleans are not a
+  recursive assertion about all descendants.
 - `projects/<repo>/<run>` entries are included only with `--include-projects`;
   runs without evidence markers are reported as `needs-policy`, not deleted.
 
@@ -126,11 +132,17 @@ agent-out cleanup apply \
   --format json
 ```
 
-Apply deletes only `delete` items from the plan, rejects digest mismatches,
-requires the resolved agent home to match the plan, rejects parent-directory or
-out-of-root delete paths, and re-checks evidence markers immediately before
-deletion. If `--agent-home` is omitted, `AGENT_HOME` is still required so the
-plan has a live runtime-root boundary.
+Apply deletes only reviewed `cache` delete items from the plan. It rejects
+digest mismatches, requires the resolved agent home to match the plan, rejects
+parent-directory or out-of-root delete paths, validates every delete candidate
+before removing any path, rejects duplicate delete paths, re-checks evidence
+markers immediately before deletion, and skips stale items whose size,
+modification time, or content digest changed after planning. Cache delete items
+must include `content_digest`. Older v1 plans that contain
+`top-level-noncanonical` delete items or cache delete items without
+`content_digest` must be regenerated; apply now fails those closed instead of
+deleting them. If `--agent-home` is omitted, `AGENT_HOME` is still required so
+the plan has a live runtime-root boundary.
 
 ### `completion`
 
