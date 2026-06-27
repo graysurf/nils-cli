@@ -439,6 +439,8 @@ walk_help_path() {
   local path_key="$1"
   local depth="$2"
 
+  # Record depth overflows as audit failures, but return success so traversal-style
+  # callers can continue and report all discovered issues in one run.
   if (( depth > MAX_COMMAND_DEPTH )); then
     HELP_FAILURES["$path_key"]="path depth exceeded safety limit (${MAX_COMMAND_DEPTH})"
     return 0
