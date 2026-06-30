@@ -2,6 +2,7 @@ use crate::commit_shared::{git_output, git_status_success, git_stdout_trimmed_op
 use anyhow::Context;
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
 use nils_common::git::PrKind;
+use nils_common::shell::quote_posix_single;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
         "list" => Some(run_list(args)),
         "remove" => Some(run_remove(args)),
         "prune" => Some(run_prune(args)),
+        "go" => Some(run_go(args)),
         _ => None,
     }
 }
@@ -60,6 +62,13 @@ struct RemoveArgs {
 
 #[derive(Debug)]
 struct PruneArgs {
+    format: OutputFormat,
+}
+
+#[derive(Debug)]
+struct GoArgs {
+    target: String,
+    shell: bool,
     format: OutputFormat,
 }
 
@@ -114,6 +123,15 @@ struct RemoveOutput {
 #[derive(Debug, Serialize)]
 struct PruneOutput {
     pruned: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct GoOutput {
+    path: String,
+    slug: String,
+    branch: Option<String>,
+    managed: bool,
+    shell_command: String,
 }
 
 impl CliError {
@@ -222,6 +240,137 @@ fn run_prune(args: &[String]) -> i32 {
         }),
         Err(err) => emit_error("worktree.prune", parsed.format, err),
     }
+}
+
+fn run_go(args: &[String]) -> i32 {
+    let requested_format = detect_format(args);
+    let parsed = match parse_go_args(args) {
+        Ok(parsed) => parsed,
+        Err(err) => return emit_error("worktree.go", requested_format, err),
+    };
+
+    match resolve_go(&parsed) {
+        Ok(output) => {
+            // Shell mode short-circuits the standard text rendering and prints a
+            // single evaluable `cd -- <path>` command (mirroring
+            // `git-cli utils root --shell`) so a shell wrapper can `eval` it.
+            // An explicit `--format json` still wins for machine consumers.
+            if parsed.shell && !matches!(parsed.format, OutputFormat::Json) {
+                println!("{}", output.shell_command);
+                return exit::SUCCESS;
+            }
+            emit_success("worktree.go", parsed.format, &output, || {
+                output.path.clone()
+            })
+        }
+        Err(err) => emit_error("worktree.go", parsed.format, err),
+    }
+}
+
+fn resolve_go(args: &GoArgs) -> Result<GoOutput, CliError> {
+    let layout = resolve_layout()?;
+    let entries = list_linked_worktrees()
+        .map_err(|err| CliError::runtime("git-worktree-list-failed", err.to_string()))?;
+    let entry = resolve_go_target(&args.target, &layout, &entries)?;
+
+    let path = canonical_or_raw(&entry.path);
+    let path_text = display_path(&path);
+    let slug = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(args.target.as_str())
+        .to_string();
+    let shell_command = format!("cd -- {}", quote_posix_single(&path_text));
+    Ok(GoOutput {
+        path: path_text,
+        slug,
+        branch: entry.branch.clone(),
+        managed: is_managed_worktree(&entry.path, &layout),
+        shell_command,
+    })
+}
+
+/// Resolve a `worktree go` target to a single linked worktree. Accepts, in
+/// priority order: an exact branch name, an explicit worktree path, a managed
+/// slug, or any worktree directory's basename. Resolution is driven entirely by
+/// the live `git worktree list`, so it works identically from the primary
+/// checkout or from inside any linked worktree.
+fn resolve_go_target<'a>(
+    target: &str,
+    layout: &WorktreeLayout,
+    entries: &'a [LinkedWorktree],
+) -> Result<&'a LinkedWorktree, CliError> {
+    // 1. Exact branch name (e.g. `feat/topic`).
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.branch.as_deref() == Some(target))
+    {
+        return Ok(entry);
+    }
+
+    // 2. Explicit path (absolute or multi-component) naming a known worktree.
+    let candidate = Path::new(target);
+    if candidate.is_absolute() || path_has_multiple_components(candidate) {
+        let target_key = path_key(candidate);
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| path_key(&entry.path) == target_key)
+        {
+            return Ok(entry);
+        }
+    }
+
+    // 3. Managed slug -> managed worktree path, then the slug as a basename.
+    if let Ok(slug) = normalize_slug(target) {
+        let managed_key = path_key(&layout.worktree_root.join(&layout.repo_key).join(&slug));
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| path_key(&entry.path) == managed_key)
+        {
+            return Ok(entry);
+        }
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| basename(&entry.path) == Some(slug.as_str()))
+        {
+            return Ok(entry);
+        }
+    }
+
+    // 4. Raw basename match (external worktrees whose dir name is not a slug).
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| basename(&entry.path) == Some(target))
+    {
+        return Ok(entry);
+    }
+
+    let mut err = CliError::data(
+        "worktree-not-found",
+        format!("no worktree found for {target}"),
+    )
+    .with_details(json!({ "target": target }));
+    if let Some(hint) = go_candidate_hint(entries) {
+        err = err.with_hint(hint);
+    }
+    Err(err)
+}
+
+fn basename(path: &Path) -> Option<&str> {
+    path.file_name().and_then(|name| name.to_str())
+}
+
+fn go_candidate_hint(entries: &[LinkedWorktree]) -> Option<String> {
+    let mut names: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| basename(&entry.path).map(str::to_string))
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    names.dedup();
+    Some(format!("available worktrees: {}", names.join(", ")))
 }
 
 fn add_worktree(args: &AddArgs) -> Result<AddOutput, CliError> {
@@ -603,6 +752,52 @@ fn parse_prune_args(args: &[String]) -> Result<PruneArgs, CliError> {
     Ok(PruneArgs { format })
 }
 
+fn parse_go_args(args: &[String]) -> Result<GoArgs, CliError> {
+    let mut args = args.to_vec();
+    let format = take_format(&mut args)?;
+    if take_help(&args) {
+        print_go_help();
+        return Err(CliError::usage("help", "help requested"));
+    }
+
+    let mut shell = false;
+    let mut target: Option<String> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shell" => {
+                shell = true;
+                i += 1;
+            }
+            value if value.starts_with('-') => {
+                return Err(CliError::usage(
+                    "unknown-argument",
+                    format!("unknown argument: {value}"),
+                ));
+            }
+            value => {
+                if target.is_some() {
+                    return Err(CliError::usage(
+                        "too-many-arguments",
+                        "worktree go accepts exactly one slug, branch, or path",
+                    ));
+                }
+                target = Some(value.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    let target = target.ok_or_else(|| {
+        CliError::usage("missing-target", "missing worktree slug, branch, or path")
+    })?;
+    Ok(GoArgs {
+        target,
+        shell,
+        format,
+    })
+}
+
 fn take_format(args: &mut Vec<String>) -> Result<OutputFormat, CliError> {
     let mut format = OutputFormat::Text;
     let mut i = 0usize;
@@ -702,6 +897,12 @@ fn print_prune_help() {
     println!("Usage: git-cli worktree prune [--format text|json]");
 }
 
+fn print_go_help() {
+    println!("Usage: git-cli worktree go <slug-or-branch-or-path> [--shell] [--format text|json]");
+    println!("  Resolve a worktree and print its path (default), so you can `cd` into it.");
+    println!("  --shell  Print an evaluable `cd -- <path>` command instead of the bare path");
+}
+
 fn resolve_layout() -> Result<WorktreeLayout, CliError> {
     let repo_root = require_repo_root()?;
     let agent_home = resolve_agent_home()?;
@@ -728,13 +929,27 @@ fn ensure_inside_git_repo() -> Result<(), CliError> {
 
 fn require_repo_root() -> Result<PathBuf, CliError> {
     ensure_inside_git_repo()?;
-    let root = git_stdout_trimmed_optional(&["rev-parse", "--show-toplevel"]).ok_or_else(|| {
+    let root = primary_worktree_root()?;
+    absolute_existing_path(&root)
+}
+
+/// Resolve the repository's *primary* worktree, independent of the worktree the
+/// command is invoked from. `git rev-parse --show-toplevel` returns the current
+/// linked worktree, which would make the managed layout (`repo_key`, the
+/// managed/external classification, and slug-based add/remove paths) diverge
+/// when an agent runs from inside a linked worktree. `git worktree list` always
+/// emits the primary worktree first, so its first entry is the stable anchor
+/// for the managed layout from anywhere in the repository.
+fn primary_worktree_root() -> Result<PathBuf, CliError> {
+    let entries = list_linked_worktrees()
+        .map_err(|err| CliError::runtime("git-worktree-list-failed", err.to_string()))?;
+    let first = entries.into_iter().next().ok_or_else(|| {
         CliError::runtime(
             "repo-root-unavailable",
             "unable to resolve git repository root",
         )
     })?;
-    absolute_existing_path(Path::new(&root))
+    Ok(first.path)
 }
 
 fn resolve_agent_home() -> Result<PathBuf, CliError> {
@@ -996,7 +1211,7 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::{
         LinkedWorktree, branch_name_hint, normalize_slug, parse_worktree_porcelain,
-        repo_key_for_path, resolve_remove_target,
+        repo_key_for_path, resolve_go_target, resolve_remove_target,
     };
     use pretty_assertions::{assert_eq, assert_ne};
     use std::path::{Path, PathBuf};
@@ -1082,6 +1297,42 @@ mod tests {
         )];
         assert!(branch_name_hint("docs/typo", &entries).is_none());
         assert!(branch_name_hint("closeout-records-delivery", &entries).is_none());
+    }
+
+    #[test]
+    fn resolve_go_target_matches_branch_path_slug_and_basename() {
+        let layout = super::WorktreeLayout {
+            agent_home: Path::new("/agent").to_path_buf(),
+            worktree_root: Path::new("/agent/worktrees").to_path_buf(),
+            repo_root: Path::new("/repo").to_path_buf(),
+            repo_key: "repo-12345678".to_string(),
+        };
+        let entries = vec![
+            managed_entry("/repo", Some("main")),
+            managed_entry(
+                "/agent/worktrees/repo-12345678/topic-one",
+                Some("feat/topic-one"),
+            ),
+        ];
+
+        let by_branch =
+            resolve_go_target("feat/topic-one", &layout, &entries).expect("branch match");
+        assert_eq!(
+            by_branch.path,
+            Path::new("/agent/worktrees/repo-12345678/topic-one")
+        );
+
+        let by_slug = resolve_go_target("topic-one", &layout, &entries).expect("slug match");
+        assert_eq!(
+            by_slug.path,
+            Path::new("/agent/worktrees/repo-12345678/topic-one")
+        );
+
+        let by_path = resolve_go_target("/repo", &layout, &entries).expect("path match");
+        assert_eq!(by_path.path, Path::new("/repo"));
+
+        let unknown = resolve_go_target("does-not-exist", &layout, &entries);
+        assert!(unknown.is_err(), "unknown target should not resolve");
     }
 
     #[test]

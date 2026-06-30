@@ -17,7 +17,7 @@ subcommands (matching the binary's `--help` output):
 - `commit`: `context`, `context-json` (aliases `context_json`, `contextjson`, `json`),
   `to-stash` (alias `stash`).
 - `branch`: `cleanup` (alias `delete-merged`).
-- `worktree`: `add`, `list`, `remove`, `prune`.
+- `worktree`: `add`, `list`, `remove`, `prune`, `go`.
 - `ci`: `pick`.
 - `open`: `repo`, `branch`, `default-branch` (alias `default`), `commit`, `compare`,
   `pr` (aliases `pull-request`, `mr`, `merge-request`), `pulls` (aliases `prs`,
@@ -64,13 +64,22 @@ subcommands (matching the binary's `--help` output):
 ### worktree
 
 - `add <slug>`: Create a managed worktree under
-  `$AGENT_HOME/worktrees/<repo-key>/<branch-slug>` on a fresh `feat/<branch-slug>` branch.
-  Options: `--from <ref>`, `--format text|json`.
+  `$AGENT_HOME/worktrees/<repo-key>/<branch-slug>` on a fresh `<prefix>/<branch-slug>` branch.
+  Options: `--from <ref>`, `--kind feature|bug|chore|docs|ci|refactor` (selects the branch prefix;
+  default `feature`), `--format text|json`.
 - `list`: List all linked git worktrees and mark entries managed by the git-cli convention.
   Options: `--format text|json`.
 - `remove <slug-or-path>`: Remove a linked worktree by managed slug or explicit path, refusing the
   primary checkout and the current worktree. Options: `--format text|json`.
 - `prune`: Run `git worktree prune`. Options: `--format text|json`.
+- `go <slug-or-branch-or-path>`: Resolve a worktree and print its path so you can `cd` into it.
+  Matches by branch name, explicit path, managed slug, or worktree directory name. Use `--shell` to
+  emit an evaluable `cd -- <path>` command (mirrors `utils root --shell`); the `gxwcd` shell helper
+  wraps this with worktree-name completion. Options: `--shell`, `--format text|json`.
+
+The managed layout (`repo-key`, the managed/external classification, and slug-based resolution) is
+anchored to the repository's primary worktree, so `worktree` commands behave identically whether run
+from the primary checkout or from inside any linked worktree.
 
 ### ci
 

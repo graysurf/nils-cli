@@ -118,13 +118,13 @@ _nils_cli_git_cli_complete() {
 
 if _nils_cli_git_cli_source_common_bash; then
   _nils_cli_completion_common_register_bash _nils_cli_git_cli_complete \
-    git-cli gx gxh gxu gxr gxc gxb gxi gxo \
+    git-cli gx gxh gxu gxr gxc gxb gxi gxo gxw \
     gxuz gxuc gxur gxuh gxrs gxrm gxrh gxru gxrbh gxrbc gxrr \
     gxcc gxcj gxcs gxbc gxip \
     gxor gxob gxod gxoc gxocp gxop gxopl gxoi gxoa gxorl gxot gxocs gxof gxobl
 else
   complete -F _nils_cli_git_cli_complete \
-    git-cli gx gxh gxu gxr gxc gxb gxi gxo \
+    git-cli gx gxh gxu gxr gxc gxb gxi gxo gxw \
     gxuz gxuc gxur gxuh gxrs gxrm gxrh gxru gxrbh gxrbc gxrr \
     gxcc gxcj gxcs gxbc gxip \
     gxor gxob gxod gxoc gxocp gxop gxopl gxoi gxoa gxorl gxot gxocs gxof gxobl

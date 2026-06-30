@@ -160,6 +160,8 @@ enum WorktreeCommand {
     Remove(RawArgs),
     #[command(about = "Prune stale git worktree metadata")]
     Prune(RawArgs),
+    #[command(about = "Resolve a worktree path to cd into")]
+    Go(RawArgs),
     #[command(about = "Display help message for worktree")]
     Help,
 }
@@ -338,6 +340,9 @@ fn run_worktree(group: WorktreeGroup) -> i32 {
         }
         Some(WorktreeCommand::Prune(raw)) => {
             worktree::dispatch("prune", &raw.args).unwrap_or(exit::USAGE)
+        }
+        Some(WorktreeCommand::Go(raw)) => {
+            worktree::dispatch("go", &raw.args).unwrap_or(exit::USAGE)
         }
         Some(WorktreeCommand::Help) | None => print_group_help("worktree"),
     }

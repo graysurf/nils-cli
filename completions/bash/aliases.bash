@@ -42,6 +42,7 @@ _nils_cli__has_alias gxc || alias gxc='git-cli commit'
 _nils_cli__has_alias gxb || alias gxb='git-cli branch'
 _nils_cli__has_alias gxi || alias gxi='git-cli ci'
 _nils_cli__has_alias gxo || alias gxo='git-cli open'
+_nils_cli__has_alias gxw || alias gxw='git-cli worktree'
 
 _nils_cli__has_alias gxuz || alias gxuz='git-cli utils zip'
 _nils_cli__has_alias gxuc || alias gxuc='git-cli utils copy-staged'
@@ -78,6 +79,21 @@ _nils_cli__has_alias gxot || alias gxot='git-cli open tags'
 _nils_cli__has_alias gxocs || alias gxocs='git-cli open commits'
 _nils_cli__has_alias gxof || alias gxof='git-cli open file'
 _nils_cli__has_alias gxobl || alias gxobl='git-cli open blame'
+
+# Jump into a worktree (uses eval to change the parent shell's directory):
+_nils_cli__has_function gxwcd || gxwcd() { eval "$(git-cli worktree go --shell "$@")"; }
+# Worktree-name completion for the cd helper; candidates come straight from the
+# live `git worktree list`. Agents never reach this completion path.
+_nils_cli_gxwcd_complete() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local cands
+  cands="$(command git worktree list --porcelain 2>/dev/null | awk '
+    /^worktree /  { n = split($2, p, "/"); print p[n] }
+    /^branch /    { b = $2; sub(/^refs\/heads\//, "", b); print b }
+  ')"
+  mapfile -t COMPREPLY < <(compgen -W "$cands" -- "$cur")
+}
+complete -F _nils_cli_gxwcd_complete gxwcd 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # codex-cli (cx*)
