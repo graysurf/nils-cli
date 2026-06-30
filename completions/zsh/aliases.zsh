@@ -32,6 +32,7 @@ fi
 (( $+aliases[gxb] )) || alias gxb='git-cli branch'
 (( $+aliases[gxi] )) || alias gxi='git-cli ci'
 (( $+aliases[gxo] )) || alias gxo='git-cli open'
+(( $+aliases[gxw] )) || alias gxw='git-cli worktree'
 
 (( $+aliases[gxuz] )) || alias gxuz='git-cli utils zip'
 (( $+aliases[gxuc] )) || alias gxuc='git-cli utils copy-staged'
@@ -70,6 +71,25 @@ fi
 (( $+aliases[gxocs] )) || alias gxocs='git-cli open commits'
 (( $+aliases[gxof] )) || alias gxof='git-cli open file'
 (( $+aliases[gxobl] )) || alias gxobl='git-cli open blame'
+
+# Jump into a worktree (uses eval to change the parent shell's directory):
+if (( ! $+functions[gxwcd] )); then
+  gxwcd() { eval "$(git-cli worktree go --shell "$@")"; }
+fi
+# Best-effort worktree-name completion for the cd helper. Guarded on `compdef`
+# so sourcing this file before `compinit` stays error-free; agents never reach
+# this path. Candidates come straight from the live `git worktree list`.
+if (( $+functions[compdef] )); then
+  _nils_cli_gxwcd() {
+    local -a _nils_wt
+    _nils_wt=( ${(f)"$(command git worktree list --porcelain 2>/dev/null | awk '
+      /^worktree /  { n = split($2, p, "/"); print p[n] }
+      /^branch /    { b = $2; sub(/^refs\/heads\//, "", b); print b }
+    ')"} )
+    compadd -- $_nils_wt
+  }
+  compdef _nils_cli_gxwcd gxwcd
+fi
 
 # ---------------------------------------------------------------------------
 # codex-cli (cx*)

@@ -315,11 +315,29 @@ fn build_worktree_group() -> Command {
                         .help("Base ref for the new branch")
                         .value_name("ref"),
                 )
+                .arg(kind_arg())
                 .arg(format_arg()),
         )
         .subcommand(
             Command::new("list")
                 .about("List git worktrees")
+                .arg(format_arg()),
+        )
+        .subcommand(
+            Command::new("go")
+                .about("Resolve a worktree path to cd into")
+                .arg(
+                    Arg::new("target")
+                        .value_name("slug-or-branch-or-path")
+                        .required(true)
+                        .value_hint(ValueHint::AnyPath),
+                )
+                .arg(
+                    Arg::new("shell")
+                        .long("shell")
+                        .help("Print an evaluable cd command instead of the bare path")
+                        .action(ArgAction::SetTrue),
+                )
                 .arg(format_arg()),
         )
         .subcommand(
@@ -482,4 +500,58 @@ fn format_arg() -> Arg {
         .help("Output format")
         .value_name("format")
         .value_parser(["text", "json"])
+}
+
+fn kind_arg() -> Arg {
+    Arg::new("kind")
+        .long("kind")
+        .help("Branch prefix kind")
+        .value_name("kind")
+        .value_parser(["feature", "bug", "chore", "docs", "ci", "refactor"])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_command_model;
+
+    #[test]
+    fn worktree_group_exposes_go_subcommand() {
+        let cmd = build_command_model();
+        let worktree = cmd
+            .find_subcommand("worktree")
+            .expect("worktree group present");
+        let go = worktree
+            .find_subcommand("go")
+            .expect("worktree go subcommand present in completion model");
+        assert!(
+            go.get_arguments().any(|arg| arg.get_id() == "shell"),
+            "worktree go should advertise --shell in completion"
+        );
+    }
+
+    #[test]
+    fn worktree_add_kind_advertises_value_candidates() {
+        let cmd = build_command_model();
+        let worktree = cmd
+            .find_subcommand("worktree")
+            .expect("worktree group present");
+        let add = worktree
+            .find_subcommand("add")
+            .expect("worktree add subcommand present");
+        let kind = add
+            .get_arguments()
+            .find(|arg| arg.get_id() == "kind")
+            .expect("worktree add --kind arg present in completion model");
+        let values: Vec<String> = kind
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_string())
+            .collect();
+        for expected in ["feature", "bug", "chore", "docs", "ci", "refactor"] {
+            assert!(
+                values.iter().any(|value| value == expected),
+                "kind candidate `{expected}` should be present, got {values:?}"
+            );
+        }
+    }
 }

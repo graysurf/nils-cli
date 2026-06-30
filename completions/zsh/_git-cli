@@ -1,4 +1,4 @@
-#compdef git-cli gx gxh gxu gxr gxc gxb gxi gxo \
+#compdef git-cli gx gxh gxu gxr gxc gxb gxi gxo gxw \
 #  gxuz gxuc gxur gxuh gxrs gxrm gxrh gxru gxrbh gxrbc gxrr \
 #  gxcc gxcj gxcs gxbc gxip \
 #  gxor gxob gxod gxoc gxocp gxop gxopl gxoi gxoa gxorl gxot gxocs gxof gxobl
