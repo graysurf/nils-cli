@@ -123,8 +123,9 @@ fn live_home_for<'a>(ctx: &'a HelperContext, product: &str) -> Result<&'a str, E
     match product {
         "codex" => Ok(roots.codex.live_home.as_str()),
         "claude" => Ok(roots.claude.live_home.as_str()),
+        "hermes" => Ok(roots.hermes.live_home.as_str()),
         other => Err(helper_error(format!(
-            "script(): unknown product {other:?}; supported: codex, claude",
+            "script(): unknown product {other:?}; supported: codex, claude, hermes",
         ))),
     }
 }

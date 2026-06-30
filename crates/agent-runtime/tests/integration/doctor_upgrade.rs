@@ -65,6 +65,14 @@ products:
     recommended_version: \"0.2.0\"
     min_version_effective_from: \"2099-01-01\"
     version_probe: \"claude --version\"
+  hermes:
+    live_home: \"{home}\"
+    docs_home: \"{home}\"
+    state_home: \"{state_home}\"
+    min_version: \"0.1.0\"
+    recommended_version: \"0.2.0\"
+    min_version_effective_from: \"2099-01-01\"
+    version_probe: \"hermes --version\"
 ",
             home = home.display(),
             state_home = state_home.display(),

@@ -36,7 +36,7 @@ pub const DEFAULT_RETENTION: usize = 5;
 
 /// Products that gc-backups can scan when `--product` is not specified.
 /// Kept in deterministic order so test golden output stays stable.
-pub const ALL_PRODUCTS: &[&str] = &["claude", "codex"];
+pub const ALL_PRODUCTS: &[&str] = &["claude", "codex", "hermes"];
 
 /// Per-run dry-run / apply selector. Mirrors `install::Mode` /
 /// `uninstall::Mode` / `restore_backups::Mode` so the four lifecycle

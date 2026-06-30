@@ -20,3 +20,11 @@ products:
     recommended_version: "0.12.0"
     min_version_effective_from: "2026-05-21"
     version_probe: "claude --version"
+  hermes:
+    live_home: "$HOME/.hermes"
+    docs_home: "$HOME/.hermes"
+    state_home: "${HERMES_HOME:-$HOME/.hermes}"
+    min_version: "0.17.0"
+    recommended_version: "0.17.0"
+    min_version_effective_from: "2026-06-30"
+    version_probe: "hermes --version"

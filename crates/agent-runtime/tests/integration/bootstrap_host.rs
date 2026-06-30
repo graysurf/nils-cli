@@ -29,6 +29,7 @@ fn fixture(tmp: &TempDir) -> PathBuf {
     let state = tmp.path().join("state");
     let codex_live = live.join("codex");
     let claude_live = live.join("claude");
+    let hermes_live = live.join("hermes");
 
     write(
         &root.join("manifests/skills.yaml"),
@@ -90,6 +91,21 @@ products:
     runtime_state:
       state_home_env: "STATE"
       default_path: "/tmp/state"
+  hermes:
+    nested_skill_support: true
+    plugin_manifest:
+      path_pattern: "ignored"
+      loaded_at_runtime: false
+      schema_ref: "ignored"
+    hooks_model:
+      config_surface: "n/a"
+      payload_shape: "n/a"
+      supports_inline_python: false
+    config_activation:
+      - "$HOME/.hermes/SOUL.md"
+    runtime_state:
+      state_home_env: "HERMES_HOME"
+      default_path: "/tmp/state"
 "#,
     );
     write(
@@ -118,6 +134,14 @@ products:
     recommended_version: "0.0.0"
     min_version_effective_from: "2026-01-01"
     version_probe: "claude --version"
+  hermes:
+    live_home: "{}"
+    docs_home: "{}"
+    state_home: "{}"
+    min_version: "0.0.0"
+    recommended_version: "0.0.0"
+    min_version_effective_from: "2026-01-01"
+    version_probe: "hermes --version"
 "#,
             codex_live.display(),
             codex_live.display(),
@@ -127,6 +151,9 @@ products:
             claude_live.display(),
             state.join("claude").display(),
             claude_live.display(),
+            hermes_live.display(),
+            hermes_live.display(),
+            state.join("hermes").display(),
         ),
     );
     write(

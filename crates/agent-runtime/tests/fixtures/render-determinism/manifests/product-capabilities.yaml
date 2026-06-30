@@ -32,3 +32,19 @@ products:
       state_home_env: "CLAUDE_KIT_STATE_HOME"
       default_path: "${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit/claude"
     marketplace_concept: true
+  hermes:
+    nested_skill_support: true
+    plugin_manifest:
+      path_pattern: "$HOME/.hermes/plugins/<domain>/.hermes-plugin/plugin.json"
+      loaded_at_runtime: false
+      schema_ref: "core/docs/schemas/hermes-plugin.schema.json"
+    hooks_model:
+      config_surface: "n/a"
+      payload_shape: "n/a"
+      supports_inline_python: false
+    config_activation:
+      - "$HOME/.hermes/SOUL.md"
+    runtime_state:
+      state_home_env: "HERMES_HOME"
+      default_path: "$HOME/.hermes"
+    marketplace_concept: false

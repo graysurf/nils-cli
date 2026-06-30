@@ -62,7 +62,7 @@ pub enum DoctorError {
     Coverage(#[from] coverage::CoverageError),
     #[error("version-alignment: {0}")]
     VersionAlignment(#[from] version_alignment::VersionAlignmentError),
-    #[error("unknown product `{product}`; expected `codex` or `claude`")]
+    #[error("unknown product `{product}`; expected `codex`, `claude`, or `hermes`")]
     UnknownProduct { product: String },
 }
 
@@ -467,6 +467,7 @@ fn product_root<'a>(
     match product {
         "codex" => Ok(&runtime_roots.products.codex),
         "claude" => Ok(&runtime_roots.products.claude),
+        "hermes" => Ok(&runtime_roots.products.hermes),
         other => Err(DoctorError::UnknownProduct {
             product: other.to_string(),
         }),
@@ -495,6 +496,14 @@ fn resolve_runtime_roots_with_env(
     {
         env.insert(
             "CODEX_HOME".to_string(),
+            live_home.to_string_lossy().into_owned(),
+        );
+    }
+    if let Some(live_home) = live_home_override
+        && product == "hermes"
+    {
+        env.insert(
+            "HERMES_HOME".to_string(),
             live_home.to_string_lossy().into_owned(),
         );
     }
@@ -555,6 +564,14 @@ fn resolve_product_path(
                 return live_home.to_path_buf();
             }
             if let Some(rest) = raw.strip_prefix("$CODEX_HOME/") {
+                return live_home.join(rest);
+            }
+        }
+        if product == "hermes" {
+            if raw == "$HOME/.hermes" {
+                return live_home.to_path_buf();
+            }
+            if let Some(rest) = raw.strip_prefix("$HOME/.hermes/") {
                 return live_home.join(rest);
             }
         }
