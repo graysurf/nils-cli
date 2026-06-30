@@ -59,6 +59,21 @@ products:
     runtime_state:
       state_home_env: "STATE"
       default_path: "/tmp/state"
+  hermes:
+    nested_skill_support: true
+    plugin_manifest:
+      path_pattern: "ignored"
+      loaded_at_runtime: false
+      schema_ref: "ignored"
+    hooks_model:
+      config_surface: "n/a"
+      payload_shape: "n/a"
+      supports_inline_python: false
+    config_activation:
+      - "$HOME/.hermes/skills"
+    runtime_state:
+      state_home_env: "STATE"
+      default_path: "/tmp/state"
 "#;
 
 const VALID_RUNTIME_ROOTS: &str = r#"
@@ -84,6 +99,14 @@ products:
     recommended_version: "<TBD: pin during Phase 1>"
     min_version_effective_from: "<TBD: pin during Phase 1>"
     version_probe: "claude --version"
+  hermes:
+    live_home: "$HOME/.hermes"
+    docs_home: "$HOME/.hermes"
+    state_home: "/tmp/state"
+    min_version: "1.0.0"
+    recommended_version: "1.0.0"
+    min_version_effective_from: "<TBD>"
+    version_probe: "hermes --version"
 "#;
 
 const VALID_CLI_TOOLS: &str = r#"

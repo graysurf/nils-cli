@@ -146,6 +146,7 @@ mod test_support {
                 render_to: "plugins/market/skills/favorites/SKILL.md".to_string(),
                 path_override: None,
             }),
+            hermes: None,
         };
         let mut required_clis = IndexMap::new();
         required_clis.insert("agent-out".to_string(), ">=0.5.0".to_string());
@@ -186,6 +187,7 @@ mod test_support {
                 products: ProductCapabilitiesProducts {
                     codex: product_capability(),
                     claude: product_capability(),
+                    hermes: product_capability(),
                 },
                 plugin_manifest_diff: None,
             },
@@ -194,6 +196,7 @@ mod test_support {
                 products: RuntimeRootsProducts {
                     codex: product_root(),
                     claude: product_root(),
+                    hermes: product_root(),
                 },
                 host_profiles: IndexMap::new(),
             },

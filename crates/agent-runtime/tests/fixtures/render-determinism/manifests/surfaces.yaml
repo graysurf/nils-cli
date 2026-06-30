@@ -40,3 +40,19 @@ surfaces:
             descriptive_only: true
         source_manifest:
           - "manifests/runtime-roots.yaml:2"
+      hermes:
+        state: shipped
+        mechanism: "hermes deterministic mechanism"
+        source_artifacts:
+          - SOUL.md
+        min_product: "0.17.0"
+        min_nils_cli: "v0.20.0"
+        acceptance:
+          - kind: ci
+            note: "cargo test"
+            descriptive_only: true
+          - kind: live
+            note: "manual session"
+            descriptive_only: true
+        source_manifest:
+          - "manifests/runtime-roots.yaml:3"

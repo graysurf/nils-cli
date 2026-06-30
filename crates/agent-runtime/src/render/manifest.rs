@@ -182,8 +182,8 @@ pub struct Skill {
     pub domain: String,
     pub source: String,
     // `products` is required per the upstream schema. The map is closed
-    // to the known products (`codex`, `claude`) — an unknown key in
-    // skills.yaml is a typo, not a silent skip.
+    // to the known products (`codex`, `claude`, `hermes`) — an unknown key
+    // in skills.yaml is a typo, not a silent skip.
     pub products: SkillProducts,
     pub required_clis: IndexMap<String, String>,
     #[serde(default)]
@@ -208,6 +208,8 @@ pub struct SkillProducts {
     pub codex: Option<ProductRender>,
     #[serde(default)]
     pub claude: Option<ProductRender>,
+    #[serde(default)]
+    pub hermes: Option<ProductRender>,
 }
 
 impl SkillProducts {
@@ -218,6 +220,7 @@ impl SkillProducts {
         match product {
             "codex" => self.codex.as_ref(),
             "claude" => self.claude.as_ref(),
+            "hermes" => self.hermes.as_ref(),
             _ => None,
         }
     }
@@ -316,6 +319,8 @@ pub struct PluginProductManifests {
     pub codex: Option<String>,
     #[serde(default)]
     pub claude: Option<String>,
+    #[serde(default)]
+    pub hermes: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -351,6 +356,7 @@ impl WithSchemaVersion for ProductCapabilitiesManifest {
 pub struct ProductCapabilitiesProducts {
     pub codex: ProductCapability,
     pub claude: ProductCapability,
+    pub hermes: ProductCapability,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +430,7 @@ impl WithSchemaVersion for RuntimeRootsManifest {
 pub struct RuntimeRootsProducts {
     pub codex: ProductRoot,
     pub claude: ProductRoot,
+    pub hermes: ProductRoot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,6 +539,22 @@ products:
       state_home_env: "CLAUDE_KIT_STATE_HOME"
       default_path: "${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-kit/claude"
     marketplace_concept: true
+  hermes:
+    nested_skill_support: true
+    plugin_manifest:
+      path_pattern: "$HERMES_HOME/plugins/<domain>/.hermes-plugin/plugin.json"
+      loaded_at_runtime: false
+      schema_ref: "core/docs/schemas/hermes-plugin.schema.json"
+    hooks_model:
+      config_surface: "n/a (Hermes has no native hook system)"
+      payload_shape: "n/a"
+      supports_inline_python: false
+    config_activation:
+      - "$HERMES_HOME/config.yaml"
+    runtime_state:
+      state_home_env: "HERMES_HOME"
+      default_path: "$HOME/.hermes"
+    marketplace_concept: false
 "#;
     const VALID_RUNTIME_ROOTS: &str = r#"
 schema_version: 1
@@ -556,6 +579,14 @@ products:
     recommended_version: "<TBD: pin during Phase 1>"
     min_version_effective_from: "<TBD: pin during Phase 1>"
     version_probe: "claude --version"
+  hermes:
+    live_home: "$HOME/.hermes"
+    docs_home: "$HOME/.hermes"
+    state_home: "$HOME/.hermes"
+    min_version: "1.0.0"
+    recommended_version: "1.0.0"
+    min_version_effective_from: "<TBD>"
+    version_probe: "hermes --version"
 "#;
     const VALID_CLI_TOOLS: &str = r#"
 schema_version: 1

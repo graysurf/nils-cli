@@ -846,9 +846,9 @@ fn validate_render_to(skill_id: &str, product: &str, render_to: &str) -> Result<
 
 fn require_known_product(manifests: &ManifestSet, product: &str) -> Result<()> {
     match product {
-        "codex" | "claude" => Ok(()),
+        "codex" | "claude" | "hermes" => Ok(()),
         other => Err(anyhow!(
-            "unknown --product {other:?}; supported: codex, claude. \
+            "unknown --product {other:?}; supported: codex, claude, hermes. \
              schema_version={}",
             manifests.product_capabilities.schema_version
         )),
@@ -872,8 +872,9 @@ fn render_template(
     };
     let mut engine = Engine::builder().build();
     register_all(&mut engine, Arc::new(ctx));
+    let vars = serde_json::json!({ "product": product });
     engine
-        .render_str(template_body, &serde_json::Value::Null)
+        .render_str(template_body, &vars)
         .with_context(|| format!("render skill {}", skill.id))
 }
 
@@ -1318,6 +1319,21 @@ products:
     runtime_state:
       state_home_env: "STATE"
       default_path: "/tmp/state"
+  hermes:
+    nested_skill_support: true
+    plugin_manifest:
+      path_pattern: "ignored"
+      loaded_at_runtime: false
+      schema_ref: "ignored"
+    hooks_model:
+      config_surface: "n/a"
+      payload_shape: "n/a"
+      supports_inline_python: false
+    config_activation:
+      - "$HOME/.hermes/skills"
+    runtime_state:
+      state_home_env: "STATE"
+      default_path: "/tmp/state"
 "#;
 
     const RUNTIME_ROOTS: &str = r#"
@@ -1343,6 +1359,14 @@ products:
     recommended_version: "<TBD: pin during Phase 1>"
     min_version_effective_from: "<TBD: pin during Phase 1>"
     version_probe: "claude --version"
+  hermes:
+    live_home: "$HOME/.hermes"
+    docs_home: "$HOME/.hermes"
+    state_home: "/tmp/state"
+    min_version: "1.0.0"
+    recommended_version: "1.0.0"
+    min_version_effective_from: "<TBD>"
+    version_probe: "hermes --version"
 "#;
 
     const CLI_TOOLS: &str = r#"

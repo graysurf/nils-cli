@@ -231,7 +231,10 @@ fn identify_skill(product: &str, dest_rel: &Path) -> Option<String> {
         })
         .collect();
     match product {
-        "codex" => {
+        // Hermes installs skills under `~/.hermes/skills/<domain>/<skill>/`
+        // via a recursive copy, so its destination layout matches codex's
+        // `skills/<domain>/<skill>` surface exactly.
+        "codex" | "hermes" => {
             // `skills/<domain>/<skill>` is the active discoverable skill
             // surface; the rehearsal pins these.
             if components.len() == 3 && components[0] == "skills" {

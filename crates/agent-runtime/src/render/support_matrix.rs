@@ -52,11 +52,20 @@ struct Surface {
 struct SurfaceProducts {
     codex: SurfaceProduct,
     claude: SurfaceProduct,
+    // Optional so codex/claude-only surface manifests (and the crate's own
+    // fixtures) still parse. The runtime-kit enforces hermes presence on
+    // every surface through `scripts/ci/validate-surfaces-manifest.sh`.
+    #[serde(default)]
+    hermes: Option<SurfaceProduct>,
 }
 
 impl SurfaceProducts {
-    fn iter(&self) -> [(&'static str, &SurfaceProduct); 2] {
-        [("codex", &self.codex), ("claude", &self.claude)]
+    fn iter(&self) -> Vec<(&'static str, &SurfaceProduct)> {
+        let mut out = vec![("codex", &self.codex), ("claude", &self.claude)];
+        if let Some(hermes) = &self.hermes {
+            out.push(("hermes", hermes));
+        }
+        out
     }
 }
 
@@ -136,7 +145,11 @@ pub fn render(root: &SourceRoot) -> Result<SupportMatrixReport> {
     Ok(SupportMatrixReport {
         output_path: guarded,
         surfaces: manifest.surfaces.len(),
-        rows: manifest.surfaces.len() * 2,
+        rows: manifest
+            .surfaces
+            .iter()
+            .map(|surface| surface.products.iter().len())
+            .sum(),
     })
 }
 
