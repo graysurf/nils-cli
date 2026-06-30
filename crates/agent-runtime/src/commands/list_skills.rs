@@ -95,9 +95,9 @@ pub struct SkillWarning {
 }
 
 pub fn run(args: ListSkillsArgs) -> anyhow::Result<u8> {
-    if args.product != "claude" && args.product != "codex" {
+    if args.product != "claude" && args.product != "codex" && args.product != "hermes" {
         anyhow::bail!(
-            "agent-runtime list-skills: unknown --product `{}` (expected one of: claude, codex)",
+            "agent-runtime list-skills: unknown --product `{}` (expected one of: claude, codex, hermes)",
             args.product
         );
     }
@@ -547,6 +547,97 @@ entries:
             };
             let dest_rel = dest.strip_prefix(&synthetic_home).unwrap();
             if let Some(id) = identify_skill("claude", dest_rel)
+                && seen.insert(id.clone())
+            {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "reporting.daily-brief".to_string(),
+                "reporting.topic-radar".to_string(),
+            ]
+        );
+    }
+
+    fn make_hermes_source_root() -> TempDir {
+        // Hermes installs skills under `~/.hermes/skills/<domain>/<skill>/`
+        // via a recursive skills-tree, so destinations are relative to the
+        // `~/.hermes` live-home and start with a bare `skills/` (no `.hermes/`
+        // prefix) exactly like codex's `skills/` surface.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_min_runtime_roots(root);
+        write(
+            &root.join("targets/hermes/link-map.yaml"),
+            r#"schema_version: 1
+entries:
+  - id: reporting.plugin-manifest
+    kind: plugin-manifest-copy
+    source: targets/hermes/plugins/reporting/.hermes-plugin/plugin.json
+    destination: plugins/reporting/.hermes-plugin/plugin.json
+  - id: reporting.skills-tree
+    kind: symlinked-file
+    source: build/hermes/plugins/reporting/skills
+    destination: skills/reporting
+    recursive: true
+"#,
+        );
+        write(
+            &root.join("targets/hermes/plugins/reporting/.hermes-plugin/plugin.json"),
+            "{}\n",
+        );
+        write(
+            &root.join("build/hermes/plugins/reporting/skills/daily-brief/SKILL.md"),
+            "# daily-brief\n",
+        );
+        write(
+            &root.join("build/hermes/plugins/reporting/skills/topic-radar/SKILL.md"),
+            "# topic-radar\n",
+        );
+        tmp
+    }
+
+    #[test]
+    fn accepts_hermes_product() {
+        // Before hermes was added to the product guard, `run` bailed with
+        // "unknown --product `hermes`"; it must now enumerate cleanly.
+        let tmp = make_hermes_source_root();
+        let args = ListSkillsArgs {
+            source_root: Some(tmp.path().to_path_buf()),
+            product: "hermes".to_string(),
+            live_home: None,
+            format: OutputFormat::Json,
+            include_warnings: false,
+        };
+        assert_eq!(run(args).unwrap(), 0);
+    }
+
+    #[test]
+    fn hermes_recursive_expansion_yields_one_record_per_skill() {
+        let tmp = make_hermes_source_root();
+        let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
+        let link_map = LinkMap::load(root.path(), "hermes").unwrap();
+        let synthetic_home = PathBuf::from("/var/empty/agent-runtime-list-skills-home");
+        let synthetic_state = PathBuf::from("/var/empty/agent-runtime-list-skills-state");
+        let plan = InstallPlan::build(
+            "hermes",
+            root.path(),
+            &synthetic_home,
+            &synthetic_state,
+            &link_map,
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for action in &plan.actions {
+            let PlanAction::Symlink { dest, .. } = action else {
+                continue;
+            };
+            let dest_rel = dest.strip_prefix(&synthetic_home).unwrap();
+            if let Some(id) = identify_skill("hermes", dest_rel)
                 && seen.insert(id.clone())
             {
                 ids.push(id);

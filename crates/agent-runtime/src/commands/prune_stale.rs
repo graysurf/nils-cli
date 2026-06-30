@@ -12,7 +12,7 @@ pub struct PruneStaleArgs {
     /// Defaults to the current working directory.
     #[arg(long)]
     pub source_root: Option<PathBuf>,
-    /// Product to prune (`codex` or `claude`).
+    /// Product to prune (`codex`, `claude`, or `hermes`).
     #[arg(long)]
     pub product: String,
     /// Absolute path of the runtime home to scan and optionally repair.
@@ -65,9 +65,9 @@ struct JsonData<'a> {
 }
 
 pub fn run(args: PruneStaleArgs) -> anyhow::Result<u8> {
-    if args.product != "claude" && args.product != "codex" {
+    if args.product != "claude" && args.product != "codex" && args.product != "hermes" {
         anyhow::bail!(
-            "agent-runtime prune-stale: unknown --product `{}` (expected one of: claude, codex)",
+            "agent-runtime prune-stale: unknown --product `{}` (expected one of: claude, codex, hermes)",
             args.product
         );
     }
@@ -185,5 +185,89 @@ fn format_change(change: &PruneChange) -> String {
         PruneChange::SkippedNonEmptyDirectory { rel_path, .. } => {
             format!("  ? skip non-empty directory {}", rel_path.display())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn write(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    fn make_hermes_source_root() -> TempDir {
+        // Mirrors the real `targets/hermes/link-map.yaml`: destinations are
+        // relative to the `~/.hermes` live-home and start with a bare
+        // `skills/` / `plugins/` (no `.hermes/` prefix).
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("manifests/runtime-roots.yaml"),
+            "schema_version: 1\nproducts: {}\n",
+        );
+        write(
+            &root.join("targets/hermes/link-map.yaml"),
+            r#"schema_version: 1
+entries:
+  - id: reporting.plugin-manifest
+    kind: plugin-manifest-copy
+    source: targets/hermes/plugins/reporting/.hermes-plugin/plugin.json
+    destination: plugins/reporting/.hermes-plugin/plugin.json
+  - id: reporting.skills-tree
+    kind: symlinked-file
+    source: build/hermes/plugins/reporting/skills
+    destination: skills/reporting
+    recursive: true
+"#,
+        );
+        write(
+            &root.join("targets/hermes/plugins/reporting/.hermes-plugin/plugin.json"),
+            "{}\n",
+        );
+        write(
+            &root.join("build/hermes/plugins/reporting/skills/daily-brief/SKILL.md"),
+            "# daily-brief\n",
+        );
+        tmp
+    }
+
+    fn hermes_args(source_root: &Path, live_home: &Path, product: &str) -> PruneStaleArgs {
+        PruneStaleArgs {
+            source_root: Some(source_root.to_path_buf()),
+            product: product.to_string(),
+            live_home: live_home.to_path_buf(),
+            no_overlay: true,
+            overlay_path: None,
+            dry_run: true,
+            apply: false,
+            format: OutputFormat::Json,
+        }
+    }
+
+    #[test]
+    fn accepts_hermes_product() {
+        // Before hermes was added to the product guard, `run` bailed with
+        // "unknown --product `hermes`"; pruning an empty live-home must now
+        // succeed (the sync workflow runs prune-stale for hermes).
+        let src = make_hermes_source_root();
+        let live = TempDir::new().unwrap();
+        let args = hermes_args(src.path(), live.path(), "hermes");
+        assert_eq!(run(args).unwrap(), 0);
+    }
+
+    #[test]
+    fn rejects_unknown_product() {
+        let src = make_hermes_source_root();
+        let live = TempDir::new().unwrap();
+        let args = hermes_args(src.path(), live.path(), "vscode");
+        let err = run(args).unwrap_err();
+        assert!(err.to_string().contains("unknown --product"));
     }
 }
