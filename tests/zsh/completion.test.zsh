@@ -116,7 +116,19 @@ typeset -A required_alias_prefix_by_binary
 integer required_count=0
 
 for row in "${matrix_rows[@]}"; do
-  IFS=$'\t' read -r binary obligation zsh_cell bash_cell alias_required alias_prefix engine <<< "$row"
+  # Split on tabs WITHOUT collapsing empties: `read` merges consecutive IFS
+  # delimiters, which drops an empty `alias_prefix` and shifts `engine` off the
+  # end — silently disabling the dynamic-engine assertion for dynamic CLIs that
+  # have no alias family (e.g. agent-memory, secrets). `(@ps:\t:)` preserves the
+  # empty field so every column lands in its intended slot.
+  local -a _row_fields=("${(@ps:\t:)row}")
+  binary="${_row_fields[1]-}"
+  obligation="${_row_fields[2]-}"
+  zsh_cell="${_row_fields[3]-}"
+  bash_cell="${_row_fields[4]-}"
+  alias_required="${_row_fields[5]-}"
+  alias_prefix="${_row_fields[6]-}"
+  engine="${_row_fields[7]-}"
 
   [[ -n "$binary" ]] || continue
 

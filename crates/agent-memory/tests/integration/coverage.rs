@@ -292,25 +292,98 @@ fn invalid_flag_is_a_usage_error() {
 }
 
 #[test]
-fn completion_scripts_render_for_supported_shells() {
+fn completion_zsh_emits_dynamic_registration() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_layout(tmp.path());
+
+    let zsh = run_home(tmp.path(), &["completion", "zsh"]);
+    assert_eq!(zsh.code, 0, "stderr={}", zsh.stderr);
+    // agent-memory is a `completion_engine=dynamic` CLI: the exported zsh script
+    // is a clap_complete `CompleteEnv` registration stub, not a static
+    // `generate()` script. The dynamic completer calls back into the binary at
+    // TAB time to enumerate live memory scopes.
+    assert!(
+        zsh.stdout.contains("#compdef agent-memory"),
+        "dynamic zsh registration keeps the #compdef header"
+    );
+    assert!(
+        zsh.stdout.contains("_clap_dynamic_completer_agent_memory"),
+        "dynamic zsh registration defines the CompleteEnv completer function"
+    );
+    assert!(
+        zsh.stdout
+            .contains("compdef _clap_dynamic_completer_agent_memory agent-memory"),
+        "dynamic zsh registration binds the completer to agent-memory"
+    );
+    // The static `generate()` surface (`_arguments`) must be gone: candidates are
+    // computed at runtime, not baked into the stub.
+    assert!(
+        !zsh.stdout.contains("_arguments"),
+        "dynamic stub must not embed the static `_arguments` surface"
+    );
+}
+
+#[test]
+fn dynamic_completion_enumerates_live_scopes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_layout(tmp.path());
+    fs::create_dir_all(tmp.path().join("agents/alpha")).expect("agent alpha");
+    fs::create_dir_all(tmp.path().join("agents/beta")).expect("agent beta");
+    fs::create_dir_all(tmp.path().join("personas/reviewer/memory")).expect("persona reviewer");
+
+    // Drive the clap_complete `CompleteEnv` runtime completer directly: with
+    // `COMPLETE=zsh` set and the cursor on the `SCOPE` positional, the binary
+    // should print the live scope candidates attached via `#[arg(add = ...)]`.
+    let amh = tmp.path().to_string_lossy().into_owned();
+    let home = tmp.path().join("home").to_string_lossy().into_owned();
+    let options = CmdOptions::new()
+        .with_env_remove_many(&["XDG_CONFIG_HOME"])
+        .with_envs(&[
+            ("AGENT_MEMORY_HOME", amh.as_str()),
+            ("HOME", home.as_str()),
+            ("COMPLETE", "zsh"),
+            ("_CLAP_COMPLETE_INDEX", "2"),
+            ("_CLAP_IFS", "\n"),
+        ]);
+    let output = run_resolved(
+        "agent-memory",
+        &["--", "agent-memory", "path", ""],
+        &options,
+    );
+    let stdout = output.stdout_text();
+
+    for expected in [
+        "root",
+        "global",
+        "agents/alpha",
+        "agents/beta",
+        "personas/reviewer",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "scope completion should offer `{expected}`, got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn completion_bash_emits_dynamic_registration() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     seed_layout(tmp.path());
 
     let bash = run_home(tmp.path(), &["completion", "bash"]);
     assert_eq!(bash.code, 0, "stderr={}", bash.stderr);
     assert!(
-        bash.stdout.contains("agent-memory"),
-        "bash completion should mention the binary"
+        bash.stdout.contains("_clap_complete_agent_memory"),
+        "dynamic bash registration defines the CompleteEnv completer function"
+    );
+    assert!(
+        bash.stdout
+            .contains("-F _clap_complete_agent_memory agent-memory"),
+        "dynamic bash registration binds the completer to agent-memory via complete -F"
     );
     assert!(
         !bash.stdout.contains("__subcmd__"),
-        "bash completion placeholder should be normalized away"
-    );
-
-    let zsh = run_home(tmp.path(), &["completion", "zsh"]);
-    assert_eq!(zsh.code, 0, "stderr={}", zsh.stderr);
-    assert!(
-        zsh.stdout.contains("#compdef agent-memory"),
-        "zsh completion should declare the compdef header"
+        "dynamic stub must not carry the static subcommand placeholder"
     );
 }

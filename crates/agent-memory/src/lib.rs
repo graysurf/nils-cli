@@ -33,6 +33,11 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
+    // Short-circuit `COMPLETE=<shell> agent-memory ...` dynamic-completion
+    // requests before the normal parse. No-op when `COMPLETE` is unset, so
+    // ordinary invocations are unaffected.
+    completion::complete_env();
+
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     if args.len() == 1 {
         return match print_help() {
@@ -227,6 +232,41 @@ pub(crate) fn memory_scopes(layout: &Layout) -> Result<Vec<(String, PathBuf)>, C
     }
 
     Ok(scopes)
+}
+
+/// Enumerate the memory scopes a user can pass as a `SCOPE` argument, for shell
+/// completion: the two well-known roots (`root`, `global`) followed by each
+/// registered `agents/<id>` and `personas/<id>`. Reuses the same store layout
+/// and `child_dirs` enumeration the `agents`/`personas` subcommands rely on.
+///
+/// This runs at TAB time inside the dynamic completer, so it must never panic
+/// or block: any resolution or I/O failure yields the well-known roots (or an
+/// empty vec) instead of an error, and it performs no network access.
+pub(crate) fn scope_completion_values() -> Vec<String> {
+    let mut values = vec!["root".to_string(), "global".to_string()];
+
+    let Ok(layout) = Layout::from_env() else {
+        return values;
+    };
+
+    for (dir, prefix) in [
+        (layout.agents_dir(), "agents"),
+        (layout.personas_dir(), "personas"),
+    ] {
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(children) = child_dirs(&dir) else {
+            continue;
+        };
+        for child in children {
+            if let Some(name) = dir_name(&child) {
+                values.push(format!("{prefix}/{name}"));
+            }
+        }
+    }
+
+    values
 }
 
 fn list_scope(layout: &Layout, args: &ListArgs) -> Result<i32, CliError> {

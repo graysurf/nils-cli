@@ -1,5 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueHint};
+use clap_complete::engine::ArgValueCandidates;
 use nils_common::cli_contract::OutputFormat;
+
+use crate::completion::scope_candidates;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -56,7 +59,7 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct ScopeArgs {
     /// Scope to resolve.
-    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath)]
+    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath, add = ArgValueCandidates::new(scope_candidates))]
     pub scope: Option<String>,
 }
 
@@ -70,7 +73,7 @@ pub struct IdArgs {
 #[derive(Debug, Args)]
 pub struct CheckArgs {
     /// Scope to check (default: global).
-    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath)]
+    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath, add = ArgValueCandidates::new(scope_candidates))]
     pub scope: Option<String>,
     /// Check every memory scope (global, agents, personas).
     #[arg(long)]
@@ -89,7 +92,7 @@ pub struct CheckArgs {
 #[derive(Debug, Args)]
 pub struct ListArgs {
     /// Scope to list (default: global).
-    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath)]
+    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath, add = ArgValueCandidates::new(scope_candidates))]
     pub scope: Option<String>,
     /// Filter by frontmatter type (user|feedback|project|reference).
     #[arg(long, value_name = "TYPE")]
@@ -105,7 +108,7 @@ pub struct ListArgs {
 #[derive(Debug, Args)]
 pub struct AddArgs {
     /// Scope to write into (default: global).
-    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath)]
+    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath, add = ArgValueCandidates::new(scope_candidates))]
     pub scope: Option<String>,
     /// Note slug (becomes `<slug>.md` and the frontmatter `name`).
     #[arg(long, value_name = "SLUG")]
@@ -145,7 +148,7 @@ pub struct SearchArgs {
     #[arg(value_name = "TERM")]
     pub term: String,
     /// Scope to search (default: global).
-    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath)]
+    #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath, add = ArgValueCandidates::new(scope_candidates))]
     pub scope: Option<String>,
     /// Search every memory scope (global, agents, personas).
     #[arg(long)]

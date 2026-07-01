@@ -63,9 +63,9 @@
 | 2.1 | done | Wire CompleteEnv into git-cli main dispatch | pending; 27b3973 CompleteEnv::with_factory(build_command_model).complete() in run(); idle path (COMPLETE unset) unchanged; verified via integration tests | Wired; idle no-op verified. |
 | 2.2 | done | Attach live worktree candidates to worktree go/remove | pending; 27b3973 ArgValueCandidates over live git worktree list on worktree go/remove targets; empirical smoke returns live slugs+branches | Live candidates verified. |
 | 2.3 | done | Emit CompleteEnv registration + update assets and aliases | pending; 27b3973 emit CompleteEnv registration stub; committed zsh/bash assets load via dynamic adapter; gxw->worktree alias; gxwcd note | Assets + aliases reconciled. |
-| 2.4 | pending | Full CI, release patch, real-install verification | pending | test / test_macos / coverage; zsh + bash real install. |
-| 3.1 | pending | Inventory + add per-CLI dynamic value providers | pending | Gated on released Sprint 2; branches/remotes/tags/worktrees/paths. |
-| 3.2 | pending | Migrate CLI-by-CLI with per-CLI audit + release validation | pending | Opt-in per CLI; static stays for CLIs w/o runtime candidates. |
+| 2.4 | done | Full CI, release patch, real-install verification | pending; Released nils-cli v1.20.5 (PR #1003, tag v1.20.5, 8 tarballs, Homebrew tap 1.20.4->1.20.5); verified shipped dynamic completion on real install (COMPLETE=zsh git-cli -- worktree go returns live candidates) | Sprint 2 pilot released + install-verified. |
+| 3.1 | done | Inventory + add per-CLI dynamic value providers | pending; Inventoried all workspace CLIs; added ArgValueCandidates to agent-memory (scopes) + secrets (store entries). Recorded stay-static set (plan-issue/api-*/agent-docs/etc.) and deferred external-dep CLIs (docker-tools daemon, forge-cli API cost, git-lock raw-args, git-scope git-refs, git-summary no-candidates) | Providers added only where local/fast/fail-soft + valuable. |
+| 3.2 | done | Migrate CLI-by-CLI with per-CLI audit + release validation | pending; Migrated agent-memory + secrets to completion_engine=dynamic (derive #[arg(add=..)] + CompleteEnv); per-CLI audits pass (freshness dynamic_engine_skipped=6, flag-parity=3, asset); release validation via v1.20.6. Remaining candidates (docker-tools/forge-cli/git-lock/git-scope) deferred as documented follow-ups; git-summary stays static | Opt-in per CLI; clear local-candidate wins migrated, external-dep/marginal ones deferred with rationale. |
 
 ## Session Log
 
@@ -105,6 +105,23 @@
   test (it silently exercised only 1 row); fixed so it now covers all 46
   required rows and the new dynamic assertion fires. Sprint 2's own release
   (2.4) and Sprint 3 remain pending.
+- 2026-07-01: Released Sprint 2 as nils-cli `v1.20.5` (PR #1003, tag `v1.20.5`,
+  8 tarballs, Homebrew tap 1.20.4->1.20.5); verified the shipped dynamic
+  completion on the real install (`COMPLETE=zsh git-cli -- git-cli worktree go`
+  returns live worktree candidates). Delivered Sprint 3: migrated `agent-memory`
+  (scope args -> live agent/persona/global scopes) and `secrets` (name args ->
+  live store entry names) to `completion_engine=dynamic` via the derive
+  `#[arg(add = ArgValueCandidates::new(..))]` form + `CompleteEnv`. Scope
+  decision: migrated the clear local/fast/fail-soft wins; kept `git-summary`
+  static (no runtime candidates) and deferred `docker-tools` (needs a live
+  daemon in the completion path), `forge-cli` (per-keystroke API cost), and
+  `git-lock`/`git-scope` (raw-arg / git-ref plumbing) as documented follow-ups.
+  Two 3-lens adversarial reviews (Rust+security, shell+audits+docs): security
+  confirmed the secrets completer emits entry *names* only (never values); one
+  finding fixed — the zsh completion test's tab-collapsing `read` silently
+  skipped the dynamic assertion for no-alias dynamic CLIs, now split
+  empty-preservingly so it covers agent-memory + secrets (negative-control
+  verified). Sprint 3 release (v1.20.6) + closeout pending.
 
 ## Validation
 
