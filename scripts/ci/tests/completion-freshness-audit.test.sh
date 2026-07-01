@@ -125,19 +125,45 @@ assert_fresh_assets_pass() {
 }
 
 assert_dynamic_cli_skipped() {
-  echo "== dynamic-engine CLI is skipped, not flagged stale =="
+  echo "== dynamic-engine CLI is skipped, and static WOULD flag the same asset stale =="
   local output
   output="$(bash "$script" --root "$tmp" --skip-build 2>&1)"
   # The committed dynamic asset differs from the runtime output; a static diff
   # would report it stale. Dynamic mode must not.
-  if grep -qF "stale bash completion asset: completions/bash/dynamic-cli" <<<"$output"; then
-    echo "FAIL: dynamic-cli bash asset was flagged stale (should be skipped)"
+  if grep -qF "stale bash completion asset: completions/bash/dynamic-cli" <<<"$output" \
+    || grep -qF "stale zsh completion asset: completions/zsh/_dynamic-cli" <<<"$output"; then
+    echo "FAIL: dynamic-cli asset was flagged stale (should be skipped)"
     echo "$output"
     exit 1
   fi
-  if grep -qF "stale zsh completion asset: completions/zsh/_dynamic-cli" <<<"$output"; then
-    echo "FAIL: dynamic-cli zsh asset was flagged stale (should be skipped)"
-    echo "$output"
+
+  # Negative control: strip the `completion_engine=dynamic` key so the SAME
+  # differing asset is treated as static. It must now be flagged stale. This
+  # proves the skip is caused by the engine key, not by something incidental,
+  # so this assertion cannot pass vacuously alongside assert_fresh_assets_pass.
+  local matrix="$tmp/docs/specs/completion-coverage-matrix-v1.md"
+  cp "$matrix" "$matrix.orig"
+  sed -i.bak 's/; completion_engine=dynamic`/`/' "$matrix"
+  rm -f "$matrix.bak"
+
+  local ctrl status
+  set +e
+  ctrl="$(bash "$script" --root "$tmp" --skip-build 2>&1)"
+  status=$?
+  set -e
+
+  cp "$matrix.orig" "$matrix"
+  rm -f "$matrix.orig"
+
+  if [[ "$status" -eq 0 ]]; then
+    echo "FAIL: with the engine key removed, the differing dynamic-cli asset should be flagged stale"
+    echo "$ctrl"
+    exit 1
+  fi
+  if ! { grep -qF "stale bash completion asset: completions/bash/dynamic-cli" <<<"$ctrl" \
+      || grep -qF "stale zsh completion asset: completions/zsh/_dynamic-cli" <<<"$ctrl"; }; then
+    echo "FAIL: negative control did not flag the now-static dynamic-cli asset stale"
+    echo "$ctrl"
     exit 1
   fi
   echo "ok"

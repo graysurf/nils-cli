@@ -111,9 +111,14 @@ parse_required_bins() {
   ' "$matrix" | LC_ALL=C sort -u
 }
 
-# Emit `bin<TAB>engine` for each required row. `engine` is `dynamic` when the
-# enforcement-metadata cell carries `completion_engine=dynamic`, else `static`
-# (the default). Scanning the whole row keeps this independent of column order.
+# Emit `bin<TAB>engine` for each required row. `engine` is `dynamic` only when
+# the enforcement-metadata cell (field 6 of the pipe table, `$7` after the
+# leading empty field) carries a `completion_engine=dynamic` value, anchored on
+# a value boundary (`;`, closing backtick, whitespace, or end). Scoping to that
+# cell — not the whole row — and anchoring the value prevents the literal string
+# in a free-text column (e.g. Rationale) or a longer value (e.g.
+# `dynamic-experimental`) from misclassifying a static CLI as dynamic, which
+# would silently skip its freshness diff.
 parse_bin_engine() {
   local matrix="$1"
   awk -F'|' '
@@ -126,7 +131,8 @@ parse_bin_engine() {
       obligation = trim($3)
       if (bin ~ /^`[^`]+`$/ && obligation == "`required`") {
         gsub(/`/, "", bin)
-        engine = ($0 ~ /completion_engine=dynamic/) ? "dynamic" : "static"
+        meta = trim($7)
+        engine = (meta ~ /completion_engine=dynamic([;`\t ]|$)/) ? "dynamic" : "static"
         print bin "\t" engine
       }
     }
