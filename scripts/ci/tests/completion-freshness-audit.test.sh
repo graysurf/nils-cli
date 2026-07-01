@@ -31,6 +31,7 @@ cat >"$tmp/docs/specs/completion-coverage-matrix-v1.md" <<'EOF'
 | --- | --- | --- | --- | --- | --- | --- |
 | `fake-cli` | `required` | `present` (`_fake-cli`) | `present` (`fake-cli`) | not required | `completion_mode=clap-first; completion_mode_toggles=forbidden; alternate_completion_dispatch=forbidden; generated_load_failure=fail-closed` | synthetic test binary |
 | `adapter-cli` | `required` | `present` (`_adapter-cli`) | `present` (`adapter-cli`) | not required | `completion_mode=clap-first; completion_mode_toggles=forbidden; alternate_completion_dispatch=forbidden; generated_load_failure=fail-closed` | synthetic adapter test binary |
+| `dynamic-cli` | `required` | `present` (`_dynamic-cli`) | `present` (`dynamic-cli`) | not required | `completion_mode=clap-first; completion_mode_toggles=forbidden; alternate_completion_dispatch=forbidden; generated_load_failure=fail-closed; completion_engine=dynamic` | synthetic dynamic-engine test binary |
 EOF
 
 cat >"$tmp/target/debug/fake-cli" <<'EOF'
@@ -71,21 +72,102 @@ exit 64
 EOF
 chmod +x "$tmp/target/debug/adapter-cli"
 
+# A dynamic-engine CLI emits a `CompleteEnv` registration whose stub embeds the
+# resolved binary path (`current_exe()`), so the runtime output is intentionally
+# NOT byte-identical to the committed registration asset. The freshness audit
+# must classify it as a dynamic engine and skip the diff instead of flagging it
+# stale.
+cat >"$tmp/target/debug/dynamic-cli" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "completion" && "${2:-}" == "bash" ]]; then
+  printf '%s\n' "complete -F _clap_dynamic_completer_dynamic-cli -o nosort -o bashdefault -o default dynamic-cli"
+  printf '%s\n' "# COMPLETE registration path: /runtime/only/target/debug/dynamic-cli"
+  exit 0
+fi
+
+if [[ "${1:-}" == "completion" && "${2:-}" == "zsh" ]]; then
+  printf '%s\n' "#compdef dynamic-cli"
+  printf '%s\n' "_clap_dynamic_completer_dynamic-cli \"\$@\""
+  printf '%s\n' "# COMPLETE registration path: /runtime/only/target/debug/dynamic-cli"
+  exit 0
+fi
+
+echo "unexpected dynamic-cli invocation: $*" >&2
+exit 64
+EOF
+chmod +x "$tmp/target/debug/dynamic-cli"
+
 printf '%s\n' "bash completion v1" >"$tmp/completions/bash/fake-cli"
 printf '%s\n' "zsh completion v1" >"$tmp/completions/zsh/_fake-cli"
 printf '%s\n' "_nils_cli_completion_common_load_generated_bash" >"$tmp/completions/bash/adapter-cli"
 printf '%s\n' "_nils_cli_completion_common_load_generated_zsh" >"$tmp/completions/zsh/_adapter-cli"
+# Committed dynamic registration asset, deliberately embedding a DIFFERENT
+# (install-time) path than the runtime binary emits above. A static-mode diff
+# would flag this stale; a dynamic-mode audit must skip it.
+printf '%s\n' "complete -F _clap_dynamic_completer_dynamic-cli -o nosort -o bashdefault -o default dynamic-cli" >"$tmp/completions/bash/dynamic-cli"
+printf '%s\n' "# COMPLETE registration path: /opt/homebrew/bin/dynamic-cli" >>"$tmp/completions/bash/dynamic-cli"
+printf '%s\n' "#compdef dynamic-cli" >"$tmp/completions/zsh/_dynamic-cli"
+printf '%s\n' "_clap_dynamic_completer_dynamic-cli \"\$@\"" >>"$tmp/completions/zsh/_dynamic-cli"
+printf '%s\n' "# COMPLETE registration path: /opt/homebrew/bin/dynamic-cli" >>"$tmp/completions/zsh/_dynamic-cli"
 
 assert_fresh_assets_pass() {
   echo "== fresh committed assets pass =="
   local output
   output="$(bash "$script" --root "$tmp" --skip-build)"
-  if ! grep -qF "PASS: completion freshness audit (required=2, snapshots_checked=2, runtime_adapters_skipped=2, failures=0)" <<<"$output"; then
+  if ! grep -qF "PASS: completion freshness audit (required=3, snapshots_checked=2, runtime_adapters_skipped=2, dynamic_engine_skipped=2, failures=0)" <<<"$output"; then
     echo "FAIL: expected fresh assets to pass"
     echo "$output"
     exit 1
   fi
   echo "ok"
+}
+
+assert_dynamic_cli_skipped() {
+  echo "== dynamic-engine CLI is skipped, not flagged stale =="
+  local output
+  output="$(bash "$script" --root "$tmp" --skip-build 2>&1)"
+  # The committed dynamic asset differs from the runtime output; a static diff
+  # would report it stale. Dynamic mode must not.
+  if grep -qF "stale bash completion asset: completions/bash/dynamic-cli" <<<"$output"; then
+    echo "FAIL: dynamic-cli bash asset was flagged stale (should be skipped)"
+    echo "$output"
+    exit 1
+  fi
+  if grep -qF "stale zsh completion asset: completions/zsh/_dynamic-cli" <<<"$output"; then
+    echo "FAIL: dynamic-cli zsh asset was flagged stale (should be skipped)"
+    echo "$output"
+    exit 1
+  fi
+  echo "ok"
+}
+
+assert_dynamic_cli_missing_asset_fails() {
+  echo "== dynamic-engine CLI still requires a committed asset =="
+  local saved output status
+  saved="$(cat "$tmp/completions/zsh/_dynamic-cli")"
+  rm -f "$tmp/completions/zsh/_dynamic-cli"
+
+  set +e
+  output="$(bash "$script" --root "$tmp" --skip-build 2>&1)"
+  status=$?
+  set -e
+
+  # restore for later assertions
+  printf '%s\n' "$saved" >"$tmp/completions/zsh/_dynamic-cli"
+
+  if [[ "$status" -eq 0 ]]; then
+    echo "FAIL: expected missing dynamic asset to fail"
+    echo "$output"
+    exit 1
+  fi
+  if ! grep -qF "missing committed zsh completion asset: completions/zsh/_dynamic-cli" <<<"$output"; then
+    echo "FAIL: missing dynamic asset did not surface the expected failure"
+    echo "$output"
+    exit 1
+  fi
+  echo "ok ($status)"
 }
 
 assert_stale_asset_fails() {
@@ -117,6 +199,8 @@ assert_stale_asset_fails() {
 }
 
 assert_fresh_assets_pass
+assert_dynamic_cli_skipped
+assert_dynamic_cli_missing_asset_fails
 assert_stale_asset_fails
 
 echo

@@ -26,6 +26,7 @@ completion enforcement, and validation stay deterministic across CLI migrations.
   - `completion_mode_toggles=<forbidden>`
   - `alternate_completion_dispatch=<forbidden>`
   - `generated_load_failure=<fail-closed>`
+  - `completion_engine=<static|dynamic>` (optional; absent means `static`)
 
 ## command graph (required)
 
@@ -78,12 +79,13 @@ Checklist:
 Declare and validate metadata that enforces clap-first behavior and forbids runtime mode switches or alternate completion dispatch paths.
 Values must match the CLI row in `docs/specs/completion-coverage-matrix-v1.md`.
 
-| metadata key                    | required value | declared value | enforcement location | verification method                                                        |
-| ------------------------------- | -------------- | -------------- | -------------------- | -------------------------------------------------------------------------- |
-| `completion_mode`               | `clap-first`   | `<value>`      | `<path>`             | `<proof>`                                                                  |
-| `completion_mode_toggles`       | `forbidden`    | `<value>`      | `<path>`             | `rg -n "COMPLETION_MODE" <paths>`                                          |
-| `alternate_completion_dispatch` | `forbidden`    | `<value>`      | `<path>`             | `rg -n "alternate completion\|fallback completer\|old completion" <paths>` |
-| `generated_load_failure`        | `fail-closed`  | `<value>`      | `<path>`             | `<completion test case>`                                                   |
+| metadata key                    | required value | declared value      | enforcement location | verification method                                                            |
+| ------------------------------- | -------------- | ------------------- | -------------------- | ------------------------------------------------------------------------------ |
+| `completion_mode`               | `clap-first`   | `<value>`           | `<path>`             | `<proof>`                                                                      |
+| `completion_mode_toggles`       | `forbidden`    | `<value>`           | `<path>`             | `rg -n "COMPLETION_MODE" <paths>`                                              |
+| `alternate_completion_dispatch` | `forbidden`    | `<value>`           | `<path>`             | `rg -n "alternate completion\|fallback completer\|old completion" <paths>`     |
+| `generated_load_failure`        | `fail-closed`  | `<value>`           | `<path>`             | `<completion test case>`                                                       |
+| `completion_engine`             | `static`       | `<static\|dynamic>` | `<path>`             | matrix row engine value; `dynamic` requires a `CompleteEnv` registration asset |
 
 Checklist:
 

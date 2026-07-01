@@ -54,12 +54,20 @@ version = "1.20.3"
 
 [workspace.dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive", "string"] }
+clap = { version = "4", features = ["derive", "string", "unstable-ext"] }
 # Pinned EXACT on purpose: clap_complete's generated completion-script output can
 # change between releases, which would break the completion-matrix CI baseline
 # (completion-freshness/flag-parity audits). Bump deliberately and regenerate the
 # completion assets rather than letting this float to `^4.6`.
-clap_complete = "=4.6.5"
+#
+# `unstable-dynamic` enables the `CompleteEnv` + `engine::ArgValueCandidates`
+# runtime-completion path used by `completion_engine=dynamic` CLIs. It is behind
+# clap_complete's explicit unstable gate and pulls `shlex 1.x` + `is_executable`
+# (skip-listed in `deny.toml`); the exact `=4.6.5` pin keeps the emitted dynamic
+# registration stub version-matched to the shipped binary. `clap`'s
+# `unstable-ext` is required for `Arg::add` used to attach dynamic value
+# providers. Both are opt-in per CLI; static `generate()` remains the default.
+clap_complete = { version = "=4.6.5", features = ["unstable-dynamic"] }
 directories = "6"
 indexmap = { version = "2", features = ["serde"] }
 # Forward-standard datetime library: NEW crates and new date/time code use
