@@ -3,9 +3,7 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: active; Sprint 1 (framework dynamic mode) delivered on
-  `feat/completion-engine-dynamic-mode` (`d557152`), PR pending; Sprints 2-3
-  gated on a nils-cli release carrying Sprint 1.
+- Status: complete; tracking issue closed
 - Target scope: teach the completion framework a `completion_engine = static |
   dynamic` dimension (Sprint 1), pilot git-cli's migration to `CompleteEnv`
   (Sprint 2), then roll out per-CLI opt-in dynamic value providers (Sprint 3).
@@ -16,7 +14,7 @@
 - Next task: Sprint 2 — git-cli pilot, gated on a nils-cli release carrying
   Sprint 1.
 - Last updated: 2026-07-01
-- Branch/commit/PR: `feat/completion-engine-dynamic-mode` (Sprint 1 PR pending).
+- Branch/commit/PR: sympoies/nils-cli#1004 merged (<https://github.com/sympoies/nils-cli/pull/1004>)
 - Source document:
   `docs/plans/2026-07-01-clap-complete-dynamic-completion/clap-complete-dynamic-completion-discussion-source.md`
 - Plan document:
