@@ -1,8 +1,10 @@
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::engine::ArgValueCandidates;
 use nils_common::cli_contract::{OutputFormat, emit_parse_error, exit};
 use std::ffi::OsString;
 
+use crate::completion::name_candidates;
 use crate::{completion, runtime};
 
 pub const BINARY: &str = "secrets";
@@ -75,7 +77,7 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct NameArgs {
     /// Override the auto-detected entry: bare name, `repos/<o>/<r>`, or `stacks/<x>`
-    #[arg(value_name = "name")]
+    #[arg(value_name = "name", add = ArgValueCandidates::new(name_candidates))]
     pub name: Option<String>,
 }
 
@@ -108,6 +110,11 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    // Short-circuit `COMPLETE=<shell> secrets ...` dynamic-completion requests
+    // before the normal parse. No-op when `COMPLETE` is unset, so ordinary
+    // invocations are unaffected.
+    completion::complete_env();
+
     let argv: Vec<OsString> = args.into_iter().map(|arg| arg.into()).collect();
 
     let cli = match Cli::try_parse_from(&argv) {

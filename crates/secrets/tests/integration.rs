@@ -206,14 +206,32 @@ fn completion_exports_bash_and_zsh() {
     let store = tmp.path().join("store");
     init_store(&store);
 
+    // secrets is a `completion_engine=dynamic` CLI: the exported scripts are
+    // clap_complete `CompleteEnv` registration stubs, not static `generate()`
+    // scripts. The dynamic completer calls back into the binary at TAB time to
+    // enumerate live store entry names.
     let zsh = run(
         &["completion", "zsh"],
         &options(tmp.path(), &store, stubs.path()),
     );
     assert_exit(&zsh, 0);
     let zsh_text = zsh.stdout_text();
-    assert!(zsh_text.contains("#compdef secrets"));
-    assert!(zsh_text.contains("pull:"));
+    assert!(
+        zsh_text.contains("#compdef secrets"),
+        "dynamic zsh registration keeps the #compdef header"
+    );
+    assert!(
+        zsh_text.contains("_clap_dynamic_completer_secrets"),
+        "dynamic zsh registration defines the CompleteEnv completer function"
+    );
+    assert!(
+        zsh_text.contains("compdef _clap_dynamic_completer_secrets secrets"),
+        "dynamic zsh registration binds the completer to secrets"
+    );
+    assert!(
+        !zsh_text.contains("_arguments"),
+        "dynamic stub must not embed the static `_arguments` surface"
+    );
 
     let bash = run(
         &["completion", "bash"],
@@ -221,8 +239,44 @@ fn completion_exports_bash_and_zsh() {
     );
     assert_exit(&bash, 0);
     let bash_text = bash.stdout_text();
-    assert!(bash_text.contains("_secrets()"));
-    assert!(bash_text.contains("complete -F _secrets"));
+    assert!(
+        bash_text.contains("_clap_complete_secrets"),
+        "dynamic bash registration defines the CompleteEnv completer function"
+    );
+    assert!(
+        bash_text.contains("-F _clap_complete_secrets secrets"),
+        "dynamic bash registration binds the completer to secrets via complete -F"
+    );
+}
+
+#[test]
+fn dynamic_completion_enumerates_live_store_entries() {
+    let tmp = TempDir::new().expect("tmp");
+    let store = tmp.path().join("store");
+    init_store(&store);
+    fs::create_dir_all(store.join("repos/graysurf")).expect("repos/graysurf");
+    fs::write(store.join("repos/graysurf/g14-infra.enc.env"), "x").expect("repo entry");
+    fs::write(store.join("stacks/web.enc.env"), "x").expect("stack web");
+    fs::write(store.join("stacks/db.enc.env"), "x").expect("stack db");
+
+    // Drive the clap_complete `CompleteEnv` runtime completer directly: with
+    // `COMPLETE=zsh` and the cursor on the `name` positional, the binary should
+    // print the live store entry names attached via `#[arg(add = ...)]`.
+    let opts = options(tmp.path(), &store, tmp.path())
+        .with_env("COMPLETE", "zsh")
+        .with_env("_CLAP_COMPLETE_INDEX", "2")
+        .with_env("_CLAP_IFS", "\n");
+    let output = run(&["--", "secrets", "pull", ""], &opts);
+    assert_exit(&output, 0);
+    let stdout = output.stdout_text();
+
+    for expected in ["repos/graysurf/g14-infra", "stacks/db", "stacks/web"] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "name completion should offer `{expected}`, got:\n{stdout}"
+        );
+    }
+    assert_no_secret_leak(&output);
 }
 
 #[test]
