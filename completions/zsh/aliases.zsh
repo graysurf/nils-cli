@@ -72,23 +72,13 @@ fi
 (( $+aliases[gxof] )) || alias gxof='git-cli open file'
 (( $+aliases[gxobl] )) || alias gxobl='git-cli open blame'
 
-# Jump into a worktree (uses eval to change the parent shell's directory):
+# Jump into a worktree (uses eval to change the parent shell's directory).
+# Worktree-name completion for `gxwcd` is provided by the autoloaded
+# `completions/zsh/_gxwcd`, so it registers via compinit regardless of whether
+# this alias file is sourced before or after `compinit` runs. Agents never
+# reach the completion path.
 if (( ! $+functions[gxwcd] )); then
   gxwcd() { eval "$(git-cli worktree go --shell "$@")"; }
-fi
-# Best-effort worktree-name completion for the cd helper. Guarded on `compdef`
-# so sourcing this file before `compinit` stays error-free; agents never reach
-# this path. Candidates come straight from the live `git worktree list`.
-if (( $+functions[compdef] )); then
-  _nils_cli_gxwcd() {
-    local -a _nils_wt
-    _nils_wt=( ${(f)"$(command git worktree list --porcelain 2>/dev/null | awk '
-      /^worktree /  { n = split($2, p, "/"); print p[n] }
-      /^branch /    { b = $2; sub(/^refs\/heads\//, "", b); print b }
-    ')"} )
-    compadd -- $_nils_wt
-  }
-  compdef _nils_cli_gxwcd gxwcd
 fi
 
 # ---------------------------------------------------------------------------
