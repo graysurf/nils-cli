@@ -3,8 +3,8 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `9a9c383d7a71793914bc6634964db5f1f7444da28165dab528530d04508a40be`
-- Third-party crates (`source != null`): 449
+- Cargo.lock SHA256: `360ddcc92ea2b3749bc2a748be58f0e7d44384ba4a5e2ab634435404043e7992`
+- Third-party crates (`source != null`): 451
 - Workspace crates (`source == null`, excluded below): 43
 
 ## Notes
@@ -17,7 +17,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 
 | License Expression | Crate Count |
 | --- | ---: |
-| MIT OR Apache-2.0 | 213 |
+| MIT OR Apache-2.0 | 215 |
 | MIT | 80 |
 | Apache-2.0 OR MIT | 38 |
 | Zlib OR Apache-2.0 OR MIT | 19 |
@@ -197,6 +197,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | indexmap | 2.14.0 | Apache-2.0 OR MIT | crates.io |
 | indicatif | 0.18.4 | MIT | crates.io |
 | ipnet | 2.12.0 | MIT OR Apache-2.0 | crates.io |
+| is_executable | 1.0.6 | MIT OR Apache-2.0 | crates.io |
 | is_terminal_polyfill | 1.70.2 | MIT OR Apache-2.0 | crates.io |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | crates.io |
 | jaq-core | 3.1.0 | MIT | crates.io |
@@ -341,6 +342,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | sha2 | 0.11.0 | MIT OR Apache-2.0 | crates.io |
 | sharded-slab | 0.1.7 | MIT | crates.io |
 | shell-words | 1.1.1 | MIT/Apache-2.0 | crates.io |
+| shlex | 1.3.0 | MIT OR Apache-2.0 | crates.io |
 | shlex | 2.0.1 | MIT OR Apache-2.0 | crates.io |
 | signal-hook-registry | 1.4.8 | MIT OR Apache-2.0 | crates.io |
 | signature | 2.2.0 | Apache-2.0 OR MIT | crates.io |

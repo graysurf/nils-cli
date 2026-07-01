@@ -22,6 +22,13 @@
   loaded.
 - Completion enforcement metadata is required for every `required` binary and must use:
   `completion_mode=clap-first; completion_mode_toggles=forbidden; alternate_completion_dispatch=forbidden; generated_load_failure=fail-closed`.
+- Completion engine dimension: the enforcement metadata may carry an optional `completion_engine=<static|dynamic>` key. When the key is
+  absent, `static` is assumed — the CLI ships a `clap_complete` `generate()`-baked baseline (the default; every current row is `static`). A
+  `dynamic` CLI opts into the `clap_complete` `CompleteEnv` runtime-completion engine (`unstable-dynamic`) and must declare
+  `completion_engine=dynamic` explicitly. Dynamic mode extends the clap-first baseline and remains a single completion path per CLI (it is
+  not an alternate dispatch): the completion-freshness audit classifies a `dynamic` CLI as a runtime adapter (no static baseline to diff).
+  Flag-parity and shared-adapter handling for `dynamic` CLIs land with the first dynamic migration (the git-cli pilot); until a CLI declares
+  `completion_engine=dynamic`, every audit path is unchanged. See `docs/runbooks/cli-completion-development-standard.md`.
 - This matrix currently tracks asset coverage, obligation decisions, and completion enforcement metadata; deeper quality/export-command
   conformance is validated in rollout sprints and completion tests.
 

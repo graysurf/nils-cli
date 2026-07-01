@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `9a9c383d7a71793914bc6634964db5f1f7444da28165dab528530d04508a40be`
-- Third-party crates (`source != null`): 449
+- Cargo.lock SHA256: `360ddcc92ea2b3749bc2a748be58f0e7d44384ba4a5e2ab634435404043e7992`
+- Third-party crates (`source != null`): 451
 
 ## Notice Extraction Policy
 
@@ -1292,6 +1292,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
+### is_executable 1.0.6
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+
 ### is_terminal_polyfill 1.70.2
 
 - License: `MIT OR Apache-2.0`
@@ -2516,6 +2525,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
 ### shell-words 1.1.1
 
 - License: `MIT/Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+
+### shlex 1.3.0
+
+- License: `MIT OR Apache-2.0`
 - Source: `crates.io`
 - Notice files: No explicit NOTICE file discovered.
 - License file references:

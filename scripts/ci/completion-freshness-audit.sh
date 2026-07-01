@@ -111,6 +111,34 @@ parse_required_bins() {
   ' "$matrix" | LC_ALL=C sort -u
 }
 
+# Emit `bin<TAB>engine` for each required row. `engine` is `dynamic` only when
+# the enforcement-metadata cell (field 6 of the pipe table, `$7` after the
+# leading empty field) carries a `completion_engine=dynamic` value, anchored on
+# a value boundary (`;`, closing backtick, whitespace, or end). Scoping to that
+# cell — not the whole row — and anchoring the value prevents the literal string
+# in a free-text column (e.g. Rationale) or a longer value (e.g.
+# `dynamic-experimental`) from misclassifying a static CLI as dynamic, which
+# would silently skip its freshness diff.
+parse_bin_engine() {
+  local matrix="$1"
+  awk -F'|' '
+    function trim(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      return s
+    }
+    {
+      bin = trim($2)
+      obligation = trim($3)
+      if (bin ~ /^`[^`]+`$/ && obligation == "`required`") {
+        gsub(/`/, "", bin)
+        meta = trim($7)
+        engine = (meta ~ /completion_engine=dynamic([;`\t ]|$)/) ? "dynamic" : "static"
+        print bin "\t" engine
+      }
+    }
+  ' "$matrix"
+}
+
 contains_bin() {
   local needle="$1"
   shift
@@ -217,6 +245,12 @@ if (( ${#all_required_bins[@]} == 0 )); then
   exit 2
 fi
 
+declare -A bin_engine=()
+while IFS=$'\t' read -r engine_bin engine_value; do
+  [[ -n "$engine_bin" ]] || continue
+  bin_engine["$engine_bin"]="$engine_value"
+done < <(parse_bin_engine "$matrix_path")
+
 declare -a audit_bins=()
 if (( ${#requested_bins[@]} > 0 )); then
   for requested in "${requested_bins[@]}"; do
@@ -257,6 +291,7 @@ declare -a diff_labels=()
 declare -a diff_paths=()
 snapshots_checked=0
 runtime_adapters_skipped=0
+dynamic_engine_skipped=0
 
 for binary in "${audit_bins[@]}"; do
   binary_path="$target_debug_dir/${binary}${PLATFORM_EXE_SUFFIX}"
@@ -269,6 +304,16 @@ for binary in "${audit_bins[@]}"; do
     asset_path="$(asset_path_for "$shell_name" "$binary")"
     if [[ ! -f "$asset_path" ]]; then
       failures+=( "${binary}: missing committed ${shell_name} completion asset: $asset_path" )
+      continue
+    fi
+
+    # A `completion_engine=dynamic` CLI ships a `clap_complete` CompleteEnv
+    # registration stub whose contents embed the resolved binary path and are
+    # not deterministically reproducible against the committed asset, so there
+    # is no static baseline to diff. Require the asset to exist (checked above)
+    # but skip the freshness comparison, like a runtime adapter.
+    if [[ "${bin_engine[$binary]:-static}" == "dynamic" ]]; then
+      dynamic_engine_skipped=$((dynamic_engine_skipped + 1))
       continue
     fi
 
@@ -305,8 +350,8 @@ if (( ${#failures[@]} > 0 )); then
     echo "INFO: diff preview for ${diff_labels[$idx]} completion drift"
     sed -n '1,120p' "${diff_paths[$idx]}"
   done
-  echo "FAIL: completion freshness audit (required=${#audit_bins[@]}, snapshots_checked=$snapshots_checked, runtime_adapters_skipped=$runtime_adapters_skipped, failures=${#failures[@]})"
+  echo "FAIL: completion freshness audit (required=${#audit_bins[@]}, snapshots_checked=$snapshots_checked, runtime_adapters_skipped=$runtime_adapters_skipped, dynamic_engine_skipped=$dynamic_engine_skipped, failures=${#failures[@]})"
   exit 1
 fi
 
-echo "PASS: completion freshness audit (required=${#audit_bins[@]}, snapshots_checked=$snapshots_checked, runtime_adapters_skipped=$runtime_adapters_skipped, failures=0)"
+echo "PASS: completion freshness audit (required=${#audit_bins[@]}, snapshots_checked=$snapshots_checked, runtime_adapters_skipped=$runtime_adapters_skipped, dynamic_engine_skipped=$dynamic_engine_skipped, failures=0)"

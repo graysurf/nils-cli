@@ -165,6 +165,41 @@ Rules:
 - if generated completion quality is wrong, fix clap metadata and/or thin adapter logic in-place
 - generated-load failure must fail closed (empty/no candidates) rather than routing to an alternate path
 
+### Completion engine: static vs dynamic
+
+The single-path rule governs *how many* completion stacks a CLI has (exactly
+one), not *which* `clap_complete` engine backs it. A CLI declares its engine via
+the optional `completion_engine=<static|dynamic>` key in its matrix
+enforcement-metadata tuple (absent means `static`):
+
+- `static` (default): the CLI ships a `clap_complete::generate()`-baked baseline
+  committed under `completions/`. Every current CLI is `static`.
+- `dynamic`: the CLI opts into `clap_complete::env::CompleteEnv` (behind
+  `clap_complete`'s `unstable-dynamic` feature) so it can compute candidates at
+  TAB time (worktree names, branches, remotes, tags, live paths) that a static
+  model cannot enumerate. It is opt-in per CLI and never forced.
+
+`dynamic` mode is a single completion path, not an alternate dispatch: the CLI's
+`completion <shell>` export emits exactly one registration (the `CompleteEnv`
+stub), the binary is the sole candidate source, and idle invocation (with
+`COMPLETE` unset) runs the normal app path at zero cost. It therefore satisfies
+`completion_mode_toggles=forbidden` and `alternate_completion_dispatch=forbidden`
+— there is no runtime toggle and no second dispatch function — and it extends,
+rather than replaces, the clap-first contract. Generated-load failure still
+fails closed.
+
+Framework handling of a `dynamic` CLI:
+
+- The completion-freshness audit classifies it as a runtime adapter and skips
+  the static byte-diff (the `CompleteEnv` stub embeds the resolved binary path
+  and has no reproducible static baseline); the committed registration asset
+  must still exist.
+- Flag-parity assertion and the shared runtime-adapter registration shape
+  (`_clap_dynamic_completer_<bin>` / `complete -F`, plus alias-family rewrite
+  through the underlying binary) gain their dynamic handling with the first
+  `dynamic` CLI migration (the `git-cli` pilot). Until a CLI declares
+  `completion_engine=dynamic`, every audit and adapter path is unchanged.
+
 ### Required completion enforcement metadata
 
 Every completion-required CLI migration must declare and validate this metadata contract in both:
@@ -178,6 +213,7 @@ Canonical metadata tuple:
 - `completion_mode_toggles=forbidden` (runtime completion-mode toggles are disallowed)
 - `alternate_completion_dispatch=forbidden`
 - `generated_load_failure=fail-closed`
+- `completion_engine=static|dynamic` (optional; absent means `static` — see "Completion engine: static vs dynamic")
 
 Validation expectation:
 
