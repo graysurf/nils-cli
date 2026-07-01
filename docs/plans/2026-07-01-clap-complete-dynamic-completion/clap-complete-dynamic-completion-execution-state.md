@@ -21,9 +21,12 @@
   `docs/plans/2026-07-01-clap-complete-dynamic-completion/clap-complete-dynamic-completion-plan.md`
 - Direct source-doc execution waiver: not applicable.
 - Tracking issue: <https://github.com/sympoies/nils-cli/issues/999>
-- Source snapshot: pending record attach
-- Plan snapshot: pending record attach
-- Initial state snapshot: pending record attach
+- Source snapshot:
+  <https://github.com/sympoies/nils-cli/issues/999#issuecomment-4850473605>
+- Plan snapshot:
+  <https://github.com/sympoies/nils-cli/issues/999#issuecomment-4850473807>
+- Initial state snapshot:
+  <https://github.com/sympoies/nils-cli/issues/999#issuecomment-4850473978>
 
 ## Validation Plan
 
@@ -79,7 +82,8 @@
 
 | Command | Status | Summary | Artifact |
 | --- | --- | --- | --- |
-| `plan-tooling validate --file docs/plans/2026-07-01-clap-complete-dynamic-completion/clap-complete-dynamic-completion-plan.md --format text --explain` | pending | Plan Format v1 lint. | local |
-| `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pending | Docs placement, hygiene, markdown lint, plan-bundle. | local |
-| `plan-issue --repo sympoies/nils-cli --format json --dry-run record attach --issue 999 --profile tracking ...` | pending | Dry-run attach shape onto #999. | local |
-| `plan-issue --repo sympoies/nils-cli --format json record attach --issue 999 --profile tracking ...` | pending | Live attach: source/plan/state onto #999. | <https://github.com/sympoies/nils-cli/issues/999> |
+| `plan-tooling validate --file docs/plans/2026-07-01-clap-complete-dynamic-completion/clap-complete-dynamic-completion-plan.md --format text --explain` | pass | Plan Format v1 clean; 0 errors. | local |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Docs placement, hygiene, markdown lint, plan-bundle all pass. | local |
+| `plan-issue --repo sympoies/nils-cli --format json --dry-run record attach --issue 999 --profile tracking ...` | pass | Dry-run rendered source/plan/state comments; repo-relative paths only; issue 999. | local |
+| `plan-issue --repo sympoies/nils-cli --format json record attach --issue 999 --profile tracking ...` | pass | Live attach posted source/plan/state and rendered the tracking dashboard. | <https://github.com/sympoies/nils-cli/issues/999> |
+| `forge-cli issue edit 999 --add-label workflow::plan --add-label workflow::tracking --add-label state::ready --remove-label workflow::follow-up --remove-label state::needs-triage` | pass | Reconciled #999 to the tracking taxonomy. | <https://github.com/sympoies/nils-cli/issues/999> |
