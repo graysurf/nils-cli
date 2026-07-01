@@ -1,6 +1,8 @@
 use clap::{Arg, ArgAction, Command, ValueHint};
-use clap_complete::{Shell, generate};
-use std::io::{self, Write};
+use clap_complete::CompleteEnv;
+use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
+use clap_complete::env::{Bash, EnvCompleter, Zsh};
+use std::io;
 
 pub fn dispatch(shell_raw: &str, extra: &[String]) -> i32 {
     if !extra.is_empty() {
@@ -9,8 +11,8 @@ pub fn dispatch(shell_raw: &str, extra: &[String]) -> i32 {
     }
 
     match shell_raw {
-        "bash" => generate_script(Shell::Bash),
-        "zsh" => generate_script(Shell::Zsh),
+        "bash" => emit_registration(&Bash),
+        "zsh" => emit_registration(&Zsh),
         other => {
             eprintln!("git-cli: error: unsupported completion shell '{other}'");
             eprintln!("usage: git-cli completion <bash|zsh>");
@@ -19,27 +21,49 @@ pub fn dispatch(shell_raw: &str, extra: &[String]) -> i32 {
     }
 }
 
-fn generate_script(generator: Shell) -> i32 {
-    let mut command = build_command_model();
-    let bin_name = command.get_name().to_string();
-    if matches!(generator, Shell::Bash) {
-        let mut output = Vec::new();
-        generate(generator, &mut command, bin_name.clone(), &mut output);
-        let normalized = normalize_bash_completion(
-            String::from_utf8(output).expect("bash completion should be valid UTF-8"),
-        );
-        io::stdout()
-            .write_all(normalized.as_bytes())
-            .expect("failed to write bash completion");
-        return 0;
+/// Emit a `clap_complete` `CompleteEnv` dynamic-completion registration stub for
+/// the given shell.
+///
+/// git-cli is a `completion_engine=dynamic` CLI (see the completion coverage
+/// matrix): candidates such as live worktree names and branches are computed at
+/// TAB time by the binary itself, so the exported script is a thin registration
+/// that calls back into `git-cli` rather than a static `generate()` script. This
+/// remains a single completion path per the completion development standard.
+fn emit_registration<C: EnvCompleter>(completer: &C) -> i32 {
+    match completer.write_registration(
+        "COMPLETE",
+        "git-cli",
+        "git-cli",
+        "git-cli",
+        &mut io::stdout(),
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("git-cli: error: failed to emit completion registration: {err}");
+            1
+        }
     }
-
-    generate(generator, &mut command, bin_name, &mut io::stdout());
-    0
 }
 
-fn normalize_bash_completion(script: String) -> String {
-    script.replace("__subcmd__", "__")
+/// Intercept `COMPLETE=<shell> git-cli ...` completion requests before the
+/// hand-rolled dispatch.
+///
+/// On a completion request `CompleteEnv::complete()` prints the registration
+/// stub (or the runtime candidates) and exits the process itself; when
+/// `COMPLETE` is unset it returns and the normal application path proceeds
+/// unchanged, so this is a no-op for ordinary invocations.
+pub(crate) fn complete_env() {
+    CompleteEnv::with_factory(build_command_model).complete();
+}
+
+/// Live completion candidates for `git-cli worktree go|remove <target>`:
+/// managed worktree slugs and their branch names, sourced at TAB time from the
+/// real `git worktree list`. Supersedes the static `gxwcd` workaround.
+fn worktree_target_candidates() -> Vec<CompletionCandidate> {
+    crate::worktree::go_target_candidates()
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
 }
 
 fn build_command_model() -> Command {
@@ -330,7 +354,7 @@ fn build_worktree_group() -> Command {
                     Arg::new("target")
                         .value_name("slug-or-branch-or-path")
                         .required(true)
-                        .value_hint(ValueHint::AnyPath),
+                        .add(ArgValueCandidates::new(worktree_target_candidates)),
                 )
                 .arg(
                     Arg::new("shell")
@@ -347,7 +371,7 @@ fn build_worktree_group() -> Command {
                     Arg::new("target")
                         .value_name("slug-or-path")
                         .required(true)
-                        .value_hint(ValueHint::AnyPath),
+                        .add(ArgValueCandidates::new(worktree_target_candidates)),
                 )
                 .arg(format_arg()),
         )

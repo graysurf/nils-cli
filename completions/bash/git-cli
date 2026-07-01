@@ -27,14 +27,14 @@ _NILS_GIT_CLI_BASH_GENERATED_STATE=0
 _nils_cli_git_cli_load_generated_bash() {
   _nils_cli_git_cli_source_common_bash || return 1
 
-  # command git-cli completion bash
-  _nils_cli_completion_common_load_generated_bash \
+  # git-cli is completion_engine=dynamic: load the clap_complete `CompleteEnv`
+  # registration stub emitted by `git-cli completion bash` as an alias-aware
+  # generated function (renamed from `_clap_complete_git_cli`).
+  _nils_cli_completion_common_load_dynamic_bash \
     "_NILS_GIT_CLI_BASH_GENERATED_STATE" \
     "_nils_cli_git_cli_generated" \
     "git-cli" \
-    "_git-cli" \
-    '^if \[\[ "\${BASH_VERSINFO\[0\]}" -eq 4 ' \
-    '^fi$'
+    "_clap_complete_git_cli"
 }
 
 _nils_cli_git_cli_complete() {
@@ -62,6 +62,7 @@ _nils_cli_git_cli_complete() {
     gxb) inject=(branch) ;;
     gxi) inject=(ci) ;;
     gxo) inject=(open) ;;
+    gxw) inject=(worktree) ;;
     gxuz) inject=(utils zip) ;;
     gxuc) inject=(utils copy-staged) ;;
     gxur) inject=(utils root) ;;

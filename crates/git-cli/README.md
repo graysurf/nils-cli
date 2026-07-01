@@ -24,7 +24,9 @@ subcommands (matching the binary's `--help` output):
   `merge-requests`, `mrs`), `issues` (alias `issue`), `actions` (alias `action`),
   `releases` (alias `release`), `tags` (alias `tag`), `commits` (alias `history`),
   `file` (alias `blob`), `blame`.
-- `completion`: `bash`, `zsh` (writes a clap-generated completion script to stdout).
+- `completion`: `bash`, `zsh` (writes the completion registration to stdout). git-cli uses
+  `clap_complete` `CompleteEnv` dynamic completion, so this emits a thin registration stub that
+  computes candidates (e.g. live worktree names) at TAB time rather than a static script.
 
 ## Commands
 
@@ -73,9 +75,11 @@ subcommands (matching the binary's `--help` output):
   primary checkout and the current worktree. Options: `--format text|json`.
 - `prune`: Run `git worktree prune`. Options: `--format text|json`.
 - `go <slug-or-branch-or-path>`: Resolve a worktree and print its path so you can `cd` into it.
-  Matches by branch name, explicit path, managed slug, or worktree directory name. Use `--shell` to
-  emit an evaluable `cd -- <path>` command (mirrors `utils root --shell`); the `gxwcd` shell helper
-  wraps this with worktree-name completion. Options: `--shell`, `--format text|json`.
+  Matches by branch name, explicit path, managed slug, or worktree directory name. `go` and `remove`
+  complete live worktree names/branches via `clap_complete` dynamic completion (superseding the
+  static `gxwcd` completion workaround, though `gxwcd` remains for cd-on-select ergonomics). Use
+  `--shell` to emit an evaluable `cd -- <path>` command (mirrors `utils root --shell`). Options:
+  `--shell`, `--format text|json`.
 
 The managed layout (`repo-key`, the managed/external classification, and slug-based resolution) is
 anchored to the repository's primary worktree, so `worktree` commands behave identically whether run

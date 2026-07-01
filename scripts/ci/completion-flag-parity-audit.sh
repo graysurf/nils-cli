@@ -112,6 +112,34 @@ parse_required_bins() {
   ' "$matrix_path" | LC_ALL=C sort -u
 }
 
+# Emit `bin<TAB>engine` for each required row. `engine` is `dynamic` only when
+# the enforcement-metadata cell (`$7` after the leading empty field) carries a
+# `completion_engine=dynamic` value anchored on a value boundary, matching the
+# freshness audit's classifier. A `dynamic` CLI ships a clap_complete
+# `CompleteEnv` registration stub rather than a static `generate()` asset, so it
+# has no committed static flag list to compare against `--help`; flag-parity
+# skips those (its invariant is moot when candidates are computed at runtime by
+# the binary itself).
+parse_bin_engine() {
+  local matrix_path="$1"
+  awk -F'|' '
+    function trim(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      return s
+    }
+    {
+      bin = trim($2)
+      obligation = trim($3)
+      if (bin ~ /^`[^`]+`$/ && obligation == "`required`") {
+        gsub(/`/, "", bin)
+        meta = trim($7)
+        engine = (meta ~ /completion_engine=dynamic([;`\t ]|$)/) ? "dynamic" : "static"
+        print bin "\t" engine
+      }
+    }
+  ' "$matrix_path"
+}
+
 parse_commands() {
   local help_text="$1"
   printf '%s\n' "$help_text" | awk '
@@ -707,8 +735,22 @@ main() {
     return 2
   fi
 
+  local -A bin_engine=()
+  local engine_bin engine_value
+  while IFS=$'\t' read -r engine_bin engine_value; do
+    [[ -n "$engine_bin" ]] && bin_engine["$engine_bin"]="$engine_value"
+  done < <(parse_bin_engine "$matrix_path")
+
   local binary
+  local dynamic_engine_skipped=0
   for binary in "${required_bins[@]}"; do
+    # A `completion_engine=dynamic` CLI ships a clap_complete CompleteEnv stub,
+    # not a static asset with a comparable flag list, so there is nothing for
+    # flag-parity to diff; skip it (counted, never silently).
+    if [[ "${bin_engine[$binary]:-static}" == "dynamic" ]]; then
+      dynamic_engine_skipped=$((dynamic_engine_skipped + 1))
+      continue
+    fi
     audit_binary "$repo_root" "$binary" "$repo_root/target/debug/${binary}${PLATFORM_EXE_SUFFIX}"
   done
 
@@ -717,11 +759,11 @@ main() {
     for failure in "${FAILURES[@]}"; do
       echo "FAIL: $failure"
     done
-    echo "FAIL: completion flag parity audit (required=${#required_bins[@]}, failures=${#FAILURES[@]})"
+    echo "FAIL: completion flag parity audit (required=${#required_bins[@]}, dynamic_engine_skipped=$dynamic_engine_skipped, failures=${#FAILURES[@]})"
     return 1
   fi
 
-  echo "PASS: completion flag parity audit (required=${#required_bins[@]}, failures=0)"
+  echo "PASS: completion flag parity audit (required=${#required_bins[@]}, dynamic_engine_skipped=$dynamic_engine_skipped, failures=0)"
   return 0
 }
 

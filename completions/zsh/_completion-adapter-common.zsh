@@ -127,6 +127,46 @@ _nils_cli_completion_common_load_generated_zsh() {
   return 0
 }
 
+_nils_cli_completion_common_load_dynamic_zsh() {
+  # Load a `completion_engine=dynamic` CLI's clap_complete `CompleteEnv`
+  # registration stub (emitted by `<cli> completion zsh`) as an alias-aware
+  # generated function.
+  #
+  # The stub defines `_clap_dynamic_completer_<name>` (which shells back into the
+  # binary at TAB time) and ends with `compdef _clap_dynamic_completer_<name>
+  # <bin>`. We rename the completer to the caller's generated symbol and strip
+  # that trailing `compdef` line so the thin adapter keeps ownership of
+  # registration (and its `words`/`CURRENT` alias rewrite). Reuses the shared
+  # load/eval/fail-closed machinery for a single, vetted load path.
+  emulate -L zsh
+
+  local state_var="${1-}"
+  local generated_fn="${2-}"
+  local cli_bin="${3-}"
+  local dynamic_symbol="${4-}"
+
+  if [[ -z "$dynamic_symbol" ]]; then
+    _nils_cli_completion_common_warn_once_zsh '' "${cli_bin}" 'invalid dynamic helper arguments'
+    _nils_cli_completion_common_fail_closed_zsh
+    return 1
+  fi
+
+  # Matches the trailing registration line *after* the symbol rewrite renames
+  # `${dynamic_symbol}` to `${generated_fn}`. The begin==end single-line strip is
+  # correct because clap_complete emits `compdef` as the final line of the zsh
+  # stub; this holds for the exact-pinned `clap_complete =4.6.5` (see Cargo.toml)
+  # and is re-checked on any version bump.
+  local strip_regex="^compdef ${generated_fn} ${cli_bin}\$"
+
+  _nils_cli_completion_common_load_generated_zsh \
+    "$state_var" \
+    "$generated_fn" \
+    "$cli_bin" \
+    "$dynamic_symbol" \
+    "$strip_regex" \
+    "$strip_regex"
+}
+
 _nils_cli_completion_common_register_zsh() {
   emulate -L zsh
 

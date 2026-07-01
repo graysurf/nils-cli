@@ -574,6 +574,32 @@ pub(crate) fn linked_worktrees_by_branch() -> anyhow::Result<HashMap<String, Str
         .collect())
 }
 
+/// Completion candidates for the `worktree go`/`worktree remove` target arg:
+/// managed worktree slugs (path basenames) plus their branch names, sorted and
+/// deduped. Fails soft to an empty list when `git worktree list` is unavailable
+/// (e.g. outside a repository) so completion never errors.
+pub(crate) fn go_target_candidates() -> Vec<String> {
+    let Ok(entries) = list_linked_worktrees() else {
+        return Vec::new();
+    };
+    worktree_candidates_from_entries(&entries)
+}
+
+fn worktree_candidates_from_entries(entries: &[LinkedWorktree]) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in entries {
+        if let Some(slug) = entry.path.file_name().and_then(|name| name.to_str()) {
+            out.push(slug.to_string());
+        }
+        if let Some(branch) = entry.branch.as_deref() {
+            out.push(branch.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn list_linked_worktrees() -> anyhow::Result<Vec<LinkedWorktree>> {
     let output = git_output(&["worktree", "list", "--porcelain"])?;
     let stdout = String::from_utf8(output.stdout).context("git worktree output was not UTF-8")?;
@@ -1254,6 +1280,26 @@ mod tests {
         assert_eq!(entries[0].branch.as_deref(), Some("main"));
         assert_eq!(entries[1].path, Path::new("/repo/wt"));
         assert!(entries[1].detached);
+    }
+
+    #[test]
+    fn worktree_candidates_include_slugs_and_branches() {
+        let entries = parse_worktree_porcelain(
+            "worktree /repo/main\nHEAD 111\nbranch refs/heads/main\n\nworktree /repo/.worktrees/feat-x\nHEAD 222\nbranch refs/heads/feat/x\n\nworktree /repo/.worktrees/detached-wt\nHEAD 333\ndetached\n",
+        );
+        let candidates = super::worktree_candidates_from_entries(&entries);
+        // Slugs are path basenames; branch names are stripped of `refs/heads/`.
+        assert!(candidates.contains(&"main".to_string()));
+        assert!(candidates.contains(&"feat-x".to_string()));
+        assert!(candidates.contains(&"feat/x".to_string()));
+        // Detached worktrees still contribute their slug (no branch).
+        assert!(candidates.contains(&"detached-wt".to_string()));
+        // Sorted + deduped: `main` is both a slug basename and a branch name but
+        // appears once.
+        assert_eq!(
+            candidates.iter().filter(|c| c.as_str() == "main").count(),
+            1
+        );
     }
 
     #[test]

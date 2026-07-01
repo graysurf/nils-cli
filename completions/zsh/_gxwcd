@@ -1,11 +1,17 @@
 #compdef gxwcd
-# Worktree-name completion for the `gxwcd` helper (wraps `git-cli worktree go`).
+# Worktree-name completion for the `gxwcd` helper (a shell function that wraps
+# `git-cli worktree go --shell` to cd on select).
 #
 # Autoloaded via compinit from `fpath`, so it registers regardless of whether
-# the nils-cli alias bundle is sourced before or after `compinit` runs. This is
-# a dynamic value provider: `git-cli worktree go`'s own clap completion is
-# static and cannot enumerate worktrees, so the candidates come straight from
-# the live `git worktree list`. Agents never reach this completion path.
+# the nils-cli alias bundle is sourced before or after `compinit` runs, and it
+# feeds candidates straight from the live `git worktree list`.
+#
+# Note: `git-cli worktree go`/`remove` now complete worktree names/branches
+# directly via clap_complete `CompleteEnv` (completion_engine=dynamic), so this
+# file no longer works around a static-completion gap. It is retained only
+# because `gxwcd` is a *shell function* (not the `git-cli` binary), so the
+# binary's dynamic completion cannot register for it; the candidate source is
+# identical. Agents never reach this completion path.
 
 local -a _nils_wt
 _nils_wt=( ${(f)"$(command git worktree list --porcelain 2>/dev/null | awk '
