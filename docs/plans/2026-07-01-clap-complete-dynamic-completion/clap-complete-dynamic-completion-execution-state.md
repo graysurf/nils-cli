@@ -55,14 +55,14 @@
 | --- | --- | --- | --- | --- |
 | 1.1 | done | Add completion_engine dimension to matrix + contract metadata | d557152 matrix policy note + contract-template metadata tuple/enforcement row | Coverage matrix column + contract-template metadata tuple; all existing rows `static`. |
 | 1.2 | done | Enable clap unstable features + gate dependency footprint | d557152 clap unstable-ext + clap_complete unstable-dynamic; deny.toml shlex@1.3.0 + windows-sys@0.60.2 skips; THIRD_PARTY regenerated; cargo deny green; 0 generate() drift | `clap/unstable-ext` + `clap_complete/unstable-dynamic`; `deny.toml` shlex@1.3.0 skip; confirm is_executable license. |
-| 1.3 | deferred | Teach completion-flag-parity-audit the dynamic mode | Sprint 2 (pending) | Reassigned to Sprint 2: flag-parity has no --root/test harness, so its dynamic assertion is tested against git-cli's real dynamic asset, not a synthetic fixture. Inert until a CLI is dynamic. |
+| 1.3 | done | Teach completion-flag-parity-audit the dynamic mode | Sprint 2 (pending); 27b3973 flag-parity skips completion_engine=dynamic CLIs (dynamic_engine_skipped counted); exercised against git-cli real dynamic asset | Landed with Sprint 2 pilot. |
 | 1.4 | done | Teach freshness + asset audits the dynamic mode | d557152 freshness audit dynamic skip + test RED->GREEN | asset-audit needs no change (content-agnostic: dynamic stub satisfies present/format checks); flag-parity dynamic assert reassigned to 1.3 |
-| 1.5 | deferred | Extend shared runtime adapter for CompleteEnv + alias rewrite | Sprint 2 (pending) | Reassigned to Sprint 2: shared adapter dynamic helpers land with git-cli's real CompleteEnv asset. |
-| 1.6 | deferred | Cover dynamic registration shape in zsh completion test | Sprint 2 (pending) | Reassigned to Sprint 2: zsh completion-test dynamic branch exercised against git-cli's real dynamic asset. |
+| 1.5 | done | Extend shared runtime adapter for CompleteEnv + alias rewrite | Sprint 2 (pending); 27b3973 shared adapter _nils_cli_completion_common_load_dynamic_{zsh,bash}; alias rewrite + fail-closed preserved | Landed with Sprint 2 pilot. |
+| 1.6 | done | Cover dynamic registration shape in zsh completion test | Sprint 2 (pending); 27b3973 zsh completion test dynamic-shape assertion + fixed padding-intolerant row selector (now exercises all 46 required rows) | Landed with Sprint 2 pilot; review-caught selector bug fixed. |
 | 1.7 | done | Document dynamic mode in completion development standard | d557152 completion development standard: dynamic engine subsection + tuple key | Reconcile with single-completion-path policy; name `completion_engine`. |
-| 2.1 | pending | Wire CompleteEnv into git-cli main dispatch | pending | Gated on released Sprint 1. |
-| 2.2 | pending | Attach live worktree candidates to worktree go/remove | pending | `ArgValueCandidates` over `git worktree list --porcelain`. |
-| 2.3 | pending | Emit CompleteEnv registration + update assets and aliases | pending | Regenerate committed assets; gx*/gxw wiring; keep `gxwcd` ergonomics. |
+| 2.1 | done | Wire CompleteEnv into git-cli main dispatch | pending; 27b3973 CompleteEnv::with_factory(build_command_model).complete() in run(); idle path (COMPLETE unset) unchanged; verified via integration tests | Wired; idle no-op verified. |
+| 2.2 | done | Attach live worktree candidates to worktree go/remove | pending; 27b3973 ArgValueCandidates over live git worktree list on worktree go/remove targets; empirical smoke returns live slugs+branches | Live candidates verified. |
+| 2.3 | done | Emit CompleteEnv registration + update assets and aliases | pending; 27b3973 emit CompleteEnv registration stub; committed zsh/bash assets load via dynamic adapter; gxw->worktree alias; gxwcd note | Assets + aliases reconciled. |
 | 2.4 | pending | Full CI, release patch, real-install verification | pending | test / test_macos / coverage; zsh + bash real install. |
 | 3.1 | pending | Inventory + add per-CLI dynamic value providers | pending | Gated on released Sprint 2; branches/remotes/tags/worktrees/paths. |
 | 3.2 | pending | Migrate CLI-by-CLI with per-CLI audit + release validation | pending | Opt-in per CLI; static stays for CLIs w/o runtime candidates. |
@@ -91,6 +91,20 @@
   reassigned to Sprint 2 so they are exercised against git-cli's real dynamic
   asset instead of speculative synthetic fixtures. Every current CLI stays
   `static`, so all audit/adapter paths are unchanged and nothing half-breaks.
+- 2026-07-01: Released Sprint 1 as nils-cli `v1.20.4` (PR #1001, tag `v1.20.4`,
+  8 release tarballs, Homebrew tap updated). Delivered Sprint 2 (git-cli pilot)
+  as `feat(git-cli)` commit `27b3973`, PR #1002: `CompleteEnv` +
+  `ArgValueCandidates` so `worktree go`/`remove` complete live worktree
+  names/branches (superseding the static `gxwcd` workaround), plus the deferred
+  framework dynamic-handling (flag-parity dynamic skip 1.3, shared adapter
+  dynamic loader 1.5, zsh completion-test dynamic branch 1.6). Marked git-cli
+  `completion_engine=dynamic`. Test-first RED->GREEN on the dynamic-registration
+  integration tests; validated end-to-end (`COMPLETE=zsh git-cli -- ...` returns
+  live candidates; bash e2e incl. the `gxw` alias). A 3-lens adversarial review
+  caught a pre-existing padding-intolerant row selector in the zsh completion
+  test (it silently exercised only 1 row); fixed so it now covers all 46
+  required rows and the new dynamic assertion fires. Sprint 2's own release
+  (2.4) and Sprint 3 remain pending.
 
 ## Validation
 
