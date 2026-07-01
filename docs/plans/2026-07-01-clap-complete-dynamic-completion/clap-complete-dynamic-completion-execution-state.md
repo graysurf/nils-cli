@@ -3,7 +3,9 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: active; Sprint 1 (framework dynamic mode) in delivery.
+- Status: active; Sprint 1 (framework dynamic mode) delivered on
+  `feat/completion-engine-dynamic-mode` (`d557152`), PR pending; Sprints 2-3
+  gated on a nils-cli release carrying Sprint 1.
 - Target scope: teach the completion framework a `completion_engine = static |
   dynamic` dimension (Sprint 1), pilot git-cli's migration to `CompleteEnv`
   (Sprint 2), then roll out per-CLI opt-in dynamic value providers (Sprint 3).
@@ -51,13 +53,13 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | pending | Add completion_engine dimension to matrix + contract metadata | pending | Coverage matrix column + contract-template metadata tuple; all existing rows `static`. |
-| 1.2 | pending | Enable clap unstable features + gate dependency footprint | pending | `clap/unstable-ext` + `clap_complete/unstable-dynamic`; `deny.toml` shlex@1.3.0 skip; confirm is_executable license. |
-| 1.3 | pending | Teach completion-flag-parity-audit the dynamic mode | pending | Provider-assert instead of static-flag parse for dynamic CLIs. |
-| 1.4 | pending | Teach freshness + asset audits the dynamic mode | pending | Dynamic CLI = freshness-skip (runtime-adapter) + registration-shape asset. |
-| 1.5 | pending | Extend shared runtime adapter for CompleteEnv + alias rewrite | pending | `_clap_dynamic_completer_<bin>` / `complete -F` shape + alias-through-binary; fail-closed preserved. |
-| 1.6 | pending | Cover dynamic registration shape in zsh completion test | pending | Synthetic dynamic fixture; assert registration + alias family, not static `_<cli>` symbol. |
-| 1.7 | pending | Document dynamic mode in completion development standard | pending | Reconcile with single-completion-path policy; name `completion_engine`. |
+| 1.1 | done | Add completion_engine dimension to matrix + contract metadata | d557152 matrix policy note + contract-template metadata tuple/enforcement row | Coverage matrix column + contract-template metadata tuple; all existing rows `static`. |
+| 1.2 | done | Enable clap unstable features + gate dependency footprint | d557152 clap unstable-ext + clap_complete unstable-dynamic; deny.toml shlex@1.3.0 + windows-sys@0.60.2 skips; THIRD_PARTY regenerated; cargo deny green; 0 generate() drift | `clap/unstable-ext` + `clap_complete/unstable-dynamic`; `deny.toml` shlex@1.3.0 skip; confirm is_executable license. |
+| 1.3 | deferred | Teach completion-flag-parity-audit the dynamic mode | Sprint 2 (pending) | Reassigned to Sprint 2: flag-parity has no --root/test harness, so its dynamic assertion is tested against git-cli's real dynamic asset, not a synthetic fixture. Inert until a CLI is dynamic. |
+| 1.4 | done | Teach freshness + asset audits the dynamic mode | d557152 freshness audit dynamic skip + test RED->GREEN | asset-audit needs no change (content-agnostic: dynamic stub satisfies present/format checks); flag-parity dynamic assert reassigned to 1.3 |
+| 1.5 | deferred | Extend shared runtime adapter for CompleteEnv + alias rewrite | Sprint 2 (pending) | Reassigned to Sprint 2: shared adapter dynamic helpers land with git-cli's real CompleteEnv asset. |
+| 1.6 | deferred | Cover dynamic registration shape in zsh completion test | Sprint 2 (pending) | Reassigned to Sprint 2: zsh completion-test dynamic branch exercised against git-cli's real dynamic asset. |
+| 1.7 | done | Document dynamic mode in completion development standard | d557152 completion development standard: dynamic engine subsection + tuple key | Reconcile with single-completion-path policy; name `completion_engine`. |
 | 2.1 | pending | Wire CompleteEnv into git-cli main dispatch | pending | Gated on released Sprint 1. |
 | 2.2 | pending | Attach live worktree candidates to worktree go/remove | pending | `ArgValueCandidates` over `git worktree list --porcelain`. |
 | 2.3 | pending | Emit CompleteEnv registration + update assets and aliases | pending | Regenerate committed assets; gx*/gxw wiring; keep `gxwcd` ergonomics. |
@@ -77,6 +79,18 @@
   and `shlex 2.0.1` is already in tree so `unstable-dynamic`'s `shlex ^1` needs a
   `deny.toml` skip. Assembled and validated the bundle; delivering Sprint 1 as
   the first PR (Sprints 2-3 gated on release, tracked here).
+- 2026-07-01: Delivered Sprint 1 as `feat(completion)` commit `d557152`.
+  Empirically verified that enabling `unstable-ext`/`unstable-dynamic` does not
+  change `clap_complete::generate()` output (0 freshness drift across 46 CLIs),
+  so no static asset regen was needed; the new deps surfaced a `windows-sys
+  0.60` duplicate (via `is_executable`) skip-listed alongside `shlex 1.3.0`, and
+  THIRD_PARTY artifacts were regenerated. Scope decision: only the freshness
+  audit gained dynamic handling this sprint (it has a `--root` test harness, so
+  a synthetic dynamic fixture gives a real test-first RED->GREEN); flag-parity
+  (1.3), the shared adapter (1.5), and the zsh completion test (1.6) are
+  reassigned to Sprint 2 so they are exercised against git-cli's real dynamic
+  asset instead of speculative synthetic fixtures. Every current CLI stays
+  `static`, so all audit/adapter paths are unchanged and nothing half-breaks.
 
 ## Validation
 
@@ -87,3 +101,10 @@
 | `plan-issue --repo sympoies/nils-cli --format json --dry-run record attach --issue 999 --profile tracking ...` | pass | Dry-run rendered source/plan/state comments; repo-relative paths only; issue 999. | local |
 | `plan-issue --repo sympoies/nils-cli --format json record attach --issue 999 --profile tracking ...` | pass | Live attach posted source/plan/state and rendered the tracking dashboard. | <https://github.com/sympoies/nils-cli/issues/999> |
 | `forge-cli issue edit 999 --add-label workflow::plan --add-label workflow::tracking --add-label state::ready --remove-label workflow::follow-up --remove-label state::needs-triage` | pass | Reconciled #999 to the tracking taxonomy. | <https://github.com/sympoies/nils-cli/issues/999> |
+| `bash scripts/ci/tests/completion-freshness-audit.test.sh` (vs unmodified audit) | pass | Test-first RED: synthetic `completion_engine=dynamic` fixture falsely flagged stale (exit 1). | local |
+| `bash scripts/ci/tests/completion-freshness-audit.test.sh` (vs modified audit) | pass | GREEN: dynamic skip + asset-existence + static-staleness assertions pass (exit 0). | local |
+| `bash scripts/ci/completion-freshness-audit.sh --strict` | pass | required=46, dynamic_engine_skipped=0, 0 drift with unstable features enabled. | local |
+| `bash scripts/ci/completion-flag-parity-audit.sh --strict` | pass | required=46, 0 failures. | local |
+| `bash scripts/ci/completion-asset-audit.sh --strict` | pass | 48 workspace bins, 46 required, 2 excluded, 0 errors. | local |
+| `bash scripts/ci/cargo-deny-audit.sh` | pass | advisories ok, bans ok (shlex@1.3.0 + windows-sys@0.60.2 skips). | local |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Docs + workspace Rust gate green after THIRD_PARTY regen. | local |
