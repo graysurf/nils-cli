@@ -135,6 +135,39 @@ _nils_cli_completion_common_load_generated_bash() {
   return 0
 }
 
+_nils_cli_completion_common_load_dynamic_bash() {
+  # Load a `completion_engine=dynamic` CLI's clap_complete `CompleteEnv`
+  # registration stub (emitted by `<cli> completion bash`) as an alias-aware
+  # generated function.
+  #
+  # The stub defines `_clap_complete_<name>` (which shells back into the binary
+  # at TAB time) and ends with the standard `complete -F _clap_complete_<name>
+  # <bin>` guard wrapped in a `BASH_VERSINFO` version check. We rename the
+  # completer to the caller's generated symbol and strip that trailing guard so
+  # the thin adapter keeps ownership of registration (and its
+  # `COMP_WORDS`/`COMP_CWORD` alias rewrite). The guard's shape is identical for
+  # static and dynamic clap_complete output, so the same strip bounds apply.
+  # Reuses the shared load/eval/fail-closed machinery for a single, vetted path.
+  local state_var="${1-}"
+  local generated_fn="${2-}"
+  local cli_bin="${3-}"
+  local dynamic_symbol="${4-}"
+
+  if [[ -z "$dynamic_symbol" ]]; then
+    _nils_cli_completion_common_warn_once_bash '' "${cli_bin}" 'invalid dynamic helper arguments'
+    _nils_cli_completion_common_fail_closed_bash
+    return 1
+  fi
+
+  _nils_cli_completion_common_load_generated_bash \
+    "$state_var" \
+    "$generated_fn" \
+    "$cli_bin" \
+    "$dynamic_symbol" \
+    '^if \[\[ "\${BASH_VERSINFO\[0\]}" -eq 4 ' \
+    '^fi$'
+}
+
 _nils_cli_completion_common_register_bash() {
   local completion_fn="${1-}"
   shift || true

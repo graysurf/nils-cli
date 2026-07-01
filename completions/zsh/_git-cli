@@ -34,13 +34,14 @@ typeset -gi _NILS_GIT_CLI_ZSH_GENERATED_STATE=0
 _nils_cli_git_cli_load_generated_zsh() {
   _nils_cli_git_cli_source_common_zsh || return 1
 
-  _nils_cli_completion_common_load_generated_zsh \
+  # git-cli is completion_engine=dynamic: load the clap_complete `CompleteEnv`
+  # registration stub emitted by `git-cli completion zsh` as an alias-aware
+  # generated function (renamed from `_clap_dynamic_completer_git_cli`).
+  _nils_cli_completion_common_load_dynamic_zsh \
     "_NILS_GIT_CLI_ZSH_GENERATED_STATE" \
     "_nils_cli_git_cli_generated" \
     "git-cli" \
-    "_git-cli" \
-    '^if \[ "\$funcstack\[1\]" = "_nils_cli_git_cli_generated" \]; then$' \
-    '^fi$'
+    "_clap_dynamic_completer_git_cli"
 }
 
 _nils_cli_git_cli_apply_alias_rewrite_zsh() {
@@ -55,6 +56,7 @@ _nils_cli_git_cli_apply_alias_rewrite_zsh() {
     gxb) inject=(branch) ;;
     gxi) inject=(ci) ;;
     gxo) inject=(open) ;;
+    gxw) inject=(worktree) ;;
     gxuz) inject=(utils zip) ;;
     gxuc) inject=(utils copy-staged) ;;
     gxur) inject=(utils root) ;;
@@ -132,13 +134,13 @@ _git-cli() {
 
 if _nils_cli_git_cli_source_common_zsh; then
   _nils_cli_completion_common_register_zsh _git-cli \
-    git-cli gx gxh gxu gxr gxc gxb gxi gxo \
+    git-cli gx gxh gxu gxr gxc gxb gxi gxo gxw \
     gxuz gxuc gxur gxuh gxrs gxrm gxrh gxru gxrbh gxrbc gxrr \
     gxcc gxcj gxcs gxbc gxip \
     gxor gxob gxod gxoc gxocp gxop gxopl gxoi gxoa gxorl gxot gxocs gxof gxobl
 else
   compdef _git-cli \
-    git-cli gx gxh gxu gxr gxc gxb gxi gxo \
+    git-cli gx gxh gxu gxr gxc gxb gxi gxo gxw \
     gxuz gxuc gxur gxuh gxrs gxrm gxrh gxru gxrbh gxrbc gxrr \
     gxcc gxcj gxcs gxbc gxip \
     gxor gxob gxod gxoc gxocp gxop gxopl gxoi gxoa gxorl gxot gxocs gxof gxobl

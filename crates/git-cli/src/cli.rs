@@ -241,6 +241,10 @@ struct RawArgs {
 }
 
 pub fn run() -> i32 {
+    // Short-circuit `COMPLETE=<shell> git-cli ...` dynamic-completion requests
+    // before the hand-rolled dispatch. No-op when `COMPLETE` is unset, so
+    // ordinary invocations are unaffected.
+    completion::complete_env();
     run_from(std::env::args())
 }
 

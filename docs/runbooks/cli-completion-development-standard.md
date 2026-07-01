@@ -194,11 +194,19 @@ Framework handling of a `dynamic` CLI:
   the static byte-diff (the `CompleteEnv` stub embeds the resolved binary path
   and has no reproducible static baseline); the committed registration asset
   must still exist.
-- Flag-parity assertion and the shared runtime-adapter registration shape
-  (`_clap_dynamic_completer_<bin>` / `complete -F`, plus alias-family rewrite
-  through the underlying binary) gain their dynamic handling with the first
-  `dynamic` CLI migration (the `git-cli` pilot). Until a CLI declares
-  `completion_engine=dynamic`, every audit and adapter path is unchanged.
+- Flag-parity skips a `dynamic` CLI's static flag diff: the committed asset is a
+  `CompleteEnv` registration stub with no static flag list to compare against
+  `--help` (skips are counted, never silent).
+- The shared runtime adapter loads the dynamic registration shape
+  (`_clap_dynamic_completer_<bin>` for zsh / `_clap_complete_<bin>` +
+  `complete -F` for bash) through
+  `_nils_cli_completion_common_load_dynamic_{zsh,bash}`, which renames the
+  completer, strips the raw `compdef`/`complete` registration line, and lets the
+  thin adapter keep alias-family rewrite through the underlying binary.
+- `git-cli` is the first `dynamic` CLI: `worktree go`/`remove` complete live
+  worktree names and branches (superseding the static `gxwcd` workaround). Until
+  a CLI declares `completion_engine=dynamic`, every audit and adapter path is
+  unchanged.
 
 ### Required completion enforcement metadata
 

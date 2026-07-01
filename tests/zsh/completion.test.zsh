@@ -73,7 +73,7 @@ END {
 
 typeset -a matrix_rows
 matrix_rows=("${(@f)$(awk '
-/^[[:space:]]*\| `[^`]+` \|/ {
+/^[[:space:]]*\| `[^`]+` +\|/ {
   split($0, cells, "|")
   if (length(cells) < 6) {
     next
@@ -84,6 +84,7 @@ matrix_rows=("${(@f)$(awk '
   zsh_cell = cells[4]
   bash_cell = cells[5]
   alias_cell = cells[6]
+  enforcement_cell = (length(cells) >= 7) ? cells[7] : ""
 
   gsub(/^[[:space:]]+|[[:space:]]+$/, "", binary)
   gsub(/^[[:space:]]+|[[:space:]]+$/, "", obligation)
@@ -102,7 +103,9 @@ matrix_rows=("${(@f)$(awk '
     alias_prefix = alias_pattern
   }
 
-  printf "%s\t%s\t%s\t%s\t%s\t%s\n", binary, obligation, zsh_cell, bash_cell, alias_required, alias_prefix
+  engine = (enforcement_cell ~ /completion_engine=dynamic([;`\t ]|$)/) ? "dynamic" : "static"
+
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", binary, obligation, zsh_cell, bash_cell, alias_required, alias_prefix, engine
 }
 ' "$MATRIX_FILE")}")
 
@@ -113,7 +116,7 @@ typeset -A required_alias_prefix_by_binary
 integer required_count=0
 
 for row in "${matrix_rows[@]}"; do
-  IFS=$'\t' read -r binary obligation zsh_cell bash_cell alias_required alias_prefix <<< "$row"
+  IFS=$'\t' read -r binary obligation zsh_cell bash_cell alias_required alias_prefix engine <<< "$row"
 
   [[ -n "$binary" ]] || continue
 
@@ -139,6 +142,16 @@ for row in "${matrix_rows[@]}"; do
       if ! has_compdef_mapping "$function_name" "$binary" "$compdef_before" && \
          ! has_compdef_header_token "$comp_file" "$binary"; then
         fail "zsh completion '$function_name' missing registration for '$binary' (compdef/#compdef)"
+      fi
+
+      # A `completion_engine=dynamic` CLI ships a clap_complete `CompleteEnv`
+      # registration stub, so its committed asset must load it through the shared
+      # dynamic adapter helper (which renames the completer and strips the raw
+      # `compdef` line) rather than the static `generate()` load path. This keeps
+      # the dynamic registration shape asserted rather than assumed.
+      if [[ "$engine" == "dynamic" ]]; then
+        grep -q '_nils_cli_completion_common_load_dynamic_zsh' "$comp_file" \
+          || fail "dynamic CLI '$binary' must load its CompleteEnv stub via _nils_cli_completion_common_load_dynamic_zsh"
       fi
 
       if [[ "$alias_required" == "1" ]]; then
