@@ -1919,7 +1919,10 @@ fn close_exec_state_writeback(
             linked_prs
                 .iter()
                 .map(|pr| match &pr.url {
-                    Some(url) => format!("{} merged ({url})", pr.pr_ref),
+                    // Angle-bracket the URL so the written execution-state passes
+                    // markdown lint (MD034 forbids bare URLs), matching the
+                    // `Tracking issue` bullet's autolink treatment (#1006).
+                    Some(url) => format!("{} merged (<{url}>)", pr.pr_ref),
                     None => format!("{} merged", pr.pr_ref),
                 })
                 .collect::<Vec<_>>()
@@ -8693,8 +8696,16 @@ mod tests {
         assert_eq!(out.get("changed").and_then(|v| v.as_bool()), Some(true));
         let written = std::fs::read_to_string(&state).unwrap();
         assert!(written.contains("- Status: complete; tracking issue closed"));
+        // The PR URL must be an angle-bracket autolink so the written
+        // execution-state passes markdown lint (MD034 forbids bare URLs), matching
+        // the `Tracking issue` bullet's treatment. Regression guard for #1006.
         assert!(
-            written.contains("- Branch/commit/PR: o/r#42 merged (https://github.com/o/r/pull/42)")
+            written
+                .contains("- Branch/commit/PR: o/r#42 merged (<https://github.com/o/r/pull/42>)")
+        );
+        assert!(
+            !written.contains("merged (https://"),
+            "PR URL must not be written as a bare URL (MD034)"
         );
         assert!(written.contains("- Tracking issue: <https://github.com/o/r/issues/738>"));
         // Task Ledger row preserved verbatim.
