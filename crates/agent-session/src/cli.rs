@@ -1,0 +1,232 @@
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
+use nils_common::cli_contract::OutputFormat;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "agent-session",
+    version,
+    long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
+    about = "Start and manage tmux-backed Codex and Claude Code sessions.",
+    long_about = "Start and manage tmux-backed Codex and Claude Code sessions for mobile handoff workflows.",
+    disable_help_subcommand = true,
+    after_help = "EXAMPLES:\n  agent-session start --agent codex --cwd ~/Project/app --prompt-file prompt.md\n  agent-session list\n  agent-session command <id>\n  agent-session attach <id>\n  agent-session delete <id>\n\nENVIRONMENT:\n  AGENT_SESSION_HOST       Hostname used in generated ssh attach commands.\n  AGENT_SESSION_STATE_DIR  Default state directory override.\n  AGENT_SESSION_TMUX_BIN   tmux binary override.\n  AGENT_SESSION_CODEX_BIN  codex binary override.\n  AGENT_SESSION_CLAUDE_BIN claude binary override.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error"
+)]
+pub struct Cli {
+    /// State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session.
+    #[arg(long = "state-dir", global = true, value_name = "PATH", value_hint = ValueHint::DirPath)]
+    pub state_dir: Option<PathBuf>,
+
+    /// Hostname used in generated ssh attach commands.
+    #[arg(long, global = true, value_name = "HOST")]
+    pub host: Option<String>,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Start an interactive tmux-backed agent session.
+    Start(StartArgs),
+    /// Run a one-shot agent task in a tmux session and write output to a log file.
+    Run(RunArgs),
+    /// List recorded agent sessions.
+    List(ListArgs),
+    /// Print the attach command for a session.
+    #[command(name = "command")]
+    Show(SessionRefArgs),
+    /// Attach to a tmux session from the current terminal.
+    Attach(AttachArgs),
+    /// Print captured tmux pane output or a one-shot run log.
+    Logs(LogsArgs),
+    /// Delete session state and kill the tmux session if it is still alive.
+    Delete(DeleteArgs),
+    /// Print shell completion script.
+    Completion(CompletionArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct StartArgs {
+    /// Agent to run.
+    #[arg(long, value_enum)]
+    pub agent: AgentKind,
+
+    /// Working directory for the agent session. Defaults to the current directory.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::DirPath)]
+    pub cwd: Option<PathBuf>,
+
+    /// Human-readable session title.
+    #[arg(long, value_name = "TITLE")]
+    pub title: Option<String>,
+
+    /// Short explicit session id. Usually auto-generated.
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
+
+    /// Prompt text. Prefer --prompt-file or --prompt-stdin for long prompts.
+    #[arg(long, value_name = "TEXT")]
+    pub prompt: Option<String>,
+
+    /// Prompt file path, or '-' to read stdin.
+    #[arg(long = "prompt-file", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub prompt_file: Option<PathBuf>,
+
+    /// Read prompt from stdin.
+    #[arg(long)]
+    pub prompt_stdin: bool,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
+
+    /// Agent binary override.
+    #[arg(long = "agent-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub agent_bin: Option<PathBuf>,
+
+    /// Extra argument passed to the underlying agent command.
+    #[arg(long = "agent-arg", value_name = "ARG")]
+    pub agent_args: Vec<String>,
+
+    /// Delay before pasting the initial prompt into the tmux pane.
+    #[arg(long = "paste-delay-ms", default_value_t = 1200)]
+    pub paste_delay_ms: u64,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Agent to run.
+    #[arg(long, value_enum)]
+    pub agent: AgentKind,
+
+    /// Working directory for the agent session. Defaults to the current directory.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::DirPath)]
+    pub cwd: Option<PathBuf>,
+
+    /// Human-readable session title.
+    #[arg(long, value_name = "TITLE")]
+    pub title: Option<String>,
+
+    /// Short explicit session id. Usually auto-generated.
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
+
+    /// Prompt text. Prefer --prompt-file or --prompt-stdin for long prompts.
+    #[arg(long, value_name = "TEXT")]
+    pub prompt: Option<String>,
+
+    /// Prompt file path, or '-' to read stdin.
+    #[arg(long = "prompt-file", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub prompt_file: Option<PathBuf>,
+
+    /// Read prompt from stdin.
+    #[arg(long)]
+    pub prompt_stdin: bool,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
+
+    /// Agent binary override.
+    #[arg(long = "agent-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub agent_bin: Option<PathBuf>,
+
+    /// Extra argument passed to the underlying agent command.
+    #[arg(long = "agent-arg", value_name = "ARG")]
+    pub agent_args: Vec<String>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionRefArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct AttachArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// Number of lines to capture from the tmux pane.
+    #[arg(long, default_value_t = 120)]
+    pub tail: usize,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionArgs {
+    /// Shell to generate completion script for.
+    #[arg(value_enum)]
+    pub shell: crate::completion::CompletionShell,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum AgentKind {
+    Codex,
+    Claude,
+}
+
+impl AgentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}

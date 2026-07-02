@@ -10,6 +10,7 @@ members = [
   "crates/agent-runtime",
   "crates/agent-memory",
   "crates/memo",
+  "crates/agent-session",
   "crates/claude-cli",
   "crates/codex-cli",
   "crates/opencode-cli",
