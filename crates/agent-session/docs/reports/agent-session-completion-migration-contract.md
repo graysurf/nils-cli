@@ -96,18 +96,19 @@ Checklist:
 1. `zsh -n completions/zsh/_agent-session`
 2. `bash -n completions/bash/agent-session`
 3. `cargo run -p nils-agent-session -- completion zsh | rg -- "--help|--version|--"`
-4. `cargo test -p nils-agent-session --test integration`
-5. `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
+4. `zsh -f tests/zsh/completion.test.zsh`
+5. `cargo test -p nils-agent-session --test integration`
+6. `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`
 
 ### test coverage mapping
 
 | requirement | test file or command | status | notes |
 | --- | --- | --- | --- |
-| command graph candidates | completion freshness/flag parity | pending local-fast | generated assets committed |
-| value providers | completion freshness/flag parity | pending local-fast | enum and path-hint backed |
+| command graph candidates | completion freshness/flag parity | pass | generated assets committed |
+| value providers | completion freshness/flag parity | pass | enum and path-hint backed |
 | alias map registration | matrix row | pass | aliases not required |
 | completion enforcement metadata | matrix row + this report | pass | static clap-first |
-| single-path invariants | grep validation + freshness audit | pending local-fast | no alternate dispatch code |
+| single-path invariants | grep validation + freshness audit | pass | no alternate dispatch code |
 
 ## acceptance criteria
 
@@ -116,5 +117,5 @@ Checklist:
 - [x] alias map reflects zsh/bash alias entries and completion registration.
 - [x] completion enforcement metadata is declared, matches matrix policy, and is validated.
 - [x] single-path invariants are enforced and verified.
-- [ ] tests and validation commands pass, with evidence captured.
-- [ ] PR notes link this contract and summarize follow-up risk, if any.
+- [x] tests and validation commands pass, with evidence captured.
+- [x] PR notes link this contract and summarize follow-up risk, if any.

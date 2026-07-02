@@ -28,7 +28,7 @@ agent-session delete <id>
 
 Human-readable text is the default. JSON is opt-in with `--format json` on command subcommands.
 
-JSON output uses versioned envelopes with `schema_version`, `command`, `ok`, and either `result`, `results`, or `error`.
+JSON output uses the workspace envelope: `schema_version`, `ok`, `data`, optional `warnings`, and `error` on failure.
 
 ## Secret-safety boundary
 

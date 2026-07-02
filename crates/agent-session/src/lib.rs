@@ -13,7 +13,9 @@ use std::time::Duration;
 use clap::Parser;
 use clap::error::ErrorKind;
 use jiff::Zoned;
-use nils_common::cli_contract::{OutputFormat, exit};
+use nils_common::cli_contract::{
+    Envelope, EnvelopeError, OutputFormat, emit_parse_error, exit, schema_version_for,
+};
 use nils_common::fs::{
     SECRET_FILE_MODE, display_path, expand_home, home_dir, normalize_path, write_atomic,
 };
@@ -24,12 +26,12 @@ use cli::{AgentKind, Cli, Command};
 
 const SESSION_DOCUMENT_VERSION: &str = "agent-session.session.v1";
 const BINARY: &str = "agent-session";
-const START_COMMAND: &str = "agent-session start";
-const RUN_COMMAND: &str = "agent-session run";
-const LIST_COMMAND: &str = "agent-session list";
-const COMMAND_COMMAND: &str = "agent-session command";
-const LOGS_COMMAND: &str = "agent-session logs";
-const DELETE_COMMAND: &str = "agent-session delete";
+const START_COMMAND: &str = "start";
+const RUN_COMMAND: &str = "run";
+const LIST_COMMAND: &str = "list";
+const COMMAND_COMMAND: &str = "command";
+const LOGS_COMMAND: &str = "logs";
+const DELETE_COMMAND: &str = "delete";
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -40,15 +42,28 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
+    let raw_args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cli = match Cli::try_parse_from(raw_args.clone()) {
         Ok(cli) => cli,
         Err(err) => {
-            let code = match err.kind() {
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit_code(),
-                _ => exit::USAGE,
+            let kind = err.kind();
+            if matches!(
+                kind,
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                let _ = err.print();
+                return err.exit_code();
+            }
+
+            let format = detect_format_from_args(&raw_args);
+            let code = match kind {
+                ErrorKind::InvalidSubcommand => "unknown-subcommand",
+                _ => "parse-error",
             };
-            let _ = err.print();
-            return code;
+            let message = render_clap_message(&err);
+            return emit_parse_error(BINARY, format, code, &message);
         }
     };
 
@@ -56,15 +71,15 @@ where
 }
 
 fn dispatch(cli: Cli) -> i32 {
+    if let Command::Completion(args) = cli.command {
+        return completion::run(args.shell);
+    }
+
+    let format = command_format(&cli.command);
     let context = match CliContext::resolve(cli.state_dir, cli.host) {
         Ok(context) => context,
         Err(err) => {
-            return render_error(
-                "cli.agent-session.error.v1",
-                BINARY,
-                OutputFormat::Text,
-                err,
-            );
+            return render_error("error", format, err);
         }
     };
 
@@ -76,60 +91,99 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Attach(args) => run_attach(&context, args),
         Command::Logs(args) => run_logs(&context, args),
         Command::Delete(args) => run_delete(&context, args),
-        Command::Completion(args) => completion::run(args.shell),
+        Command::Completion(_) => unreachable!("completion is handled before context resolution"),
     }
+}
+
+fn command_format(command: &Command) -> OutputFormat {
+    match command {
+        Command::Start(args) => args.format,
+        Command::Run(args) => args.format,
+        Command::List(args) => args.format,
+        Command::Show(args) => args.format,
+        Command::Logs(args) => args.format,
+        Command::Delete(args) => args.format,
+        Command::Attach(_) | Command::Completion(_) => OutputFormat::Text,
+    }
+}
+
+fn detect_format_from_args(args: &[OsString]) -> OutputFormat {
+    let mut index = 1;
+    while index < args.len() {
+        let Some(arg) = args[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if arg == "--format" {
+            if args
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+            {
+                return OutputFormat::Json;
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--format=")
+            && value.eq_ignore_ascii_case("json")
+        {
+            return OutputFormat::Json;
+        }
+        index += 1;
+    }
+    OutputFormat::Text
+}
+
+fn render_clap_message(err: &clap::Error) -> String {
+    let rendered = err.to_string();
+    rendered
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix("error:")
+                .map(str::trim)
+                .unwrap_or(line)
+                .to_string()
+        })
+        .unwrap_or_else(|| "command-line parse failed".to_string())
 }
 
 fn run_start(context: &CliContext, args: cli::StartArgs) -> i32 {
     let format = args.format;
     match start_session(context, args) {
         Ok(view) => render_single_success(
-            "cli.agent-session.start.v1",
             START_COMMAND,
             view.format,
             &view.result,
             render_started_text,
         ),
-        Err(err) => render_error("cli.agent-session.start.v1", START_COMMAND, format, err),
+        Err(err) => render_error(START_COMMAND, format, err),
     }
 }
 
 fn run_one_shot(context: &CliContext, args: cli::RunArgs) -> i32 {
     let format = args.format;
     match start_run_session(context, args) {
-        Ok(view) => render_single_success(
-            "cli.agent-session.run.v1",
-            RUN_COMMAND,
-            view.format,
-            &view.result,
-            render_started_text,
-        ),
-        Err(err) => render_error("cli.agent-session.run.v1", RUN_COMMAND, format, err),
+        Ok(view) => {
+            render_single_success(RUN_COMMAND, view.format, &view.result, render_started_text)
+        }
+        Err(err) => render_error(RUN_COMMAND, format, err),
     }
 }
 
 fn run_list(context: &CliContext, args: cli::ListArgs) -> i32 {
     match list_sessions(context, None) {
         Ok(results) => render_list_success(args.format, &results),
-        Err(err) => render_error("cli.agent-session.list.v1", LIST_COMMAND, args.format, err),
+        Err(err) => render_error(LIST_COMMAND, args.format, err),
     }
 }
 
 fn run_command(context: &CliContext, args: cli::SessionRefArgs) -> i32 {
     match load_session_view(context, &args.id, None) {
-        Ok(view) => render_single_success(
-            "cli.agent-session.command.v1",
-            COMMAND_COMMAND,
-            args.format,
-            &view,
-            render_command_text,
-        ),
-        Err(err) => render_error(
-            "cli.agent-session.command.v1",
-            COMMAND_COMMAND,
-            args.format,
-            err,
-        ),
+        Ok(view) => render_single_success(COMMAND_COMMAND, args.format, &view, render_command_text),
+        Err(err) => render_error(COMMAND_COMMAND, args.format, err),
     }
 }
 
@@ -154,12 +208,7 @@ fn run_attach(context: &CliContext, args: cli::AttachArgs) -> i32 {
                 }
             }
         }
-        Err(err) => render_error(
-            "cli.agent-session.attach.v1",
-            "agent-session attach",
-            OutputFormat::Text,
-            err,
-        ),
+        Err(err) => render_error("attach", OutputFormat::Text, err),
     }
 }
 
@@ -171,14 +220,8 @@ fn run_logs(context: &CliContext, args: cli::LogsArgs) -> i32 {
             &resolve_tmux_bin(args.tmux_bin.as_deref()),
         )
     }) {
-        Ok(result) => render_single_success(
-            "cli.agent-session.logs.v1",
-            LOGS_COMMAND,
-            args.format,
-            &result,
-            render_logs_text,
-        ),
-        Err(err) => render_error("cli.agent-session.logs.v1", LOGS_COMMAND, args.format, err),
+        Ok(result) => render_single_success(LOGS_COMMAND, args.format, &result, render_logs_text),
+        Err(err) => render_error(LOGS_COMMAND, args.format, err),
     }
 }
 
@@ -188,19 +231,10 @@ fn run_delete(context: &CliContext, args: cli::DeleteArgs) -> i32 {
         &args.id,
         resolve_tmux_bin(args.tmux_bin.as_deref()),
     ) {
-        Ok(result) => render_single_success(
-            "cli.agent-session.delete.v1",
-            DELETE_COMMAND,
-            args.format,
-            &result,
-            render_delete_text,
-        ),
-        Err(err) => render_error(
-            "cli.agent-session.delete.v1",
-            DELETE_COMMAND,
-            args.format,
-            err,
-        ),
+        Ok(result) => {
+            render_single_success(DELETE_COMMAND, args.format, &result, render_delete_text)
+        }
+        Err(err) => render_error(DELETE_COMMAND, args.format, err),
     }
 }
 
@@ -213,9 +247,10 @@ struct CliContext {
 impl CliContext {
     fn resolve(state_dir: Option<PathBuf>, host: Option<String>) -> Result<Self, CliError> {
         let state_dir = resolve_state_dir(state_dir)?;
-        let host = host
-            .or_else(|| non_empty_env("AGENT_SESSION_HOST"))
-            .or_else(short_hostname);
+        let host = resolve_host(
+            host.or_else(|| non_empty_env("AGENT_SESSION_HOST"))
+                .or_else(short_hostname),
+        )?;
         Ok(Self { state_dir, host })
     }
 }
@@ -274,38 +309,6 @@ struct LogsResult {
     text: String,
 }
 
-#[derive(Debug, Serialize)]
-struct JsonSingle<'a, T: Serialize> {
-    schema_version: &'a str,
-    command: &'a str,
-    ok: bool,
-    result: &'a T,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonList<'a, T: Serialize> {
-    schema_version: &'a str,
-    command: &'a str,
-    ok: bool,
-    results: &'a [T],
-}
-
-#[derive(Debug, Serialize)]
-struct JsonFailure<'a> {
-    schema_version: &'a str,
-    command: &'a str,
-    ok: bool,
-    error: JsonError,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonError {
-    code: String,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<Value>,
-}
-
 #[derive(Debug, Clone)]
 struct CliError(Box<CliErrorData>);
 
@@ -340,6 +343,15 @@ impl CliError {
         }))
     }
 
+    fn data(code: impl Into<String>, message: impl Into<String>, details: Option<Value>) -> Self {
+        Self(Box::new(CliErrorData {
+            code: code.into(),
+            message: message.into(),
+            details,
+            exit_code: exit::DATA,
+        }))
+    }
+
     fn into_inner(self) -> CliErrorData {
         *self.0
     }
@@ -361,19 +373,25 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
 
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let agent_bin = resolve_agent_bin(args.agent, args.agent_bin.as_deref());
-    start_interactive_tmux(
+    if let Err(err) = start_interactive_tmux(
         &tmux_bin,
         &agent_bin,
         args.agent,
         &created.record,
         args.title.as_deref(),
         &args.agent_args,
-    )?;
+    ) {
+        cleanup_created_record(&created);
+        return Err(err);
+    }
     if created.prompt_file.is_some() {
         if args.paste_delay_ms > 0 {
             thread::sleep(Duration::from_millis(args.paste_delay_ms));
         }
-        paste_prompt(&tmux_bin, &created.record)?;
+        if let Err(err) = paste_prompt(&tmux_bin, &created.record) {
+            cleanup_created_record(&created);
+            return Err(err);
+        }
     }
 
     let result = session_view(context, &created.record, Some("running".to_string()));
@@ -409,13 +427,16 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
 
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let agent_bin = resolve_agent_bin(args.agent, args.agent_bin.as_deref());
-    start_run_tmux(
+    if let Err(err) = start_run_tmux(
         &tmux_bin,
         &agent_bin,
         args.agent,
         &created.record,
         &args.agent_args,
-    )?;
+    ) {
+        cleanup_created_record(&created);
+        return Err(err);
+    }
 
     let result = session_view(context, &created.record, Some("running".to_string()));
     Ok(StartView {
@@ -427,6 +448,7 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
 struct CreatedRecord {
     record: SessionRecord,
     prompt_file: Option<PathBuf>,
+    session_dir: PathBuf,
 }
 
 struct RecordRequest<'a> {
@@ -483,7 +505,12 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
     Ok(CreatedRecord {
         record,
         prompt_file,
+        session_dir,
     })
+}
+
+fn cleanup_created_record(created: &CreatedRecord) {
+    let _ = fs::remove_dir_all(&created.session_dir);
 }
 
 fn start_interactive_tmux(
@@ -598,13 +625,29 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
         .arg("paste-buffer")
         .arg("-b")
         .arg(&buffer_name)
+        .arg("-d")
         .arg("-t")
         .arg(&target);
-    run_status(paste, "tmux paste-buffer")?;
+    if let Err(err) = run_status(paste, "tmux paste-buffer") {
+        delete_tmux_buffer(tmux_bin, &buffer_name);
+        return Err(err);
+    }
 
     let mut enter = ProcessCommand::new(tmux_bin);
     enter.arg("send-keys").arg("-t").arg(&target).arg("Enter");
-    run_status(enter, "tmux send-keys")
+    if let Err(err) = run_status(enter, "tmux send-keys") {
+        delete_tmux_buffer(tmux_bin, &buffer_name);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn delete_tmux_buffer(tmux_bin: &Path, buffer_name: &str) {
+    let _ = ProcessCommand::new(tmux_bin)
+        .arg("delete-buffer")
+        .arg("-b")
+        .arg(buffer_name)
+        .status();
 }
 
 fn list_sessions(
@@ -669,9 +712,10 @@ fn load_session_record(context: &CliContext, id: &str) -> Result<SessionRecord, 
 }
 
 fn resolve_session_record_path(context: &CliContext, id: &str) -> Result<PathBuf, CliError> {
+    validate_id(id)?;
     let exact = session_dir(context, id).join("session.json");
     if exact.is_file() {
-        return Ok(exact);
+        return ensure_record_in_sessions_root(context, &exact);
     }
     let sessions_root = context.state_dir.join("sessions");
     let mut matches = Vec::new();
@@ -692,7 +736,10 @@ fn resolve_session_record_path(context: &CliContext, id: &str) -> Result<PathBuf
             })?;
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with(id) && entry.path().join("session.json").is_file() {
-                matches.push(entry.path().join("session.json"));
+                matches.push(ensure_record_in_sessions_root(
+                    context,
+                    &entry.path().join("session.json"),
+                )?);
             }
         }
     }
@@ -711,6 +758,32 @@ fn resolve_session_record_path(context: &CliContext, id: &str) -> Result<PathBuf
     }
 }
 
+fn ensure_record_in_sessions_root(context: &CliContext, path: &Path) -> Result<PathBuf, CliError> {
+    let sessions_root = context.state_dir.join("sessions");
+    let canonical_root = fs::canonicalize(&sessions_root).map_err(|err| {
+        CliError::runtime(
+            "session-root-unavailable",
+            format!("failed to canonicalize {}: {err}", sessions_root.display()),
+            Some(json!({ "path": display_path(&sessions_root) })),
+        )
+    })?;
+    let canonical_path = fs::canonicalize(path).map_err(|err| {
+        CliError::runtime(
+            "session-read-failed",
+            format!("failed to canonicalize {}: {err}", path.display()),
+            Some(json!({ "path": display_path(path) })),
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(CliError::usage(
+            "session-path-escaped",
+            "session record path escapes the managed state directory",
+            Some(json!({ "id_path": display_path(path) })),
+        ));
+    }
+    Ok(canonical_path)
+}
+
 fn read_session_record(path: &Path) -> Result<SessionRecord, CliError> {
     let contents = fs::read_to_string(path).map_err(|err| {
         CliError::runtime(
@@ -720,14 +793,14 @@ fn read_session_record(path: &Path) -> Result<SessionRecord, CliError> {
         )
     })?;
     let record: SessionRecord = serde_json::from_str(&contents).map_err(|err| {
-        CliError::runtime(
+        CliError::data(
             "session-json-invalid",
             format!("failed to parse {}: {err}", path.display()),
             Some(json!({ "path": display_path(path) })),
         )
     })?;
     if record.schema_version != SESSION_DOCUMENT_VERSION {
-        return Err(CliError::runtime(
+        return Err(CliError::data(
             "unsupported-session-version",
             format!(
                 "unsupported session schema_version {}; expected {}",
@@ -1025,6 +1098,36 @@ fn resolve_tmux_bin(explicit: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("tmux"))
 }
 
+fn resolve_host(host: Option<String>) -> Result<Option<String>, CliError> {
+    let Some(host) = host else {
+        return Ok(None);
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        return Ok(None);
+    }
+    validate_host(host)?;
+    Ok(Some(host.to_string()))
+}
+
+fn validate_host(host: &str) -> Result<(), CliError> {
+    if host.starts_with('-') {
+        return Err(CliError::usage(
+            "invalid-host",
+            "host must not start with '-' because ssh would parse it as an option",
+            Some(json!({ "host": host })),
+        ));
+    }
+    if host.chars().any(char::is_control) || host.chars().any(char::is_whitespace) {
+        return Err(CliError::usage(
+            "invalid-host",
+            "host must not contain whitespace or control characters",
+            Some(json!({ "host": host })),
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_agent_bin(agent: AgentKind, explicit: Option<&Path>) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();
@@ -1127,7 +1230,6 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
 }
 
 fn render_single_success<T: Serialize>(
-    schema_version: &'static str,
     command: &'static str,
     format: OutputFormat,
     result: &T,
@@ -1135,12 +1237,7 @@ fn render_single_success<T: Serialize>(
 ) -> i32 {
     match format {
         OutputFormat::Json => {
-            let envelope = JsonSingle {
-                schema_version,
-                command,
-                ok: true,
-                result,
-            };
+            let envelope = Envelope::success(schema_version_for(BINARY, command, 1), result);
             print_json(&envelope)
         }
         OutputFormat::Text => {
@@ -1153,12 +1250,7 @@ fn render_single_success<T: Serialize>(
 fn render_list_success(format: OutputFormat, results: &[SessionView]) -> i32 {
     match format {
         OutputFormat::Json => {
-            let envelope = JsonList {
-                schema_version: "cli.agent-session.list.v1",
-                command: LIST_COMMAND,
-                ok: true,
-                results,
-            };
+            let envelope = Envelope::success(schema_version_for(BINARY, LIST_COMMAND, 1), results);
             print_json(&envelope)
         }
         OutputFormat::Text => {
@@ -1177,25 +1269,16 @@ fn render_list_success(format: OutputFormat, results: &[SessionView]) -> i32 {
     }
 }
 
-fn render_error(
-    schema_version: &'static str,
-    command: &'static str,
-    format: OutputFormat,
-    err: CliError,
-) -> i32 {
+fn render_error(command: &'static str, format: OutputFormat, err: CliError) -> i32 {
     let err = err.into_inner();
     match format {
         OutputFormat::Json => {
-            let envelope = JsonFailure {
-                schema_version,
-                command,
-                ok: false,
-                error: JsonError {
-                    code: err.code,
-                    message: err.message,
-                    details: err.details,
-                },
-            };
+            let mut envelope_error = EnvelopeError::new(err.code, err.message);
+            if let Some(details) = err.details {
+                envelope_error = envelope_error.with_details(details);
+            }
+            let envelope: Envelope<()> =
+                Envelope::failure(schema_version_for(BINARY, command, 1), envelope_error);
             print_json(&envelope);
         }
         OutputFormat::Text => {
@@ -1213,7 +1296,7 @@ fn print_json<T: Serialize>(value: &T) -> i32 {
         }
         Err(err) => {
             eprintln!("error: failed to serialize json: {err}");
-            exit::RUNTIME
+            exit::SOFTWARE
         }
     }
 }
