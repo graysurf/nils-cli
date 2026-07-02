@@ -1832,6 +1832,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-agent-session"
+version = "1.20.6"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "jiff",
+ "nils-build-info",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tempfile",
+]
+
+[[package]]
 name = "nils-agent-workflow-primitives"
 version = "1.20.6"
 dependencies = [

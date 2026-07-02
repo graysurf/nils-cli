@@ -4,6 +4,7 @@ nils-common
 nils-agent-docs
 nils-agent-memory
 nils-agent-out
+nils-agent-session
 nils-agent-scope-lock
 nils-term
 nils-markdown

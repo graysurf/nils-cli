@@ -1,0 +1,203 @@
+#compdef agent-session
+
+autoload -U is-at-least
+
+_agent-session() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_agent-session_commands" \
+"*::: :->agent-session" \
+&& ret=0
+    case $state in
+    (agent-session)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-session-command-$line[1]:"
+        case $line[1] in
+            (start)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Agent to run]:AGENT:(codex claude)' \
+'--cwd=[Working directory for the agent session. Defaults to the current directory]:PATH:_files -/' \
+'--title=[Human-readable session title]:TITLE:_default' \
+'--id=[Short explicit session id. Usually auto-generated]:ID:_default' \
+'--prompt=[Prompt text. Prefer --prompt-file or --prompt-stdin for long prompts]:TEXT:_default' \
+'--prompt-file=[Prompt file path, or '\''-'\'' to read stdin]:PATH:_files' \
+'--tmux-bin=[tmux binary override]:PATH:_files' \
+'--agent-bin=[Agent binary override]:PATH:_files' \
+'*--agent-arg=[Extra argument passed to the underlying agent command]:ARG:_default' \
+'--paste-delay-ms=[Delay before pasting the initial prompt into the tmux pane]:PASTE_DELAY_MS:_default' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'--prompt-stdin[Read prompt from stdin]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(run)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Agent to run]:AGENT:(codex claude)' \
+'--cwd=[Working directory for the agent session. Defaults to the current directory]:PATH:_files -/' \
+'--title=[Human-readable session title]:TITLE:_default' \
+'--id=[Short explicit session id. Usually auto-generated]:ID:_default' \
+'--prompt=[Prompt text. Prefer --prompt-file or --prompt-stdin for long prompts]:TEXT:_default' \
+'--prompt-file=[Prompt file path, or '\''-'\'' to read stdin]:PATH:_files' \
+'--tmux-bin=[tmux binary override]:PATH:_files' \
+'--agent-bin=[Agent binary override]:PATH:_files' \
+'*--agent-arg=[Extra argument passed to the underlying agent command]:ARG:_default' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'--prompt-stdin[Read prompt from stdin]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(command)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Session id:_default' \
+&& ret=0
+;;
+(attach)
+_arguments "${_arguments_options[@]}" : \
+'--tmux-bin=[tmux binary override]:PATH:_files' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+':id -- Session id:_default' \
+&& ret=0
+;;
+(logs)
+_arguments "${_arguments_options[@]}" : \
+'--tail=[Number of lines to capture from the tmux pane]:TAIL:_default' \
+'--tmux-bin=[tmux binary override]:PATH:_files' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Session id:_default' \
+&& ret=0
+;;
+(delete)
+_arguments "${_arguments_options[@]}" : \
+'--tmux-bin=[tmux binary override]:PATH:_files' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Session id:_default' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completion script for:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_agent-session_commands] )) ||
+_agent-session_commands() {
+    local commands; commands=(
+'start:Start an interactive tmux-backed agent session' \
+'run:Run a one-shot agent task in a tmux session and write output to a log file' \
+'list:List recorded agent sessions' \
+'command:Print the attach command for a session' \
+'attach:Attach to a tmux session from the current terminal' \
+'logs:Print captured tmux pane output or a one-shot run log' \
+'delete:Delete session state and kill the tmux session if it is still alive' \
+'completion:Print shell completion script' \
+    )
+    _describe -t commands 'agent-session commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__attach_commands] )) ||
+_agent-session__subcmd__attach_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session attach commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__command_commands] )) ||
+_agent-session__subcmd__command_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session command commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__completion_commands] )) ||
+_agent-session__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session completion commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__delete_commands] )) ||
+_agent-session__subcmd__delete_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session delete commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__list_commands] )) ||
+_agent-session__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session list commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__logs_commands] )) ||
+_agent-session__subcmd__logs_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session logs commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__run_commands] )) ||
+_agent-session__subcmd__run_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session run commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__start_commands] )) ||
+_agent-session__subcmd__start_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session start commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_agent-session" ]; then
+    _agent-session "$@"
+else
+    compdef _agent-session agent-session
+fi
