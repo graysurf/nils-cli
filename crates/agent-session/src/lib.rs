@@ -389,6 +389,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
             thread::sleep(Duration::from_millis(args.paste_delay_ms));
         }
         if let Err(err) = paste_prompt(&tmux_bin, &created.record) {
+            let _ = kill_tmux_session(&tmux_bin, &created.record.tmux_session);
             cleanup_created_record(&created);
             return Err(err);
         }
@@ -677,9 +678,17 @@ fn list_sessions(
             )
         })?;
         if entry.path().is_dir() {
+            let entry_name = entry.file_name().to_string_lossy().to_string();
             let record_path = entry.path().join("session.json");
             if record_path.is_file() {
-                let record = read_session_record(&record_path)?;
+                let resolved = ensure_record_in_session_dir(
+                    context,
+                    &record_path,
+                    &entry.path(),
+                    &entry_name,
+                )?;
+                let record = read_session_record(&resolved.record_path)?;
+                validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
                 let status = live_status(&tmux_bin, &record.tmux_session);
                 records.push(session_view(context, &record, Some(status)));
             }
@@ -707,15 +716,28 @@ fn load_session_view(
 }
 
 fn load_session_record(context: &CliContext, id: &str) -> Result<SessionRecord, CliError> {
-    let record_path = resolve_session_record_path(context, id)?;
-    read_session_record(&record_path)
+    let resolved = resolve_session_record_path(context, id)?;
+    let record = read_session_record(&resolved.record_path)?;
+    validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
+    Ok(record)
 }
 
-fn resolve_session_record_path(context: &CliContext, id: &str) -> Result<PathBuf, CliError> {
+#[derive(Debug)]
+struct ResolvedRecordPath {
+    record_path: PathBuf,
+    session_dir: PathBuf,
+    expected_id: String,
+}
+
+fn resolve_session_record_path(
+    context: &CliContext,
+    id: &str,
+) -> Result<ResolvedRecordPath, CliError> {
     validate_id(id)?;
-    let exact = session_dir(context, id).join("session.json");
+    let exact_dir = session_dir(context, id);
+    let exact = exact_dir.join("session.json");
     if exact.is_file() {
-        return ensure_record_in_sessions_root(context, &exact);
+        return ensure_record_in_session_dir(context, &exact, &exact_dir, id);
     }
     let sessions_root = context.state_dir.join("sessions");
     let mut matches = Vec::new();
@@ -735,10 +757,13 @@ fn resolve_session_record_path(context: &CliContext, id: &str) -> Result<PathBuf
                 )
             })?;
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(id) && entry.path().join("session.json").is_file() {
-                matches.push(ensure_record_in_sessions_root(
+            let record_path = entry.path().join("session.json");
+            if name.starts_with(id) && record_path.is_file() {
+                matches.push(ensure_record_in_session_dir(
                     context,
-                    &entry.path().join("session.json"),
+                    &record_path,
+                    &entry.path(),
+                    &name,
                 )?);
             }
         }
@@ -758,7 +783,12 @@ fn resolve_session_record_path(context: &CliContext, id: &str) -> Result<PathBuf
     }
 }
 
-fn ensure_record_in_sessions_root(context: &CliContext, path: &Path) -> Result<PathBuf, CliError> {
+fn ensure_record_in_session_dir(
+    context: &CliContext,
+    path: &Path,
+    expected_session_dir: &Path,
+    expected_id: &str,
+) -> Result<ResolvedRecordPath, CliError> {
     let sessions_root = context.state_dir.join("sessions");
     let canonical_root = fs::canonicalize(&sessions_root).map_err(|err| {
         CliError::runtime(
@@ -767,6 +797,23 @@ fn ensure_record_in_sessions_root(context: &CliContext, path: &Path) -> Result<P
             Some(json!({ "path": display_path(&sessions_root) })),
         )
     })?;
+    let canonical_session_dir = fs::canonicalize(expected_session_dir).map_err(|err| {
+        CliError::runtime(
+            "session-read-failed",
+            format!(
+                "failed to canonicalize {}: {err}",
+                expected_session_dir.display()
+            ),
+            Some(json!({ "path": display_path(expected_session_dir) })),
+        )
+    })?;
+    if !canonical_session_dir.starts_with(&canonical_root) {
+        return Err(CliError::usage(
+            "session-path-escaped",
+            "session directory escapes the managed state directory",
+            Some(json!({ "session_dir": display_path(expected_session_dir) })),
+        ));
+    }
     let canonical_path = fs::canonicalize(path).map_err(|err| {
         CliError::runtime(
             "session-read-failed",
@@ -774,14 +821,22 @@ fn ensure_record_in_sessions_root(context: &CliContext, path: &Path) -> Result<P
             Some(json!({ "path": display_path(path) })),
         )
     })?;
-    if !canonical_path.starts_with(&canonical_root) {
+    let expected_record_path = canonical_session_dir.join("session.json");
+    if canonical_path != expected_record_path {
         return Err(CliError::usage(
             "session-path-escaped",
-            "session record path escapes the managed state directory",
-            Some(json!({ "id_path": display_path(path) })),
+            "session record path escapes the requested session directory",
+            Some(json!({
+                "path": display_path(path),
+                "expected_session_dir": display_path(expected_session_dir),
+            })),
         ));
     }
-    Ok(canonical_path)
+    Ok(ResolvedRecordPath {
+        record_path: canonical_path,
+        session_dir: canonical_session_dir,
+        expected_id: expected_id.to_string(),
+    })
 }
 
 fn read_session_record(path: &Path) -> Result<SessionRecord, CliError> {
@@ -810,6 +865,28 @@ fn read_session_record(path: &Path) -> Result<SessionRecord, CliError> {
         ));
     }
     Ok(record)
+}
+
+fn validate_record_id(
+    record: &SessionRecord,
+    expected_id: &str,
+    path: &Path,
+) -> Result<(), CliError> {
+    if record.id != expected_id {
+        return Err(CliError::data(
+            "session-record-mismatch",
+            format!(
+                "session record id {} does not match directory {}",
+                record.id, expected_id
+            ),
+            Some(json!({
+                "path": display_path(path),
+                "record_id": record.id,
+                "expected_id": expected_id,
+            })),
+        ));
+    }
+    Ok(())
 }
 
 fn write_session_record(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
@@ -857,6 +934,10 @@ fn session_logs(
     tail: usize,
     tmux_bin: &Path,
 ) -> Result<LogsResult, CliError> {
+    if let Some(result) = read_session_log_file(record, tail)? {
+        return Ok(result);
+    }
+
     if live_status(tmux_bin, &record.tmux_session) == "running" {
         let start = format!("-{}", tail.max(1));
         let output = ProcessCommand::new(tmux_bin)
@@ -883,21 +964,6 @@ fn session_logs(
         }
     }
 
-    if let Some(log_file) = &record.log_file {
-        let text = fs::read_to_string(log_file).map_err(|err| {
-            CliError::runtime(
-                "log-read-failed",
-                format!("failed to read {log_file}: {err}"),
-                Some(json!({ "log_file": log_file })),
-            )
-        })?;
-        return Ok(LogsResult {
-            id: record.id.clone(),
-            source: "file".to_string(),
-            text: tail_lines(&text, tail),
-        });
-    }
-
     Err(CliError::runtime(
         "logs-unavailable",
         "no tmux pane output or log file is available",
@@ -905,23 +971,41 @@ fn session_logs(
     ))
 }
 
+fn read_session_log_file(
+    record: &SessionRecord,
+    tail: usize,
+) -> Result<Option<LogsResult>, CliError> {
+    if let Some(log_file) = &record.log_file {
+        match fs::read_to_string(log_file) {
+            Ok(text) => {
+                return Ok(Some(LogsResult {
+                    id: record.id.clone(),
+                    source: "file".to_string(),
+                    text: tail_lines(&text, tail),
+                }));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(CliError::runtime(
+                    "log-read-failed",
+                    format!("failed to read {log_file}: {err}"),
+                    Some(json!({ "log_file": log_file })),
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn delete_session(
     context: &CliContext,
     id: &str,
     tmux_bin: PathBuf,
 ) -> Result<DeleteResult, CliError> {
-    let record_path = resolve_session_record_path(context, id)?;
-    let record = read_session_record(&record_path)?;
-    let session_dir = record_path
-        .parent()
-        .ok_or_else(|| {
-            CliError::runtime(
-                "invalid-session-path",
-                "session record has no parent directory",
-                None,
-            )
-        })?
-        .to_path_buf();
+    let resolved = resolve_session_record_path(context, id)?;
+    let record = read_session_record(&resolved.record_path)?;
+    validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
+    let session_dir = resolved.session_dir;
     let killed = kill_tmux_session(&tmux_bin, &record.tmux_session);
     fs::remove_dir_all(&session_dir).map_err(|err| {
         CliError::runtime(

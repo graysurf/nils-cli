@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
@@ -40,6 +40,10 @@ if [ "$1" = "has-session" ] && [ "${AGENT_SESSION_FAKE_TMUX_HAS_SESSION:-1}" = "
 fi
 
 if [ "$1" = "capture-pane" ]; then
+  if [ "${AGENT_SESSION_FAKE_TMUX_CAPTURE+x}" = "x" ]; then
+    printf '%s' "$AGENT_SESSION_FAKE_TMUX_CAPTURE"
+    exit 0
+  fi
   printf 'pane one\npane two\n'
   exit 0
 fi
@@ -414,7 +418,8 @@ fn run_and_logs_cover_json_contract_and_file_fallback() {
         "run script must not inline prompt text: {script}"
     );
 
-    let logs_from_tmux = run(
+    fs::write(&log_file, "alpha\nbeta\ngamma\n").expect("write log file");
+    let logs_from_file = run(
         tmp.path(),
         &[
             "--state-dir",
@@ -429,17 +434,16 @@ fn run_and_logs_cover_json_contract_and_file_fallback() {
         &env_refs,
     );
     assert_eq!(
-        logs_from_tmux.code,
+        logs_from_file.code,
         0,
         "stderr={}",
-        logs_from_tmux.stderr_text()
+        logs_from_file.stderr_text()
     );
-    let tmux_logs_json = logs_from_tmux.stdout_json();
-    let tmux_logs = data(&tmux_logs_json);
-    assert_eq!(tmux_logs["source"], "tmux");
-    assert!(tmux_logs["text"].as_str().unwrap().contains("pane two"));
+    let file_logs_json = logs_from_file.stdout_json();
+    let file_logs = data(&file_logs_json);
+    assert_eq!(file_logs["source"], "file");
+    assert_eq!(file_logs["text"], "alpha\nbeta\ngamma\n");
 
-    fs::write(&log_file, "alpha\nbeta\ngamma\n").expect("write log file");
     let envs = [
         (
             "AGENT_SESSION_FAKE_TMUX_LOG",
@@ -537,6 +541,59 @@ fn failure_paths_return_json_without_leaking_prompt_or_orphaning_state() {
     assert!(
         !state_dir.join("sessions").join("fail-start").exists(),
         "failed tmux startup should not leave session state"
+    );
+
+    let envs = [
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            tmux_log.to_string_lossy().to_string(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_FAIL", "paste-buffer".to_string()),
+    ];
+    let env_refs = [
+        (envs[0].0, envs[0].1.as_str()),
+        (envs[1].0, envs[1].1.as_str()),
+    ];
+    let paste_fail = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--id",
+            "paste-fail",
+            "--prompt",
+            secret,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &env_refs,
+    );
+    assert_eq!(paste_fail.code, 1, "stderr={}", paste_fail.stderr_text());
+    assert_no_secret(&paste_fail, secret);
+    assert!(
+        !state_dir.join("sessions").join("paste-fail").exists(),
+        "failed prompt paste should remove session state"
+    );
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls.iter().any(|call| call
+            == &vec![
+                "kill-session".to_string(),
+                "-t".to_string(),
+                "hs-codex-paste-fail".to_string(),
+            ]),
+        "failed prompt paste should kill the orphaned tmux session: {calls:?}"
     );
 
     let missing_prompt = run(
@@ -666,4 +723,48 @@ fn parse_context_data_and_session_reference_errors_follow_contract() {
     let value = data_error.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-session.command.v1");
     assert_eq!(value["error"]["code"], "session-json-invalid");
+
+    let sessions_root = state_dir.join("sessions");
+    let victim_dir = sessions_root.join("victim");
+    let alias_dir = sessions_root.join("alias");
+    fs::create_dir_all(&victim_dir).expect("victim session dir");
+    fs::create_dir_all(&alias_dir).expect("alias session dir");
+    fs::write(
+        victim_dir.join("session.json"),
+        r#"{
+  "schema_version": "agent-session.session.v1",
+  "id": "victim",
+  "agent": "codex",
+  "mode": "interactive",
+  "title": null,
+  "cwd": "/tmp",
+  "tmux_session": "hs-codex-victim",
+  "prompt_file": null,
+  "log_file": null,
+  "created_at": "2026-07-02T00:00:00Z",
+  "updated_at": "2026-07-02T00:00:00Z"
+}"#,
+    )
+    .expect("victim session record");
+    symlink(
+        victim_dir.join("session.json"),
+        alias_dir.join("session.json"),
+    )
+    .expect("alias session symlink");
+    let alias = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "command",
+            "alias",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(alias.code, 64);
+    let value = alias.stdout_json();
+    assert_eq!(value["schema_version"], "cli.agent-session.command.v1");
+    assert_eq!(value["error"]["code"], "session-path-escaped");
 }
