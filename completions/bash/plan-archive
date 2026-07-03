@@ -495,7 +495,7 @@ _plan-archive() {
             return 0
             ;;
         plan__archive__search)
-            opts="-h --archive --format --json --help <TERM>"
+            opts="-h --archive --format --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

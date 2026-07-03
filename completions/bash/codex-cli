@@ -312,7 +312,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__agent__advice)
-            opts="-h --ephemeral --help [question]..."
+            opts="-h --ephemeral --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -326,7 +326,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__agent__commit)
-            opts="-p -a -h --push --auto-stage --ephemeral --help [extra]..."
+            opts="-p -a -h --push --auto-stage --ephemeral --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -424,7 +424,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__agent__knowledge)
-            opts="-h --ephemeral --help [concept]..."
+            opts="-h --ephemeral --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -438,7 +438,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__agent__prompt)
-            opts="-h --ephemeral --help [prompt]..."
+            opts="-h --ephemeral --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -702,7 +702,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__auth__refresh)
-            opts="-h --format --json --help [secret]..."
+            opts="-h --format --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -802,7 +802,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__auth__remove)
-            opts="-y -h --format --json --yes --help [secret]..."
+            opts="-y -h --format --json --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -820,7 +820,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__auth__save)
-            opts="-y -h --format --json --yes --help [secret]..."
+            opts="-y -h --format --json --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -874,7 +874,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__auth__use)
-            opts="-h --format --json --help [target]..."
+            opts="-h --format --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -976,7 +976,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__config__set)
-            opts="-h --help <KEY> <VALUE>"
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1060,7 +1060,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__diag__rate__limits)
-            opts="-c -d -h --clear-cache --debug --cached --no-refresh-auth --format --json --one-line --all --async --watch --jobs --help [SECRET]"
+            opts="-c -d -h --clear-cache --debug --cached --no-refresh-auth --format --json --one-line --all --async --watch --jobs --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

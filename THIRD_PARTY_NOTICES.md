@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `c1812946416608d87b3b5aba85b8469480e26f48a04321c37f75f5d08bbd1f50`
-- Third-party crates (`source != null`): 451
+- Cargo.lock SHA256: `466ff61bccc00871b0702755cffa7956332114536bc6b0936937e6e473fc83ed`
+- Third-party crates (`source != null`): 450
 
 ## Notice Extraction Policy
 
@@ -406,7 +406,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### clap_complete 4.6.5
+### clap_complete 4.6.7
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -476,7 +476,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### console 0.16.3
+### console 0.16.4
 
 - License: `MIT`
 - Source: `crates.io`
@@ -1275,7 +1275,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### indicatif 0.18.4
+### indicatif 0.18.6
 
 - License: `MIT`
 - Source: `crates.io`
@@ -1340,7 +1340,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### jiff 0.2.29
+### jiff 0.2.31
 
 - License: `Unlicense OR MIT`
 - Source: `crates.io`
@@ -1350,7 +1350,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `COPYING`
   - `UNLICENSE`
 
-### jiff-static 0.2.29
+### jiff-static 0.2.31
 
 - License: `Unlicense OR MIT`
 - Source: `crates.io`
@@ -2531,15 +2531,6 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### shlex 1.3.0
-
-- License: `MIT OR Apache-2.0`
-- Source: `crates.io`
-- Notice files: No explicit NOTICE file discovered.
-- License file references:
-  - `LICENSE-APACHE`
-  - `LICENSE-MIT`
-
 ### shlex 2.0.1
 
 - License: `MIT OR Apache-2.0`
@@ -2763,7 +2754,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### time 0.3.51
+### time 0.3.53
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -2781,7 +2772,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-Apache`
   - `LICENSE-MIT`
 
-### time-macros 0.2.30
+### time-macros 0.2.31
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`

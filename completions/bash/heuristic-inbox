@@ -61,7 +61,7 @@ _heuristic-inbox() {
             return 0
             ;;
         heuristic__inbox__archive)
-            opts="-y -h --inbox-dir --archive-root --date --link --reason --yes --dry-run --log-dir --format --help <PATH>"
+            opts="-y -h --inbox-dir --archive-root --date --link --reason --yes --dry-run --log-dir --format --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -197,7 +197,7 @@ _heuristic-inbox() {
             return 0
             ;;
         heuristic__inbox__ingest__evidence)
-            opts="-h --from --label --suffix --max-bytes --force --log-dir --format --help <PATH>"
+            opts="-h --from --label --suffix --max-bytes --force --log-dir --format --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -342,7 +342,7 @@ _heuristic-inbox() {
             return 0
             ;;
         heuristic__inbox__set__status)
-            opts="-h --status --link --next-action --log-dir --format --help <PATH>"
+            opts="-h --status --link --next-action --log-dir --format --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -379,7 +379,7 @@ _heuristic-inbox() {
             return 0
             ;;
         heuristic__inbox__verify)
-            opts="-h --inbox-dir --strict --format --help <PATH>"
+            opts="-h --inbox-dir --strict --format --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
