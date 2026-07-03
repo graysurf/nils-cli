@@ -94,7 +94,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__alias)
-            opts="-h --help [query]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -122,7 +122,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__def)
-            opts="-h --help [query]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -136,7 +136,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__directory)
-            opts="-h --vi --vscode --help [query]..."
+            opts="-h --vi --vscode --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -150,7 +150,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__env)
-            opts="-h --help [query]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -164,7 +164,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__file)
-            opts="-h --vi --vscode --help [query]..."
+            opts="-h --vi --vscode --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -178,7 +178,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__function)
-            opts="-h --help [query]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -192,7 +192,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__git__branch)
-            opts="-h --help [query]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -206,7 +206,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__git__checkout)
-            opts="-h --help [query]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -220,7 +220,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__git__commit)
-            opts="-h --snapshot --help [query]..."
+            opts="-h --snapshot --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -234,7 +234,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__git__status)
-            opts="-h --help [query]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -248,7 +248,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__git__tag)
-            opts="-h --help [query]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -276,7 +276,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__history)
-            opts="-h --help [query]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -290,7 +290,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__kill__port)
-            opts="-9 -h --force --help [port]..."
+            opts="-9 -h --force --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -304,7 +304,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__kill__process)
-            opts="-9 -h --force --help [pid]..."
+            opts="-9 -h --force --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -318,7 +318,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__open__changed__files)
-            opts="-v -h --list --git --workspace-mode --dry-run --verbose --max-files --help [files]..."
+            opts="-v -h --list --git --workspace-mode --dry-run --verbose --max-files --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -340,7 +340,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__port)
-            opts="-k -9 -h --kill --force --help [query]..."
+            opts="-k -9 -h --kill --force --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -354,7 +354,7 @@ _fzf-cli() {
             return 0
             ;;
         fzf__cli__process)
-            opts="-k -9 -h --kill --force --help [query]..."
+            opts="-k -9 -h --kill --force --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

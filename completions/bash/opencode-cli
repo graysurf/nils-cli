@@ -111,7 +111,7 @@ _opencode-cli() {
             return 0
             ;;
         opencode__cli__agent__advice)
-            opts="-h --help [question]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -125,7 +125,7 @@ _opencode-cli() {
             return 0
             ;;
         opencode__cli__agent__commit)
-            opts="-p -a -h --push --auto-stage --help [extra]..."
+            opts="-p -a -h --push --auto-stage --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -223,7 +223,7 @@ _opencode-cli() {
             return 0
             ;;
         opencode__cli__agent__knowledge)
-            opts="-h --help [concept]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -237,7 +237,7 @@ _opencode-cli() {
             return 0
             ;;
         opencode__cli__agent__prompt)
-            opts="-h --help [prompt]..."
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

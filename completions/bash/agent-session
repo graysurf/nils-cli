@@ -72,7 +72,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__attach)
-            opts="-h --tmux-bin --state-dir --host --help <ID>"
+            opts="-h --tmux-bin --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -112,7 +112,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__command)
-            opts="-h --format --state-dir --host --help <ID>"
+            opts="-h --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -166,7 +166,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__delete)
-            opts="-h --tmux-bin --format --state-dir --host --help <ID>"
+            opts="-h --tmux-bin --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -239,7 +239,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__logs)
-            opts="-h --tail --tmux-bin --format --state-dir --host --help <ID>"
+            opts="-h --tail --tmux-bin --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

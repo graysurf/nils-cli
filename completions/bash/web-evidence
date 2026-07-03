@@ -43,7 +43,7 @@ _web-evidence() {
             return 0
             ;;
         web__evidence__capture)
-            opts="-h --out --label --format --method --timeout-seconds --max-body-bytes --body-preview-bytes --help <URL>"
+            opts="-h --out --label --format --method --timeout-seconds --max-body-bytes --body-preview-bytes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

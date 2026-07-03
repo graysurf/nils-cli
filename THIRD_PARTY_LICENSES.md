@@ -3,8 +3,8 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `c1812946416608d87b3b5aba85b8469480e26f48a04321c37f75f5d08bbd1f50`
-- Third-party crates (`source != null`): 451
+- Cargo.lock SHA256: `466ff61bccc00871b0702755cffa7956332114536bc6b0936937e6e473fc83ed`
+- Third-party crates (`source != null`): 450
 - Workspace crates (`source == null`, excluded below): 44
 
 ## Notes
@@ -17,7 +17,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 
 | License Expression | Crate Count |
 | --- | ---: |
-| MIT OR Apache-2.0 | 215 |
+| MIT OR Apache-2.0 | 214 |
 | MIT | 80 |
 | Apache-2.0 OR MIT | 38 |
 | Zlib OR Apache-2.0 OR MIT | 19 |
@@ -95,7 +95,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | chrono-tz | 0.10.4 | MIT OR Apache-2.0 | crates.io |
 | clap | 4.6.1 | MIT OR Apache-2.0 | crates.io |
 | clap_builder | 4.6.0 | MIT OR Apache-2.0 | crates.io |
-| clap_complete | 4.6.5 | MIT OR Apache-2.0 | crates.io |
+| clap_complete | 4.6.7 | MIT OR Apache-2.0 | crates.io |
 | clap_derive | 4.6.1 | MIT OR Apache-2.0 | crates.io |
 | clap_lex | 1.1.0 | MIT OR Apache-2.0 | crates.io |
 | cmake | 0.1.58 | MIT OR Apache-2.0 | crates.io |
@@ -103,7 +103,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | colorchoice | 1.0.5 | MIT OR Apache-2.0 | crates.io |
 | combine | 4.6.7 | MIT | crates.io |
 | concurrent-queue | 2.5.0 | Apache-2.0 OR MIT | crates.io |
-| console | 0.16.3 | MIT | crates.io |
+| console | 0.16.4 | MIT | crates.io |
 | const-oid | 0.10.2 | Apache-2.0 OR MIT | crates.io |
 | core-foundation | 0.10.1 | MIT OR Apache-2.0 | crates.io |
 | core-foundation-sys | 0.8.7 | MIT OR Apache-2.0 | crates.io |
@@ -195,7 +195,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | image-webp | 0.2.4 | MIT OR Apache-2.0 | crates.io |
 | imagesize | 0.14.0 | MIT | crates.io |
 | indexmap | 2.14.0 | Apache-2.0 OR MIT | crates.io |
-| indicatif | 0.18.4 | MIT | crates.io |
+| indicatif | 0.18.6 | MIT | crates.io |
 | ipnet | 2.12.0 | MIT OR Apache-2.0 | crates.io |
 | is_executable | 1.0.6 | MIT OR Apache-2.0 | crates.io |
 | is_terminal_polyfill | 1.70.2 | MIT OR Apache-2.0 | crates.io |
@@ -203,8 +203,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | jaq-core | 3.1.0 | MIT | crates.io |
 | jaq-json | 2.0.1 | MIT | crates.io |
 | jaq-std | 3.0.1 | MIT | crates.io |
-| jiff | 0.2.29 | Unlicense OR MIT | crates.io |
-| jiff-static | 0.2.29 | Unlicense OR MIT | crates.io |
+| jiff | 0.2.31 | Unlicense OR MIT | crates.io |
+| jiff-static | 0.2.31 | Unlicense OR MIT | crates.io |
 | jiff-tzdb | 0.1.6 | Unlicense OR MIT | crates.io |
 | jiff-tzdb-platform | 0.1.3 | Unlicense OR MIT | crates.io |
 | jni | 0.22.4 | MIT OR Apache-2.0 | crates.io |
@@ -342,7 +342,6 @@ This file documents third-party Rust crate licenses used by this workspace.
 | sha2 | 0.11.0 | MIT OR Apache-2.0 | crates.io |
 | sharded-slab | 0.1.7 | MIT | crates.io |
 | shell-words | 1.1.1 | MIT/Apache-2.0 | crates.io |
-| shlex | 1.3.0 | MIT OR Apache-2.0 | crates.io |
 | shlex | 2.0.1 | MIT OR Apache-2.0 | crates.io |
 | signal-hook-registry | 1.4.8 | MIT OR Apache-2.0 | crates.io |
 | signature | 2.2.0 | Apache-2.0 OR MIT | crates.io |
@@ -369,9 +368,9 @@ This file documents third-party Rust crate licenses used by this workspace.
 | thiserror | 2.0.18 | MIT OR Apache-2.0 | crates.io |
 | thiserror-impl | 2.0.18 | MIT OR Apache-2.0 | crates.io |
 | thread_local | 1.1.9 | MIT OR Apache-2.0 | crates.io |
-| time | 0.3.51 | MIT OR Apache-2.0 | crates.io |
+| time | 0.3.53 | MIT OR Apache-2.0 | crates.io |
 | time-core | 0.1.9 | MIT OR Apache-2.0 | crates.io |
-| time-macros | 0.2.30 | MIT OR Apache-2.0 | crates.io |
+| time-macros | 0.2.31 | MIT OR Apache-2.0 | crates.io |
 | tiny-skia | 0.12.0 | BSD-3-Clause | crates.io |
 | tiny-skia-path | 0.12.0 | BSD-3-Clause | crates.io |
 | tinystr | 0.8.3 | Unicode-3.0 | crates.io |
