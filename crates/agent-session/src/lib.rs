@@ -22,7 +22,7 @@ use nils_common::fs::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use cli::{AgentKind, Cli, Command};
+use cli::{AgentKind, Cli, Command, SpecialKey};
 
 const SESSION_DOCUMENT_VERSION: &str = "agent-session.session.v1";
 const BINARY: &str = "agent-session";
@@ -31,6 +31,8 @@ const RUN_COMMAND: &str = "run";
 const LIST_COMMAND: &str = "list";
 const COMMAND_COMMAND: &str = "command";
 const LOGS_COMMAND: &str = "logs";
+const SEND_COMMAND: &str = "send";
+const GLANCE_COMMAND: &str = "glance";
 const DELETE_COMMAND: &str = "delete";
 
 pub fn run() -> i32 {
@@ -90,6 +92,8 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Show(args) => run_command(&context, args),
         Command::Attach(args) => run_attach(&context, args),
         Command::Logs(args) => run_logs(&context, args),
+        Command::Send(args) => run_send(&context, args),
+        Command::Glance(args) => run_glance(&context, args),
         Command::Delete(args) => run_delete(&context, args),
         Command::Completion(_) => unreachable!("completion is handled before context resolution"),
     }
@@ -102,6 +106,8 @@ fn command_format(command: &Command) -> OutputFormat {
         Command::List(args) => args.format,
         Command::Show(args) => args.format,
         Command::Logs(args) => args.format,
+        Command::Send(args) => args.format,
+        Command::Glance(args) => args.format,
         Command::Delete(args) => args.format,
         Command::Attach(_) | Command::Completion(_) => OutputFormat::Text,
     }
@@ -225,6 +231,22 @@ fn run_logs(context: &CliContext, args: cli::LogsArgs) -> i32 {
     }
 }
 
+fn run_send(context: &CliContext, args: cli::SendArgs) -> i32 {
+    let format = args.format;
+    match send_to_session(context, args) {
+        Ok(result) => render_single_success(SEND_COMMAND, format, &result, render_send_text),
+        Err(err) => render_error(SEND_COMMAND, format, err),
+    }
+}
+
+fn run_glance(context: &CliContext, args: cli::GlanceArgs) -> i32 {
+    let format = args.format;
+    match glance_session(context, args) {
+        Ok(result) => render_single_success(GLANCE_COMMAND, format, &result, render_glance_text),
+        Err(err) => render_error(GLANCE_COMMAND, format, err),
+    }
+}
+
 fn run_delete(context: &CliContext, args: cli::DeleteArgs) -> i32 {
     match delete_session(
         context,
@@ -307,6 +329,26 @@ struct LogsResult {
     id: String,
     source: String,
     text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SendResult {
+    id: String,
+    tmux_session: String,
+    sent_text: bool,
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GlanceResult {
+    id: String,
+    agent: String,
+    title: Option<String>,
+    tmux_session: String,
+    status: String,
+    tail: String,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -542,6 +584,9 @@ fn start_interactive_tmux(
                 command.arg("--name").arg(title);
             }
         }
+        AgentKind::Hermes => {
+            command.arg("chat");
+        }
     }
     command.args(agent_args);
     run_status(command, "tmux new-session")
@@ -574,6 +619,13 @@ fn start_run_tmux(
         }
         AgentKind::Claude => {
             parts.push("-p".to_string());
+        }
+        AgentKind::Hermes => {
+            return Err(CliError::usage(
+                "unsupported-run-agent",
+                "hermes does not support one-shot run mode; use start --agent hermes",
+                None,
+            ));
         }
     }
     parts.extend(
@@ -614,30 +666,38 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
     let buffer_name = format!("{}-prompt", record.id);
     let target = format!("{}:0.0", record.tmux_session);
 
+    load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))?;
+
+    // The initial prompt is submitted; `send` deliberately leaves this to
+    // an explicit `--key enter`.
+    let mut enter = ProcessCommand::new(tmux_bin);
+    enter.arg("send-keys").arg("-t").arg(&target).arg("Enter");
+    run_status(enter, "tmux send-keys")
+}
+
+/// Load `file` into a named tmux buffer and paste it into `target`, deleting the
+/// buffer after paste (`-d`) or on failure. Shared by `paste_prompt` (initial
+/// prompt) and `send` (steering text) so the buffer lifecycle lives in one place.
+fn load_and_paste_buffer(
+    tmux_bin: &Path,
+    buffer_name: &str,
+    target: &str,
+    file: &Path,
+) -> Result<(), CliError> {
     let mut load = ProcessCommand::new(tmux_bin);
-    load.arg("load-buffer")
-        .arg("-b")
-        .arg(&buffer_name)
-        .arg(prompt_file);
+    load.arg("load-buffer").arg("-b").arg(buffer_name).arg(file);
     run_status(load, "tmux load-buffer")?;
 
     let mut paste = ProcessCommand::new(tmux_bin);
     paste
         .arg("paste-buffer")
         .arg("-b")
-        .arg(&buffer_name)
+        .arg(buffer_name)
         .arg("-d")
         .arg("-t")
-        .arg(&target);
+        .arg(target);
     if let Err(err) = run_status(paste, "tmux paste-buffer") {
-        delete_tmux_buffer(tmux_bin, &buffer_name);
-        return Err(err);
-    }
-
-    let mut enter = ProcessCommand::new(tmux_bin);
-    enter.arg("send-keys").arg("-t").arg(&target).arg("Enter");
-    if let Err(err) = run_status(enter, "tmux send-keys") {
-        delete_tmux_buffer(tmux_bin, &buffer_name);
+        delete_tmux_buffer(tmux_bin, buffer_name);
         return Err(err);
     }
     Ok(())
@@ -649,6 +709,172 @@ fn delete_tmux_buffer(tmux_bin: &Path, buffer_name: &str) {
         .arg("-b")
         .arg(buffer_name)
         .status();
+}
+
+fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResult, CliError> {
+    let text = read_send_text(&args.text, args.text_stdin)?;
+    if text.is_none() && args.keys.is_empty() {
+        return Err(CliError::usage(
+            "empty-send",
+            "send requires --text, --text-stdin, or at least one --key",
+            None,
+        ));
+    }
+    let mut record = load_session_record(context, &args.id)?;
+    let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
+    if live_status(&tmux_bin, &record.tmux_session) != "running" {
+        return Err(CliError::runtime(
+            "session-not-running",
+            format!("session is not running: {}", record.id),
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    send_input(context, &record, text.as_deref(), &args.keys, &tmux_bin)?;
+    touch_updated_at(context, &mut record)?;
+    Ok(SendResult {
+        id: record.id.clone(),
+        tmux_session: record.tmux_session.clone(),
+        sent_text: text.is_some(),
+        keys: args
+            .keys
+            .iter()
+            .map(|key| key.as_str().to_string())
+            .collect(),
+    })
+}
+
+/// Push literal text (via a private buffer file, never argv/stdout) and then
+/// each special key into the live pane. `send-keys` interprets the tmux key
+/// names, so approvals like Enter/Esc/Ctrl-C/arrows work from mobile.
+fn send_input(
+    context: &CliContext,
+    record: &SessionRecord,
+    text: Option<&str>,
+    keys: &[SpecialKey],
+    tmux_bin: &Path,
+) -> Result<(), CliError> {
+    let target = format!("{}:0.0", record.tmux_session);
+    if let Some(text) = text {
+        let buffer_name = format!("{}-send", record.id);
+        let temp = session_dir(context, &record.id).join("send-input");
+        write_private_file(&temp, text.as_bytes())?;
+        let result = load_and_paste_buffer(tmux_bin, &buffer_name, &target, &temp);
+        let _ = fs::remove_file(&temp);
+        result?;
+    }
+    for key in keys {
+        let mut command = ProcessCommand::new(tmux_bin);
+        command
+            .arg("send-keys")
+            .arg("-t")
+            .arg(&target)
+            .arg(key.tmux_key());
+        run_status(command, "tmux send-keys")?;
+    }
+    Ok(())
+}
+
+fn read_send_text(text: &Option<String>, text_stdin: bool) -> Result<Option<String>, CliError> {
+    // Empty text (an empty `--text ""` or an empty stdin pipe) collapses to
+    // `None` so the caller's empty-send guard treats it as "no text" rather than
+    // pasting an empty buffer and reporting `sent_text: true` for a no-op. A
+    // whitespace-only value is preserved: a space can be a meaningful keystroke.
+    match (text, text_stdin) {
+        (Some(_), true) => Err(CliError::usage(
+            "multiple-text-sources",
+            "use only one of --text or --text-stdin",
+            None,
+        )),
+        (Some(value), false) => Ok(Some(value.clone()).filter(|value| !value.is_empty())),
+        (None, true) => {
+            let mut input = String::new();
+            io::stdin().read_to_string(&mut input).map_err(|err| {
+                CliError::runtime(
+                    "stdin-read-failed",
+                    format!("failed to read stdin: {err}"),
+                    None,
+                )
+            })?;
+            Ok(Some(input).filter(|value| !value.is_empty()))
+        }
+        (None, false) => Ok(None),
+    }
+}
+
+fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceResult, CliError> {
+    let record = load_session_record(context, &args.id)?;
+    let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
+    let status = live_status(&tmux_bin, &record.tmux_session);
+    let tail = if status == "running" {
+        capture_pane_tail(&record, args.tail, &tmux_bin)?
+    } else {
+        String::new()
+    };
+    Ok(GlanceResult {
+        id: record.id.clone(),
+        agent: record.agent.clone(),
+        title: record.title.clone(),
+        tmux_session: record.tmux_session.clone(),
+        status,
+        tail,
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+    })
+}
+
+/// Run `tmux capture-pane -p -S -<tail>` for a session. Returns `Ok(Some(text))`
+/// on success, `Ok(None)` when tmux ran but capture failed (a non-running or
+/// gone pane), and `Err` only when the tmux binary could not be spawned. Shared
+/// by `glance` and `logs` so the capture invocation lives in one place.
+fn run_capture_pane(
+    record: &SessionRecord,
+    tail: usize,
+    tmux_bin: &Path,
+) -> Result<Option<String>, CliError> {
+    let start = format!("-{}", tail.max(1));
+    let output = ProcessCommand::new(tmux_bin)
+        .arg("capture-pane")
+        .arg("-p")
+        .arg("-t")
+        .arg(&record.tmux_session)
+        .arg("-S")
+        .arg(start)
+        .output()
+        .map_err(|err| {
+            CliError::runtime(
+                "tmux-capture-failed",
+                format!("failed to run {}: {err}", tmux_bin.display()),
+                Some(json!({ "tmux_session": record.tmux_session })),
+            )
+        })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
+}
+
+fn capture_pane_tail(
+    record: &SessionRecord,
+    tail: usize,
+    tmux_bin: &Path,
+) -> Result<String, CliError> {
+    match run_capture_pane(record, tail, tmux_bin)? {
+        Some(text) => Ok(tail_lines(&text, tail)),
+        None => Err(CliError::runtime(
+            "tmux-capture-failed",
+            "tmux capture-pane failed",
+            Some(json!({ "tmux_session": record.tmux_session })),
+        )),
+    }
+}
+
+/// Bump `updated_at` to now so `list` can order by real control-plane activity.
+/// Applied on `send` (a steering action); intentionally not on `glance`, which
+/// is a high-frequency dashboard poll that would otherwise make `updated_at`
+/// track polling rather than activity.
+fn touch_updated_at(context: &CliContext, record: &mut SessionRecord) -> Result<(), CliError> {
+    record.updated_at = Zoned::now().timestamp().to_string();
+    write_session_record(context, record)
 }
 
 fn list_sessions(
@@ -695,8 +921,9 @@ fn list_sessions(
         }
     }
     records.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.created_at.cmp(&a.created_at))
             .then_with(|| a.id.cmp(&b.id))
     });
     Ok(records)
@@ -938,30 +1165,14 @@ fn session_logs(
         return Ok(result);
     }
 
-    if live_status(tmux_bin, &record.tmux_session) == "running" {
-        let start = format!("-{}", tail.max(1));
-        let output = ProcessCommand::new(tmux_bin)
-            .arg("capture-pane")
-            .arg("-p")
-            .arg("-t")
-            .arg(&record.tmux_session)
-            .arg("-S")
-            .arg(start)
-            .output()
-            .map_err(|err| {
-                CliError::runtime(
-                    "tmux-capture-failed",
-                    format!("failed to run {}: {err}", tmux_bin.display()),
-                    Some(json!({ "tmux_session": record.tmux_session })),
-                )
-            })?;
-        if output.status.success() {
-            return Ok(LogsResult {
-                id: record.id.clone(),
-                source: "tmux".to_string(),
-                text: String::from_utf8_lossy(&output.stdout).to_string(),
-            });
-        }
+    if live_status(tmux_bin, &record.tmux_session) == "running"
+        && let Some(text) = run_capture_pane(record, tail, tmux_bin)?
+    {
+        return Ok(LogsResult {
+            id: record.id.clone(),
+            source: "tmux".to_string(),
+            text,
+        });
     }
 
     Err(CliError::runtime(
@@ -1219,6 +1430,7 @@ fn resolve_agent_bin(agent: AgentKind, explicit: Option<&Path>) -> PathBuf {
     let env_key = match agent {
         AgentKind::Codex => "AGENT_SESSION_CODEX_BIN",
         AgentKind::Claude => "AGENT_SESSION_CLAUDE_BIN",
+        AgentKind::Hermes => "AGENT_SESSION_HERMES_BIN",
     };
     non_empty_env(env_key)
         .map(PathBuf::from)
@@ -1406,6 +1618,31 @@ fn render_command_text(result: &SessionView) -> String {
 
 fn render_logs_text(result: &LogsResult) -> String {
     result.text.clone()
+}
+
+fn render_send_text(result: &SendResult) -> String {
+    let mut parts = Vec::new();
+    if result.sent_text {
+        parts.push("text".to_string());
+    }
+    if !result.keys.is_empty() {
+        parts.push(format!("keys [{}]", result.keys.join(" ")));
+    }
+    let detail = if parts.is_empty() {
+        "nothing".to_string()
+    } else {
+        parts.join(" + ")
+    };
+    format!("sent {detail} to {}\n", result.id)
+}
+
+fn render_glance_text(result: &GlanceResult) -> String {
+    let mut text = format!("{} {} [{}]\n", result.id, result.agent, result.status);
+    text.push_str(&result.tail);
+    if !result.tail.is_empty() && !result.tail.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 
 fn render_delete_text(result: &DeleteResult) -> String {

@@ -32,7 +32,7 @@ _agent-session() {
         case $line[1] in
             (start)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Agent to run]:AGENT:(codex claude)' \
+'--agent=[Agent to run]:AGENT:(codex claude hermes)' \
 '--cwd=[Working directory for the agent session. Defaults to the current directory]:PATH:_files -/' \
 '--title=[Human-readable session title]:TITLE:_default' \
 '--id=[Short explicit session id. Usually auto-generated]:ID:_default' \
@@ -53,7 +53,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (run)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Agent to run]:AGENT:(codex claude)' \
+'--agent=[Agent to run]:AGENT:(codex claude hermes)' \
 '--cwd=[Working directory for the agent session. Defaults to the current directory]:PATH:_files -/' \
 '--title=[Human-readable session title]:TITLE:_default' \
 '--id=[Short explicit session id. Usually auto-generated]:ID:_default' \
@@ -115,6 +115,34 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':id -- Session id:_default' \
 && ret=0
 ;;
+(send)
+_arguments "${_arguments_options[@]}" : \
+'--text=[Literal text to type into the session. Applied before any --key. Prefer --text-stdin for secrets (--text is visible in this process'\''s arguments)]:TEXT:_default' \
+'*--key=[Special key to press (repeatable), applied in order after any text]:KEY:(enter escape c-c up down left right tab)' \
+'--tmux-bin=[tmux binary override]:PATH:_files' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'--text-stdin[Read the literal text to type from stdin (secret-safe; never echoed)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Session id:_default' \
+&& ret=0
+;;
+(glance)
+_arguments "${_arguments_options[@]}" : \
+'--tail=[Number of pane lines to capture for the glance tail]:TAIL:_default' \
+'--tmux-bin=[tmux binary override]:PATH:_files' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Session id:_default' \
+&& ret=0
+;;
 (delete)
 _arguments "${_arguments_options[@]}" : \
 '--tmux-bin=[tmux binary override]:PATH:_files' \
@@ -150,6 +178,8 @@ _agent-session_commands() {
 'command:Print the attach command for a session' \
 'attach:Attach to a tmux session from the current terminal' \
 'logs:Print captured tmux pane output or a one-shot run log' \
+'send:Send input (literal text and/or special keys) to a live session' \
+'glance:Capture the recent pane tail plus live status as a dashboard glance' \
 'delete:Delete session state and kill the tmux session if it is still alive' \
 'completion:Print shell completion script' \
     )
@@ -175,6 +205,11 @@ _agent-session__subcmd__delete_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session delete commands' commands "$@"
 }
+(( $+functions[_agent-session__subcmd__glance_commands] )) ||
+_agent-session__subcmd__glance_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session glance commands' commands "$@"
+}
 (( $+functions[_agent-session__subcmd__list_commands] )) ||
 _agent-session__subcmd__list_commands() {
     local commands; commands=()
@@ -189,6 +224,11 @@ _agent-session__subcmd__logs_commands() {
 _agent-session__subcmd__run_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session run commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__send_commands] )) ||
+_agent-session__subcmd__send_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session send commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__start_commands] )) ||
 _agent-session__subcmd__start_commands() {

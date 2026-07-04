@@ -8,10 +8,10 @@ use nils_common::cli_contract::OutputFormat;
     name = "agent-session",
     version,
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
-    about = "Start and manage tmux-backed Codex and Claude Code sessions.",
-    long_about = "Start and manage tmux-backed Codex and Claude Code sessions for mobile handoff workflows.",
+    about = "Start and manage tmux-backed Codex, Claude Code, and Hermes sessions.",
+    long_about = "Start and manage tmux-backed Codex, Claude Code, and Hermes sessions for mobile handoff workflows.",
     disable_help_subcommand = true,
-    after_help = "EXAMPLES:\n  agent-session start --agent codex --cwd ~/Project/app --prompt-file prompt.md\n  agent-session list\n  agent-session command <id>\n  agent-session attach <id>\n  agent-session delete <id>\n\nENVIRONMENT:\n  AGENT_SESSION_HOST       Hostname used in generated ssh attach commands.\n  AGENT_SESSION_STATE_DIR  Default state directory override.\n  AGENT_SESSION_TMUX_BIN   tmux binary override.\n  AGENT_SESSION_CODEX_BIN  codex binary override.\n  AGENT_SESSION_CLAUDE_BIN claude binary override.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error"
+    after_help = "EXAMPLES:\n  agent-session start --agent codex --cwd ~/Project/app --prompt-file prompt.md\n  agent-session start --agent hermes --cwd ~\n  agent-session list\n  agent-session glance <id> --tail 40\n  agent-session send <id> --text yes --key enter\n  agent-session send <id> --key c-c\n  agent-session command <id>\n  agent-session attach <id>\n  agent-session delete <id>\n\nENVIRONMENT:\n  AGENT_SESSION_HOST       Hostname used in generated ssh attach commands.\n  AGENT_SESSION_STATE_DIR  Default state directory override.\n  AGENT_SESSION_TMUX_BIN   tmux binary override.\n  AGENT_SESSION_CODEX_BIN  codex binary override.\n  AGENT_SESSION_CLAUDE_BIN claude binary override.\n  AGENT_SESSION_HERMES_BIN hermes binary override.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error"
 )]
 pub struct Cli {
     /// State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session.
@@ -41,6 +41,10 @@ pub enum Command {
     Attach(AttachArgs),
     /// Print captured tmux pane output or a one-shot run log.
     Logs(LogsArgs),
+    /// Send input (literal text and/or special keys) to a live session.
+    Send(SendArgs),
+    /// Capture the recent pane tail plus live status as a dashboard glance.
+    Glance(GlanceArgs),
     /// Delete session state and kill the tmux session if it is still alive.
     Delete(DeleteArgs),
     /// Print shell completion script.
@@ -194,6 +198,53 @@ pub struct LogsArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct SendArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// Literal text to type into the session. Applied before any --key. Prefer
+    /// --text-stdin for secrets (--text is visible in this process's arguments).
+    #[arg(long, value_name = "TEXT")]
+    pub text: Option<String>,
+
+    /// Read the literal text to type from stdin (secret-safe; never echoed).
+    #[arg(long = "text-stdin")]
+    pub text_stdin: bool,
+
+    /// Special key to press (repeatable), applied in order after any text.
+    #[arg(long = "key", value_enum, value_name = "KEY")]
+    pub keys: Vec<SpecialKey>,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct GlanceArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// Number of pane lines to capture for the glance tail.
+    #[arg(long, default_value_t = 40)]
+    pub tail: usize,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
 pub struct DeleteArgs {
     /// Session id.
     #[arg(value_name = "ID")]
@@ -220,6 +271,7 @@ pub struct CompletionArgs {
 pub enum AgentKind {
     Codex,
     Claude,
+    Hermes,
 }
 
 impl AgentKind {
@@ -227,6 +279,52 @@ impl AgentKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Hermes => "hermes",
+        }
+    }
+}
+
+/// Named special keys accepted by `send`, mapped to tmux `send-keys` names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum SpecialKey {
+    Enter,
+    Escape,
+    #[value(name = "c-c")]
+    CtrlC,
+    Up,
+    Down,
+    Left,
+    Right,
+    Tab,
+}
+
+impl SpecialKey {
+    /// Canonical CLI name, used in the JSON contract (never echoes user input).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enter => "enter",
+            Self::Escape => "escape",
+            Self::CtrlC => "c-c",
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Tab => "tab",
+        }
+    }
+
+    /// tmux `send-keys` key name.
+    pub fn tmux_key(self) -> &'static str {
+        match self {
+            Self::Enter => "Enter",
+            Self::Escape => "Escape",
+            Self::CtrlC => "C-c",
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::Tab => "Tab",
         }
     }
 }
