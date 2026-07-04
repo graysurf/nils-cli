@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `466ff61bccc00871b0702755cffa7956332114536bc6b0936937e6e473fc83ed`
+- Cargo.lock SHA256: `af45f5ba909a74008d661d0376f1d978dafc8b830e2ee22efae284490f9f07ac`
 - Third-party crates (`source != null`): 450
 - Workspace crates (`source == null`, excluded below): 44
 
@@ -222,7 +222,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | libsqlite3-sys | 0.38.1 | MIT | crates.io |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | litemap | 0.8.2 | Unicode-3.0 | crates.io |
-| log | 0.4.32 | MIT OR Apache-2.0 | crates.io |
+| log | 0.4.33 | MIT OR Apache-2.0 | crates.io |
 | lru-slab | 0.1.2 | MIT OR Apache-2.0 OR Zlib | crates.io |
 | matchers | 0.2.0 | MIT | crates.io |
 | memchr | 2.8.2 | Unlicense OR MIT | crates.io |
