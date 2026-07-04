@@ -768,3 +768,322 @@ fn parse_context_data_and_session_reference_errors_follow_contract() {
     assert_eq!(value["schema_version"], "cli.agent-session.command.v1");
     assert_eq!(value["error"]["code"], "session-path-escaped");
 }
+
+fn write_session_record(dir: &Path, id: &str, agent: &str, tmux_session: &str) -> PathBuf {
+    let session = dir.join("sessions").join(id);
+    fs::create_dir_all(&session).expect("session dir");
+    let record = format!(
+        r#"{{
+  "schema_version": "agent-session.session.v1",
+  "id": "{id}",
+  "agent": "{agent}",
+  "mode": "interactive",
+  "title": null,
+  "cwd": "/tmp",
+  "tmux_session": "{tmux_session}",
+  "prompt_file": null,
+  "log_file": null,
+  "created_at": "2000-01-01T00:00:00Z",
+  "updated_at": "2000-01-01T00:00:00Z"
+}}"#
+    );
+    fs::write(session.join("session.json"), record).expect("session record");
+    session
+}
+
+#[test]
+fn send_delivers_text_and_keys_without_leaking_and_bumps_updated_at() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let session = write_session_record(&state_dir, "steer", "codex", "hs-codex-steer");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let env_refs = [("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())];
+    let secret = "approve-secret-payload";
+
+    // With neither text nor keys, send is a usage error before touching tmux.
+    let empty = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "steer",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &env_refs,
+    );
+    assert_eq!(empty.code, 64, "stderr={}", empty.stderr_text());
+    assert_eq!(empty.stdout_json()["error"]["code"], "empty-send");
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "steer",
+            "--text",
+            secret,
+            "--key",
+            "enter",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &env_refs,
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_no_secret(&output, secret);
+    let value = output.stdout_json();
+    assert_eq!(value["schema_version"], "cli.agent-session.send.v1");
+    let result = data(&value);
+    assert_eq!(result["id"], "steer");
+    assert_eq!(result["sent_text"], true);
+    let keys = result["keys"].as_array().expect("keys array");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0], "enter");
+
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.first().is_some_and(|arg| arg == "load-buffer")),
+        "missing load-buffer call: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| call
+            == &vec![
+                "paste-buffer".to_string(),
+                "-b".to_string(),
+                "steer-send".to_string(),
+                "-d".to_string(),
+                "-t".to_string(),
+                "hs-codex-steer:0.0".to_string(),
+            ]),
+        "missing paste-buffer -d call: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| call
+            == &vec![
+                "send-keys".to_string(),
+                "-t".to_string(),
+                "hs-codex-steer:0.0".to_string(),
+                "Enter".to_string(),
+            ]),
+        "missing send-keys Enter call: {calls:?}"
+    );
+    // The secret text travels through a private buffer file, never argv.
+    for call in &calls {
+        for arg in call {
+            assert!(
+                !arg.contains(secret),
+                "secret text leaked into tmux argv: {call:?}"
+            );
+        }
+    }
+    assert!(
+        !session.join("send-input").exists(),
+        "send-input temp file should be cleaned up"
+    );
+
+    // send bumps updated_at away from the sentinel so list can sort by activity.
+    let after: Value = serde_json::from_str(
+        &fs::read_to_string(session.join("session.json")).expect("re-read record"),
+    )
+    .expect("parse record");
+    assert_ne!(
+        after["updated_at"], "2000-01-01T00:00:00Z",
+        "updated_at should be bumped after send"
+    );
+    assert!(
+        after["updated_at"].as_str().unwrap() > "2000-01-01T00:00:00Z",
+        "updated_at should advance forward: {}",
+        after["updated_at"]
+    );
+}
+
+#[test]
+fn glance_returns_pane_tail_and_status_contract() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    write_session_record(&state_dir, "look", "claude", "hs-claude-look");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "glance",
+            "look",
+            "--tail",
+            "10",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["schema_version"], "cli.agent-session.glance.v1");
+    let result = data(&value);
+    assert_eq!(result["id"], "look");
+    assert_eq!(result["agent"], "claude");
+    assert_eq!(result["status"], "running");
+    let tail = result["tail"].as_str().expect("tail");
+    assert!(
+        tail.contains("pane one") && tail.contains("pane two"),
+        "unexpected tail: {tail}"
+    );
+
+    // A stopped session yields status=stopped with an empty tail, no error.
+    let stopped = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "glance",
+            "look",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(stopped.code, 0, "stderr={}", stopped.stderr_text());
+    let stopped_result = data(&stopped.stdout_json()).clone();
+    assert_eq!(stopped_result["status"], "stopped");
+    assert_eq!(stopped_result["tail"], "");
+}
+
+#[test]
+fn start_hermes_launches_interactive_chat_session() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let hermes_bin = fake_agent(tmp.path(), "hermes");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let hermes_arg = hermes_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "hermes",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &hermes_arg,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["schema_version"], "cli.agent-session.start.v1");
+    let result = data(&value);
+    assert_eq!(result["agent"], "hermes");
+    assert!(
+        result["tmux_session"]
+            .as_str()
+            .unwrap()
+            .starts_with("hs-hermes-"),
+        "tmux_session={}",
+        result["tmux_session"]
+    );
+
+    let calls = tmux_calls(&tmux_log);
+    let new_session = calls
+        .iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("new-session call");
+    let bin_idx = new_session
+        .iter()
+        .position(|arg| arg == &hermes_arg)
+        .expect("hermes bin in new-session call");
+    assert_eq!(
+        new_session.get(bin_idx + 1).map(String::as_str),
+        Some("chat"),
+        "hermes must launch the `chat` subcommand: {new_session:?}"
+    );
+}
+
+#[test]
+fn run_rejects_hermes_agent_without_orphaning_state() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let hermes_bin = fake_agent(tmp.path(), "hermes");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let hermes_arg = hermes_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "run",
+            "--agent",
+            "hermes",
+            "--cwd",
+            &cwd_arg,
+            "--prompt",
+            "do a thing",
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &hermes_arg,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["schema_version"], "cli.agent-session.run.v1");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "unsupported-run-agent");
+    let orphans = fs::read_dir(state_dir.join("sessions"))
+        .map(|dir| dir.count())
+        .unwrap_or(0);
+    assert_eq!(
+        orphans, 0,
+        "rejected hermes run must not leave session state"
+    );
+}
