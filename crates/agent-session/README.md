@@ -29,9 +29,10 @@ agent-session delete <id>
 ```
 
 `send` pushes input to a live session: literal text (`--text` / `--text-stdin`) and/or repeatable named keys
-(`--key enter|escape|c-c|up|down|left|right|tab`), so codex/claude approval prompts are answerable from a phone. `glance` returns the recent
-pane tail plus live status as a JSON contract for dashboard tiles (cheaper than a full attach). `send` bumps `updated_at`, so `list` orders by
-real control-plane activity. `--agent hermes` launches `hermes chat` interactively (one-shot `run` mode is codex/claude only).
+(`--key enter|escape|c-c|up|down|left|right|tab`), so codex/claude approval prompts are answerable from a phone.
+`glance` returns the recent pane tail plus live status as a JSON contract for dashboard tiles (cheaper than a full attach).
+`send` bumps `updated_at`, so `list` orders by real control-plane activity. `--agent hermes` launches `hermes chat`
+interactively (one-shot `run` mode is codex/claude only).
 
 ## Output contract
 
@@ -43,8 +44,8 @@ JSON output uses the workspace envelope: `schema_version`, `ok`, `data`, optiona
 
 Prompts are stored under the local agent-session state directory and are not printed in command output. For sensitive prompts, prefer
 interactive `start`; one-shot `run` may need to pass the prompt through the underlying agent process command line depending on that agent's
-CLI capabilities. `send` routes literal text through a private (0600) buffer file loaded into tmux, so it never appears in the tmux command
-line or command output; the JSON contract reports only `sent_text` (a boolean) and the special-key names, never the text itself. For secrets,
-prefer `--text-stdin`: `--text <value>` still places the literal in agent-session's own process arguments (visible in `ps` to same-user
-processes), exactly as the existing `--prompt` flag does. `send` is not idempotent — keystrokes are delivered before the command returns, so a
-retry after a mid-delivery failure can re-send; callers that auto-retry should account for this.
+CLI capabilities. `send` routes literal text through a private (0600) buffer file loaded into tmux, so it never appears in the tmux
+command line or command output; the JSON contract reports only `sent_text` (a boolean) and the special-key names, never the text itself.
+For secrets, prefer `--text-stdin`: `--text <value>` still places the literal in agent-session's own process arguments (visible in `ps`
+to same-user processes), exactly as the existing `--prompt` flag does. `send` is not idempotent — keystrokes are delivered before the
+command returns, so a retry after a mid-delivery failure can re-send; callers that auto-retry should account for this.
