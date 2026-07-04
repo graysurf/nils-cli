@@ -41,9 +41,9 @@ interactively (one-shot `run` mode is codex/claude only).
 web console). It builds its own tokio runtime and reuses the synchronous lifecycle functions via `spawn_blocking`, so there
 is no second state model.
 
-- `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N`, `GET /workdirs?q=...&limit=N` — reads, open on
-  loopback. `workdirs` searches only the default operator roots (`$HOME/Project` and `$HOME/.config`) with bounded depth,
-  count, and elapsed-time limits.
+- `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback.
+- `GET /workdirs?q=...&limit=N` — authenticated read; searches only the default operator roots (`$HOME/Project` and
+  `$HOME/.config`) with bounded depth, count, and elapsed-time limits.
 - `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
   `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
 - Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
@@ -60,10 +60,11 @@ Every response uses the `cli.agent-session.serve.v1` envelope and carries a `mac
 when no token is configured (or it is empty) those endpoints fail closed (503). Use a strong, high-entropy token.
 
 Trust model: the daemon binds loopback and *refuses* a non-loopback bind unless `--allow-non-loopback` is passed, because
-it drives a remote shell. Reads (`list` / `glance`) are intentionally open on the bind address — front the daemon with the
-agent-console edge (which applies its own auth) and do **not** `tailscale serve` the raw serve port; expose only the edge,
-tailnet-only, no funnel. Browser WebSocket clients cannot set an `Authorization` header, so the edge must proxy the attach
-and inject the bearer server-side — never put the token in the `ws://` URL/query.
+it drives a remote shell. Session reads (`list` / `glance`) are intentionally open on the bind address, while path-bearing
+reads (`workdirs`), writes, and attach require the bearer token. Front the daemon with the agent-console edge (which
+applies its own auth) and do **not** `tailscale serve` the raw serve port; expose only the edge, tailnet-only, no funnel.
+Browser WebSocket clients cannot set an `Authorization` header, so the edge must proxy the attach and inject the bearer
+server-side — never put the token in the `ws://` URL/query.
 
 ## Output contract
 

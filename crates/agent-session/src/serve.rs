@@ -304,12 +304,6 @@ struct SendBody {
 }
 
 #[derive(Debug, Deserialize)]
-struct UpdateSessionBody {
-    #[serde(default)]
-    title: Option<Option<String>>,
-}
-
-#[derive(Debug, Deserialize)]
 struct AttachmentQuery {
     filename: Option<String>,
 }
@@ -434,17 +428,35 @@ async fn update_session_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<UpdateSessionBody>,
+    Json(body): Json<Value>,
 ) -> Response {
     if let Some(resp) = deny_unauthorized(&state, &headers) {
         return resp;
     }
-    let Some(title) = body.title else {
+    let Some(object) = body.as_object() else {
         return envelope_err(CliError::usage(
-            "missing-title",
-            "session update requires a title field",
-            Some(json!({ "field": "title" })),
+            "invalid-session-update",
+            "session update body must be a JSON object",
+            None,
         ));
+    };
+    let title = match object.get("title") {
+        Some(Value::String(title)) => Some(title.clone()),
+        Some(Value::Null) => None,
+        Some(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-title",
+                "session title must be a string or null",
+                Some(json!({ "field": "title" })),
+            ));
+        }
+        None => {
+            return envelope_err(CliError::usage(
+                "missing-title",
+                "session update requires a title field",
+                Some(json!({ "field": "title" })),
+            ));
+        }
     };
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
@@ -506,8 +518,12 @@ async fn upload_attachment_handler(
 
 async fn workdirs_handler(
     State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
     Query(query): Query<WorkdirQuery>,
 ) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
     let q = query.q.clone();
     let limit = query.limit;
     match tokio::task::spawn_blocking(move || search_workdirs(q.as_deref(), limit)).await {
@@ -786,7 +802,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use nils_test_support::{EnvGuard, GlobalStateLock};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use tower::ServiceExt;
 
     const MACHINE: &str = "test-machine";
@@ -851,6 +867,14 @@ mod tests {
             .unwrap()
     }
 
+    fn get_auth(uri: &str, token: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
     fn auth_headers(token: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(token) = token {
@@ -885,7 +909,7 @@ mod tests {
             .unwrap()
     }
 
-    fn post_bytes(uri: &str, token: Option<&str>, body: &'static [u8]) -> Request<Body> {
+    fn post_bytes(uri: &str, token: Option<&str>, body: &[u8]) -> Request<Body> {
         let mut builder = Request::builder()
             .method("POST")
             .uri(uri)
@@ -893,7 +917,7 @@ mod tests {
         if let Some(token) = token {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
-        builder.body(Body::from(body)).unwrap()
+        builder.body(Body::from(body.to_vec())).unwrap()
     }
 
     #[tokio::test]
@@ -1077,11 +1101,44 @@ mod tests {
 
         let (status, body) = call(
             router(st.clone()),
+            patch_json("/sessions/steer", Some(TOKEN), json!({ "title": null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], Value::Null);
+
+        let (status, body) = call(
+            router(st.clone()),
             patch_json("/sessions/steer", Some(TOKEN), json!({ "title": "" })),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert_eq!(body["data"]["session"]["title"], Value::Null);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/steer", Some(TOKEN), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "missing-title");
+
+        let too_long = "x".repeat(121);
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/steer", Some(TOKEN), json!({ "title": too_long })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "title-too-long");
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/ghost", Some(TOKEN), json!({ "title": "Ghost" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "session-not-found");
     }
 
     #[tokio::test]
@@ -1139,6 +1196,53 @@ mod tests {
         assert!(path.starts_with(tmp.path().join("sessions/steer/attachments")));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "attachment file must be private");
+
+        let (status, second) = call(
+            router(st.clone()),
+            post_bytes(
+                "/sessions/steer/attachments?filename=Screen%20Shot.png",
+                Some(TOKEN),
+                b"second payload",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={second}");
+        let second_path = PathBuf::from(second["data"]["attachment"]["path"].as_str().unwrap());
+        assert_ne!(second_path, path);
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"second payload");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_bytes(
+                "/sessions/ghost/attachments?filename=ghost.png",
+                Some(TOKEN),
+                b"ghost",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "session-not-found");
+
+        let before_oversize = std::fs::read_dir(tmp.path().join("sessions/steer/attachments"))
+            .unwrap()
+            .count();
+        let oversize = vec![0u8; MAX_ATTACHMENT_BYTES + 1];
+        let (status, body) = call(
+            router(st.clone()),
+            post_bytes(
+                "/sessions/steer/attachments?filename=oversize.bin",
+                Some(TOKEN),
+                &oversize,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"]["code"], "attachment-too-large");
+        let after_oversize = std::fs::read_dir(tmp.path().join("sessions/steer/attachments"))
+            .unwrap()
+            .count();
+        assert_eq!(after_oversize, before_oversize);
     }
 
     #[tokio::test]
@@ -1147,15 +1251,27 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         let project_match = home.join("Project/sympoies/agent-console");
+        let second_match = home.join("Project/agent-tools");
+        let too_deep_match = home.join("Project/a/b/c/d/e/agent-deep");
         let config_match = home.join(".config/zsh");
         let outside = home.join("Downloads/agent-console-copy");
         std::fs::create_dir_all(project_match.join(".git")).unwrap();
+        std::fs::create_dir_all(&second_match).unwrap();
+        std::fs::create_dir_all(&too_deep_match).unwrap();
         std::fs::create_dir_all(&config_match).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
 
         let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
         let (status, body) = call(router(st.clone()), get("/workdirs?q=agent&limit=20")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth("/workdirs?q=agent&limit=20", Some(TOKEN)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
         let workdirs = body["data"]["workdirs"].as_array().expect("workdirs array");
@@ -1171,8 +1287,32 @@ mod tests {
                 .any(|item| item["path"] == outside.to_string_lossy().as_ref()),
             "outside root must not be returned: {workdirs:?}"
         );
+        assert!(
+            !workdirs
+                .iter()
+                .any(|item| item["path"] == too_deep_match.to_string_lossy().as_ref()),
+            "matches beyond max depth must not be returned: {workdirs:?}"
+        );
 
-        let (status, body) = call(router(st.clone()), get("/workdirs?q=zsh&limit=20")).await;
+        let (status, limited) = call(
+            router(st.clone()),
+            get_auth("/workdirs?q=agent&limit=1", Some(TOKEN)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={limited}");
+        assert_eq!(
+            limited["data"]["workdirs"]
+                .as_array()
+                .expect("workdirs")
+                .len(),
+            1
+        );
+
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth("/workdirs?q=zsh&limit=20", Some(TOKEN)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         let workdirs = body["data"]["workdirs"].as_array().expect("workdirs array");
         assert!(
@@ -1180,6 +1320,31 @@ mod tests {
                 .iter()
                 .any(|item| item["path"] == config_match.to_string_lossy().as_ref()),
             ".config match missing: {workdirs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workdir_search_rejects_symlink_roots() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(outside.join("agent-secret")).unwrap();
+        symlink(&outside, home.join("Project")).unwrap();
+        let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
+
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth("/workdirs?q=agent&limit=20", Some(TOKEN)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let workdirs = body["data"]["workdirs"].as_array().expect("workdirs array");
+        assert!(
+            workdirs.is_empty(),
+            "symlink roots must not expose outside directories: {workdirs:?}"
         );
     }
 

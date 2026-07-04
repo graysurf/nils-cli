@@ -5,7 +5,7 @@ mod serve;
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -951,8 +951,7 @@ fn write_session_attachment(
     let filename = sanitize_attachment_filename(filename.unwrap_or("attachment.bin"));
     let dir = session_dir(context, &record.id).join("attachments");
     ensure_private_dir(&dir)?;
-    let path = unique_attachment_path(&dir, &filename);
-    write_private_file(&path, bytes)?;
+    let path = write_unique_attachment_file(&dir, &filename, bytes)?;
     Ok(AttachmentResult {
         id: record.id,
         filename,
@@ -989,19 +988,55 @@ fn sanitize_attachment_filename(raw: &str) -> String {
     safe
 }
 
-fn unique_attachment_path(dir: &Path, filename: &str) -> PathBuf {
+fn attachment_candidate_path(dir: &Path, filename: &str, attempt: usize) -> PathBuf {
     let stamp = Zoned::now().strftime("%Y%m%d-%H%M%S").to_string();
-    let first = dir.join(format!("{stamp}-{filename}"));
-    if !first.exists() {
-        return first;
+    if attempt == 0 {
+        dir.join(format!("{stamp}-{filename}"))
+    } else {
+        dir.join(format!("{stamp}-{attempt}-{filename}"))
     }
-    for n in 2..1000 {
-        let candidate = dir.join(format!("{stamp}-{n}-{filename}"));
-        if !candidate.exists() {
-            return candidate;
+}
+
+fn write_unique_attachment_file(
+    dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, CliError> {
+    for attempt in 0..1000 {
+        let path = attachment_candidate_path(dir, filename, attempt);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(SECRET_FILE_MODE);
         }
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(CliError::runtime(
+                    "file-write-failed",
+                    format!("failed to write {}: {err}", path.display()),
+                    Some(json!({ "path": display_path(&path) })),
+                ));
+            }
+        };
+        if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            let _ = fs::remove_file(&path);
+            return Err(CliError::runtime(
+                "file-write-failed",
+                format!("failed to write {}: {err}", path.display()),
+                Some(json!({ "path": display_path(&path) })),
+            ));
+        }
+        return Ok(path);
     }
-    dir.join(format!("{stamp}-overflow-{filename}"))
+    Err(CliError::runtime(
+        "attachment-name-exhausted",
+        "failed to allocate a unique attachment filename",
+        Some(json!({ "filename": filename })),
+    ))
 }
 
 const WORKDIR_SEARCH_MAX_DEPTH: usize = 4;
@@ -1043,18 +1078,27 @@ fn search_workdirs_in_roots(
         if started.elapsed() >= WORKDIR_SEARCH_TIMEOUT || visited >= WORKDIR_SEARCH_MAX_VISITED {
             break;
         }
-        let Ok(root_meta) = fs::metadata(root) else {
+        let Ok(root_meta) = fs::symlink_metadata(root) else {
             continue;
         };
-        if !root_meta.is_dir() {
+        if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
             continue;
         }
+        let Ok(canonical_root) = fs::canonicalize(root) else {
+            continue;
+        };
         let root_display = display_path(root);
         let mut queue = VecDeque::from([(root.clone(), 0usize)]);
         while let Some((path, depth)) = queue.pop_front() {
             if started.elapsed() >= WORKDIR_SEARCH_TIMEOUT || visited >= WORKDIR_SEARCH_MAX_VISITED
             {
                 break;
+            }
+            let Ok(canonical_path) = fs::canonicalize(&path) else {
+                continue;
+            };
+            if !canonical_path.starts_with(&canonical_root) {
+                continue;
             }
             visited += 1;
             let name = path
