@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Json;
@@ -33,8 +34,12 @@ use crate::cli::{self, AgentKind, SpecialKey};
 use crate::{
     BINARY, CliContext, CliError, delete_session, glance_session, list_sessions,
     load_session_record, non_empty_env, resolve_tmux_bin, run_capture_pane, send_input,
-    session_dir, short_hostname, start_session,
+    session_dir, short_hostname, start_session, write_private_file,
 };
+
+/// Monotonic counter giving each attach connection a private pipe file, so
+/// concurrent attaches to one session never delete each other's file.
+static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Shared daemon state handed to every request handler.
 struct ServeState {
@@ -52,6 +57,14 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             return exit::USAGE;
         }
     };
+    if !bind.ip().is_loopback() && !args.allow_non_loopback {
+        eprintln!(
+            "error: refusing to bind a non-loopback address ({bind}); this endpoint drives a \
+             remote shell. Keep it tailnet-only behind `tailscale serve`, or pass \
+             --allow-non-loopback to override deliberately."
+        );
+        return exit::USAGE;
+    }
     if !bind.ip().is_loopback() {
         eprintln!(
             "warning: binding a non-loopback address ({bind}) exposes a remote shell; \
@@ -59,10 +72,10 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
         );
     }
 
-    let token = args
-        .token
-        .clone()
-        .or_else(|| non_empty_env("AGENT_SESSION_TOKEN"));
+    // Sanitize the explicit --token the same way the env fallback is sanitized,
+    // so an empty/whitespace `--token ""` fails closed instead of authorizing an
+    // empty bearer.
+    let token = sanitize_token(args.token.clone()).or_else(|| non_empty_env("AGENT_SESSION_TOKEN"));
     if token.is_none() {
         eprintln!(
             "warning: no --token / AGENT_SESSION_TOKEN set; write and attach endpoints are disabled"
@@ -137,13 +150,26 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Treat an empty/whitespace explicit `--token` as "no token" (fail closed),
+/// matching the env-var sanitization in `non_empty_env`.
+fn sanitize_token(token: Option<String>) -> Option<String> {
+    token.filter(|value| !value.trim().is_empty())
+}
+
 // --- response helpers ---------------------------------------------------------
 
-fn envelope_ok(command: &str, data: Value) -> Response {
+// Every serve response uses one wire contract, `cli.agent-session.serve.v1`,
+// distinct from the CLI stdout envelopes: the `data` shape ({machine, ...}) is
+// serve-specific, so it must NOT reuse the CLI's per-command schema versions.
+fn serve_schema() -> String {
+    schema_version_for(BINARY, "serve", 1)
+}
+
+fn envelope_ok(data: Value) -> Response {
     (
         StatusCode::OK,
         Json(json!({
-            "schema_version": schema_version_for(BINARY, command, 1),
+            "schema_version": serve_schema(),
             "ok": true,
             "data": data,
         })),
@@ -151,11 +177,11 @@ fn envelope_ok(command: &str, data: Value) -> Response {
         .into_response()
 }
 
-fn envelope_err(command: &str, err: CliError) -> Response {
+fn envelope_err(err: CliError) -> Response {
     let data = err.into_inner();
     let status = match data.code.as_str() {
         "session-not-found" => StatusCode::NOT_FOUND,
-        "ambiguous-session-id" => StatusCode::CONFLICT,
+        "session-exists" => StatusCode::CONFLICT,
         _ => match data.exit_code {
             exit::USAGE => StatusCode::BAD_REQUEST,
             exit::DATA => StatusCode::UNPROCESSABLE_ENTITY,
@@ -172,7 +198,7 @@ fn envelope_err(command: &str, err: CliError) -> Response {
     (
         status,
         Json(json!({
-            "schema_version": schema_version_for(BINARY, command, 1),
+            "schema_version": serve_schema(),
             "ok": false,
             "error": error,
         })),
@@ -184,7 +210,7 @@ fn status_json(status: StatusCode, code: &str, message: &str) -> Response {
     (
         status,
         Json(json!({
-            "schema_version": schema_version_for(BINARY, "serve", 1),
+            "schema_version": serve_schema(),
             "ok": false,
             "error": { "code": code, "message": message },
         })),
@@ -192,15 +218,18 @@ fn status_json(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-fn join_err(command: &str) -> Response {
-    envelope_err(
-        command,
-        CliError::runtime("serve-task-failed", "internal task failed", None),
-    )
+fn join_err() -> Response {
+    envelope_err(CliError::runtime(
+        "serve-task-failed",
+        "internal task failed",
+        None,
+    ))
 }
 
-/// Length-checked, XOR-accumulating comparison to avoid leaking the token length
-/// difference through early-return timing. Not echoed anywhere.
+/// XOR-accumulating byte comparison so a correct-length wrong token is compared
+/// in constant time (no early return on the first differing byte). The length
+/// check is intentionally NOT constant-time — the token length is not treated as
+/// a secret; the token itself is the high-entropy secret. Never echoed anywhere.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -266,19 +295,16 @@ struct SendBody {
 // --- handlers -----------------------------------------------------------------
 
 async fn healthz(State(state): State<Arc<ServeState>>) -> Response {
-    envelope_ok("serve", json!({ "status": "ok", "machine": state.machine }))
+    envelope_ok(json!({ "status": "ok", "machine": state.machine }))
 }
 
 async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
     match tokio::task::spawn_blocking(move || list_sessions(&context, Some(&tmux))).await {
-        Ok(Ok(sessions)) => envelope_ok(
-            "list",
-            json!({ "machine": state.machine, "sessions": sessions }),
-        ),
-        Ok(Err(err)) => envelope_err("list", err),
-        Err(_) => join_err("list"),
+        Ok(Ok(sessions)) => envelope_ok(json!({ "machine": state.machine, "sessions": sessions })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
     }
 }
 
@@ -290,17 +316,14 @@ async fn glance_handler(
     let context = state.context.clone();
     let args = cli::GlanceArgs {
         id,
-        tail: query.tail.unwrap_or(40),
+        tail: query.tail.unwrap_or(cli::DEFAULT_GLANCE_TAIL),
         tmux_bin: Some(state.tmux_bin.clone()),
         format: nils_common::cli_contract::OutputFormat::Json,
     };
     match tokio::task::spawn_blocking(move || glance_session(&context, args)).await {
-        Ok(Ok(glance)) => envelope_ok(
-            "glance",
-            json!({ "machine": state.machine, "glance": glance }),
-        ),
-        Ok(Err(err)) => envelope_err("glance", err),
-        Err(_) => join_err("glance"),
+        Ok(Ok(glance)) => envelope_ok(json!({ "machine": state.machine, "glance": glance })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
     }
 }
 
@@ -313,14 +336,11 @@ async fn create_handler(
         return resp;
     }
     let Some(agent) = AgentKind::from_name(&body.agent) else {
-        return envelope_err(
-            "start",
-            CliError::usage(
-                "invalid-agent",
-                format!("unknown agent: {}", body.agent),
-                None,
-            ),
-        );
+        return envelope_err(CliError::usage(
+            "invalid-agent",
+            format!("unknown agent: {}", body.agent),
+            None,
+        ));
     };
     let context = state.context.clone();
     let args = cli::StartArgs {
@@ -334,16 +354,13 @@ async fn create_handler(
         tmux_bin: Some(state.tmux_bin.clone()),
         agent_bin: None,
         agent_args: body.agent_args,
-        paste_delay_ms: 1200,
+        paste_delay_ms: cli::DEFAULT_PASTE_DELAY_MS,
         format: nils_common::cli_contract::OutputFormat::Json,
     };
     match tokio::task::spawn_blocking(move || start_session(&context, args)).await {
-        Ok(Ok(view)) => envelope_ok(
-            "start",
-            json!({ "machine": state.machine, "session": view.result }),
-        ),
-        Ok(Err(err)) => envelope_err("start", err),
-        Err(_) => join_err("start"),
+        Ok(Ok(view)) => envelope_ok(json!({ "machine": state.machine, "session": view.result })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
     }
 }
 
@@ -361,10 +378,11 @@ async fn send_handler(
         match SpecialKey::from_name(name) {
             Some(key) => keys.push(key),
             None => {
-                return envelope_err(
-                    "send",
-                    CliError::usage("invalid-key", format!("unknown key: {name}"), None),
-                );
+                return envelope_err(CliError::usage(
+                    "invalid-key",
+                    format!("unknown key: {name}"),
+                    None,
+                ));
             }
         }
     }
@@ -378,9 +396,9 @@ async fn send_handler(
         format: nils_common::cli_contract::OutputFormat::Json,
     };
     match tokio::task::spawn_blocking(move || crate::send_to_session(&context, args)).await {
-        Ok(Ok(sent)) => envelope_ok("send", json!({ "machine": state.machine, "sent": sent })),
-        Ok(Err(err)) => envelope_err("send", err),
-        Err(_) => join_err("send"),
+        Ok(Ok(sent)) => envelope_ok(json!({ "machine": state.machine, "sent": sent })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
     }
 }
 
@@ -395,12 +413,9 @@ async fn delete_handler(
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
     match tokio::task::spawn_blocking(move || delete_session(&context, &id, tmux)).await {
-        Ok(Ok(result)) => envelope_ok(
-            "delete",
-            json!({ "machine": state.machine, "deleted": result }),
-        ),
-        Ok(Err(err)) => envelope_err("delete", err),
-        Err(_) => join_err("delete"),
+        Ok(Ok(result)) => envelope_ok(json!({ "machine": state.machine, "deleted": result })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
     }
 }
 
@@ -422,8 +437,8 @@ async fn attach_handler(
     .await;
     let record = match lookup {
         Ok(Ok(record)) => record,
-        Ok(Err(err)) => return envelope_err("serve", err),
-        Err(_) => return join_err("serve"),
+        Ok(Err(err)) => return envelope_err(err),
+        Err(_) => return join_err(),
     };
     let tmux = state.tmux_bin.clone();
     ws.on_upgrade(move |socket| attach_socket(socket, context, tmux, record))
@@ -452,21 +467,38 @@ async fn attach_socket(
         let _ = sender.send(Message::Binary(text.into_bytes().into())).await;
     }
 
-    // Stream live pane output via `tmux pipe-pane` into a private file we tail.
-    let pipe_file = session_dir(&context, &record.id).join("attach.pipe");
-    let _ = std::fs::write(&pipe_file, b"");
-    let enabled = ProcessCommand::new(&tmux)
-        .arg("pipe-pane")
-        .arg("-o")
-        .arg("-t")
-        .arg(&target)
-        .arg(format!(
-            "cat >> {}",
-            shell_words::quote(&pipe_file.to_string_lossy())
-        ))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+    // Stream live pane output via `tmux pipe-pane` into a private per-connection
+    // file we tail. The file is 0600 (honoring the crate's secret-file model,
+    // since pane output can contain secrets) and uniquely named so concurrent
+    // attaches never remove each other's file. Note: tmux allows one pipe-pane
+    // per pane, so simultaneous attaches to the SAME session share the pane and
+    // the last to connect wins the live pipe (a documented tmux limitation).
+    let seq = ATTACH_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pipe_file = session_dir(&context, &record.id).join(format!("attach-{seq}.pipe"));
+    let enabled = {
+        let tmux = tmux.clone();
+        let target = target.clone();
+        let pipe_file = pipe_file.clone();
+        tokio::task::spawn_blocking(move || {
+            if write_private_file(&pipe_file, b"").is_err() {
+                return false;
+            }
+            ProcessCommand::new(&tmux)
+                .arg("pipe-pane")
+                .arg("-o")
+                .arg("-t")
+                .arg(&target)
+                .arg(format!(
+                    "cat >> {}",
+                    shell_words::quote(&pipe_file.to_string_lossy())
+                ))
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    };
     let tail_task = enabled.then(|| tokio::spawn(tail_pipe(pipe_file.clone(), sender)));
 
     // Client -> pane: JSON control frames { text?, key?, keys?, resize{cols,rows} }.
@@ -480,17 +512,20 @@ async fn attach_socket(
         }
     }
 
-    // Teardown: disable the pipe, stop the tail, remove the private file. The
-    // tmux session itself stays alive (durability across disconnect).
+    // Teardown: stop the tail, disable the pipe, remove this connection's private
+    // file. The tmux session itself stays alive (durability across disconnect).
     if let Some(handle) = tail_task {
         handle.abort();
     }
-    let _ = ProcessCommand::new(&tmux)
-        .arg("pipe-pane")
-        .arg("-t")
-        .arg(&target)
-        .status();
-    let _ = std::fs::remove_file(&pipe_file);
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = ProcessCommand::new(&tmux)
+            .arg("pipe-pane")
+            .arg("-t")
+            .arg(&target)
+            .status();
+        let _ = std::fs::remove_file(&pipe_file);
+    })
+    .await;
 }
 
 /// Tail an appended-to file, forwarding new bytes as binary WebSocket frames.
@@ -537,15 +572,20 @@ async fn handle_input(
         let cols = resize.get("cols").and_then(Value::as_u64);
         let rows = resize.get("rows").and_then(Value::as_u64);
         if let (Some(cols), Some(rows)) = (cols, rows) {
-            let _ = ProcessCommand::new(tmux)
-                .arg("resize-window")
-                .arg("-t")
-                .arg(target)
-                .arg("-x")
-                .arg(cols.to_string())
-                .arg("-y")
-                .arg(rows.to_string())
-                .status();
+            let tmux = tmux.to_path_buf();
+            let target = target.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                ProcessCommand::new(&tmux)
+                    .arg("resize-window")
+                    .arg("-t")
+                    .arg(&target)
+                    .arg("-x")
+                    .arg(cols.to_string())
+                    .arg("-y")
+                    .arg(rows.to_string())
+                    .status()
+            })
+            .await;
         }
         return;
     }
@@ -693,7 +733,7 @@ mod tests {
         // No Authorization header: reads are open on loopback.
         let (status, body) = call(router(st.clone()), get("/sessions")).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["schema_version"], "cli.agent-session.list.v1");
+        assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
         assert_eq!(body["data"]["machine"], MACHINE);
         assert_eq!(body["data"]["sessions"].as_array().unwrap().len(), 0);
     }
@@ -746,7 +786,25 @@ mod tests {
         let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
         assert!(deny_unauthorized(&st, &auth_headers(None)).is_some());
         assert!(deny_unauthorized(&st, &auth_headers(Some("nope"))).is_some());
+        // Equal-length but wrong token exercises the constant-time byte loop's
+        // deny path (a shorter wrong token short-circuits on the length check).
+        let same_len_wrong = "X".repeat(TOKEN.len());
+        assert_eq!(same_len_wrong.len(), TOKEN.len());
+        assert!(deny_unauthorized(&st, &auth_headers(Some(&same_len_wrong))).is_some());
         assert!(deny_unauthorized(&st, &auth_headers(Some(TOKEN))).is_none());
+    }
+
+    #[test]
+    fn sanitize_token_blanks_fail_closed() {
+        // An empty/whitespace --token collapses to None so serve fails closed
+        // instead of authorizing an empty bearer.
+        assert_eq!(sanitize_token(Some(String::new())), None);
+        assert_eq!(sanitize_token(Some("   ".to_string())), None);
+        assert_eq!(sanitize_token(None), None);
+        assert_eq!(
+            sanitize_token(Some("tok".to_string())),
+            Some("tok".to_string())
+        );
     }
 
     #[tokio::test]
@@ -780,7 +838,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body={body}");
-        assert_eq!(body["schema_version"], "cli.agent-session.send.v1");
+        assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
         assert_eq!(body["data"]["machine"], MACHINE);
         assert_eq!(body["data"]["sent"]["sent_text"], true);
         assert_eq!(body["data"]["sent"]["keys"][0], "enter");
@@ -820,5 +878,145 @@ mod tests {
         };
         let addr: SocketAddr = args.bind.parse().unwrap();
         assert!(addr.ip().is_loopback(), "default bind must be loopback");
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unknown_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (status, body) = call(
+            router(st.clone()),
+            post_json("/sessions", Some(TOKEN), json!({"agent": "banana"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid-agent");
+    }
+
+    #[tokio::test]
+    async fn glance_reads_open_with_machine() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "look", "codex", "hs-codex-look");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        // No auth header: glance is a read, open on loopback.
+        let (status, body) = call(router(st.clone()), get("/sessions/look/glance")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+        assert_eq!(body["data"]["machine"], MACHINE);
+        assert!(body["data"]["glance"].is_object());
+    }
+
+    #[tokio::test]
+    async fn delete_missing_session_maps_to_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let del = Request::builder()
+            .method("DELETE")
+            .uri("/sessions/ghost")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(router(st.clone()), del).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "session-not-found");
+    }
+
+    #[tokio::test]
+    async fn handle_input_resizes_and_ignores_malformed_frames() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("calls.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let ctx = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = test_record("look", "hs-codex-look");
+        let target = "hs-codex-look:0.0";
+
+        // Malformed JSON and an empty object must not touch tmux.
+        handle_input(&ctx, &tmux, &record, target, "{ not json").await;
+        handle_input(&ctx, &tmux, &record, target, "{}").await;
+        let after_noops = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            after_noops.trim().is_empty(),
+            "malformed/empty frames must not call tmux: {after_noops:?}"
+        );
+
+        // A resize frame maps to `tmux resize-window -x <cols> -y <rows>`.
+        handle_input(
+            &ctx,
+            &tmux,
+            &record,
+            target,
+            r#"{"resize":{"cols":123,"rows":45}}"#,
+        )
+        .await;
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.contains("resize-window") && calls.contains("123") && calls.contains("45"),
+            "resize frame must invoke resize-window: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn from_name_round_trips_agent_and_key() {
+        use clap::ValueEnum;
+        for agent in AgentKind::value_variants() {
+            assert_eq!(AgentKind::from_name(agent.as_str()), Some(*agent));
+        }
+        assert_eq!(AgentKind::from_name("banana"), None);
+        for key in SpecialKey::value_variants() {
+            assert_eq!(SpecialKey::from_name(key.as_str()), Some(*key));
+        }
+        assert_eq!(SpecialKey::from_name("f13"), None);
+    }
+
+    #[test]
+    fn private_files_are_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        // The attach pipe is created via write_private_file; assert the mode is
+        // 0600 so live pane output is not group/world-readable.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("attach.pipe");
+        write_private_file(&path, b"").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "pipe file must not be group/world readable"
+        );
+    }
+
+    fn logging_tmux(dir: &Path, log: &Path) -> PathBuf {
+        let bin = dir.join("tmux");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                shell_words::quote(&log.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
+    fn test_record(id: &str, tmux_session: &str) -> crate::SessionRecord {
+        crate::SessionRecord {
+            schema_version: crate::SESSION_DOCUMENT_VERSION.to_string(),
+            id: id.to_string(),
+            agent: "codex".to_string(),
+            mode: "interactive".to_string(),
+            title: None,
+            cwd: "/tmp".to_string(),
+            tmux_session: tmux_session.to_string(),
+            prompt_file: None,
+            log_file: None,
+            created_at: "2000-01-01T00:00:00Z".to_string(),
+            updated_at: "2000-01-01T00:00:00Z".to_string(),
+        }
     }
 }

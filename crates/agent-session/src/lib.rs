@@ -1507,13 +1507,38 @@ fn session_dir(context: &CliContext, id: &str) -> PathBuf {
 }
 
 fn private_dir(path: &Path) -> Result<(), CliError> {
-    fs::create_dir_all(path).map_err(|err| {
-        CliError::runtime(
-            "directory-create-failed",
-            format!("failed to create {}: {err}", path.display()),
-            Some(json!({ "path": display_path(path) })),
-        )
-    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::runtime(
+                "directory-create-failed",
+                format!("failed to create {}: {err}", parent.display()),
+                Some(json!({ "path": display_path(parent) })),
+            )
+        })?;
+    }
+    // Create the session dir as an ATOMIC ownership claim (fail if it already
+    // exists) rather than create_dir_all. This closes a create/create race:
+    // without it, two concurrent creates of the same id both pass the earlier
+    // exists() check, both proceed, and the one whose tmux new-session loses the
+    // duplicate-name race runs cleanup_created_record -> remove_dir_all on the
+    // shared dir, deleting the winner's session.json and orphaning a live agent.
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(CliError::runtime(
+                "session-exists",
+                format!("session already exists: {}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            ));
+        }
+        Err(err) => {
+            return Err(CliError::runtime(
+                "directory-create-failed",
+                format!("failed to create {}: {err}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            ));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1727,4 +1752,26 @@ fn tail_lines(text: &str, tail: usize) -> String {
         output.push('\n');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_trailing_blank_lines;
+
+    #[test]
+    fn strip_trailing_blank_lines_preserves_content_and_internal_blanks() {
+        // Trailing blank/whitespace-only lines are dropped...
+        assert_eq!(
+            strip_trailing_blank_lines("top-line\nsecond-line\n\n\n\n"),
+            "top-line\nsecond-line"
+        );
+        assert_eq!(strip_trailing_blank_lines("a\nb\n   \n\t\n"), "a\nb");
+        // ...but internal blank lines are preserved (only the tail is trimmed).
+        assert_eq!(strip_trailing_blank_lines("a\n\nb\n\n\n"), "a\n\nb");
+        // An all-blank pane collapses to empty.
+        assert_eq!(strip_trailing_blank_lines("\n\n\n"), "");
+        assert_eq!(strip_trailing_blank_lines(""), "");
+        // Content with no trailing blanks is unchanged.
+        assert_eq!(strip_trailing_blank_lines("only"), "only");
+    }
 }

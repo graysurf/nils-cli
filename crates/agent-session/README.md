@@ -48,10 +48,16 @@ is no second state model.
   `{ "text": "...", "key": "enter", "keys": ["c-c"], "resize": { "cols": 80, "rows": 24 } }`. Token-gated; disconnect
   leaves the tmux session alive.
 
-Every response carries a `machine` identity (`--machine` / `AGENT_SESSION_MACHINE` / `--host` / hostname) so an edge can
-aggregate several machines. Auth is a bearer token (`--token` / `AGENT_SESSION_TOKEN`) on all write and attach endpoints;
-when no token is configured those endpoints fail closed (503). Bind defaults to loopback — this is a remote-shell surface,
-so keep it tailnet-only (front it with `tailscale serve`, no funnel) and never bind a public address.
+Every response uses the `cli.agent-session.serve.v1` envelope and carries a `machine` identity (`--machine` /
+`AGENT_SESSION_MACHINE` / `--host` / hostname) so an edge can aggregate several machines. Auth is a bearer token
+(`--token` / `AGENT_SESSION_TOKEN`) on all write and attach endpoints, compared without an early-exit on the token bytes;
+when no token is configured (or it is empty) those endpoints fail closed (503). Use a strong, high-entropy token.
+
+Trust model: the daemon binds loopback and *refuses* a non-loopback bind unless `--allow-non-loopback` is passed, because
+it drives a remote shell. Reads (`list` / `glance`) are intentionally open on the bind address — front the daemon with the
+agent-console edge (which applies its own auth) and do **not** `tailscale serve` the raw serve port; expose only the edge,
+tailnet-only, no funnel. Browser WebSocket clients cannot set an `Authorization` header, so the edge must proxy the attach
+and inject the bearer server-side — never put the token in the `ws://` URL/query.
 
 ## Output contract
 

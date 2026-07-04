@@ -3,6 +3,12 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use nils_common::cli_contract::OutputFormat;
 
+/// Default delay before pasting the initial prompt (ms). Shared by `start`'s
+/// `--paste-delay-ms` default and the serve create endpoint.
+pub const DEFAULT_PASTE_DELAY_MS: u64 = 1200;
+/// Default number of pane lines captured by `glance` (CLI and serve).
+pub const DEFAULT_GLANCE_TAIL: usize = 40;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "agent-session",
@@ -96,7 +102,7 @@ pub struct StartArgs {
     pub agent_args: Vec<String>,
 
     /// Delay before pasting the initial prompt into the tmux pane.
-    #[arg(long = "paste-delay-ms", default_value_t = 1200)]
+    #[arg(long = "paste-delay-ms", default_value_t = DEFAULT_PASTE_DELAY_MS)]
     pub paste_delay_ms: u64,
 
     /// Output format.
@@ -234,7 +240,7 @@ pub struct GlanceArgs {
     pub id: String,
 
     /// Number of pane lines to capture for the glance tail.
-    #[arg(long, default_value_t = 40)]
+    #[arg(long, default_value_t = DEFAULT_GLANCE_TAIL)]
     pub tail: usize,
 
     /// tmux binary override.
@@ -248,8 +254,8 @@ pub struct GlanceArgs {
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// Address to bind. Defaults to loopback; binding a non-loopback address is
-    /// a remote-shell exposure and is warned about.
+    /// Address to bind. Defaults to loopback; a non-loopback address is refused
+    /// unless --allow-non-loopback is passed (it exposes a remote shell).
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8781")]
     pub bind: String,
 
@@ -263,6 +269,11 @@ pub struct ServeArgs {
     /// AGENT_SESSION_MACHINE, then --host, then the short hostname.
     #[arg(long, value_name = "NAME")]
     pub machine: Option<String>,
+
+    /// Deliberately allow binding a non-loopback address. Without this, a
+    /// non-loopback --bind is refused because it exposes a remote shell.
+    #[arg(long = "allow-non-loopback")]
+    pub allow_non_loopback: bool,
 
     /// tmux binary override.
     #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
