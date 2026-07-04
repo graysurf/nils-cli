@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `af45f5ba909a74008d661d0376f1d978dafc8b830e2ee22efae284490f9f07ac`
+- Cargo.lock SHA256: `38f4f472eab056537c177e06cda48750d147ba646f2efe186dab80c53127830e`
 - Third-party crates (`source != null`): 450
 - Workspace crates (`source == null`, excluded below): 44
 
@@ -61,7 +61,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | anstyle-wincon | 3.0.11 | MIT OR Apache-2.0 | crates.io |
 | anyhow | 1.0.103 | MIT OR Apache-2.0 | crates.io |
 | arrayref | 0.3.9 | BSD-2-Clause | crates.io |
-| arrayvec | 0.7.6 | MIT OR Apache-2.0 | crates.io |
+| arrayvec | 0.7.8 | MIT OR Apache-2.0 | crates.io |
 | async-broadcast | 0.7.2 | MIT OR Apache-2.0 | crates.io |
 | async-channel | 2.5.0 | Apache-2.0 OR MIT | crates.io |
 | async-executor | 1.14.0 | Apache-2.0 OR MIT | crates.io |
