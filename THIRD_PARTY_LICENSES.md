@@ -3,8 +3,8 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `a5c62962e3a9c4405ca0a17ce07b02f1620f952c5487b142ffdaf53f5353edd0`
-- Third-party crates (`source != null`): 450
+- Cargo.lock SHA256: `cf30b8ed89823375a772222f7e5766be52c66651018afda097f20bc59db79050`
+- Third-party crates (`source != null`): 458
 - Workspace crates (`source == null`, excluded below): 44
 
 ## Notes
@@ -17,8 +17,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 
 | License Expression | Crate Count |
 | --- | ---: |
-| MIT OR Apache-2.0 | 214 |
-| MIT | 80 |
+| MIT OR Apache-2.0 | 217 |
+| MIT | 84 |
 | Apache-2.0 OR MIT | 38 |
 | Zlib OR Apache-2.0 OR MIT | 19 |
 | Unicode-3.0 | 18 |
@@ -45,6 +45,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | CC0-1.0 OR MIT-0 OR Apache-2.0 | 1 |
 | ISC AND (Apache-2.0 OR ISC) | 1 |
 | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | 1 |
+| MIT AND BSD-3-Clause | 1 |
 | MIT OR Zlib OR Apache-2.0 | 1 |
 
 ## Dependency List
@@ -76,6 +77,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | autocfg | 1.5.1 | Apache-2.0 OR MIT | crates.io |
 | aws-lc-rs | 1.17.0 | ISC AND (Apache-2.0 OR ISC) | crates.io |
 | aws-lc-sys | 0.41.0 | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | crates.io |
+| axum | 0.8.9 | MIT | crates.io |
+| axum-core | 0.5.6 | MIT | crates.io |
 | base64 | 0.22.1 | MIT OR Apache-2.0 | crates.io |
 | bitflags | 1.3.2 | MIT/Apache-2.0 | crates.io |
 | bitflags | 2.13.0 | MIT OR Apache-2.0 | crates.io |
@@ -154,6 +157,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | futures-core | 0.3.32 | MIT OR Apache-2.0 | crates.io |
 | futures-io | 0.3.32 | MIT OR Apache-2.0 | crates.io |
 | futures-lite | 2.6.1 | Apache-2.0 OR MIT | crates.io |
+| futures-macro | 0.3.32 | MIT OR Apache-2.0 | crates.io |
 | futures-sink | 0.3.32 | MIT OR Apache-2.0 | crates.io |
 | futures-task | 0.3.32 | MIT OR Apache-2.0 | crates.io |
 | futures-util | 0.3.32 | MIT OR Apache-2.0 | crates.io |
@@ -175,6 +179,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | http-body | 1.0.1 | MIT | crates.io |
 | http-body-util | 0.1.3 | MIT | crates.io |
 | httparse | 1.10.1 | MIT OR Apache-2.0 | crates.io |
+| httpdate | 1.0.3 | MIT OR Apache-2.0 | crates.io |
 | hybrid-array | 0.4.12 | MIT OR Apache-2.0 | crates.io |
 | hyper | 1.10.1 | MIT | crates.io |
 | hyper-rustls | 0.27.9 | Apache-2.0 OR ISC OR MIT | crates.io |
@@ -225,6 +230,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | log | 0.4.33 | MIT OR Apache-2.0 | crates.io |
 | lru-slab | 0.1.2 | MIT OR Apache-2.0 OR Zlib | crates.io |
 | matchers | 0.2.0 | MIT | crates.io |
+| matchit | 0.8.4 | MIT AND BSD-3-Clause | crates.io |
 | memchr | 2.8.2 | Unlicense OR MIT | crates.io |
 | memmap2 | 0.9.11 | MIT OR Apache-2.0 | crates.io |
 | memo-map | 0.3.3 | Apache-2.0 | crates.io |
@@ -334,6 +340,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | serde_core | 1.0.228 | MIT OR Apache-2.0 | crates.io |
 | serde_derive | 1.0.228 | MIT OR Apache-2.0 | crates.io |
 | serde_json | 1.0.150 | MIT OR Apache-2.0 | crates.io |
+| serde_path_to_error | 0.1.20 | MIT OR Apache-2.0 | crates.io |
 | serde_repr | 0.1.20 | MIT OR Apache-2.0 | crates.io |
 | serde_spanned | 1.1.1 | MIT OR Apache-2.0 | crates.io |
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 | crates.io |
@@ -377,7 +384,9 @@ This file documents third-party Rust crate licenses used by this workspace.
 | tinyvec | 1.11.0 | Zlib OR Apache-2.0 OR MIT | crates.io |
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib | crates.io |
 | tokio | 1.52.3 | MIT | crates.io |
+| tokio-macros | 2.7.0 | MIT | crates.io |
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 | crates.io |
+| tokio-tungstenite | 0.29.0 | MIT | crates.io |
 | toml | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_edit | 0.25.12+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |

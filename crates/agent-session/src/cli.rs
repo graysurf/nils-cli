@@ -3,6 +3,12 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use nils_common::cli_contract::OutputFormat;
 
+/// Default delay before pasting the initial prompt (ms). Shared by `start`'s
+/// `--paste-delay-ms` default and the serve create endpoint.
+pub const DEFAULT_PASTE_DELAY_MS: u64 = 1200;
+/// Default number of pane lines captured by `glance` (CLI and serve).
+pub const DEFAULT_GLANCE_TAIL: usize = 40;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "agent-session",
@@ -45,6 +51,8 @@ pub enum Command {
     Send(SendArgs),
     /// Capture the recent pane tail plus live status as a dashboard glance.
     Glance(GlanceArgs),
+    /// Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback.
+    Serve(ServeArgs),
     /// Delete session state and kill the tmux session if it is still alive.
     Delete(DeleteArgs),
     /// Print shell completion script.
@@ -94,7 +102,7 @@ pub struct StartArgs {
     pub agent_args: Vec<String>,
 
     /// Delay before pasting the initial prompt into the tmux pane.
-    #[arg(long = "paste-delay-ms", default_value_t = 1200)]
+    #[arg(long = "paste-delay-ms", default_value_t = DEFAULT_PASTE_DELAY_MS)]
     pub paste_delay_ms: u64,
 
     /// Output format.
@@ -232,7 +240,7 @@ pub struct GlanceArgs {
     pub id: String,
 
     /// Number of pane lines to capture for the glance tail.
-    #[arg(long, default_value_t = 40)]
+    #[arg(long, default_value_t = DEFAULT_GLANCE_TAIL)]
     pub tail: usize,
 
     /// tmux binary override.
@@ -242,6 +250,34 @@ pub struct GlanceArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Address to bind. Defaults to loopback; a non-loopback address is refused
+    /// unless --allow-non-loopback is passed (it exposes a remote shell).
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8781")]
+    pub bind: String,
+
+    /// Bearer token required on write and attach endpoints. Falls back to
+    /// AGENT_SESSION_TOKEN. When unset, writes and attach are disabled (reads
+    /// still work on loopback).
+    #[arg(long, value_name = "TOKEN")]
+    pub token: Option<String>,
+
+    /// Machine identity reported in responses. Falls back to
+    /// AGENT_SESSION_MACHINE, then --host, then the short hostname.
+    #[arg(long, value_name = "NAME")]
+    pub machine: Option<String>,
+
+    /// Deliberately allow binding a non-loopback address. Without this, a
+    /// non-loopback --bind is refused because it exposes a remote shell.
+    #[arg(long = "allow-non-loopback")]
+    pub allow_non_loopback: bool,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -282,6 +318,17 @@ impl AgentKind {
             Self::Hermes => "hermes",
         }
     }
+
+    /// Parse an agent name (as accepted by `--agent` / emitted by `as_str`).
+    /// Used by the serve create endpoint to map a JSON `agent` field.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            "hermes" => Some(Self::Hermes),
+            _ => None,
+        }
+    }
 }
 
 /// Named special keys accepted by `send`, mapped to tmux `send-keys` names.
@@ -311,6 +358,22 @@ impl SpecialKey {
             Self::Left => "left",
             Self::Right => "right",
             Self::Tab => "tab",
+        }
+    }
+
+    /// Parse a canonical key name (as accepted by `--key` / emitted by `as_str`).
+    /// Used by the serve WebSocket protocol to map client key names to keys.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "enter" => Some(Self::Enter),
+            "escape" => Some(Self::Escape),
+            "c-c" => Some(Self::CtrlC),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "tab" => Some(Self::Tab),
+            _ => None,
         }
     }
 

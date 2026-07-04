@@ -1,5 +1,6 @@
 mod cli;
 pub mod completion;
+mod serve;
 
 use std::env;
 use std::ffi::OsString;
@@ -94,6 +95,7 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Logs(args) => run_logs(&context, args),
         Command::Send(args) => run_send(&context, args),
         Command::Glance(args) => run_glance(&context, args),
+        Command::Serve(args) => serve::run_serve(&context, args),
         Command::Delete(args) => run_delete(&context, args),
         Command::Completion(_) => unreachable!("completion is handled before context resolution"),
     }
@@ -109,7 +111,7 @@ fn command_format(command: &Command) -> OutputFormat {
         Command::Send(args) => args.format,
         Command::Glance(args) => args.format,
         Command::Delete(args) => args.format,
-        Command::Attach(_) | Command::Completion(_) => OutputFormat::Text,
+        Command::Attach(_) | Command::Serve(_) | Command::Completion(_) => OutputFormat::Text,
     }
 }
 
@@ -859,13 +861,25 @@ fn capture_pane_tail(
     tmux_bin: &Path,
 ) -> Result<String, CliError> {
     match run_capture_pane(record, tail, tmux_bin)? {
-        Some(text) => Ok(tail_lines(&text, tail)),
+        Some(text) => Ok(tail_lines(&strip_trailing_blank_lines(&text), tail)),
         None => Err(CliError::runtime(
             "tmux-capture-failed",
             "tmux capture-pane failed",
             Some(json!({ "tmux_session": record.tmux_session })),
         )),
     }
+}
+
+/// `capture-pane` pads its output to the full pane height with blank lines, so a
+/// short, top-anchored pane ends with many empties. Drop the trailing blank
+/// lines before taking the tail, or `glance` would show the empty bottom of the
+/// pane instead of the actual recent content.
+fn strip_trailing_blank_lines(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 /// Bump `updated_at` to now so `list` can order by real control-plane activity.
@@ -1493,13 +1507,38 @@ fn session_dir(context: &CliContext, id: &str) -> PathBuf {
 }
 
 fn private_dir(path: &Path) -> Result<(), CliError> {
-    fs::create_dir_all(path).map_err(|err| {
-        CliError::runtime(
-            "directory-create-failed",
-            format!("failed to create {}: {err}", path.display()),
-            Some(json!({ "path": display_path(path) })),
-        )
-    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::runtime(
+                "directory-create-failed",
+                format!("failed to create {}: {err}", parent.display()),
+                Some(json!({ "path": display_path(parent) })),
+            )
+        })?;
+    }
+    // Create the session dir as an ATOMIC ownership claim (fail if it already
+    // exists) rather than create_dir_all. This closes a create/create race:
+    // without it, two concurrent creates of the same id both pass the earlier
+    // exists() check, both proceed, and the one whose tmux new-session loses the
+    // duplicate-name race runs cleanup_created_record -> remove_dir_all on the
+    // shared dir, deleting the winner's session.json and orphaning a live agent.
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(CliError::runtime(
+                "session-exists",
+                format!("session already exists: {}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            ));
+        }
+        Err(err) => {
+            return Err(CliError::runtime(
+                "directory-create-failed",
+                format!("failed to create {}: {err}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            ));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1713,4 +1752,26 @@ fn tail_lines(text: &str, tail: usize) -> String {
         output.push('\n');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_trailing_blank_lines;
+
+    #[test]
+    fn strip_trailing_blank_lines_preserves_content_and_internal_blanks() {
+        // Trailing blank/whitespace-only lines are dropped...
+        assert_eq!(
+            strip_trailing_blank_lines("top-line\nsecond-line\n\n\n\n"),
+            "top-line\nsecond-line"
+        );
+        assert_eq!(strip_trailing_blank_lines("a\nb\n   \n\t\n"), "a\nb");
+        // ...but internal blank lines are preserved (only the tail is trimmed).
+        assert_eq!(strip_trailing_blank_lines("a\n\nb\n\n\n"), "a\n\nb");
+        // An all-blank pane collapses to empty.
+        assert_eq!(strip_trailing_blank_lines("\n\n\n"), "");
+        assert_eq!(strip_trailing_blank_lines(""), "");
+        // Content with no trailing blanks is unchanged.
+        assert_eq!(strip_trailing_blank_lines("only"), "only");
+    }
 }
