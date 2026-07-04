@@ -880,6 +880,23 @@ fn send_delivers_text_and_keys_without_leaking_and_bumps_updated_at() {
             ]),
         "missing send-keys Enter call: {calls:?}"
     );
+    // Text is applied BEFORE keys: the paste must precede the Enter, or an empty
+    // prompt would be submitted before the text arrives.
+    let paste_idx = calls
+        .iter()
+        .position(|call| call.first().is_some_and(|arg| arg == "paste-buffer"))
+        .expect("paste-buffer call");
+    let enter_idx = calls
+        .iter()
+        .position(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Enter")
+        })
+        .expect("send-keys Enter call");
+    assert!(
+        paste_idx < enter_idx,
+        "text paste must precede the Enter key: {calls:?}"
+    );
     // The secret text travels through a private buffer file, never argv.
     for call in &calls {
         for arg in call {
@@ -1085,5 +1102,280 @@ fn run_rejects_hermes_agent_without_orphaning_state() {
     assert_eq!(
         orphans, 0,
         "rejected hermes run must not leave session state"
+    );
+}
+
+fn run_with_stdin(dir: &Path, args: &[&str], envs: &[(&str, &str)], stdin: &str) -> CmdOutput {
+    let options = CmdOptions::new()
+        .with_cwd(dir)
+        .with_envs(envs)
+        .with_stdin_str(stdin);
+    run_resolved("agent-session", args, &options)
+}
+
+#[test]
+fn send_keys_only_skips_buffer_and_maps_special_keys() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    write_session_record(&state_dir, "steer", "codex", "hs-codex-steer");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "steer",
+            "--key",
+            "c-c",
+            "--key",
+            "escape",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["schema_version"], "cli.agent-session.send.v1");
+    let result = data(&value);
+    assert_eq!(result["sent_text"], false);
+    let keys = result["keys"].as_array().expect("keys array");
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0], "c-c");
+    assert_eq!(keys[1], "escape");
+
+    let calls = tmux_calls(&tmux_log);
+    // Keys-only: no buffer is loaded or pasted.
+    assert!(
+        !calls.iter().any(|call| call
+            .first()
+            .is_some_and(|arg| arg == "load-buffer" || arg == "paste-buffer")),
+        "keys-only send must not touch buffers: {calls:?}"
+    );
+    // Special keys map to their tmux names and are sent in order.
+    let ctrl_c_idx = calls
+        .iter()
+        .position(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "C-c")
+        })
+        .expect("send-keys C-c call");
+    let escape_idx = calls
+        .iter()
+        .position(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Escape")
+        })
+        .expect("send-keys Escape call");
+    assert!(
+        ctrl_c_idx < escape_idx,
+        "keys must send in order: {calls:?}"
+    );
+}
+
+#[test]
+fn send_rejects_stopped_session_without_delivering() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    write_session_record(&state_dir, "steer", "codex", "hs-codex-steer");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "steer",
+            "--text",
+            "x",
+            "--key",
+            "enter",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "session-not-running");
+    // Nothing is delivered to a dead pane.
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.first().is_some_and(|arg| arg == "load-buffer"
+                || arg == "paste-buffer"
+                || arg == "send-keys")),
+        "stopped session must not receive input: {calls:?}"
+    );
+}
+
+#[test]
+fn send_reads_stdin_and_rejects_empty_or_dual_text() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    write_session_record(&state_dir, "steer", "codex", "hs-codex-steer");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let env_refs = [("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())];
+    let secret = "stdin-secret-payload";
+
+    // --text-stdin delivers without leaking the secret into output or argv.
+    let stdin_out = run_with_stdin(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "steer",
+            "--text-stdin",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &env_refs,
+        secret,
+    );
+    assert_eq!(stdin_out.code, 0, "stderr={}", stdin_out.stderr_text());
+    assert_no_secret(&stdin_out, secret);
+    assert_eq!(data(&stdin_out.stdout_json())["sent_text"], true);
+    let stdin_calls = tmux_calls(&tmux_log);
+    assert!(
+        stdin_calls
+            .iter()
+            .any(|call| call.first().is_some_and(|arg| arg == "paste-buffer")),
+        "stdin text should be pasted: {stdin_calls:?}"
+    );
+    for call in &stdin_calls {
+        for arg in call {
+            assert!(
+                !arg.contains(secret),
+                "secret leaked into tmux argv: {call:?}"
+            );
+        }
+    }
+
+    // --text + --text-stdin together is a usage error.
+    let dual = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "steer",
+            "--text",
+            "x",
+            "--text-stdin",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &env_refs,
+    );
+    assert_eq!(dual.code, 64, "stderr={}", dual.stderr_text());
+    assert_eq!(dual.stdout_json()["error"]["code"], "multiple-text-sources");
+
+    // An empty --text is a no-op, not a false success: caught by empty-send.
+    let empty_text = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "steer",
+            "--text",
+            "",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &env_refs,
+    );
+    assert_eq!(empty_text.code, 64, "stderr={}", empty_text.stderr_text());
+    assert_eq!(empty_text.stdout_json()["error"]["code"], "empty-send");
+}
+
+#[test]
+fn glance_truncates_to_tail_and_leaves_updated_at() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let session = write_session_record(&state_dir, "look", "claude", "hs-claude-look");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "glance",
+            "look",
+            "--tail",
+            "2",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_CAPTURE", "l1\nl2\nl3\nl4\nl5\n"),
+        ],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let result = data(&output.stdout_json()).clone();
+    // Client-side truncation keeps only the last N lines.
+    assert_eq!(result["tail"], "l4\nl5\n");
+    // The capture is requested with the right tail window and target.
+    let calls = tmux_calls(&tmux_log);
+    let capture = calls
+        .iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "capture-pane"))
+        .expect("capture-pane call");
+    assert!(
+        capture.contains(&"-S".to_string()) && capture.contains(&"-2".to_string()),
+        "capture must request the tail window: {capture:?}"
+    );
+    assert!(
+        capture.contains(&"hs-claude-look".to_string()),
+        "capture must target the session pane: {capture:?}"
+    );
+
+    // glance is a passive poll: it must not bump updated_at.
+    let after: Value = serde_json::from_str(
+        &fs::read_to_string(session.join("session.json")).expect("re-read record"),
+    )
+    .expect("parse record");
+    assert_eq!(
+        after["updated_at"], "2000-01-01T00:00:00Z",
+        "glance must not bump updated_at"
     );
 }

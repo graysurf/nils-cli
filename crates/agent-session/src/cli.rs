@@ -203,7 +203,8 @@ pub struct SendArgs {
     #[arg(value_name = "ID")]
     pub id: String,
 
-    /// Literal text to type into the session. Applied before any --key.
+    /// Literal text to type into the session. Applied before any --key. Prefer
+    /// --text-stdin for secrets (--text is visible in this process's arguments).
     #[arg(long, value_name = "TEXT")]
     pub text: Option<String>,
 

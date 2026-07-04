@@ -666,30 +666,38 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
     let buffer_name = format!("{}-prompt", record.id);
     let target = format!("{}:0.0", record.tmux_session);
 
+    load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))?;
+
+    // The initial prompt is submitted; `send` deliberately leaves this to
+    // an explicit `--key enter`.
+    let mut enter = ProcessCommand::new(tmux_bin);
+    enter.arg("send-keys").arg("-t").arg(&target).arg("Enter");
+    run_status(enter, "tmux send-keys")
+}
+
+/// Load `file` into a named tmux buffer and paste it into `target`, deleting the
+/// buffer after paste (`-d`) or on failure. Shared by `paste_prompt` (initial
+/// prompt) and `send` (steering text) so the buffer lifecycle lives in one place.
+fn load_and_paste_buffer(
+    tmux_bin: &Path,
+    buffer_name: &str,
+    target: &str,
+    file: &Path,
+) -> Result<(), CliError> {
     let mut load = ProcessCommand::new(tmux_bin);
-    load.arg("load-buffer")
-        .arg("-b")
-        .arg(&buffer_name)
-        .arg(prompt_file);
+    load.arg("load-buffer").arg("-b").arg(buffer_name).arg(file);
     run_status(load, "tmux load-buffer")?;
 
     let mut paste = ProcessCommand::new(tmux_bin);
     paste
         .arg("paste-buffer")
         .arg("-b")
-        .arg(&buffer_name)
+        .arg(buffer_name)
         .arg("-d")
         .arg("-t")
-        .arg(&target);
+        .arg(target);
     if let Err(err) = run_status(paste, "tmux paste-buffer") {
-        delete_tmux_buffer(tmux_bin, &buffer_name);
-        return Err(err);
-    }
-
-    let mut enter = ProcessCommand::new(tmux_bin);
-    enter.arg("send-keys").arg("-t").arg(&target).arg("Enter");
-    if let Err(err) = run_status(enter, "tmux send-keys") {
-        delete_tmux_buffer(tmux_bin, &buffer_name);
+        delete_tmux_buffer(tmux_bin, buffer_name);
         return Err(err);
     }
     Ok(())
@@ -750,28 +758,9 @@ fn send_input(
         let buffer_name = format!("{}-send", record.id);
         let temp = session_dir(context, &record.id).join("send-input");
         write_private_file(&temp, text.as_bytes())?;
-
-        let mut load = ProcessCommand::new(tmux_bin);
-        load.arg("load-buffer")
-            .arg("-b")
-            .arg(&buffer_name)
-            .arg(&temp);
-        let load_result = run_status(load, "tmux load-buffer");
+        let result = load_and_paste_buffer(tmux_bin, &buffer_name, &target, &temp);
         let _ = fs::remove_file(&temp);
-        load_result?;
-
-        let mut paste = ProcessCommand::new(tmux_bin);
-        paste
-            .arg("paste-buffer")
-            .arg("-b")
-            .arg(&buffer_name)
-            .arg("-d")
-            .arg("-t")
-            .arg(&target);
-        if let Err(err) = run_status(paste, "tmux paste-buffer") {
-            delete_tmux_buffer(tmux_bin, &buffer_name);
-            return Err(err);
-        }
+        result?;
     }
     for key in keys {
         let mut command = ProcessCommand::new(tmux_bin);
@@ -786,13 +775,17 @@ fn send_input(
 }
 
 fn read_send_text(text: &Option<String>, text_stdin: bool) -> Result<Option<String>, CliError> {
+    // Empty text (an empty `--text ""` or an empty stdin pipe) collapses to
+    // `None` so the caller's empty-send guard treats it as "no text" rather than
+    // pasting an empty buffer and reporting `sent_text: true` for a no-op. A
+    // whitespace-only value is preserved: a space can be a meaningful keystroke.
     match (text, text_stdin) {
         (Some(_), true) => Err(CliError::usage(
             "multiple-text-sources",
             "use only one of --text or --text-stdin",
             None,
         )),
-        (Some(value), false) => Ok(Some(value.clone())),
+        (Some(value), false) => Ok(Some(value.clone()).filter(|value| !value.is_empty())),
         (None, true) => {
             let mut input = String::new();
             io::stdin().read_to_string(&mut input).map_err(|err| {
@@ -802,7 +795,7 @@ fn read_send_text(text: &Option<String>, text_stdin: bool) -> Result<Option<Stri
                     None,
                 )
             })?;
-            Ok(Some(input))
+            Ok(Some(input).filter(|value| !value.is_empty()))
         }
         (None, false) => Ok(None),
     }
@@ -829,11 +822,15 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
     })
 }
 
-fn capture_pane_tail(
+/// Run `tmux capture-pane -p -S -<tail>` for a session. Returns `Ok(Some(text))`
+/// on success, `Ok(None)` when tmux ran but capture failed (a non-running or
+/// gone pane), and `Err` only when the tmux binary could not be spawned. Shared
+/// by `glance` and `logs` so the capture invocation lives in one place.
+fn run_capture_pane(
     record: &SessionRecord,
     tail: usize,
     tmux_bin: &Path,
-) -> Result<String, CliError> {
+) -> Result<Option<String>, CliError> {
     let start = format!("-{}", tail.max(1));
     let output = ProcessCommand::new(tmux_bin)
         .arg("capture-pane")
@@ -851,13 +848,24 @@ fn capture_pane_tail(
             )
         })?;
     if !output.status.success() {
-        return Err(CliError::runtime(
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
+}
+
+fn capture_pane_tail(
+    record: &SessionRecord,
+    tail: usize,
+    tmux_bin: &Path,
+) -> Result<String, CliError> {
+    match run_capture_pane(record, tail, tmux_bin)? {
+        Some(text) => Ok(tail_lines(&text, tail)),
+        None => Err(CliError::runtime(
             "tmux-capture-failed",
             "tmux capture-pane failed",
             Some(json!({ "tmux_session": record.tmux_session })),
-        ));
+        )),
     }
-    Ok(tail_lines(&String::from_utf8_lossy(&output.stdout), tail))
 }
 
 /// Bump `updated_at` to now so `list` can order by real control-plane activity.
@@ -1157,30 +1165,14 @@ fn session_logs(
         return Ok(result);
     }
 
-    if live_status(tmux_bin, &record.tmux_session) == "running" {
-        let start = format!("-{}", tail.max(1));
-        let output = ProcessCommand::new(tmux_bin)
-            .arg("capture-pane")
-            .arg("-p")
-            .arg("-t")
-            .arg(&record.tmux_session)
-            .arg("-S")
-            .arg(start)
-            .output()
-            .map_err(|err| {
-                CliError::runtime(
-                    "tmux-capture-failed",
-                    format!("failed to run {}: {err}", tmux_bin.display()),
-                    Some(json!({ "tmux_session": record.tmux_session })),
-                )
-            })?;
-        if output.status.success() {
-            return Ok(LogsResult {
-                id: record.id.clone(),
-                source: "tmux".to_string(),
-                text: String::from_utf8_lossy(&output.stdout).to_string(),
-            });
-        }
+    if live_status(tmux_bin, &record.tmux_session) == "running"
+        && let Some(text) = run_capture_pane(record, tail, tmux_bin)?
+    {
+        return Ok(LogsResult {
+            id: record.id.clone(),
+            source: "tmux".to_string(),
+            text,
+        });
     }
 
     Err(CliError::runtime(
