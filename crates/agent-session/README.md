@@ -42,7 +42,13 @@ web console). It builds its own tokio runtime and reuses the synchronous lifecyc
 is no second state model.
 
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback.
-- `POST /sessions` (create), `POST /sessions/{id}/send`, `DELETE /sessions/{id}` — writes, require a bearer token.
+- `GET /workdirs?q=...&limit=N` — authenticated read; searches only the default operator roots (`$HOME/Project` and
+  `$HOME/.config`) with bounded depth, count, and elapsed-time limits.
+- `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
+  `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
+- Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
+  session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
+  Empty or null titles clear the custom session title so clients can fall back to the session id.
 - `GET /sessions/{id}/attach` — a WebSocket PTY attach: a `capture-pane` snapshot then a live `tmux pipe-pane` byte
   stream (binary frames, renderable by xterm.js); the client sends JSON control frames
   `{ "text": "...", "key": "enter", "keys": ["c-c"], "resize": { "cols": 80, "rows": 24 } }`. Token-gated; disconnect
@@ -54,10 +60,11 @@ Every response uses the `cli.agent-session.serve.v1` envelope and carries a `mac
 when no token is configured (or it is empty) those endpoints fail closed (503). Use a strong, high-entropy token.
 
 Trust model: the daemon binds loopback and *refuses* a non-loopback bind unless `--allow-non-loopback` is passed, because
-it drives a remote shell. Reads (`list` / `glance`) are intentionally open on the bind address — front the daemon with the
-agent-console edge (which applies its own auth) and do **not** `tailscale serve` the raw serve port; expose only the edge,
-tailnet-only, no funnel. Browser WebSocket clients cannot set an `Authorization` header, so the edge must proxy the attach
-and inject the bearer server-side — never put the token in the `ws://` URL/query.
+it drives a remote shell. Session reads (`list` / `glance`) are intentionally open on the bind address, while path-bearing
+reads (`workdirs`), writes, and attach require the bearer token. Front the daemon with the agent-console edge (which
+applies its own auth) and do **not** `tailscale serve` the raw serve port; expose only the edge, tailnet-only, no funnel.
+Browser WebSocket clients cannot set an `Authorization` header, so the edge must proxy the attach and inject the bearer
+server-side — never put the token in the `ws://` URL/query.
 
 ## Output contract
 

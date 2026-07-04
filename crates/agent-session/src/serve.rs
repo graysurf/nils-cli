@@ -18,12 +18,13 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, patch, post};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use nils_common::cli_contract::{exit, schema_version_for};
@@ -33,13 +34,15 @@ use serde_json::{Value, json};
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::{
     BINARY, CliContext, CliError, delete_session, glance_session, list_sessions,
-    load_session_record, non_empty_env, resolve_tmux_bin, run_capture_pane, send_input,
-    session_dir, short_hostname, start_session, write_private_file,
+    load_session_record, non_empty_env, resolve_tmux_bin, run_capture_pane, search_workdirs,
+    send_input, session_dir, short_hostname, start_session, update_session_title,
+    write_private_file, write_session_attachment,
 };
 
 /// Monotonic counter giving each attach connection a private pipe file, so
 /// concurrent attaches to one session never delete each other's file.
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
+const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 
 /// Shared daemon state handed to every request handler.
 struct ServeState {
@@ -139,10 +142,18 @@ fn router(state: Arc<ServeState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/sessions", get(list_handler).post(create_handler))
+        .route("/workdirs", get(workdirs_handler))
         .route("/sessions/{id}/glance", get(glance_handler))
         .route("/sessions/{id}/send", post(send_handler))
+        .route(
+            "/sessions/{id}/attachments",
+            post(upload_attachment_handler),
+        )
         .route("/sessions/{id}/attach", get(attach_handler))
-        .route("/sessions/{id}", delete(delete_handler))
+        .route(
+            "/sessions/{id}",
+            patch(update_session_handler).delete(delete_handler),
+        )
         .with_state(state)
 }
 
@@ -292,6 +303,17 @@ struct SendBody {
     keys: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AttachmentQuery {
+    filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkdirQuery {
+    q: Option<String>,
+    limit: Option<usize>,
+}
+
 // --- handlers -----------------------------------------------------------------
 
 async fn healthz(State(state): State<Arc<ServeState>>) -> Response {
@@ -397,6 +419,115 @@ async fn send_handler(
     };
     match tokio::task::spawn_blocking(move || crate::send_to_session(&context, args)).await {
         Ok(Ok(sent)) => envelope_ok(json!({ "machine": state.machine, "sent": sent })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn update_session_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let Some(object) = body.as_object() else {
+        return envelope_err(CliError::usage(
+            "invalid-session-update",
+            "session update body must be a JSON object",
+            None,
+        ));
+    };
+    let title = match object.get("title") {
+        Some(Value::String(title)) => Some(title.clone()),
+        Some(Value::Null) => None,
+        Some(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-title",
+                "session title must be a string or null",
+                Some(json!({ "field": "title" })),
+            ));
+        }
+        None => {
+            return envelope_err(CliError::usage(
+                "missing-title",
+                "session update requires a title field",
+                Some(json!({ "field": "title" })),
+            ));
+        }
+    };
+    let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
+    match tokio::task::spawn_blocking(move || update_session_title(&context, &id, title, &tmux))
+        .await
+    {
+        Ok(Ok(session)) => envelope_ok(json!({ "machine": state.machine, "session": session })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn upload_attachment_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    Query(query): Query<AttachmentQuery>,
+    body: Body,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = match to_bytes(body, MAX_ATTACHMENT_BYTES + 1).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return status_json(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "attachment-too-large",
+                "attachment exceeds the maximum allowed size",
+            );
+        }
+    };
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return status_json(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "attachment-too-large",
+            "attachment exceeds the maximum allowed size",
+        );
+    }
+    let context = state.context.clone();
+    let filename = query.filename.clone();
+    let bytes = bytes.to_vec();
+    match tokio::task::spawn_blocking(move || {
+        write_session_attachment(&context, &id, filename.as_deref(), content_type, &bytes)
+    })
+    .await
+    {
+        Ok(Ok(attachment)) => {
+            envelope_ok(json!({ "machine": state.machine, "attachment": attachment }))
+        }
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn workdirs_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    Query(query): Query<WorkdirQuery>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let q = query.q.clone();
+    let limit = query.limit;
+    match tokio::task::spawn_blocking(move || search_workdirs(q.as_deref(), limit)).await {
+        Ok(Ok(workdirs)) => envelope_ok(json!({ "machine": state.machine, "workdirs": workdirs })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
@@ -670,7 +801,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use std::os::unix::fs::PermissionsExt;
+    use nils_test_support::{EnvGuard, GlobalStateLock};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use tower::ServiceExt;
 
     const MACHINE: &str = "test-machine";
@@ -735,6 +867,14 @@ mod tests {
             .unwrap()
     }
 
+    fn get_auth(uri: &str, token: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
     fn auth_headers(token: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(token) = token {
@@ -754,6 +894,30 @@ mod tests {
         builder
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
+    }
+
+    fn patch_json(uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn post_bytes(uri: &str, token: Option<&str>, body: &[u8]) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/octet-stream");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_vec())).unwrap()
     }
 
     #[tokio::test]
@@ -906,6 +1070,282 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid-key");
+    }
+
+    #[tokio::test]
+    async fn update_session_title_persists_and_clears_custom_title() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "steer", "codex", "hs-codex-steer");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/steer",
+                Some(TOKEN),
+                json!({ "title": "Reviewed title" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+        assert_eq!(body["data"]["machine"], MACHINE);
+        assert_eq!(body["data"]["session"]["title"], "Reviewed title");
+
+        let record_path = tmp.path().join("sessions/steer/session.json");
+        let record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(record["title"], "Reviewed title");
+        assert_ne!(record["updated_at"], "2000-01-01T00:00:00Z");
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/steer", Some(TOKEN), json!({ "title": null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], Value::Null);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/steer", Some(TOKEN), json!({ "title": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], Value::Null);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/steer", Some(TOKEN), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "missing-title");
+
+        let too_long = "x".repeat(121);
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/steer", Some(TOKEN), json!({ "title": too_long })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "title-too-long");
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/ghost", Some(TOKEN), json!({ "title": "Ghost" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "session-not-found");
+    }
+
+    #[tokio::test]
+    async fn new_write_routes_require_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "steer", "codex", "hs-codex-steer");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/steer", None, json!({ "title": "Nope" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_bytes(
+                "/sessions/steer/attachments?filename=secret.png",
+                None,
+                b"bytes",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_writes_private_session_file_with_safe_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "steer", "codex", "hs-codex-steer");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let payload = b"not actually a png";
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_bytes(
+                "/sessions/steer/attachments?filename=..%2FScreen%20Shot.png",
+                Some(TOKEN),
+                payload,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+        let attachment = &body["data"]["attachment"];
+        assert_eq!(attachment["bytes"], payload.len());
+        assert_eq!(attachment["filename"], "Screen_Shot.png");
+        let path = PathBuf::from(attachment["path"].as_str().expect("attachment path"));
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        assert!(path.starts_with(tmp.path().join("sessions/steer/attachments")));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "attachment file must be private");
+
+        let (status, second) = call(
+            router(st.clone()),
+            post_bytes(
+                "/sessions/steer/attachments?filename=Screen%20Shot.png",
+                Some(TOKEN),
+                b"second payload",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={second}");
+        let second_path = PathBuf::from(second["data"]["attachment"]["path"].as_str().unwrap());
+        assert_ne!(second_path, path);
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"second payload");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_bytes(
+                "/sessions/ghost/attachments?filename=ghost.png",
+                Some(TOKEN),
+                b"ghost",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "session-not-found");
+
+        let before_oversize = std::fs::read_dir(tmp.path().join("sessions/steer/attachments"))
+            .unwrap()
+            .count();
+        let oversize = vec![0u8; MAX_ATTACHMENT_BYTES + 1];
+        let (status, body) = call(
+            router(st.clone()),
+            post_bytes(
+                "/sessions/steer/attachments?filename=oversize.bin",
+                Some(TOKEN),
+                &oversize,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"]["code"], "attachment-too-large");
+        let after_oversize = std::fs::read_dir(tmp.path().join("sessions/steer/attachments"))
+            .unwrap()
+            .count();
+        assert_eq!(after_oversize, before_oversize);
+    }
+
+    #[tokio::test]
+    async fn workdir_search_filters_default_project_and_config_roots() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let project_match = home.join("Project/sympoies/agent-console");
+        let second_match = home.join("Project/agent-tools");
+        let too_deep_match = home.join("Project/a/b/c/d/e/agent-deep");
+        let config_match = home.join(".config/zsh");
+        let outside = home.join("Downloads/agent-console-copy");
+        std::fs::create_dir_all(project_match.join(".git")).unwrap();
+        std::fs::create_dir_all(&second_match).unwrap();
+        std::fs::create_dir_all(&too_deep_match).unwrap();
+        std::fs::create_dir_all(&config_match).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
+
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (status, body) = call(router(st.clone()), get("/workdirs?q=agent&limit=20")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth("/workdirs?q=agent&limit=20", Some(TOKEN)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+        let workdirs = body["data"]["workdirs"].as_array().expect("workdirs array");
+        assert!(
+            workdirs
+                .iter()
+                .any(|item| item["path"] == project_match.to_string_lossy().as_ref()),
+            "Project match missing: {workdirs:?}"
+        );
+        assert!(
+            !workdirs
+                .iter()
+                .any(|item| item["path"] == outside.to_string_lossy().as_ref()),
+            "outside root must not be returned: {workdirs:?}"
+        );
+        assert!(
+            !workdirs
+                .iter()
+                .any(|item| item["path"] == too_deep_match.to_string_lossy().as_ref()),
+            "matches beyond max depth must not be returned: {workdirs:?}"
+        );
+
+        let (status, limited) = call(
+            router(st.clone()),
+            get_auth("/workdirs?q=agent&limit=1", Some(TOKEN)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={limited}");
+        assert_eq!(
+            limited["data"]["workdirs"]
+                .as_array()
+                .expect("workdirs")
+                .len(),
+            1
+        );
+
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth("/workdirs?q=zsh&limit=20", Some(TOKEN)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let workdirs = body["data"]["workdirs"].as_array().expect("workdirs array");
+        assert!(
+            workdirs
+                .iter()
+                .any(|item| item["path"] == config_match.to_string_lossy().as_ref()),
+            ".config match missing: {workdirs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workdir_search_rejects_symlink_roots() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(outside.join("agent-secret")).unwrap();
+        symlink(&outside, home.join("Project")).unwrap();
+        let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
+
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth("/workdirs?q=agent&limit=20", Some(TOKEN)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let workdirs = body["data"]["workdirs"].as_array().expect("workdirs array");
+        assert!(
+            workdirs.is_empty(),
+            "symlink roots must not expose outside directories: {workdirs:?}"
+        );
     }
 
     #[test]

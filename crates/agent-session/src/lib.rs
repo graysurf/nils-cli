@@ -2,14 +2,15 @@ mod cli;
 pub mod completion;
 mod serve;
 
+use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -351,6 +352,23 @@ struct GlanceResult {
     tail: String,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AttachmentResult {
+    id: String,
+    filename: String,
+    path: String,
+    bytes: usize,
+    content_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkdirResult {
+    path: String,
+    name: String,
+    root: String,
+    is_git_repo: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -889,6 +907,253 @@ fn strip_trailing_blank_lines(text: &str) -> String {
 fn touch_updated_at(context: &CliContext, record: &mut SessionRecord) -> Result<(), CliError> {
     record.updated_at = Zoned::now().timestamp().to_string();
     write_session_record(context, record)
+}
+
+fn update_session_title(
+    context: &CliContext,
+    id: &str,
+    title: Option<String>,
+    tmux_bin: &Path,
+) -> Result<SessionView, CliError> {
+    let mut record = load_session_record(context, id)?;
+    record.title = normalize_title(title)?;
+    touch_updated_at(context, &mut record)?;
+    let status = live_status(tmux_bin, &record.tmux_session);
+    Ok(session_view(context, &record, Some(status)))
+}
+
+fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
+    let Some(title) = title else {
+        return Ok(None);
+    };
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    if title.chars().count() > 120 {
+        return Err(CliError::usage(
+            "title-too-long",
+            "session title must be 120 characters or fewer",
+            Some(json!({ "max_chars": 120 })),
+        ));
+    }
+    Ok(Some(title))
+}
+
+fn write_session_attachment(
+    context: &CliContext,
+    id: &str,
+    filename: Option<&str>,
+    content_type: Option<String>,
+    bytes: &[u8],
+) -> Result<AttachmentResult, CliError> {
+    let record = load_session_record(context, id)?;
+    let filename = sanitize_attachment_filename(filename.unwrap_or("attachment.bin"));
+    let dir = session_dir(context, &record.id).join("attachments");
+    ensure_private_dir(&dir)?;
+    let path = write_unique_attachment_file(&dir, &filename, bytes)?;
+    Ok(AttachmentResult {
+        id: record.id,
+        filename,
+        path: display_path(&path),
+        bytes: bytes.len(),
+        content_type,
+    })
+}
+
+fn sanitize_attachment_filename(raw: &str) -> String {
+    let leaf = Path::new(raw)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment.bin");
+    let mut safe = leaf
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    safe = safe
+        .trim_matches(|ch| matches!(ch, '.' | '-' | '_'))
+        .to_string();
+    if safe.is_empty() {
+        safe = "attachment.bin".to_string();
+    }
+    if safe.len() > 120 {
+        safe.truncate(120);
+    }
+    safe
+}
+
+fn attachment_candidate_path(dir: &Path, filename: &str, attempt: usize) -> PathBuf {
+    let stamp = Zoned::now().strftime("%Y%m%d-%H%M%S").to_string();
+    if attempt == 0 {
+        dir.join(format!("{stamp}-{filename}"))
+    } else {
+        dir.join(format!("{stamp}-{attempt}-{filename}"))
+    }
+}
+
+fn write_unique_attachment_file(
+    dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, CliError> {
+    for attempt in 0..1000 {
+        let path = attachment_candidate_path(dir, filename, attempt);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(SECRET_FILE_MODE);
+        }
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(CliError::runtime(
+                    "file-write-failed",
+                    format!("failed to write {}: {err}", path.display()),
+                    Some(json!({ "path": display_path(&path) })),
+                ));
+            }
+        };
+        if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            let _ = fs::remove_file(&path);
+            return Err(CliError::runtime(
+                "file-write-failed",
+                format!("failed to write {}: {err}", path.display()),
+                Some(json!({ "path": display_path(&path) })),
+            ));
+        }
+        return Ok(path);
+    }
+    Err(CliError::runtime(
+        "attachment-name-exhausted",
+        "failed to allocate a unique attachment filename",
+        Some(json!({ "filename": filename })),
+    ))
+}
+
+const WORKDIR_SEARCH_MAX_DEPTH: usize = 4;
+const WORKDIR_SEARCH_MAX_VISITED: usize = 5000;
+const WORKDIR_SEARCH_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn search_workdirs(
+    query: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<WorkdirResult>, CliError> {
+    let Some(home) = home_dir() else {
+        return Ok(Vec::new());
+    };
+    let roots = [home.join("Project"), home.join(".config")];
+    search_workdirs_in_roots(
+        &roots,
+        query.unwrap_or_default(),
+        limit.unwrap_or(30).clamp(1, 100),
+    )
+}
+
+fn search_workdirs_in_roots(
+    roots: &[PathBuf],
+    query: &str,
+    limit: usize,
+) -> Result<Vec<WorkdirResult>, CliError> {
+    #[derive(Debug)]
+    struct Candidate {
+        result: WorkdirResult,
+        depth: usize,
+    }
+
+    let query = query.trim().to_ascii_lowercase();
+    let started = Instant::now();
+    let mut visited = 0usize;
+    let mut matches = Vec::new();
+
+    for root in roots {
+        if started.elapsed() >= WORKDIR_SEARCH_TIMEOUT || visited >= WORKDIR_SEARCH_MAX_VISITED {
+            break;
+        }
+        let Ok(root_meta) = fs::symlink_metadata(root) else {
+            continue;
+        };
+        if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+            continue;
+        }
+        let Ok(canonical_root) = fs::canonicalize(root) else {
+            continue;
+        };
+        let root_display = display_path(root);
+        let mut queue = VecDeque::from([(root.clone(), 0usize)]);
+        while let Some((path, depth)) = queue.pop_front() {
+            if started.elapsed() >= WORKDIR_SEARCH_TIMEOUT || visited >= WORKDIR_SEARCH_MAX_VISITED
+            {
+                break;
+            }
+            let Ok(canonical_path) = fs::canonicalize(&path) else {
+                continue;
+            };
+            if !canonical_path.starts_with(&canonical_root) {
+                continue;
+            }
+            visited += 1;
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if depth > 0 && workdir_matches(&path, &name, &query) {
+                matches.push(Candidate {
+                    depth,
+                    result: WorkdirResult {
+                        path: display_path(&path),
+                        name,
+                        root: root_display.clone(),
+                        is_git_repo: path.join(".git").exists(),
+                    },
+                });
+            }
+            if depth >= WORKDIR_SEARCH_MAX_DEPTH {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    queue.push_back((entry.path(), depth + 1));
+                }
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| {
+        b.result
+            .is_git_repo
+            .cmp(&a.result.is_git_repo)
+            .then_with(|| a.depth.cmp(&b.depth))
+            .then_with(|| a.result.path.cmp(&b.result.path))
+    });
+    matches.truncate(limit);
+    Ok(matches
+        .into_iter()
+        .map(|candidate| candidate.result)
+        .collect())
+}
+
+fn workdir_matches(path: &Path, name: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    name.to_ascii_lowercase().contains(query)
+        || path.to_string_lossy().to_ascii_lowercase().contains(query)
 }
 
 fn list_sessions(
@@ -1539,6 +1804,29 @@ fn private_dir(path: &Path) -> Result<(), CliError> {
             ));
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = fs::Permissions::from_mode(0o700);
+        fs::set_permissions(path, permissions).map_err(|err| {
+            CliError::runtime(
+                "directory-permissions-failed",
+                format!("failed to set permissions on {}: {err}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), CliError> {
+    fs::create_dir_all(path).map_err(|err| {
+        CliError::runtime(
+            "directory-create-failed",
+            format!("failed to create {}: {err}", path.display()),
+            Some(json!({ "path": display_path(path) })),
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
