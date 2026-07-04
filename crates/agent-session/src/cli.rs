@@ -45,6 +45,8 @@ pub enum Command {
     Send(SendArgs),
     /// Capture the recent pane tail plus live status as a dashboard glance.
     Glance(GlanceArgs),
+    /// Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback.
+    Serve(ServeArgs),
     /// Delete session state and kill the tmux session if it is still alive.
     Delete(DeleteArgs),
     /// Print shell completion script.
@@ -245,6 +247,29 @@ pub struct GlanceArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Address to bind. Defaults to loopback; binding a non-loopback address is
+    /// a remote-shell exposure and is warned about.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8781")]
+    pub bind: String,
+
+    /// Bearer token required on write and attach endpoints. Falls back to
+    /// AGENT_SESSION_TOKEN. When unset, writes and attach are disabled (reads
+    /// still work on loopback).
+    #[arg(long, value_name = "TOKEN")]
+    pub token: Option<String>,
+
+    /// Machine identity reported in responses. Falls back to
+    /// AGENT_SESSION_MACHINE, then --host, then the short hostname.
+    #[arg(long, value_name = "NAME")]
+    pub machine: Option<String>,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 pub struct DeleteArgs {
     /// Session id.
     #[arg(value_name = "ID")]
@@ -282,6 +307,17 @@ impl AgentKind {
             Self::Hermes => "hermes",
         }
     }
+
+    /// Parse an agent name (as accepted by `--agent` / emitted by `as_str`).
+    /// Used by the serve create endpoint to map a JSON `agent` field.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            "hermes" => Some(Self::Hermes),
+            _ => None,
+        }
+    }
 }
 
 /// Named special keys accepted by `send`, mapped to tmux `send-keys` names.
@@ -311,6 +347,22 @@ impl SpecialKey {
             Self::Left => "left",
             Self::Right => "right",
             Self::Tab => "tab",
+        }
+    }
+
+    /// Parse a canonical key name (as accepted by `--key` / emitted by `as_str`).
+    /// Used by the serve WebSocket protocol to map client key names to keys.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "enter" => Some(Self::Enter),
+            "escape" => Some(Self::Escape),
+            "c-c" => Some(Self::CtrlC),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "tab" => Some(Self::Tab),
+            _ => None,
         }
     }
 

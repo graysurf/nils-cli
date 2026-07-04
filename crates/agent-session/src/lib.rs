@@ -1,5 +1,6 @@
 mod cli;
 pub mod completion;
+mod serve;
 
 use std::env;
 use std::ffi::OsString;
@@ -94,6 +95,7 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Logs(args) => run_logs(&context, args),
         Command::Send(args) => run_send(&context, args),
         Command::Glance(args) => run_glance(&context, args),
+        Command::Serve(args) => serve::run_serve(&context, args),
         Command::Delete(args) => run_delete(&context, args),
         Command::Completion(_) => unreachable!("completion is handled before context resolution"),
     }
@@ -109,7 +111,7 @@ fn command_format(command: &Command) -> OutputFormat {
         Command::Send(args) => args.format,
         Command::Glance(args) => args.format,
         Command::Delete(args) => args.format,
-        Command::Attach(_) | Command::Completion(_) => OutputFormat::Text,
+        Command::Attach(_) | Command::Serve(_) | Command::Completion(_) => OutputFormat::Text,
     }
 }
 
@@ -859,13 +861,25 @@ fn capture_pane_tail(
     tmux_bin: &Path,
 ) -> Result<String, CliError> {
     match run_capture_pane(record, tail, tmux_bin)? {
-        Some(text) => Ok(tail_lines(&text, tail)),
+        Some(text) => Ok(tail_lines(&strip_trailing_blank_lines(&text), tail)),
         None => Err(CliError::runtime(
             "tmux-capture-failed",
             "tmux capture-pane failed",
             Some(json!({ "tmux_session": record.tmux_session })),
         )),
     }
+}
+
+/// `capture-pane` pads its output to the full pane height with blank lines, so a
+/// short, top-anchored pane ends with many empties. Drop the trailing blank
+/// lines before taking the tail, or `glance` would show the empty bottom of the
+/// pane instead of the actual recent content.
+fn strip_trailing_blank_lines(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 /// Bump `updated_at` to now so `list` can order by real control-plane activity.

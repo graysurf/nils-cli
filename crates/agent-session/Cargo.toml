@@ -24,8 +24,14 @@ nils-common = { version = "1.20.8", path = "../nils-common", package = "nils-com
 serde = { workspace = true }
 serde_json = { workspace = true }
 shell-words = { workspace = true }
+# `serve` daemon (control plane + WebSocket PTY attach).
+tokio = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 nils-test-support = { version = "1.20.8", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
+# `tower::ServiceExt::oneshot` drives the serve Router in tests without binding a socket.
+tower = { version = "0.5", features = ["util"] }

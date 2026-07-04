@@ -88,6 +88,13 @@ toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 indicatif = "0.18"
+# Async HTTP + WebSocket server stack for `agent-session serve` — the first
+# server in the workspace. axum 0.8 unifies on the hyper 1.x / tower 0.5 /
+# tokio 1.x already resolved transitively via reqwest's blocking client. The
+# `serve` subcommand builds its own runtime; the rest of the workspace stays sync.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "sync", "time", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
 
 [profile.dev]
 # Faster dev/test link times: drop full DWARF (keep line tables so backtraces

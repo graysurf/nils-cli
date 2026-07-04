@@ -22,6 +22,7 @@ agent-session list
 agent-session glance <id> --tail 40
 agent-session send <id> --text yes --key enter
 agent-session send <id> --key c-c
+agent-session serve --bind 127.0.0.1:8781 --token "$AGENT_SESSION_TOKEN"
 agent-session command <id>
 agent-session attach <id>
 agent-session logs <id>
@@ -33,6 +34,24 @@ agent-session delete <id>
 `glance` returns the recent pane tail plus live status as a JSON contract for dashboard tiles (cheaper than a full attach).
 `send` bumps `updated_at`, so `list` orders by real control-plane activity. `--agent hermes` launches `hermes chat`
 interactively (one-shot `run` mode is codex/claude only).
+
+## Serve daemon
+
+`agent-session serve` exposes the session control plane over loopback HTTP for a per-machine edge (e.g. the agent-console
+web console). It builds its own tokio runtime and reuses the synchronous lifecycle functions via `spawn_blocking`, so there
+is no second state model.
+
+- `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback.
+- `POST /sessions` (create), `POST /sessions/{id}/send`, `DELETE /sessions/{id}` — writes, require a bearer token.
+- `GET /sessions/{id}/attach` — a WebSocket PTY attach: a `capture-pane` snapshot then a live `tmux pipe-pane` byte
+  stream (binary frames, renderable by xterm.js); the client sends JSON control frames
+  `{ "text": "...", "key": "enter", "keys": ["c-c"], "resize": { "cols": 80, "rows": 24 } }`. Token-gated; disconnect
+  leaves the tmux session alive.
+
+Every response carries a `machine` identity (`--machine` / `AGENT_SESSION_MACHINE` / `--host` / hostname) so an edge can
+aggregate several machines. Auth is a bearer token (`--token` / `AGENT_SESSION_TOKEN`) on all write and attach endpoints;
+when no token is configured those endpoints fail closed (503). Bind defaults to loopback — this is a remote-shell surface,
+so keep it tailnet-only (front it with `tailscale serve`, no funnel) and never bind a public address.
 
 ## Output contract
 

@@ -143,6 +143,18 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':id -- Session id:_default' \
 && ret=0
 ;;
+(serve)
+_arguments "${_arguments_options[@]}" : \
+'--bind=[Address to bind. Defaults to loopback; binding a non-loopback address is a remote-shell exposure and is warned about]:ADDR:_default' \
+'--token=[Bearer token required on write and attach endpoints. Falls back to AGENT_SESSION_TOKEN. When unset, writes and attach are disabled (reads still work on loopback)]:TOKEN:_default' \
+'--machine=[Machine identity reported in responses. Falls back to AGENT_SESSION_MACHINE, then --host, then the short hostname]:NAME:_default' \
+'--tmux-bin=[tmux binary override]:PATH:_files' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (delete)
 _arguments "${_arguments_options[@]}" : \
 '--tmux-bin=[tmux binary override]:PATH:_files' \
@@ -180,6 +192,7 @@ _agent-session_commands() {
 'logs:Print captured tmux pane output or a one-shot run log' \
 'send:Send input (literal text and/or special keys) to a live session' \
 'glance:Capture the recent pane tail plus live status as a dashboard glance' \
+'serve:Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback' \
 'delete:Delete session state and kill the tmux session if it is still alive' \
 'completion:Print shell completion script' \
     )
@@ -229,6 +242,11 @@ _agent-session__subcmd__run_commands() {
 _agent-session__subcmd__send_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session send commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__serve_commands] )) ||
+_agent-session__subcmd__serve_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session serve commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__start_commands] )) ||
 _agent-session__subcmd__start_commands() {

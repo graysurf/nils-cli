@@ -1379,3 +1379,46 @@ fn glance_truncates_to_tail_and_leaves_updated_at() {
         "glance must not bump updated_at"
     );
 }
+
+#[test]
+fn glance_strips_trailing_blank_pane_padding() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    write_session_record(&state_dir, "look", "codex", "hs-codex-look");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    // capture-pane pads a short, top-anchored pane to the full height with blank
+    // lines; glance must show the real content, not the empty bottom rows.
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "glance",
+            "look",
+            "--tail",
+            "10",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            (
+                "AGENT_SESSION_FAKE_TMUX_CAPTURE",
+                "top-line\nsecond-line\n\n\n\n\n\n",
+            ),
+        ],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let tail = data(&output.stdout_json())["tail"]
+        .as_str()
+        .expect("tail")
+        .to_string();
+    assert_eq!(tail, "top-line\nsecond-line\n", "tail={tail:?}");
+}
