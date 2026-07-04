@@ -41,8 +41,14 @@ interactively (one-shot `run` mode is codex/claude only).
 web console). It builds its own tokio runtime and reuses the synchronous lifecycle functions via `spawn_blocking`, so there
 is no second state model.
 
-- `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback.
-- `POST /sessions` (create), `POST /sessions/{id}/send`, `DELETE /sessions/{id}` — writes, require a bearer token.
+- `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N`, `GET /workdirs?q=...&limit=N` — reads, open on
+  loopback. `workdirs` searches only the default operator roots (`$HOME/Project` and `$HOME/.config`) with bounded depth,
+  count, and elapsed-time limits.
+- `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
+  `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
+- Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
+  session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
+  Empty or null titles clear the custom session title so clients can fall back to the session id.
 - `GET /sessions/{id}/attach` — a WebSocket PTY attach: a `capture-pane` snapshot then a live `tmux pipe-pane` byte
   stream (binary frames, renderable by xterm.js); the client sends JSON control frames
   `{ "text": "...", "key": "enter", "keys": ["c-c"], "resize": { "cols": 80, "rows": 24 } }`. Token-gated; disconnect
