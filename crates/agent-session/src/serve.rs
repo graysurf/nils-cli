@@ -502,10 +502,20 @@ async fn attach_socket(
     let tail_task = enabled.then(|| tokio::spawn(tail_pipe(pipe_file.clone(), sender)));
 
     // Client -> pane: JSON control frames { text?, key?, keys?, resize{cols,rows} }.
+    // The first resize after attach forces a full-frame repaint (see resize_pane).
+    let mut initial_repaint_pending = true;
     while let Some(Ok(message)) = receiver.next().await {
         match message {
             Message::Text(text) => {
-                handle_input(&context, &tmux, &record, &target, text.as_str()).await;
+                handle_input(
+                    &context,
+                    &tmux,
+                    &record,
+                    &target,
+                    text.as_str(),
+                    &mut initial_repaint_pending,
+                )
+                .await;
             }
             Message::Close(_) => break,
             _ => {}
@@ -557,12 +567,54 @@ async fn tail_pipe(path: PathBuf, mut sender: SplitSink<WebSocket, Message>) {
     }
 }
 
+/// After a fresh (re)attach the client rebuilds its terminal emulator from
+/// scratch and sends its real size as the first resize frame. A `resize-window`
+/// to dimensions the tmux pane already has is a no-op — no SIGWINCH — so a
+/// full-screen agent (codex/claude/hermes) never repaints, and the client is
+/// left rendering the stale pre-attach snapshot mis-wrapped against its new
+/// grid. Force exactly one guaranteed size change on that first resize so the
+/// agent redraws its whole frame into the fresh grid. The short pause lets the
+/// agent observe the intermediate size, so the two changes are not coalesced
+/// into "no net change" (which would skip the redraw).
+const INITIAL_REPAINT_NUDGE_DELAY: Duration = Duration::from_millis(150);
+
+/// Apply a client resize to the pane. On the first resize after attach
+/// (`force_repaint`), nudge to an off-by-one height first so the final resize to
+/// `rows` is always a real change that repaints the agent's frame; afterwards a
+/// single `resize-window` is issued so ordinary mid-session resizes don't flicker.
+async fn resize_pane(tmux: &Path, target: &str, cols: u64, rows: u64, force_repaint: bool) {
+    if force_repaint {
+        let nudge_rows = if rows > 1 { rows - 1 } else { rows + 1 };
+        run_resize_window(tmux, target, cols, nudge_rows).await;
+        tokio::time::sleep(INITIAL_REPAINT_NUDGE_DELAY).await;
+    }
+    run_resize_window(tmux, target, cols, rows).await;
+}
+
+async fn run_resize_window(tmux: &Path, target: &str, cols: u64, rows: u64) {
+    let tmux = tmux.to_path_buf();
+    let target = target.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        ProcessCommand::new(&tmux)
+            .arg("resize-window")
+            .arg("-t")
+            .arg(&target)
+            .arg("-x")
+            .arg(cols.to_string())
+            .arg("-y")
+            .arg(rows.to_string())
+            .status()
+    })
+    .await;
+}
+
 async fn handle_input(
     context: &CliContext,
     tmux: &Path,
     record: &crate::SessionRecord,
     target: &str,
     frame: &str,
+    initial_repaint_pending: &mut bool,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(frame) else {
         return;
@@ -572,20 +624,8 @@ async fn handle_input(
         let cols = resize.get("cols").and_then(Value::as_u64);
         let rows = resize.get("rows").and_then(Value::as_u64);
         if let (Some(cols), Some(rows)) = (cols, rows) {
-            let tmux = tmux.to_path_buf();
-            let target = target.to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                ProcessCommand::new(&tmux)
-                    .arg("resize-window")
-                    .arg("-t")
-                    .arg(&target)
-                    .arg("-x")
-                    .arg(cols.to_string())
-                    .arg("-y")
-                    .arg(rows.to_string())
-                    .status()
-            })
-            .await;
+            let force_repaint = std::mem::take(initial_repaint_pending);
+            resize_pane(tmux, target, cols, rows, force_repaint).await;
         }
         return;
     }
@@ -935,27 +975,113 @@ mod tests {
         let target = "hs-codex-look:0.0";
 
         // Malformed JSON and an empty object must not touch tmux.
-        handle_input(&ctx, &tmux, &record, target, "{ not json").await;
-        handle_input(&ctx, &tmux, &record, target, "{}").await;
+        let mut pending = false;
+        handle_input(&ctx, &tmux, &record, target, "{ not json", &mut pending).await;
+        handle_input(&ctx, &tmux, &record, target, "{}", &mut pending).await;
         let after_noops = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
             after_noops.trim().is_empty(),
             "malformed/empty frames must not call tmux: {after_noops:?}"
         );
 
-        // A resize frame maps to `tmux resize-window -x <cols> -y <rows>`.
+        // A non-initial resize frame maps to a single `tmux resize-window
+        // -x <cols> -y <rows>` (no repaint nudge once the flag is spent).
         handle_input(
             &ctx,
             &tmux,
             &record,
             target,
             r#"{"resize":{"cols":123,"rows":45}}"#,
+            &mut pending,
         )
         .await;
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let resizes: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.contains("resize-window"))
+            .collect();
+        assert_eq!(
+            resizes.len(),
+            1,
+            "a non-initial resize must issue exactly one resize-window: {calls:?}"
+        );
         assert!(
-            calls.contains("resize-window") && calls.contains("123") && calls.contains("45"),
-            "resize frame must invoke resize-window: {calls:?}"
+            resizes[0].contains("123") && resizes[0].contains("45"),
+            "resize frame must invoke resize-window with the requested size: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_resize_forces_a_repaint_nudge_then_plain_resizes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("calls.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let ctx = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = test_record("look", "hs-codex-look");
+        let target = "hs-codex-look:0.0";
+
+        // First resize after attach: nudge to rows-1, then the real rows, so the
+        // agent is guaranteed a SIGWINCH and repaints its whole frame into the
+        // freshly rebuilt client grid (fixes stale layout on re-entry).
+        let mut pending = true;
+        handle_input(
+            &ctx,
+            &tmux,
+            &record,
+            target,
+            r#"{"resize":{"cols":80,"rows":24}}"#,
+            &mut pending,
+        )
+        .await;
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let resizes: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.contains("resize-window"))
+            .collect();
+        assert_eq!(
+            resizes.len(),
+            2,
+            "the first resize must nudge then set the real size: {calls:?}"
+        );
+        assert!(
+            resizes[0].contains("-y 23"),
+            "nudge step must use rows-1: {:?}",
+            resizes[0]
+        );
+        assert!(
+            resizes[1].contains("-y 24"),
+            "final step must use the requested rows: {:?}",
+            resizes[1]
+        );
+        assert!(
+            !pending,
+            "the initial-repaint flag must be consumed after the first resize"
+        );
+
+        // Subsequent resizes are a single plain resize-window (no flicker).
+        std::fs::write(&log, "").unwrap();
+        handle_input(
+            &ctx,
+            &tmux,
+            &record,
+            target,
+            r#"{"resize":{"cols":100,"rows":40}}"#,
+            &mut pending,
+        )
+        .await;
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let resizes: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.contains("resize-window"))
+            .collect();
+        assert_eq!(resizes.len(), 1, "later resizes must not nudge: {calls:?}");
+        assert!(
+            resizes[0].contains("-y 40"),
+            "later resize must use the requested rows: {:?}",
+            resizes[0]
         );
     }
 
