@@ -143,6 +143,18 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':id -- Session id:_default' \
 && ret=0
 ;;
+(resume)
+_arguments "${_arguments_options[@]}" : \
+'--tmux-bin=[tmux binary override]:PATH:_files' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Session id:_default' \
+&& ret=0
+;;
 (serve)
 _arguments "${_arguments_options[@]}" : \
 '--bind=[Address to bind. Defaults to loopback; a non-loopback address is refused unless --allow-non-loopback is passed (it exposes a remote shell)]:ADDR:_default' \
@@ -193,6 +205,7 @@ _agent-session_commands() {
 'logs:Print captured tmux pane output or a one-shot run log' \
 'send:Send input (literal text and/or special keys) to a live session' \
 'glance:Capture the recent pane tail plus live status as a dashboard glance' \
+'resume:Recreate a missing tmux runtime from exact provider resume metadata' \
 'serve:Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback' \
 'delete:Delete session state and kill the tmux session if it is still alive' \
 'completion:Print shell completion script' \
@@ -233,6 +246,11 @@ _agent-session__subcmd__list_commands() {
 _agent-session__subcmd__logs_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session logs commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__resume_commands] )) ||
+_agent-session__subcmd__resume_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session resume commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__run_commands] )) ||
 _agent-session__subcmd__run_commands() {

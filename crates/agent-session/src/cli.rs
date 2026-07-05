@@ -17,7 +17,7 @@ pub const DEFAULT_GLANCE_TAIL: usize = 40;
     about = "Start and manage tmux-backed Codex, Claude Code, and Hermes sessions.",
     long_about = "Start and manage tmux-backed Codex, Claude Code, and Hermes sessions for mobile handoff workflows.",
     disable_help_subcommand = true,
-    after_help = "EXAMPLES:\n  agent-session start --agent codex --cwd ~/Project/app --prompt-file prompt.md\n  agent-session start --agent hermes --cwd ~\n  agent-session list\n  agent-session glance <id> --tail 40\n  agent-session send <id> --text yes --key enter\n  agent-session send <id> --key c-c\n  agent-session command <id>\n  agent-session attach <id>\n  agent-session delete <id>\n\nENVIRONMENT:\n  AGENT_SESSION_HOST       Hostname used in generated ssh attach commands.\n  AGENT_SESSION_STATE_DIR  Default state directory override.\n  AGENT_SESSION_TMUX_BIN   tmux binary override.\n  AGENT_SESSION_CODEX_BIN  codex binary override.\n  AGENT_SESSION_CLAUDE_BIN claude binary override.\n  AGENT_SESSION_HERMES_BIN hermes binary override.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error"
+    after_help = "EXAMPLES:\n  agent-session start --agent codex --cwd ~/Project/app --prompt-file prompt.md\n  agent-session start --agent hermes --cwd ~\n  agent-session list\n  agent-session glance <id> --tail 40\n  agent-session send <id> --text yes --key enter\n  agent-session send <id> --key c-c\n  agent-session resume <id>\n  agent-session command <id>\n  agent-session attach <id>\n  agent-session delete <id>\n\nENVIRONMENT:\n  AGENT_SESSION_HOST       Hostname used in generated ssh attach commands.\n  AGENT_SESSION_STATE_DIR  Default state directory override.\n  AGENT_SESSION_TMUX_BIN   tmux binary override.\n  AGENT_SESSION_CODEX_BIN  codex binary override.\n  AGENT_SESSION_CLAUDE_BIN claude binary override.\n  AGENT_SESSION_HERMES_BIN hermes binary override.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error"
 )]
 pub struct Cli {
     /// State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session.
@@ -51,6 +51,8 @@ pub enum Command {
     Send(SendArgs),
     /// Capture the recent pane tail plus live status as a dashboard glance.
     Glance(GlanceArgs),
+    /// Recreate a missing tmux runtime from exact provider resume metadata.
+    Resume(ResumeArgs),
     /// Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback.
     Serve(ServeArgs),
     /// Delete session state and kill the tmux session if it is still alive.
@@ -242,6 +244,21 @@ pub struct GlanceArgs {
     /// Number of pane lines to capture for the glance tail.
     #[arg(long, default_value_t = DEFAULT_GLANCE_TAIL)]
     pub tail: usize,
+
+    /// tmux binary override.
+    #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub tmux_bin: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ResumeArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: String,
 
     /// tmux binary override.
     #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]

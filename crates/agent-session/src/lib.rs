@@ -2,19 +2,19 @@ mod cli;
 pub mod completion;
 mod serve;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use clap::Parser;
 use clap::error::ErrorKind;
-use jiff::Zoned;
+use jiff::{Timestamp, Zoned};
 use nils_common::cli_contract::{
     Envelope, EnvelopeError, OutputFormat, emit_parse_error, exit, schema_version_for,
 };
@@ -27,6 +27,8 @@ use serde_json::{Value, json};
 use cli::{AgentKind, Cli, Command, SpecialKey};
 
 const SESSION_DOCUMENT_VERSION: &str = "agent-session.session.v1";
+const SESSION_RESUME_DOCUMENT_VERSION: &str = "agent-session.resume.v1";
+const SESSION_RESUME_FILE: &str = "resume.json";
 const BINARY: &str = "agent-session";
 const START_COMMAND: &str = "start";
 const RUN_COMMAND: &str = "run";
@@ -35,8 +37,16 @@ const COMMAND_COMMAND: &str = "command";
 const LOGS_COMMAND: &str = "logs";
 const SEND_COMMAND: &str = "send";
 const GLANCE_COMMAND: &str = "glance";
+const RESUME_COMMAND: &str = "resume";
 const DELETE_COMMAND: &str = "delete";
 const WORKDIR_USAGE_FILE: &str = "workdir-usage.json";
+const CODEX_RESUME_CAPTURE_TIMEOUT_MS: u64 = 1500;
+const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
+const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
+const CODEX_RESUME_SCAN_MAX_DEPTH: usize = 6;
+const CODEX_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
+const CODEX_RESUME_SCAN_SLICE_MS: u64 = 250;
+const CODEX_SESSION_META_MAX_LINE_BYTES: u64 = 64 * 1024;
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -97,6 +107,7 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Logs(args) => run_logs(&context, args),
         Command::Send(args) => run_send(&context, args),
         Command::Glance(args) => run_glance(&context, args),
+        Command::Resume(args) => run_resume(&context, args),
         Command::Serve(args) => serve::run_serve(&context, args),
         Command::Delete(args) => run_delete(&context, args),
         Command::Completion(_) => unreachable!("completion is handled before context resolution"),
@@ -112,6 +123,7 @@ fn command_format(command: &Command) -> OutputFormat {
         Command::Logs(args) => args.format,
         Command::Send(args) => args.format,
         Command::Glance(args) => args.format,
+        Command::Resume(args) => args.format,
         Command::Delete(args) => args.format,
         Command::Attach(_) | Command::Serve(_) | Command::Completion(_) => OutputFormat::Text,
     }
@@ -251,6 +263,14 @@ fn run_glance(context: &CliContext, args: cli::GlanceArgs) -> i32 {
     }
 }
 
+fn run_resume(context: &CliContext, args: cli::ResumeArgs) -> i32 {
+    let format = args.format;
+    match resume_session(context, args) {
+        Ok(result) => render_single_success(RESUME_COMMAND, format, &result, render_resumed_text),
+        Err(err) => render_error(RESUME_COMMAND, format, err),
+    }
+}
+
 fn run_delete(context: &CliContext, args: cli::DeleteArgs) -> i32 {
     match delete_session(
         context,
@@ -294,6 +314,54 @@ struct SessionRecord {
     log_file: Option<String>,
     created_at: String,
     updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_resume: Option<ProviderResume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<RuntimeInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agent_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_bin: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
+    #[serde(skip)]
+    resume_sidecar_extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ProviderResume {
+    provider: String,
+    session_id: String,
+    captured_at: String,
+    capture_method: String,
+    resume_args: Vec<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RuntimeInfo {
+    kind: String,
+    tmux_session: String,
+    generation: u64,
+    started_at: String,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DurableResumeRecord {
+    schema_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_resume: Option<ProviderResume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<RuntimeInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agent_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_bin: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -305,6 +373,8 @@ struct SessionView {
     cwd: String,
     tmux_session: String,
     status: String,
+    resumable: bool,
+    repo_name: Option<String>,
     attach_command: String,
     ssh_attach_command: Option<String>,
     prompt_file: Option<String>,
@@ -350,6 +420,8 @@ struct GlanceResult {
     title: Option<String>,
     tmux_session: String,
     status: String,
+    resumable: bool,
+    repo_name: Option<String>,
     tail: String,
     created_at: String,
     updated_at: String,
@@ -433,9 +505,14 @@ impl CliError {
 }
 
 fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView, CliError> {
+    validate_agent_args(args.agent, &args.agent_args)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let prompt = read_prompt(&args.prompt, args.prompt_file.as_deref(), args.prompt_stdin)?;
-    let created = create_record(RecordRequest {
+    let provider_plan = initial_provider_resume_plan(args.agent, &cwd);
+    let launch_started_at = SystemTime::now();
+    let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
+    let agent_bin = resolve_agent_bin(args.agent, args.agent_bin.as_deref());
+    let mut created = create_record(RecordRequest {
         context,
         agent: args.agent,
         mode: "interactive",
@@ -444,16 +521,18 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         cwd: &cwd,
         prompt: prompt.as_deref(),
         log_file_name: None,
+        provider_resume: provider_plan.provider_resume.clone(),
+        agent_args: args.agent_args.clone(),
+        agent_bin: Some(display_path(&agent_bin)),
     })?;
 
-    let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
-    let agent_bin = resolve_agent_bin(args.agent, args.agent_bin.as_deref());
     if let Err(err) = start_interactive_tmux(
         &tmux_bin,
         &agent_bin,
         args.agent,
         &created.record,
         args.title.as_deref(),
+        &provider_plan.launch_args,
         &args.agent_args,
     ) {
         cleanup_created_record(&created);
@@ -469,6 +548,13 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
             return Err(err);
         }
     }
+    if created.record.provider_resume.is_none()
+        && let Some(provider_resume) =
+            capture_provider_resume_after_launch(args.agent, &created.record, launch_started_at)
+    {
+        created.record.provider_resume = Some(provider_resume);
+        created.record = persist_or_reload_session_record(context, &created.record);
+    }
 
     let result = session_view(context, &created.record, Some("running".to_string()));
     record_workdir_usage(context, &cwd);
@@ -479,6 +565,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
 }
 
 fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartView, CliError> {
+    validate_agent_args(args.agent, &args.agent_args)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let prompt = read_prompt(&args.prompt, args.prompt_file.as_deref(), args.prompt_stdin)?;
     let prompt = prompt
@@ -500,6 +587,9 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         cwd: &cwd,
         prompt: Some(&prompt),
         log_file_name: log_file,
+        provider_resume: None,
+        agent_args: args.agent_args.clone(),
+        agent_bin: None,
     })?;
 
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
@@ -538,6 +628,9 @@ struct RecordRequest<'a> {
     cwd: &'a Path,
     prompt: Option<&'a str>,
     log_file_name: Option<&'a str>,
+    provider_resume: Option<ProviderResume>,
+    agent_args: Vec<String>,
+    agent_bin: Option<String>,
 }
 
 fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> {
@@ -572,11 +665,23 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         mode: request.mode.to_string(),
         title: request.title.map(str::to_string),
         cwd: display_path(request.cwd),
-        tmux_session,
+        tmux_session: tmux_session.clone(),
         prompt_file: prompt_file.as_ref().map(|path| display_path(path)),
         log_file: log_file.as_ref().map(|path| display_path(path)),
         created_at: iso.clone(),
         updated_at: iso,
+        provider_resume: request.provider_resume,
+        runtime: Some(RuntimeInfo {
+            kind: "tmux".to_string(),
+            tmux_session: tmux_session.clone(),
+            generation: 1,
+            started_at: now.timestamp().to_string(),
+            extra: BTreeMap::new(),
+        }),
+        agent_args: request.agent_args,
+        agent_bin: request.agent_bin,
+        extra: BTreeMap::new(),
+        resume_sidecar_extra: BTreeMap::new(),
     };
 
     write_session_record(request.context, &record)?;
@@ -591,12 +696,77 @@ fn cleanup_created_record(created: &CreatedRecord) {
     let _ = fs::remove_dir_all(&created.session_dir);
 }
 
+#[derive(Debug, Default)]
+struct InitialProviderPlan {
+    provider_resume: Option<ProviderResume>,
+    launch_args: Vec<String>,
+}
+
+fn initial_provider_resume_plan(agent: AgentKind, _cwd: &Path) -> InitialProviderPlan {
+    match agent {
+        AgentKind::Claude => {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            InitialProviderPlan {
+                provider_resume: Some(ProviderResume {
+                    provider: agent.as_str().to_string(),
+                    session_id: session_id.clone(),
+                    captured_at: Zoned::now().timestamp().to_string(),
+                    capture_method: "claude-explicit-session-id".to_string(),
+                    resume_args: vec!["--resume".to_string(), session_id.clone()],
+                    extra: BTreeMap::new(),
+                }),
+                launch_args: vec!["--session-id".to_string(), session_id],
+            }
+        }
+        AgentKind::Codex => InitialProviderPlan::default(),
+        AgentKind::Hermes => InitialProviderPlan::default(),
+    }
+}
+
+fn validate_agent_args(agent: AgentKind, args: &[String]) -> Result<(), CliError> {
+    if agent != AgentKind::Claude {
+        return Ok(());
+    }
+    for arg in args {
+        if let Some(flag) = reserved_claude_resume_arg(arg) {
+            return Err(CliError::usage(
+                "reserved-agent-arg",
+                format!(
+                    "{flag} is managed by agent-session for durable Claude resume; do not pass it via --agent-arg"
+                ),
+                Some(json!({ "agent": agent.as_str(), "flag": flag })),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reserved_claude_resume_arg(arg: &str) -> Option<&'static str> {
+    [
+        "--session-id",
+        "--resume",
+        "-r",
+        "--continue",
+        "-c",
+        "--fork-session",
+        "--from-pr",
+    ]
+    .into_iter()
+    .find(|flag| {
+        arg == *flag
+            || arg
+                .strip_prefix(*flag)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
 fn start_interactive_tmux(
     tmux_bin: &Path,
     agent_bin: &Path,
     agent: AgentKind,
     record: &SessionRecord,
     title: Option<&str>,
+    provider_launch_args: &[String],
     agent_args: &[String],
 ) -> Result<(), CliError> {
     let mut command = ProcessCommand::new(tmux_bin);
@@ -615,6 +785,7 @@ fn start_interactive_tmux(
             command.arg("--cd").arg(&record.cwd).arg("--no-alt-screen");
         }
         AgentKind::Claude => {
+            command.args(provider_launch_args);
             if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
                 command.arg("--name").arg(title);
             }
@@ -688,6 +859,262 @@ fn start_run_tmux(
         .arg("-lc")
         .arg(script);
     run_status(command, "tmux new-session")
+}
+
+fn capture_provider_resume_after_launch(
+    agent: AgentKind,
+    record: &SessionRecord,
+    launch_started_at: SystemTime,
+) -> Option<ProviderResume> {
+    match agent {
+        AgentKind::Codex => capture_codex_resume(record, launch_started_at),
+        AgentKind::Claude | AgentKind::Hermes => None,
+    }
+}
+
+#[derive(Debug)]
+struct CodexResumeCandidate {
+    session_id: String,
+}
+
+#[derive(Debug, PartialEq)]
+struct CodexSessionMeta {
+    session_id: String,
+    created_at: SystemTime,
+}
+
+fn capture_codex_resume(
+    record: &SessionRecord,
+    launch_started_at: SystemTime,
+) -> Option<ProviderResume> {
+    let root = codex_sessions_root()?;
+    let timeout = Duration::from_millis(env_u64(
+        "AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS",
+        CODEX_RESUME_CAPTURE_TIMEOUT_MS,
+    ));
+    let poll = Duration::from_millis(
+        env_u64(
+            "AGENT_SESSION_CODEX_CAPTURE_POLL_MS",
+            CODEX_RESUME_CAPTURE_POLL_MS,
+        )
+        .max(1),
+    );
+    let ambiguity_window = Duration::from_millis(env_u64(
+        "AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS",
+        CODEX_RESUME_AMBIGUITY_WINDOW_MS,
+    ));
+    let started = Instant::now();
+    let mut observed_singleton: Option<(String, Instant)> = None;
+
+    loop {
+        let mut candidates = Vec::new();
+        let mut budget = CodexResumeScanBudget::from_env();
+        collect_codex_resume_candidates(
+            &root,
+            0,
+            launch_started_at,
+            &record.cwd,
+            &mut candidates,
+            &mut budget,
+        );
+        if budget.truncated {
+            return None;
+        }
+
+        let candidate_ids: BTreeSet<String> = candidates
+            .into_iter()
+            .map(|candidate| candidate.session_id)
+            .collect();
+        match candidate_ids.len() {
+            1 => {
+                let candidate_id = candidate_ids.iter().next().expect("singleton candidate");
+                match &observed_singleton {
+                    Some((observed, first_seen_at)) if observed == candidate_id => {
+                        if codex_candidate_satisfied_ambiguity_window(
+                            *first_seen_at,
+                            ambiguity_window,
+                        ) {
+                            return Some(codex_provider_resume(record, candidate_id));
+                        }
+                    }
+                    Some(_) => return None,
+                    None => observed_singleton = Some((candidate_id.clone(), Instant::now())),
+                }
+            }
+            0 => {
+                if observed_singleton.is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        if timeout.is_zero() || started.elapsed() >= timeout {
+            return observed_singleton
+                .as_ref()
+                .filter(|(_, first_seen_at)| {
+                    codex_candidate_satisfied_ambiguity_window(*first_seen_at, ambiguity_window)
+                })
+                .map(|(session_id, _)| codex_provider_resume(record, session_id));
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(poll.min(remaining));
+    }
+}
+
+fn codex_candidate_satisfied_ambiguity_window(
+    first_seen_at: Instant,
+    ambiguity_window: Duration,
+) -> bool {
+    ambiguity_window.is_zero() || first_seen_at.elapsed() >= ambiguity_window
+}
+
+fn codex_provider_resume(record: &SessionRecord, session_id: &str) -> ProviderResume {
+    ProviderResume {
+        provider: "codex".to_string(),
+        session_id: session_id.to_string(),
+        captured_at: Zoned::now().timestamp().to_string(),
+        capture_method: "codex-session-meta".to_string(),
+        resume_args: canonical_provider_resume_args(AgentKind::Codex, &record.cwd, session_id)
+            .expect("codex resume args"),
+        extra: BTreeMap::new(),
+    }
+}
+
+fn codex_sessions_root() -> Option<PathBuf> {
+    if let Some(codex_home) = non_empty_env("CODEX_HOME") {
+        return Some(PathBuf::from(codex_home).join("sessions"));
+    }
+    home_dir().map(|home| home.join(".codex/sessions"))
+}
+
+#[derive(Debug)]
+struct CodexResumeScanBudget {
+    visited: usize,
+    max_entries: usize,
+    deadline: Instant,
+    truncated: bool,
+}
+
+impl CodexResumeScanBudget {
+    fn from_env() -> Self {
+        let max_entries = env_usize(
+            "AGENT_SESSION_CODEX_CAPTURE_MAX_ENTRIES",
+            CODEX_RESUME_SCAN_MAX_ENTRIES,
+        )
+        .max(1);
+        let slice = Duration::from_millis(env_u64(
+            "AGENT_SESSION_CODEX_SCAN_SLICE_MS",
+            CODEX_RESUME_SCAN_SLICE_MS,
+        ));
+        Self {
+            visited: 0,
+            max_entries,
+            deadline: Instant::now() + slice,
+            truncated: false,
+        }
+    }
+
+    fn visit_entry(&mut self) -> bool {
+        if self.visited >= self.max_entries || Instant::now() >= self.deadline {
+            self.truncated = true;
+            return false;
+        }
+        self.visited += 1;
+        true
+    }
+}
+
+fn collect_codex_resume_candidates(
+    dir: &Path,
+    depth: usize,
+    earliest: SystemTime,
+    cwd: &str,
+    candidates: &mut Vec<CodexResumeCandidate>,
+    budget: &mut CodexResumeScanBudget,
+) {
+    if depth > CODEX_RESUME_SCAN_MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !budget.visit_entry() {
+            return;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_codex_resume_candidates(&path, depth + 1, earliest, cwd, candidates, budget);
+            if budget.truncated {
+                return;
+            }
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let modified_at = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if modified_at < earliest {
+            continue;
+        }
+        if let Some(meta) = read_codex_session_meta(&path, cwd) {
+            if meta.created_at < earliest {
+                continue;
+            }
+            candidates.push(CodexResumeCandidate {
+                session_id: meta.session_id,
+            });
+        }
+    }
+}
+
+fn read_codex_session_meta(path: &Path, cwd: &str) -> Option<CodexSessionMeta> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = io::BufReader::new(file).take(CODEX_SESSION_META_MAX_LINE_BYTES + 1);
+    let mut first_line = Vec::new();
+    let read = reader.read_until(b'\n', &mut first_line).ok()?;
+    if read == 0 || first_line.len() as u64 > CODEX_SESSION_META_MAX_LINE_BYTES {
+        return None;
+    }
+    if first_line.last() == Some(&b'\n') {
+        first_line.pop();
+        if first_line.last() == Some(&b'\r') {
+            first_line.pop();
+        }
+    }
+    let first_line = std::str::from_utf8(&first_line).ok()?;
+    let value: Value = serde_json::from_str(first_line).ok()?;
+    if value.get("type").and_then(Value::as_str)? != "session_meta" {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("cwd").and_then(Value::as_str)? != cwd {
+        return None;
+    }
+    if payload.get("source").and_then(Value::as_str)? != "cli" {
+        return None;
+    }
+    let session_id = payload
+        .get("id")
+        .or_else(|| payload.get("session_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)?;
+    let timestamp = payload
+        .get("timestamp")
+        .or_else(|| value.get("timestamp"))
+        .and_then(Value::as_str)?;
+    let created_at: SystemTime = timestamp.parse::<Timestamp>().ok()?.into();
+    Some(CodexSessionMeta {
+        session_id,
+        created_at,
+    })
 }
 
 fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError> {
@@ -839,7 +1266,7 @@ fn read_send_text(text: &Option<String>, text_stdin: bool) -> Result<Option<Stri
 fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceResult, CliError> {
     let record = load_session_record(context, &args.id)?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
-    let status = live_status(&tmux_bin, &record.tmux_session);
+    let status = session_status(&tmux_bin, &record);
     let tail = if status == "running" {
         capture_pane_tail(&record, args.tail, &tmux_bin)?
     } else {
@@ -851,6 +1278,8 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         title: record.title.clone(),
         tmux_session: record.tmux_session.clone(),
         status,
+        resumable: is_resumable(&record),
+        repo_name: repo_name_from_cwd(&record.cwd),
         tail,
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
@@ -915,6 +1344,84 @@ fn strip_trailing_blank_lines(text: &str) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
+mod codex_resume_tests {
+    use super::*;
+
+    #[test]
+    fn codex_session_meta_reader_matches_only_cli_source_and_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_codex_session_meta(&path, "/repo").map(|meta| meta.session_id),
+            Some("codex-id".to_string())
+        );
+        assert_eq!(read_codex_session_meta(&path, "/other"), None);
+
+        fs::write(
+            &path,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}},"timestamp":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_codex_session_meta(&path, "/repo"), None);
+    }
+
+    #[test]
+    fn codex_session_meta_reader_rejects_oversized_first_line() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{{"id":"oversized-codex-id","session_id":"oversized-codex-id","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z","pad":"{}"}}}}"#,
+                "x".repeat(2 * 1024 * 1024)
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(read_codex_session_meta(&path, "/repo"), None);
+    }
+
+    #[test]
+    fn codex_resume_scan_truncates_large_stale_tree_by_entry_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..32 {
+            fs::write(
+                root.join(format!("stale-{index}.jsonl")),
+                r#"{"timestamp":"2000-01-01T00:00:00Z","type":"session_meta","payload":{"id":"old","cwd":"/repo","source":"cli","timestamp":"2000-01-01T00:00:00Z"}}"#,
+            )
+            .unwrap();
+        }
+
+        let mut candidates = Vec::new();
+        let mut budget = CodexResumeScanBudget {
+            visited: 0,
+            max_entries: 5,
+            deadline: Instant::now() + Duration::from_secs(60),
+            truncated: false,
+        };
+        collect_codex_resume_candidates(
+            &root,
+            0,
+            SystemTime::now(),
+            "/repo",
+            &mut candidates,
+            &mut budget,
+        );
+
+        assert_eq!(budget.visited, 5);
+        assert!(budget.truncated);
+        assert!(candidates.is_empty());
+    }
+}
+
 /// Bump `updated_at` to now so `list` can order by real control-plane activity.
 /// Applied on `send` (a steering action); intentionally not on `glance`, which
 /// is a high-frequency dashboard poll that would otherwise make `updated_at`
@@ -933,8 +1440,82 @@ fn update_session_title(
     let mut record = load_session_record(context, id)?;
     record.title = normalize_title(title)?;
     touch_updated_at(context, &mut record)?;
-    let status = live_status(tmux_bin, &record.tmux_session);
+    let status = session_status(tmux_bin, &record);
     Ok(session_view(context, &record, Some(status)))
+}
+
+fn resume_session(context: &CliContext, args: cli::ResumeArgs) -> Result<SessionView, CliError> {
+    let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
+    resume_session_by_id(context, &args.id, &tmux_bin)
+}
+
+fn resume_session_by_id(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: &Path,
+) -> Result<SessionView, CliError> {
+    let mut record = load_session_record(context, id)?;
+    match session_status(tmux_bin, &record).as_str() {
+        "running" => return Ok(session_view(context, &record, Some("running".to_string()))),
+        "unknown" => {
+            return Err(CliError::runtime(
+                "session-status-unknown",
+                format!("session status could not be checked: {}", record.id),
+                Some(json!({ "id": record.id })),
+            ));
+        }
+        _ => {}
+    }
+    let (provider_resume, agent) = validate_resume_metadata(&record)?;
+    let resume_args = provider_resume.resume_args.clone();
+    let agent_bin = record
+        .agent_bin
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve_agent_bin(agent, None));
+    start_resume_tmux(tmux_bin, &agent_bin, &record, &resume_args)?;
+
+    let now = Zoned::now();
+    let next_generation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.generation.saturating_add(1))
+        .unwrap_or(1);
+    record.runtime = Some(RuntimeInfo {
+        kind: "tmux".to_string(),
+        tmux_session: record.tmux_session.clone(),
+        generation: next_generation,
+        started_at: now.timestamp().to_string(),
+        extra: record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.extra.clone())
+            .unwrap_or_default(),
+    });
+    record.updated_at = now.timestamp().to_string();
+    record = persist_or_reload_session_record(context, &record);
+    Ok(session_view(context, &record, Some("running".to_string())))
+}
+
+fn start_resume_tmux(
+    tmux_bin: &Path,
+    agent_bin: &Path,
+    record: &SessionRecord,
+    resume_args: &[String],
+) -> Result<(), CliError> {
+    let mut command = ProcessCommand::new(tmux_bin);
+    command
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(&record.tmux_session)
+        .arg("-c")
+        .arg(&record.cwd)
+        .arg("--")
+        .arg(agent_bin)
+        .args(resume_args)
+        .args(&record.agent_args);
+    run_status(command, "tmux new-session")
 }
 
 fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
@@ -1277,7 +1858,7 @@ fn list_sessions(
                 )?;
                 let record = read_session_record(&resolved.record_path)?;
                 validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
-                let status = live_status(&tmux_bin, &record.tmux_session);
+                let status = session_status(&tmux_bin, &record);
                 records.push(session_view(context, &record, Some(status)));
             }
         }
@@ -1300,7 +1881,7 @@ fn load_session_view(
     let tmux_bin = tmux_bin
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_tmux_bin(None));
-    let status = live_status(&tmux_bin, &record.tmux_session);
+    let status = session_status(&tmux_bin, &record);
     Ok(session_view(context, &record, Some(status)))
 }
 
@@ -1436,7 +2017,7 @@ fn read_session_record(path: &Path) -> Result<SessionRecord, CliError> {
             Some(json!({ "path": display_path(path) })),
         )
     })?;
-    let record: SessionRecord = serde_json::from_str(&contents).map_err(|err| {
+    let mut record: SessionRecord = serde_json::from_str(&contents).map_err(|err| {
         CliError::data(
             "session-json-invalid",
             format!("failed to parse {}: {err}", path.display()),
@@ -1453,6 +2034,7 @@ fn read_session_record(path: &Path) -> Result<SessionRecord, CliError> {
             Some(json!({ "path": display_path(path), "schema_version": record.schema_version })),
         ));
     }
+    merge_resume_sidecar(path, &mut record)?;
     Ok(record)
 }
 
@@ -1487,7 +2069,119 @@ fn write_session_record(context: &CliContext, record: &SessionRecord) -> Result<
         )
     })?;
     let path = session_dir(context, &record.id).join("session.json");
+    write_resume_sidecar(context, record)?;
     write_private_file(&path, &bytes)
+}
+
+fn persist_or_reload_session_record(context: &CliContext, record: &SessionRecord) -> SessionRecord {
+    match write_session_record(context, record) {
+        Ok(()) => record.clone(),
+        Err(_) => load_session_record(context, &record.id).unwrap_or_else(|_| record.clone()),
+    }
+}
+
+fn merge_resume_sidecar(path: &Path, record: &mut SessionRecord) -> Result<(), CliError> {
+    let sidecar_path = path.with_file_name(SESSION_RESUME_FILE);
+    if !sidecar_path.is_file() {
+        return Ok(());
+    }
+    let Ok(contents) = fs::read_to_string(&sidecar_path) else {
+        return Ok(());
+    };
+    let Ok(sidecar) = serde_json::from_str::<DurableResumeRecord>(&contents) else {
+        return Ok(());
+    };
+    if sidecar.schema_version != SESSION_RESUME_DOCUMENT_VERSION {
+        return Ok(());
+    }
+    if let Some(provider_resume) = sidecar.provider_resume.clone() {
+        if let Some(existing) = record.provider_resume.as_mut() {
+            merge_extra_fields(&mut existing.extra, provider_resume.extra);
+        } else {
+            record.provider_resume = Some(provider_resume);
+        }
+    }
+    if let Some(runtime) = sidecar.runtime.clone() {
+        if let Some(existing) = record.runtime.as_mut() {
+            merge_extra_fields(&mut existing.extra, runtime.extra);
+        } else {
+            record.runtime = Some(runtime);
+        }
+    }
+    if record.agent_args.is_empty() {
+        record.agent_args = sidecar.agent_args.clone();
+    }
+    if record.agent_bin.is_none() {
+        record.agent_bin = sidecar.agent_bin.clone();
+    }
+    record.resume_sidecar_extra = sidecar.extra;
+    Ok(())
+}
+
+fn merge_extra_fields(target: &mut BTreeMap<String, Value>, source: BTreeMap<String, Value>) {
+    for (key, value) in source {
+        target.entry(key).or_insert(value);
+    }
+}
+
+fn write_resume_sidecar(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
+    let path = session_dir(context, &record.id).join(SESSION_RESUME_FILE);
+    let Some(sidecar) = durable_resume_record(record) else {
+        return remove_current_resume_sidecar_if_present(&path);
+    };
+    if should_preserve_existing_unsupported_resume_sidecar(&path) {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&sidecar).map_err(|err| {
+        CliError::runtime(
+            "session-render-failed",
+            format!("failed to render resume json: {err}"),
+            None,
+        )
+    })?;
+    write_private_file(&path, &bytes)
+}
+
+fn should_preserve_existing_unsupported_resume_sidecar(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str::<DurableResumeRecord>(&contents)
+            .map(|sidecar| sidecar.schema_version != SESSION_RESUME_DOCUMENT_VERSION)
+            .unwrap_or(true),
+        Err(_) => false,
+    }
+}
+
+fn remove_current_resume_sidecar_if_present(path: &Path) -> Result<(), CliError> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(sidecar) = serde_json::from_str::<DurableResumeRecord>(&contents) else {
+        return Ok(());
+    };
+    if sidecar.schema_version != SESSION_RESUME_DOCUMENT_VERSION {
+        return Ok(());
+    }
+    fs::remove_file(path).map_err(|err| {
+        CliError::runtime(
+            "file-delete-failed",
+            format!("failed to delete {}: {err}", path.display()),
+            Some(json!({ "path": display_path(path) })),
+        )
+    })
+}
+
+fn durable_resume_record(record: &SessionRecord) -> Option<DurableResumeRecord> {
+    record
+        .provider_resume
+        .as_ref()
+        .map(|provider_resume| DurableResumeRecord {
+            schema_version: SESSION_RESUME_DOCUMENT_VERSION.to_string(),
+            provider_resume: Some(provider_resume.clone()),
+            runtime: record.runtime.clone(),
+            agent_args: record.agent_args.clone(),
+            agent_bin: record.agent_bin.clone(),
+            extra: record.resume_sidecar_extra.clone(),
+        })
 }
 
 fn session_view(
@@ -1495,8 +2189,7 @@ fn session_view(
     record: &SessionRecord,
     forced_status: Option<String>,
 ) -> SessionView {
-    let status =
-        forced_status.unwrap_or_else(|| live_status(&resolve_tmux_bin(None), &record.tmux_session));
+    let status = forced_status.unwrap_or_else(|| session_status(&resolve_tmux_bin(None), record));
     SessionView {
         id: record.id.clone(),
         agent: record.agent.clone(),
@@ -1505,6 +2198,8 @@ fn session_view(
         cwd: record.cwd.clone(),
         tmux_session: record.tmux_session.clone(),
         status,
+        resumable: is_resumable(record),
+        repo_name: repo_name_from_cwd(&record.cwd),
         attach_command: local_attach_command(&record.tmux_session),
         ssh_attach_command: context
             .host
@@ -1606,6 +2301,140 @@ fn kill_tmux_session(tmux_bin: &Path, tmux_session: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn session_status(tmux_bin: &Path, record: &SessionRecord) -> String {
+    live_status(tmux_bin, &record.tmux_session)
+}
+
+fn is_resumable(record: &SessionRecord) -> bool {
+    validate_resume_metadata(record).is_ok()
+}
+
+fn validate_resume_metadata(
+    record: &SessionRecord,
+) -> Result<(&ProviderResume, AgentKind), CliError> {
+    if record.mode != "interactive" {
+        return Err(CliError::data(
+            "session-not-resumable",
+            format!("session mode is not resumable: {}", record.id),
+            Some(json!({ "id": record.id.clone(), "mode": record.mode.clone() })),
+        ));
+    }
+    let provider_resume = record.provider_resume.as_ref().ok_or_else(|| {
+        CliError::data(
+            "session-not-resumable",
+            format!(
+                "session has no exact provider resume identity: {}",
+                record.id
+            ),
+            Some(json!({ "id": record.id.clone() })),
+        )
+    })?;
+    if provider_resume.resume_args.is_empty() {
+        return Err(CliError::data(
+            "session-not-resumable",
+            format!("session has no provider resume command: {}", record.id),
+            Some(json!({ "id": record.id.clone() })),
+        ));
+    }
+    let agent = AgentKind::from_name(&record.agent).ok_or_else(|| {
+        CliError::data(
+            "invalid-agent",
+            format!("unknown agent in session record: {}", record.agent),
+            Some(json!({ "id": record.id.clone(), "agent": record.agent.clone() })),
+        )
+    })?;
+    if provider_resume.provider != agent.as_str() {
+        return Err(CliError::data(
+            "session-provider-mismatch",
+            "session provider resume metadata does not match the agent",
+            Some(json!({
+                "id": record.id.clone(),
+                "agent": record.agent.clone(),
+                "provider": provider_resume.provider.clone(),
+            })),
+        ));
+    }
+    validate_stored_agent_args(record, agent)?;
+    let expected_args =
+        canonical_provider_resume_args(agent, &record.cwd, &provider_resume.session_id)
+            .ok_or_else(|| {
+                CliError::data(
+                    "session-not-resumable",
+                    format!("session provider is not resumable: {}", record.id),
+                    Some(json!({
+                        "id": record.id.clone(),
+                        "agent": record.agent.clone(),
+                        "provider": provider_resume.provider.clone(),
+                    })),
+                )
+            })?;
+    if provider_resume.session_id.trim().is_empty() || provider_resume.resume_args != expected_args
+    {
+        return Err(CliError::data(
+            "session-not-resumable",
+            "session provider resume command does not match the stored identity",
+            Some(json!({
+                "id": record.id.clone(),
+                "agent": record.agent.clone(),
+                "provider": provider_resume.provider.clone(),
+            })),
+        ));
+    }
+    Ok((provider_resume, agent))
+}
+
+fn canonical_provider_resume_args(
+    agent: AgentKind,
+    cwd: &str,
+    session_id: &str,
+) -> Option<Vec<String>> {
+    match agent {
+        AgentKind::Codex => Some(vec![
+            "resume".to_string(),
+            session_id.to_string(),
+            "--cd".to_string(),
+            cwd.to_string(),
+            "--no-alt-screen".to_string(),
+        ]),
+        AgentKind::Claude => Some(vec!["--resume".to_string(), session_id.to_string()]),
+        AgentKind::Hermes => None,
+    }
+}
+
+fn validate_stored_agent_args(record: &SessionRecord, agent: AgentKind) -> Result<(), CliError> {
+    if agent != AgentKind::Claude {
+        return Ok(());
+    }
+    if let Some(flag) = record
+        .agent_args
+        .iter()
+        .find_map(|arg| reserved_claude_resume_arg(arg))
+    {
+        return Err(CliError::data(
+            "session-not-resumable",
+            "session provider arguments conflict with durable resume identity",
+            Some(json!({
+                "id": record.id.clone(),
+                "agent": record.agent.clone(),
+                "flag": flag,
+            })),
+        ));
+    }
+    Ok(())
+}
+
+fn repo_name_from_cwd(cwd: &str) -> Option<String> {
+    let trimmed = cwd.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
 fn live_status(tmux_bin: &Path, tmux_session: &str) -> String {
     match ProcessCommand::new(tmux_bin)
         .arg("has-session")
@@ -1614,7 +2443,8 @@ fn live_status(tmux_bin: &Path, tmux_session: &str) -> String {
         .status()
     {
         Ok(status) if status.success() => "running".to_string(),
-        Ok(_) => "stopped".to_string(),
+        Ok(status) if status.code() == Some(1) => "stopped".to_string(),
+        Ok(_) => "unknown".to_string(),
         Err(_) => "unknown".to_string(),
     }
 }
@@ -2055,6 +2885,13 @@ fn render_glance_text(result: &GlanceResult) -> String {
     text
 }
 
+fn render_resumed_text(result: &SessionView) -> String {
+    format!(
+        "resumed {} session {}\ntmux: {}\nattach: {}\n",
+        result.agent, result.id, result.tmux_session, result.attach_command
+    )
+}
+
 fn render_delete_text(result: &DeleteResult) -> String {
     format!(
         "deleted {} (tmux killed: {})\n",
@@ -2101,6 +2938,18 @@ fn slugify(value: &str) -> String {
 
 fn non_empty_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    non_empty_env(key)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    non_empty_env(key)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 fn short_hostname() -> Option<String> {

@@ -24,6 +24,7 @@ nils-common = { version = "1.20.12", path = "../nils-common", package = "nils-co
 serde = { workspace = true }
 serde_json = { workspace = true }
 shell-words = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 # `serve` daemon (control plane + WebSocket PTY attach).
 tokio = { workspace = true }
 axum = { workspace = true }
