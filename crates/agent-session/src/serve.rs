@@ -1484,6 +1484,22 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "provider-resume-prompt-conflict");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "provider_resume_id": "external-id",
+                    "agent_args": ["--cd", "/should-not-override"]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "provider-resume-agent-args-conflict");
     }
 
     #[tokio::test]
@@ -1603,21 +1619,23 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().join("repo");
         let claude_config = tmp.path().join("claude-config");
-        let transcript = claude_config
+        let bad_transcript = claude_config
             .join("projects")
             .join("-fixture-project")
-            .join("external-claude-id.jsonl");
+            .join("oversized.jsonl");
         std::fs::create_dir_all(&cwd).unwrap();
-        std::fs::create_dir_all(transcript.parent().expect("parent")).unwrap();
+        std::fs::create_dir_all(bad_transcript.parent().expect("parent")).unwrap();
         std::fs::write(
-            &transcript,
-            format!(
-                "{}\n{{\"type\":\"user\",\"isSidechain\":false,\"cwd\":\"{}\",\"sessionId\":\"external-claude-id\"}}\n",
-                "x".repeat(crate::CLAUDE_SESSION_META_MAX_LINE_BYTES + 1),
-                cwd.to_string_lossy()
-            ),
+            &bad_transcript,
+            "x".repeat(crate::CLAUDE_SESSION_META_MAX_LINE_BYTES + 1),
         )
         .unwrap();
+        write_claude_session_transcript(
+            &claude_config,
+            "-fixture-project",
+            "external-claude-id",
+            &cwd,
+        );
         let log = tmp.path().join("tmux.log");
         let tmux = logging_tmux(tmp.path(), &log);
         let claude = fake_agent(tmp.path(), "claude");

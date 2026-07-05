@@ -657,6 +657,7 @@ pub(crate) fn start_provider_resume_session(
     context: &CliContext,
     args: ProviderResumeImportArgs,
 ) -> Result<StartView, CliError> {
+    validate_provider_resume_import_agent_args(args.agent, &args.agent_args)?;
     validate_agent_args(args.agent, &args.agent_args)?;
     let provider_resume_id = normalize_provider_resume_id(&args.provider_resume_id)?;
     let source = resolve_provider_resume_source(args.agent, &provider_resume_id)?;
@@ -843,6 +844,20 @@ fn validate_agent_args(agent: AgentKind, args: &[String]) -> Result<(), CliError
     Ok(())
 }
 
+fn validate_provider_resume_import_agent_args(
+    agent: AgentKind,
+    args: &[String],
+) -> Result<(), CliError> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::usage(
+        "provider-resume-agent-args-conflict",
+        "provider_resume_id mode owns the resume command; omit agent_args",
+        Some(json!({ "agent": agent.as_str() })),
+    ))
+}
+
 fn reserved_claude_resume_arg(arg: &str) -> Option<&'static str> {
     [
         "--session-id",
@@ -860,6 +875,17 @@ fn reserved_claude_resume_arg(arg: &str) -> Option<&'static str> {
                 .strip_prefix(*flag)
                 .is_some_and(|rest| rest.starts_with('='))
     })
+}
+
+fn reserved_codex_resume_arg(arg: &str) -> Option<&'static str> {
+    ["--cd", "-C", "--last", "--all", "--include-non-interactive"]
+        .into_iter()
+        .find(|flag| {
+            arg == *flag
+                || arg
+                    .strip_prefix(*flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
 }
 
 struct ProviderResumeSource {
@@ -1129,7 +1155,7 @@ fn read_claude_session_cwd(path: &Path, session_id: &str) -> Option<String> {
             read_bounded_line(&mut reader, &mut line, CLAUDE_SESSION_META_MAX_LINE_BYTES).ok()?;
         let within_limit = within_limit?;
         if !within_limit {
-            continue;
+            return None;
         }
         let Ok(line) = std::str::from_utf8(trim_line_ending(&line)) else {
             continue;
@@ -1163,27 +1189,25 @@ fn read_bounded_line<R: BufRead>(
 ) -> io::Result<Option<bool>> {
     buffer.clear();
     let mut total = 0usize;
-    let mut within_limit = true;
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return Ok((total > 0).then_some(within_limit));
+            return Ok((total > 0).then_some(true));
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take_len = newline.map_or(available.len(), |index| index + 1);
-        if within_limit {
-            let remaining = max_bytes.saturating_sub(total);
-            if take_len <= remaining {
-                buffer.extend_from_slice(&available[..take_len]);
-            } else {
-                buffer.extend_from_slice(&available[..remaining]);
-                within_limit = false;
-            }
+        let remaining = max_bytes.saturating_sub(total);
+        if take_len > remaining {
+            buffer.extend_from_slice(&available[..remaining]);
+            let consume_len = remaining.saturating_add(1).min(take_len);
+            reader.consume(consume_len);
+            return Ok(Some(false));
         }
+        buffer.extend_from_slice(&available[..take_len]);
         total = total.saturating_add(take_len);
         reader.consume(take_len);
         if newline.is_some() {
-            return Ok(Some(within_limit));
+            return Ok(Some(true));
         }
     }
 }
@@ -1840,10 +1864,10 @@ mod codex_resume_tests {
         );
         assert_eq!(line.len(), 8);
         assert_eq!(
-            read_bounded_line(&mut reader, &mut line, 8).unwrap(),
-            Some(true)
+            reader.position(),
+            9,
+            "oversized lines must not be drained to newline"
         );
-        assert_eq!(trim_line_ending(&line), b"valid");
     }
 
     #[test]
@@ -2865,14 +2889,18 @@ fn canonical_provider_resume_args(
 }
 
 fn validate_stored_agent_args(record: &SessionRecord, agent: AgentKind) -> Result<(), CliError> {
-    if agent != AgentKind::Claude {
-        return Ok(());
-    }
-    if let Some(flag) = record
-        .agent_args
-        .iter()
-        .find_map(|arg| reserved_claude_resume_arg(arg))
-    {
+    let flag = match agent {
+        AgentKind::Codex => record
+            .agent_args
+            .iter()
+            .find_map(|arg| reserved_codex_resume_arg(arg)),
+        AgentKind::Claude => record
+            .agent_args
+            .iter()
+            .find_map(|arg| reserved_claude_resume_arg(arg)),
+        AgentKind::Hermes => None,
+    };
+    if let Some(flag) = flag {
         return Err(CliError::data(
             "session-not-resumable",
             "session provider arguments conflict with durable resume identity",

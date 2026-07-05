@@ -2786,6 +2786,91 @@ fn resume_refuses_stored_claude_resume_identity_agent_args() {
 }
 
 #[test]
+fn resume_refuses_stored_codex_cwd_agent_args() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+
+    let session_record = write_resumable_session_record(
+        &state_dir,
+        "codex-record-conflict",
+        "codex",
+        "hs-codex-record-conflict",
+        &cwd,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().expect("cwd"),
+            "--no-alt-screen",
+        ],
+    );
+    let record_path = session_record.join("session.json");
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
+            .expect("record json");
+    record["agent_args"] = json!(["--cd", "/tmp/other"]);
+    fs::write(
+        &record_path,
+        serde_json::to_string_pretty(&record).expect("record json"),
+    )
+    .expect("session record");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let list = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
+    let list_json = list.stdout_json();
+    let sessions = data(&list_json).as_array().expect("list data");
+    let session = sessions
+        .iter()
+        .find(|session| session["id"] == "codex-record-conflict")
+        .expect("listed session");
+    assert_eq!(session["status"], "stopped");
+    assert_eq!(session["resumable"], false);
+
+    let resume = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "codex-record-conflict",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(resume.code, 65, "stderr={}", resume.stderr_text());
+    assert_eq!(
+        resume.stdout_json()["error"]["code"],
+        "session-not-resumable"
+    );
+    assert!(
+        !tmux_calls(&tmux_log)
+            .iter()
+            .any(|call| call.first().is_some_and(|arg| arg == "new-session")),
+        "invalid stored agent args must not start tmux"
+    );
+}
+
+#[test]
 fn resume_refuses_when_tmux_status_is_unknown() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
