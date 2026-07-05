@@ -46,6 +46,7 @@ const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
 const CODEX_RESUME_SCAN_MAX_DEPTH: usize = 6;
 const CODEX_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
 const CODEX_RESUME_SCAN_SLICE_MS: u64 = 250;
+const CODEX_SESSION_META_MAX_LINE_BYTES: u64 = 64 * 1024;
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -741,14 +742,22 @@ fn validate_agent_args(agent: AgentKind, args: &[String]) -> Result<(), CliError
 }
 
 fn reserved_claude_resume_arg(arg: &str) -> Option<&'static str> {
-    ["--session-id", "--resume", "--continue"]
-        .into_iter()
-        .find(|flag| {
-            arg == *flag
-                || arg
-                    .strip_prefix(*flag)
-                    .is_some_and(|rest| rest.starts_with('='))
-        })
+    [
+        "--session-id",
+        "--resume",
+        "-r",
+        "--continue",
+        "-c",
+        "--fork-session",
+        "--from-pr",
+    ]
+    .into_iter()
+    .find(|flag| {
+        arg == *flag
+            || arg
+                .strip_prefix(*flag)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
 }
 
 fn start_interactive_tmux(
@@ -1033,9 +1042,20 @@ fn collect_codex_resume_candidates(
 
 fn read_codex_session_meta(path: &Path, cwd: &str) -> Option<CodexSessionMeta> {
     let file = fs::File::open(path).ok()?;
-    let mut lines = io::BufReader::new(file).lines();
-    let first_line = lines.next()?.ok()?;
-    let value: Value = serde_json::from_str(&first_line).ok()?;
+    let mut reader = io::BufReader::new(file).take(CODEX_SESSION_META_MAX_LINE_BYTES + 1);
+    let mut first_line = Vec::new();
+    let read = reader.read_until(b'\n', &mut first_line).ok()?;
+    if read == 0 || first_line.len() as u64 > CODEX_SESSION_META_MAX_LINE_BYTES {
+        return None;
+    }
+    if first_line.last() == Some(&b'\n') {
+        first_line.pop();
+        if first_line.last() == Some(&b'\r') {
+            first_line.pop();
+        }
+    }
+    let first_line = std::str::from_utf8(&first_line).ok()?;
+    let value: Value = serde_json::from_str(first_line).ok()?;
     if value.get("type").and_then(Value::as_str)? != "session_meta" {
         return None;
     }
@@ -1314,6 +1334,22 @@ mod codex_resume_tests {
             r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}},"timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
+        assert_eq!(read_codex_session_meta(&path, "/repo"), None);
+    }
+
+    #[test]
+    fn codex_session_meta_reader_rejects_oversized_first_line() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{{"id":"oversized-codex-id","session_id":"oversized-codex-id","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z","pad":"{}"}}}}"#,
+                "x".repeat(2 * 1024 * 1024)
+            ),
+        )
+        .unwrap();
+
         assert_eq!(read_codex_session_meta(&path, "/repo"), None);
     }
 
@@ -2059,6 +2095,9 @@ fn write_resume_sidecar(context: &CliContext, record: &SessionRecord) -> Result<
     let Some(sidecar) = durable_resume_record(record) else {
         return remove_current_resume_sidecar_if_present(&path);
     };
+    if should_preserve_existing_unsupported_resume_sidecar(&path) {
+        return Ok(());
+    }
     let bytes = serde_json::to_vec_pretty(&sidecar).map_err(|err| {
         CliError::runtime(
             "session-render-failed",
@@ -2067,6 +2106,15 @@ fn write_resume_sidecar(context: &CliContext, record: &SessionRecord) -> Result<
         )
     })?;
     write_private_file(&path, &bytes)
+}
+
+fn should_preserve_existing_unsupported_resume_sidecar(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str::<DurableResumeRecord>(&contents)
+            .map(|sidecar| sidecar.schema_version != SESSION_RESUME_DOCUMENT_VERSION)
+            .unwrap_or(true),
+        Err(_) => false,
+    }
 }
 
 fn remove_current_resume_sidecar_if_present(path: &Path) -> Result<(), CliError> {

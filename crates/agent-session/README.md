@@ -86,8 +86,8 @@ interactive `start`; one-shot `run` may need to pass the prompt through the unde
 CLI capabilities. `send` routes literal text through a private (0600) buffer file loaded into tmux, so it never appears in the tmux
 command line or command output; the JSON contract reports only `sent_text` (a boolean) and the special-key names, never the text itself.
 Values passed with `--agent-arg` are persisted in the private session record so durable resume can recreate the same provider invocation.
-Do not put secrets in provider arguments. For Claude sessions, provider identity/resume flags such as `--session-id`, `--resume`, and
-`--continue` are reserved for agent-session so the stored resume identity stays exact.
+Do not put secrets in provider arguments. For Claude sessions, provider identity/resume flags such as `--session-id`, `--resume`/`-r`,
+`--continue`/`-c`, `--fork-session`, and `--from-pr` are reserved for agent-session so the stored resume identity stays exact.
 For secrets, prefer `--text-stdin`: `--text <value>` still places the literal in agent-session's own process arguments (visible in `ps`
 to same-user processes), exactly as the existing `--prompt` flag does. `send` is not idempotent — keystrokes are delivered before the
 command returns, so a retry after a mid-delivery failure can re-send; callers that auto-retry should account for this.
