@@ -2,8 +2,7 @@ mod cli;
 pub mod completion;
 mod serve;
 
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -43,7 +42,6 @@ const DELETE_COMMAND: &str = "delete";
 const WORKDIR_USAGE_FILE: &str = "workdir-usage.json";
 const CODEX_RESUME_CAPTURE_TIMEOUT_MS: u64 = 1500;
 const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
-const CODEX_RESUME_CAPTURE_SETTLE_MS: u64 = 150;
 const CODEX_RESUME_SCAN_MAX_DEPTH: usize = 6;
 const CODEX_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
 const CODEX_RESUME_SCAN_SLICE_MS: u64 = 250;
@@ -876,13 +874,6 @@ fn capture_provider_resume_after_launch(
 #[derive(Debug)]
 struct CodexResumeCandidate {
     session_id: String,
-    modified_at: SystemTime,
-}
-
-#[derive(Debug)]
-struct StableCodexResumeCandidate {
-    session_id: String,
-    first_seen_at: Instant,
 }
 
 #[derive(Debug, PartialEq)]
@@ -907,12 +898,8 @@ fn capture_codex_resume(
         )
         .max(1),
     );
-    let settle = Duration::from_millis(env_u64(
-        "AGENT_SESSION_CODEX_CAPTURE_SETTLE_MS",
-        CODEX_RESUME_CAPTURE_SETTLE_MS,
-    ));
     let started = Instant::now();
-    let mut stable_candidate: Option<StableCodexResumeCandidate> = None;
+    let mut observed_singleton: Option<String> = None;
 
     loop {
         let mut candidates = Vec::new();
@@ -928,35 +915,31 @@ fn capture_codex_resume(
         if budget.truncated {
             return None;
         }
-        candidates.sort_by_key(|candidate| Reverse(candidate.modified_at));
-        match candidates.as_slice() {
-            [candidate] => {
-                let first_seen_at = match &stable_candidate {
-                    Some(stable) if stable.session_id == candidate.session_id => {
-                        stable.first_seen_at
-                    }
-                    _ => {
-                        stable_candidate = Some(StableCodexResumeCandidate {
-                            session_id: candidate.session_id.clone(),
-                            first_seen_at: Instant::now(),
-                        });
-                        stable_candidate
-                            .as_ref()
-                            .expect("stable candidate")
-                            .first_seen_at
-                    }
-                };
-                if settle.is_zero() || first_seen_at.elapsed() >= settle {
-                    return Some(codex_provider_resume(record, &candidate.session_id));
+
+        let candidate_ids: BTreeSet<String> = candidates
+            .into_iter()
+            .map(|candidate| candidate.session_id)
+            .collect();
+        match candidate_ids.len() {
+            1 => {
+                let candidate_id = candidate_ids.iter().next().expect("singleton candidate");
+                match observed_singleton.as_deref() {
+                    Some(observed) if observed == candidate_id => {}
+                    Some(_) => return None,
+                    None => observed_singleton = Some(candidate_id.clone()),
                 }
             }
-            [] => {
-                stable_candidate = None;
+            0 => {
+                if observed_singleton.is_some() {
+                    return None;
+                }
             }
             _ => return None,
         }
         if timeout.is_zero() || started.elapsed() >= timeout {
-            return None;
+            return observed_singleton
+                .as_deref()
+                .map(|session_id| codex_provider_resume(record, session_id));
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         thread::sleep(poll.min(remaining));
@@ -1064,7 +1047,6 @@ fn collect_codex_resume_candidates(
             }
             candidates.push(CodexResumeCandidate {
                 session_id: meta.session_id,
-                modified_at,
             });
         }
     }

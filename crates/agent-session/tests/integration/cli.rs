@@ -1373,7 +1373,7 @@ fn start_does_not_capture_transient_singleton_codex_session_meta() {
     let other_session_arg = other_session.to_string_lossy().to_string();
     let delayed_cwd = cwd_arg.clone();
     let delayed_writer = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(50));
         fs::create_dir_all(own_session.parent().expect("parent")).expect("codex sessions");
         fs::write(
             &own_session,
@@ -1409,9 +1409,8 @@ fn start_does_not_capture_transient_singleton_codex_session_meta() {
             ("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &other_session_arg),
             ("AGENT_SESSION_FAKE_CODEX_SESSION_ID", "other-codex-id"),
             ("AGENT_SESSION_FAKE_CODEX_CWD", &cwd_arg),
-            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "500"),
+            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "1000"),
             ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
-            ("AGENT_SESSION_CODEX_CAPTURE_SETTLE_MS", "300"),
         ],
     );
     delayed_writer.join().expect("delayed writer");
@@ -2501,6 +2500,114 @@ fn resume_refuses_provider_resume_args_that_do_not_match_session_id() {
             .iter()
             .any(|call| call.first().is_some_and(|arg| arg == "new-session")),
         "invalid resume args must not start tmux"
+    );
+}
+
+#[test]
+fn resume_refuses_stored_claude_resume_identity_agent_args() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let claude_bin = fake_agent(tmp.path(), "claude");
+
+    let session_record = write_resumable_session_record(
+        &state_dir,
+        "claude-record-conflict",
+        "claude",
+        "hs-claude-record-conflict",
+        &cwd,
+        &["--resume", "resume-session-id"],
+    );
+    let record_path = session_record.join("session.json");
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
+            .expect("record json");
+    record["agent_args"] = json!(["-r", "other-session"]);
+    fs::write(
+        &record_path,
+        serde_json::to_string_pretty(&record).expect("record json"),
+    )
+    .expect("session record");
+
+    let sidecar_record = write_session_record(
+        &state_dir,
+        "claude-sidecar-conflict",
+        "claude",
+        "hs-claude-sidecar-conflict",
+    );
+    write_resume_sidecar(
+        &sidecar_record,
+        "claude",
+        "hs-claude-sidecar-conflict",
+        &claude_bin,
+        &["--resume", "resume-session-id"],
+    );
+    let sidecar_path = sidecar_record.join("resume.json");
+    let mut sidecar: Value =
+        serde_json::from_str(&fs::read_to_string(&sidecar_path).expect("resume sidecar"))
+            .expect("sidecar json");
+    sidecar["agent_args"] = json!(["--continue"]);
+    fs::write(
+        &sidecar_path,
+        serde_json::to_string_pretty(&sidecar).expect("sidecar json"),
+    )
+    .expect("resume sidecar");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let list = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
+    let list_json = list.stdout_json();
+    let sessions = data(&list_json).as_array().expect("list data");
+    for id in ["claude-record-conflict", "claude-sidecar-conflict"] {
+        let session = sessions
+            .iter()
+            .find(|session| session["id"] == id)
+            .expect("listed session");
+        assert_eq!(session["status"], "stopped");
+        assert_eq!(session["resumable"], false);
+    }
+
+    for id in ["claude-record-conflict", "claude-sidecar-conflict"] {
+        let resume = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "resume",
+                id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+            ],
+        );
+        assert_eq!(resume.code, 65, "id={id}, stderr={}", resume.stderr_text());
+        assert_eq!(
+            resume.stdout_json()["error"]["code"],
+            "session-not-resumable"
+        );
+    }
+    assert!(
+        !tmux_calls(&tmux_log)
+            .iter()
+            .any(|call| call.first().is_some_and(|arg| arg == "new-session")),
+        "invalid stored agent args must not start tmux"
     );
 }
 
