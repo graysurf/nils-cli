@@ -609,13 +609,24 @@ async fn attach_handler(
         Err(_) => return join_err(),
     };
     if status != "running" {
-        return envelope_err(CliError::data(
-            "session-not-running",
-            format!("session is not running: {}", record.id),
-            Some(json!({ "id": record.id, "status": status })),
-        ));
+        return envelope_err(attach_unavailable_error(&record, &status));
     }
     ws.on_upgrade(move |socket| attach_socket(socket, context, tmux, record))
+}
+
+fn attach_unavailable_error(record: &crate::SessionRecord, status: &str) -> CliError {
+    if status == "unknown" {
+        return CliError::runtime(
+            "session-status-unknown",
+            format!("session status could not be checked: {}", record.id),
+            Some(json!({ "id": record.id.clone() })),
+        );
+    }
+    CliError::data(
+        "session-not-running",
+        format!("session is not running: {}", record.id),
+        Some(json!({ "id": record.id.clone(), "status": status })),
+    )
 }
 
 // --- websocket attach ---------------------------------------------------------
@@ -1111,6 +1122,30 @@ mod tests {
         assert_eq!(same_len_wrong.len(), TOKEN.len());
         assert!(deny_unauthorized(&st, &auth_headers(Some(&same_len_wrong))).is_some());
         assert!(deny_unauthorized(&st, &auth_headers(Some(TOKEN))).is_none());
+    }
+
+    #[test]
+    fn attach_status_errors_distinguish_unknown_from_non_running() {
+        let record = test_record("attach-me", "hs-codex-attach-me");
+        let stopped = attach_unavailable_error(&record, "stopped").into_inner();
+        assert_eq!(stopped.code, "session-not-running");
+        assert_eq!(stopped.exit_code, exit::DATA);
+        assert_eq!(
+            stopped.details.unwrap()["status"],
+            Value::String("stopped".to_string())
+        );
+
+        let resumable = attach_unavailable_error(&record, "resumable").into_inner();
+        assert_eq!(resumable.code, "session-not-running");
+        assert_eq!(resumable.exit_code, exit::DATA);
+        assert_eq!(
+            resumable.details.unwrap()["status"],
+            Value::String("resumable".to_string())
+        );
+
+        let unknown = attach_unavailable_error(&record, "unknown").into_inner();
+        assert_eq!(unknown.code, "session-status-unknown");
+        assert_eq!(unknown.exit_code, exit::RUNTIME);
     }
 
     #[test]

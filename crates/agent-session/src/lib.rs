@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use clap::Parser;
 use clap::error::ErrorKind;
-use jiff::Zoned;
+use jiff::{Timestamp, Zoned};
 use nils_common::cli_contract::{
     Envelope, EnvelopeError, OutputFormat, emit_parse_error, exit, schema_version_for,
 };
@@ -543,7 +543,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
             capture_provider_resume_after_launch(args.agent, &created.record, launch_started_at)
     {
         created.record.provider_resume = Some(provider_resume);
-        let _ = write_session_record(context, &created.record);
+        created.record = persist_or_reload_session_record(context, &created.record);
     }
 
     let result = session_view(context, &created.record, Some("running".to_string()));
@@ -827,6 +827,12 @@ struct CodexResumeCandidate {
     modified_at: SystemTime,
 }
 
+#[derive(Debug, PartialEq)]
+struct CodexSessionMeta {
+    session_id: String,
+    created_at: SystemTime,
+}
+
 fn capture_codex_resume(
     record: &SessionRecord,
     launch_started_at: SystemTime,
@@ -970,16 +976,19 @@ fn collect_codex_resume_candidates(
         if modified_at < earliest {
             continue;
         }
-        if let Some(session_id) = read_codex_session_meta(&path, cwd) {
+        if let Some(meta) = read_codex_session_meta(&path, cwd) {
+            if meta.created_at < earliest {
+                continue;
+            }
             candidates.push(CodexResumeCandidate {
-                session_id,
+                session_id: meta.session_id,
                 modified_at,
             });
         }
     }
 }
 
-fn read_codex_session_meta(path: &Path, cwd: &str) -> Option<String> {
+fn read_codex_session_meta(path: &Path, cwd: &str) -> Option<CodexSessionMeta> {
     let file = fs::File::open(path).ok()?;
     let mut lines = io::BufReader::new(file).lines();
     let first_line = lines.next()?.ok()?;
@@ -994,12 +1003,21 @@ fn read_codex_session_meta(path: &Path, cwd: &str) -> Option<String> {
     if payload.get("source").and_then(Value::as_str)? != "cli" {
         return None;
     }
-    payload
+    let session_id = payload
         .get("id")
         .or_else(|| payload.get("session_id"))
         .and_then(Value::as_str)
         .filter(|id| !id.trim().is_empty())
-        .map(str::to_string)
+        .map(str::to_string)?;
+    let timestamp = payload
+        .get("timestamp")
+        .or_else(|| value.get("timestamp"))
+        .and_then(Value::as_str)?;
+    let created_at: SystemTime = timestamp.parse::<Timestamp>().ok()?.into();
+    Some(CodexSessionMeta {
+        session_id,
+        created_at,
+    })
 }
 
 fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError> {
@@ -1239,18 +1257,18 @@ mod codex_resume_tests {
         let path = tmp.path().join("rollout.jsonl");
         fs::write(
             &path,
-            r#"{"type":"session_meta","payload":{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"cli"}}"#,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
         assert_eq!(
-            read_codex_session_meta(&path, "/repo"),
+            read_codex_session_meta(&path, "/repo").map(|meta| meta.session_id),
             Some("codex-id".to_string())
         );
         assert_eq!(read_codex_session_meta(&path, "/other"), None);
 
         fs::write(
             &path,
-            r#"{"type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}}}}"#,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}},"timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
         assert_eq!(read_codex_session_meta(&path, "/repo"), None);
@@ -1323,7 +1341,7 @@ fn resume_session_by_id(
         started_at: now.timestamp().to_string(),
     });
     record.updated_at = now.timestamp().to_string();
-    let _ = write_session_record(context, &record);
+    record = persist_or_reload_session_record(context, &record);
     Ok(session_view(context, &record, Some("running".to_string())))
 }
 
@@ -1901,6 +1919,13 @@ fn write_session_record(context: &CliContext, record: &SessionRecord) -> Result<
     let path = session_dir(context, &record.id).join("session.json");
     write_private_file(&path, &bytes)?;
     write_resume_sidecar(context, record)
+}
+
+fn persist_or_reload_session_record(context: &CliContext, record: &SessionRecord) -> SessionRecord {
+    match write_session_record(context, record) {
+        Ok(()) => record.clone(),
+        Err(_) => load_session_record(context, &record.id).unwrap_or_else(|_| record.clone()),
+    }
 }
 
 fn merge_resume_sidecar(path: &Path, record: &mut SessionRecord) -> Result<(), CliError> {
