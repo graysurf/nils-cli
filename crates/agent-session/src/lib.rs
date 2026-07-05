@@ -1123,17 +1123,18 @@ impl ClaudeResumeScanBudget {
 fn read_claude_session_cwd(path: &Path, session_id: &str) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let mut reader = io::BufReader::new(file);
-    let mut line = String::new();
+    let mut line = Vec::new();
     for _ in 0..CLAUDE_SESSION_SCAN_MAX_LINES {
-        line.clear();
-        let read = reader.read_line(&mut line).ok()?;
-        if read == 0 {
-            return None;
-        }
-        if read > CLAUDE_SESSION_META_MAX_LINE_BYTES {
+        let within_limit =
+            read_bounded_line(&mut reader, &mut line, CLAUDE_SESSION_META_MAX_LINE_BYTES).ok()?;
+        let within_limit = within_limit?;
+        if !within_limit {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
+        let Ok(line) = std::str::from_utf8(trim_line_ending(&line)) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let id_matches = value
@@ -1153,6 +1154,43 @@ fn read_claude_session_cwd(path: &Path, session_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<Option<bool>> {
+    buffer.clear();
+    let mut total = 0usize;
+    let mut within_limit = true;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((total > 0).then_some(within_limit));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take_len = newline.map_or(available.len(), |index| index + 1);
+        if within_limit {
+            let remaining = max_bytes.saturating_sub(total);
+            if take_len <= remaining {
+                buffer.extend_from_slice(&available[..take_len]);
+            } else {
+                buffer.extend_from_slice(&available[..remaining]);
+                within_limit = false;
+            }
+        }
+        total = total.saturating_add(take_len);
+        reader.consume(take_len);
+        if newline.is_some() {
+            return Ok(Some(within_limit));
+        }
+    }
+}
+
+fn trim_line_ending(bytes: &[u8]) -> &[u8] {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
 fn start_interactive_tmux(
@@ -1393,11 +1431,15 @@ struct CodexResumeScanBudget {
 
 impl CodexResumeScanBudget {
     fn from_env() -> Self {
-        let max_entries = env_usize(
-            "AGENT_SESSION_CODEX_CAPTURE_MAX_ENTRIES",
-            CODEX_RESUME_SCAN_MAX_ENTRIES,
-        )
-        .max(1);
+        let max_entries = non_empty_env("AGENT_SESSION_CODEX_RESUME_SCAN_MAX_ENTRIES")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                env_usize(
+                    "AGENT_SESSION_CODEX_CAPTURE_MAX_ENTRIES",
+                    CODEX_RESUME_SCAN_MAX_ENTRIES,
+                )
+            })
+            .max(1);
         let slice = Duration::from_millis(env_u64(
             "AGENT_SESSION_CODEX_SCAN_SLICE_MS",
             CODEX_RESUME_SCAN_SLICE_MS,
@@ -1785,6 +1827,23 @@ mod codex_resume_tests {
         .unwrap();
 
         assert_eq!(read_codex_session_meta(&path), None);
+    }
+
+    #[test]
+    fn bounded_line_reader_discards_oversized_lines_without_growing_buffer() {
+        let mut reader = io::Cursor::new(format!("{}\nvalid\n", "x".repeat(32)).into_bytes());
+        let mut line = Vec::new();
+
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 8).unwrap(),
+            Some(false)
+        );
+        assert_eq!(line.len(), 8);
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 8).unwrap(),
+            Some(true)
+        );
+        assert_eq!(trim_line_ending(&line), b"valid");
     }
 
     #[test]
