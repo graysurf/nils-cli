@@ -1069,6 +1069,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_preserves_provider_resume_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        seed_resumable_session(
+            tmp.path(),
+            "recover",
+            "codex",
+            "hs-codex-recover",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["sessions"][0];
+        assert_eq!(session["provider_resume"]["provider"], "codex");
+        assert_eq!(
+            session["provider_resume"]["session_id"],
+            "resume-session-id"
+        );
+        assert_eq!(
+            session["provider_resume"]["resume_args"],
+            json!([
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen"
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn writes_require_token() {
         let tmp = tempfile::TempDir::new().unwrap();
         let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
@@ -1728,6 +1769,31 @@ mod tests {
         assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
         assert_eq!(body["data"]["machine"], MACHINE);
         assert!(body["data"]["glance"].is_object());
+    }
+
+    #[tokio::test]
+    async fn glance_preserves_provider_resume_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        seed_resumable_session(
+            tmp.path(),
+            "recover",
+            "claude",
+            "hs-claude-recover",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(router(st.clone()), get("/sessions/recover/glance")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let glance = &body["data"]["glance"];
+        assert_eq!(glance["provider_resume"]["provider"], "claude");
+        assert_eq!(
+            glance["provider_resume"]["resume_args"],
+            json!(["--resume", "resume-session-id"])
+        );
     }
 
     #[tokio::test]

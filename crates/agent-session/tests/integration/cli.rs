@@ -1940,6 +1940,21 @@ fn list_marks_missing_tmux_with_resume_identity_as_resumable() {
     assert_eq!(sessions[0]["status"], "stopped");
     assert_eq!(sessions[0]["resumable"], true);
     assert_eq!(sessions[0]["repo_name"], "repo");
+    assert_eq!(sessions[0]["provider_resume"]["provider"], "codex");
+    assert_eq!(
+        sessions[0]["provider_resume"]["session_id"],
+        "resume-session-id"
+    );
+    assert_eq!(
+        sessions[0]["provider_resume"]["resume_args"],
+        json!([
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen"
+        ])
+    );
 }
 
 #[test]

@@ -375,6 +375,8 @@ struct SessionView {
     status: String,
     resumable: bool,
     repo_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_resume: Option<ProviderResume>,
     attach_command: String,
     ssh_attach_command: Option<String>,
     prompt_file: Option<String>,
@@ -422,6 +424,8 @@ struct GlanceResult {
     status: String,
     resumable: bool,
     repo_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_resume: Option<ProviderResume>,
     tail: String,
     created_at: String,
     updated_at: String,
@@ -1280,6 +1284,7 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         status,
         resumable: is_resumable(&record),
         repo_name: repo_name_from_cwd(&record.cwd),
+        provider_resume: record.provider_resume.clone(),
         tail,
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
@@ -2200,6 +2205,7 @@ fn session_view(
         status,
         resumable: is_resumable(record),
         repo_name: repo_name_from_cwd(&record.cwd),
+        provider_resume: record.provider_resume.clone(),
         attach_command: local_attach_command(&record.tmux_session),
         ssh_attach_command: context
             .host
