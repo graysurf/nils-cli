@@ -860,32 +860,49 @@ fn validate_provider_resume_import_agent_args(
 
 fn reserved_claude_resume_arg(arg: &str) -> Option<&'static str> {
     [
-        "--session-id",
-        "--resume",
-        "-r",
-        "--continue",
-        "-c",
-        "--fork-session",
-        "--from-pr",
+        ("--session-id", false),
+        ("--resume", false),
+        ("-r", true),
+        ("--continue", false),
+        ("-c", false),
+        ("--fork-session", false),
+        ("--from-pr", false),
     ]
     .into_iter()
-    .find(|flag| {
-        arg == *flag
-            || arg
-                .strip_prefix(*flag)
-                .is_some_and(|rest| rest.starts_with('='))
+    .find_map(|(flag, allow_attached_short_value)| {
+        reserved_agent_arg_matches(arg, flag, allow_attached_short_value).then_some(flag)
     })
 }
 
 fn reserved_codex_resume_arg(arg: &str) -> Option<&'static str> {
-    ["--cd", "-C", "--last", "--all", "--include-non-interactive"]
-        .into_iter()
-        .find(|flag| {
-            arg == *flag
-                || arg
-                    .strip_prefix(*flag)
-                    .is_some_and(|rest| rest.starts_with('='))
-        })
+    [
+        ("--cd", false),
+        ("-C", true),
+        ("--last", false),
+        ("--all", false),
+        ("--include-non-interactive", false),
+    ]
+    .into_iter()
+    .find_map(|(flag, allow_attached_short_value)| {
+        reserved_agent_arg_matches(arg, flag, allow_attached_short_value).then_some(flag)
+    })
+}
+
+fn reserved_agent_arg_matches(
+    arg: &str,
+    flag: &'static str,
+    allow_attached_short_value: bool,
+) -> bool {
+    if arg == flag {
+        return true;
+    }
+    arg.strip_prefix(flag).is_some_and(|rest| {
+        rest.starts_with('=')
+            || (allow_attached_short_value
+                && flag.starts_with('-')
+                && !flag.starts_with("--")
+                && !rest.is_empty())
+    })
 }
 
 struct ProviderResumeSource {

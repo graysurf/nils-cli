@@ -2698,7 +2698,7 @@ fn resume_refuses_stored_claude_resume_identity_agent_args() {
     let mut record: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
             .expect("record json");
-    record["agent_args"] = json!(["-r", "other-session"]);
+    record["agent_args"] = json!(["-rother-session"]);
     fs::write(
         &record_path,
         serde_json::to_string_pretty(&record).expect("record json"),
@@ -2811,7 +2811,7 @@ fn resume_refuses_stored_codex_cwd_agent_args() {
     let mut record: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
             .expect("record json");
-    record["agent_args"] = json!(["--cd", "/tmp/other"]);
+    record["agent_args"] = json!(["-C/tmp/other"]);
     fs::write(
         &record_path,
         serde_json::to_string_pretty(&record).expect("record json"),
