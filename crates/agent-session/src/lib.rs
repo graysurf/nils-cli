@@ -930,8 +930,10 @@ fn capture_codex_resume(
                 let candidate_id = candidate_ids.iter().next().expect("singleton candidate");
                 match &observed_singleton {
                     Some((observed, first_seen_at)) if observed == candidate_id => {
-                        if ambiguity_window.is_zero() || first_seen_at.elapsed() >= ambiguity_window
-                        {
+                        if codex_candidate_satisfied_ambiguity_window(
+                            *first_seen_at,
+                            ambiguity_window,
+                        ) {
                             return Some(codex_provider_resume(record, candidate_id));
                         }
                     }
@@ -949,11 +951,21 @@ fn capture_codex_resume(
         if timeout.is_zero() || started.elapsed() >= timeout {
             return observed_singleton
                 .as_ref()
+                .filter(|(_, first_seen_at)| {
+                    codex_candidate_satisfied_ambiguity_window(*first_seen_at, ambiguity_window)
+                })
                 .map(|(session_id, _)| codex_provider_resume(record, session_id));
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         thread::sleep(poll.min(remaining));
     }
+}
+
+fn codex_candidate_satisfied_ambiguity_window(
+    first_seen_at: Instant,
+    ambiguity_window: Duration,
+) -> bool {
+    ambiguity_window.is_zero() || first_seen_at.elapsed() >= ambiguity_window
 }
 
 fn codex_provider_resume(record: &SessionRecord, session_id: &str) -> ProviderResume {

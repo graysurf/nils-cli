@@ -1134,6 +1134,7 @@ fn start_captures_codex_resume_metadata_from_unique_post_launch_session_meta() {
             ("AGENT_SESSION_FAKE_CODEX_CWD", &cwd_arg),
             ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250"),
             ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
+            ("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40"),
         ],
     );
 
@@ -1488,6 +1489,71 @@ fn start_captures_stable_codex_session_meta_before_full_timeout() {
     let value = output.stdout_json();
     let result = data(&value);
     assert_eq!(result["resumable"], true);
+}
+
+#[test]
+fn start_does_not_capture_codex_singleton_before_ambiguity_window() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let codex_home = tmp.path().join("codex-home");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let codex_session = codex_home.join("sessions/2026/07/05/short-timeout.jsonl");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let codex_home_arg = codex_home.to_string_lossy().to_string();
+    let codex_session_arg = codex_session.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            ("CODEX_HOME", &codex_home_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &codex_session_arg),
+            (
+                "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
+                "short-timeout-codex-id",
+            ),
+            ("AGENT_SESSION_FAKE_CODEX_CWD", &cwd_arg),
+            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "40"),
+            ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
+            ("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "200"),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    let result = data(&value);
+    assert_eq!(result["resumable"], false);
+    let id = result["id"].as_str().expect("session id");
+    let record_path = state_dir.join("sessions").join(id).join("session.json");
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
+            .expect("record json");
+    assert!(record.get("provider_resume").is_none());
+    assert!(!record_path.with_file_name("resume.json").exists());
 }
 
 #[test]
