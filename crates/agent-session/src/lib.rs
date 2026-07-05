@@ -42,6 +42,7 @@ const DELETE_COMMAND: &str = "delete";
 const WORKDIR_USAGE_FILE: &str = "workdir-usage.json";
 const CODEX_RESUME_CAPTURE_TIMEOUT_MS: u64 = 1500;
 const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
+const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
 const CODEX_RESUME_SCAN_MAX_DEPTH: usize = 6;
 const CODEX_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
 const CODEX_RESUME_SCAN_SLICE_MS: u64 = 250;
@@ -898,8 +899,12 @@ fn capture_codex_resume(
         )
         .max(1),
     );
+    let ambiguity_window = Duration::from_millis(env_u64(
+        "AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS",
+        CODEX_RESUME_AMBIGUITY_WINDOW_MS,
+    ));
     let started = Instant::now();
-    let mut observed_singleton: Option<String> = None;
+    let mut observed_singleton: Option<(String, Instant)> = None;
 
     loop {
         let mut candidates = Vec::new();
@@ -923,10 +928,15 @@ fn capture_codex_resume(
         match candidate_ids.len() {
             1 => {
                 let candidate_id = candidate_ids.iter().next().expect("singleton candidate");
-                match observed_singleton.as_deref() {
-                    Some(observed) if observed == candidate_id => {}
+                match &observed_singleton {
+                    Some((observed, first_seen_at)) if observed == candidate_id => {
+                        if ambiguity_window.is_zero() || first_seen_at.elapsed() >= ambiguity_window
+                        {
+                            return Some(codex_provider_resume(record, candidate_id));
+                        }
+                    }
                     Some(_) => return None,
-                    None => observed_singleton = Some(candidate_id.clone()),
+                    None => observed_singleton = Some((candidate_id.clone(), Instant::now())),
                 }
             }
             0 => {
@@ -938,8 +948,8 @@ fn capture_codex_resume(
         }
         if timeout.is_zero() || started.elapsed() >= timeout {
             return observed_singleton
-                .as_deref()
-                .map(|session_id| codex_provider_resume(record, session_id));
+                .as_ref()
+                .map(|(session_id, _)| codex_provider_resume(record, session_id));
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         thread::sleep(poll.min(remaining));

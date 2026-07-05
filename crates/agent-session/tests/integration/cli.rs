@@ -1411,6 +1411,7 @@ fn start_does_not_capture_transient_singleton_codex_session_meta() {
             ("AGENT_SESSION_FAKE_CODEX_CWD", &cwd_arg),
             ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "1000"),
             ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
+            ("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "800"),
         ],
     );
     delayed_writer.join().expect("delayed writer");
@@ -1426,6 +1427,67 @@ fn start_does_not_capture_transient_singleton_codex_session_meta() {
             .expect("record json");
     assert!(record.get("provider_resume").is_none());
     assert!(!record_path.with_file_name("resume.json").exists());
+}
+
+#[test]
+fn start_captures_stable_codex_session_meta_before_full_timeout() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let codex_home = tmp.path().join("codex-home");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let codex_session = codex_home.join("sessions/2026/07/05/stable.jsonl");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let codex_home_arg = codex_home.to_string_lossy().to_string();
+    let codex_session_arg = codex_session.to_string_lossy().to_string();
+    let started = std::time::Instant::now();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            ("CODEX_HOME", &codex_home_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &codex_session_arg),
+            ("AGENT_SESSION_FAKE_CODEX_SESSION_ID", "stable-codex-id"),
+            ("AGENT_SESSION_FAKE_CODEX_CWD", &cwd_arg),
+            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "1000"),
+            ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
+            ("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40"),
+        ],
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert!(
+        elapsed < std::time::Duration::from_millis(750),
+        "stable capture should not wait for full timeout; elapsed={elapsed:?}"
+    );
+    let value = output.stdout_json();
+    let result = data(&value);
+    assert_eq!(result["resumable"], true);
 }
 
 #[test]
