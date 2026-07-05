@@ -48,6 +48,23 @@ if [ "$1" = "capture-pane" ]; then
   exit 0
 fi
 
+if [ "$1" = "new-session" ] && [ "${AGENT_SESSION_FAKE_CODEX_SESSION_FILE+x}" = "x" ]; then
+  cwd="${AGENT_SESSION_FAKE_CODEX_CWD:-}"
+  if [ -z "$cwd" ]; then
+    previous=""
+    for arg in "$@"; do
+      if [ "$previous" = "-c" ]; then
+        cwd="$arg"
+        break
+      fi
+      previous="$arg"
+    done
+  fi
+  session_id="${AGENT_SESSION_FAKE_CODEX_SESSION_ID:-fake-codex-session}"
+  mkdir -p "$(dirname "$AGENT_SESSION_FAKE_CODEX_SESSION_FILE")"
+  printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s","source":"cli"}}\n' "$session_id" "$cwd" > "$AGENT_SESSION_FAKE_CODEX_SESSION_FILE"
+fi
+
 exit 0
 "#,
     );
@@ -833,10 +850,39 @@ fn write_resumable_session_record(
     cwd: &Path,
     resume_args: &[&str],
 ) -> PathBuf {
+    write_resumable_session_record_with_agent_bin(
+        dir,
+        id,
+        agent,
+        tmux_session,
+        cwd,
+        resume_args,
+        None,
+    )
+}
+
+fn write_resumable_session_record_with_agent_bin(
+    dir: &Path,
+    id: &str,
+    agent: &str,
+    tmux_session: &str,
+    cwd: &Path,
+    resume_args: &[&str],
+    agent_bin: Option<&Path>,
+) -> PathBuf {
     let session = dir.join("sessions").join(id);
     fs::create_dir_all(&session).expect("session dir");
     let resume_args = serde_json::to_string(resume_args).expect("resume args json");
     let cwd = cwd.to_string_lossy();
+    let agent_bin_json = agent_bin
+        .map(|path| {
+            format!(
+                r#",
+  "agent_bin": "{}""#,
+                path.to_string_lossy()
+            )
+        })
+        .unwrap_or_default();
     let record = format!(
         r#"{{
   "schema_version": "agent-session.session.v1",
@@ -864,10 +910,195 @@ fn write_resumable_session_record(
     "started_at": "2000-01-01T00:00:00Z"
   }},
   "agent_args": ["--model", "fixture-model"]
+  {agent_bin_json}
 }}"#
     );
     fs::write(session.join("session.json"), record).expect("session record");
     session
+}
+
+fn write_resume_sidecar(
+    session: &Path,
+    agent: &str,
+    tmux_session: &str,
+    agent_bin: &Path,
+    resume_args: &[&str],
+) {
+    let resume_args = serde_json::to_string(resume_args).expect("resume args json");
+    fs::write(
+        session.join("resume.json"),
+        format!(
+            r#"{{
+  "schema_version": "agent-session.resume.v1",
+  "provider_resume": {{
+    "provider": "{agent}",
+    "session_id": "resume-session-id",
+    "captured_at": "2000-01-01T00:00:00Z",
+    "capture_method": "fixture-sidecar",
+    "resume_args": {resume_args}
+  }},
+  "runtime": {{
+    "kind": "tmux",
+    "tmux_session": "{tmux_session}",
+    "generation": 3,
+    "started_at": "2000-01-01T00:00:00Z"
+  }},
+  "agent_args": ["--model", "sidecar-model"],
+  "agent_bin": "{}"
+}}"#,
+            agent_bin.to_string_lossy()
+        ),
+    )
+    .expect("resume sidecar");
+}
+
+#[test]
+fn start_captures_codex_resume_metadata_from_unique_post_launch_session_meta() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let codex_home = tmp.path().join("codex-home");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let codex_session = codex_home.join("sessions/2026/07/05/session.jsonl");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let codex_home_arg = codex_home.to_string_lossy().to_string();
+    let codex_session_arg = codex_session.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--title",
+            "Capture Codex",
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            ("CODEX_HOME", &codex_home_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &codex_session_arg),
+            (
+                "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
+                "codex-post-launch-id",
+            ),
+            ("AGENT_SESSION_FAKE_CODEX_CWD", &cwd_arg),
+            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250"),
+            ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    let result = data(&value);
+    assert_eq!(result["resumable"], true);
+    let id = result["id"].as_str().expect("session id");
+    let record_path = state_dir.join("sessions").join(id).join("session.json");
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
+            .expect("record json");
+    assert_eq!(record["provider_resume"]["provider"], "codex");
+    assert_eq!(
+        record["provider_resume"]["resume_args"],
+        serde_json::json!([
+            "resume",
+            "codex-post-launch-id",
+            "--cd",
+            cwd_arg,
+            "--no-alt-screen"
+        ])
+    );
+    assert_eq!(record["agent_bin"], codex_arg);
+    assert!(
+        record_path.with_file_name("resume.json").is_file(),
+        "durable resume sidecar should be written"
+    );
+}
+
+#[test]
+fn start_does_not_capture_prelaunch_codex_session_meta() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let codex_home = tmp.path().join("codex-home");
+    let cwd = tmp.path().join("repo");
+    let codex_session = codex_home.join("sessions/2026/07/05/prelaunch.jsonl");
+    fs::create_dir_all(codex_session.parent().expect("parent")).expect("codex sessions");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    fs::write(
+        &codex_session,
+        format!(
+            r#"{{"type":"session_meta","payload":{{"id":"stale-codex-id","cwd":"{}","source":"cli"}}}}"#,
+            cwd.to_string_lossy()
+        ),
+    )
+    .expect("stale codex metadata");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let codex_home_arg = codex_home.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            ("CODEX_HOME", &codex_home_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "25"),
+            ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "5"),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    let result = data(&value);
+    assert_eq!(result["resumable"], false);
+    let id = result["id"].as_str().expect("session id");
+    let record_path = state_dir.join("sessions").join(id).join("session.json");
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
+            .expect("record json");
+    assert!(record.get("provider_resume").is_none());
+    assert!(
+        !record_path.with_file_name("resume.json").exists(),
+        "stale pre-launch metadata must not create a resume sidecar"
+    );
 }
 
 #[test]
@@ -924,7 +1155,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
     fs::create_dir_all(&cwd).expect("repo dir");
     let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
     let codex_bin = fake_agent(tmp.path(), "codex");
-    write_resumable_session_record(
+    write_resumable_session_record_with_agent_bin(
         &state_dir,
         "recoverable",
         "codex",
@@ -937,6 +1168,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             cwd.to_str().unwrap(),
             "--no-alt-screen",
         ],
+        Some(&codex_bin),
     );
 
     let state_arg = state_dir.to_string_lossy().to_string();
@@ -956,7 +1188,6 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             "json",
         ],
         &[
-            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
             ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
         ],
@@ -985,7 +1216,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             "-c".to_string(),
             cwd.to_string_lossy().to_string(),
             "--".to_string(),
-            codex_arg,
+            codex_arg.clone(),
             "resume".to_string(),
             "resume-session-id".to_string(),
             "--cd".to_string(),
@@ -997,10 +1228,265 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
     );
 
     let record_path = state_dir.join("sessions/recoverable/session.json");
-    let record: Value = serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
+    let record: Value = serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
     assert_eq!(record["id"], "recoverable");
     assert_eq!(record["runtime"]["generation"], 2);
     assert_ne!(record["updated_at"], "2000-01-01T00:00:00Z");
+    assert_eq!(record["agent_bin"], codex_arg);
+    assert!(
+        record_path.with_file_name("resume.json").is_file(),
+        "resume should refresh the durable sidecar"
+    );
+}
+
+#[test]
+fn resume_recovers_provider_identity_from_durable_sidecar() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-custom");
+    let session =
+        write_session_record(&state_dir, "sidecar-only", "codex", "hs-codex-sidecar-only");
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(session.join("session.json")).unwrap()).unwrap();
+    record["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+    fs::write(
+        session.join("session.json"),
+        serde_json::to_string_pretty(&record).unwrap(),
+    )
+    .expect("rewrite fixture record");
+    write_resume_sidecar(
+        &session,
+        "codex",
+        "hs-codex-sidecar-only",
+        &codex_bin,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
+    );
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let list = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
+    let list_json = list.stdout_json();
+    let sessions = data(&list_json).as_array().expect("list data");
+    assert_eq!(sessions[0]["status"], "resumable");
+
+    let resume = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "sidecar-only",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(resume.code, 0, "stderr={}", resume.stderr_text());
+    let calls = tmux_calls(&tmux_log);
+    let new_session = calls
+        .iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("new-session call");
+    assert!(
+        new_session.contains(&codex_arg),
+        "resume should use sidecar agent_bin: {new_session:?}"
+    );
+    assert!(
+        new_session.contains(&"sidecar-model".to_string()),
+        "resume should use sidecar agent args: {new_session:?}"
+    );
+}
+
+#[test]
+fn resume_refuses_non_resumable_or_invalid_identity_without_starting_tmux() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    write_session_record(&state_dir, "plain", "codex", "hs-codex-plain");
+    let mismatch_session = write_resumable_session_record(
+        &state_dir,
+        "mismatch",
+        "codex",
+        "hs-codex-mismatch",
+        &cwd,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
+    );
+    let mismatch_path = mismatch_session.join("session.json");
+    let mut mismatch: Value =
+        serde_json::from_str(&fs::read_to_string(&mismatch_path).unwrap()).unwrap();
+    mismatch["provider_resume"]["provider"] = Value::String("claude".to_string());
+    fs::write(
+        &mismatch_path,
+        serde_json::to_string_pretty(&mismatch).unwrap(),
+    )
+    .expect("mismatch fixture");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let env_refs = [
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+    ];
+
+    let plain = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "plain",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &env_refs,
+    );
+    assert_eq!(plain.code, 65, "stderr={}", plain.stderr_text());
+    assert_eq!(
+        plain.stdout_json()["error"]["code"],
+        "session-not-resumable"
+    );
+
+    let list = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
+    let list_json = list.stdout_json();
+    let sessions = data(&list_json).as_array().expect("list data");
+    let mismatch = sessions
+        .iter()
+        .find(|session| session["id"] == "mismatch")
+        .expect("mismatch session");
+    assert_eq!(mismatch["status"], "stopped");
+    assert_eq!(mismatch["resumable"], false);
+
+    let mismatch = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "mismatch",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &env_refs,
+    );
+    assert_eq!(mismatch.code, 65, "stderr={}", mismatch.stderr_text());
+    assert_eq!(
+        mismatch.stdout_json()["error"]["code"],
+        "session-provider-mismatch"
+    );
+
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
+        "resume refusals should not create tmux sessions: {calls:?}"
+    );
+}
+
+#[test]
+fn resume_refuses_when_tmux_status_is_unknown() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    write_resumable_session_record_with_agent_bin(
+        &state_dir,
+        "unknown-status",
+        "codex",
+        "hs-codex-unknown-status",
+        &cwd,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
+        Some(&codex_bin),
+    );
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "unknown-status",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL", "has-session"),
+        ],
+    );
+
+    assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "session-status-unknown"
+    );
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
+        "unknown status should not create tmux sessions: {calls:?}"
+    );
 }
 
 #[test]

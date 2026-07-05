@@ -591,19 +591,23 @@ async fn attach_handler(
         return resp;
     }
     let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
     let lookup = tokio::task::spawn_blocking({
         let context = context.clone();
         let id = id.clone();
-        move || load_session_record(&context, &id)
+        let tmux = tmux.clone();
+        move || {
+            let record = load_session_record(&context, &id)?;
+            let status = session_status(&tmux, &record);
+            Ok::<_, CliError>((record, status))
+        }
     })
     .await;
-    let record = match lookup {
-        Ok(Ok(record)) => record,
+    let (record, status) = match lookup {
+        Ok(Ok(result)) => result,
         Ok(Err(err)) => return envelope_err(err),
         Err(_) => return join_err(),
     };
-    let tmux = state.tmux_bin.clone();
-    let status = session_status(&tmux, &record);
     if status != "running" {
         return envelope_err(CliError::data(
             "session-not-running",
@@ -1236,6 +1240,30 @@ mod tests {
         assert!(
             calls.contains("resume resume-session-id"),
             "resume must use the exact provider id: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_non_resumable_session_with_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        seed_session(tmp.path(), "plain", "codex", "hs-codex-plain");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json("/sessions/plain/resume", Some(TOKEN), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "session-not-resumable");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("new-session"),
+            "non-resumable sessions must not create tmux runtimes: {calls:?}"
         );
     }
 
@@ -1874,6 +1902,8 @@ mod tests {
             provider_resume: None,
             runtime: None,
             agent_args: Vec::new(),
+            agent_bin: None,
+            extra: std::collections::BTreeMap::new(),
         }
     }
 }
