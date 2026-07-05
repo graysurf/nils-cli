@@ -430,6 +430,55 @@ fn list_command_and_delete_manage_existing_session() {
 }
 
 #[test]
+fn start_rejects_claude_resume_identity_agent_args() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let claude_bin = fake_agent(tmp.path(), "claude");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let claude_arg = claude_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "claude",
+            "--cwd",
+            &cwd_arg,
+            "--id",
+            "bad-claude-arg",
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &claude_arg,
+            "--agent-arg=--session-id",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)],
+    );
+
+    assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
+    assert_eq!(output.stdout_json()["error"]["code"], "reserved-agent-arg");
+    assert!(
+        !state_dir.join("sessions/bad-claude-arg").exists(),
+        "invalid managed identity args must be rejected before state creation"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "invalid managed identity args must not start tmux"
+    );
+}
+
+#[test]
 fn run_and_logs_cover_json_contract_and_file_fallback() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -1987,6 +2036,48 @@ fn list_and_delete_ignore_unsupported_or_malformed_resume_sidecars() {
         assert_eq!(delete.code, 0, "stderr={}", delete.stderr_text());
         assert_eq!(data(&delete.stdout_json())["deleted"], true);
     }
+}
+
+#[test]
+fn send_preserves_unsupported_resume_sidecar() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let session = write_session_record(
+        &state_dir,
+        "future-sidecar-write",
+        "codex",
+        "hs-codex-future-sidecar-write",
+    );
+    let sidecar_path = session.join("resume.json");
+    let future_sidecar = r#"{"schema_version":"agent-session.resume.v2","provider_resume":{"provider":"codex","session_id":"future","captured_at":"2000-01-01T00:00:00Z","capture_method":"fixture","resume_args":["resume","future"]}}"#;
+    fs::write(&sidecar_path, future_sidecar).expect("future sidecar");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let send = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "future-sidecar-write",
+            "--key",
+            "enter",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)],
+    );
+
+    assert_eq!(send.code, 0, "stderr={}", send.stderr_text());
+    assert_eq!(
+        fs::read_to_string(&sidecar_path).expect("future sidecar after send"),
+        future_sidecar
+    );
 }
 
 #[test]

@@ -504,6 +504,7 @@ impl CliError {
 }
 
 fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView, CliError> {
+    validate_agent_args(args.agent, &args.agent_args)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let prompt = read_prompt(&args.prompt, args.prompt_file.as_deref(), args.prompt_stdin)?;
     let provider_plan = initial_provider_resume_plan(args.agent, &cwd);
@@ -563,6 +564,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
 }
 
 fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartView, CliError> {
+    validate_agent_args(args.agent, &args.agent_args)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let prompt = read_prompt(&args.prompt, args.prompt_file.as_deref(), args.prompt_stdin)?;
     let prompt = prompt
@@ -718,6 +720,35 @@ fn initial_provider_resume_plan(agent: AgentKind, _cwd: &Path) -> InitialProvide
         AgentKind::Codex => InitialProviderPlan::default(),
         AgentKind::Hermes => InitialProviderPlan::default(),
     }
+}
+
+fn validate_agent_args(agent: AgentKind, args: &[String]) -> Result<(), CliError> {
+    if agent != AgentKind::Claude {
+        return Ok(());
+    }
+    for arg in args {
+        if let Some(flag) = reserved_claude_resume_arg(arg) {
+            return Err(CliError::usage(
+                "reserved-agent-arg",
+                format!(
+                    "{flag} is managed by agent-session for durable Claude resume; do not pass it via --agent-arg"
+                ),
+                Some(json!({ "agent": agent.as_str(), "flag": flag })),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reserved_claude_resume_arg(arg: &str) -> Option<&'static str> {
+    ["--session-id", "--resume", "--continue"]
+        .into_iter()
+        .find(|flag| {
+            arg == *flag
+                || arg
+                    .strip_prefix(*flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
 }
 
 fn start_interactive_tmux(
@@ -2026,10 +2057,7 @@ fn merge_extra_fields(target: &mut BTreeMap<String, Value>, source: BTreeMap<Str
 fn write_resume_sidecar(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
     let path = session_dir(context, &record.id).join(SESSION_RESUME_FILE);
     let Some(sidecar) = durable_resume_record(record) else {
-        if path.exists() {
-            let _ = fs::remove_file(path);
-        }
-        return Ok(());
+        return remove_current_resume_sidecar_if_present(&path);
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).map_err(|err| {
         CliError::runtime(
@@ -2039,6 +2067,25 @@ fn write_resume_sidecar(context: &CliContext, record: &SessionRecord) -> Result<
         )
     })?;
     write_private_file(&path, &bytes)
+}
+
+fn remove_current_resume_sidecar_if_present(path: &Path) -> Result<(), CliError> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(sidecar) = serde_json::from_str::<DurableResumeRecord>(&contents) else {
+        return Ok(());
+    };
+    if sidecar.schema_version != SESSION_RESUME_DOCUMENT_VERSION {
+        return Ok(());
+    }
+    fs::remove_file(path).map_err(|err| {
+        CliError::runtime(
+            "file-delete-failed",
+            format!("failed to delete {}: {err}", path.display()),
+            Some(json!({ "path": display_path(path) })),
+        )
+    })
 }
 
 fn durable_resume_record(record: &SessionRecord) -> Option<DurableResumeRecord> {
