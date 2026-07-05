@@ -83,8 +83,8 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 
 - [crates/agent-runtime](crates/agent-runtime): Runtime-kit tooling binary (`agent-runtime`) for render, install, doctor,
   audit-drift, runtime state maintenance, skill listing, and PR/MR body rendering.
-- [crates/agent-docs](crates/agent-docs): Deterministic policy-document resolver for Codex/agent workflows (`resolve`, `contexts`, `add`,
-  `baseline`).
+- [crates/agent-docs](crates/agent-docs): Deterministic policy-document resolver and auditor for Codex/agent workflows (`audit`,
+  `preflight`, `init`, `explain`, `list`, `remove`).
 - [crates/agent-memory](crates/agent-memory): Local agent memory-store resolver and manager (`path`, `index`, `init-agent`,
   `init-persona`, `doctor`, `completion`).
 - [crates/agent-out](crates/agent-out): Canonical `$AGENT_HOME/out/` path generator and layout auditor for agent workflow artifacts.
