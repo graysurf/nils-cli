@@ -323,6 +323,8 @@ struct SessionRecord {
     agent_bin: Option<String>,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     extra: BTreeMap<String, Value>,
+    #[serde(skip)]
+    resume_sidecar_extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -332,6 +334,8 @@ struct ProviderResume {
     captured_at: String,
     capture_method: String,
     resume_args: Vec<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -340,6 +344,8 @@ struct RuntimeInfo {
     tmux_session: String,
     generation: u64,
     started_at: String,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -353,6 +359,8 @@ struct DurableResumeRecord {
     agent_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_bin: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -665,10 +673,12 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
             tmux_session: tmux_session.clone(),
             generation: 1,
             started_at: now.timestamp().to_string(),
+            extra: BTreeMap::new(),
         }),
         agent_args: request.agent_args,
         agent_bin: request.agent_bin,
         extra: BTreeMap::new(),
+        resume_sidecar_extra: BTreeMap::new(),
     };
 
     write_session_record(request.context, &record)?;
@@ -700,6 +710,7 @@ fn initial_provider_resume_plan(agent: AgentKind, _cwd: &Path) -> InitialProvide
                     captured_at: Zoned::now().timestamp().to_string(),
                     capture_method: "claude-explicit-session-id".to_string(),
                     resume_args: vec!["--resume".to_string(), session_id.clone()],
+                    extra: BTreeMap::new(),
                 }),
                 launch_args: vec!["--session-id".to_string(), session_id],
             }
@@ -880,6 +891,7 @@ fn capture_codex_resume(
                         record.cwd.clone(),
                         "--no-alt-screen".to_string(),
                     ],
+                    extra: BTreeMap::new(),
                 });
             }
             [] => {}
@@ -1273,6 +1285,40 @@ mod codex_resume_tests {
         .unwrap();
         assert_eq!(read_codex_session_meta(&path, "/repo"), None);
     }
+
+    #[test]
+    fn codex_resume_scan_truncates_large_stale_tree_by_entry_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..32 {
+            fs::write(
+                root.join(format!("stale-{index}.jsonl")),
+                r#"{"timestamp":"2000-01-01T00:00:00Z","type":"session_meta","payload":{"id":"old","cwd":"/repo","source":"cli","timestamp":"2000-01-01T00:00:00Z"}}"#,
+            )
+            .unwrap();
+        }
+
+        let mut candidates = Vec::new();
+        let mut budget = CodexResumeScanBudget {
+            visited: 0,
+            max_entries: 5,
+            deadline: Instant::now() + Duration::from_secs(60),
+            truncated: false,
+        };
+        collect_codex_resume_candidates(
+            &root,
+            0,
+            SystemTime::now(),
+            "/repo",
+            &mut candidates,
+            &mut budget,
+        );
+
+        assert_eq!(budget.visited, 5);
+        assert!(budget.truncated);
+        assert!(candidates.is_empty());
+    }
 }
 
 /// Bump `updated_at` to now so `list` can order by real control-plane activity.
@@ -1339,6 +1385,11 @@ fn resume_session_by_id(
         tmux_session: record.tmux_session.clone(),
         generation: next_generation,
         started_at: now.timestamp().to_string(),
+        extra: record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.extra.clone())
+            .unwrap_or_default(),
     });
     record.updated_at = now.timestamp().to_string();
     record = persist_or_reload_session_record(context, &record);
@@ -1917,8 +1968,8 @@ fn write_session_record(context: &CliContext, record: &SessionRecord) -> Result<
         )
     })?;
     let path = session_dir(context, &record.id).join("session.json");
-    write_private_file(&path, &bytes)?;
-    write_resume_sidecar(context, record)
+    write_resume_sidecar(context, record)?;
+    write_private_file(&path, &bytes)
 }
 
 fn persist_or_reload_session_record(context: &CliContext, record: &SessionRecord) -> SessionRecord {
@@ -1933,46 +1984,43 @@ fn merge_resume_sidecar(path: &Path, record: &mut SessionRecord) -> Result<(), C
     if !sidecar_path.is_file() {
         return Ok(());
     }
-    let contents = fs::read_to_string(&sidecar_path).map_err(|err| {
-        CliError::runtime(
-            "session-read-failed",
-            format!("failed to read {}: {err}", sidecar_path.display()),
-            Some(json!({ "path": display_path(&sidecar_path) })),
-        )
-    })?;
-    let sidecar: DurableResumeRecord = serde_json::from_str(&contents).map_err(|err| {
-        CliError::data(
-            "session-json-invalid",
-            format!("failed to parse {}: {err}", sidecar_path.display()),
-            Some(json!({ "path": display_path(&sidecar_path) })),
-        )
-    })?;
+    let Ok(contents) = fs::read_to_string(&sidecar_path) else {
+        return Ok(());
+    };
+    let Ok(sidecar) = serde_json::from_str::<DurableResumeRecord>(&contents) else {
+        return Ok(());
+    };
     if sidecar.schema_version != SESSION_RESUME_DOCUMENT_VERSION {
-        return Err(CliError::data(
-            "unsupported-session-resume-version",
-            format!(
-                "unsupported resume schema_version {}; expected {}",
-                sidecar.schema_version, SESSION_RESUME_DOCUMENT_VERSION
-            ),
-            Some(json!({
-                "path": display_path(&sidecar_path),
-                "schema_version": sidecar.schema_version,
-            })),
-        ));
+        return Ok(());
     }
-    if record.provider_resume.is_none() {
-        record.provider_resume = sidecar.provider_resume;
+    if let Some(provider_resume) = sidecar.provider_resume.clone() {
+        if let Some(existing) = record.provider_resume.as_mut() {
+            merge_extra_fields(&mut existing.extra, provider_resume.extra);
+        } else {
+            record.provider_resume = Some(provider_resume);
+        }
     }
-    if record.runtime.is_none() {
-        record.runtime = sidecar.runtime;
+    if let Some(runtime) = sidecar.runtime.clone() {
+        if let Some(existing) = record.runtime.as_mut() {
+            merge_extra_fields(&mut existing.extra, runtime.extra);
+        } else {
+            record.runtime = Some(runtime);
+        }
     }
     if record.agent_args.is_empty() {
-        record.agent_args = sidecar.agent_args;
+        record.agent_args = sidecar.agent_args.clone();
     }
     if record.agent_bin.is_none() {
-        record.agent_bin = sidecar.agent_bin;
+        record.agent_bin = sidecar.agent_bin.clone();
     }
+    record.resume_sidecar_extra = sidecar.extra;
     Ok(())
+}
+
+fn merge_extra_fields(target: &mut BTreeMap<String, Value>, source: BTreeMap<String, Value>) {
+    for (key, value) in source {
+        target.entry(key).or_insert(value);
+    }
 }
 
 fn write_resume_sidecar(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
@@ -2003,6 +2051,7 @@ fn durable_resume_record(record: &SessionRecord) -> Option<DurableResumeRecord> 
             runtime: record.runtime.clone(),
             agent_args: record.agent_args.clone(),
             agent_bin: record.agent_bin.clone(),
+            extra: record.resume_sidecar_extra.clone(),
         })
 }
 
@@ -2124,10 +2173,7 @@ fn kill_tmux_session(tmux_bin: &Path, tmux_session: &str) -> bool {
 }
 
 fn session_status(tmux_bin: &Path, record: &SessionRecord) -> String {
-    match live_status(tmux_bin, &record.tmux_session).as_str() {
-        "stopped" if is_resumable(record) => "resumable".to_string(),
-        other => other.to_string(),
-    }
+    live_status(tmux_bin, &record.tmux_session)
 }
 
 fn is_resumable(record: &SessionRecord) -> bool {

@@ -1135,14 +1135,6 @@ mod tests {
             Value::String("stopped".to_string())
         );
 
-        let resumable = attach_unavailable_error(&record, "resumable").into_inner();
-        assert_eq!(resumable.code, "session-not-running");
-        assert_eq!(resumable.exit_code, exit::DATA);
-        assert_eq!(
-            resumable.details.unwrap()["status"],
-            Value::String("resumable".to_string())
-        );
-
         let unknown = attach_unavailable_error(&record, "unknown").into_inner();
         assert_eq!(unknown.code, "session-status-unknown");
         assert_eq!(unknown.exit_code, exit::RUNTIME);
@@ -1939,6 +1931,7 @@ mod tests {
             agent_args: Vec::new(),
             agent_bin: None,
             extra: std::collections::BTreeMap::new(),
+            resume_sidecar_extra: std::collections::BTreeMap::new(),
         }
     }
 }
