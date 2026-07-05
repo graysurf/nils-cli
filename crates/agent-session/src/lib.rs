@@ -43,6 +43,7 @@ const DELETE_COMMAND: &str = "delete";
 const WORKDIR_USAGE_FILE: &str = "workdir-usage.json";
 const CODEX_RESUME_CAPTURE_TIMEOUT_MS: u64 = 1500;
 const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
+const CODEX_RESUME_CAPTURE_SETTLE_MS: u64 = 150;
 const CODEX_RESUME_SCAN_MAX_DEPTH: usize = 6;
 const CODEX_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
 const CODEX_RESUME_SCAN_SLICE_MS: u64 = 250;
@@ -878,6 +879,12 @@ struct CodexResumeCandidate {
     modified_at: SystemTime,
 }
 
+#[derive(Debug)]
+struct StableCodexResumeCandidate {
+    session_id: String,
+    first_seen_at: Instant,
+}
+
 #[derive(Debug, PartialEq)]
 struct CodexSessionMeta {
     session_id: String,
@@ -900,7 +907,12 @@ fn capture_codex_resume(
         )
         .max(1),
     );
+    let settle = Duration::from_millis(env_u64(
+        "AGENT_SESSION_CODEX_CAPTURE_SETTLE_MS",
+        CODEX_RESUME_CAPTURE_SETTLE_MS,
+    ));
     let started = Instant::now();
+    let mut stable_candidate: Option<StableCodexResumeCandidate> = None;
 
     loop {
         let mut candidates = Vec::new();
@@ -919,22 +931,28 @@ fn capture_codex_resume(
         candidates.sort_by_key(|candidate| Reverse(candidate.modified_at));
         match candidates.as_slice() {
             [candidate] => {
-                return Some(ProviderResume {
-                    provider: "codex".to_string(),
-                    session_id: candidate.session_id.clone(),
-                    captured_at: Zoned::now().timestamp().to_string(),
-                    capture_method: "codex-session-meta".to_string(),
-                    resume_args: vec![
-                        "resume".to_string(),
-                        candidate.session_id.clone(),
-                        "--cd".to_string(),
-                        record.cwd.clone(),
-                        "--no-alt-screen".to_string(),
-                    ],
-                    extra: BTreeMap::new(),
-                });
+                let first_seen_at = match &stable_candidate {
+                    Some(stable) if stable.session_id == candidate.session_id => {
+                        stable.first_seen_at
+                    }
+                    _ => {
+                        stable_candidate = Some(StableCodexResumeCandidate {
+                            session_id: candidate.session_id.clone(),
+                            first_seen_at: Instant::now(),
+                        });
+                        stable_candidate
+                            .as_ref()
+                            .expect("stable candidate")
+                            .first_seen_at
+                    }
+                };
+                if settle.is_zero() || first_seen_at.elapsed() >= settle {
+                    return Some(codex_provider_resume(record, &candidate.session_id));
+                }
             }
-            [] => {}
+            [] => {
+                stable_candidate = None;
+            }
             _ => return None,
         }
         if timeout.is_zero() || started.elapsed() >= timeout {
@@ -942,6 +960,18 @@ fn capture_codex_resume(
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         thread::sleep(poll.min(remaining));
+    }
+}
+
+fn codex_provider_resume(record: &SessionRecord, session_id: &str) -> ProviderResume {
+    ProviderResume {
+        provider: "codex".to_string(),
+        session_id: session_id.to_string(),
+        captured_at: Zoned::now().timestamp().to_string(),
+        capture_method: "codex-session-meta".to_string(),
+        resume_args: canonical_provider_resume_args(AgentKind::Codex, &record.cwd, session_id)
+            .expect("codex resume args"),
+        extra: BTreeMap::new(),
     }
 }
 
@@ -2320,7 +2350,73 @@ fn validate_resume_metadata(
             })),
         ));
     }
+    validate_stored_agent_args(record, agent)?;
+    let expected_args =
+        canonical_provider_resume_args(agent, &record.cwd, &provider_resume.session_id)
+            .ok_or_else(|| {
+                CliError::data(
+                    "session-not-resumable",
+                    format!("session provider is not resumable: {}", record.id),
+                    Some(json!({
+                        "id": record.id.clone(),
+                        "agent": record.agent.clone(),
+                        "provider": provider_resume.provider.clone(),
+                    })),
+                )
+            })?;
+    if provider_resume.session_id.trim().is_empty() || provider_resume.resume_args != expected_args
+    {
+        return Err(CliError::data(
+            "session-not-resumable",
+            "session provider resume command does not match the stored identity",
+            Some(json!({
+                "id": record.id.clone(),
+                "agent": record.agent.clone(),
+                "provider": provider_resume.provider.clone(),
+            })),
+        ));
+    }
     Ok((provider_resume, agent))
+}
+
+fn canonical_provider_resume_args(
+    agent: AgentKind,
+    cwd: &str,
+    session_id: &str,
+) -> Option<Vec<String>> {
+    match agent {
+        AgentKind::Codex => Some(vec![
+            "resume".to_string(),
+            session_id.to_string(),
+            "--cd".to_string(),
+            cwd.to_string(),
+            "--no-alt-screen".to_string(),
+        ]),
+        AgentKind::Claude => Some(vec!["--resume".to_string(), session_id.to_string()]),
+        AgentKind::Hermes => None,
+    }
+}
+
+fn validate_stored_agent_args(record: &SessionRecord, agent: AgentKind) -> Result<(), CliError> {
+    if agent != AgentKind::Claude {
+        return Ok(());
+    }
+    if let Some(flag) = record
+        .agent_args
+        .iter()
+        .find_map(|arg| reserved_claude_resume_arg(arg))
+    {
+        return Err(CliError::data(
+            "session-not-resumable",
+            "session provider arguments conflict with durable resume identity",
+            Some(json!({
+                "id": record.id.clone(),
+                "agent": record.agent.clone(),
+                "flag": flag,
+            })),
+        ));
+    }
+    Ok(())
 }
 
 fn repo_name_from_cwd(cwd: &str) -> Option<String> {

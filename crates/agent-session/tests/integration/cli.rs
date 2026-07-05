@@ -1353,6 +1353,83 @@ fn start_does_not_capture_ambiguous_post_launch_codex_session_meta() {
 }
 
 #[test]
+fn start_does_not_capture_transient_singleton_codex_session_meta() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let codex_home = tmp.path().join("codex-home");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let other_session = codex_home.join("sessions/2026/07/05/other.jsonl");
+    let own_session = codex_home.join("sessions/2026/07/05/own.jsonl");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let codex_home_arg = codex_home.to_string_lossy().to_string();
+    let other_session_arg = other_session.to_string_lossy().to_string();
+    let delayed_cwd = cwd_arg.clone();
+    let delayed_writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        fs::create_dir_all(own_session.parent().expect("parent")).expect("codex sessions");
+        fs::write(
+            &own_session,
+            format!(
+                r#"{{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{{"id":"own-codex-id","session_id":"own-codex-id","cwd":"{}","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}}}"#,
+                delayed_cwd
+            ),
+        )
+        .expect("delayed codex metadata");
+    });
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            ("CODEX_HOME", &codex_home_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &other_session_arg),
+            ("AGENT_SESSION_FAKE_CODEX_SESSION_ID", "other-codex-id"),
+            ("AGENT_SESSION_FAKE_CODEX_CWD", &cwd_arg),
+            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "500"),
+            ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
+            ("AGENT_SESSION_CODEX_CAPTURE_SETTLE_MS", "300"),
+        ],
+    );
+    delayed_writer.join().expect("delayed writer");
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    let result = data(&value);
+    assert_eq!(result["resumable"], false);
+    let id = result["id"].as_str().expect("session id");
+    let record_path = state_dir.join("sessions").join(id).join("session.json");
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
+            .expect("record json");
+    assert!(record.get("provider_resume").is_none());
+    assert!(!record_path.with_file_name("resume.json").exists());
+}
+
+#[test]
 fn start_does_not_capture_old_codex_session_meta_appended_after_launch() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -2353,6 +2430,77 @@ fn resume_refuses_non_resumable_or_invalid_identity_without_starting_tmux() {
             .iter()
             .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
         "resume refusals should not create tmux sessions: {calls:?}"
+    );
+}
+
+#[test]
+fn resume_refuses_provider_resume_args_that_do_not_match_session_id() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let session = write_resumable_session_record(
+        &state_dir,
+        "mismatched-resume-args",
+        "codex",
+        "hs-codex-mismatched-resume-args",
+        &cwd,
+        &[
+            "resume",
+            "different-session-id",
+            "--cd",
+            cwd.to_str().expect("cwd"),
+            "--no-alt-screen",
+        ],
+    );
+    assert!(session.join("session.json").exists());
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let list = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
+    let list_json = list.stdout_json();
+    let sessions = data(&list_json).as_array().expect("list data");
+    assert_eq!(sessions[0]["resumable"], false);
+
+    let resume = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "mismatched-resume-args",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+
+    assert_eq!(resume.code, 65, "stderr={}", resume.stderr_text());
+    assert_eq!(
+        resume.stdout_json()["error"]["code"],
+        "session-not-resumable"
+    );
+    assert!(
+        !tmux_calls(&tmux_log)
+            .iter()
+            .any(|call| call.first().is_some_and(|arg| arg == "new-session")),
+        "invalid resume args must not start tmux"
     );
 }
 
