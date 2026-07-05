@@ -339,6 +339,27 @@ struct ProviderResume {
     extra: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ProviderResumeView {
+    provider: String,
+    session_id: String,
+    captured_at: String,
+    capture_method: String,
+    resume_args: Vec<String>,
+}
+
+impl From<&ProviderResume> for ProviderResumeView {
+    fn from(provider_resume: &ProviderResume) -> Self {
+        Self {
+            provider: provider_resume.provider.clone(),
+            session_id: provider_resume.session_id.clone(),
+            captured_at: provider_resume.captured_at.clone(),
+            capture_method: provider_resume.capture_method.clone(),
+            resume_args: provider_resume.resume_args.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct RuntimeInfo {
     kind: String,
@@ -375,6 +396,8 @@ struct SessionView {
     status: String,
     resumable: bool,
     repo_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_resume: Option<ProviderResumeView>,
     attach_command: String,
     ssh_attach_command: Option<String>,
     prompt_file: Option<String>,
@@ -422,6 +445,8 @@ struct GlanceResult {
     status: String,
     resumable: bool,
     repo_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_resume: Option<ProviderResumeView>,
     tail: String,
     created_at: String,
     updated_at: String,
@@ -1280,6 +1305,10 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         status,
         resumable: is_resumable(&record),
         repo_name: repo_name_from_cwd(&record.cwd),
+        provider_resume: record
+            .provider_resume
+            .as_ref()
+            .map(ProviderResumeView::from),
         tail,
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
@@ -2200,6 +2229,10 @@ fn session_view(
         status,
         resumable: is_resumable(record),
         repo_name: repo_name_from_cwd(&record.cwd),
+        provider_resume: record
+            .provider_resume
+            .as_ref()
+            .map(ProviderResumeView::from),
         attach_command: local_attach_command(&record.tmux_session),
         ssh_attach_command: context
             .host

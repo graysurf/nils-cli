@@ -946,6 +946,14 @@ mod tests {
         .unwrap();
     }
 
+    fn add_provider_resume_extra(state_dir: &Path, id: &str) {
+        let path = state_dir.join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        record["provider_resume"]["storage_only"] = json!({ "keep": true });
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+    }
+
     fn executable(path: &Path, body: &str) -> PathBuf {
         std::fs::write(path, body).unwrap();
         let mut perms = std::fs::metadata(path).unwrap().permissions();
@@ -1066,6 +1074,49 @@ mod tests {
         assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
         assert_eq!(body["data"]["machine"], MACHINE);
         assert_eq!(body["data"]["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_preserves_provider_resume_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        seed_resumable_session(
+            tmp.path(),
+            "recover",
+            "codex",
+            "hs-codex-recover",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        add_provider_resume_extra(tmp.path(), "recover");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["sessions"][0];
+        assert_eq!(session["provider_resume"]["provider"], "codex");
+        assert_eq!(
+            session["provider_resume"]["session_id"],
+            "resume-session-id"
+        );
+        assert_eq!(
+            session["provider_resume"]["resume_args"],
+            json!([
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen"
+            ])
+        );
+        assert!(session["provider_resume"].get("storage_only").is_none());
     }
 
     #[tokio::test]
@@ -1728,6 +1779,33 @@ mod tests {
         assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
         assert_eq!(body["data"]["machine"], MACHINE);
         assert!(body["data"]["glance"].is_object());
+    }
+
+    #[tokio::test]
+    async fn glance_preserves_provider_resume_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        seed_resumable_session(
+            tmp.path(),
+            "recover",
+            "claude",
+            "hs-claude-recover",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        add_provider_resume_extra(tmp.path(), "recover");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(router(st.clone()), get("/sessions/recover/glance")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let glance = &body["data"]["glance"];
+        assert_eq!(glance["provider_resume"]["provider"], "claude");
+        assert_eq!(
+            glance["provider_resume"]["resume_args"],
+            json!(["--resume", "resume-session-id"])
+        );
+        assert!(glance["provider_resume"].get("storage_only").is_none());
     }
 
     #[tokio::test]
