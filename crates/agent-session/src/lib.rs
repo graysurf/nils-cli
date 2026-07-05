@@ -2,7 +2,7 @@ mod cli;
 pub mod completion;
 mod serve;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -36,6 +36,7 @@ const LOGS_COMMAND: &str = "logs";
 const SEND_COMMAND: &str = "send";
 const GLANCE_COMMAND: &str = "glance";
 const DELETE_COMMAND: &str = "delete";
+const WORKDIR_USAGE_FILE: &str = "workdir-usage.json";
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -369,6 +370,18 @@ struct WorkdirResult {
     name: String,
     root: String,
     is_git_repo: bool,
+    last_used: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct WorkdirSearchOptions {
+    git_only: bool,
+    exclude_worktrees: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct WorkdirUsage {
+    entries: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +471,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
     }
 
     let result = session_view(context, &created.record, Some("running".to_string()));
+    record_workdir_usage(context, &cwd);
     Ok(StartView {
         format: args.format,
         result,
@@ -502,6 +516,7 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
     }
 
     let result = session_view(context, &created.record, Some("running".to_string()));
+    record_workdir_usage(context, &cwd);
     Ok(StartView {
         format: args.format,
         result,
@@ -1044,17 +1059,22 @@ const WORKDIR_SEARCH_MAX_VISITED: usize = 5000;
 const WORKDIR_SEARCH_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn search_workdirs(
+    context: &CliContext,
     query: Option<&str>,
     limit: Option<usize>,
+    options: WorkdirSearchOptions,
 ) -> Result<Vec<WorkdirResult>, CliError> {
     let Some(home) = home_dir() else {
         return Ok(Vec::new());
     };
     let roots = [home.join("Project"), home.join(".config")];
+    let usage = load_workdir_usage(context);
     search_workdirs_in_roots(
         &roots,
         query.unwrap_or_default(),
         limit.unwrap_or(30).clamp(1, 100),
+        options,
+        &usage,
     )
 }
 
@@ -1062,6 +1082,8 @@ fn search_workdirs_in_roots(
     roots: &[PathBuf],
     query: &str,
     limit: usize,
+    options: WorkdirSearchOptions,
+    usage: &BTreeMap<String, String>,
 ) -> Result<Vec<WorkdirResult>, CliError> {
     #[derive(Debug)]
     struct Candidate {
@@ -1106,18 +1128,29 @@ fn search_workdirs_in_roots(
                 .and_then(|value| value.to_str())
                 .unwrap_or_default()
                 .to_string();
-            if depth > 0 && workdir_matches(&path, &name, &query) {
+            let is_git_repo = is_git_repo(&path);
+            let is_linked_worktree = is_linked_worktree(&path);
+            let include = depth > 0
+                && workdir_matches(&path, &name, &query)
+                && (!options.git_only || is_git_repo)
+                && (!options.exclude_worktrees || !is_linked_worktree);
+            if include {
+                let path_display = display_path(&path);
                 matches.push(Candidate {
                     depth,
                     result: WorkdirResult {
-                        path: display_path(&path),
+                        last_used: usage.get(&path_display).cloned(),
+                        path: path_display,
                         name,
                         root: root_display.clone(),
-                        is_git_repo: path.join(".git").exists(),
+                        is_git_repo,
                     },
                 });
             }
             if depth >= WORKDIR_SEARCH_MAX_DEPTH {
+                continue;
+            }
+            if options.git_only && is_git_repo {
                 continue;
             }
             let Ok(entries) = fs::read_dir(&path) else {
@@ -1127,6 +1160,14 @@ fn search_workdirs_in_roots(
                 let Ok(file_type) = entry.file_type() else {
                     continue;
                 };
+                if options.git_only
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name == ".git")
+                {
+                    continue;
+                }
                 if file_type.is_dir() {
                     queue.push_back((entry.path(), depth + 1));
                 }
@@ -1135,10 +1176,15 @@ fn search_workdirs_in_roots(
     }
 
     matches.sort_by(|a, b| {
-        b.result
-            .is_git_repo
-            .cmp(&a.result.is_git_repo)
-            .then_with(|| a.depth.cmp(&b.depth))
+        let base = if options.git_only || options.exclude_worktrees {
+            b.result
+                .last_used
+                .cmp(&a.result.last_used)
+                .then_with(|| a.result.name.cmp(&b.result.name))
+        } else {
+            b.result.is_git_repo.cmp(&a.result.is_git_repo)
+        };
+        base.then_with(|| a.depth.cmp(&b.depth))
             .then_with(|| a.result.path.cmp(&b.result.path))
     });
     matches.truncate(limit);
@@ -1154,6 +1200,43 @@ fn workdir_matches(path: &Path, name: &str, query: &str) -> bool {
     }
     name.to_ascii_lowercase().contains(query)
         || path.to_string_lossy().to_ascii_lowercase().contains(query)
+}
+
+fn is_git_repo(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
+fn is_linked_worktree(path: &Path) -> bool {
+    fs::symlink_metadata(path.join(".git"))
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+}
+
+fn workdir_usage_path(context: &CliContext) -> PathBuf {
+    context.state_dir.join(WORKDIR_USAGE_FILE)
+}
+
+fn load_workdir_usage(context: &CliContext) -> BTreeMap<String, String> {
+    let path = workdir_usage_path(context);
+    let Ok(contents) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_str::<WorkdirUsage>(&contents)
+        .map(|usage| usage.entries)
+        .unwrap_or_default()
+}
+
+fn record_workdir_usage(context: &CliContext, cwd: &Path) {
+    let path = workdir_usage_path(context);
+    let mut usage = WorkdirUsage {
+        entries: load_workdir_usage(context),
+    };
+    usage
+        .entries
+        .insert(display_path(cwd), Zoned::now().timestamp().to_string());
+    if let Ok(bytes) = serde_json::to_vec_pretty(&usage) {
+        let _ = write_atomic(&path, &bytes, SECRET_FILE_MODE);
+    }
 }
 
 fn list_sessions(
