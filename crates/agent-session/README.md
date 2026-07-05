@@ -53,6 +53,11 @@ is no second state model.
 - `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
   `POST /sessions/{id}/resume`,
   `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
+- `POST /sessions` normally creates a fresh session from `agent`, optional `cwd`, `title`, `id`, `prompt`, and
+  `agent_args`. When `provider_resume_id` is present (alias: `resume_id`), the daemon imports an existing Codex or
+  Claude provider conversation instead: it resolves the original cwd from local provider history, persists exact
+  `provider_resume` metadata, and starts tmux with the canonical resume command. In resume-id mode, omit `cwd`, `prompt`,
+  and `agent_args`; invalid, missing, ambiguous, or unsupported provider ids return structured errors.
 - Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
   session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
   Empty or null titles clear the custom session title so clients can fall back to the session id.

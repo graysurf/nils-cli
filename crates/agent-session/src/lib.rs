@@ -47,6 +47,10 @@ const CODEX_RESUME_SCAN_MAX_DEPTH: usize = 6;
 const CODEX_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
 const CODEX_RESUME_SCAN_SLICE_MS: u64 = 250;
 const CODEX_SESSION_META_MAX_LINE_BYTES: u64 = 64 * 1024;
+const CLAUDE_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
+const CLAUDE_RESUME_SCAN_SLICE_MS: u64 = 250;
+const CLAUDE_SESSION_SCAN_MAX_LINES: usize = 64;
+const CLAUDE_SESSION_META_MAX_LINE_BYTES: usize = 1024 * 1024;
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -412,6 +416,17 @@ struct StartView {
     result: SessionView,
 }
 
+pub(crate) struct ProviderResumeImportArgs {
+    pub(crate) agent: AgentKind,
+    pub(crate) provider_resume_id: String,
+    pub(crate) title: Option<String>,
+    pub(crate) id: Option<String>,
+    pub(crate) tmux_bin: Option<PathBuf>,
+    pub(crate) agent_bin: Option<PathBuf>,
+    pub(crate) agent_args: Vec<String>,
+    pub(crate) format: OutputFormat,
+}
+
 #[derive(Debug, Serialize)]
 struct DeleteResult {
     id: String,
@@ -638,6 +653,69 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
     })
 }
 
+pub(crate) fn start_provider_resume_session(
+    context: &CliContext,
+    args: ProviderResumeImportArgs,
+) -> Result<StartView, CliError> {
+    validate_provider_resume_import_agent_args(args.agent, &args.agent_args)?;
+    validate_agent_args(args.agent, &args.agent_args)?;
+    let provider_resume_id = normalize_provider_resume_id(&args.provider_resume_id)?;
+    let source = resolve_provider_resume_source(args.agent, &provider_resume_id)?;
+    let cwd = resolve_cwd(Some(&source.cwd))?;
+    let cwd_string = display_path(&cwd);
+    let resume_args = canonical_provider_resume_args(args.agent, &cwd_string, &provider_resume_id)
+        .ok_or_else(|| {
+            CliError::usage(
+                "unsupported-provider-resume-agent",
+                format!(
+                    "{} sessions cannot be imported by provider resume id",
+                    args.agent.as_str()
+                ),
+                Some(json!({ "agent": args.agent.as_str() })),
+            )
+        })?;
+    let provider_resume = ProviderResume {
+        provider: args.agent.as_str().to_string(),
+        session_id: provider_resume_id,
+        captured_at: Zoned::now().timestamp().to_string(),
+        capture_method: source.capture_method,
+        resume_args,
+        extra: BTreeMap::new(),
+    };
+    let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
+    let agent_bin = resolve_agent_bin(args.agent, args.agent_bin.as_deref());
+    let created = create_record(RecordRequest {
+        context,
+        agent: args.agent,
+        mode: "interactive",
+        title: args.title.as_deref(),
+        explicit_id: args.id.as_deref(),
+        cwd: &cwd,
+        prompt: None,
+        log_file_name: None,
+        provider_resume: Some(provider_resume.clone()),
+        agent_args: args.agent_args,
+        agent_bin: Some(display_path(&agent_bin)),
+    })?;
+
+    if let Err(err) = start_resume_tmux(
+        &tmux_bin,
+        &agent_bin,
+        &created.record,
+        &provider_resume.resume_args,
+    ) {
+        cleanup_created_record(&created);
+        return Err(err);
+    }
+
+    let result = session_view(context, &created.record, Some("running".to_string()));
+    record_workdir_usage(context, &cwd);
+    Ok(StartView {
+        format: args.format,
+        result,
+    })
+}
+
 struct CreatedRecord {
     record: SessionRecord,
     prompt_file: Option<PathBuf>,
@@ -766,23 +844,394 @@ fn validate_agent_args(agent: AgentKind, args: &[String]) -> Result<(), CliError
     Ok(())
 }
 
+fn validate_provider_resume_import_agent_args(
+    agent: AgentKind,
+    args: &[String],
+) -> Result<(), CliError> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::usage(
+        "provider-resume-agent-args-conflict",
+        "provider_resume_id mode owns the resume command; omit agent_args",
+        Some(json!({ "agent": agent.as_str() })),
+    ))
+}
+
 fn reserved_claude_resume_arg(arg: &str) -> Option<&'static str> {
     [
-        "--session-id",
-        "--resume",
-        "-r",
-        "--continue",
-        "-c",
-        "--fork-session",
-        "--from-pr",
+        ("--session-id", false),
+        ("--resume", false),
+        ("-r", true),
+        ("--continue", false),
+        ("-c", false),
+        ("--fork-session", false),
+        ("--from-pr", false),
     ]
     .into_iter()
-    .find(|flag| {
-        arg == *flag
-            || arg
-                .strip_prefix(*flag)
-                .is_some_and(|rest| rest.starts_with('='))
+    .find_map(|(flag, allow_attached_short_value)| {
+        reserved_agent_arg_matches(arg, flag, allow_attached_short_value).then_some(flag)
     })
+}
+
+fn reserved_codex_resume_arg(arg: &str) -> Option<&'static str> {
+    [
+        ("--cd", false),
+        ("-C", true),
+        ("--last", false),
+        ("--all", false),
+        ("--include-non-interactive", false),
+    ]
+    .into_iter()
+    .find_map(|(flag, allow_attached_short_value)| {
+        reserved_agent_arg_matches(arg, flag, allow_attached_short_value).then_some(flag)
+    })
+}
+
+fn reserved_agent_arg_matches(
+    arg: &str,
+    flag: &'static str,
+    allow_attached_short_value: bool,
+) -> bool {
+    if arg == flag {
+        return true;
+    }
+    arg.strip_prefix(flag).is_some_and(|rest| {
+        rest.starts_with('=')
+            || (allow_attached_short_value
+                && flag.starts_with('-')
+                && !flag.starts_with("--")
+                && !rest.is_empty())
+    })
+}
+
+struct ProviderResumeSource {
+    cwd: PathBuf,
+    capture_method: String,
+}
+
+fn normalize_provider_resume_id(session_id: &str) -> Result<String, CliError> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err(CliError::usage(
+            "invalid-provider-resume-id",
+            "provider resume id must not be empty",
+            None,
+        ));
+    }
+    if session_id.chars().any(char::is_control) {
+        return Err(CliError::usage(
+            "invalid-provider-resume-id",
+            "provider resume id must not contain control characters",
+            None,
+        ));
+    }
+    Ok(session_id.to_string())
+}
+
+fn resolve_provider_resume_source(
+    agent: AgentKind,
+    session_id: &str,
+) -> Result<ProviderResumeSource, CliError> {
+    match agent {
+        AgentKind::Codex => resolve_codex_provider_resume_source(session_id),
+        AgentKind::Claude => resolve_claude_provider_resume_source(session_id),
+        AgentKind::Hermes => Err(CliError::usage(
+            "unsupported-provider-resume-agent",
+            "hermes sessions cannot be imported by provider resume id",
+            Some(json!({ "agent": agent.as_str() })),
+        )),
+    }
+}
+
+fn provider_resume_not_found(agent: AgentKind, session_id: &str) -> CliError {
+    CliError::data(
+        "provider-resume-not-found",
+        format!(
+            "no {} provider history contains resume id: {session_id}",
+            agent.as_str()
+        ),
+        Some(json!({ "agent": agent.as_str(), "provider_resume_id": session_id })),
+    )
+}
+
+fn provider_resume_ambiguous(agent: AgentKind, session_id: &str, cwd_count: usize) -> CliError {
+    CliError::data(
+        "provider-resume-ambiguous",
+        format!(
+            "{} provider history has multiple cwd matches for resume id: {session_id}",
+            agent.as_str()
+        ),
+        Some(json!({
+            "agent": agent.as_str(),
+            "provider_resume_id": session_id,
+            "cwd_count": cwd_count,
+        })),
+    )
+}
+
+fn provider_resume_scan_truncated(agent: AgentKind, session_id: &str) -> CliError {
+    CliError::runtime(
+        "provider-resume-scan-truncated",
+        format!(
+            "{} provider history scan was truncated before resume id could be resolved: {session_id}",
+            agent.as_str()
+        ),
+        Some(json!({ "agent": agent.as_str(), "provider_resume_id": session_id })),
+    )
+}
+
+fn resolve_codex_provider_resume_source(
+    session_id: &str,
+) -> Result<ProviderResumeSource, CliError> {
+    let root = codex_sessions_root()
+        .ok_or_else(|| provider_resume_not_found(AgentKind::Codex, session_id))?;
+    let mut matches = BTreeSet::new();
+    let mut budget = CodexResumeScanBudget::from_env();
+    collect_codex_provider_resume_matches(&root, 0, session_id, &mut matches, &mut budget);
+    if budget.truncated {
+        return Err(provider_resume_scan_truncated(AgentKind::Codex, session_id));
+    }
+    provider_resume_source_from_matches(
+        AgentKind::Codex,
+        session_id,
+        matches,
+        "codex-session-meta-import",
+    )
+}
+
+fn collect_codex_provider_resume_matches(
+    dir: &Path,
+    depth: usize,
+    session_id: &str,
+    matches: &mut BTreeSet<String>,
+    budget: &mut CodexResumeScanBudget,
+) {
+    if depth > CODEX_RESUME_SCAN_MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !budget.visit_entry() {
+            return;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_codex_provider_resume_matches(&path, depth + 1, session_id, matches, budget);
+            if budget.truncated {
+                return;
+            }
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(meta) = read_codex_session_meta(&path)
+            && meta.session_id == session_id
+        {
+            matches.insert(meta.cwd);
+        }
+    }
+}
+
+fn resolve_claude_provider_resume_source(
+    session_id: &str,
+) -> Result<ProviderResumeSource, CliError> {
+    let root = claude_projects_root()
+        .ok_or_else(|| provider_resume_not_found(AgentKind::Claude, session_id))?;
+    let mut matches = BTreeSet::new();
+    let mut budget = ClaudeResumeScanBudget::from_env();
+    collect_claude_provider_resume_matches(&root, session_id, &mut matches, &mut budget);
+    if budget.truncated {
+        return Err(provider_resume_scan_truncated(
+            AgentKind::Claude,
+            session_id,
+        ));
+    }
+    provider_resume_source_from_matches(
+        AgentKind::Claude,
+        session_id,
+        matches,
+        "claude-project-transcript-import",
+    )
+}
+
+fn claude_projects_root() -> Option<PathBuf> {
+    if let Some(claude_config_dir) = non_empty_env("CLAUDE_CONFIG_DIR") {
+        return Some(PathBuf::from(claude_config_dir).join("projects"));
+    }
+    home_dir().map(|home| home.join(".claude/projects"))
+}
+
+fn collect_claude_provider_resume_matches(
+    projects_root: &Path,
+    session_id: &str,
+    matches: &mut BTreeSet<String>,
+    budget: &mut ClaudeResumeScanBudget,
+) {
+    let Ok(projects) = fs::read_dir(projects_root) else {
+        return;
+    };
+    for project in projects.flatten() {
+        if !budget.visit_entry() {
+            return;
+        }
+        let Ok(project_type) = project.file_type() else {
+            continue;
+        };
+        if !project_type.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(project.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !budget.visit_entry() {
+                return;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            if let Some(cwd) = read_claude_session_cwd(&path, session_id) {
+                matches.insert(cwd);
+            }
+        }
+    }
+}
+
+fn provider_resume_source_from_matches(
+    agent: AgentKind,
+    session_id: &str,
+    matches: BTreeSet<String>,
+    capture_method: &str,
+) -> Result<ProviderResumeSource, CliError> {
+    match matches.len() {
+        0 => Err(provider_resume_not_found(agent, session_id)),
+        1 => Ok(ProviderResumeSource {
+            cwd: PathBuf::from(matches.iter().next().expect("single match")),
+            capture_method: capture_method.to_string(),
+        }),
+        len => Err(provider_resume_ambiguous(agent, session_id, len)),
+    }
+}
+
+#[derive(Debug)]
+struct ClaudeResumeScanBudget {
+    visited: usize,
+    max_entries: usize,
+    deadline: Instant,
+    truncated: bool,
+}
+
+impl ClaudeResumeScanBudget {
+    fn from_env() -> Self {
+        let max_entries = env_usize(
+            "AGENT_SESSION_CLAUDE_RESUME_SCAN_MAX_ENTRIES",
+            CLAUDE_RESUME_SCAN_MAX_ENTRIES,
+        )
+        .max(1);
+        let slice = Duration::from_millis(env_u64(
+            "AGENT_SESSION_CLAUDE_RESUME_SCAN_SLICE_MS",
+            CLAUDE_RESUME_SCAN_SLICE_MS,
+        ));
+        Self {
+            visited: 0,
+            max_entries,
+            deadline: Instant::now() + slice,
+            truncated: false,
+        }
+    }
+
+    fn visit_entry(&mut self) -> bool {
+        if self.visited >= self.max_entries || Instant::now() >= self.deadline {
+            self.truncated = true;
+            return false;
+        }
+        self.visited += 1;
+        true
+    }
+}
+
+fn read_claude_session_cwd(path: &Path, session_id: &str) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = io::BufReader::new(file);
+    let mut line = Vec::new();
+    for _ in 0..CLAUDE_SESSION_SCAN_MAX_LINES {
+        let within_limit =
+            read_bounded_line(&mut reader, &mut line, CLAUDE_SESSION_META_MAX_LINE_BYTES).ok()?;
+        let within_limit = within_limit?;
+        if !within_limit {
+            return None;
+        }
+        let Ok(line) = std::str::from_utf8(trim_line_ending(&line)) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let id_matches = value
+            .get("sessionId")
+            .or_else(|| value.get("session_id"))
+            .and_then(Value::as_str)
+            == Some(session_id);
+        if !id_matches || value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(cwd) = value
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|cwd| !cwd.trim().is_empty())
+        {
+            return Some(cwd.to_string());
+        }
+    }
+    None
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<Option<bool>> {
+    buffer.clear();
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((total > 0).then_some(true));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take_len = newline.map_or(available.len(), |index| index + 1);
+        let remaining = max_bytes.saturating_sub(total);
+        if take_len > remaining {
+            buffer.extend_from_slice(&available[..remaining]);
+            let consume_len = remaining.saturating_add(1).min(take_len);
+            reader.consume(consume_len);
+            return Ok(Some(false));
+        }
+        buffer.extend_from_slice(&available[..take_len]);
+        total = total.saturating_add(take_len);
+        reader.consume(take_len);
+        if newline.is_some() {
+            return Ok(Some(true));
+        }
+    }
+}
+
+fn trim_line_ending(bytes: &[u8]) -> &[u8] {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
 fn start_interactive_tmux(
@@ -905,6 +1354,7 @@ struct CodexResumeCandidate {
 #[derive(Debug, PartialEq)]
 struct CodexSessionMeta {
     session_id: String,
+    cwd: String,
     created_at: SystemTime,
 }
 
@@ -1022,11 +1472,15 @@ struct CodexResumeScanBudget {
 
 impl CodexResumeScanBudget {
     fn from_env() -> Self {
-        let max_entries = env_usize(
-            "AGENT_SESSION_CODEX_CAPTURE_MAX_ENTRIES",
-            CODEX_RESUME_SCAN_MAX_ENTRIES,
-        )
-        .max(1);
+        let max_entries = non_empty_env("AGENT_SESSION_CODEX_RESUME_SCAN_MAX_ENTRIES")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                env_usize(
+                    "AGENT_SESSION_CODEX_CAPTURE_MAX_ENTRIES",
+                    CODEX_RESUME_SCAN_MAX_ENTRIES,
+                )
+            })
+            .max(1);
         let slice = Duration::from_millis(env_u64(
             "AGENT_SESSION_CODEX_SCAN_SLICE_MS",
             CODEX_RESUME_SCAN_SLICE_MS,
@@ -1088,7 +1542,10 @@ fn collect_codex_resume_candidates(
         if modified_at < earliest {
             continue;
         }
-        if let Some(meta) = read_codex_session_meta(&path, cwd) {
+        if let Some(meta) = read_codex_session_meta(&path) {
+            if meta.cwd != cwd {
+                continue;
+            }
             if meta.created_at < earliest {
                 continue;
             }
@@ -1099,7 +1556,7 @@ fn collect_codex_resume_candidates(
     }
 }
 
-fn read_codex_session_meta(path: &Path, cwd: &str) -> Option<CodexSessionMeta> {
+fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
     let file = fs::File::open(path).ok()?;
     let mut reader = io::BufReader::new(file).take(CODEX_SESSION_META_MAX_LINE_BYTES + 1);
     let mut first_line = Vec::new();
@@ -1119,9 +1576,7 @@ fn read_codex_session_meta(path: &Path, cwd: &str) -> Option<CodexSessionMeta> {
         return None;
     }
     let payload = value.get("payload")?;
-    if payload.get("cwd").and_then(Value::as_str)? != cwd {
-        return None;
-    }
+    let cwd = payload.get("cwd").and_then(Value::as_str)?.to_string();
     if payload.get("source").and_then(Value::as_str)? != "cli" {
         return None;
     }
@@ -1138,6 +1593,7 @@ fn read_codex_session_meta(path: &Path, cwd: &str) -> Option<CodexSessionMeta> {
     let created_at: SystemTime = timestamp.parse::<Timestamp>().ok()?.into();
     Some(CodexSessionMeta {
         session_id,
+        cwd,
         created_at,
     })
 }
@@ -1386,18 +1842,16 @@ mod codex_resume_tests {
             r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        assert_eq!(
-            read_codex_session_meta(&path, "/repo").map(|meta| meta.session_id),
-            Some("codex-id".to_string())
-        );
-        assert_eq!(read_codex_session_meta(&path, "/other"), None);
+        let meta = read_codex_session_meta(&path).expect("session meta");
+        assert_eq!(meta.session_id, "codex-id");
+        assert_eq!(meta.cwd, "/repo");
 
         fs::write(
             &path,
             r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}},"timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        assert_eq!(read_codex_session_meta(&path, "/repo"), None);
+        assert_eq!(read_codex_session_meta(&path), None);
     }
 
     #[test]
@@ -1413,7 +1867,24 @@ mod codex_resume_tests {
         )
         .unwrap();
 
-        assert_eq!(read_codex_session_meta(&path, "/repo"), None);
+        assert_eq!(read_codex_session_meta(&path), None);
+    }
+
+    #[test]
+    fn bounded_line_reader_discards_oversized_lines_without_growing_buffer() {
+        let mut reader = io::Cursor::new(format!("{}\nvalid\n", "x".repeat(32)).into_bytes());
+        let mut line = Vec::new();
+
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 8).unwrap(),
+            Some(false)
+        );
+        assert_eq!(line.len(), 8);
+        assert_eq!(
+            reader.position(),
+            9,
+            "oversized lines must not be drained to newline"
+        );
     }
 
     #[test]
@@ -2435,14 +2906,18 @@ fn canonical_provider_resume_args(
 }
 
 fn validate_stored_agent_args(record: &SessionRecord, agent: AgentKind) -> Result<(), CliError> {
-    if agent != AgentKind::Claude {
-        return Ok(());
-    }
-    if let Some(flag) = record
-        .agent_args
-        .iter()
-        .find_map(|arg| reserved_claude_resume_arg(arg))
-    {
+    let flag = match agent {
+        AgentKind::Codex => record
+            .agent_args
+            .iter()
+            .find_map(|arg| reserved_codex_resume_arg(arg)),
+        AgentKind::Claude => record
+            .agent_args
+            .iter()
+            .find_map(|arg| reserved_claude_resume_arg(arg)),
+        AgentKind::Hermes => None,
+    };
+    if let Some(flag) = flag {
         return Err(CliError::data(
             "session-not-resumable",
             "session provider arguments conflict with durable resume identity",

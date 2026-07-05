@@ -33,10 +33,11 @@ use serde_json::{Value, json};
 
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::{
-    BINARY, CliContext, CliError, WorkdirSearchOptions, delete_session, glance_session,
-    list_sessions, load_session_record, non_empty_env, resolve_tmux_bin, resume_session_by_id,
-    run_capture_pane, search_workdirs, send_input, session_dir, session_status, short_hostname,
-    start_session, update_session_title, write_private_file, write_session_attachment,
+    BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
+    glance_session, list_sessions, load_session_record, non_empty_env, resolve_tmux_bin,
+    resume_session_by_id, run_capture_pane, search_workdirs, send_input, session_dir,
+    session_status, short_hostname, start_provider_resume_session, start_session,
+    update_session_title, write_private_file, write_session_attachment,
 };
 
 /// Monotonic counter giving each attach connection a private pipe file, so
@@ -293,6 +294,8 @@ struct CreateBody {
     title: Option<String>,
     id: Option<String>,
     prompt: Option<String>,
+    #[serde(default, alias = "resume_id")]
+    provider_resume_id: Option<String>,
     #[serde(default)]
     agent_args: Vec<String>,
 }
@@ -370,6 +373,43 @@ async fn create_handler(
         ));
     };
     let context = state.context.clone();
+    if let Some(provider_resume_id) = body.provider_resume_id {
+        if body.cwd.is_some() {
+            return envelope_err(CliError::usage(
+                "provider-resume-cwd-conflict",
+                "provider_resume_id mode resolves cwd from provider history; omit cwd",
+                None,
+            ));
+        }
+        if body.prompt.is_some() {
+            return envelope_err(CliError::usage(
+                "provider-resume-prompt-conflict",
+                "provider_resume_id mode imports an existing provider session; omit prompt",
+                None,
+            ));
+        }
+        let args = ProviderResumeImportArgs {
+            agent,
+            provider_resume_id,
+            title: body.title,
+            id: body.id,
+            tmux_bin: Some(state.tmux_bin.clone()),
+            agent_bin: None,
+            agent_args: body.agent_args,
+            format: nils_common::cli_contract::OutputFormat::Json,
+        };
+        return match tokio::task::spawn_blocking(move || {
+            start_provider_resume_session(&context, args)
+        })
+        .await
+        {
+            Ok(Ok(view)) => {
+                envelope_ok(json!({ "machine": state.machine, "session": view.result }))
+            }
+            Ok(Err(err)) => envelope_err(err),
+            Err(_) => join_err(),
+        };
+    }
     let args = cli::StartArgs {
         agent,
         cwd: body.cwd.map(PathBuf::from),
@@ -979,6 +1019,52 @@ mod tests {
         )
     }
 
+    fn write_codex_session_meta(codex_home: &Path, session_id: &str, cwd: &Path) {
+        write_codex_session_meta_file(codex_home, "session.jsonl", session_id, cwd);
+    }
+
+    fn write_codex_session_meta_file(
+        codex_home: &Path,
+        filename: &str,
+        session_id: &str,
+        cwd: &Path,
+    ) {
+        let path = codex_home.join("sessions/2026/07/05").join(filename);
+        std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{{"id":"{session_id}","session_id":"{session_id}","cwd":"{}","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}}}
+"#,
+                cwd.to_string_lossy()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_claude_session_transcript(
+        claude_config: &Path,
+        project_slug: &str,
+        session_id: &str,
+        cwd: &Path,
+    ) {
+        let path = claude_config
+            .join("projects")
+            .join(project_slug)
+            .join(format!("{session_id}.jsonl"));
+        std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"type":"mode","mode":"normal","sessionId":"{session_id}"}}
+{{"type":"user","isSidechain":false,"cwd":"{}","sessionId":"{session_id}"}}
+"#,
+                cwd.to_string_lossy()
+            ),
+        )
+        .unwrap();
+    }
+
     async fn call(app: Router, req: Request<Body>) -> (StatusCode, Value) {
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
@@ -1215,6 +1301,389 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "token-not-configured");
+    }
+
+    #[tokio::test]
+    async fn create_imports_codex_session_from_provider_resume_id() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let codex_home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_codex_session_meta(&codex_home, "external-codex-id", &cwd);
+        let log = tmp.path().join("tmux.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let codex = fake_agent(tmp.path(), "codex");
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "id": "imported-codex",
+                    "provider_resume_id": "external-codex-id",
+                    "title": "Imported Codex"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["session"];
+        assert_eq!(session["id"], "imported-codex");
+        assert_eq!(session["agent"], "codex");
+        assert_eq!(session["cwd"], cwd.to_string_lossy().as_ref());
+        assert_eq!(session["status"], "running");
+        assert_eq!(session["resumable"], true);
+        assert_eq!(
+            session["provider_resume"]["session_id"],
+            "external-codex-id"
+        );
+        assert_eq!(
+            session["provider_resume"]["resume_args"],
+            json!([
+                "resume",
+                "external-codex-id",
+                "--cd",
+                cwd.to_string_lossy(),
+                "--no-alt-screen"
+            ])
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("new-session -d -s hs-codex-imported-codex"),
+            "import must create a tmux runtime: {calls:?}"
+        );
+        assert!(
+            calls.contains("resume external-codex-id"),
+            "import must use the external provider id: {calls:?}"
+        );
+        assert!(
+            calls.contains("--cd") && calls.contains(cwd.to_string_lossy().as_ref()),
+            "import must resume in the provider cwd: {calls:?}"
+        );
+        assert!(
+            tmp.path()
+                .join("sessions/imported-codex/resume.json")
+                .is_file(),
+            "import must persist durable resume metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_imports_claude_session_from_resume_id_alias() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let claude_config = tmp.path().join("claude-config");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_claude_session_transcript(
+            &claude_config,
+            "-fixture-project",
+            "external-claude-id",
+            &cwd,
+        );
+        let log = tmp.path().join("tmux.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let claude = fake_agent(tmp.path(), "claude");
+        let _claude_config =
+            EnvGuard::set(&lock, "CLAUDE_CONFIG_DIR", claude_config.to_str().unwrap());
+        let _claude_bin =
+            EnvGuard::set(&lock, "AGENT_SESSION_CLAUDE_BIN", claude.to_str().unwrap());
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "claude",
+                    "id": "imported-claude",
+                    "resume_id": "external-claude-id",
+                    "title": "Imported Claude"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["session"];
+        assert_eq!(session["id"], "imported-claude");
+        assert_eq!(session["agent"], "claude");
+        assert_eq!(session["cwd"], cwd.to_string_lossy().as_ref());
+        assert_eq!(session["status"], "running");
+        assert_eq!(session["resumable"], true);
+        assert_eq!(
+            session["provider_resume"]["session_id"],
+            "external-claude-id"
+        );
+        assert_eq!(
+            session["provider_resume"]["resume_args"],
+            json!(["--resume", "external-claude-id"])
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("new-session -d -s hs-claude-imported-claude"),
+            "import must create a tmux runtime: {calls:?}"
+        );
+        assert!(
+            calls.contains("--resume external-claude-id"),
+            "import must use the external provider id: {calls:?}"
+        );
+        assert!(
+            !calls.contains("--session-id"),
+            "imported Claude resume must not create a new provider session: {calls:?}"
+        );
+        assert!(
+            tmp.path()
+                .join("sessions/imported-claude/resume.json")
+                .is_file(),
+            "import must persist durable resume metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_provider_resume_id_rejects_cwd_and_prompt_overrides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "provider_resume_id": "external-id",
+                    "cwd": "/should-not-override"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "provider-resume-cwd-conflict");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "provider_resume_id": "external-id",
+                    "prompt": "continue"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "provider-resume-prompt-conflict");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "provider_resume_id": "external-id",
+                    "agent_args": ["--cd", "/should-not-override"]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "provider-resume-agent-args-conflict");
+    }
+
+    #[tokio::test]
+    async fn create_provider_resume_id_reports_not_found() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "provider_resume_id": "missing-codex-id"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "provider-resume-not-found");
+        assert_eq!(
+            body["error"]["details"]["provider_resume_id"],
+            "missing-codex-id"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_provider_resume_id_rejects_invalid_values() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        for provider_resume_id in ["", "bad\nid"] {
+            let (status, body) = call(
+                router(st.clone()),
+                post_json(
+                    "/sessions",
+                    Some(TOKEN),
+                    json!({
+                        "agent": "codex",
+                        "provider_resume_id": provider_resume_id
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "invalid-provider-resume-id");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_provider_resume_id_reports_ambiguous_cwd_matches() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let cwd_a = tmp.path().join("repo-a");
+        let cwd_b = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&cwd_a).unwrap();
+        std::fs::create_dir_all(&cwd_b).unwrap();
+        write_codex_session_meta_file(&codex_home, "first.jsonl", "shared-codex-id", &cwd_a);
+        write_codex_session_meta_file(&codex_home, "second.jsonl", "shared-codex-id", &cwd_b);
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "provider_resume_id": "shared-codex-id"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "provider-resume-ambiguous");
+        assert_eq!(body["error"]["details"]["cwd_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn create_provider_resume_id_reports_scan_truncation() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_codex_session_meta(&codex_home, "external-codex-id", &cwd);
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let _max_entries = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RESUME_SCAN_MAX_ENTRIES", "1");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "provider_resume_id": "external-codex-id"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "provider-resume-scan-truncated");
+    }
+
+    #[tokio::test]
+    async fn create_imports_claude_session_after_oversized_transcript_line() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let claude_config = tmp.path().join("claude-config");
+        let bad_transcript = claude_config
+            .join("projects")
+            .join("-fixture-project")
+            .join("oversized.jsonl");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(bad_transcript.parent().expect("parent")).unwrap();
+        std::fs::write(
+            &bad_transcript,
+            "x".repeat(crate::CLAUDE_SESSION_META_MAX_LINE_BYTES + 1),
+        )
+        .unwrap();
+        write_claude_session_transcript(
+            &claude_config,
+            "-fixture-project",
+            "external-claude-id",
+            &cwd,
+        );
+        let log = tmp.path().join("tmux.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let claude = fake_agent(tmp.path(), "claude");
+        let _claude_config =
+            EnvGuard::set(&lock, "CLAUDE_CONFIG_DIR", claude_config.to_str().unwrap());
+        let _claude_bin =
+            EnvGuard::set(&lock, "AGENT_SESSION_CLAUDE_BIN", claude.to_str().unwrap());
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "claude",
+                    "id": "imported-claude-oversized",
+                    "provider_resume_id": "external-claude-id"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(
+            body["data"]["session"]["cwd"],
+            cwd.to_string_lossy().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_provider_resume_id_rejects_unsupported_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "hermes",
+                    "provider_resume_id": "external-id"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "unsupported-provider-resume-agent");
     }
 
     #[tokio::test]
