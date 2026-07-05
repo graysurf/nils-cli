@@ -1049,6 +1049,16 @@ fn write_resumable_session_record_with_agent_bin(
     session
 }
 
+fn add_provider_resume_extra(session: &Path) {
+    let record_path = session.join("session.json");
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
+            .expect("record json");
+    record["provider_resume"]["storage_only"] = json!({ "keep": true });
+    fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap())
+        .expect("rewrite session record");
+}
+
 fn write_resume_sidecar(
     session: &Path,
     agent: &str,
@@ -1903,7 +1913,7 @@ fn list_marks_missing_tmux_with_resume_identity_as_resumable() {
     let cwd = tmp.path().join("repo");
     fs::create_dir_all(&cwd).expect("repo dir");
     let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
-    write_resumable_session_record(
+    let session = write_resumable_session_record(
         &state_dir,
         "recoverable",
         "codex",
@@ -1917,6 +1927,7 @@ fn list_marks_missing_tmux_with_resume_identity_as_resumable() {
             "--no-alt-screen",
         ],
     );
+    add_provider_resume_extra(&session);
 
     let state_arg = state_dir.to_string_lossy().to_string();
     let tmux_arg = tmux_bin.to_string_lossy().to_string();
@@ -1955,6 +1966,7 @@ fn list_marks_missing_tmux_with_resume_identity_as_resumable() {
             "--no-alt-screen"
         ])
     );
+    assert!(sessions[0]["provider_resume"].get("storage_only").is_none());
 }
 
 #[test]
@@ -2160,6 +2172,25 @@ fn resume_recovers_provider_identity_from_durable_sidecar() {
     let list_json = list.stdout_json();
     let sessions = data(&list_json).as_array().expect("list data");
     assert_eq!(sessions[0]["status"], "stopped");
+    assert_eq!(sessions[0]["provider_resume"]["provider"], "codex");
+    assert_eq!(
+        sessions[0]["provider_resume"]["session_id"],
+        "resume-session-id"
+    );
+    assert_eq!(
+        sessions[0]["provider_resume"]["capture_method"],
+        "fixture-sidecar"
+    );
+    assert_eq!(
+        sessions[0]["provider_resume"]["resume_args"],
+        json!([
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen"
+        ])
+    );
 
     let resume = run(
         tmp.path(),
@@ -2983,6 +3014,7 @@ fn glance_returns_pane_tail_and_status_contract() {
     assert_eq!(result["id"], "look");
     assert_eq!(result["agent"], "claude");
     assert_eq!(result["status"], "running");
+    assert!(result.get("provider_resume").is_none());
     let tail = result["tail"].as_str().expect("tail");
     assert!(
         tail.contains("pane one") && tail.contains("pane two"),
@@ -3011,6 +3043,71 @@ fn glance_returns_pane_tail_and_status_contract() {
     let stopped_result = data(&stopped.stdout_json()).clone();
     assert_eq!(stopped_result["status"], "stopped");
     assert_eq!(stopped_result["tail"], "");
+    assert!(stopped_result.get("provider_resume").is_none());
+
+    let recover_cwd = tmp.path().join("recoverable-repo");
+    fs::create_dir_all(&recover_cwd).expect("recoverable repo dir");
+    let recover_session = write_resumable_session_record(
+        &state_dir,
+        "recoverable",
+        "codex",
+        "hs-codex-recoverable",
+        &recover_cwd,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            recover_cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
+    );
+    add_provider_resume_extra(&recover_session);
+
+    let resumable = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "glance",
+            "recoverable",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(resumable.code, 0, "stderr={}", resumable.stderr_text());
+    let resumable_result = data(&resumable.stdout_json()).clone();
+    assert_eq!(resumable_result["status"], "stopped");
+    assert_eq!(resumable_result["resumable"], true);
+    assert_eq!(resumable_result["provider_resume"]["provider"], "codex");
+    assert_eq!(
+        resumable_result["provider_resume"]["session_id"],
+        "resume-session-id"
+    );
+    assert_eq!(
+        resumable_result["provider_resume"]["capture_method"],
+        "fixture"
+    );
+    assert_eq!(
+        resumable_result["provider_resume"]["resume_args"],
+        json!([
+            "resume",
+            "resume-session-id",
+            "--cd",
+            recover_cwd.to_str().unwrap(),
+            "--no-alt-screen"
+        ])
+    );
+    assert!(
+        resumable_result["provider_resume"]
+            .get("storage_only")
+            .is_none()
+    );
 }
 
 #[test]

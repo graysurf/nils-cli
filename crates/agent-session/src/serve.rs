@@ -946,6 +946,14 @@ mod tests {
         .unwrap();
     }
 
+    fn add_provider_resume_extra(state_dir: &Path, id: &str) {
+        let path = state_dir.join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        record["provider_resume"]["storage_only"] = json!({ "keep": true });
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+    }
+
     fn executable(path: &Path, body: &str) -> PathBuf {
         std::fs::write(path, body).unwrap();
         let mut perms = std::fs::metadata(path).unwrap().permissions();
@@ -1087,6 +1095,7 @@ mod tests {
                 "--no-alt-screen",
             ],
         );
+        add_provider_resume_extra(tmp.path(), "recover");
         let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
 
         let (status, body) = call(router(st.clone()), get("/sessions")).await;
@@ -1107,6 +1116,7 @@ mod tests {
                 "--no-alt-screen"
             ])
         );
+        assert!(session["provider_resume"].get("storage_only").is_none());
     }
 
     #[tokio::test]
@@ -1784,6 +1794,7 @@ mod tests {
             &cwd,
             &["--resume", "resume-session-id"],
         );
+        add_provider_resume_extra(tmp.path(), "recover");
         let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
 
         let (status, body) = call(router(st.clone()), get("/sessions/recover/glance")).await;
@@ -1794,6 +1805,7 @@ mod tests {
             glance["provider_resume"]["resume_args"],
             json!(["--resume", "resume-session-id"])
         );
+        assert!(glance["provider_resume"].get("storage_only").is_none());
     }
 
     #[tokio::test]
