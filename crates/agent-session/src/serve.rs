@@ -33,9 +33,9 @@ use serde_json::{Value, json};
 
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::{
-    BINARY, CliContext, CliError, delete_session, glance_session, list_sessions,
-    load_session_record, non_empty_env, resolve_tmux_bin, run_capture_pane, search_workdirs,
-    send_input, session_dir, short_hostname, start_session, update_session_title,
+    BINARY, CliContext, CliError, WorkdirSearchOptions, delete_session, glance_session,
+    list_sessions, load_session_record, non_empty_env, resolve_tmux_bin, run_capture_pane,
+    search_workdirs, send_input, session_dir, short_hostname, start_session, update_session_title,
     write_private_file, write_session_attachment,
 };
 
@@ -312,6 +312,10 @@ struct AttachmentQuery {
 struct WorkdirQuery {
     q: Option<String>,
     limit: Option<usize>,
+    #[serde(default)]
+    git_only: bool,
+    #[serde(default)]
+    exclude_worktrees: bool,
 }
 
 // --- handlers -----------------------------------------------------------------
@@ -526,7 +530,16 @@ async fn workdirs_handler(
     }
     let q = query.q.clone();
     let limit = query.limit;
-    match tokio::task::spawn_blocking(move || search_workdirs(q.as_deref(), limit)).await {
+    let options = WorkdirSearchOptions {
+        git_only: query.git_only,
+        exclude_worktrees: query.exclude_worktrees,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        search_workdirs(&context, q.as_deref(), limit, options)
+    })
+    .await
+    {
         Ok(Ok(workdirs)) => envelope_ok(json!({ "machine": state.machine, "workdirs": workdirs })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
@@ -1321,6 +1334,127 @@ mod tests {
                 .any(|item| item["path"] == config_match.to_string_lossy().as_ref()),
             ".config match missing: {workdirs:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn workdir_search_can_return_git_repos_without_linked_worktrees() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let project_repo = home.join("Project/sympoies/agent-console");
+        let linked_worktree = home.join("Project/sympoies/wt-agent-console-21");
+        let non_git_dir = home.join("Project/sympoies/notes");
+        let config_repo = home.join(".config/zsh");
+        std::fs::create_dir_all(project_repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&linked_worktree).unwrap();
+        std::fs::write(
+            linked_worktree.join(".git"),
+            "gitdir: ../agent-console/.git/worktrees/wt-agent-console-21\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&non_git_dir).unwrap();
+        std::fs::create_dir_all(config_repo.join(".git")).unwrap();
+        let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
+
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth(
+                "/workdirs?q=&limit=20&git_only=true&exclude_worktrees=true",
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let workdirs = body["data"]["workdirs"].as_array().expect("workdirs array");
+        let paths: Vec<&str> = workdirs
+            .iter()
+            .filter_map(|item| item["path"].as_str())
+            .collect();
+        assert!(
+            paths.contains(&project_repo.to_string_lossy().as_ref()),
+            "primary project repo missing: {workdirs:?}"
+        );
+        assert!(
+            paths.contains(&config_repo.to_string_lossy().as_ref()),
+            "config repo missing: {workdirs:?}"
+        );
+        assert!(
+            !paths.contains(&non_git_dir.to_string_lossy().as_ref()),
+            "non-git dir must not be returned: {workdirs:?}"
+        );
+        assert!(
+            !paths.contains(&linked_worktree.to_string_lossy().as_ref()),
+            "linked worktree must not be returned: {workdirs:?}"
+        );
+        assert!(
+            workdirs.iter().all(|item| item["is_git_repo"] == true),
+            "all returned rows must be git repos: {workdirs:?}"
+        );
+        assert!(
+            workdirs.iter().all(|item| item.get("last_used").is_some()),
+            "last_used field must be present for every row: {workdirs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_records_workdir_usage_for_recent_first_search() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let alpha_repo = home.join("Project/sympoies/alpha");
+        let beta_repo = home.join("Project/sympoies/beta");
+        std::fs::create_dir_all(alpha_repo.join(".git")).unwrap();
+        std::fs::create_dir_all(beta_repo.join(".git")).unwrap();
+        let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
+        let tmux = minimal_tmux(tmp.path());
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "id": "uses-beta",
+                    "cwd": beta_repo.to_string_lossy(),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth(
+                "/workdirs?q=&limit=20&git_only=true&exclude_worktrees=true",
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let workdirs = body["data"]["workdirs"].as_array().expect("workdirs array");
+        assert_eq!(
+            workdirs
+                .first()
+                .and_then(|item| item["path"].as_str())
+                .unwrap_or_default(),
+            beta_repo.to_string_lossy().as_ref(),
+            "created cwd must rank first: {workdirs:?}"
+        );
+        assert!(
+            workdirs
+                .first()
+                .and_then(|item| item["last_used"].as_str())
+                .is_some_and(|value| !value.is_empty()),
+            "created cwd must expose last_used: {workdirs:?}"
+        );
+        let alpha = workdirs
+            .iter()
+            .find(|item| item["path"] == alpha_repo.to_string_lossy().as_ref())
+            .expect("unused repo row");
+        assert_eq!(alpha["last_used"], Value::Null);
     }
 
     #[tokio::test]
