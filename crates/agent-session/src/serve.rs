@@ -34,9 +34,9 @@ use serde_json::{Value, json};
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::{
     BINARY, CliContext, CliError, WorkdirSearchOptions, delete_session, glance_session,
-    list_sessions, load_session_record, non_empty_env, resolve_tmux_bin, run_capture_pane,
-    search_workdirs, send_input, session_dir, short_hostname, start_session, update_session_title,
-    write_private_file, write_session_attachment,
+    list_sessions, load_session_record, non_empty_env, resolve_tmux_bin, resume_session_by_id,
+    run_capture_pane, search_workdirs, send_input, session_dir, session_status, short_hostname,
+    start_session, update_session_title, write_private_file, write_session_attachment,
 };
 
 /// Monotonic counter giving each attach connection a private pipe file, so
@@ -145,6 +145,7 @@ fn router(state: Arc<ServeState>) -> Router {
         .route("/workdirs", get(workdirs_handler))
         .route("/sessions/{id}/glance", get(glance_handler))
         .route("/sessions/{id}/send", post(send_handler))
+        .route("/sessions/{id}/resume", post(resume_handler))
         .route(
             "/sessions/{id}/attachments",
             post(upload_attachment_handler),
@@ -428,6 +429,23 @@ async fn send_handler(
     }
 }
 
+async fn resume_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
+    match tokio::task::spawn_blocking(move || resume_session_by_id(&context, &id, &tmux)).await {
+        Ok(Ok(session)) => envelope_ok(json!({ "machine": state.machine, "session": session })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
 async fn update_session_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
@@ -585,6 +603,14 @@ async fn attach_handler(
         Err(_) => return join_err(),
     };
     let tmux = state.tmux_bin.clone();
+    let status = session_status(&tmux, &record);
+    if status != "running" {
+        return envelope_err(CliError::data(
+            "session-not-running",
+            format!("session is not running: {}", record.id),
+            Some(json!({ "id": record.id, "status": status })),
+        ));
+    }
     ws.on_upgrade(move |socket| attach_socket(socket, context, tmux, record))
 }
 
@@ -858,6 +884,78 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_resumable_session(
+        state_dir: &Path,
+        id: &str,
+        agent: &str,
+        tmux_session: &str,
+        cwd: &Path,
+        resume_args: &[&str],
+    ) {
+        let dir = state_dir.join("sessions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let resume_args = serde_json::to_string(resume_args).unwrap();
+        std::fs::write(
+            dir.join("session.json"),
+            format!(
+                r#"{{
+  "schema_version": "agent-session.session.v1",
+  "id": "{id}",
+  "agent": "{agent}",
+  "mode": "interactive",
+  "title": null,
+  "cwd": "{}",
+  "tmux_session": "{tmux_session}",
+  "prompt_file": null,
+  "log_file": null,
+  "created_at": "2000-01-01T00:00:00Z",
+  "updated_at": "2000-01-01T00:00:00Z",
+  "provider_resume": {{
+    "provider": "{agent}",
+    "session_id": "resume-session-id",
+    "captured_at": "2000-01-01T00:00:00Z",
+    "capture_method": "fixture",
+    "resume_args": {resume_args}
+  }},
+  "runtime": {{
+    "kind": "tmux",
+    "tmux_session": "{tmux_session}",
+    "generation": 1,
+    "started_at": "2000-01-01T00:00:00Z"
+  }},
+  "agent_args": []
+}}"#,
+                cwd.to_string_lossy()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn executable(path: &Path, body: &str) -> PathBuf {
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+        path.to_path_buf()
+    }
+
+    fn resume_tmux(dir: &Path, log: &Path) -> PathBuf {
+        executable(
+            &dir.join("tmux"),
+            &format!(
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  *) exit 0 ;;\nesac\n",
+                shell_words::quote(&log.to_string_lossy())
+            ),
+        )
+    }
+
+    fn fake_agent(dir: &Path, name: &str) -> PathBuf {
+        executable(
+            &dir.join(name),
+            "#!/usr/bin/env sh\nprintf 'fake agent started\\n'\n",
+        )
+    }
+
     async fn call(app: Router, req: Request<Body>) -> (StatusCode, Value) {
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
@@ -1083,6 +1181,62 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid-key");
+    }
+
+    #[tokio::test]
+    async fn resume_recreates_missing_runtime_with_token() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let codex = fake_agent(tmp.path(), "codex");
+        let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        seed_resumable_session(
+            tmp.path(),
+            "recover",
+            "codex",
+            "hs-codex-recover",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json("/sessions/recover/resume", None, json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json("/sessions/recover/resume", Some(TOKEN), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["session"];
+        assert_eq!(session["id"], "recover");
+        assert_eq!(session["status"], "running");
+        assert_eq!(session["resumable"], true);
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("new-session -d -s hs-codex-recover"),
+            "resume must create a tmux runtime: {calls:?}"
+        );
+        assert!(
+            calls.contains("resume resume-session-id"),
+            "resume must use the exact provider id: {calls:?}"
+        );
     }
 
     #[tokio::test]
@@ -1717,6 +1871,9 @@ mod tests {
             log_file: None,
             created_at: "2000-01-01T00:00:00Z".to_string(),
             updated_at: "2000-01-01T00:00:00Z".to_string(),
+            provider_resume: None,
+            runtime: None,
+            agent_args: Vec::new(),
         }
     }
 }

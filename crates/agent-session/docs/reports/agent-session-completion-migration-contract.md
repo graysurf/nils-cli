@@ -26,6 +26,7 @@
 | `agent-session command` | `crates/agent-session/src/cli.rs` | session id + format enum | prints attach commands |
 | `agent-session attach` | `crates/agent-session/src/cli.rs` | session id + tmux binary path hint | local tmux attach |
 | `agent-session logs` | `crates/agent-session/src/cli.rs` | session id, tail count, format enum | tmux capture or run log |
+| `agent-session resume` | `crates/agent-session/src/cli.rs` | session id, tmux binary path hint, format enum | recreate a missing tmux runtime from exact provider metadata |
 | `agent-session delete` | `crates/agent-session/src/cli.rs` | session id, tmux binary path hint, format enum | kill tmux and remove state |
 | `agent-session completion` | `crates/agent-session/src/cli.rs` | shell enum | `bash` and `zsh` |
 

@@ -22,6 +22,7 @@ agent-session list
 agent-session glance <id> --tail 40
 agent-session send <id> --text yes --key enter
 agent-session send <id> --key c-c
+agent-session resume <id>
 agent-session serve --bind 127.0.0.1:8781 --token "$AGENT_SESSION_TOKEN"
 agent-session command <id>
 agent-session attach <id>
@@ -32,8 +33,9 @@ agent-session delete <id>
 `send` pushes input to a live session: literal text (`--text` / `--text-stdin`) and/or repeatable named keys
 (`--key enter|escape|c-c|up|down|left|right|tab`), so codex/claude approval prompts are answerable from a phone.
 `glance` returns the recent pane tail plus live status as a JSON contract for dashboard tiles (cheaper than a full attach).
-`send` bumps `updated_at`, so `list` orders by real control-plane activity. `--agent hermes` launches `hermes chat`
-interactively (one-shot `run` mode is codex/claude only).
+`resume` recreates a missing tmux runtime only when the session has exact provider resume metadata; it never resumes the
+latest provider conversation implicitly. `send` bumps `updated_at`, so `list` orders by real control-plane activity.
+`--agent hermes` launches `hermes chat` interactively (one-shot `run` mode is codex/claude only).
 
 ## Serve daemon
 
@@ -41,12 +43,15 @@ interactively (one-shot `run` mode is codex/claude only).
 web console). It builds its own tokio runtime and reuses the synchronous lifecycle functions via `spawn_blocking`, so there
 is no second state model.
 
-- `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback.
+- `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. Sessions report
+  `running`, `resumable`, `stopped`, or `unknown` plus a boolean `resumable` field and best-effort `repo_name` derived
+  from the recorded `cwd`.
 - `GET /workdirs?q=...&limit=N` — authenticated read; searches only the default operator roots (`$HOME/Project` and
   `$HOME/.config`) with bounded depth, count, and elapsed-time limits. Add `git_only=true&exclude_worktrees=true` for
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage
   (`last_used`) and then name/path.
 - `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
+  `POST /sessions/{id}/resume`,
   `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
 - Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
   session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.

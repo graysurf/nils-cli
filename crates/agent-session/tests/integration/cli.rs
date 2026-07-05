@@ -285,6 +285,40 @@ fn list_command_and_delete_manage_existing_session() {
         .as_str()
         .expect("id")
         .to_string();
+    let record_path = state_dir.join("sessions").join(&id).join("session.json");
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
+            .expect("record json");
+    let provider_resume = &record["provider_resume"];
+    let claude_session_id = provider_resume["session_id"]
+        .as_str()
+        .expect("claude session id");
+    assert_eq!(provider_resume["provider"], "claude");
+    assert_eq!(
+        provider_resume["resume_args"],
+        serde_json::json!(["--resume", claude_session_id])
+    );
+    assert_eq!(record["runtime"]["generation"], 1);
+    assert!(record.get("agent_args").is_none());
+    let calls = tmux_calls(&tmux_log);
+    let new_session = calls
+        .iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("new-session call");
+    let session_flag = new_session
+        .iter()
+        .position(|arg| arg == "--session-id")
+        .expect("claude --session-id");
+    assert_eq!(
+        new_session.get(session_flag + 1).map(String::as_str),
+        Some(claude_session_id)
+    );
+    assert!(
+        new_session
+            .windows(2)
+            .any(|pair| pair[0] == "--name" && pair[1] == "Review"),
+        "claude launch should keep title name: {new_session:?}"
+    );
 
     let list = run(
         tmp.path(),
@@ -789,6 +823,184 @@ fn write_session_record(dir: &Path, id: &str, agent: &str, tmux_session: &str) -
     );
     fs::write(session.join("session.json"), record).expect("session record");
     session
+}
+
+fn write_resumable_session_record(
+    dir: &Path,
+    id: &str,
+    agent: &str,
+    tmux_session: &str,
+    cwd: &Path,
+    resume_args: &[&str],
+) -> PathBuf {
+    let session = dir.join("sessions").join(id);
+    fs::create_dir_all(&session).expect("session dir");
+    let resume_args = serde_json::to_string(resume_args).expect("resume args json");
+    let cwd = cwd.to_string_lossy();
+    let record = format!(
+        r#"{{
+  "schema_version": "agent-session.session.v1",
+  "id": "{id}",
+  "agent": "{agent}",
+  "mode": "interactive",
+  "title": "Recover me",
+  "cwd": "{cwd}",
+  "tmux_session": "{tmux_session}",
+  "prompt_file": null,
+  "log_file": null,
+  "created_at": "2000-01-01T00:00:00Z",
+  "updated_at": "2000-01-01T00:00:00Z",
+  "provider_resume": {{
+    "provider": "{agent}",
+    "session_id": "resume-session-id",
+    "captured_at": "2000-01-01T00:00:00Z",
+    "capture_method": "fixture",
+    "resume_args": {resume_args}
+  }},
+  "runtime": {{
+    "kind": "tmux",
+    "tmux_session": "{tmux_session}",
+    "generation": 1,
+    "started_at": "2000-01-01T00:00:00Z"
+  }},
+  "agent_args": ["--model", "fixture-model"]
+}}"#
+    );
+    fs::write(session.join("session.json"), record).expect("session record");
+    session
+}
+
+#[test]
+fn list_marks_missing_tmux_with_resume_identity_as_resumable() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    write_resumable_session_record(
+        &state_dir,
+        "recoverable",
+        "codex",
+        "hs-codex-recoverable",
+        &cwd,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
+    );
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["schema_version"], "cli.agent-session.list.v1");
+    let sessions = data(&value).as_array().expect("list data");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["id"], "recoverable");
+    assert_eq!(sessions[0]["status"], "resumable");
+    assert_eq!(sessions[0]["resumable"], true);
+    assert_eq!(sessions[0]["repo_name"], "repo");
+}
+
+#[test]
+fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    write_resumable_session_record(
+        &state_dir,
+        "recoverable",
+        "codex",
+        "hs-codex-recoverable",
+        &cwd,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
+    );
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "recoverable",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["schema_version"], "cli.agent-session.resume.v1");
+    let result = data(&value);
+    assert_eq!(result["id"], "recoverable");
+    assert_eq!(result["status"], "running");
+    assert_eq!(result["resumable"], true);
+
+    let calls = tmux_calls(&tmux_log);
+    let new_session = calls
+        .iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("new-session call");
+    assert_eq!(
+        new_session,
+        &vec![
+            "new-session".to_string(),
+            "-d".to_string(),
+            "-s".to_string(),
+            "hs-codex-recoverable".to_string(),
+            "-c".to_string(),
+            cwd.to_string_lossy().to_string(),
+            "--".to_string(),
+            codex_arg,
+            "resume".to_string(),
+            "resume-session-id".to_string(),
+            "--cd".to_string(),
+            cwd.to_string_lossy().to_string(),
+            "--no-alt-screen".to_string(),
+            "--model".to_string(),
+            "fixture-model".to_string(),
+        ]
+    );
+
+    let record_path = state_dir.join("sessions/recoverable/session.json");
+    let record: Value = serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
+    assert_eq!(record["id"], "recoverable");
+    assert_eq!(record["runtime"]["generation"], 2);
+    assert_ne!(record["updated_at"], "2000-01-01T00:00:00Z");
 }
 
 #[test]

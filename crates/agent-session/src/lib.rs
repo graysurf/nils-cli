@@ -2,15 +2,16 @@ mod cli;
 pub mod completion;
 mod serve;
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -35,6 +36,7 @@ const COMMAND_COMMAND: &str = "command";
 const LOGS_COMMAND: &str = "logs";
 const SEND_COMMAND: &str = "send";
 const GLANCE_COMMAND: &str = "glance";
+const RESUME_COMMAND: &str = "resume";
 const DELETE_COMMAND: &str = "delete";
 const WORKDIR_USAGE_FILE: &str = "workdir-usage.json";
 
@@ -97,6 +99,7 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Logs(args) => run_logs(&context, args),
         Command::Send(args) => run_send(&context, args),
         Command::Glance(args) => run_glance(&context, args),
+        Command::Resume(args) => run_resume(&context, args),
         Command::Serve(args) => serve::run_serve(&context, args),
         Command::Delete(args) => run_delete(&context, args),
         Command::Completion(_) => unreachable!("completion is handled before context resolution"),
@@ -112,6 +115,7 @@ fn command_format(command: &Command) -> OutputFormat {
         Command::Logs(args) => args.format,
         Command::Send(args) => args.format,
         Command::Glance(args) => args.format,
+        Command::Resume(args) => args.format,
         Command::Delete(args) => args.format,
         Command::Attach(_) | Command::Serve(_) | Command::Completion(_) => OutputFormat::Text,
     }
@@ -251,6 +255,14 @@ fn run_glance(context: &CliContext, args: cli::GlanceArgs) -> i32 {
     }
 }
 
+fn run_resume(context: &CliContext, args: cli::ResumeArgs) -> i32 {
+    let format = args.format;
+    match resume_session(context, args) {
+        Ok(result) => render_single_success(RESUME_COMMAND, format, &result, render_resumed_text),
+        Err(err) => render_error(RESUME_COMMAND, format, err),
+    }
+}
+
 fn run_delete(context: &CliContext, args: cli::DeleteArgs) -> i32 {
     match delete_session(
         context,
@@ -294,6 +306,29 @@ struct SessionRecord {
     log_file: Option<String>,
     created_at: String,
     updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_resume: Option<ProviderResume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<RuntimeInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agent_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ProviderResume {
+    provider: String,
+    session_id: String,
+    captured_at: String,
+    capture_method: String,
+    resume_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RuntimeInfo {
+    kind: String,
+    tmux_session: String,
+    generation: u64,
+    started_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -305,6 +340,8 @@ struct SessionView {
     cwd: String,
     tmux_session: String,
     status: String,
+    resumable: bool,
+    repo_name: Option<String>,
     attach_command: String,
     ssh_attach_command: Option<String>,
     prompt_file: Option<String>,
@@ -350,6 +387,8 @@ struct GlanceResult {
     title: Option<String>,
     tmux_session: String,
     status: String,
+    resumable: bool,
+    repo_name: Option<String>,
     tail: String,
     created_at: String,
     updated_at: String,
@@ -435,7 +474,9 @@ impl CliError {
 fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView, CliError> {
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let prompt = read_prompt(&args.prompt, args.prompt_file.as_deref(), args.prompt_stdin)?;
-    let created = create_record(RecordRequest {
+    let provider_plan = initial_provider_resume_plan(args.agent, &cwd);
+    let launch_started_at = SystemTime::now();
+    let mut created = create_record(RecordRequest {
         context,
         agent: args.agent,
         mode: "interactive",
@@ -444,6 +485,8 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         cwd: &cwd,
         prompt: prompt.as_deref(),
         log_file_name: None,
+        provider_resume: provider_plan.provider_resume.clone(),
+        agent_args: args.agent_args.clone(),
     })?;
 
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
@@ -454,6 +497,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         args.agent,
         &created.record,
         args.title.as_deref(),
+        &provider_plan.launch_args,
         &args.agent_args,
     ) {
         cleanup_created_record(&created);
@@ -468,6 +512,13 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
             cleanup_created_record(&created);
             return Err(err);
         }
+    }
+    if created.record.provider_resume.is_none()
+        && let Some(provider_resume) =
+            capture_provider_resume_after_launch(args.agent, &created.record, launch_started_at)
+    {
+        created.record.provider_resume = Some(provider_resume);
+        write_session_record(context, &created.record)?;
     }
 
     let result = session_view(context, &created.record, Some("running".to_string()));
@@ -500,6 +551,8 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         cwd: &cwd,
         prompt: Some(&prompt),
         log_file_name: log_file,
+        provider_resume: None,
+        agent_args: args.agent_args.clone(),
     })?;
 
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
@@ -538,6 +591,8 @@ struct RecordRequest<'a> {
     cwd: &'a Path,
     prompt: Option<&'a str>,
     log_file_name: Option<&'a str>,
+    provider_resume: Option<ProviderResume>,
+    agent_args: Vec<String>,
 }
 
 fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> {
@@ -572,11 +627,19 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         mode: request.mode.to_string(),
         title: request.title.map(str::to_string),
         cwd: display_path(request.cwd),
-        tmux_session,
+        tmux_session: tmux_session.clone(),
         prompt_file: prompt_file.as_ref().map(|path| display_path(path)),
         log_file: log_file.as_ref().map(|path| display_path(path)),
         created_at: iso.clone(),
         updated_at: iso,
+        provider_resume: request.provider_resume,
+        runtime: Some(RuntimeInfo {
+            kind: "tmux".to_string(),
+            tmux_session: tmux_session.clone(),
+            generation: 1,
+            started_at: now.timestamp().to_string(),
+        }),
+        agent_args: request.agent_args,
     };
 
     write_session_record(request.context, &record)?;
@@ -591,12 +654,39 @@ fn cleanup_created_record(created: &CreatedRecord) {
     let _ = fs::remove_dir_all(&created.session_dir);
 }
 
+#[derive(Debug, Default)]
+struct InitialProviderPlan {
+    provider_resume: Option<ProviderResume>,
+    launch_args: Vec<String>,
+}
+
+fn initial_provider_resume_plan(agent: AgentKind, _cwd: &Path) -> InitialProviderPlan {
+    match agent {
+        AgentKind::Claude => {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            InitialProviderPlan {
+                provider_resume: Some(ProviderResume {
+                    provider: agent.as_str().to_string(),
+                    session_id: session_id.clone(),
+                    captured_at: Zoned::now().timestamp().to_string(),
+                    capture_method: "claude-explicit-session-id".to_string(),
+                    resume_args: vec!["--resume".to_string(), session_id.clone()],
+                }),
+                launch_args: vec!["--session-id".to_string(), session_id],
+            }
+        }
+        AgentKind::Codex => InitialProviderPlan::default(),
+        AgentKind::Hermes => InitialProviderPlan::default(),
+    }
+}
+
 fn start_interactive_tmux(
     tmux_bin: &Path,
     agent_bin: &Path,
     agent: AgentKind,
     record: &SessionRecord,
     title: Option<&str>,
+    provider_launch_args: &[String],
     agent_args: &[String],
 ) -> Result<(), CliError> {
     let mut command = ProcessCommand::new(tmux_bin);
@@ -615,6 +705,7 @@ fn start_interactive_tmux(
             command.arg("--cd").arg(&record.cwd).arg("--no-alt-screen");
         }
         AgentKind::Claude => {
+            command.args(provider_launch_args);
             if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
                 command.arg("--name").arg(title);
             }
@@ -688,6 +779,130 @@ fn start_run_tmux(
         .arg("-lc")
         .arg(script);
     run_status(command, "tmux new-session")
+}
+
+fn capture_provider_resume_after_launch(
+    agent: AgentKind,
+    record: &SessionRecord,
+    launch_started_at: SystemTime,
+) -> Option<ProviderResume> {
+    match agent {
+        AgentKind::Codex => capture_codex_resume(record, launch_started_at),
+        AgentKind::Claude | AgentKind::Hermes => None,
+    }
+}
+
+#[derive(Debug)]
+struct CodexResumeCandidate {
+    session_id: String,
+    modified_at: SystemTime,
+}
+
+fn capture_codex_resume(
+    record: &SessionRecord,
+    launch_started_at: SystemTime,
+) -> Option<ProviderResume> {
+    let root = codex_sessions_root()?;
+    let earliest = launch_started_at
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut candidates = Vec::new();
+    collect_codex_resume_candidates(&root, 0, earliest, &record.cwd, &mut candidates);
+    candidates.sort_by_key(|candidate| Reverse(candidate.modified_at));
+    let first = candidates.first()?;
+    if candidates
+        .get(1)
+        .is_some_and(|other| other.modified_at == first.modified_at)
+    {
+        return None;
+    }
+    if candidates.len() > 1 {
+        return None;
+    }
+    Some(ProviderResume {
+        provider: "codex".to_string(),
+        session_id: first.session_id.clone(),
+        captured_at: Zoned::now().timestamp().to_string(),
+        capture_method: "codex-session-meta".to_string(),
+        resume_args: vec![
+            "resume".to_string(),
+            first.session_id.clone(),
+            "--cd".to_string(),
+            record.cwd.clone(),
+            "--no-alt-screen".to_string(),
+        ],
+    })
+}
+
+fn codex_sessions_root() -> Option<PathBuf> {
+    if let Some(codex_home) = non_empty_env("CODEX_HOME") {
+        return Some(PathBuf::from(codex_home).join("sessions"));
+    }
+    home_dir().map(|home| home.join(".codex/sessions"))
+}
+
+fn collect_codex_resume_candidates(
+    dir: &Path,
+    depth: usize,
+    earliest: SystemTime,
+    cwd: &str,
+    candidates: &mut Vec<CodexResumeCandidate>,
+) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_codex_resume_candidates(&path, depth + 1, earliest, cwd, candidates);
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let modified_at = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if modified_at < earliest {
+            continue;
+        }
+        if let Some(session_id) = read_codex_session_meta(&path, cwd) {
+            candidates.push(CodexResumeCandidate {
+                session_id,
+                modified_at,
+            });
+        }
+    }
+}
+
+fn read_codex_session_meta(path: &Path, cwd: &str) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut lines = io::BufReader::new(file).lines();
+    let first_line = lines.next()?.ok()?;
+    let value: Value = serde_json::from_str(&first_line).ok()?;
+    if value.get("type").and_then(Value::as_str)? != "session_meta" {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("cwd").and_then(Value::as_str)? != cwd {
+        return None;
+    }
+    if payload.get("source").and_then(Value::as_str)? != "cli" {
+        return None;
+    }
+    payload
+        .get("id")
+        .or_else(|| payload.get("session_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
 }
 
 fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError> {
@@ -839,7 +1054,7 @@ fn read_send_text(text: &Option<String>, text_stdin: bool) -> Result<Option<Stri
 fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceResult, CliError> {
     let record = load_session_record(context, &args.id)?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
-    let status = live_status(&tmux_bin, &record.tmux_session);
+    let status = session_status(&tmux_bin, &record);
     let tail = if status == "running" {
         capture_pane_tail(&record, args.tail, &tmux_bin)?
     } else {
@@ -851,6 +1066,8 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         title: record.title.clone(),
         tmux_session: record.tmux_session.clone(),
         status,
+        resumable: is_resumable(&record),
+        repo_name: repo_name_from_cwd(&record.cwd),
         tail,
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
@@ -915,6 +1132,34 @@ fn strip_trailing_blank_lines(text: &str) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
+mod codex_resume_tests {
+    use super::*;
+
+    #[test]
+    fn codex_session_meta_reader_matches_only_cli_source_and_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"cli"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_codex_session_meta(&path, "/repo"),
+            Some("codex-id".to_string())
+        );
+        assert_eq!(read_codex_session_meta(&path, "/other"), None);
+
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_codex_session_meta(&path, "/repo"), None);
+    }
+}
+
 /// Bump `updated_at` to now so `list` can order by real control-plane activity.
 /// Applied on `send` (a steering action); intentionally not on `glance`, which
 /// is a high-frequency dashboard poll that would otherwise make `updated_at`
@@ -933,8 +1178,106 @@ fn update_session_title(
     let mut record = load_session_record(context, id)?;
     record.title = normalize_title(title)?;
     touch_updated_at(context, &mut record)?;
-    let status = live_status(tmux_bin, &record.tmux_session);
+    let status = session_status(tmux_bin, &record);
     Ok(session_view(context, &record, Some(status)))
+}
+
+fn resume_session(context: &CliContext, args: cli::ResumeArgs) -> Result<SessionView, CliError> {
+    let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
+    resume_session_by_id(context, &args.id, &tmux_bin)
+}
+
+fn resume_session_by_id(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: &Path,
+) -> Result<SessionView, CliError> {
+    let mut record = load_session_record(context, id)?;
+    match session_status(tmux_bin, &record).as_str() {
+        "running" => return Ok(session_view(context, &record, Some("running".to_string()))),
+        "unknown" => {
+            return Err(CliError::runtime(
+                "session-status-unknown",
+                format!("session status could not be checked: {}", record.id),
+                Some(json!({ "id": record.id })),
+            ));
+        }
+        _ => {}
+    }
+    let provider_resume = record.provider_resume.clone().ok_or_else(|| {
+        CliError::data(
+            "session-not-resumable",
+            format!(
+                "session has no exact provider resume identity: {}",
+                record.id
+            ),
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    if provider_resume.resume_args.is_empty() {
+        return Err(CliError::data(
+            "session-not-resumable",
+            format!("session has no provider resume command: {}", record.id),
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    let agent = AgentKind::from_name(&record.agent).ok_or_else(|| {
+        CliError::data(
+            "invalid-agent",
+            format!("unknown agent in session record: {}", record.agent),
+            Some(json!({ "id": record.id, "agent": record.agent })),
+        )
+    })?;
+    if provider_resume.provider != agent.as_str() {
+        return Err(CliError::data(
+            "session-provider-mismatch",
+            "session provider resume metadata does not match the agent",
+            Some(json!({
+                "id": record.id,
+                "agent": record.agent,
+                "provider": provider_resume.provider,
+            })),
+        ));
+    }
+    let agent_bin = resolve_agent_bin(agent, None);
+    start_resume_tmux(tmux_bin, &agent_bin, &record, &provider_resume.resume_args)?;
+
+    let now = Zoned::now();
+    let next_generation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.generation.saturating_add(1))
+        .unwrap_or(1);
+    record.runtime = Some(RuntimeInfo {
+        kind: "tmux".to_string(),
+        tmux_session: record.tmux_session.clone(),
+        generation: next_generation,
+        started_at: now.timestamp().to_string(),
+    });
+    record.updated_at = now.timestamp().to_string();
+    write_session_record(context, &record)?;
+    Ok(session_view(context, &record, Some("running".to_string())))
+}
+
+fn start_resume_tmux(
+    tmux_bin: &Path,
+    agent_bin: &Path,
+    record: &SessionRecord,
+    resume_args: &[String],
+) -> Result<(), CliError> {
+    let mut command = ProcessCommand::new(tmux_bin);
+    command
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(&record.tmux_session)
+        .arg("-c")
+        .arg(&record.cwd)
+        .arg("--")
+        .arg(agent_bin)
+        .args(resume_args)
+        .args(&record.agent_args);
+    run_status(command, "tmux new-session")
 }
 
 fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
@@ -1277,7 +1620,7 @@ fn list_sessions(
                 )?;
                 let record = read_session_record(&resolved.record_path)?;
                 validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
-                let status = live_status(&tmux_bin, &record.tmux_session);
+                let status = session_status(&tmux_bin, &record);
                 records.push(session_view(context, &record, Some(status)));
             }
         }
@@ -1300,7 +1643,7 @@ fn load_session_view(
     let tmux_bin = tmux_bin
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_tmux_bin(None));
-    let status = live_status(&tmux_bin, &record.tmux_session);
+    let status = session_status(&tmux_bin, &record);
     Ok(session_view(context, &record, Some(status)))
 }
 
@@ -1495,8 +1838,7 @@ fn session_view(
     record: &SessionRecord,
     forced_status: Option<String>,
 ) -> SessionView {
-    let status =
-        forced_status.unwrap_or_else(|| live_status(&resolve_tmux_bin(None), &record.tmux_session));
+    let status = forced_status.unwrap_or_else(|| session_status(&resolve_tmux_bin(None), record));
     SessionView {
         id: record.id.clone(),
         agent: record.agent.clone(),
@@ -1505,6 +1847,8 @@ fn session_view(
         cwd: record.cwd.clone(),
         tmux_session: record.tmux_session.clone(),
         status,
+        resumable: is_resumable(record),
+        repo_name: repo_name_from_cwd(&record.cwd),
         attach_command: local_attach_command(&record.tmux_session),
         ssh_attach_command: context
             .host
@@ -1604,6 +1948,29 @@ fn kill_tmux_session(tmux_bin: &Path, tmux_session: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn session_status(tmux_bin: &Path, record: &SessionRecord) -> String {
+    match live_status(tmux_bin, &record.tmux_session).as_str() {
+        "stopped" if is_resumable(record) => "resumable".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn is_resumable(record: &SessionRecord) -> bool {
+    record.mode == "interactive" && record.provider_resume.is_some()
+}
+
+fn repo_name_from_cwd(cwd: &str) -> Option<String> {
+    let trimmed = cwd.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
 }
 
 fn live_status(tmux_bin: &Path, tmux_session: &str) -> String {
@@ -2053,6 +2420,13 @@ fn render_glance_text(result: &GlanceResult) -> String {
         text.push('\n');
     }
     text
+}
+
+fn render_resumed_text(result: &SessionView) -> String {
+    format!(
+        "resumed {} session {}\ntmux: {}\nattach: {}\n",
+        result.agent, result.id, result.tmux_session, result.attach_command
+    )
 }
 
 fn render_delete_text(result: &DeleteResult) -> String {
