@@ -44,8 +44,8 @@ web console). It builds its own tokio runtime and reuses the synchronous lifecyc
 is no second state model.
 
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. Sessions report
-  `running`, `resumable`, `stopped`, or `unknown` plus a boolean `resumable` field and best-effort `repo_name` derived
-  from the recorded `cwd`.
+  `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
+  the recorded `cwd`.
 - `GET /workdirs?q=...&limit=N` — authenticated read; searches only the default operator roots (`$HOME/Project` and
   `$HOME/.config`) with bounded depth, count, and elapsed-time limits. Add `git_only=true&exclude_worktrees=true` for
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage
