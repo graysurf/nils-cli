@@ -130,6 +130,8 @@ pub struct PrChecksPayload {
     pub checks: Vec<CheckItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 pub fn run(
@@ -306,7 +308,13 @@ fn snapshot_github_rollup_fallback<R: BackendRunner>(
     let call = build_github_rollup_view_call(ctx, &args.id);
     let output = runner.run(&call)?;
     let checks = parse_github_status_rollup(&output, args.required_only)?;
-    Ok(aggregate(ctx, checks, args.required_only, None))
+    let mut payload = aggregate(ctx, checks, args.required_only, None);
+    if args.required_only {
+        payload
+            .warnings
+            .push("github_status_rollup_requiredness_unknown_all_rows_gated".to_string());
+    }
+    Ok(payload)
 }
 
 /// Build the `gh pr checks <id> --json …` call. Public so the dry-run helper
@@ -553,7 +561,8 @@ fn parse_github_rollup_entry(
         .or_else(|| value.get("state"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let state = normalize_github_state(None, conclusion.as_deref(), raw_state);
+    let kind = value.get("__typename").and_then(|v| v.as_str());
+    let state = normalize_github_rollup_state(kind, conclusion.as_deref(), raw_state);
     let url = value
         .get("detailsUrl")
         .or_else(|| value.get("targetUrl"))
@@ -587,6 +596,40 @@ fn parse_github_rollup_entry(
         started_at,
         completed_at,
     })
+}
+
+fn normalize_github_rollup_state(
+    kind: Option<&str>,
+    conclusion: Option<&str>,
+    raw_state: Option<&str>,
+) -> CheckState {
+    if matches!(kind, Some("CheckRun"))
+        && matches!(
+            raw_state.map(str::to_ascii_lowercase).as_deref(),
+            Some("completed")
+        )
+        && !is_known_github_conclusion(conclusion)
+    {
+        return CheckState::Pending;
+    }
+    normalize_github_state(None, conclusion, raw_state)
+}
+
+fn is_known_github_conclusion(conclusion: Option<&str>) -> bool {
+    matches!(
+        conclusion.map(str::to_ascii_lowercase).as_deref(),
+        Some(
+            "success"
+                | "failure"
+                | "action_required"
+                | "stale"
+                | "startup_failure"
+                | "cancelled"
+                | "skipped"
+                | "neutral"
+                | "timed_out"
+        )
+    )
 }
 
 fn parse_github_entry(
@@ -784,6 +827,7 @@ pub fn aggregate(
         pending,
         checks,
         duration_ms,
+        warnings: Vec::new(),
     }
 }
 

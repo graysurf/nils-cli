@@ -90,6 +90,32 @@ esac
     .to_string()
 }
 
+fn gh_status_rollup_fallback_stub_with_rollup(rollup_json: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr checks")
+    echo "GraphQL: Resource not accessible by integration (node.statusCheckRollup.nodes.0.commit.statusCheckRollup)" >&2
+    exit 1
+    ;;
+  "pr view")
+    cat <<'EOF'
+{{
+  "headRefOid": "abc123",
+  "statusCheckRollup": {rollup_json}
+}}
+EOF
+    ;;
+  *)
+    echo "stub: unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    )
+}
+
 fn run_checks(
     all_checks_json: &str,
     required_checks_json: &str,
@@ -136,6 +162,10 @@ fn pr_checks_falls_back_to_status_rollup_view_on_permission_error() {
     assert_eq!(env["data"]["state"], "success");
     assert_eq!(env["data"]["required_count"], 2);
     assert_eq!(env["data"]["success_count"], 2);
+    assert_eq!(
+        env["data"]["warnings"][0],
+        "github_status_rollup_requiredness_unknown_all_rows_gated"
+    );
     let checks = env["data"]["checks"].as_array().expect("checks array");
     assert_eq!(checks.len(), 2);
     assert_eq!(checks[0]["name"], "test");
@@ -149,6 +179,127 @@ fn pr_checks_falls_back_to_status_rollup_view_on_permission_error() {
         checks[1]["url"],
         "https://github.com/sympoies/nils-cli/runs/3"
     );
+}
+
+#[test]
+fn pr_checks_rollup_completed_check_run_without_conclusion_is_pending() {
+    let stub = StubEnv::new().gh_stub(&gh_status_rollup_fallback_stub_with_rollup(
+        r#"[
+    {
+      "__typename": "CheckRun",
+      "name": "test",
+      "status": "COMPLETED",
+      "detailsUrl": "https://github.com/sympoies/nils-cli/actions/runs/1/job/2"
+    }
+  ]"#,
+    ));
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["state"], "pending");
+    assert_eq!(env["data"]["required_count"], 1);
+    assert_eq!(env["data"]["success_count"], 0);
+    assert_eq!(env["data"]["pending"][0]["name"], "test");
+    assert_eq!(env["data"]["checks"][0]["state"], "pending");
+}
+
+#[test]
+fn pr_checks_rollup_non_success_conclusions_fail_or_cancel() {
+    let stub = StubEnv::new().gh_stub(&gh_status_rollup_fallback_stub_with_rollup(
+        r#"[
+    {
+      "__typename": "CheckRun",
+      "name": "test",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "timeout",
+      "status": "COMPLETED",
+      "conclusion": "TIMED_OUT"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "cancelled",
+      "status": "COMPLETED",
+      "conclusion": "CANCELLED"
+    }
+  ]"#,
+    ));
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["state"], "failure");
+    let failed = env["data"]["failed"].as_array().expect("failed");
+    assert_eq!(failed.len(), 3);
+    assert_eq!(env["data"]["checks"][0]["state"], "failure");
+    assert_eq!(env["data"]["checks"][1]["state"], "timed_out");
+    assert_eq!(env["data"]["checks"][2]["state"], "cancelled");
+}
+
+#[test]
+fn pr_checks_rollup_required_only_false_gates_all_rows_without_warning() {
+    let stub = StubEnv::new().gh_stub(&gh_status_rollup_fallback_stub_with_rollup(
+        r#"[
+    {
+      "__typename": "CheckRun",
+      "name": "optional-flaky",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE"
+    }
+  ]"#,
+    ));
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "7",
+            "--required-only",
+            "false",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["state"], "failure");
+    assert_eq!(env["data"]["required_count"], 1);
+    assert!(env["data"].get("warnings").is_none());
 }
 
 #[test]

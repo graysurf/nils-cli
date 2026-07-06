@@ -135,6 +135,7 @@ mod tests {
                 },
             ],
             duration_ms: None,
+            warnings: Vec::new(),
         }
     }
 

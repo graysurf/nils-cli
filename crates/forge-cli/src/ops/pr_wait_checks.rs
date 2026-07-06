@@ -271,6 +271,7 @@ fn timed_out_placeholder(ctx: &ProviderContext) -> PrChecksPayload {
         pending: Vec::new(),
         checks: Vec::new(),
         duration_ms: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -438,6 +439,7 @@ mod tests {
             pending: Vec::new(),
             checks: Vec::new(),
             duration_ms: Some(123),
+            warnings: Vec::new(),
         };
         assert!(is_terminal(&snapshot));
         let code = emit_failure(

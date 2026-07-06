@@ -249,6 +249,40 @@ fn pr_create_rejects_dirty_worktree_with_data_exit() {
 }
 
 #[test]
+fn pr_create_missing_head_branch_reports_head_not_pushed() {
+    let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "feat/missing",
+            "--base",
+            "main",
+            "--title",
+            "feat: missing branch",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "expected DATA 65, stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "head_not_pushed");
+}
+
+#[test]
 fn pr_create_rejects_branch_kind_mismatch_with_data_exit() {
     let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
     let repo_path = tempdir.path().join("repo");

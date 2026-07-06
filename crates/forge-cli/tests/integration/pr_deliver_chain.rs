@@ -874,6 +874,108 @@ fn pr_deliver_adopts_existing_open_pr_for_head_branch() {
 }
 
 #[test]
+fn pr_deliver_adopt_head_flag_uses_named_branch_push_state() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    git(&repo_path, &["checkout", "-q", "main"]);
+
+    let stub = StubEnv::new();
+    let create_sentinel = stub.tempdir.path().join("create-called");
+    let gh_path = write_adopt_chain_stub(&stub, ADOPTABLE_PR_VIEW_JSON);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], true);
+    let steps: Vec<&str> = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .map(|s| s["step"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            "auth_status",
+            "repo_view",
+            "adopt",
+            "wait_checks",
+            "ready",
+            "merge",
+        ]
+    );
+    assert!(
+        !create_sentinel.exists(),
+        "adopt path must never call the backend pr create"
+    );
+}
+
+#[test]
+fn pr_deliver_missing_head_branch_reports_head_not_pushed() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let gh_path = write_full_chain_stub(&stub);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: missing branch",
+            "--body",
+            "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/missing",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(
+        out.code, 65,
+        "expected DATA 65 for missing head branch, stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "head_not_pushed");
+}
+
+#[test]
 fn pr_deliver_adopt_revalidates_existing_pr_body_and_fails_closed() {
     // The adopted PR's actual body (fetched via pr view) goes through the
     // same `## Summary` / `## Test plan` gate as a create-path body. A

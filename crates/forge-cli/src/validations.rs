@@ -648,7 +648,20 @@ pub fn git_head_state(workdir: &Path) -> Result<HeadState, ForgeError> {
 /// via git so explicit `--head <branch>` validation is independent of the
 /// checkout's current `HEAD`.
 pub fn git_branch_state(workdir: &Path, branch: &str) -> Result<HeadState, ForgeError> {
-    let head_sha = run_git_capture(workdir, &["rev-parse", branch])?;
+    let head_sha = match run_git_capture(workdir, &["rev-parse", branch]) {
+        Ok(output) => output,
+        Err(ForgeError::SoftwareError { message, .. })
+            if message.contains("rev-parse") && message.contains("exited non-zero") =>
+        {
+            return Err(ForgeError::validation(
+                schema(),
+                "head_not_pushed",
+                format!("head branch '{branch}' does not exist locally"),
+                Some("create or fetch the branch before opening or delivering a PR".to_string()),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
     let head_sha = head_sha.trim().to_string();
     let upstream_ref = format!("{branch}@{{upstream}}");
     let upstream_sha = match run_git_capture(workdir, &["rev-parse", &upstream_ref]) {

@@ -352,7 +352,11 @@ backend mapping, validation rules, and output schema versions.
   so the backend stays compatible with `gh 2.92.0`. If `gh pr checks`
   fails on a `statusCheckRollup` permission traversal, the GitHub path
   falls back to `gh pr view --json headRefOid,statusCheckRollup` and
-  treats the readable head-SHA rollup rows as the snapshot. On GitLab,
+  treats the readable head-SHA rollup rows as the snapshot. When
+  `--required-only=true`, that fallback cannot recover GitHub's required
+  classification, so it fail-closed gates every readable rollup row and
+  adds `github_status_rollup_requiredness_unknown_all_rows_gated` to
+  `data.warnings[]`. On GitLab,
   numeric MR ids use `glab mr view -F json` for the MR head pipeline and
   `glab api --hostname <host> projects/<project>/pipelines/<id>/jobs`
   for job rows; `allow_failure=true` jobs remain visible in
@@ -366,7 +370,7 @@ backend mapping, validation rules, and output schema versions.
   - timeout reached → `ok = false`, exit `UNAVAILABLE 69`,
     `error.kind = "checks_timeout"`.
 - Output schema: `cli.forge-cli.pr.checks.v1`,
-  `data = { state, required_count, success_count, failed:[…], pending:[…], duration_ms }`.
+  `data = { state, required_count, success_count, failed:[…], pending:[…], checks:[…], duration_ms, warnings? }`.
 
 ### `pr review-threads` (read)
 
