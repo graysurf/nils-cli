@@ -43,6 +43,7 @@ const WORKDIR_USAGE_FILE: &str = "workdir-usage.json";
 const CODEX_RESUME_CAPTURE_TIMEOUT_MS: u64 = 1500;
 const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
 const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
+const CODEX_RESUME_BACKFILL_MAX_AGE_SECS: u64 = 10 * 60;
 const CODEX_RESUME_SCAN_MAX_DEPTH: usize = 6;
 const CODEX_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
 const CODEX_RESUME_SCAN_SLICE_MS: u64 = 250;
@@ -1349,6 +1350,7 @@ fn capture_provider_resume_after_launch(
 #[derive(Debug)]
 struct CodexResumeCandidate {
     session_id: String,
+    created_at: SystemTime,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1434,6 +1436,40 @@ fn capture_codex_resume(
         let remaining = timeout.saturating_sub(started.elapsed());
         thread::sleep(poll.min(remaining));
     }
+}
+
+fn capture_codex_resume_from_history(record: &SessionRecord) -> Option<ProviderResume> {
+    let root = codex_sessions_root()?;
+    let earliest = record
+        .created_at
+        .parse::<Timestamp>()
+        .ok()
+        .map(SystemTime::from)?;
+    let latest = earliest.checked_add(Duration::from_secs(CODEX_RESUME_BACKFILL_MAX_AGE_SECS))?;
+    let mut candidates = Vec::new();
+    let mut budget = CodexResumeScanBudget::from_env();
+    collect_codex_resume_candidates(
+        &root,
+        0,
+        earliest,
+        &record.cwd,
+        &mut candidates,
+        &mut budget,
+    );
+    if budget.truncated {
+        return None;
+    }
+
+    let candidate_ids: BTreeSet<String> = candidates
+        .into_iter()
+        .filter(|candidate| candidate.created_at <= latest)
+        .map(|candidate| candidate.session_id)
+        .collect();
+    if candidate_ids.len() == 1 {
+        let candidate_id = candidate_ids.iter().next().expect("singleton candidate");
+        return Some(codex_provider_resume(record, candidate_id));
+    }
+    None
 }
 
 fn codex_candidate_satisfied_ambiguity_window(
@@ -1551,6 +1587,7 @@ fn collect_codex_resume_candidates(
             }
             candidates.push(CodexResumeCandidate {
                 session_id: meta.session_id,
+                created_at: meta.created_at,
             });
         }
     }
@@ -1745,7 +1782,7 @@ fn read_send_text(text: &Option<String>, text_stdin: bool) -> Result<Option<Stri
 }
 
 fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceResult, CliError> {
-    let record = load_session_record(context, &args.id)?;
+    let record = load_session_record_with_provider_resume_backfill(context, &args.id)?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let status = session_status(&tmux_bin, &record);
     let tail = if status == "running" {
@@ -1991,7 +2028,7 @@ fn resume_session_by_id(
     id: &str,
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
-    let mut record = load_session_record(context, id)?;
+    let mut record = load_session_record_with_provider_resume_backfill(context, id)?;
     match session_status(tmux_bin, &record).as_str() {
         "running" => return Ok(session_view(context, &record, Some("running".to_string()))),
         "unknown" => {
@@ -2395,6 +2432,7 @@ fn list_sessions(
                 )?;
                 let record = read_session_record(&resolved.record_path)?;
                 validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
+                let record = backfill_provider_resume(context, record);
                 let status = session_status(&tmux_bin, &record);
                 records.push(session_view(context, &record, Some(status)));
             }
@@ -2414,7 +2452,7 @@ fn load_session_view(
     id: &str,
     tmux_bin: Option<&Path>,
 ) -> Result<SessionView, CliError> {
-    let record = load_session_record(context, id)?;
+    let record = load_session_record_with_provider_resume_backfill(context, id)?;
     let tmux_bin = tmux_bin
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_tmux_bin(None));
@@ -2427,6 +2465,27 @@ fn load_session_record(context: &CliContext, id: &str) -> Result<SessionRecord, 
     let record = read_session_record(&resolved.record_path)?;
     validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
     Ok(record)
+}
+
+fn load_session_record_with_provider_resume_backfill(
+    context: &CliContext,
+    id: &str,
+) -> Result<SessionRecord, CliError> {
+    load_session_record(context, id).map(|record| backfill_provider_resume(context, record))
+}
+
+fn backfill_provider_resume(context: &CliContext, record: SessionRecord) -> SessionRecord {
+    if record.provider_resume.is_some()
+        || AgentKind::from_name(&record.agent) != Some(AgentKind::Codex)
+    {
+        return record;
+    }
+    let Some(provider_resume) = capture_codex_resume_from_history(&record) else {
+        return record;
+    };
+    let mut record = record;
+    record.provider_resume = Some(provider_resume);
+    persist_or_reload_session_record(context, &record)
 }
 
 #[derive(Debug)]
