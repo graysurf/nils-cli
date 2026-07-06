@@ -1938,10 +1938,47 @@ fn update_session_title(
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
     let mut record = load_session_record(context, id)?;
+    let previous_title = record.title.clone();
     record.title = normalize_title(title)?;
     touch_updated_at(context, &mut record)?;
     let status = session_status(tmux_bin, &record);
+    // The persisted record above is the source of truth. Claude also carries its
+    // own prompt-bar display name, which we set once via `--name` at launch
+    // (`start_interactive_tmux`) and which never changes afterwards, so a renamed
+    // session would show a stale name in the terminal while the console shows the
+    // new one. Claude exposes `/rename <name>` as a runtime rename, so push the
+    // new title into the live pane to keep the two in sync. Best-effort: a tmux
+    // hiccup must not fail the title update, and Codex/Hermes have no such display
+    // name so this is Claude-only and only when the title actually changed.
+    if status == "running"
+        && AgentKind::from_name(&record.agent) == Some(AgentKind::Claude)
+        && record.title != previous_title
+        && let Some(new_title) = record.title.as_deref()
+    {
+        let _ = rename_live_claude_session(context, &record, new_title, tmux_bin);
+    }
     Ok(session_view(context, &record, Some(status)))
+}
+
+/// Push Claude's `/rename <name>` slash command into the live pane so the
+/// prompt-bar display name follows a title change. Reuses the same buffered
+/// paste + Enter injection as steering `send`, and collapses any embedded
+/// newlines so the rename stays a single submitted line.
+fn rename_live_claude_session(
+    context: &CliContext,
+    record: &SessionRecord,
+    title: &str,
+    tmux_bin: &Path,
+) -> Result<(), CliError> {
+    let single_line = title.replace(['\n', '\r'], " ");
+    let command = format!("/rename {single_line}");
+    send_input(
+        context,
+        record,
+        Some(&command),
+        &[SpecialKey::Enter],
+        tmux_bin,
+    )
 }
 
 fn resume_session(context: &CliContext, args: cli::ResumeArgs) -> Result<SessionView, CliError> {
