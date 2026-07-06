@@ -1235,6 +1235,65 @@ fn trim_line_ending(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
+/// Resolve the `systemd-run` binary used to launch the tmux server inside a
+/// transient systemd `--user` scope, or `None` to launch tmux directly.
+///
+/// `agent-session serve` starts each session as a child `tmux new-session -d`,
+/// so the tmux server it spawns lands in the caller's cgroup. Under the
+/// agent-console serve systemd service that means the server shares the unit
+/// cgroup, and a service stop/restart can kill every live session
+/// (`sympoies/agent-console#122`). Wrapping the server start in
+/// `systemd-run --user --scope` moves it into its own transient scope cgroup, a
+/// sibling of the service, so the sessions survive even an explicit
+/// cgroup-wide kill of the serve unit.
+///
+/// This is opt-in via `AGENT_SESSION_TMUX_SCOPE` (the serve launcher sets it) and
+/// only engages when a systemd `--user` manager is actually reachable, so an
+/// opt-in on an unsupported host (no user manager, missing `systemd-run`,
+/// non-Linux) degrades to a direct launch instead of failing session creation.
+fn tmux_scope_runner() -> Option<PathBuf> {
+    if !env_truthy("AGENT_SESSION_TMUX_SCOPE") {
+        return None;
+    }
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    // A running systemd --user manager exposes this socket; without it
+    // `systemd-run --user` cannot register the scope.
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")?;
+    if !Path::new(&runtime_dir)
+        .join("systemd")
+        .join("private")
+        .exists()
+    {
+        return None;
+    }
+    binary_on_path("systemd-run")
+}
+
+/// Build the base command for a `tmux new-session` that may start the tmux
+/// server. With `scope_runner` set the server is launched inside a transient
+/// systemd user scope (see [`tmux_scope_runner`]); otherwise tmux runs directly.
+/// Callers append the `new-session ...` arguments to the returned command; both
+/// forms accept the same trailing arguments because `systemd-run`'s `--`
+/// hands everything after the tmux binary straight to tmux.
+fn new_session_command(tmux_bin: &Path, scope_runner: Option<&Path>) -> ProcessCommand {
+    match scope_runner {
+        Some(runner) => {
+            let mut command = ProcessCommand::new(runner);
+            command
+                .arg("--user")
+                .arg("--scope")
+                .arg("--quiet")
+                .arg("--collect")
+                .arg("--")
+                .arg(tmux_bin);
+            command
+        }
+        None => ProcessCommand::new(tmux_bin),
+    }
+}
+
 fn start_interactive_tmux(
     tmux_bin: &Path,
     agent_bin: &Path,
@@ -1244,7 +1303,7 @@ fn start_interactive_tmux(
     provider_launch_args: &[String],
     agent_args: &[String],
 ) -> Result<(), CliError> {
-    let mut command = ProcessCommand::new(tmux_bin);
+    let mut command = new_session_command(tmux_bin, tmux_scope_runner().as_deref());
     command
         .arg("new-session")
         .arg("-d")
@@ -1321,7 +1380,7 @@ fn start_run_tmux(
         shell_words::quote(log_file)
     );
 
-    let mut command = ProcessCommand::new(tmux_bin);
+    let mut command = new_session_command(tmux_bin, tmux_scope_runner().as_deref());
     command
         .arg("new-session")
         .arg("-d")
@@ -2077,7 +2136,7 @@ fn start_resume_tmux(
     record: &SessionRecord,
     resume_args: &[String],
 ) -> Result<(), CliError> {
-    let mut command = ProcessCommand::new(tmux_bin);
+    let mut command = new_session_command(tmux_bin, tmux_scope_runner().as_deref());
     command
         .arg("new-session")
         .arg("-d")
@@ -3544,6 +3603,25 @@ fn non_empty_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|value| !value.trim().is_empty())
 }
 
+fn is_truthy_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn env_truthy(key: &str) -> bool {
+    non_empty_env(key).is_some_and(|value| is_truthy_flag(&value))
+}
+
+/// First `name` found on `PATH` as a regular file, or `None`.
+fn binary_on_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 fn env_u64(key: &str, default: u64) -> u64 {
     non_empty_env(key)
         .and_then(|value| value.parse::<u64>().ok())
@@ -3597,5 +3675,54 @@ mod tests {
         assert_eq!(strip_trailing_blank_lines(""), "");
         // Content with no trailing blanks is unchanged.
         assert_eq!(strip_trailing_blank_lines("only"), "only");
+    }
+
+    #[test]
+    fn new_session_command_runs_tmux_directly_without_scope() {
+        use super::new_session_command;
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        let command = new_session_command(Path::new("/opt/tmux"), None);
+        assert_eq!(command.get_program(), OsStr::new("/opt/tmux"));
+        // The caller appends `new-session ...`, so the base command has no args.
+        assert_eq!(command.get_args().count(), 0);
+    }
+
+    #[test]
+    fn new_session_command_wraps_tmux_in_systemd_scope() {
+        use super::new_session_command;
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        let command = new_session_command(
+            Path::new("/usr/bin/tmux"),
+            Some(Path::new("/usr/bin/systemd-run")),
+        );
+        assert_eq!(command.get_program(), OsStr::new("/usr/bin/systemd-run"));
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                OsStr::new("--user"),
+                OsStr::new("--scope"),
+                OsStr::new("--quiet"),
+                OsStr::new("--collect"),
+                OsStr::new("--"),
+                OsStr::new("/usr/bin/tmux"),
+            ]
+        );
+    }
+
+    #[test]
+    fn is_truthy_flag_accepts_common_true_values_case_insensitively() {
+        use super::is_truthy_flag;
+
+        for value in ["1", "true", "TRUE", " Yes ", "on", "On"] {
+            assert!(is_truthy_flag(value), "expected truthy: {value:?}");
+        }
+        for value in ["0", "false", "no", "off", "", "  ", "2", "enabled"] {
+            assert!(!is_truthy_flag(value), "expected falsey: {value:?}");
+        }
     }
 }
