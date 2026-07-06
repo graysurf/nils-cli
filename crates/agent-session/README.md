@@ -78,6 +78,14 @@ applies its own auth) and do **not** `tailscale serve` the raw serve port; expos
 Browser WebSocket clients cannot set an `Authorization` header, so the edge must proxy the attach and inject the bearer
 server-side — never put the token in the `ws://` URL/query.
 
+Session survival across serve restarts: the daemon starts each session as a child `tmux new-session -d`, so the tmux
+server shares the caller's cgroup. Under a systemd service that means it shares the unit cgroup, and stopping or restarting
+the service can kill every live session. Set `AGENT_SESSION_TMUX_SCOPE=1` to launch the tmux server inside a transient
+systemd user scope (`systemd-run --user --scope`) so it lands in its own cgroup instead — a sibling of the service, so
+sessions survive a daemon restart or even an explicit cgroup-wide kill. It is opt-in (the serve launcher sets it) and only
+engages when a systemd `--user` manager is reachable; on any other host (no user manager, missing `systemd-run`, non-Linux)
+it falls back to launching tmux directly. Pairs with `KillMode=process` on the serve unit for defense in depth.
+
 ## Output contract
 
 Human-readable text is the default. JSON is opt-in with `--format json` on command subcommands.
