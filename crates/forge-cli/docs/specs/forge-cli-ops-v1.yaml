@@ -48,7 +48,7 @@ validations_catalog:
     error_kind: dirty_worktree
     exit: DATA
   head_pushed:
-    rule: "HEAD has upstream and matches remote-tracking ref"
+    rule: "resolved head branch has upstream and matches remote-tracking ref"
     error_kind: head_not_pushed
     exit: DATA
   default_branch_protected:
@@ -488,6 +488,7 @@ operations:
     backends:
       github: { program: gh,   argv: [pr, checks, "{id}", --json, "name,state,bucket,workflow,link,startedAt,completedAt,description"] }
       github_required: { program: gh, argv: [pr, checks, "{id}", --required, --json, "name,state,bucket,workflow,link,startedAt,completedAt,description"] }
+      github_rollup_fallback: { program: gh, argv: [pr, view, "{id}", --json, "headRefOid,statusCheckRollup"] }
       gitlab: { program: glab, argv: [ci, status,  "-b", "{branch}"] }   # text fallback parsed
     output:
       data:
@@ -496,6 +497,7 @@ operations:
         success_count: integer
         failed: list<{ name, url, conclusion }>
         pending: list<{ name, url }>
+        warnings: optional<list<string>>
 
   - id: pr.wait-checks
     schema_version: cli.forge-cli.pr.checks.v1   # shares schema with pr.checks

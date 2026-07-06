@@ -37,8 +37,8 @@ use crate::ops::label::{LabelTarget, validate_label_inputs};
 use crate::ops::repo_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::{
-    BodyHeadings, PrKind, body_sections, branch_kind_matches, branch_name, git_head_state,
-    git_status_porcelain, head_pushed, no_local_path, title_length, worktree_clean,
+    BodyHeadings, PrKind, body_sections, branch_kind_matches, branch_name, branch_pushed,
+    git_branch_state, git_status_porcelain, no_local_path, title_length, worktree_clean,
 };
 
 const SCHEMA: &str = "pr.create";
@@ -49,7 +49,8 @@ type CurrentBranchFn<'a> = Box<dyn Fn() -> Result<String, ForgeError> + 'a>;
 type DefaultBranchFn<'a> =
     Box<dyn Fn(&dyn BackendRunner, &ProviderContext) -> Result<String, ForgeError> + 'a>;
 type GitStatusFn<'a> = Box<dyn Fn(&Path) -> Result<String, ForgeError> + 'a>;
-type HeadStateFn<'a> = Box<dyn Fn(&Path) -> Result<crate::validations::HeadState, ForgeError> + 'a>;
+type HeadStateFn<'a> =
+    Box<dyn Fn(&Path, &str) -> Result<crate::validations::HeadState, ForgeError> + 'a>;
 
 /// Envelope payload for `cli.forge-cli.pr.create.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -127,7 +128,7 @@ impl<'a> Environment<'a> {
                 Ok(payload.default_branch)
             }),
             git_status: Box::new(git_status_porcelain),
-            head_state: Box::new(git_head_state),
+            head_state: Box::new(git_branch_state),
             workdir,
             headings: BodyHeadings::default(),
             test_first_required: cfg.resolve_test_first_required(None),
@@ -252,7 +253,7 @@ pub fn run_with<R: BackendRunner>(
         label_target,
     )?;
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
-    head_pushed(&env.workdir, |w| (env.head_state)(w))?;
+    branch_pushed(&env.workdir, &head, |w, branch| (env.head_state)(w, branch))?;
     test_first_gate(
         kind,
         env.test_first_required,
@@ -332,7 +333,7 @@ pub fn compute<R: BackendRunner>(
         label_target,
     )?;
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
-    head_pushed(&env.workdir, |w| (env.head_state)(w))?;
+    branch_pushed(&env.workdir, &head, |w, branch| (env.head_state)(w, branch))?;
     test_first_gate(
         kind,
         env.test_first_required,
@@ -875,7 +876,7 @@ mod tests {
             current_branch: Box::new(|| Ok("feat/sample".into())),
             default_branch: Box::new(|_, _| Ok("main".into())),
             git_status: Box::new(|_| Ok(String::new())),
-            head_state: Box::new(|_| {
+            head_state: Box::new(|_, _| {
                 Ok(crate::validations::HeadState {
                     head_sha: "abc".into(),
                     upstream_sha: Some("abc".into()),

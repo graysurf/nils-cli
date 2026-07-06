@@ -130,6 +130,8 @@ pub struct PrChecksPayload {
     pub checks: Vec<CheckItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 pub fn run(
@@ -277,13 +279,54 @@ fn snapshot_github<R: BackendRunner>(
     args: &PrChecksArgs,
 ) -> Result<PrChecksPayload, ForgeError> {
     let call = build_github_call(ctx, &args.id);
-    let output = run_github_checks_call(runner, &call)?;
+    let output = match run_github_checks_call(runner, &call) {
+        Ok(output) => output,
+        Err(err) if is_status_rollup_permission_error(&err) => {
+            return snapshot_github_rollup_fallback(runner, ctx, args);
+        }
+        Err(err) => return Err(err),
+    };
     if args.required_only {
         let required_call = build_github_required_call(ctx, &args.id);
-        let required_output = run_github_checks_call(runner, &required_call)?;
+        let required_output = match run_github_checks_call(runner, &required_call) {
+            Ok(output) => output,
+            Err(err) if is_status_rollup_permission_error(&err) => {
+                return snapshot_github_rollup_fallback(runner, ctx, args);
+            }
+            Err(err) => return Err(err),
+        };
         return parse_github_snapshot_with_required_output(ctx, &output, &required_output);
     }
     parse_github_snapshot(ctx, &output, false)
+}
+
+fn snapshot_github_rollup_fallback<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    args: &PrChecksArgs,
+) -> Result<PrChecksPayload, ForgeError> {
+    let call = build_github_rollup_view_call(ctx, &args.id);
+    let output = runner.run(&call)?;
+    let mut checks = parse_github_status_rollup(&output, args.required_only)?;
+    if args.required_only && checks.is_empty() {
+        checks.push(CheckItem {
+            name: "github-status-rollup-requiredness-unknown".to_string(),
+            state: CheckState::Pending.as_str(),
+            url: None,
+            conclusion: None,
+            workflow: None,
+            required: true,
+            started_at: None,
+            completed_at: None,
+        });
+    }
+    let mut payload = aggregate(ctx, checks, args.required_only, None);
+    if args.required_only {
+        payload
+            .warnings
+            .push("github_status_rollup_requiredness_unknown_all_rows_gated".to_string());
+    }
+    Ok(payload)
 }
 
 /// Build the `gh pr checks <id> --json …` call. Public so the dry-run helper
@@ -311,6 +354,20 @@ pub fn build_github_required_call(ctx: &ProviderContext, id: &str) -> BackendCal
         OsString::from("--required"),
         OsString::from("--json"),
         OsString::from(GH_JSON_FIELDS),
+    ];
+    ctx.push_repo_override(&mut argv);
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+/// Build the GitHub fallback call used when `gh pr checks` hits a
+/// permission-sensitive statusCheckRollup traversal internally.
+pub fn build_github_rollup_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
+    let mut argv: Vec<OsString> = vec![
+        OsString::from("pr"),
+        OsString::from("view"),
+        OsString::from(id),
+        OsString::from("--json"),
+        OsString::from("headRefOid,statusCheckRollup"),
     ];
     ctx.push_repo_override(&mut argv);
     BackendCall::new(BackendProgram::Gh, argv)
@@ -364,6 +421,22 @@ fn is_no_checks_reported(detail: Option<&str>) -> bool {
             lower.contains("no required checks reported") || lower.contains("no checks reported")
         })
         .unwrap_or(false)
+}
+
+fn is_status_rollup_permission_error(err: &ForgeError) -> bool {
+    let detail = match err {
+        ForgeError::BackendError {
+            detail: Some(detail),
+            ..
+        } => detail,
+        _ => return false,
+    };
+    let lower = detail.to_ascii_lowercase();
+    let has_rollup = lower.contains("statuscheckrollup") || lower.contains("status check rollup");
+    has_rollup
+        && (lower.contains("resource not accessible")
+            || lower.contains("not accessible")
+            || lower.contains("permission"))
 }
 
 fn parse_github_snapshot(
@@ -435,6 +508,140 @@ fn parse_github_checks(
         checks.push(parse_github_entry(entry, required_names, force_required)?);
     }
     Ok(checks)
+}
+
+fn parse_github_status_rollup(
+    output: &BackendSuccess,
+    force_required: bool,
+) -> Result<Vec<CheckItem>, ForgeError> {
+    let trimmed = output.stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "pr view statusCheckRollup JSON is invalid",
+            Some(e.to_string()),
+        )
+    })?;
+    let head_oid = value
+        .get("headRefOid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ForgeError::software(
+                schema_err(),
+                "missing required field 'headRefOid' in pr view JSON",
+                None,
+            )
+        })?;
+    let rollup = value
+        .get("statusCheckRollup")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            ForgeError::software(
+                schema_err(),
+                "missing required field 'statusCheckRollup' in pr view JSON",
+                Some(format!("headRefOid={head_oid}")),
+            )
+        })?;
+    let mut checks = Vec::with_capacity(rollup.len());
+    for entry in rollup {
+        checks.push(parse_github_rollup_entry(entry, force_required)?);
+    }
+    Ok(checks)
+}
+
+fn parse_github_rollup_entry(
+    value: &serde_json::Value,
+    force_required: bool,
+) -> Result<CheckItem, ForgeError> {
+    let name = value
+        .get("name")
+        .or_else(|| value.get("context"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| missing("name"))?;
+    let conclusion = value
+        .get("conclusion")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let raw_state = value
+        .get("status")
+        .or_else(|| value.get("state"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let kind = value.get("__typename").and_then(|v| v.as_str());
+    let state = normalize_github_rollup_state(kind, conclusion.as_deref(), raw_state);
+    let url = value
+        .get("detailsUrl")
+        .or_else(|| value.get("targetUrl"))
+        .or_else(|| value.get("link"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let workflow = value
+        .get("workflowName")
+        .or_else(|| value.get("workflow"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let started_at = value
+        .get("startedAt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let completed_at = value
+        .get("completedAt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(CheckItem {
+        name,
+        state: state.as_str(),
+        url,
+        conclusion,
+        workflow,
+        required: force_required,
+        started_at,
+        completed_at,
+    })
+}
+
+fn normalize_github_rollup_state(
+    kind: Option<&str>,
+    conclusion: Option<&str>,
+    raw_state: Option<&str>,
+) -> CheckState {
+    if matches!(kind, Some("CheckRun"))
+        && matches!(
+            raw_state.map(str::to_ascii_lowercase).as_deref(),
+            Some("completed")
+        )
+        && !is_known_github_conclusion(conclusion)
+    {
+        return CheckState::Pending;
+    }
+    normalize_github_state(None, conclusion, raw_state)
+}
+
+fn is_known_github_conclusion(conclusion: Option<&str>) -> bool {
+    matches!(
+        conclusion.map(str::to_ascii_lowercase).as_deref(),
+        Some(
+            "success"
+                | "failure"
+                | "action_required"
+                | "stale"
+                | "startup_failure"
+                | "cancelled"
+                | "skipped"
+                | "neutral"
+                | "timed_out"
+        )
+    )
 }
 
 fn parse_github_entry(
@@ -632,6 +839,7 @@ pub fn aggregate(
         pending,
         checks,
         duration_ms,
+        warnings: Vec::new(),
     }
 }
 

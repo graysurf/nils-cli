@@ -204,7 +204,14 @@ Starting with `nils-cli` `0.17.0`, GitHub `pr checks` calls request only the
 `gh 2.92.0` supported JSON fields. Required-check gates use an explicit
 `gh pr checks --required` snapshot instead of the removed `isRequired` JSON
 field, so `pr checks`, `pr wait-checks`, `pr merge`, and `pr deliver` share the
-same compatibility path.
+same compatibility path. If `gh pr checks` fails on a GitHub
+`statusCheckRollup` permission traversal, `forge-cli` falls back to
+`gh pr view --json headRefOid,statusCheckRollup` and returns the readable
+head-SHA rollup rows instead of surfacing a backend error. If that fallback
+cannot recover required-check classification, required-only snapshots fail
+closed by gating every readable row, synthesize a pending required row when the
+readable rollup is empty, and include
+`github_status_rollup_requiredness_unknown_all_rows_gated` in `data.warnings[]`.
 
 ## GitLab MR delivery compatibility
 
