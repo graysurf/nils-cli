@@ -1884,6 +1884,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_session_title_renames_live_claude_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls_log = tmp.path().join("tmux-calls.log");
+        let pasted_log = tmp.path().join("tmux-pasted.log");
+        let tmux = rename_probe_tmux(tmp.path(), &calls_log, &pasted_log, true);
+        seed_session(tmp.path(), "steer", "claude", "hs-claude-steer");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/steer",
+                Some(TOKEN),
+                json!({ "title": "Cleaned up title" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "Cleaned up title");
+
+        let calls = std::fs::read_to_string(&calls_log).unwrap();
+        assert!(
+            calls.contains("paste-buffer -b steer-send"),
+            "a live Claude rename must paste into the pane: {calls:?}"
+        );
+        assert!(
+            calls.contains("send-keys -t hs-claude-steer:0.0 Enter"),
+            "a live Claude rename must be submitted with Enter: {calls:?}"
+        );
+        let pasted = std::fs::read_to_string(&pasted_log).unwrap();
+        assert_eq!(
+            pasted.trim_end(),
+            "/rename Cleaned up title",
+            "the pasted rename command must carry the new title: {pasted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_session_title_does_not_rename_non_claude_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls_log = tmp.path().join("tmux-calls.log");
+        let pasted_log = tmp.path().join("tmux-pasted.log");
+        let tmux = rename_probe_tmux(tmp.path(), &calls_log, &pasted_log, true);
+        seed_session(tmp.path(), "steer", "codex", "hs-codex-steer");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/steer",
+                Some(TOKEN),
+                json!({ "title": "Cleaned up title" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "Cleaned up title");
+
+        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert!(
+            !calls.contains("paste-buffer"),
+            "Codex has no prompt-bar display name; it must not receive /rename: {calls:?}"
+        );
+        assert!(
+            !pasted_log.exists(),
+            "no rename text should be pasted for a non-Claude session"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_session_title_skips_rename_for_stopped_claude_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls_log = tmp.path().join("tmux-calls.log");
+        let pasted_log = tmp.path().join("tmux-pasted.log");
+        let tmux = rename_probe_tmux(tmp.path(), &calls_log, &pasted_log, false);
+        seed_session(tmp.path(), "steer", "claude", "hs-claude-steer");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/steer",
+                Some(TOKEN),
+                json!({ "title": "New title" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "New title");
+        assert_eq!(body["data"]["session"]["status"], "stopped");
+
+        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert!(
+            !calls.contains("paste-buffer"),
+            "a stopped session has no live pane to rename: {calls:?}"
+        );
+        assert!(
+            !pasted_log.exists(),
+            "no rename text should be pasted for a stopped session"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_session_title_clearing_to_null_does_not_rename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls_log = tmp.path().join("tmux-calls.log");
+        let pasted_log = tmp.path().join("tmux-pasted.log");
+        let tmux = rename_probe_tmux(tmp.path(), &calls_log, &pasted_log, true);
+        seed_session(tmp.path(), "steer", "claude", "hs-claude-steer");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, _body) = call(
+            router(st.clone()),
+            patch_json("/sessions/steer", Some(TOKEN), json!({ "title": "First" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Clearing the title must not fire `/rename` with no argument (which would
+        // make Claude auto-generate an unrelated name).
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json("/sessions/steer", Some(TOKEN), json!({ "title": null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], Value::Null);
+
+        let pasted = std::fs::read_to_string(&pasted_log).unwrap();
+        assert_eq!(
+            pasted.matches("/rename").count(),
+            1,
+            "only the non-empty title should have been pushed as a rename: {pasted:?}"
+        );
+        assert!(
+            pasted.contains("/rename First"),
+            "the one rename must be the non-empty title: {pasted:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn new_write_routes_require_token() {
         let tmp = tempfile::TempDir::new().unwrap();
         let tmux = minimal_tmux(tmp.path());
@@ -2451,6 +2592,29 @@ mod tests {
             format!(
                 "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
+    /// tmux stub that logs every invocation to `calls` and, on `load-buffer`,
+    /// appends the pasted buffer file's content to `pasted`. `running` toggles
+    /// the `has-session` result so title-rename gating can be exercised for both
+    /// live and stopped sessions.
+    fn rename_probe_tmux(dir: &Path, calls: &Path, pasted: &Path, running: bool) -> PathBuf {
+        let bin = dir.join("tmux");
+        let has_session_exit = if running { 0 } else { 1 };
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit {} ;;\n  load-buffer) cat \"$4\" >> {}; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                shell_words::quote(&calls.to_string_lossy()),
+                has_session_exit,
+                shell_words::quote(&pasted.to_string_lossy()),
             ),
         )
         .unwrap();
