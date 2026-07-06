@@ -303,6 +303,39 @@ fn pr_checks_rollup_required_only_false_gates_all_rows_without_warning() {
 }
 
 #[test]
+fn pr_checks_rollup_required_only_empty_rollup_is_pending() {
+    let stub = StubEnv::new().gh_stub(&gh_status_rollup_fallback_stub_with_rollup(r#"[]"#));
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["state"], "pending");
+    assert_eq!(env["data"]["required_count"], 1);
+    assert_eq!(env["data"]["success_count"], 0);
+    assert_eq!(
+        env["data"]["pending"][0]["name"],
+        "github-status-rollup-requiredness-unknown"
+    );
+    assert_eq!(
+        env["data"]["warnings"][0],
+        "github_status_rollup_requiredness_unknown_all_rows_gated"
+    );
+}
+
+#[test]
 fn pr_checks_all_success_emits_success_state() {
     let (_, env) = run_checks(FIXTURE_ALL_SUCCESS, FIXTURE_ALL_SUCCESS, &[]);
     assert_eq!(env["schema_version"], "cli.forge-cli.pr.checks.v1");

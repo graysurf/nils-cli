@@ -355,7 +355,8 @@ backend mapping, validation rules, and output schema versions.
   treats the readable head-SHA rollup rows as the snapshot. When
   `--required-only=true`, that fallback cannot recover GitHub's required
   classification, so it fail-closed gates every readable rollup row and
-  adds `github_status_rollup_requiredness_unknown_all_rows_gated` to
+  synthesizes a pending required row when the readable rollup is empty. It
+  also adds `github_status_rollup_requiredness_unknown_all_rows_gated` to
   `data.warnings[]`. On GitLab,
   numeric MR ids use `glab mr view -F json` for the MR head pipeline and
   `glab api --hostname <host> projects/<project>/pipelines/<id>/jobs`

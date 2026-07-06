@@ -307,7 +307,19 @@ fn snapshot_github_rollup_fallback<R: BackendRunner>(
 ) -> Result<PrChecksPayload, ForgeError> {
     let call = build_github_rollup_view_call(ctx, &args.id);
     let output = runner.run(&call)?;
-    let checks = parse_github_status_rollup(&output, args.required_only)?;
+    let mut checks = parse_github_status_rollup(&output, args.required_only)?;
+    if args.required_only && checks.is_empty() {
+        checks.push(CheckItem {
+            name: "github-status-rollup-requiredness-unknown".to_string(),
+            state: CheckState::Pending.as_str(),
+            url: None,
+            conclusion: None,
+            workflow: None,
+            required: true,
+            started_at: None,
+            completed_at: None,
+        });
+    }
     let mut payload = aggregate(ctx, checks, args.required_only, None);
     if args.required_only {
         payload
