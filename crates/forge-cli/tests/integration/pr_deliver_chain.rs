@@ -177,6 +177,21 @@ fn make_git_repo() -> TempDir {
     tempdir
 }
 
+fn git(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("git spawn");
+    if !out.status.success() {
+        panic!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 fn write_full_chain_stub(stub: &StubEnv) -> PathBuf {
     write_chain_stub(stub, FULL_PR_VIEW_JSON, MERGED_PR_VIEW_JSON, false)
 }
@@ -471,6 +486,60 @@ fn pr_deliver_full_chain_no_merge_emits_four_steps_and_returns_success() {
     assert_eq!(envelope["data"]["pr"]["merged"], false);
     assert!(envelope["data"]["pr"]["merge_sha"].is_null());
     assert_eq!(envelope["data"]["pr"]["number"], 123);
+}
+
+#[test]
+fn pr_deliver_head_flag_uses_named_branch_push_state() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    git(&repo_path, &["checkout", "-q", "main"]);
+
+    let stub = StubEnv::new();
+    let gh_path = write_full_chain_stub(&stub);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+            "--no-merge",
+        ],
+    );
+    assert_eq!(
+        out.code, 0,
+        "explicit --head branch is pushed even when current HEAD lacks upstream; stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], true);
+    let steps: Vec<&str> = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .map(|s| s["step"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        steps,
+        vec!["auth_status", "repo_view", "create", "wait_checks"]
+    );
 }
 
 #[test]

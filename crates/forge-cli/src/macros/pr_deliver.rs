@@ -43,7 +43,7 @@ use crate::ops::{
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::{
     BodyHeadings, PreflightInputs, RuleVerdict, body_sections, branch_kind_matches, branch_name,
-    git_current_branch, git_head_state, git_status_porcelain, head_pushed, run_local_preflight,
+    branch_pushed, git_branch_state, git_current_branch, git_status_porcelain, run_local_preflight,
     worktree_clean,
 };
 
@@ -437,7 +437,7 @@ fn validate_adopted(
     let headings = BodyHeadings::default();
     body_sections(view.body.as_deref().unwrap_or(""), &headings)?;
     worktree_clean(workdir, git_status_porcelain)?;
-    head_pushed(workdir, git_head_state)?;
+    branch_pushed(workdir, &view.head, git_branch_state)?;
     test_first_gate(
         args.kind.into_kind(),
         test_first_required,
@@ -564,7 +564,7 @@ fn emit_dry_run(
         headings: &headings,
     };
     let mut local_preflight =
-        run_local_preflight(&inputs, workdir, git_status_porcelain, git_head_state);
+        run_local_preflight(&inputs, workdir, git_status_porcelain, git_branch_state);
     // Faithful test-first gate: when the repo opts in, the real run enforces
     // evidence for feature/bug kinds (both create and adopt paths), so surface
     // the same verdict here instead of predicting a success the real deliver

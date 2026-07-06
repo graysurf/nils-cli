@@ -82,6 +82,21 @@ fn make_git_repo(provider_host: &str, repo_slug: &str) -> TempDir {
     tempdir
 }
 
+fn git(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("git spawn");
+    if !out.status.success() {
+        panic!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 fn well_formed_body() -> &'static str {
     "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified via cargo test.\n"
 }
@@ -495,6 +510,48 @@ fn pr_create_github_full_chain_emits_canonical_envelope() {
         envelope["data"]["url"],
         "https://github.com/sympoies/nils-cli/pull/123"
     );
+}
+
+#[test]
+fn pr_create_head_flag_uses_named_branch_push_state() {
+    let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+    git(&repo_path, &["checkout", "-q", "main"]);
+
+    let stub = StubEnv::new();
+    let gh_path = write_gh_dispatch_stub(&stub);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--title",
+            "feat: sample feature",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+        ],
+    );
+    assert_eq!(
+        out.code, 0,
+        "explicit --head branch is pushed even when current HEAD lacks upstream; stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["head"], "feat/sample");
 }
 
 #[test]

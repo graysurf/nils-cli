@@ -48,6 +48,48 @@ esac
     )
 }
 
+fn gh_status_rollup_fallback_stub() -> String {
+    r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr checks")
+    echo "GraphQL: Resource not accessible by integration (node.statusCheckRollup.nodes.0.commit.statusCheckRollup)" >&2
+    exit 1
+    ;;
+  "pr view")
+    cat <<'EOF'
+{
+  "headRefOid": "abc123",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "name": "test",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/sympoies/nils-cli/actions/runs/1/job/2",
+      "workflowName": "CI",
+      "startedAt": "2026-07-06T10:00:00Z",
+      "completedAt": "2026-07-06T10:05:00Z"
+    },
+    {
+      "__typename": "StatusContext",
+      "context": "coverage",
+      "state": "SUCCESS",
+      "targetUrl": "https://github.com/sympoies/nils-cli/runs/3"
+    }
+  ]
+}
+EOF
+    ;;
+  *)
+    echo "stub: unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    .to_string()
+}
+
 fn run_checks(
     all_checks_json: &str,
     required_checks_json: &str,
@@ -68,6 +110,45 @@ fn run_checks(
     assert_eq!(out.code, 0, "stderr={}", out.stderr);
     let env = parse_envelope(&out.stdout);
     (out.code, env)
+}
+
+#[test]
+fn pr_checks_falls_back_to_status_rollup_view_on_permission_error() {
+    let stub = StubEnv::new().gh_stub(&gh_status_rollup_fallback_stub());
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.pr.checks.v1");
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["state"], "success");
+    assert_eq!(env["data"]["required_count"], 2);
+    assert_eq!(env["data"]["success_count"], 2);
+    let checks = env["data"]["checks"].as_array().expect("checks array");
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0]["name"], "test");
+    assert_eq!(
+        checks[0]["url"],
+        "https://github.com/sympoies/nils-cli/actions/runs/1/job/2"
+    );
+    assert_eq!(checks[0]["workflow"], "CI");
+    assert_eq!(checks[1]["name"], "coverage");
+    assert_eq!(
+        checks[1]["url"],
+        "https://github.com/sympoies/nils-cli/runs/3"
+    );
 }
 
 #[test]

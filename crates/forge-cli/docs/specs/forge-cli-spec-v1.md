@@ -125,7 +125,7 @@ Parity matrix (v1):
 | `pr merge <id>`                             | `gh pr merge <id> --squash --delete-branch`                                                                                                  | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg)                                                                                     |
 | `pr close <id>`                             | `gh pr close <id>`                                                                                                                           | `glab mr close <id>`                                        | exact                                                                                                                    |
 | `pr checks <id>`                            | `gh pr checks <id> --json …` plus `--required` for gating                                                                                    | `glab mr view -F json` + `glab api .../pipelines/<id>/jobs` | emulated on GitLab                                                                                                       |
-| `pr wait-checks <id>`                       | poll `gh pr checks` / `gh pr checks --required`                                                                                              | poll structured MR pipeline/jobs snapshot                   | emulated; same envelope                                                                                                  |
+| `pr wait-checks <id>`                       | poll `gh pr checks` / `gh pr checks --required`; fall back to readable `statusCheckRollup` rows on rollup permission errors                  | poll structured MR pipeline/jobs snapshot                   | emulated; same envelope                                                                                                  |
 | `issue create`                              | `gh issue create …`                                                                                                                          | `glab issue create …`                                       | exact                                                                                                                    |
 | `issue view <id>`                           | `gh issue view <id> --json …`                                                                                                                | `glab issue view <id> -F json`                              | exact                                                                                                                    |
 | `issue edit <id>`                           | `gh issue edit <id> …`                                                                                                                       | `glab issue update <id> …`                                  | exact                                                                                                                    |
@@ -333,7 +333,7 @@ backend mapping, validation rules, and output schema versions.
   - body MUST contain non-empty `## Summary` and `## Test plan`
     sections;
   - working tree MUST be clean (`git status --porcelain` empty);
-  - HEAD MUST be pushed and remote-tracked.
+  - resolved head branch MUST be pushed and remote-tracked.
 - Output schema: `cli.forge-cli.pr.create.v1`,
   `data = { number, url, head, base, draft, title, kind, provider }`.
 
@@ -349,8 +349,11 @@ backend mapping, validation rules, and output schema versions.
   GitHub, required-check classification comes from an explicit
   `gh pr checks --required` call; the JSON field set is
   `name,state,bucket,workflow,link,startedAt,completedAt,description`
-  so the backend stays compatible with `gh 2.92.0`. On GitLab, numeric
-  MR ids use `glab mr view -F json` for the MR head pipeline and
+  so the backend stays compatible with `gh 2.92.0`. If `gh pr checks`
+  fails on a `statusCheckRollup` permission traversal, the GitHub path
+  falls back to `gh pr view --json headRefOid,statusCheckRollup` and
+  treats the readable head-SHA rollup rows as the snapshot. On GitLab,
+  numeric MR ids use `glab mr view -F json` for the MR head pipeline and
   `glab api --hostname <host> projects/<project>/pipelines/<id>/jobs`
   for job rows; `allow_failure=true` jobs remain visible in
   `data.checks` but are not required. Branch-only GitLab snapshots
@@ -612,8 +615,8 @@ Steps:
    payload is recorded, and the lifecycle resumes from step 5. The
    adopted PR's *actual* body (fetched via `pr view`) is re-validated
    against the body-section gate, and the branch-kind / clean-worktree /
-   head-pushed rules still apply. `--title` / `--body` inputs are
-   ignored on adoption — the existing PR keeps its own.
+   resolved-head push-state rules still apply. `--title` / `--body`
+   inputs are ignored on adoption — the existing PR keeps its own.
 4. `pr create --draft` — atom; validates branch / title / body. Only
    runs when the lookup found nothing.
 5. `pr wait-checks` — atom; blocks until terminal.
@@ -650,8 +653,8 @@ backend implementations cannot diverge.
 4. **Working tree.** `git status --porcelain` MUST be empty for
    `create`, `merge`, and `deliver`. (`view`/`list`/`comment` are
    read/append-only and do not check.)
-5. **Push state.** HEAD MUST be pushed to a remote-tracking branch
-   before `create` runs.
+5. **Push state.** The resolved head branch MUST be pushed to a
+   remote-tracking branch before `create` or `deliver` runs.
 6. **Default-branch protection.** `forge-cli` refuses any operation
    that would force-push, delete, or merge directly into the repo
    default branch except via a merged PR/MR. `--allow-non-default-base`

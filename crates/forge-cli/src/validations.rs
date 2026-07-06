@@ -399,21 +399,46 @@ where
     F: FnOnce(&Path) -> Result<HeadState, ForgeError>,
 {
     let state = head_state_fn(workdir)?;
+    pushed_state("HEAD", state)
+}
+
+/// Rule 5 variant for an explicitly resolved head branch. Used when the
+/// caller supplies `--head <branch>` so the push guard validates that branch,
+/// not the process checkout's current `HEAD`.
+pub fn branch_pushed<F>(workdir: &Path, branch: &str, branch_state_fn: F) -> Result<(), ForgeError>
+where
+    F: FnOnce(&Path, &str) -> Result<HeadState, ForgeError>,
+{
+    let state = branch_state_fn(workdir, branch)?;
+    pushed_state(branch, state)
+}
+
+fn pushed_state(subject: &str, state: HeadState) -> Result<(), ForgeError> {
     match state.upstream_sha {
         None => Err(ForgeError::validation(
             schema(),
             "head_not_pushed",
-            "HEAD has no upstream tracking branch (push the branch first)",
+            if subject == "HEAD" {
+                "HEAD has no upstream tracking branch (push the branch first)".to_string()
+            } else {
+                format!(
+                    "branch '{subject}' has no upstream tracking branch (push the branch first)"
+                )
+            },
             None,
         )),
         Some(upstream) if upstream == state.head_sha => Ok(()),
         Some(upstream) => Err(ForgeError::validation(
             schema(),
             "head_not_pushed",
-            "HEAD differs from its upstream (push the branch first)",
+            if subject == "HEAD" {
+                "HEAD differs from its upstream (push the branch first)".to_string()
+            } else {
+                format!("branch '{subject}' differs from its upstream (push the branch first)")
+            },
             Some(format!(
-                "head={head}\nupstream={upstream}",
-                head = state.head_sha
+                "branch={subject}\nhead={head}\nupstream={upstream}",
+                head = state.head_sha,
             )),
         )),
     }
@@ -496,7 +521,7 @@ pub fn run_local_preflight<FS, FH>(
 ) -> Vec<RuleVerdict>
 where
     FS: FnOnce(&Path) -> Result<String, ForgeError>,
-    FH: FnOnce(&Path) -> Result<HeadState, ForgeError>,
+    FH: FnOnce(&Path, &str) -> Result<HeadState, ForgeError>,
 {
     let mut verdicts = Vec::with_capacity(9);
 
@@ -552,11 +577,14 @@ where
         worktree_clean(workdir, git_status_fn),
     ));
 
-    // Rule 5 — head pushed / matches upstream (local git read).
-    verdicts.push(RuleVerdict::from_result(
-        "head_pushed",
-        head_pushed(workdir, head_state_fn),
-    ));
+    // Rule 5 — resolved head branch pushed / matches upstream (local git read).
+    verdicts.push(match prefix {
+        Some(_) => RuleVerdict::from_result(
+            "head_pushed",
+            branch_pushed(workdir, inputs.branch, head_state_fn),
+        ),
+        None => RuleVerdict::not_evaluated("head_pushed", "branch name is invalid"),
+    });
 
     verdicts
 }
@@ -608,6 +636,23 @@ pub fn git_head_state(workdir: &Path) -> Result<HeadState, ForgeError> {
                 .trim()
                 .to_string(),
         ),
+        Err(_) => None,
+    };
+    Ok(HeadState {
+        head_sha,
+        upstream_sha,
+    })
+}
+
+/// Default branch-state resolver. Reads `<branch>` and `<branch>@{upstream}`
+/// via git so explicit `--head <branch>` validation is independent of the
+/// checkout's current `HEAD`.
+pub fn git_branch_state(workdir: &Path, branch: &str) -> Result<HeadState, ForgeError> {
+    let head_sha = run_git_capture(workdir, &["rev-parse", branch])?;
+    let head_sha = head_sha.trim().to_string();
+    let upstream_ref = format!("{branch}@{{upstream}}");
+    let upstream_sha = match run_git_capture(workdir, &["rev-parse", &upstream_ref]) {
+        Ok(output) => Some(output.trim().to_string()),
         Err(_) => None,
     };
     Ok(HeadState {
@@ -899,14 +944,14 @@ mod tests {
         Ok(String::new())
     }
 
-    fn pushed_head(_: &Path) -> Result<HeadState, ForgeError> {
+    fn pushed_head(_: &Path, _: &str) -> Result<HeadState, ForgeError> {
         Ok(HeadState {
             head_sha: "deadbeef".into(),
             upstream_sha: Some("deadbeef".into()),
         })
     }
 
-    fn unpushed_head(_: &Path) -> Result<HeadState, ForgeError> {
+    fn unpushed_head(_: &Path, _: &str) -> Result<HeadState, ForgeError> {
         Ok(HeadState {
             head_sha: "deadbeef".into(),
             upstream_sha: None,
