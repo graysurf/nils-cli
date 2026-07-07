@@ -17,7 +17,7 @@
 - Plan document:
   `docs/plans/2026-07-07-claude-usage-fallback/claude-usage-fallback-plan.md`
 - Direct source-doc execution waiver: not applicable.
-- Tracking issue: pending.
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/1046>
 - Source snapshot: pending.
 - Plan snapshot: pending.
 - Initial state snapshot: pending.
