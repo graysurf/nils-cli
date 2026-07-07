@@ -489,6 +489,9 @@ operations:
       github: { program: gh,   argv: [pr, checks, "{id}", --json, "name,state,bucket,workflow,link,startedAt,completedAt,description"] }
       github_required: { program: gh, argv: [pr, checks, "{id}", --required, --json, "name,state,bucket,workflow,link,startedAt,completedAt,description"] }
       github_rollup_fallback: { program: gh, argv: [pr, view, "{id}", --json, "headRefOid,statusCheckRollup"] }
+      github_head_fallback: { program: gh, argv: [pr, view, "{id}", --json, "headRefOid"] }
+      github_check_runs_fallback: { program: gh, argv: [api, "repos/{repo}/commits/{headRefOid}/check-runs?per_page=100"] }
+      github_statuses_fallback: { program: gh, argv: [api, "repos/{repo}/commits/{headRefOid}/status"] }
       gitlab: { program: glab, argv: [ci, status,  "-b", "{branch}"] }   # text fallback parsed
     output:
       data:

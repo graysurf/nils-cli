@@ -352,11 +352,14 @@ backend mapping, validation rules, and output schema versions.
   so the backend stays compatible with `gh 2.92.0`. If `gh pr checks`
   fails on a `statusCheckRollup` permission traversal, the GitHub path
   falls back to `gh pr view --json headRefOid,statusCheckRollup` and
-  treats the readable head-SHA rollup rows as the snapshot. When
-  `--required-only=true`, that fallback cannot recover GitHub's required
-  classification, so it fail-closed gates every readable rollup row and
-  synthesizes a pending required row when the readable rollup is empty. It
-  also adds `github_status_rollup_requiredness_unknown_all_rows_gated` to
+  treats the readable head-SHA rollup rows as the snapshot. If that
+  projection is also permission-blocked, it reads `headRefOid` alone and
+  falls back to REST `gh api` commit check-runs plus combined status
+  contexts for the same head SHA. When `--required-only=true`, those
+  fallbacks cannot recover GitHub's required classification, so they
+  fail-closed gate every readable fallback row and synthesize a pending
+  required row when the fallback snapshot is empty. They also add
+  `github_status_rollup_requiredness_unknown_all_rows_gated` to
   `data.warnings[]`. On GitLab,
   numeric MR ids use `glab mr view -F json` for the MR head pipeline and
   `glab api --hostname <host> projects/<project>/pipelines/<id>/jobs`

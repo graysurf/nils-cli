@@ -116,6 +116,75 @@ esac
     )
 }
 
+fn gh_status_rollup_then_rest_fallback_stub() -> String {
+    r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr checks")
+    echo "GraphQL: Resource not accessible by integration (repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup)" >&2
+    exit 1
+    ;;
+  "pr view")
+    case " $* " in
+      *" headRefOid,statusCheckRollup "*)
+        echo "GraphQL: Resource not accessible by integration (repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup)" >&2
+        exit 1
+        ;;
+      *" headRefOid "*)
+        cat <<'EOF'
+{"headRefOid":"abc123"}
+EOF
+        ;;
+      *)
+        echo "stub: unexpected gh pr view args: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  "api repos/sympoies/nils-cli/commits/abc123/check-runs?per_page=100")
+    cat <<'EOF'
+{
+  "total_count": 1,
+  "check_runs": [
+    {
+      "name": "build",
+      "status": "completed",
+      "conclusion": "success",
+      "details_url": "https://github.com/sympoies/nils-cli/actions/runs/1/job/2",
+      "started_at": "2026-07-06T10:00:00Z",
+      "completed_at": "2026-07-06T10:05:00Z",
+      "check_suite": {
+        "workflow_run": {
+          "name": "CI"
+        }
+      }
+    }
+  ]
+}
+EOF
+    ;;
+  "api repos/sympoies/nils-cli/commits/abc123/status")
+    cat <<'EOF'
+{
+  "statuses": [
+    {
+      "context": "coverage",
+      "state": "success",
+      "target_url": "https://github.com/sympoies/nils-cli/runs/3"
+    }
+  ]
+}
+EOF
+    ;;
+  *)
+    echo "stub: unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    .to_string()
+}
+
 fn run_checks(
     all_checks_json: &str,
     required_checks_json: &str,
@@ -169,6 +238,49 @@ fn pr_checks_falls_back_to_status_rollup_view_on_permission_error() {
     let checks = env["data"]["checks"].as_array().expect("checks array");
     assert_eq!(checks.len(), 2);
     assert_eq!(checks[0]["name"], "test");
+    assert_eq!(
+        checks[0]["url"],
+        "https://github.com/sympoies/nils-cli/actions/runs/1/job/2"
+    );
+    assert_eq!(checks[0]["workflow"], "CI");
+    assert_eq!(checks[1]["name"], "coverage");
+    assert_eq!(
+        checks[1]["url"],
+        "https://github.com/sympoies/nils-cli/runs/3"
+    );
+}
+
+#[test]
+fn pr_checks_falls_back_to_rest_when_rollup_view_is_permission_blocked() {
+    let stub = StubEnv::new().gh_stub(&gh_status_rollup_then_rest_fallback_stub());
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["schema_version"], "cli.forge-cli.pr.checks.v1");
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["state"], "success");
+    assert_eq!(env["data"]["required_count"], 2);
+    assert_eq!(env["data"]["success_count"], 2);
+    assert_eq!(
+        env["data"]["warnings"][0],
+        "github_status_rollup_requiredness_unknown_all_rows_gated"
+    );
+    let checks = env["data"]["checks"].as_array().expect("checks array");
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0]["name"], "build");
     assert_eq!(
         checks[0]["url"],
         "https://github.com/sympoies/nils-cli/actions/runs/1/job/2"
