@@ -491,7 +491,7 @@ operations:
       github_rollup_fallback: { program: gh, argv: [pr, view, "{id}", --json, "headRefOid,statusCheckRollup"] }
       github_head_fallback: { program: gh, argv: [pr, view, "{id}", --json, "headRefOid"] }
       github_check_runs_fallback: { program: gh, argv: [api, "repos/{repo}/commits/{headRefOid}/check-runs?per_page=100"] }
-      github_statuses_fallback: { program: gh, argv: [api, "repos/{repo}/commits/{headRefOid}/status"] }
+      github_statuses_fallback: { program: gh, argv: [api, "repos/{repo}/commits/{headRefOid}/status?per_page=100"] }
       gitlab: { program: glab, argv: [ci, status,  "-b", "{branch}"] }   # text fallback parsed
     output:
       data:
