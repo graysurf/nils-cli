@@ -1,6 +1,6 @@
 [package]
 name = "nils-plan-issue"
-version = "1.20.18"
+version = "1.20.19"
 edition.workspace = true
 license.workspace = true
 default-run = "plan-issue"
@@ -24,15 +24,15 @@ path = "src/bin/plan-issue-local.rs"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.20.18", path = "../nils-build-info" }
+nils-build-info = { version = "1.20.19", path = "../nils-build-info" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
-nils-common = { version = "1.20.18", path = "../nils-common", package = "nils-common" }
-nils-markdown = { version = "1.20.18", path = "../nils-markdown", package = "nils-markdown" }
-plan-tooling = { version = "1.20.18", path = "../plan-tooling", package = "nils-plan-tooling" }
+nils-common = { version = "1.20.19", path = "../nils-common", package = "nils-common" }
+nils-markdown = { version = "1.20.19", path = "../nils-markdown", package = "nils-markdown" }
+plan-tooling = { version = "1.20.19", path = "../plan-tooling", package = "nils-plan-tooling" }
 
 [dev-dependencies]
-nils-markdown = { version = "1.20.18", path = "../nils-markdown", package = "nils-markdown", features = ["test-support"] }
-nils-test-support = { version = "1.20.18", path = "../nils-test-support" }
+nils-markdown = { version = "1.20.19", path = "../nils-markdown", package = "nils-markdown", features = ["test-support"] }
+nils-test-support = { version = "1.20.19", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
