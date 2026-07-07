@@ -410,6 +410,8 @@ struct SessionView {
     log_file: Option<String>,
     created_at: String,
     updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_terminal_activity_at: Option<String>,
 }
 
 #[derive(Debug)]
@@ -467,6 +469,8 @@ struct GlanceResult {
     tail: String,
     created_at: String,
     updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_terminal_activity_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -598,7 +602,12 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         created.record = persist_or_reload_session_record(context, &created.record);
     }
 
-    let result = session_view(context, &created.record, Some("running".to_string()));
+    let result = session_view(
+        context,
+        &created.record,
+        Some("running".to_string()),
+        Some(&tmux_bin),
+    );
     record_workdir_usage(context, &cwd);
     Ok(StartView {
         format: args.format,
@@ -647,7 +656,12 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         return Err(err);
     }
 
-    let result = session_view(context, &created.record, Some("running".to_string()));
+    let result = session_view(
+        context,
+        &created.record,
+        Some("running".to_string()),
+        Some(&tmux_bin),
+    );
     record_workdir_usage(context, &cwd);
     Ok(StartView {
         format: args.format,
@@ -710,7 +724,12 @@ pub(crate) fn start_provider_resume_session(
         return Err(err);
     }
 
-    let result = session_view(context, &created.record, Some("running".to_string()));
+    let result = session_view(
+        context,
+        &created.record,
+        Some("running".to_string()),
+        Some(&tmux_bin),
+    );
     record_workdir_usage(context, &cwd);
     Ok(StartView {
         format: args.format,
@@ -1850,6 +1869,7 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
     } else {
         String::new()
     };
+    let last_terminal_activity_at = last_terminal_activity_at(&tmux_bin, &record, &status);
     Ok(GlanceResult {
         id: record.id.clone(),
         agent: record.agent.clone(),
@@ -1865,6 +1885,7 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         tail,
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
+        last_terminal_activity_at,
     })
 }
 
@@ -2085,7 +2106,7 @@ fn update_session_title(
     {
         let _ = rename_live_claude_session(context, &record, new_title, tmux_bin);
     }
-    Ok(session_view(context, &record, Some(status)))
+    Ok(session_view(context, &record, Some(status), Some(tmux_bin)))
 }
 
 /// Push Claude's `/rename <name>` slash command into the live pane so the
@@ -2121,7 +2142,14 @@ fn resume_session_by_id(
 ) -> Result<SessionView, CliError> {
     let mut record = load_session_record_with_provider_resume_backfill(context, id)?;
     match session_status(tmux_bin, &record).as_str() {
-        "running" => return Ok(session_view(context, &record, Some("running".to_string()))),
+        "running" => {
+            return Ok(session_view(
+                context,
+                &record,
+                Some("running".to_string()),
+                Some(tmux_bin),
+            ));
+        }
         "unknown" => {
             return Err(CliError::runtime(
                 "session-status-unknown",
@@ -2159,7 +2187,12 @@ fn resume_session_by_id(
     });
     record.updated_at = now.timestamp().to_string();
     record = persist_or_reload_session_record(context, &record);
-    Ok(session_view(context, &record, Some("running".to_string())))
+    Ok(session_view(
+        context,
+        &record,
+        Some("running".to_string()),
+        Some(tmux_bin),
+    ))
 }
 
 fn start_resume_tmux(
@@ -2496,6 +2529,7 @@ fn list_sessions(
     let tmux_bin = tmux_bin
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_tmux_bin(None));
+    let tmux_snapshots = tmux_session_snapshots(&tmux_bin);
     let mut records = Vec::new();
     for entry in fs::read_dir(&sessions_root).map_err(|err| {
         CliError::runtime(
@@ -2524,8 +2558,14 @@ fn list_sessions(
                 let record = read_session_record(&resolved.record_path)?;
                 validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
                 let record = backfill_provider_resume(context, record);
-                let status = session_status(&tmux_bin, &record);
-                records.push(session_view(context, &record, Some(status)));
+                let (status, last_terminal_activity_at) =
+                    session_list_runtime_snapshot(&tmux_bin, tmux_snapshots.as_ref(), &record);
+                records.push(session_view_from_parts(
+                    context,
+                    &record,
+                    status,
+                    last_terminal_activity_at,
+                ));
             }
         }
     }
@@ -2548,7 +2588,12 @@ fn load_session_view(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_tmux_bin(None));
     let status = session_status(&tmux_bin, &record);
-    Ok(session_view(context, &record, Some(status)))
+    Ok(session_view(
+        context,
+        &record,
+        Some(status),
+        Some(&tmux_bin),
+    ))
 }
 
 fn load_session_record(context: &CliContext, id: &str) -> Result<SessionRecord, CliError> {
@@ -2875,8 +2920,27 @@ fn session_view(
     context: &CliContext,
     record: &SessionRecord,
     forced_status: Option<String>,
+    tmux_bin: Option<&Path>,
 ) -> SessionView {
-    let status = forced_status.unwrap_or_else(|| session_status(&resolve_tmux_bin(None), record));
+    let fallback_tmux;
+    let tmux_bin = match tmux_bin {
+        Some(tmux_bin) => tmux_bin,
+        None => {
+            fallback_tmux = resolve_tmux_bin(None);
+            &fallback_tmux
+        }
+    };
+    let status = forced_status.unwrap_or_else(|| session_status(tmux_bin, record));
+    let last_terminal_activity_at = last_terminal_activity_at(tmux_bin, record, &status);
+    session_view_from_parts(context, record, status, last_terminal_activity_at)
+}
+
+fn session_view_from_parts(
+    context: &CliContext,
+    record: &SessionRecord,
+    status: String,
+    last_terminal_activity_at: Option<String>,
+) -> SessionView {
     SessionView {
         id: record.id.clone(),
         agent: record.agent.clone(),
@@ -2901,7 +2965,118 @@ fn session_view(
         log_file: record.log_file.clone(),
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
+        last_terminal_activity_at,
     }
+}
+
+fn last_terminal_activity_at(
+    tmux_bin: &Path,
+    record: &SessionRecord,
+    status: &str,
+) -> Option<String> {
+    if status != "running" {
+        return None;
+    }
+    tmux_window_activity_at(tmux_bin, &record.tmux_session)
+}
+
+#[derive(Debug, Clone)]
+struct TmuxSessionSnapshot {
+    last_terminal_activity_at: Option<String>,
+}
+
+fn session_list_runtime_snapshot(
+    tmux_bin: &Path,
+    tmux_snapshots: Option<&BTreeMap<String, TmuxSessionSnapshot>>,
+    record: &SessionRecord,
+) -> (String, Option<String>) {
+    match tmux_snapshots {
+        Some(snapshots) => match snapshots.get(&record.tmux_session) {
+            Some(snapshot) => (
+                "running".to_string(),
+                snapshot.last_terminal_activity_at.clone(),
+            ),
+            None => ("stopped".to_string(), None),
+        },
+        None => (session_status(tmux_bin, record), None),
+    }
+}
+
+fn tmux_session_snapshots(tmux_bin: &Path) -> Option<BTreeMap<String, TmuxSessionSnapshot>> {
+    let output = ProcessCommand::new(tmux_bin)
+        .arg("list-windows")
+        .arg("-a")
+        .arg("-F")
+        .arg("#{session_name}\t#{window_activity}")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut activity_by_session: BTreeMap<String, Option<i64>> = BTreeMap::new();
+    for line in raw.lines() {
+        let Some((session, activity)) = line.split_once('\t') else {
+            continue;
+        };
+        if session.is_empty() {
+            continue;
+        }
+        let Some(epoch_seconds) = parse_tmux_window_activity_seconds(activity) else {
+            activity_by_session
+                .entry(session.to_string())
+                .or_insert(None);
+            continue;
+        };
+        activity_by_session
+            .entry(session.to_string())
+            .and_modify(|current| {
+                *current = Some(current.map_or(epoch_seconds, |value| value.max(epoch_seconds)));
+            })
+            .or_insert(Some(epoch_seconds));
+    }
+    Some(
+        activity_by_session
+            .into_iter()
+            .map(|(session, maybe_epoch_seconds)| {
+                (
+                    session,
+                    TmuxSessionSnapshot {
+                        last_terminal_activity_at: maybe_epoch_seconds
+                            .and_then(format_tmux_window_activity),
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+fn tmux_window_activity_at(tmux_bin: &Path, tmux_session: &str) -> Option<String> {
+    let output = ProcessCommand::new(tmux_bin)
+        .arg("display-message")
+        .arg("-p")
+        .arg("-t")
+        .arg(tmux_session)
+        .arg("#{window_activity}")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let epoch_seconds = parse_tmux_window_activity_seconds(raw.trim())?;
+    format_tmux_window_activity(epoch_seconds)
+}
+
+fn parse_tmux_window_activity_seconds(raw: &str) -> Option<i64> {
+    let epoch_seconds = raw.trim().parse::<i64>().ok()?;
+    (epoch_seconds > 0).then_some(epoch_seconds)
+}
+
+fn format_tmux_window_activity(epoch_seconds: i64) -> Option<String> {
+    Timestamp::from_second(epoch_seconds)
+        .ok()
+        .map(|timestamp| timestamp.to_string())
 }
 
 fn session_logs(
