@@ -1,6 +1,6 @@
 [package]
 name = "nils-agent-session"
-version = "1.20.17"
+version = "1.20.18"
 edition.workspace = true
 license.workspace = true
 
@@ -19,8 +19,8 @@ path = "src/main.rs"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 jiff = { workspace = true }
-nils-build-info = { version = "1.20.17", path = "../nils-build-info" }
-nils-common = { version = "1.20.17", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.20.18", path = "../nils-build-info" }
+nils-common = { version = "1.20.18", path = "../nils-common", package = "nils-common" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 shell-words = { workspace = true }
@@ -31,7 +31,7 @@ axum = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "1.20.17", path = "../nils-test-support" }
+nils-test-support = { version = "1.20.18", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
 # `tower::ServiceExt::oneshot` drives the serve Router in tests without binding a socket.
