@@ -25,6 +25,8 @@ These tools are required for common command paths. Each row is anchored to at le
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
 | `opencode` | `opencode-cli agent *` flows | Required for `opencode-cli` runtime | Install from official OpenCode distribution |
 | `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
+| `tmux` | `agent-session` start/run/resume/attach/glance/send/delete/serve flows | Required for tmux-backed `agent-session` runtime | `brew install tmux` |
+| `sops` | `secrets pull/add/edit` encryption and decryption flows | Required for `secrets` runtime | `brew install sops` |
 | `security` | `claude-cli prompt-segment` Keychain credential lookup | Required on macOS unless `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` / `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` is supplied | Preinstalled on macOS |
 | `docker` | `docker-tools container *`, `docker-tools run *`, and Docker Compose v2 resolution for `docker-tools compose down` | Required for `docker-tools` Docker-backed commands | `brew install docker` |
 | `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
@@ -68,6 +70,7 @@ in `crates/*/src`.
 | `openvpn` | Optional `forge-cli inbox --gitlab-vpn-check openvpn` readiness dependency probe; `forge-cli` never starts or stops VPN | `brew install openvpn` |
 | `glab` `mr note create --resolvable` | `forge-cli pr review` on GitLab probes `glab mr note create --help` and picks the most capable note form: with `--resolvable` it posts a non-resolvable status note; with `create` but no `--resolvable` it drops only that flag; with no `create` subcommand it uses the bare `glab mr note <id>` form. Only the first avoids registering on the `pr merge` thread gate | `brew upgrade glab` |
 | `docker-compose` | Fallback backend for `docker-tools compose down` when Docker Compose v2 is unavailable | `brew install docker-compose` |
+| `systemd-run` | Optional `agent-session` tmux cgroup isolation when `AGENT_SESSION_TMUX_SCOPE=1` on Linux/systemd hosts; falls back to direct `tmux` when unavailable | Usually provided by systemd packages |
 
 ## 3. Development and Validation Toolchain
 
@@ -83,6 +86,7 @@ in `crates/*/src`.
 | `bash-completion` | Bash completion loading (optional) | `brew install bash-completion` |
 | `gh` | PR/release operations in GitHub-driven workflows | `brew install gh` |
 | `cargo-deny` | Supply-chain audit (`scripts/ci/cargo-deny-audit.sh` and the `cargo-deny` CI job): RUSTSEC advisories + duplicate-version bans per `deny.toml` | `cargo install cargo-deny --locked` |
+| `cargo-machete` | Optional unused direct-dependency scanner for stale-code cleanup sweeps | `cargo install --locked cargo-machete` |
 
 ## 4. Repository-Local Script Entry Points
 
@@ -139,7 +143,7 @@ cargo run -p agent-docs -- preflight --intent project-dev --format json \
 ### 6.1 Base contributor profile
 
 ```bash
-brew install git gh glab fzf webp ffmpeg bat zsh python bash-completion rustup-init im-select
+brew install git gh glab fzf webp ffmpeg bat zsh python bash-completion rustup-init im-select tmux sops
 ```
 
 ### 6.2 Linux extra profile (audio/clipboard/network ergonomics)
@@ -163,7 +167,7 @@ eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 ## 8. Quick Environment Verification
 
 ```bash
-for c in git gh glab fzf grpcurl file ffmpeg bat im-select curl; do
+for c in git gh glab fzf grpcurl file ffmpeg bat im-select curl tmux sops; do
   if command -v "$c" >/dev/null 2>&1; then
     echo "[OK]   $c -> $(command -v "$c")"
   else

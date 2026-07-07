@@ -71,20 +71,28 @@ records the keep/delete decision plus the active caller evidence.
 
 | Path | Decision | Active caller evidence |
 | --- | --- | --- |
-| `scripts/ci/agent-docs-snapshots.sh` | keep | `crates/agent-docs/README.md` snapshot workflow (`scripts/ci/agent-docs-snapshots.sh [--bless]`) |
+| `scripts/ci/cargo-deny-audit.sh` | keep | `DEVELOPMENT.md` supply-chain audit section + `.github/workflows/ci.yml` `cargo-deny` job |
+| `scripts/ci/cli-output-contract-lint.sh` | keep | `DEVELOPMENT.md` docs-only/full checks list + `project-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/completion-asset-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 | `scripts/ci/completion-freshness-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 | `scripts/ci/completion-flag-parity-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 | `scripts/ci/coverage-badge.sh` | keep | `.github/workflows/ci.yml` `coverage_badge` job |
 | `scripts/ci/coverage-summary.sh` | keep | `.github/workflows/ci.yml` `coverage` job + `DEVELOPMENT.md` coverage flow |
+| `scripts/ci/crate-naming-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 | `scripts/ci/detect-docs-only.sh` | keep | `.github/workflows/ci.yml` `changes` job + `scripts/ci/tests/detect-docs-only.test.sh` |
 | `scripts/ci/docs-hygiene-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes + `scripts/ci/tests/docs-hygiene-audit.test.sh` |
 | `scripts/ci/docs-placement-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes |
+| `scripts/ci/forge-cli-fixture-lint.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 | `scripts/ci/markdownlint-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/nils-cli-checks-entrypoint.sh` | keep | `.github/workflows/ci.yml` `test` and `test_macos` jobs + `DEVELOPMENT.md` local-fast and CI/full commands |
+| `scripts/ci/nils-cli-local-fast.sh` | keep | `scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` delegates changed-scope planning/execution here |
+| `scripts/ci/plan-bundle-validate.sh` | keep | `DEVELOPMENT.md` docs-only/full checks list + `project-verify-required-checks.sh` docs-only and full passes |
+| `scripts/ci/publish-order-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step + `scripts/ci/tests/publish-order-audit.test.sh` |
 | `scripts/ci/release-tarball-third-party-audit.sh` | keep | `.github/workflows/release.yml` `build` job |
 | `scripts/ci/test-stale-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 | `scripts/ci/third-party-artifacts-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step + dependabot bump skill |
+| `scripts/ci/verify-signed-commits.sh` | keep | `lefthook.yml` pre-push hook |
+| `scripts/ci/workspace-version-lockstep.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 
 ## Auxiliary Wrapper / Tooling Decisions
 

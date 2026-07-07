@@ -228,6 +228,16 @@ assert_shell_script_is_reported() {
   echo "ok"
 }
 
+assert_deleted_shell_script_escalates_without_syntax_check() {
+  echo "== deleted shell script escalates without syntax check =="
+  local output
+  output="$(plan_for --changed-file scripts/ci/deleted-helper.sh)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=workspace"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_REASON=workspace-level path changed: scripts/ci/deleted-helper.sh"
+  assert_not_contains "$FUNCNAME" "$output" "LOCAL_FAST_SHELL=scripts/ci/deleted-helper.sh"
+  echo "ok"
+}
+
 assert_package_crate_uses_package_mode
 assert_bin_only_package_skips_doctests
 assert_library_package_keeps_doctests
@@ -245,6 +255,7 @@ assert_package_manifest_requests_third_party_artifacts
 assert_third_party_artifact_change_escapes_docs_only
 assert_docs_plus_package_runs_both
 assert_shell_script_is_reported
+assert_deleted_shell_script_escalates_without_syntax_check
 
 echo
 echo "PASS: local-fast-checks.test.sh"
