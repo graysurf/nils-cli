@@ -4,6 +4,8 @@ use nils_test_support::http::{HttpResponse, LoopbackServer};
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -65,6 +67,18 @@ fn usage_json(five_utilization: f64, weekly_utilization: f64) -> String {
     )
 }
 
+#[cfg(unix)]
+fn write_fake_claude(dir: &Path, body: &str) -> PathBuf {
+    let bin_dir = dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("fake bin dir");
+    let path = bin_dir.join("claude");
+    std::fs::write(&path, body).expect("write fake claude");
+    let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("chmod fake claude");
+    bin_dir
+}
+
 #[test]
 fn main_no_args_prints_help_and_exits_zero() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -102,6 +116,65 @@ fn main_completion_exports_bash_and_zsh_scripts() {
     assert!(bash_text.contains("_claude-cli()"));
     assert!(bash_text.contains("complete -F _claude-cli"));
     assert!(bash_text.contains("opts=\"-h --help bash zsh\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_auto_falls_back_to_claude_cli_and_writes_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = write_fake_claude(
+        tmp.path(),
+        r#"#!/usr/bin/env sh
+cat >/dev/null
+cat <<'OUT'
+Claude Code Usage
+
+Current session
+5-hour limit: 25% used, 75% remaining
+Resets at 2026-01-01T00:00:00+00:00
+
+Current week
+Weekly limit: 50% used, 50% remaining
+Resets at 2026-01-03T12:30:00+00:00
+OUT
+"#,
+    );
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(500, "upstream exploded"));
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "auto"],
+        &base_options(tmp.path())
+            .with_path_prepend(&bin_dir)
+            .with_env("CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN", "secret-token-usage")
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+                &format!("{}/usage", server.url()),
+            )
+            .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED", "1"),
+    );
+
+    assert_exit(&output, 0);
+    assert!(!stdout(&output).contains("secret-token-usage"));
+    assert!(!stderr(&output).contains("secret-token-usage"));
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["schema_version"], "claude-cli.usage.v1");
+    assert_eq!(payload["command"], "usage");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["source"], "cli");
+    assert_eq!(payload["result"]["stale"], false);
+    assert_eq!(payload["result"]["windows"][0]["key"], "5h");
+    assert_eq!(payload["result"]["windows"][0]["used_percent"], 25.0);
+    assert_eq!(payload["result"]["windows"][0]["remaining_percent"], 75.0);
+    assert_eq!(payload["result"]["windows"][1]["key"], "weekly");
+    assert_eq!(payload["result"]["windows"][1]["used_percent"], 50.0);
+    assert_eq!(payload["result"]["windows"][1]["remaining_percent"], 50.0);
+
+    let cached = std::fs::read_to_string(tmp.path().join("usage.json")).expect("cache");
+    assert!(!cached.contains("secret-token-usage"));
+    assert!(cached.contains("\"five_hour\""));
+    assert!(cached.contains("\"seven_day\""));
 }
 
 #[test]

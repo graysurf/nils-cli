@@ -8,6 +8,7 @@ mod auth;
 mod cache;
 mod client;
 mod render;
+pub mod usage;
 
 #[derive(Clone, Debug, Default)]
 pub struct PromptSegmentOptions {

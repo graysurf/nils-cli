@@ -34,6 +34,7 @@ fn run() -> i32 {
 
     match cli.command {
         Some(cli::Command::PromptSegment(args)) => handle_prompt_segment(&args),
+        Some(cli::Command::Usage(args)) => handle_usage(&args),
         Some(cli::Command::Completion(args)) => completion::run(args.shell),
         None => {
             let mut cmd = cli::Cli::command();
@@ -44,6 +45,18 @@ fn run() -> i32 {
             exit::RUNTIME
         }
     }
+}
+
+fn handle_usage(args: &cli::UsageArgs) -> i32 {
+    claude_cli::prompt_segment::usage::run(&claude_cli::prompt_segment::usage::UsageOptions {
+        source: match args.source {
+            cli::UsageSource::Auto => claude_cli::prompt_segment::usage::UsageSource::Auto,
+            cli::UsageSource::Oauth => claude_cli::prompt_segment::usage::UsageSource::Oauth,
+            cli::UsageSource::Cli => claude_cli::prompt_segment::usage::UsageSource::Cli,
+            cli::UsageSource::Cache => claude_cli::prompt_segment::usage::UsageSource::Cache,
+        },
+        output_json: args.output.is_json(),
+    })
 }
 
 fn handle_prompt_segment(args: &cli::PromptSegmentArgs) -> i32 {
