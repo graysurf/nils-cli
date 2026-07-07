@@ -2,8 +2,8 @@
 
 ## Overview
 
-`claude-cli` is a provider-specific Rust CLI for Claude-oriented helpers that should not live in shell glue. The initial surface owns
-Claude Code prompt-segment rendering, including Keychain credential lookup, usage refresh, cache fallback, and completion export.
+`claude-cli` is a provider-specific Rust CLI for Claude-oriented helpers that should not live in shell glue. The surface owns
+Claude Code prompt-segment rendering, usage source selection, Keychain credential lookup, cache fallback, and completion export.
 
 ## Usage
 
@@ -12,6 +12,7 @@ Usage:
   claude-cli prompt-segment [options]
   claude-cli prompt-segment check
   claude-cli prompt-segment status [--format text|json]
+  claude-cli usage [--format text|json] [--source auto|oauth|cli|cache]
   claude-cli completion <bash|zsh>
 
 Help:
@@ -23,7 +24,7 @@ Help:
 
 | Job | Primary owner |
 | --- | --- |
-| Claude prompt-segment auth, cache refresh, usage rendering, completion export | `claude-cli` |
+| Claude prompt-segment auth, usage source selection, cache refresh, usage rendering, completion export | `claude-cli` |
 | Shell aliases, Starship module wiring, PATH/fpath registration, wrapper dispatch | zsh-kit shell glue |
 
 `claude-cli` owns provider-specific Claude behavior. zsh-kit should keep only the small compatibility wrapper and shell integration.
@@ -48,6 +49,21 @@ The cache remains compatible with the former shell script:
 ~/Library/Caches/claude-prompt-segment/usage.json
 ```
 
+### usage
+
+- `usage [--format text|json] [--source auto|oauth|cli|cache]`: Read Claude
+  usage through a service-consumable contract.
+- `--source auto`: Try OAuth usage refresh, then a bounded Claude CLI `/usage`
+  probe, then last-good cache.
+- `--source oauth`, `--source cli`, and `--source cache`: Run one source only for
+  focused debugging.
+
+JSON output uses `schema_version: "claude-cli.usage.v1"` and never includes
+tokens or credential material. The `result.windows` array contains 5h and weekly
+windows when available, each with used/remaining percentages and optional reset
+timestamps. CLI-derived usage is normalized back into the same cache shape used
+by `prompt-segment`.
+
 ### completion
 
 - `completion <bash|zsh>`: Export shell completion script to stdout.
@@ -60,6 +76,16 @@ The cache remains compatible with the former shell script:
 - `CLAUDE_PROMPT_SEGMENT_CACHE_DIR` overrides the cache directory.
 - `CLAUDE_PROMPT_SEGMENT_ENDPOINT` overrides the usage endpoint. The default is `https://api.anthropic.com/api/oauth/usage`.
 - `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` or `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` can supply credentials for automation.
+- `CLAUDE_PROMPT_SEGMENT_CLAUDE_BIN` overrides the Claude CLI binary used by the
+  `usage --source cli` fallback. The default is `claude`.
+- `CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS` overrides the bounded CLI usage
+  probe timeout. The default is `15` seconds.
+- `CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED=1` disables the Unix PTY wrapper and
+  pipes slash commands directly to the Claude binary.
+- `CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_STARTUP_DELAY_MS` and
+  `CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_USAGE_DELAY_MS` tune the startup and
+  post-`/usage` waits for interactive Claude Code. Defaults are `4000` and
+  `3000` milliseconds.
 - `CLAUDE_PROMPT_SEGMENT_KEYCHAIN_DISABLED=1` disables macOS Keychain lookup.
 - `CLAUDE_PROMPT_SEGMENT_KEYCHAIN_SERVICE` overrides the macOS Keychain service name. The default is `Claude Code-credentials`.
 - `NO_COLOR=1` disables ANSI color.

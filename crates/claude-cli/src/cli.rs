@@ -5,6 +5,7 @@ EXAMPLES:
   claude-cli prompt-segment
   claude-cli prompt-segment --refresh
   claude-cli prompt-segment status --format json
+  claude-cli usage --format json --source auto
   claude-cli completion zsh
 
 ENVIRONMENT:
@@ -38,6 +39,8 @@ pub struct Cli {
 pub enum Command {
     /// Prompt-segment command group
     PromptSegment(PromptSegmentArgs),
+    /// Read Claude usage from OAuth, Claude CLI, or cache
+    Usage(UsageArgs),
     /// Export shell completion script
     Completion(CompletionArgs),
 }
@@ -93,6 +96,23 @@ pub enum PromptSegmentCommand {
         #[command(flatten)]
         output: OutputModeArgs,
     },
+}
+
+#[derive(Args)]
+pub struct UsageArgs {
+    #[command(flatten)]
+    pub output: OutputModeArgs,
+    /// Usage source to read
+    #[arg(long = "source", value_enum, default_value_t = UsageSource::Auto)]
+    pub source: UsageSource,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum UsageSource {
+    Auto,
+    Oauth,
+    Cli,
+    Cache,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

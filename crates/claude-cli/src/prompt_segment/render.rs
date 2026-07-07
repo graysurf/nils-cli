@@ -11,6 +11,7 @@ pub struct Usage {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Window {
+    pub used_percent: f64,
     pub remaining_percent: i64,
     pub resets_at: Option<String>,
 }
@@ -48,6 +49,7 @@ fn parse_window(value: Option<&Value>) -> Option<Window> {
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned);
     Some(Window {
+        used_percent: utilization.clamp(0.0, 100.0),
         remaining_percent,
         resets_at,
     })
