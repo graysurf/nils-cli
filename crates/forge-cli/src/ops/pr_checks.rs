@@ -474,7 +474,7 @@ pub fn build_github_statuses_call(
     repo: &str,
     head_ref_oid: &str,
 ) -> BackendCall {
-    let endpoint = format!("repos/{repo}/commits/{head_ref_oid}/status");
+    let endpoint = format!("repos/{repo}/commits/{head_ref_oid}/status?per_page=100");
     let mut argv = vec![OsString::from("api"), OsString::from(endpoint)];
     ctx.push_github_api_hostname(&mut argv);
     BackendCall::new(BackendProgram::Gh, argv)
@@ -715,9 +715,22 @@ fn parse_github_rest_check_runs(
                 None,
             )
         })?;
-    let mut checks = Vec::with_capacity(runs.len());
+    let truncated = json_total_count_exceeds_len(&value, runs.len());
+    let mut checks = Vec::with_capacity(runs.len() + usize::from(truncated));
     for run in runs {
         checks.push(parse_github_rest_check_run(run, force_required)?);
+    }
+    if truncated {
+        checks.push(CheckItem {
+            name: "github-check-runs-pagination-truncated".to_string(),
+            state: CheckState::Pending.as_str(),
+            url: None,
+            conclusion: None,
+            workflow: None,
+            required: force_required,
+            started_at: None,
+            completed_at: None,
+        });
     }
     Ok(checks)
 }
@@ -777,11 +790,32 @@ fn parse_github_rest_statuses(
                 None,
             )
         })?;
-    let mut checks = Vec::with_capacity(statuses.len());
+    let truncated = json_total_count_exceeds_len(&value, statuses.len());
+    let mut checks = Vec::with_capacity(statuses.len() + usize::from(truncated));
     for status in statuses {
         checks.push(parse_github_rest_status(status, force_required)?);
     }
+    if truncated {
+        checks.push(CheckItem {
+            name: "github-statuses-pagination-truncated".to_string(),
+            state: CheckState::Pending.as_str(),
+            url: None,
+            conclusion: None,
+            workflow: None,
+            required: force_required,
+            started_at: None,
+            completed_at: None,
+        });
+    }
     Ok(checks)
+}
+
+fn json_total_count_exceeds_len(value: &serde_json::Value, len: usize) -> bool {
+    value
+        .get("total_count")
+        .and_then(|v| v.as_u64())
+        .and_then(|count| usize::try_from(count).ok())
+        .is_some_and(|count| count > len)
 }
 
 fn parse_github_rest_status(

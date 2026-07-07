@@ -163,9 +163,126 @@ EOF
 }
 EOF
     ;;
-  "api repos/sympoies/nils-cli/commits/abc123/status")
+  "api repos/sympoies/nils-cli/commits/abc123/status?per_page=100")
     cat <<'EOF'
 {
+  "statuses": [
+    {
+      "context": "coverage",
+      "state": "success",
+      "target_url": "https://github.com/sympoies/nils-cli/runs/3"
+    }
+  ]
+}
+EOF
+    ;;
+  *)
+    echo "stub: unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    .to_string()
+}
+
+fn gh_status_rollup_then_truncated_rest_fallback_stub() -> String {
+    r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr checks")
+    echo "GraphQL: Resource not accessible by integration (repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup)" >&2
+    exit 1
+    ;;
+  "pr view")
+    case " $* " in
+      *" headRefOid,statusCheckRollup "*)
+        echo "GraphQL: Resource not accessible by integration (repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup)" >&2
+        exit 1
+        ;;
+      *" headRefOid "*)
+        cat <<'EOF'
+{"headRefOid":"abc123"}
+EOF
+        ;;
+      *)
+        echo "stub: unexpected gh pr view args: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  "api repos/sympoies/nils-cli/commits/abc123/check-runs?per_page=100")
+    cat <<'EOF'
+{
+  "total_count": 2,
+  "check_runs": [
+    {
+      "name": "build",
+      "status": "completed",
+      "conclusion": "success",
+      "details_url": "https://github.com/sympoies/nils-cli/actions/runs/1/job/2"
+    }
+  ]
+}
+EOF
+    ;;
+  "api repos/sympoies/nils-cli/commits/abc123/status?per_page=100")
+    cat <<'EOF'
+{"statuses":[]}
+EOF
+    ;;
+  *)
+    echo "stub: unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    .to_string()
+}
+
+fn gh_status_rollup_then_truncated_statuses_fallback_stub() -> String {
+    r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr checks")
+    echo "GraphQL: Resource not accessible by integration (repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup)" >&2
+    exit 1
+    ;;
+  "pr view")
+    case " $* " in
+      *" headRefOid,statusCheckRollup "*)
+        echo "GraphQL: Resource not accessible by integration (repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup)" >&2
+        exit 1
+        ;;
+      *" headRefOid "*)
+        cat <<'EOF'
+{"headRefOid":"abc123"}
+EOF
+        ;;
+      *)
+        echo "stub: unexpected gh pr view args: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  "api repos/sympoies/nils-cli/commits/abc123/check-runs?per_page=100")
+    cat <<'EOF'
+{
+  "total_count": 1,
+  "check_runs": [
+    {
+      "name": "build",
+      "status": "completed",
+      "conclusion": "success",
+      "details_url": "https://github.com/sympoies/nils-cli/actions/runs/1/job/2"
+    }
+  ]
+}
+EOF
+    ;;
+  "api repos/sympoies/nils-cli/commits/abc123/status?per_page=100")
+    cat <<'EOF'
+{
+  "total_count": 2,
   "statuses": [
     {
       "context": "coverage",
@@ -290,6 +407,64 @@ fn pr_checks_falls_back_to_rest_when_rollup_view_is_permission_blocked() {
     assert_eq!(
         checks[1]["url"],
         "https://github.com/sympoies/nils-cli/runs/3"
+    );
+}
+
+#[test]
+fn pr_checks_rest_fallback_fails_closed_on_truncated_check_runs() {
+    let stub = StubEnv::new().gh_stub(&gh_status_rollup_then_truncated_rest_fallback_stub());
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["state"], "pending");
+    assert_eq!(env["data"]["required_count"], 2);
+    assert_eq!(env["data"]["success_count"], 1);
+    assert_eq!(
+        env["data"]["pending"][0]["name"],
+        "github-check-runs-pagination-truncated"
+    );
+}
+
+#[test]
+fn pr_checks_rest_fallback_fails_closed_on_truncated_statuses() {
+    let stub = StubEnv::new().gh_stub(&gh_status_rollup_then_truncated_statuses_fallback_stub());
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "checks",
+            "7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["state"], "pending");
+    assert_eq!(env["data"]["required_count"], 3);
+    assert_eq!(env["data"]["success_count"], 2);
+    assert_eq!(
+        env["data"]["pending"][0]["name"],
+        "github-statuses-pagination-truncated"
     );
 }
 

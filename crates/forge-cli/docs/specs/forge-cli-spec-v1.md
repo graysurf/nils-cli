@@ -355,7 +355,9 @@ backend mapping, validation rules, and output schema versions.
   treats the readable head-SHA rollup rows as the snapshot. If that
   projection is also permission-blocked, it reads `headRefOid` alone and
   falls back to REST `gh api` commit check-runs plus combined status
-  contexts for the same head SHA. When `--required-only=true`, those
+  contexts for the same head SHA. If a REST check-runs or combined status
+  response is truncated, the fallback adds a pending synthetic row instead of
+  reporting a clean gate from an incomplete page. When `--required-only=true`, those
   fallbacks cannot recover GitHub's required classification, so they
   fail-closed gate every readable fallback row and synthesize a pending
   required row when the fallback snapshot is empty. They also add
