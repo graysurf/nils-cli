@@ -128,9 +128,9 @@ collect_changed_files() {
   local merge_base
   merge_base="$(git merge-base HEAD "$base")"
   {
-    git diff --name-only --diff-filter=ACMRT "$merge_base"...HEAD
-    git diff --name-only --diff-filter=ACMRT
-    git diff --name-only --cached --diff-filter=ACMRT
+    git diff --name-only --diff-filter=ACDMRT "$merge_base"...HEAD
+    git diff --name-only --diff-filter=ACDMRT
+    git diff --name-only --cached --diff-filter=ACDMRT
     git ls-files --others --exclude-standard
   } | sed '/^$/d' | sort -u
 }
@@ -216,7 +216,7 @@ shell_files = []
 docs_checks = False
 
 for path in changed:
-    if path.endswith(".sh"):
+    if path.endswith(".sh") and (repo / path).is_file():
         shell_files.append(path)
 
     if path in {"THIRD_PARTY_LICENSES.md", "THIRD_PARTY_NOTICES.md"}:
