@@ -125,7 +125,7 @@ Parity matrix (v1):
 | `pr merge <id>`                             | `gh pr merge <id> --squash --delete-branch`                                                                                                  | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg)                                                                                     |
 | `pr close <id>`                             | `gh pr close <id>`                                                                                                                           | `glab mr close <id>`                                        | exact                                                                                                                    |
 | `pr checks <id>`                            | `gh pr checks <id> --json …` plus `--required` for gating                                                                                    | `glab mr view -F json` + `glab api .../pipelines/<id>/jobs` | emulated on GitLab                                                                                                       |
-| `pr wait-checks <id>`                       | poll `gh pr checks` / `gh pr checks --required`; fall back to readable `statusCheckRollup` rows on rollup permission errors                  | poll structured MR pipeline/jobs snapshot                   | emulated; same envelope                                                                                                  |
+| `pr wait-checks <id>`                       | poll `gh pr checks` / `gh pr checks --required`; fall back to head-SHA REST checks on rollup permission errors                               | poll structured MR pipeline/jobs snapshot                   | emulated; same envelope                                                                                                  |
 | `issue create`                              | `gh issue create …`                                                                                                                          | `glab issue create …`                                       | exact                                                                                                                    |
 | `issue view <id>`                           | `gh issue view <id> --json …`                                                                                                                | `glab issue view <id> -F json`                              | exact                                                                                                                    |
 | `issue edit <id>`                           | `gh issue edit <id> …`                                                                                                                       | `glab issue update <id> …`                                  | exact                                                                                                                    |
@@ -351,12 +351,15 @@ backend mapping, validation rules, and output schema versions.
   `name,state,bucket,workflow,link,startedAt,completedAt,description`
   so the backend stays compatible with `gh 2.92.0`. If `gh pr checks`
   fails on a `statusCheckRollup` permission traversal, the GitHub path
-  falls back to `gh pr view --json headRefOid,statusCheckRollup` and
-  treats the readable head-SHA rollup rows as the snapshot. When
-  `--required-only=true`, that fallback cannot recover GitHub's required
-  classification, so it fail-closed gates every readable rollup row and
-  synthesizes a pending required row when the readable rollup is empty. It
-  also adds `github_status_rollup_requiredness_unknown_all_rows_gated` to
+  reads `headRefOid` alone and falls back to REST `gh api` commit
+  check-runs plus combined status contexts for the same head SHA. If a
+  REST check-runs or combined status
+  response is truncated, the fallback adds a pending synthetic row instead of
+  reporting a clean gate from an incomplete page. When `--required-only=true`, those
+  fallbacks cannot recover GitHub's required classification, so they
+  fail-closed gate every readable fallback row and synthesize a pending
+  required row when the fallback snapshot is empty. They also add
+  `github_status_rollup_requiredness_unknown_all_rows_gated` to
   `data.warnings[]`. On GitLab,
   numeric MR ids use `glab mr view -F json` for the MR head pipeline and
   `glab api --hostname <host> projects/<project>/pipelines/<id>/jobs`

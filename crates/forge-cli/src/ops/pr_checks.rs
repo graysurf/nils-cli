@@ -282,7 +282,7 @@ fn snapshot_github<R: BackendRunner>(
     let output = match run_github_checks_call(runner, &call) {
         Ok(output) => output,
         Err(err) if is_status_rollup_permission_error(&err) => {
-            return snapshot_github_rollup_fallback(runner, ctx, args);
+            return snapshot_github_rest_fallback(runner, ctx, args);
         }
         Err(err) => return Err(err),
     };
@@ -291,7 +291,7 @@ fn snapshot_github<R: BackendRunner>(
         let required_output = match run_github_checks_call(runner, &required_call) {
             Ok(output) => output,
             Err(err) if is_status_rollup_permission_error(&err) => {
-                return snapshot_github_rollup_fallback(runner, ctx, args);
+                return snapshot_github_rest_fallback(runner, ctx, args);
             }
             Err(err) => return Err(err),
         };
@@ -300,15 +300,40 @@ fn snapshot_github<R: BackendRunner>(
     parse_github_snapshot(ctx, &output, false)
 }
 
-fn snapshot_github_rollup_fallback<R: BackendRunner>(
+fn snapshot_github_rest_fallback<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
     args: &PrChecksArgs,
 ) -> Result<PrChecksPayload, ForgeError> {
-    let call = build_github_rollup_view_call(ctx, &args.id);
-    let output = runner.run(&call)?;
-    let mut checks = parse_github_status_rollup(&output, args.required_only)?;
-    if args.required_only && checks.is_empty() {
+    let repo = github_repo_slug(ctx)?;
+    let head_call = build_github_head_view_call(ctx, &args.id);
+    let head_output = runner.run(&head_call)?;
+    let head_ref_oid = parse_github_head_ref(&head_output)?;
+
+    let check_runs_call = build_github_check_runs_call(ctx, repo, &head_ref_oid);
+    let check_runs_output = runner.run(&check_runs_call)?;
+    let mut checks = parse_github_rest_check_runs(&check_runs_output, args.required_only)?;
+
+    let statuses_call = build_github_statuses_call(ctx, repo, &head_ref_oid);
+    let statuses_output = runner.run(&statuses_call)?;
+    checks.extend(parse_github_rest_statuses(
+        &statuses_output,
+        args.required_only,
+    )?);
+
+    Ok(aggregate_github_unknown_requiredness(
+        ctx,
+        checks,
+        args.required_only,
+    ))
+}
+
+fn aggregate_github_unknown_requiredness(
+    ctx: &ProviderContext,
+    mut checks: Vec<CheckItem>,
+    required_only: bool,
+) -> PrChecksPayload {
+    if required_only && checks.is_empty() {
         checks.push(CheckItem {
             name: "github-status-rollup-requiredness-unknown".to_string(),
             state: CheckState::Pending.as_str(),
@@ -320,13 +345,36 @@ fn snapshot_github_rollup_fallback<R: BackendRunner>(
             completed_at: None,
         });
     }
-    let mut payload = aggregate(ctx, checks, args.required_only, None);
-    if args.required_only {
+    let mut payload = aggregate(ctx, checks, required_only, None);
+    if required_only {
         payload
             .warnings
             .push("github_status_rollup_requiredness_unknown_all_rows_gated".to_string());
     }
-    Ok(payload)
+    payload
+}
+
+fn github_repo_slug(ctx: &ProviderContext) -> Result<&str, ForgeError> {
+    let Some(repo) = ctx.repo.as_deref() else {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "repo_required",
+            "github checks REST fallback requires --repo owner/name or a recognised GitHub remote",
+            None,
+        ));
+    };
+    let mut parts = repo.split('/');
+    let owner = parts.next().filter(|part| !part.is_empty());
+    let name = parts.next().filter(|part| !part.is_empty());
+    if owner.is_none() || name.is_none() || parts.next().is_some() {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "repo_required",
+            "github checks REST fallback requires a repo slug shaped as owner/name",
+            Some(format!("repo={repo}")),
+        ));
+    }
+    Ok(repo)
 }
 
 /// Build the `gh pr checks <id> --json …` call. Public so the dry-run helper
@@ -359,17 +407,41 @@ pub fn build_github_required_call(ctx: &ProviderContext, id: &str) -> BackendCal
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
-/// Build the GitHub fallback call used when `gh pr checks` hits a
+/// Build the narrow fallback call used when `gh pr checks` hits a
 /// permission-sensitive statusCheckRollup traversal internally.
-pub fn build_github_rollup_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
+pub fn build_github_head_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
     let mut argv: Vec<OsString> = vec![
         OsString::from("pr"),
         OsString::from("view"),
         OsString::from(id),
         OsString::from("--json"),
-        OsString::from("headRefOid,statusCheckRollup"),
+        OsString::from("headRefOid"),
     ];
     ctx.push_repo_override(&mut argv);
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+/// Build the REST check-runs fallback call for a PR head commit.
+pub fn build_github_check_runs_call(
+    ctx: &ProviderContext,
+    repo: &str,
+    head_ref_oid: &str,
+) -> BackendCall {
+    let endpoint = format!("repos/{repo}/commits/{head_ref_oid}/check-runs?per_page=100");
+    let mut argv = vec![OsString::from("api"), OsString::from(endpoint)];
+    ctx.push_github_api_hostname(&mut argv);
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+/// Build the REST combined-status fallback call for commit status contexts.
+pub fn build_github_statuses_call(
+    ctx: &ProviderContext,
+    repo: &str,
+    head_ref_oid: &str,
+) -> BackendCall {
+    let endpoint = format!("repos/{repo}/commits/{head_ref_oid}/status?per_page=100");
+    let mut argv = vec![OsString::from("api"), OsString::from(endpoint)];
+    ctx.push_github_api_hostname(&mut argv);
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
@@ -510,7 +582,37 @@ fn parse_github_checks(
     Ok(checks)
 }
 
-fn parse_github_status_rollup(
+fn parse_github_head_ref(output: &BackendSuccess) -> Result<String, ForgeError> {
+    let trimmed = output.stdout.trim();
+    if trimmed.is_empty() {
+        return Err(ForgeError::software(
+            schema_err(),
+            "pr view headRefOid JSON is empty",
+            None,
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "pr view headRefOid JSON is invalid",
+            Some(e.to_string()),
+        )
+    })?;
+    value
+        .get("headRefOid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ForgeError::software(
+                schema_err(),
+                "missing required field 'headRefOid' in pr view JSON",
+                None,
+            )
+        })
+}
+
+fn parse_github_rest_check_runs(
     output: &BackendSuccess,
     force_required: bool,
 ) -> Result<Vec<CheckItem>, ForgeError> {
@@ -521,83 +623,58 @@ fn parse_github_status_rollup(
     let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
         ForgeError::software(
             schema_err(),
-            "pr view statusCheckRollup JSON is invalid",
+            "GitHub check-runs JSON is invalid",
             Some(e.to_string()),
         )
     })?;
-    let head_oid = value
-        .get("headRefOid")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            ForgeError::software(
-                schema_err(),
-                "missing required field 'headRefOid' in pr view JSON",
-                None,
-            )
-        })?;
-    let rollup = value
-        .get("statusCheckRollup")
+    let runs = value
+        .get("check_runs")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
             ForgeError::software(
                 schema_err(),
-                "missing required field 'statusCheckRollup' in pr view JSON",
-                Some(format!("headRefOid={head_oid}")),
+                "missing required field 'check_runs' in GitHub check-runs JSON",
+                None,
             )
         })?;
-    let mut checks = Vec::with_capacity(rollup.len());
-    for entry in rollup {
-        checks.push(parse_github_rollup_entry(entry, force_required)?);
+    let truncated = json_total_count_exceeds_len(&value, runs.len());
+    let mut checks = Vec::with_capacity(runs.len() + usize::from(truncated));
+    for run in runs {
+        checks.push(parse_github_rest_check_run(run, force_required)?);
+    }
+    if truncated {
+        checks.push(CheckItem {
+            name: "github-check-runs-pagination-truncated".to_string(),
+            state: CheckState::Pending.as_str(),
+            url: None,
+            conclusion: None,
+            workflow: None,
+            required: force_required,
+            started_at: None,
+            completed_at: None,
+        });
     }
     Ok(checks)
 }
 
-fn parse_github_rollup_entry(
+fn parse_github_rest_check_run(
     value: &serde_json::Value,
     force_required: bool,
 ) -> Result<CheckItem, ForgeError> {
-    let name = value
-        .get("name")
-        .or_else(|| value.get("context"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| missing("name"))?;
-    let conclusion = value
-        .get("conclusion")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let raw_state = value
-        .get("status")
-        .or_else(|| value.get("state"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let kind = value.get("__typename").and_then(|v| v.as_str());
-    let state = normalize_github_rollup_state(kind, conclusion.as_deref(), raw_state);
-    let url = value
-        .get("detailsUrl")
-        .or_else(|| value.get("targetUrl"))
-        .or_else(|| value.get("link"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let workflow = value
-        .get("workflowName")
-        .or_else(|| value.get("workflow"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let started_at = value
-        .get("startedAt")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let completed_at = value
-        .get("completedAt")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let name = json_string(value, &["name"]).ok_or_else(|| missing("name"))?;
+    let conclusion = json_string(value, &["conclusion"]);
+    let raw_state = json_string(value, &["status"]);
+    let state = normalize_github_rollup_state(
+        Some("CheckRun"),
+        conclusion.as_deref(),
+        raw_state.as_deref(),
+    );
+    let url = json_string(value, &["details_url", "detailsUrl", "html_url", "htmlUrl"]);
+    let workflow = nested_json_string(value, &["check_suite", "workflow_run", "name"])
+        .or_else(|| json_string(value, &["workflow_name", "workflowName", "workflow"]))
+        .or_else(|| nested_json_string(value, &["app", "name"]));
+    let started_at = json_string(value, &["started_at", "startedAt"]);
+    let completed_at = json_string(value, &["completed_at", "completedAt"]);
     Ok(CheckItem {
         name,
         state: state.as_str(),
@@ -608,6 +685,102 @@ fn parse_github_rollup_entry(
         started_at,
         completed_at,
     })
+}
+
+fn parse_github_rest_statuses(
+    output: &BackendSuccess,
+    force_required: bool,
+) -> Result<Vec<CheckItem>, ForgeError> {
+    let trimmed = output.stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "GitHub combined status JSON is invalid",
+            Some(e.to_string()),
+        )
+    })?;
+    let statuses = value
+        .get("statuses")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            ForgeError::software(
+                schema_err(),
+                "missing required field 'statuses' in GitHub combined status JSON",
+                None,
+            )
+        })?;
+    let truncated = json_total_count_exceeds_len(&value, statuses.len());
+    let mut checks = Vec::with_capacity(statuses.len() + usize::from(truncated));
+    for status in statuses {
+        checks.push(parse_github_rest_status(status, force_required)?);
+    }
+    if truncated {
+        checks.push(CheckItem {
+            name: "github-statuses-pagination-truncated".to_string(),
+            state: CheckState::Pending.as_str(),
+            url: None,
+            conclusion: None,
+            workflow: None,
+            required: force_required,
+            started_at: None,
+            completed_at: None,
+        });
+    }
+    Ok(checks)
+}
+
+fn json_total_count_exceeds_len(value: &serde_json::Value, len: usize) -> bool {
+    value
+        .get("total_count")
+        .and_then(|v| v.as_u64())
+        .and_then(|count| usize::try_from(count).ok())
+        .is_some_and(|count| count > len)
+}
+
+fn parse_github_rest_status(
+    value: &serde_json::Value,
+    force_required: bool,
+) -> Result<CheckItem, ForgeError> {
+    let name = json_string(value, &["context"]).ok_or_else(|| missing("context"))?;
+    let raw_state = json_string(value, &["state"]);
+    let state = normalize_github_state(None, None, raw_state.as_deref());
+    let url = json_string(value, &["target_url", "targetUrl"]);
+    let started_at = json_string(value, &["created_at", "createdAt"]);
+    let completed_at = json_string(value, &["updated_at", "updatedAt"]);
+    Ok(CheckItem {
+        name,
+        state: state.as_str(),
+        url,
+        conclusion: None,
+        workflow: None,
+        required: force_required,
+        started_at,
+        completed_at,
+    })
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn nested_json_string(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn normalize_github_rollup_state(
