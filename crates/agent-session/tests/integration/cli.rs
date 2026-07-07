@@ -48,6 +48,14 @@ if [ "$1" = "capture-pane" ]; then
   exit 0
 fi
 
+if [ "$1" = "list-windows" ]; then
+  if [ "${AGENT_SESSION_FAKE_TMUX_LIST_WINDOWS+x}" = "x" ]; then
+    printf '%s\n' "$AGENT_SESSION_FAKE_TMUX_LIST_WINDOWS"
+    exit 0
+  fi
+  exit 1
+fi
+
 if [ "$1" = "display-message" ] && [ "${AGENT_SESSION_FAKE_TMUX_WINDOW_ACTIVITY+x}" = "x" ]; then
   printf '%s\n' "$AGENT_SESSION_FAKE_TMUX_WINDOW_ACTIVITY"
   exit 0
@@ -334,14 +342,21 @@ fn list_command_and_delete_manage_existing_session() {
         &env_refs,
     );
     assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
-    let id = data(&start.stdout_json())["id"]
-        .as_str()
-        .expect("id")
-        .to_string();
+    let start_json = start.stdout_json();
+    let start_data = data(&start_json);
+    let id = start_data["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        start_data["last_terminal_activity_at"],
+        "2001-09-09T01:46:40Z"
+    );
     let record_path = state_dir.join("sessions").join(&id).join("session.json");
     let record: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
             .expect("record json");
+    let tmux_session = record["tmux_session"]
+        .as_str()
+        .expect("tmux session")
+        .to_string();
     let provider_resume = &record["provider_resume"];
     let claude_session_id = provider_resume["session_id"]
         .as_str()
@@ -373,10 +388,24 @@ fn list_command_and_delete_manage_existing_session() {
         "claude launch should keep title name: {new_session:?}"
     );
 
+    let display_messages_before_list = calls
+        .iter()
+        .filter(|call| call.first().is_some_and(|arg| arg == "display-message"))
+        .count();
+    let list_windows = format!("{tmux_session}\t1000000000");
+    let list_env_refs = [
+        (envs[0].0, envs[0].1.as_str()),
+        (envs[1].0, envs[1].1.as_str()),
+        (envs[2].0, envs[2].1.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LIST_WINDOWS",
+            list_windows.as_str(),
+        ),
+    ];
     let list = run(
         tmp.path(),
         &["--state-dir", &state_arg, "list", "--format", "json"],
-        &env_refs,
+        &list_env_refs,
     );
     assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
     let list_json = list.stdout_json();
@@ -388,6 +417,55 @@ fn list_command_and_delete_manage_existing_session() {
     assert_eq!(
         list_data[0]["last_terminal_activity_at"],
         "2001-09-09T01:46:40Z"
+    );
+    let calls_after_list = tmux_calls(&tmux_log);
+    assert_eq!(
+        calls_after_list
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "list-windows"))
+            .count(),
+        1,
+        "list should batch tmux activity lookup: {calls_after_list:?}"
+    );
+    assert_eq!(
+        calls_after_list
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "display-message"))
+            .count(),
+        display_messages_before_list,
+        "list should not add per-session display-message calls: {calls_after_list:?}"
+    );
+
+    let invalid_activity_windows = format!("{tmux_session}\tnot-a-number");
+    let invalid_activity_env_refs = [
+        (envs[0].0, envs[0].1.as_str()),
+        (envs[1].0, envs[1].1.as_str()),
+        (envs[2].0, envs[2].1.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LIST_WINDOWS",
+            invalid_activity_windows.as_str(),
+        ),
+    ];
+    let list_without_activity = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &invalid_activity_env_refs,
+    );
+    assert_eq!(
+        list_without_activity.code,
+        0,
+        "stderr={}",
+        list_without_activity.stderr_text()
+    );
+    let list_without_activity_json = list_without_activity.stdout_json();
+    let list_without_activity_data = data(&list_without_activity_json)
+        .as_array()
+        .expect("list data");
+    assert_eq!(list_without_activity_data[0]["status"], "running");
+    assert!(
+        list_without_activity_data[0]
+            .get("last_terminal_activity_at")
+            .is_none()
     );
 
     let command = run(
@@ -407,12 +485,50 @@ fn list_command_and_delete_manage_existing_session() {
     assert_eq!(command.code, 0, "stderr={}", command.stderr_text());
     let command_json = command.stdout_json();
     let command_data = data(&command_json);
+    assert_eq!(
+        command_data["last_terminal_activity_at"],
+        "2001-09-09T01:46:40Z"
+    );
     assert!(
         command_data["ssh_attach_command"]
             .as_str()
             .unwrap()
             .starts_with("ssh -t sympoies"),
         "missing ssh attach command: {command_data}"
+    );
+    let command_without_activity_envs = [
+        (envs[0].0, envs[0].1.as_str()),
+        (envs[1].0, envs[1].1.as_str()),
+        (envs[2].0, envs[2].1.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_FAIL", "display-message"),
+    ];
+    let command_without_activity = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "--host",
+            "sympoies",
+            "command",
+            &id,
+            "--format",
+            "json",
+        ],
+        &command_without_activity_envs,
+    );
+    assert_eq!(
+        command_without_activity.code,
+        0,
+        "stderr={}",
+        command_without_activity.stderr_text()
+    );
+    let command_without_activity_json = command_without_activity.stdout_json();
+    let command_without_activity_data = data(&command_without_activity_json);
+    assert_eq!(command_without_activity_data["status"], "running");
+    assert!(
+        command_without_activity_data
+            .get("last_terminal_activity_at")
+            .is_none()
     );
 
     let delete = run(
