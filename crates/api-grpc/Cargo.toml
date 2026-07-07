@@ -1,6 +1,6 @@
 [package]
 name = "nils-api-grpc"
-version = "1.20.18"
+version = "1.20.19"
 edition.workspace = true
 license.workspace = true
 
@@ -11,15 +11,15 @@ repository = "https://github.com/sympoies/nils-cli"
 name = "api-grpc"
 path = "src/main.rs"
 [dependencies]
-api-testing-core = { version = "1.20.18", path = "../api-testing-core", package = "nils-api-testing-core" }
+api-testing-core = { version = "1.20.19", path = "../api-testing-core", package = "nils-api-testing-core" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.20.18", path = "../nils-build-info" }
-nils-term = { version = "1.20.18", path = "../nils-term", package = "nils-term" }
+nils-build-info = { version = "1.20.19", path = "../nils-build-info" }
+nils-term = { version = "1.20.19", path = "../nils-term", package = "nils-term" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 base64 = "0.22"
-nils-test-support = { version = "1.20.18", path = "../nils-test-support" }
+nils-test-support = { version = "1.20.19", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
