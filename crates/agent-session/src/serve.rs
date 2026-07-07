@@ -35,8 +35,8 @@ use crate::cli::{self, AgentKind, SpecialKey};
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
     glance_session, list_sessions, load_session_record, non_empty_env, resolve_tmux_bin,
-    resume_session_by_id, run_capture_pane, search_workdirs, send_input, session_dir,
-    session_status, short_hostname, start_provider_resume_session, start_session,
+    resume_session_by_id, run_capture_pane, search_workdirs, send_input, session_clipboard_buffer,
+    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
     update_session_title, write_private_file, write_session_attachment,
 };
 
@@ -145,6 +145,7 @@ fn router(state: Arc<ServeState>) -> Router {
         .route("/sessions", get(list_handler).post(create_handler))
         .route("/workdirs", get(workdirs_handler))
         .route("/sessions/{id}/glance", get(glance_handler))
+        .route("/sessions/{id}/buffer", get(buffer_handler))
         .route("/sessions/{id}/send", post(send_handler))
         .route("/sessions/{id}/resume", post(resume_handler))
         .route(
@@ -352,6 +353,24 @@ async fn glance_handler(
     };
     match tokio::task::spawn_blocking(move || glance_session(&context, args)).await {
         Ok(Ok(glance)) => envelope_ok(json!({ "machine": state.machine, "glance": glance })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+// Return the session server's tmux paste buffer (`tmux show-buffer`) — the text a
+// mouse-selection-copying TUI (e.g. Claude Code) placed there. Read-only, open on
+// loopback like `glance`; the browser edge uses it so a right-click Copy can reach
+// the on-screen selection that a live TUI never exposes to the DOM.
+async fn buffer_handler(
+    State(state): State<Arc<ServeState>>,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
+    match tokio::task::spawn_blocking(move || session_clipboard_buffer(&context, &id, &tmux)).await
+    {
+        Ok(Ok(text)) => envelope_ok(json!({ "machine": state.machine, "text": text })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
@@ -918,7 +937,7 @@ mod tests {
         let bin = dir.join("tmux");
         std::fs::write(
             &bin,
-            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
         )
         .unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
@@ -2389,6 +2408,51 @@ mod tests {
         assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
         assert_eq!(body["data"]["machine"], MACHINE);
         assert!(body["data"]["glance"].is_object());
+    }
+
+    #[tokio::test]
+    async fn buffer_returns_tmux_show_buffer_text_open_on_reads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "look", "claude", "hs-claude-look");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        // No auth header: buffer is a read, open on loopback like glance.
+        let (status, body) = call(router(st.clone()), get("/sessions/look/buffer")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+        assert_eq!(body["data"]["machine"], MACHINE);
+        assert_eq!(body["data"]["text"], "buffered selection\n");
+    }
+
+    #[tokio::test]
+    async fn buffer_unknown_session_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let (status, body) = call(router(st.clone()), get("/sessions/ghost/buffer")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+        assert_eq!(body["error"]["code"], "session-not-found");
+    }
+
+    #[tokio::test]
+    async fn buffer_reports_empty_when_no_buffer_set() {
+        // A fresh tmux server has no paste buffer yet: `show-buffer` exits non-zero
+        // ("no buffers"), which must surface as an empty selection, not an error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bin = tmp.path().join("tmux");
+        std::fs::write(
+            &bin,
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  show-buffer) echo 'no buffers' >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        seed_session(tmp.path(), "look", "claude", "hs-claude-look");
+        let st = state(tmp.path(), Some(TOKEN), bin);
+        let (status, body) = call(router(st.clone()), get("/sessions/look/buffer")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["text"], "");
     }
 
     #[tokio::test]
