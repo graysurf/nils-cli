@@ -1898,6 +1898,37 @@ fn run_capture_pane(
     Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
 }
 
+/// Read the tmux paste buffer for a session's server (`tmux show-buffer`). tmux
+/// buffers are server-global, so this returns the most recently set buffer on the
+/// socket — which, for an agent pane whose TUI copies mouse selections into the
+/// buffer (e.g. Claude Code's "copied N chars to tmux buffer"), is the user's last
+/// on-screen selection. The `id` only validates the session (and picks the
+/// daemon's socket); the buffer itself is not session-scoped. A fresh server with
+/// no buffer yet exits non-zero ("no buffers") — treated as an empty selection,
+/// not an error, so "nothing selected yet" is a normal empty result.
+fn session_clipboard_buffer(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: &Path,
+) -> Result<String, CliError> {
+    // Validate the session exists first (clean not-found) before touching tmux.
+    let _record = load_session_record(context, id)?;
+    let output = ProcessCommand::new(tmux_bin)
+        .arg("show-buffer")
+        .output()
+        .map_err(|err| {
+            CliError::runtime(
+                "tmux-show-buffer-failed",
+                format!("failed to run {}: {err}", tmux_bin.display()),
+                None,
+            )
+        })?;
+    if !output.status.success() {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 fn capture_pane_tail(
     record: &SessionRecord,
     tail: usize,
