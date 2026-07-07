@@ -48,6 +48,11 @@ if [ "$1" = "capture-pane" ]; then
   exit 0
 fi
 
+if [ "$1" = "display-message" ] && [ "${AGENT_SESSION_FAKE_TMUX_WINDOW_ACTIVITY+x}" = "x" ]; then
+  printf '%s\n' "$AGENT_SESSION_FAKE_TMUX_WINDOW_ACTIVITY"
+  exit 0
+fi
+
 if [ "$1" = "new-session" ] && [ "${AGENT_SESSION_FAKE_CODEX_SESSION_FILE+x}" = "x" ]; then
   cwd="${AGENT_SESSION_FAKE_CODEX_CWD:-}"
   if [ -z "$cwd" ]; then
@@ -292,10 +297,15 @@ fn list_command_and_delete_manage_existing_session() {
             tmux_log.to_string_lossy().to_string(),
         ),
         ("AGENT_SESSION_TMUX_BIN", tmux_arg.clone()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_WINDOW_ACTIVITY",
+            "1000000000".to_string(),
+        ),
     ];
     let env_refs = [
         (envs[0].0, envs[0].1.as_str()),
         (envs[1].0, envs[1].1.as_str()),
+        (envs[2].0, envs[2].1.as_str()),
     ];
 
     let start = run(
@@ -375,6 +385,10 @@ fn list_command_and_delete_manage_existing_session() {
     assert_eq!(list_data.len(), 1);
     assert_eq!(list_data[0]["id"], id);
     assert_eq!(list_data[0]["status"], "running");
+    assert_eq!(
+        list_data[0]["last_terminal_activity_at"],
+        "2001-09-09T01:46:40Z"
+    );
 
     let command = run(
         tmp.path(),
@@ -3234,7 +3248,10 @@ fn glance_returns_pane_tail_and_status_contract() {
             "--format",
             "json",
         ],
-        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_WINDOW_ACTIVITY", "1000000000"),
+        ],
     );
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
     let value = output.stdout_json();
@@ -3243,6 +3260,7 @@ fn glance_returns_pane_tail_and_status_contract() {
     assert_eq!(result["id"], "look");
     assert_eq!(result["agent"], "claude");
     assert_eq!(result["status"], "running");
+    assert_eq!(result["last_terminal_activity_at"], "2001-09-09T01:46:40Z");
     assert!(result.get("provider_resume").is_none());
     let tail = result["tail"].as_str().expect("tail");
     assert!(
@@ -3265,6 +3283,7 @@ fn glance_returns_pane_tail_and_status_contract() {
         ],
         &[
             ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_WINDOW_ACTIVITY", "1000000000"),
             ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
         ],
     );
@@ -3272,6 +3291,7 @@ fn glance_returns_pane_tail_and_status_contract() {
     let stopped_result = data(&stopped.stdout_json()).clone();
     assert_eq!(stopped_result["status"], "stopped");
     assert_eq!(stopped_result["tail"], "");
+    assert!(stopped_result.get("last_terminal_activity_at").is_none());
     assert!(stopped_result.get("provider_resume").is_none());
 
     let recover_cwd = tmp.path().join("recoverable-repo");
