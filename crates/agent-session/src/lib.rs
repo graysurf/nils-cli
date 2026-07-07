@@ -21,6 +21,7 @@ use nils_common::cli_contract::{
 use nils_common::fs::{
     SECRET_FILE_MODE, display_path, expand_home, home_dir, normalize_path, write_atomic,
 };
+use nils_common::git::parse_git_remote_url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -3127,6 +3128,47 @@ fn repo_name_from_cwd(cwd: &str) -> Option<String> {
         .and_then(|value| value.to_str())
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
+}
+
+fn repo_remote_url_from_cwd(cwd: &str) -> Option<String> {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let root_output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(trimmed)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !root_output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(root_output.stdout).ok()?;
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+
+    let remote_output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !remote_output.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8(remote_output.stdout).ok()?;
+    git_remote_web_url(&remote)
+}
+
+fn git_remote_web_url(remote: &str) -> Option<String> {
+    let parsed = parse_git_remote_url(remote)?;
+    if parsed.host.trim().is_empty() || parsed.path.trim().is_empty() {
+        return None;
+    }
+    Some(format!("https://{}/{}", parsed.host, parsed.path))
 }
 
 fn live_status(tmux_bin: &Path, tmux_session: &str) -> String {

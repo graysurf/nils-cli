@@ -34,10 +34,11 @@ use serde_json::{Value, json};
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
-    glance_session, list_sessions, load_session_record, non_empty_env, resolve_tmux_bin,
-    resume_session_by_id, run_capture_pane, search_workdirs, send_input, session_clipboard_buffer,
-    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
-    update_session_title, write_private_file, write_session_attachment,
+    glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
+    resolve_tmux_bin, resume_session_by_id, run_capture_pane, search_workdirs, send_input,
+    session_clipboard_buffer, session_dir, session_status, short_hostname,
+    start_provider_resume_session, start_session, update_session_title, write_private_file,
+    write_session_attachment,
 };
 
 /// Monotonic counter giving each attach connection a private pipe file, so
@@ -144,6 +145,7 @@ fn router(state: Arc<ServeState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/sessions", get(list_handler).post(create_handler))
         .route("/workdirs", get(workdirs_handler))
+        .route("/repos/remote-url", get(repo_remote_url_handler))
         .route("/sessions/{id}/glance", get(glance_handler))
         .route("/sessions/{id}/buffer", get(buffer_handler))
         .route("/sessions/{id}/send", post(send_handler))
@@ -321,6 +323,11 @@ struct WorkdirQuery {
     git_only: bool,
     #[serde(default)]
     exclude_worktrees: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoRemoteUrlQuery {
+    cwd: Option<String>,
 }
 
 // --- handlers -----------------------------------------------------------------
@@ -619,6 +626,33 @@ async fn workdirs_handler(
     {
         Ok(Ok(workdirs)) => envelope_ok(json!({ "machine": state.machine, "workdirs": workdirs })),
         Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn repo_remote_url_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    Query(query): Query<RepoRemoteUrlQuery>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let Some(cwd) = query
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return envelope_err(CliError::usage(
+            "missing-cwd",
+            "missing cwd query parameter",
+            None,
+        ));
+    };
+    let cwd = cwd.to_string();
+    match tokio::task::spawn_blocking(move || repo_remote_url_from_cwd(&cwd)).await {
+        Ok(url) => envelope_ok(json!({ "machine": state.machine, "url": url })),
         Err(_) => join_err(),
     }
 }
@@ -1036,6 +1070,32 @@ mod tests {
             &dir.join(name),
             "#!/usr/bin/env sh\nprintf 'fake agent started\\n'\n",
         )
+    }
+
+    fn init_git_remote(repo: &Path, remote: &str) {
+        std::fs::create_dir_all(repo).unwrap();
+        let init = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("init")
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let add_remote = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["remote", "add", "origin", remote])
+            .output()
+            .unwrap();
+        assert!(
+            add_remote.status.success(),
+            "git remote add failed: {}",
+            String::from_utf8_lossy(&add_remote.stderr)
+        );
     }
 
     fn write_codex_session_meta(codex_home: &Path, session_id: &str, cwd: &Path) {
@@ -2223,6 +2283,48 @@ mod tests {
                 .any(|item| item["path"] == config_match.to_string_lossy().as_ref()),
             ".config match missing: {workdirs:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn repo_remote_url_resolves_github_and_gitlab_remotes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let github_repo = tmp.path().join("home/Project/sympoies/agent-console");
+        let gitlab_repo = tmp.path().join("home/Project/acme/backend");
+        init_git_remote(&github_repo, "git@github.com:sympoies/agent-console.git");
+        init_git_remote(
+            &gitlab_repo,
+            "ssh://git@gitlab.example.com:2222/group/sub/project.git",
+        );
+
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let unauthorized = format!("/repos/remote-url?cwd={}", github_repo.to_string_lossy());
+        let (status, body) = call(router(st.clone()), get(&unauthorized)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let github_path = format!("/repos/remote-url?cwd={}", github_repo.to_string_lossy());
+        let (status, body) = call(router(st.clone()), get_auth(&github_path, Some(TOKEN))).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["machine"], "test-machine");
+        assert_eq!(
+            body["data"]["url"],
+            "https://github.com/sympoies/agent-console"
+        );
+
+        let gitlab_path = format!("/repos/remote-url?cwd={}", gitlab_repo.to_string_lossy());
+        let (status, body) = call(router(st.clone()), get_auth(&gitlab_path, Some(TOKEN))).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(
+            body["data"]["url"],
+            "https://gitlab.example.com/group/sub/project"
+        );
+
+        let missing = tmp.path().join("home/Project/no-remote");
+        std::fs::create_dir_all(&missing).unwrap();
+        let missing_path = format!("/repos/remote-url?cwd={}", missing.to_string_lossy());
+        let (status, body) = call(router(st), get_auth(&missing_path, Some(TOKEN))).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body["data"]["url"].is_null());
     }
 
     #[tokio::test]
