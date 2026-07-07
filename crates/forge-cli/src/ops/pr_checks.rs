@@ -282,7 +282,7 @@ fn snapshot_github<R: BackendRunner>(
     let output = match run_github_checks_call(runner, &call) {
         Ok(output) => output,
         Err(err) if is_status_rollup_permission_error(&err) => {
-            return snapshot_github_rollup_fallback(runner, ctx, args);
+            return snapshot_github_rest_fallback(runner, ctx, args);
         }
         Err(err) => return Err(err),
     };
@@ -291,34 +291,13 @@ fn snapshot_github<R: BackendRunner>(
         let required_output = match run_github_checks_call(runner, &required_call) {
             Ok(output) => output,
             Err(err) if is_status_rollup_permission_error(&err) => {
-                return snapshot_github_rollup_fallback(runner, ctx, args);
+                return snapshot_github_rest_fallback(runner, ctx, args);
             }
             Err(err) => return Err(err),
         };
         return parse_github_snapshot_with_required_output(ctx, &output, &required_output);
     }
     parse_github_snapshot(ctx, &output, false)
-}
-
-fn snapshot_github_rollup_fallback<R: BackendRunner>(
-    runner: &R,
-    ctx: &ProviderContext,
-    args: &PrChecksArgs,
-) -> Result<PrChecksPayload, ForgeError> {
-    let call = build_github_rollup_view_call(ctx, &args.id);
-    let output = match runner.run(&call) {
-        Ok(output) => output,
-        Err(err) if is_status_rollup_permission_error(&err) => {
-            return snapshot_github_rest_fallback(runner, ctx, args);
-        }
-        Err(err) => return Err(err),
-    };
-    let checks = parse_github_status_rollup(&output, args.required_only)?;
-    Ok(aggregate_github_unknown_requiredness(
-        ctx,
-        checks,
-        args.required_only,
-    ))
 }
 
 fn snapshot_github_rest_fallback<R: BackendRunner>(
@@ -428,22 +407,8 @@ pub fn build_github_required_call(ctx: &ProviderContext, id: &str) -> BackendCal
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
-/// Build the GitHub fallback call used when `gh pr checks` hits a
+/// Build the narrow fallback call used when `gh pr checks` hits a
 /// permission-sensitive statusCheckRollup traversal internally.
-pub fn build_github_rollup_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
-    let mut argv: Vec<OsString> = vec![
-        OsString::from("pr"),
-        OsString::from("view"),
-        OsString::from(id),
-        OsString::from("--json"),
-        OsString::from("headRefOid,statusCheckRollup"),
-    ];
-    ctx.push_repo_override(&mut argv);
-    BackendCall::new(BackendProgram::Gh, argv)
-}
-
-/// Build the narrower fallback call used when the statusCheckRollup projection
-/// is also blocked but the PR head SHA is still readable.
 pub fn build_github_head_view_call(ctx: &ProviderContext, id: &str) -> BackendCall {
     let mut argv: Vec<OsString> = vec![
         OsString::from("pr"),
@@ -613,49 +578,6 @@ fn parse_github_checks(
     let mut checks = Vec::with_capacity(arr.len());
     for entry in arr {
         checks.push(parse_github_entry(entry, required_names, force_required)?);
-    }
-    Ok(checks)
-}
-
-fn parse_github_status_rollup(
-    output: &BackendSuccess,
-    force_required: bool,
-) -> Result<Vec<CheckItem>, ForgeError> {
-    let trimmed = output.stdout.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-        ForgeError::software(
-            schema_err(),
-            "pr view statusCheckRollup JSON is invalid",
-            Some(e.to_string()),
-        )
-    })?;
-    let head_oid = value
-        .get("headRefOid")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            ForgeError::software(
-                schema_err(),
-                "missing required field 'headRefOid' in pr view JSON",
-                None,
-            )
-        })?;
-    let rollup = value
-        .get("statusCheckRollup")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            ForgeError::software(
-                schema_err(),
-                "missing required field 'statusCheckRollup' in pr view JSON",
-                Some(format!("headRefOid={head_oid}")),
-            )
-        })?;
-    let mut checks = Vec::with_capacity(rollup.len());
-    for entry in rollup {
-        checks.push(parse_github_rollup_entry(entry, force_required)?);
     }
     Ok(checks)
 }
@@ -859,63 +781,6 @@ fn nested_json_string(value: &serde_json::Value, path: &[&str]) -> Option<String
         .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-}
-
-fn parse_github_rollup_entry(
-    value: &serde_json::Value,
-    force_required: bool,
-) -> Result<CheckItem, ForgeError> {
-    let name = value
-        .get("name")
-        .or_else(|| value.get("context"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| missing("name"))?;
-    let conclusion = value
-        .get("conclusion")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let raw_state = value
-        .get("status")
-        .or_else(|| value.get("state"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let kind = value.get("__typename").and_then(|v| v.as_str());
-    let state = normalize_github_rollup_state(kind, conclusion.as_deref(), raw_state);
-    let url = value
-        .get("detailsUrl")
-        .or_else(|| value.get("targetUrl"))
-        .or_else(|| value.get("link"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let workflow = value
-        .get("workflowName")
-        .or_else(|| value.get("workflow"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let started_at = value
-        .get("startedAt")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let completed_at = value
-        .get("completedAt")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    Ok(CheckItem {
-        name,
-        state: state.as_str(),
-        url,
-        conclusion,
-        workflow,
-        required: force_required,
-        started_at,
-        completed_at,
-    })
 }
 
 fn normalize_github_rollup_state(
