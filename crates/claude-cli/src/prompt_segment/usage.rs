@@ -5,6 +5,7 @@ use nils_common::process;
 use nils_common::shell::{AnsiStripMode, quote_posix_single, strip_ansi};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -247,8 +248,34 @@ fn probe_claude_cli_usage() -> anyhow::Result<String> {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_CLAUDE_TIMEOUT_SECONDS);
 
-    let mode = ProbeMode::select(&program);
-    let mut command = mode.command(&program);
+    let mut last_error: Option<anyhow::Error> = None;
+    for mode in select_probe_modes(&program) {
+        match probe_claude_cli_usage_with_mode(&program, timeout_seconds, &mode) {
+            Ok(text)
+                if parse_cli_usage_output(&text).is_some() || matches!(mode, ProbeMode::Pipe) =>
+            {
+                return Ok(text);
+            }
+            Ok(_) => {
+                last_error = Some(anyhow::anyhow!(
+                    "claude usage probe output was not parseable"
+                ));
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("claude usage probe unavailable")))
+}
+
+fn probe_claude_cli_usage_with_mode(
+    program: &Path,
+    timeout_seconds: u64,
+    mode: &ProbeMode,
+) -> anyhow::Result<String> {
+    let mut command = mode.command(program);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -283,41 +310,35 @@ fn probe_claude_cli_usage() -> anyhow::Result<String> {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ProbeMode {
-    Pty,
+    Pty(ScriptLauncher),
     Pipe,
 }
 
-impl ProbeMode {
-    fn select(program: &Path) -> Self {
-        if shared_env::env_truthy("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED") {
-            return Self::Pipe;
-        }
-        if cfg!(unix) && process::cmd_exists("script") && program.is_file() {
-            return Self::Pty;
-        }
-        Self::Pipe
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScriptLauncher {
+    program: PathBuf,
+    flavor: ScriptFlavor,
+}
 
-    fn command(self, program: &Path) -> Command {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ScriptFlavor {
+    UtilLinux,
+    Bsd,
+}
+
+impl ProbeMode {
+    fn command(&self, program: &Path) -> Command {
         match self {
-            Self::Pty => {
-                let mut command = Command::new("script");
-                command
-                    .arg("-q")
-                    .arg("/dev/null")
-                    .arg("-c")
-                    .arg(quote_posix_single(&program.to_string_lossy()));
-                command
-            }
+            Self::Pty(launcher) => script_command(program, launcher),
             Self::Pipe => Command::new(program),
         }
     }
 
-    fn write_usage_input(self, stdin: &mut dyn Write) -> anyhow::Result<()> {
+    fn write_usage_input(&self, stdin: &mut dyn Write) -> anyhow::Result<()> {
         match self {
-            Self::Pty => {
+            Self::Pty(_) => {
                 thread::sleep(Duration::from_millis(env_u64(
                     "CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_STARTUP_DELAY_MS",
                     DEFAULT_PTY_STARTUP_DELAY_MS,
@@ -336,6 +357,74 @@ impl ProbeMode {
             }
         }
         Ok(())
+    }
+}
+
+fn select_probe_modes(program: &Path) -> Vec<ProbeMode> {
+    let script_program = if cfg!(unix) {
+        process::find_in_path("script")
+    } else {
+        None
+    };
+    select_probe_modes_for(
+        shared_env::env_truthy("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED"),
+        program.is_file(),
+        script_program,
+    )
+}
+
+fn select_probe_modes_for(
+    pty_disabled: bool,
+    program_is_file: bool,
+    script_program: Option<PathBuf>,
+) -> Vec<ProbeMode> {
+    let mut modes = Vec::new();
+    if !pty_disabled
+        && program_is_file
+        && let Some(program) = script_program
+    {
+        modes.push(ProbeMode::Pty(ScriptLauncher {
+            program,
+            flavor: platform_script_flavor(),
+        }));
+    }
+    modes.push(ProbeMode::Pipe);
+    modes
+}
+
+fn script_command(program: &Path, launcher: &ScriptLauncher) -> Command {
+    let mut command = Command::new(&launcher.program);
+    command.args(script_command_args(program, launcher.flavor));
+    command
+}
+
+fn script_command_args(program: &Path, flavor: ScriptFlavor) -> Vec<OsString> {
+    match flavor {
+        ScriptFlavor::UtilLinux => vec![
+            OsString::from("-q"),
+            OsString::from("/dev/null"),
+            OsString::from("-c"),
+            OsString::from(quote_posix_single(&program.to_string_lossy())),
+        ],
+        ScriptFlavor::Bsd => vec![
+            OsString::from("-q"),
+            OsString::from("/dev/null"),
+            program.as_os_str().to_os_string(),
+        ],
+    }
+}
+
+fn platform_script_flavor() -> ScriptFlavor {
+    if cfg!(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )) {
+        ScriptFlavor::Bsd
+    } else {
+        ScriptFlavor::UtilLinux
     }
 }
 
@@ -609,6 +698,91 @@ mod tests {
 
         let value: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(value["usage"]["five_hour"]["utilization"], 25.0);
+    }
+
+    #[test]
+    fn script_command_args_use_util_linux_c_shape() {
+        let args = script_command_args(Path::new("/opt/bin/claude"), ScriptFlavor::UtilLinux);
+
+        assert_eq!(
+            args,
+            vec!["-q", "/dev/null", "-c", "'/opt/bin/claude'"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn script_command_args_use_bsd_file_command_shape() {
+        let args = script_command_args(Path::new("/opt/bin/claude"), ScriptFlavor::Bsd);
+
+        assert_eq!(
+            args,
+            vec!["-q", "/dev/null", "/opt/bin/claude"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pty_command_uses_resolved_script_path_and_flavor() {
+        let mode = ProbeMode::Pty(ScriptLauncher {
+            program: PathBuf::from("/custom/bin/script"),
+            flavor: ScriptFlavor::Bsd,
+        });
+        let command = mode.command(Path::new("/opt/bin/claude"));
+
+        assert_eq!(command.get_program(), Path::new("/custom/bin/script"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("-q"),
+                std::ffi::OsStr::new("/dev/null"),
+                std::ffi::OsStr::new("/opt/bin/claude"),
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_probe_modes_keep_pipe_fallback_after_pty() {
+        let modes = select_probe_modes_for(false, true, Some(PathBuf::from("/usr/bin/script")));
+
+        assert_eq!(
+            modes,
+            vec![
+                ProbeMode::Pty(ScriptLauncher {
+                    program: PathBuf::from("/usr/bin/script"),
+                    flavor: platform_script_flavor(),
+                }),
+                ProbeMode::Pipe,
+            ]
+        );
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    #[test]
+    fn platform_script_flavor_is_bsd_on_bsd_targets() {
+        assert_eq!(platform_script_flavor(), ScriptFlavor::Bsd);
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    #[test]
+    fn platform_script_flavor_is_util_linux_on_other_targets() {
+        assert_eq!(platform_script_flavor(), ScriptFlavor::UtilLinux);
     }
 
     #[test]
