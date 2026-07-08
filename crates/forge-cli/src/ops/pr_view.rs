@@ -25,7 +25,19 @@ use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 const SCHEMA: &str = "pr.view";
 const SCHEMA_VERSION: u32 = 1;
 
-const GH_JSON_FIELDS: &str = "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels,body";
+const GH_JSON_FIELDS: &str = "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels,body,closingIssuesReferences";
+
+/// A single issue a PR/MR closes on merge via a `Closes/Fixes #N` closing
+/// keyword. GitHub surfaces these through the `closingIssuesReferences`
+/// GraphQL connection (populated at PR creation from the body and only for
+/// genuine closing keywords — a non-closing `Refs #N` never appears here).
+/// GitLab's `glab mr view` JSON does not expose this connection, so the list
+/// is always empty on GitLab.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClosingIssueRef {
+    pub number: u64,
+    pub url: String,
+}
 
 /// Envelope payload for `cli.forge-cli.pr.view.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -51,6 +63,11 @@ pub struct PrViewPayload {
     /// (callers that re-parse view JSON with narrower field lists, e.g.
     /// `pr ready`, keep working).
     pub body: Option<String>,
+    /// Issues this PR closes on merge via `Closes/Fixes #N` closing keywords,
+    /// from GitHub's `closingIssuesReferences`. Additive and always
+    /// serialized (empty list when the provider omits the field or is
+    /// GitLab). Consumed by `pr deliver`'s deterministic issue-closeout step.
+    pub closing_issue_refs: Vec<ClosingIssueRef>,
 }
 
 pub fn run(global: &GlobalFlags, id: String, format: OutputFormat) -> Result<i32, ForgeError> {
@@ -239,7 +256,31 @@ fn parse_github(
             .get("body")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        closing_issue_refs: parse_closing_refs(value),
     })
+}
+
+/// Parse GitHub's `closingIssuesReferences` array into typed refs. Entries
+/// without a numeric `number` are skipped; a missing `url` degrades to the
+/// empty string. Absent field / non-array → empty list.
+fn parse_closing_refs(value: &serde_json::Value) -> Vec<ClosingIssueRef> {
+    value
+        .get("closingIssuesReferences")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let number = item.get("number").and_then(|n| n.as_u64())?;
+                    let url = item
+                        .get("url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(ClosingIssueRef { number, url })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_gitlab(
@@ -284,6 +325,9 @@ fn parse_gitlab(
             .get("description")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        // `glab mr view` JSON does not expose the closes-issues connection;
+        // GitLab closeout is a no-op until a dedicated fetch is added.
+        closing_issue_refs: Vec::new(),
     })
 }
 
@@ -535,6 +579,67 @@ mod tests {
         let p = parse_view_output(&ctx(Provider::GitLab), &output).unwrap();
         assert_eq!(p.state, "merged");
         assert_eq!(p.merge_commit_sha.as_deref(), Some("1234567890abcdef"));
+    }
+
+    #[test]
+    fn build_view_call_github_requests_closing_issue_refs_field() {
+        let plan = build_view_call(&ctx(Provider::GitHub), "5").plan_argv();
+        let json_idx = plan.iter().position(|s| s == "--json").unwrap();
+        assert!(
+            plan[json_idx + 1].contains("closingIssuesReferences"),
+            "GitHub --json field list must request closingIssuesReferences"
+        );
+    }
+
+    #[test]
+    fn parse_github_extracts_closing_issue_refs() {
+        let output = BackendSuccess {
+            stdout: r###"{
+                "number":5,"url":"u","state":"OPEN","isDraft":false,"title":"t",
+                "headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE",
+                "mergedAt":null,"labels":[],
+                "closingIssuesReferences":[
+                    {"number":41,"url":"https://github.com/o/r/issues/41"},
+                    {"number":42,"url":"https://github.com/o/r/issues/42"}
+                ]
+            }"###
+                .into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitHub), &output).unwrap();
+        assert_eq!(
+            p.closing_issue_refs,
+            vec![
+                ClosingIssueRef {
+                    number: 41,
+                    url: "https://github.com/o/r/issues/41".into()
+                },
+                ClosingIssueRef {
+                    number: 42,
+                    url: "https://github.com/o/r/issues/42".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_github_closing_issue_refs_default_empty_when_absent() {
+        let output = BackendSuccess {
+            stdout: r#"{"number":5,"url":"u","state":"OPEN","isDraft":false,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}"#.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitHub), &output).unwrap();
+        assert!(p.closing_issue_refs.is_empty());
+    }
+
+    #[test]
+    fn parse_gitlab_never_populates_closing_issue_refs() {
+        let output = BackendSuccess {
+            stdout: r#"{"iid":7,"web_url":"u","state":"opened","draft":false,"title":"t","source_branch":"feat/x","target_branch":"main","merge_status":"can_be_merged","labels":[]}"#.into(),
+            stderr: String::new(),
+        };
+        let p = parse_view_output(&ctx(Provider::GitLab), &output).unwrap();
+        assert!(p.closing_issue_refs.is_empty());
     }
 
     #[test]

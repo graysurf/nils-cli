@@ -11,7 +11,7 @@ use super::support::{StubEnv, parse_envelope, run_forge_cli};
 const FORBIDDEN_STUB: &str = "#!/bin/sh\necho 'should not run during dry-run' >&2\nexit 99\n";
 
 #[test]
-fn pr_deliver_dry_run_lists_all_seven_steps_in_order() {
+fn pr_deliver_dry_run_lists_all_eight_steps_in_order() {
     let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
     let out = run_forge_cli(
         &stub,
@@ -50,6 +50,7 @@ fn pr_deliver_dry_run_lists_all_seven_steps_in_order() {
             "wait_checks",
             "ready",
             "merge",
+            "issue_closeout",
         ]
     );
     assert_eq!(env["data"]["no_merge"], false);

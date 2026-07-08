@@ -69,6 +69,33 @@ const MERGED_PR_VIEW_JSON: &str = r#"{
   "labels": []
 }"#;
 
+/// Post-merge `pr view` payload carrying one closing-keyword linked issue
+/// (`closingIssuesReferences`), used to exercise the deterministic
+/// issue-closeout step.
+const MERGED_PR_VIEW_WITH_CLOSING_JSON: &str = r#"{
+  "number": 123,
+  "url": "https://github.com/sympoies/nils-cli/pull/123",
+  "state": "MERGED",
+  "isDraft": false,
+  "title": "feat: sample feature",
+  "headRefName": "feat/sample",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergedAt": "2026-05-23T12:00:00Z",
+  "labels": [],
+  "closingIssuesReferences": [
+    { "number": 4242, "url": "https://github.com/sympoies/nils-cli/issues/4242" }
+  ]
+}"#;
+
+/// `issue view 4242` payload in the shape `issue_view::parse_view_output`
+/// expects. The closeout step reads `state` to decide whether to close.
+const LINKED_ISSUE_OPEN_JSON: &str = r#"{"number":4242,"url":"https://github.com/sympoies/nils-cli/issues/4242","state":"OPEN","title":"linked","labels":[],"assignees":[],"body":""}"#;
+
+/// Same issue already closed — GitHub's async auto-close won the race, so the
+/// closeout step must leave it alone.
+const LINKED_ISSUE_CLOSED_JSON: &str = r#"{"number":4242,"url":"https://github.com/sympoies/nils-cli/issues/4242","state":"CLOSED","title":"linked","labels":[],"assignees":[],"body":""}"#;
+
 /// One open PR for `feat/sample`, in the shape `gh pr list --json` returns.
 /// Used by the adopt-path stubs to answer the macro's head-branch lookup.
 const OPEN_PR_LIST_JSON: &str = r#"[{"number":123,"url":"https://github.com/sympoies/nils-cli/pull/123","state":"OPEN","title":"feat: sample feature","headRefName":"feat/sample","author":{"login":"testuser-gh"}}]"#;
@@ -428,6 +455,127 @@ esac
     path
 }
 
+/// Full-chain stub whose post-merge `pr view` reports a closing-keyword
+/// linked issue, plus `issue view` / `issue close` handlers so the
+/// deterministic closeout step can run end to end. `issue_view_json` selects
+/// whether the linked issue is still open (closeout must close it) or already
+/// closed (closeout must skip it). `issue close` touches an
+/// `issue-close-called` sentinel so tests can assert whether the backend close
+/// ran; when `close_exits_one` it also exits non-zero to exercise the
+/// best-effort failure path.
+fn write_closeout_chain_stub(
+    stub: &StubEnv,
+    issue_view_json: &str,
+    close_exits_one: bool,
+) -> PathBuf {
+    let merge_sentinel = stub.tempdir.path().join("merge-called");
+    let close_sentinel = stub.tempdir.path().join("issue-close-called");
+    let close_action = if close_exits_one {
+        "    echo 'gh: could not close issue' >&2\n    exit 1\n"
+    } else {
+        "    :\n"
+    };
+    let body = format!(
+        r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "auth status")
+    cat <<'EOF' 1>&2
+github.com
+  ✓ Logged in to github.com account testuser-gh (keyring)
+  - Token scopes: 'repo', 'read:org'
+EOF
+    ;;
+  "repo view")
+    cat <<'EOF'
+{{
+  "name": "nils-cli",
+  "owner": {{ "login": "sympoies" }},
+  "url": "https://github.com/sympoies/nils-cli",
+  "defaultBranchRef": {{ "name": "main" }},
+  "mergeCommitAllowed": false,
+  "squashMergeAllowed": true,
+  "rebaseMergeAllowed": false
+}}
+EOF
+    ;;
+  "pr list")
+    echo '[]'
+    ;;
+  "pr create")
+    cat <<'EOF'
+{create}
+EOF
+    ;;
+  "pr checks")
+    cat <<'EOF'
+{checks}
+EOF
+    ;;
+  "pr ready")
+    :
+    ;;
+  "api graphql")
+    cat <<'EOF'
+{{ "data": {{ "repository": {{ "pullRequest": {{ "reviewThreads": {{ "nodes": [] }} }} }} }} }}
+EOF
+    ;;
+  "pr merge")
+    touch {merge_sentinel}
+    :
+    ;;
+  "issue view")
+    cat <<'EOF'
+{issue_view}
+EOF
+    ;;
+  "issue close")
+    touch {close_sentinel}
+{close_action}
+    ;;
+  "pr view")
+    case "$*" in
+      *"--json mergeCommit"*)
+        cat <<'EOF'
+{{ "mergeCommit": {{ "oid": "abc123def456" }} }}
+EOF
+        ;;
+      *)
+        if [ -e {merge_sentinel} ]; then
+          cat <<'EOF'
+{merged_closing}
+EOF
+        else
+          cat <<'EOF'
+{pre_view}
+EOF
+        fi
+        ;;
+    esac
+    ;;
+  *)
+    echo "stub: unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+        create = FIXTURE_CREATE_STDOUT,
+        checks = FIXTURE_CHECKS_JSON,
+        merged_closing = MERGED_PR_VIEW_WITH_CLOSING_JSON,
+        pre_view = FULL_PR_VIEW_JSON,
+        issue_view = issue_view_json,
+        close_action = close_action,
+        merge_sentinel = merge_sentinel.display(),
+        close_sentinel = close_sentinel.display(),
+    );
+    let path = stub.tempdir.path().join("gh");
+    fs::write(&path, body).expect("write gh stub");
+    let mut perm = fs::metadata(&path).expect("metadata").permissions();
+    perm.set_mode(0o755);
+    fs::set_permissions(&path, perm).expect("chmod");
+    path
+}
+
 fn run_in_repo(stub: &StubEnv, repo: &Path, args: &[&str]) -> CmdOutput {
     run_forge_cli_in(stub, args, Some(repo))
 }
@@ -543,7 +691,7 @@ fn pr_deliver_head_flag_uses_named_branch_push_state() {
 }
 
 #[test]
-fn pr_deliver_full_chain_emits_all_six_steps_with_merge_sha() {
+fn pr_deliver_full_chain_emits_all_seven_steps_with_merge_sha() {
     let tempdir = make_git_repo();
     let repo_path = tempdir.path().join("repo");
 
@@ -592,11 +740,17 @@ fn pr_deliver_full_chain_emits_all_six_steps_with_merge_sha() {
             "wait_checks",
             "ready",
             "merge",
+            "issue_closeout",
         ],
-        "full chain must include all six steps in order"
+        "full chain must include all seven steps in order"
     );
     assert_eq!(envelope["data"]["pr"]["merged"], true);
     assert_eq!(envelope["data"]["pr"]["merge_sha"], "abc123def456");
+    // The merged PR has no closing-keyword references, so closeout is a
+    // no-op that still reports ok with an empty issue list.
+    let closeout = &envelope["data"]["steps"][6];
+    assert_eq!(closeout["ok"], true);
+    assert_eq!(closeout["payload"]["issues"].as_array().unwrap().len(), 0);
     // Every step carries its atom's schema literal.
     let schemas: Vec<&str> = envelope["data"]["steps"]
         .as_array()
@@ -613,6 +767,7 @@ fn pr_deliver_full_chain_emits_all_six_steps_with_merge_sha() {
             "cli.forge-cli.pr.checks.v1",
             "cli.forge-cli.pr.ready.v1",
             "cli.forge-cli.pr.merge.v1",
+            "cli.forge-cli.issue.closeout.v1",
         ]
     );
 }
@@ -793,6 +948,7 @@ fn pr_deliver_treats_gh_exit_1_after_successful_merge_as_success() {
             "wait_checks",
             "ready",
             "merge",
+            "issue_closeout",
         ],
         "merge step must still be recorded as ok=true after recovery"
     );
@@ -856,6 +1012,7 @@ fn pr_deliver_adopts_existing_open_pr_for_head_branch() {
             "wait_checks",
             "ready",
             "merge",
+            "issue_closeout",
         ],
         "adopt must replace create and continue the lifecycle"
     );
@@ -924,6 +1081,7 @@ fn pr_deliver_adopt_head_flag_uses_named_branch_push_state() {
             "wait_checks",
             "ready",
             "merge",
+            "issue_closeout",
         ]
     );
     assert!(
@@ -1080,4 +1238,271 @@ fn pr_deliver_without_body_and_no_open_pr_still_fails_create_body_gate() {
         .map(|s| s["step"].as_str().unwrap_or(""))
         .collect();
     assert_eq!(steps, vec!["auth_status", "repo_view"]);
+}
+
+#[test]
+fn pr_deliver_closes_out_open_linked_issue_after_merge() {
+    // The whole point of #1052: after a successful merge, a still-open issue
+    // referenced by a `Closes/Fixes #N` closing keyword (surfaced through
+    // `closingIssuesReferences`) must be closed deterministically instead of
+    // waiting on GitHub's asynchronous auto-close. The macro appends an
+    // `issue_closeout` step and the backend `issue close` actually runs.
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let close_sentinel = stub.tempdir.path().join("issue-close-called");
+    let gh_path = write_closeout_chain_stub(&stub, LINKED_ISSUE_OPEN_JSON, false);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nCloses #4242.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], true);
+    let steps: Vec<&str> = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .map(|s| s["step"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            "auth_status",
+            "repo_view",
+            "create",
+            "wait_checks",
+            "ready",
+            "merge",
+            "issue_closeout",
+        ],
+        "closeout must run as the last step after a merge"
+    );
+    let closeout = &envelope["data"]["steps"][6];
+    assert_eq!(closeout["ok"], true);
+    assert_eq!(
+        closeout["schema_version"],
+        "cli.forge-cli.issue.closeout.v1"
+    );
+    assert_eq!(closeout["payload"]["issues"][0]["number"], 4242);
+    assert_eq!(closeout["payload"]["issues"][0]["action"], "closed");
+    assert!(
+        close_sentinel.exists(),
+        "backend `issue close` must run for a still-open linked issue"
+    );
+}
+
+#[test]
+fn pr_deliver_closeout_skips_already_closed_linked_issue() {
+    // When GitHub's auto-close already fired (issue is CLOSED at closeout
+    // time), the step records `already_closed` and never invokes the backend
+    // `issue close` — the end state is closed either way, so the step is a
+    // no-op that stays idempotent.
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let close_sentinel = stub.tempdir.path().join("issue-close-called");
+    let gh_path = write_closeout_chain_stub(&stub, LINKED_ISSUE_CLOSED_JSON, false);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nCloses #4242.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    let closeout = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .find(|s| s["step"] == "issue_closeout")
+        .expect("issue_closeout step present");
+    assert_eq!(closeout["ok"], true);
+    assert_eq!(closeout["payload"]["issues"][0]["number"], 4242);
+    assert_eq!(closeout["payload"]["issues"][0]["action"], "already_closed");
+    assert!(
+        !close_sentinel.exists(),
+        "backend `issue close` must NOT run for an already-closed linked issue"
+    );
+}
+
+#[test]
+fn pr_deliver_reports_merge_success_when_issue_close_fails() {
+    // The core #1052 invariant: closeout is best-effort. When the backend
+    // `issue close` fails after a landed merge, the delivery is still ok=true
+    // and merged=true; only the closeout step is ok=false with an `error`
+    // outcome. A future refactor that let a failed closeout fail the merge
+    // would break exactly this test.
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let close_sentinel = stub.tempdir.path().join("issue-close-called");
+    let gh_path = write_closeout_chain_stub(
+        &stub,
+        LINKED_ISSUE_OPEN_JSON,
+        /*close_exits_one=*/ true,
+    );
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nCloses #4242.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(
+        out.code, 0,
+        "a failed closeout must not fail the delivery; stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], true, "delivery envelope must stay ok");
+    assert_eq!(envelope["data"]["pr"]["merged"], true);
+    assert_eq!(envelope["data"]["pr"]["merge_sha"], "abc123def456");
+    let closeout = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .find(|s| s["step"] == "issue_closeout")
+        .expect("issue_closeout step present");
+    assert_eq!(
+        closeout["ok"], false,
+        "closeout step reflects the failed close"
+    );
+    assert_eq!(closeout["payload"]["issues"][0]["number"], 4242);
+    assert_eq!(closeout["payload"]["issues"][0]["action"], "error");
+    assert!(
+        closeout["payload"]["issues"][0]["error"].is_string(),
+        "the failed close records an error message"
+    );
+    assert!(
+        close_sentinel.exists(),
+        "the backend close was attempted before failing"
+    );
+}
+
+#[test]
+fn pr_deliver_no_issue_closeout_flag_skips_the_step() {
+    // `--no-issue-closeout` opts out: no closeout step, no backend close call,
+    // even though the merged PR references a still-open closing issue.
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let close_sentinel = stub.tempdir.path().join("issue-close-called");
+    let gh_path = write_closeout_chain_stub(&stub, LINKED_ISSUE_OPEN_JSON, false);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nCloses #4242.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+            "--no-issue-closeout",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    let steps: Vec<&str> = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .map(|s| s["step"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            "auth_status",
+            "repo_view",
+            "create",
+            "wait_checks",
+            "ready",
+            "merge",
+        ],
+        "--no-issue-closeout must omit the closeout step"
+    );
+    assert!(
+        !close_sentinel.exists(),
+        "no backend `issue close` when closeout is disabled"
+    );
 }

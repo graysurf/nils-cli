@@ -3006,7 +3006,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__deliver)
-            opts="-h --kind --title --body --body-file --head --base --method --reviewer --label --label-catalog --strict-labels --test-first-evidence --timeout --no-merge --allow-non-default-base --allow-unresolved-threads --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
+            opts="-h --kind --title --body --body-file --head --base --method --reviewer --label --label-catalog --strict-labels --test-first-evidence --timeout --no-merge --no-issue-closeout --allow-non-default-base --allow-unresolved-threads --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

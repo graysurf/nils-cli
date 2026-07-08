@@ -230,3 +230,30 @@ stable API access but not stable text output:
   `sha` when available.
 - `pr deliver` inherits the same GitLab checks/wait/merge atoms; there is no
   separate GitLab macro.
+
+## Deterministic linked-issue closeout
+
+After a successful merge, `pr deliver` runs one more step — `issue_closeout` —
+that closes every issue the PR references through a `Closes/Fixes #N` closing
+keyword. GitHub records those references on the PR as `closingIssuesReferences`
+(also surfaced on `pr view` as `closing_issue_refs`), and normally auto-closes
+them on merge. That auto-close is **asynchronous**: it can lag the merge by more
+than the few seconds a delivery flow takes to check the issue, so a post-merge
+"is it closed yet?" probe frequently sees the issue still `OPEN` even though the
+link is correct (sympoies/nils-cli#1052). The closeout step removes that
+ambiguity by, for each still-open referenced issue, issuing one explicit,
+idempotent `issue close --reason completed`. It is a determinism layer over
+GitHub's eventually-consistent auto-close, not a workaround for a broken link.
+
+- The step reports one outcome per issue: `closed` (it was open and we closed
+  it), `already_closed` (GitHub's auto-close — or a manual close — already
+  landed; left untouched), or `error` (the state check or close failed).
+- It is **best-effort**: the merge has already landed, so a fetch/close failure
+  records an `ok:false` step but never fails the delivery.
+- It only ever acts on genuine closing keywords. Plan-tracking / dispatch flows
+  that link issues with a non-closing `Refs #N` produce an empty
+  `closingIssuesReferences`, so they are untouched and still close through
+  `plan-issue record close`.
+- GitLab is a no-op today: `glab mr view` does not expose the closes-issues
+  connection, so `closing_issue_refs` is always empty there.
+- Pass `--no-issue-closeout` to skip the step entirely.

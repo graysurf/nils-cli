@@ -83,7 +83,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     ))
 }
 
-fn build_close_call(
+pub(crate) fn build_close_call(
     ctx: &ProviderContext,
     id: u64,
     reason: Option<CloseReasonFlag>,

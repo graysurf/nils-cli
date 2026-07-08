@@ -463,6 +463,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--strict-labels[Fail when selected labels are missing, not applicable, or conflict]' \
 '--no-merge[Stop after \`pr.wait-checks\` — do not promote to ready or merge]' \
+'--no-issue-closeout[Skip the post-merge linked-issue closeout. By default, after a successful merge the macro deterministically closes any still-open issue referenced by a \`Closes/Fixes #N\` closing keyword (GitHub surfaces these via \`closingIssuesReferences\`), so delivery does not depend on GitHub'\''s asynchronous auto-close latency. Plan-tracking PRs use non-closing \`Refs #N\` (empty \`closingIssuesReferences\`) and are unaffected either way]' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch]' \
 '--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any unresolved thread (bot or human) triggers \`unresolved_review_threads\` at the merge step]' \
 '--allow-unchecked-tasks[Merge despite unchecked task-list items in the PR/MR description. Without this flag, any unchecked \`- \[ \]\` item triggers \`unchecked_task_items\` at the merge step. Requires \`--allow-unchecked-tasks-reason\`]' \

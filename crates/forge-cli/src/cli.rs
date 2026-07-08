@@ -920,6 +920,15 @@ pub struct PrDeliverArgs {
     /// Stop after `pr.wait-checks` — do not promote to ready or merge.
     #[arg(long = "no-merge", action = ArgAction::SetTrue)]
     pub no_merge: bool,
+    /// Skip the post-merge linked-issue closeout. By default, after a
+    /// successful merge the macro deterministically closes any still-open
+    /// issue referenced by a `Closes/Fixes #N` closing keyword (GitHub
+    /// surfaces these via `closingIssuesReferences`), so delivery does not
+    /// depend on GitHub's asynchronous auto-close latency. Plan-tracking PRs
+    /// use non-closing `Refs #N` (empty `closingIssuesReferences`) and are
+    /// unaffected either way.
+    #[arg(long = "no-issue-closeout", action = ArgAction::SetTrue)]
+    pub no_issue_closeout: bool,
     /// Allow merges where the PR's base is not the repo's default branch.
     #[arg(long = "allow-non-default-base", action = ArgAction::SetTrue)]
     pub allow_non_default_base: bool,
