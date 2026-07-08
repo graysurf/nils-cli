@@ -25,7 +25,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_checks::{self, PrChecksPayload, SCHEMA, SCHEMA_VERSION};
 use crate::provider::{ProviderContext, detect, git_remote_url};
-use crate::rate_limit::RateLimitedRunner;
+use crate::rate_limit::default_runner;
 
 /// Trait abstracting `now()` and `sleep` so tests can step time without
 /// `std::thread::sleep`.
@@ -62,7 +62,7 @@ pub fn run(
     args: PrWaitChecksArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = RateLimitedRunner::production();
+    let runner = default_runner();
     let clock = SystemClock;
     run_with(&runner, &clock, global, &args, format, git_remote_url)
 }

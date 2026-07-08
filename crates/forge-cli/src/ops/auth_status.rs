@@ -10,13 +10,12 @@ use std::ffi::OsString;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{
-    BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload, ProcessRunner,
-};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::provider::{Provider, ProviderContext, git_remote_url};
+use crate::rate_limit::default_runner;
 
 const SCHEMA: &str = "auth.status";
 const SCHEMA_VERSION: u32 = 1;
@@ -32,7 +31,7 @@ pub struct AuthStatusPayload {
 
 /// CLI entry point: dispatch using the real subprocess runner.
 pub fn run(global: &GlobalFlags, format: OutputFormat) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, format, git_remote_url)
 }
 

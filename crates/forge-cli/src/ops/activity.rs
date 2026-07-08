@@ -10,7 +10,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess};
 use crate::cli::{
     ActivityCommand, ActivityCommitsArgs, ActivityEventsArgs, ActivityFeedArgs,
     ActivitySummaryArgs, BINARY, GlobalFlags,
@@ -19,6 +19,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::gitlab_api;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::default_runner;
 
 const COMMITS_SCHEMA: &str = "activity.commits";
 const EVENTS_SCHEMA: &str = "activity.events";
@@ -161,7 +162,7 @@ pub fn run(
     command: ActivityCommand,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, command, format, git_remote_url)
 }
 

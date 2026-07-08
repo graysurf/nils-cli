@@ -21,15 +21,15 @@
 //! blocks real work. Timing is driven through the [`Clock`] trait (shared with
 //! `pr wait-checks`) so tests step time deterministically instead of sleeping.
 //!
-//! **Wiring scope.** For #1051 the decorator is applied only to the PR-lifecycle
-//! ops that the documented failures exercised — `pr view`/`ready`/`merge`/
-//! `checks`/`wait-checks` and the `pr deliver` macro (which threads one gated
-//! runner through the whole chain). Other GraphQL-backed standalone ops
-//! (`issue_*`, `search`, `repo view`, `pr list`/`create`/`review*`, …) still
-//! use a bare runner and can adopt [`RateLimitedRunner::production`] the same
-//! one-line way. [`is_graphql_backed`] is intentionally broader than this
-//! wiring: it answers "does this call draw on the GraphQL budget", not "is this
-//! op gated".
+//! **Wiring scope.** Every op `run()` entrypoint builds its live backend runner
+//! through the single [`default_runner`] factory rather than a bare
+//! [`ProcessRunner`], so all ops are gated by default (sympoies/nils-cli#1063).
+//! Because the decorator no-ops on non-GraphQL and non-GitHub calls, routing
+//! *every* op through it is safe: only GraphQL-backed calls (see
+//! [`is_graphql_backed`]) actually preflight/back off. Centralizing the "which
+//! runner" decision in one place means the classifier's breadth and the wiring
+//! can no longer drift — a newly-added op cannot silently ship ungated. A guard
+//! test (`ops_construct_runner_via_factory`) enforces the convention.
 //!
 //! The gate is enabled by default and tuned through the environment:
 //!   - `FORGE_CLI_RATE_LIMIT_GATE=off|0|false|no` disables it entirely.
@@ -39,7 +39,7 @@
 //!   - `FORGE_CLI_RATE_LIMIT_POLL_SECS` (default 15) — re-probe interval while
 //!     throttled.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::backend::{
@@ -188,7 +188,13 @@ pub struct RateLimitedRunner<R, C> {
     /// `config.poll_interval` so a burst of closely-spaced gated calls (e.g.
     /// the `pr deliver` chain, or the two `pr checks` calls per wait-checks
     /// poll) collapses to a single probe instead of one per call.
-    probe_cache: RefCell<Option<(Instant, u64)>>,
+    ///
+    /// A `Mutex` (not `RefCell`) so the runner stays `Sync`: ops that fan out
+    /// across threads (`inbox`'s parallel provider queries) share one runner
+    /// and require `R: Sync`. Critical sections only copy the small reading in
+    /// or out, never spanning a backend call, so there is no lock contention on
+    /// the hot path.
+    probe_cache: Mutex<Option<(Instant, u64)>>,
 }
 
 impl RateLimitedRunner<ProcessRunner, SystemClock> {
@@ -199,13 +205,27 @@ impl RateLimitedRunner<ProcessRunner, SystemClock> {
     }
 }
 
+/// The default backend runner for every production op `run()` entrypoint.
+///
+/// This is the one place the "which runner do live ops use" decision lives.
+/// Every op routes its live (non-local) backend calls through the returned
+/// gated runner instead of constructing a bare [`ProcessRunner`], so the
+/// GraphQL rate-limit gate applies uniformly and no op can silently bypass it.
+/// The gate is a transparent passthrough for non-GraphQL / non-GitHub calls
+/// (and when disabled via `FORGE_CLI_RATE_LIMIT_GATE=off`), so wrapping every
+/// op is safe. A guard test enforces that ops use this factory rather than a
+/// bare runner.
+pub fn default_runner() -> RateLimitedRunner<ProcessRunner, SystemClock> {
+    RateLimitedRunner::production()
+}
+
 impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
     pub fn new(inner: R, clock: C, config: GateConfig) -> Self {
         Self {
             inner,
             clock,
             config,
-            probe_cache: RefCell::new(None),
+            probe_cache: Mutex::new(None),
         }
     }
 
@@ -228,14 +248,17 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
     /// than `poll_interval` and otherwise re-probing (and refreshing the
     /// cache). An unreadable probe is not cached, so the next call re-probes.
     fn cached_remaining(&self) -> Option<u64> {
-        let cached = *self.probe_cache.borrow();
+        // Copy the small reading out and release the lock before probing — the
+        // probe issues a backend call and must never run under the lock.
+        let cached = *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((taken_at, remaining)) = cached
             && self.clock.now().saturating_duration_since(taken_at) < self.config.poll_interval
         {
             return Some(remaining);
         }
         let remaining = self.probe_remaining()?;
-        *self.probe_cache.borrow_mut() = Some((self.clock.now(), remaining));
+        *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((self.clock.now(), remaining));
         Some(remaining)
     }
 
@@ -243,7 +266,7 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
     /// failure so the reactive wait re-probes fresh rather than trusting a
     /// reading that predates the throttling.
     fn invalidate_cache(&self) {
-        *self.probe_cache.borrow_mut() = None;
+        *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Poll `gh api rate_limit` until `graphql.remaining` exceeds the
@@ -808,5 +831,63 @@ mod tests {
         let out = gate.run(&pr_ready_call()).expect("run");
         assert_eq!(out.stdout, "ok");
         assert_eq!(clock.sleep_count(), 0, "unreadable probe never sleeps");
+    }
+}
+
+/// Structural guard: op entrypoints must build their live runner via
+/// [`default_runner`], never a bare [`ProcessRunner`]. This is what keeps the
+/// GraphQL rate-limit gate wired to *every* op — the classifier's breadth and
+/// the wiring cannot drift, because there is only one place a runner is built
+/// (sympoies/nils-cli#1063).
+#[cfg(test)]
+mod wiring_guard {
+    use std::fs;
+    use std::path::Path;
+
+    /// Directories whose `run()` entrypoints dispatch live backend calls. A
+    /// bare `ProcessRunner` here would silently bypass the rate-limit gate.
+    const GATED_DIRS: &[&str] = &["src/ops", "src/macros"];
+
+    fn rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn ops_construct_runner_via_factory() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for rel in GATED_DIRS {
+            let mut files = Vec::new();
+            rs_files(&root.join(rel), &mut files);
+            for file in files {
+                let body = fs::read_to_string(&file).expect("read op source");
+                if body.contains("ProcessRunner") {
+                    offenders.push(
+                        file.strip_prefix(root)
+                            .unwrap_or(&file)
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "op/macro entrypoints must build the live runner via \
+             `crate::rate_limit::default_runner()`, not a bare `ProcessRunner`, \
+             so the GraphQL rate-limit gate stays wired to every op. Offending \
+             files: {offenders:?}"
+        );
     }
 }

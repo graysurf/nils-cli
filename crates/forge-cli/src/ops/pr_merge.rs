@@ -39,7 +39,7 @@ use crate::ops::pr_view;
 use crate::ops::repo_view::{self, RepoViewPayload};
 use crate::ops::required_check_gate::ensure_required_checks_green;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::rate_limit::RateLimitedRunner;
+use crate::rate_limit::default_runner;
 use crate::validations::{git_status_porcelain, worktree_clean};
 
 pub const SCHEMA: &str = "pr.merge";
@@ -67,7 +67,7 @@ pub fn run(
     args: PrMergeArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = RateLimitedRunner::production();
+    let runner = default_runner();
     let workdir = std::env::current_dir().map_err(|e| {
         ForgeError::software(
             schema_err(),

@@ -16,7 +16,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_view::{self, PrViewPayload};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::rate_limit::RateLimitedRunner;
+use crate::rate_limit::default_runner;
 use crate::validations::{git_status_porcelain, worktree_clean};
 
 const SCHEMA: &str = "pr.ready";
@@ -27,7 +27,7 @@ pub fn run(
     args: PrReadyArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = RateLimitedRunner::production();
+    let runner = default_runner();
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     run_with(
         &runner,

@@ -1019,14 +1019,17 @@ Two mechanisms harden this:
 - Backend stderr that reports an exhausted rate limit is classified as an
   explicit `backend_rate_limited` error (`UNAVAILABLE 69`) rather than a generic
   `backend_error`, so throttling is never mistaken for a missing resource.
-- GraphQL-backed calls in the PR lifecycle ops (`pr view`/`ready`/`merge`/
-  `checks`/`wait-checks`) and the `pr deliver` macro are wrapped so they
-  preflight the FREE `gh api rate_limit` endpoint (which consumes no quota) and
-  wait, bounded by `FORGE_CLI_RATE_LIMIT_MAX_WAIT_SECS`, for
-  `resources.graphql.remaining` to recover before issuing the call; a
-  `backend_rate_limited` failure then triggers one wait-and-retry. REST calls
-  (`gh api repos/…`), the probe itself, and non-GitHub backends are never gated.
-  The gate is best-effort: an unreadable probe never blocks real work.
+- Every op builds its live backend runner through a single `default_runner()`
+  factory rather than a bare process runner, so all GraphQL-backed calls — not
+  just the PR-lifecycle ops — preflight the FREE `gh api rate_limit` endpoint
+  (which consumes no quota) and wait, bounded by
+  `FORGE_CLI_RATE_LIMIT_MAX_WAIT_SECS`, for `resources.graphql.remaining` to
+  recover before issuing the call; a `backend_rate_limited` failure then
+  triggers one wait-and-retry. Centralizing runner construction keeps the
+  budget classifier and the wiring from drifting: a newly-added op cannot ship
+  ungated, and a guard test rejects an op that constructs a bare runner. REST
+  calls (`gh api repos/…`), the probe itself, and non-GitHub backends are never
+  gated. The gate is best-effort: an unreadable probe never blocks real work.
 
 ## Provider detection
 

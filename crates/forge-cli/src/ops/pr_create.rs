@@ -26,9 +26,7 @@ use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
-use crate::backend::{
-    BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload, ProcessRunner,
-};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, PrCreateArgs};
 use crate::config::ForgeConfig;
 use crate::envelope::emit_success;
@@ -36,6 +34,7 @@ use crate::error::ForgeError;
 use crate::ops::label::{LabelTarget, validate_label_inputs};
 use crate::ops::repo_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::default_runner;
 use crate::validations::{
     BodyHeadings, PrKind, body_sections, branch_kind_matches, branch_name, branch_pushed,
     git_branch_state, git_status_porcelain, no_local_path, title_length, worktree_clean,
@@ -72,7 +71,7 @@ pub fn run(
     args: PrCreateArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     let env = Environment::production();
     run_with(&runner, global, args, format, &env)
 }

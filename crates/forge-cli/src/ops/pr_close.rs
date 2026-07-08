@@ -11,12 +11,13 @@ use std::ffi::OsString;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::default_runner;
 
 const SCHEMA: &str = "pr.close";
 const SCHEMA_VERSION: u32 = 1;
@@ -31,7 +32,7 @@ pub struct PrClosePayload {
 }
 
 pub fn run(global: &GlobalFlags, id: u64, format: OutputFormat) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, id, format, git_remote_url)
 }
 

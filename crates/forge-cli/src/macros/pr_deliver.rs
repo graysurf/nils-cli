@@ -42,7 +42,7 @@ use crate::ops::{
     pr_wait_checks, repo_view,
 };
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::rate_limit::RateLimitedRunner;
+use crate::rate_limit::default_runner;
 use crate::validations::{
     BodyHeadings, PreflightInputs, RuleVerdict, body_sections, branch_kind_matches, branch_name,
     branch_pushed, git_branch_state, git_current_branch, git_status_porcelain, run_local_preflight,
@@ -109,7 +109,7 @@ pub fn run(
     args: PrDeliverArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = RateLimitedRunner::production();
+    let runner = default_runner();
     let clock = SystemClock;
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     run_with(&runner, &clock, global, args, format, &workdir)

@@ -23,7 +23,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_checks_gitlab;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::rate_limit::RateLimitedRunner;
+use crate::rate_limit::default_runner;
 
 pub const SCHEMA: &str = "pr.checks";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -138,7 +138,7 @@ pub fn run(
     args: PrChecksArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = RateLimitedRunner::production();
+    let runner = default_runner();
     run_with(&runner, global, &args, format, git_remote_url)
 }
 
