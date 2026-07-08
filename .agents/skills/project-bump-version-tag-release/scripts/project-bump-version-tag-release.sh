@@ -1413,10 +1413,26 @@ if [[ "$pr_mode" -eq 1 ]]; then
     || { rm -f "$pr_body_file"; die "forge-cli pr deliver failed; release branch ${release_branch} left in place for recovery"; }
   rm -f "$pr_body_file"
 
-  note "switching back to main and fast-forwarding"
-  git checkout main
+  note "resolving merged release bump on origin/main"
   git fetch origin --quiet
-  git reset --hard origin/main
+  # The release tag is created on the merged bump commit (origin/main tip). Only
+  # move this checkout onto the `main` branch when `main` is not already held by
+  # another git worktree: the shared-worktree-isolation flow runs the release
+  # from a dedicated worktree while the primary checkout keeps `main`, and
+  # `git checkout main` there fails with "fatal: 'main' is already used by
+  # worktree at ...". Detaching onto origin/main reaches the same commit, lets
+  # the release branch be pruned, and never touches the primary checkout. See
+  # release-script-checkout-main-fails-from-worktree / sympoies/nils-cli#1049.
+  main_worktree="$(git worktree list --porcelain \
+    | awk '/^worktree /{p=substr($0, 10)} /^branch refs\/heads\/main$/{print p}')"
+  current_worktree="$(git rev-parse --show-toplevel)"
+  if [[ -n "$main_worktree" && "$main_worktree" != "$current_worktree" ]]; then
+    note "main is checked out at ${main_worktree}; tagging origin/main without switching this worktree"
+    git checkout --quiet --detach origin/main
+  else
+    git checkout main
+    git reset --hard origin/main
+  fi
   if git rev-parse --verify "refs/heads/${release_branch}" >/dev/null 2>&1; then
     git branch -D "$release_branch" >/dev/null 2>&1 || true
   fi
