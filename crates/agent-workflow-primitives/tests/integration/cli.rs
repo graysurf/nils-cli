@@ -772,6 +772,111 @@ fn skill_usage_records_successful_skill_invocation() {
 }
 
 #[test]
+fn skill_usage_preserves_url_scheme_in_link_and_artifact() {
+    // nils-cli#1054: link-record --path and record-outcome --artifact accept
+    // absolute HTTPS URLs; they must be persisted with the scheme intact
+    // (https://…), not collapsed to https:/… by the path normalizer.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("skill-url");
+    let out = out_arg(&out_dir);
+    let link_url = "https://github.com/sympoies/nils-cli/issues/1046#issuecomment-4909586590";
+    let artifact_url = "https://github.com/sympoies/nils-cli/issues/1046";
+
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "init",
+                "--out",
+                &out,
+                "--skill",
+                "skills/tools/devex/review-evidence",
+                "--intent",
+                "record review evidence",
+                "--user-request-summary",
+                "Review PR #12",
+                "--format",
+                "json",
+            ],
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "link-record",
+                "--out",
+                &out,
+                "--type",
+                "plan-issue-closeout",
+                "--path",
+                link_url,
+            ],
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "record-validation",
+                "--out",
+                &out,
+                "--command",
+                "scripts/check.sh --docs",
+                "--status",
+                "pass",
+                "--summary",
+                "docs freshness passed",
+            ],
+        )
+        .code,
+        0
+    );
+    assert_eq!(
+        run(
+            "skill-usage",
+            tmp.path(),
+            &[
+                "record-outcome",
+                "--out",
+                &out,
+                "--status",
+                "pass",
+                "--summary",
+                "skill completed",
+                "--artifact",
+                artifact_url,
+            ],
+        )
+        .code,
+        0
+    );
+
+    let verify = run(
+        "skill-usage",
+        tmp.path(),
+        &["verify", "--out", &out, "--format", "json"],
+    );
+    assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+    let value = verify.stdout_json();
+    assert_eq!(
+        value["data"]["record"]["linked_records"][0]["path"], link_url,
+        "link-record --path must retain the https:// scheme"
+    );
+    assert_eq!(
+        value["data"]["record"]["artifacts"][0], artifact_url,
+        "record-outcome --artifact must retain the https:// scheme"
+    );
+}
+
+#[test]
 fn skill_usage_init_stamps_producer_version() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let out_dir = tmp.path().join("skill-producer");
