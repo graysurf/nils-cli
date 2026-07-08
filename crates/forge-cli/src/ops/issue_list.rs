@@ -73,6 +73,29 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         global.repo.as_deref(),
         remote_url_lookup,
     )?;
+    // Labeled GitHub lookups take the REST route to dodge the SearchType cache
+    // (see `github_rest_list`). It scans page by page and stops early, so a
+    // dry run shows the first page's command.
+    if github_rest_list(&ctx, &args) {
+        if global.dry_run {
+            let call = build_github_rest_call(&ctx, &args, 1);
+            let payload = DryRunPayload::new(ctx.provider, &call);
+            return Ok(emit_success(
+                schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
+                payload,
+                format,
+                |p| println!("would run: {plan}", plan = p.plan.join(" ")),
+            ));
+        }
+        let payload = run_github_rest_list(runner, &ctx, &args)?;
+        return Ok(emit_success(
+            schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
+            payload,
+            format,
+            render_text,
+        ));
+    }
+
     let call = build_list_call(&ctx, &args);
 
     if global.dry_run {
@@ -86,15 +109,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     }
 
     let output = runner.run(&call)?;
-    let payload = if github_rest_list(&ctx, &args) {
-        let mut rest = parse_rest_list_output(&ctx, &output)?;
-        // REST fetches whole pages; honour `--limit` client-side so the scan
-        // window matches the prior `gh issue list --limit` behaviour.
-        rest.items.truncate(args.limit.max(1) as usize);
-        rest
-    } else {
-        parse_list_output(&ctx, &output)?
-    };
+    let payload = parse_list_output(&ctx, &output)?;
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
         payload,
@@ -104,12 +119,6 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 }
 
 fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
-    // A labeled GitHub lookup goes through REST to dodge the SearchType cache
-    // (see `github_rest_list`). This path carries the slug in the endpoint, so
-    // it must not also push `--repo`.
-    if github_rest_list(ctx, args) {
-        return build_github_rest_call(ctx, args);
-    }
     let program = BackendProgram::for_provider(ctx.provider);
     let limit = args.limit.max(1);
     let mut argv: Vec<OsString> = Vec::new();
@@ -216,23 +225,32 @@ fn github_rest_list(ctx: &ProviderContext, args: &IssueListArgs) -> bool {
         && !uses_me_shortcut(args)
 }
 
-/// Build the `gh api` REST call for a labeled GitHub issue-list lookup.
-/// Callers must have confirmed [`github_rest_list`] first (repo slug present).
-fn build_github_rest_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
+/// GitHub caps REST `per_page` at 100; request full pages to minimise round
+/// trips during the scan.
+const REST_PER_PAGE: u32 = 100;
+
+/// Safety cap on pages walked by [`run_github_rest_list`]. The scan already
+/// stops as soon as it has enough issues or reaches the final page; this only
+/// bounds the degenerate case of a label shared by thousands of pull requests
+/// and almost no issues, so it never walks unboundedly. Issue-only tracker
+/// scans (`record open` uses `--limit 200`) settle in one or two pages and
+/// never approach it.
+const REST_MAX_PAGES: u32 = 20;
+
+/// Build the page-`page` `gh api` REST call for a labeled GitHub issue-list
+/// lookup. Callers must have confirmed [`github_rest_list`] first (repo slug
+/// present).
+fn build_github_rest_call(ctx: &ProviderContext, args: &IssueListArgs, page: u32) -> BackendCall {
     let slug = ctx.repo.as_deref().unwrap_or_default();
     let labels_csv = effective_labels(args).join(",");
-    let limit = args.limit.max(1);
-    // REST `per_page` tops out at 100. Only paginate when one page cannot
-    // satisfy `--limit`; otherwise a single request bounds the fetch so a small
-    // `--limit` never walks a huge labeled result set. `--limit` is still
-    // enforced client-side after parsing (see `run_with`).
-    let per_page = limit.min(100);
     let mut argv: Vec<OsString> = vec![OsString::from("api")];
     // Target the detected host so GitHub Enterprise remotes hit the right API
     // (`gh api` defaults to github.com without `--hostname`).
     ctx.push_github_api_hostname(&mut argv);
     // `-X GET` keeps `-f` params in the query string; without it, `gh api`
-    // switches to POST once any field is present.
+    // switches to POST once any field is present. One explicit page per call
+    // (no `--paginate`) lets the scan loop stop early instead of walking every
+    // page.
     argv.extend([
         OsString::from("-X"),
         OsString::from("GET"),
@@ -251,29 +269,52 @@ fn build_github_rest_call(ctx: &ProviderContext, args: &IssueListArgs) -> Backen
         argv.push(OsString::from(format!("assignee={a}")));
     }
     argv.push(OsString::from("-f"));
-    argv.push(OsString::from(format!("per_page={per_page}")));
-    if limit > 100 {
-        // More than one page is needed; `--slurp` wraps each page's array in an
-        // outer array so `parse_rest_list_output` can flatten them.
-        argv.push(OsString::from("--paginate"));
-        argv.push(OsString::from("--slurp"));
-    }
+    argv.push(OsString::from(format!("per_page={REST_PER_PAGE}")));
+    argv.push(OsString::from("-f"));
+    argv.push(OsString::from(format!("page={page}")));
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
-/// Parse a `gh api repos/<slug>/issues` response.
-///
-/// A single-page request returns a flat array of issue objects; a paginated
-/// request adds `--slurp`, which wraps each page's array in an outer array. We
-/// accept both: a top-level element that is itself an array is treated as a
-/// page to flatten, anything else as a single row. The REST issues endpoint
-/// also returns pull requests (which carry a `pull_request` key that plain
-/// issues never have); drop them. REST field names differ from `gh issue list
-/// --json`: `html_url` for the URL and `user` for the author.
-fn parse_rest_list_output(
+/// Scan `repos/<slug>/issues` page by page until `--limit` issues are
+/// collected, `--limit` cannot be satisfied (a short final page), or the page
+/// cap is hit. Fetching one page at a time and stopping early keeps a small
+/// `--limit` cheap even on repositories with a huge matching set, and keeps
+/// paging when a page is dominated by pull requests so the limit is still
+/// filled with real issues.
+fn run_github_rest_list<R: BackendRunner>(
+    runner: &R,
     ctx: &ProviderContext,
-    output: &BackendSuccess,
+    args: &IssueListArgs,
 ) -> Result<IssueListPayload, ForgeError> {
+    let limit = args.limit.max(1) as usize;
+    let mut items: Vec<IssueListItem> = Vec::new();
+    for page in 1..=REST_MAX_PAGES {
+        let call = build_github_rest_call(ctx, args, page);
+        let output = runner.run(&call)?;
+        let (rows, mut issues) = parse_rest_page(&output)?;
+        items.append(&mut issues);
+        // The REST endpoint returns fewer than `per_page` rows only on the
+        // final page, so a short page means the matching set is exhausted.
+        if items.len() >= limit || (rows as u32) < REST_PER_PAGE {
+            break;
+        }
+    }
+    items.truncate(limit);
+    Ok(IssueListPayload {
+        provider: ctx.provider.as_str(),
+        items,
+    })
+}
+
+/// Parse one flat page of `gh api repos/<slug>/issues`, returning the raw row
+/// count (issues + PRs — used to detect the final page) alongside the non-PR
+/// issue rows.
+///
+/// The REST issues endpoint also returns pull requests (which carry a
+/// `pull_request` key that plain issues never have); drop them. REST field
+/// names differ from `gh issue list --json`: `html_url` for the URL and `user`
+/// for the author.
+fn parse_rest_page(output: &BackendSuccess) -> Result<(usize, Vec<IssueListItem>), ForgeError> {
     let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|e| {
         ForgeError::software(
             schema_err(),
@@ -281,7 +322,7 @@ fn parse_rest_list_output(
             Some(e.to_string()),
         )
     })?;
-    let pages = value.as_array().ok_or_else(|| {
+    let rows = value.as_array().ok_or_else(|| {
         ForgeError::software(
             schema_err(),
             "issue list JSON is not an array",
@@ -289,23 +330,13 @@ fn parse_rest_list_output(
         )
     })?;
     let mut items = Vec::new();
-    for page in pages {
-        // Tolerate both the `--slurp` array-of-pages shape and a bare array.
-        let rows: Vec<&serde_json::Value> = match page.as_array() {
-            Some(arr) => arr.iter().collect(),
-            None => vec![page],
-        };
-        for raw in rows {
-            if raw.get("pull_request").is_some() {
-                continue;
-            }
-            items.push(parse_item_github_rest(raw)?);
+    for raw in rows {
+        if raw.get("pull_request").is_some() {
+            continue;
         }
+        items.push(parse_item_github_rest(raw)?);
     }
-    Ok(IssueListPayload {
-        provider: ctx.provider.as_str(),
-        items,
-    })
+    Ok((rows.len(), items))
 }
 
 fn parse_item_github_rest(raw: &serde_json::Value) -> Result<IssueListItem, ForgeError> {
@@ -705,21 +736,72 @@ mod tests {
     }
 
     #[test]
-    fn build_list_call_github_with_repo_and_labels_routes_through_rest_api() {
+    fn github_rest_list_routes_labeled_github_with_slug() {
         // sympoies/nils-cli#1050: `gh issue list --label` resolves through gh's
-        // GraphQL `SearchType` query, which gh caches for 24h. A stale
-        // `X-Ratelimit-Remaining: 0` in that cache hard-blocks `plan-issue
-        // record open` dedup for up to a day. A REST list
-        // (`gh api repos/<slug>/issues`) never touches that cache path.
+        // GraphQL `SearchType` query, which gh caches for 24h; a stale
+        // `X-Ratelimit-Remaining: 0` there hard-blocks `plan-issue record open`
+        // dedup. The REST route avoids that cache — but only for a labeled
+        // GitHub lookup with a known slug.
+        let mut args = default_args();
+        args.labels = vec!["plan".into()];
+        assert!(github_rest_list(&ctx_with_repo(Provider::GitHub), &args));
+    }
+
+    #[test]
+    fn github_rest_list_skips_when_no_labels() {
+        // A no-label list never hits the SearchType cache; stay on `gh issue
+        // list`.
+        assert!(!github_rest_list(
+            &ctx_with_repo(Provider::GitHub),
+            &default_args()
+        ));
+    }
+
+    #[test]
+    fn github_rest_list_skips_without_repo_slug() {
+        // No slug → no REST endpoint to build; fall back to `gh issue list`.
+        let mut args = default_args();
+        args.labels = vec!["plan".into()];
+        assert!(!github_rest_list(&ctx(Provider::GitHub), &args));
+    }
+
+    #[test]
+    fn github_rest_list_skips_at_me_filter() {
+        // REST's `creator`/`assignee` take a literal login and cannot resolve
+        // gh's `@me` shortcut, so an `@me` author/assignee stays on `gh issue
+        // list` (checked case-insensitively for both fields).
+        let mut assignee = default_args();
+        assignee.labels = vec!["plan".into()];
+        assignee.assignee = Some("@me".into());
+        assert!(!github_rest_list(
+            &ctx_with_repo(Provider::GitHub),
+            &assignee
+        ));
+
+        let mut author = default_args();
+        author.labels = vec!["plan".into()];
+        author.author = Some("@ME".into());
+        assert!(!github_rest_list(&ctx_with_repo(Provider::GitHub), &author));
+    }
+
+    #[test]
+    fn github_rest_list_skips_gitlab() {
+        // The SearchType cache bug is gh-specific; GitLab is unaffected.
+        let mut args = default_args();
+        args.labels = vec!["plan".into()];
+        assert!(!github_rest_list(&ctx_with_repo(Provider::GitLab), &args));
+    }
+
+    #[test]
+    fn build_github_rest_call_targets_issues_endpoint_with_filters_and_page() {
         let mut args = default_args();
         args.labels = vec!["plan".into(), "state::tracking".into()];
-        let call = build_list_call(&ctx_with_repo(Provider::GitHub), &args);
+        let call = build_github_rest_call(&ctx_with_repo(Provider::GitHub), &args, 2);
         let plan = call.plan_argv();
-        assert_eq!(plan[1], "api", "expected a gh REST call, got {plan:?}");
+        assert_eq!(plan[1], "api", "expected a gh REST call: {plan:?}");
         assert!(
             !plan.iter().any(|s| s == "list"),
-            "must not use the SearchType-backed `gh issue list` for a labeled \
-             GitHub lookup: {plan:?}"
+            "must not use the SearchType-backed `gh issue list`: {plan:?}"
         );
         assert!(
             plan.iter().any(|s| s == "repos/acme/widgets/issues"),
@@ -733,34 +815,18 @@ mod tests {
             "labels must stay a server-side comma filter: {plan:?}"
         );
         assert!(plan.iter().any(|s| s == "state=open"), "{plan:?}");
-        // Default `--limit 30` fits in one page: bound the fetch to a single
-        // request (no `--paginate`) so a small limit never walks a huge result
-        // set. A github.com host needs no `--hostname`.
-        assert!(plan.iter().any(|s| s == "per_page=30"), "{plan:?}");
+        assert!(plan.iter().any(|s| s == "per_page=100"), "{plan:?}");
+        assert!(plan.iter().any(|s| s == "page=2"), "{plan:?}");
+        // The scan loop drives paging so it can stop early: no `--paginate`.
         assert!(!plan.iter().any(|s| s == "--paginate"), "{plan:?}");
+        // A github.com host needs no `--hostname`.
         assert!(!plan.iter().any(|s| s == "--hostname"), "{plan:?}");
     }
 
     #[test]
-    fn build_list_call_github_rest_paginates_when_limit_exceeds_one_page() {
-        // `record open` dedup scans with `--limit 200`; a single REST page tops
-        // out at 100, so this must paginate and slurp to honour the window.
-        let mut args = default_args();
-        args.labels = vec!["plan".into()];
-        args.limit = 200;
-        let call = build_list_call(&ctx_with_repo(Provider::GitHub), &args);
-        let plan = call.plan_argv();
-        assert!(plan.iter().any(|s| s == "per_page=100"), "{plan:?}");
-        assert!(
-            plan.iter().any(|s| s == "--paginate") && plan.iter().any(|s| s == "--slurp"),
-            "limit past one page must paginate + slurp: {plan:?}"
-        );
-    }
-
-    #[test]
-    fn build_list_call_github_rest_targets_enterprise_host() {
-        // A GHES remote must send the REST request to the detected host, not
-        // github.com.
+    fn build_github_rest_call_passes_enterprise_hostname() {
+        // A GHES remote must send the REST request to the detected host, with
+        // `--hostname` right after `api` (before the endpoint).
         let ctx = ProviderContext {
             provider: Provider::GitHub,
             host: "ghe.example.com".into(),
@@ -769,111 +835,160 @@ mod tests {
         };
         let mut args = default_args();
         args.labels = vec!["plan".into()];
-        let call = build_list_call(&ctx, &args);
+        let call = build_github_rest_call(&ctx, &args, 1);
         let plan = call.plan_argv();
-        let h_idx = plan
-            .iter()
-            .position(|s| s == "--hostname")
-            .expect("enterprise host must pass --hostname");
-        assert_eq!(plan[h_idx + 1], "ghe.example.com", "{plan:?}");
+        assert_eq!(plan[1], "api", "{plan:?}");
+        assert_eq!(plan[2], "--hostname", "{plan:?}");
+        assert_eq!(plan[3], "ghe.example.com", "{plan:?}");
     }
 
     #[test]
-    fn build_list_call_github_with_repo_no_labels_stays_on_issue_list() {
-        // Only the labeled path triggers the SearchType cache; a no-label list
-        // is already safe, so leave it on `gh issue list` untouched.
-        let call = build_list_call(&ctx_with_repo(Provider::GitHub), &default_args());
-        let plan = call.plan_argv();
-        assert_eq!(plan[1..3], ["issue".to_string(), "list".to_string()]);
-        assert!(!plan.iter().any(|s| s == "api"), "{plan:?}");
+    fn parse_rest_page_excludes_prs_and_maps_rest_fields() {
+        // A page is a flat array of REST objects; PRs carry a `pull_request`
+        // key and are dropped, but still count toward the raw row total used to
+        // detect the final page. REST fields are `html_url`/`user`.
+        let stdout = r#"[
+          {"number":10,"html_url":"h10","state":"open","title":"tracker",
+           "labels":[{"name":"plan"}],"user":{"login":"alice"},
+           "assignees":[{"login":"bob"}]},
+          {"number":11,"html_url":"h11","state":"open","title":"a pr",
+           "labels":[],"user":{"login":"carol"},"assignees":[],
+           "pull_request":{"url":"p"}},
+          {"number":12,"html_url":"h12","state":"closed","title":"old",
+           "labels":[],"user":{"login":"dave"},"assignees":[]}
+        ]"#;
+        let (rows, items) = parse_rest_page(&BackendSuccess {
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+        .unwrap();
+        assert_eq!(rows, 3, "raw row count must include the PR for paging");
+        assert_eq!(
+            items.iter().map(|i| i.number).collect::<Vec<_>>(),
+            vec![10, 12],
+            "PR #11 excluded"
+        );
+        assert_eq!(items[0].url, "h10");
+        assert_eq!(items[0].state, "open");
+        assert_eq!(items[0].labels, vec!["plan".to_string()]);
+        assert_eq!(items[0].author.as_deref(), Some("alice"));
+        assert_eq!(items[0].assignees, vec!["bob".to_string()]);
+        assert_eq!(items[1].state, "closed");
     }
 
-    #[test]
-    fn build_list_call_github_at_me_filter_falls_back_to_issue_list() {
-        // REST's `creator`/`assignee` take a literal login and cannot resolve
-        // gh's `@me` shortcut, so a labeled list with `--assignee @me` must stay
-        // on `gh issue list` (which does resolve it) rather than route to REST.
+    /// A `BackendRunner` that serves scripted pages keyed by the `page=N` field
+    /// in the call's argv, recording which pages were requested.
+    struct PagedRunner {
+        pages: Vec<String>,
+        requested: std::cell::RefCell<Vec<u32>>,
+    }
+
+    impl PagedRunner {
+        fn new(pages: &[String]) -> Self {
+            Self {
+                pages: pages.to_vec(),
+                requested: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn requested_pages(&self) -> Vec<u32> {
+            self.requested.borrow().clone()
+        }
+    }
+
+    impl BackendRunner for PagedRunner {
+        fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+            let page = call
+                .argv
+                .iter()
+                .filter_map(|a| a.to_str())
+                .find_map(|s| s.strip_prefix("page="))
+                .and_then(|n| n.parse::<u32>().ok())
+                .unwrap_or(1);
+            self.requested.borrow_mut().push(page);
+            let body = self
+                .pages
+                .get((page - 1) as usize)
+                .cloned()
+                .unwrap_or_else(|| "[]".to_string());
+            Ok(BackendSuccess {
+                stdout: body,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn issue_json(n: u64) -> String {
+        format!(
+            r#"{{"number":{n},"html_url":"h{n}","state":"open","title":"t","labels":[],"user":{{"login":"a"}},"assignees":[]}}"#
+        )
+    }
+
+    fn page_of(bodies: Vec<String>) -> String {
+        format!("[{}]", bodies.join(","))
+    }
+
+    fn rest_args(limit: u32) -> IssueListArgs {
         let mut args = default_args();
         args.labels = vec!["plan".into()];
-        args.assignee = Some("@me".into());
-        let call = build_list_call(&ctx_with_repo(Provider::GitHub), &args);
-        let plan = call.plan_argv();
-        assert_eq!(plan[1..3], ["issue".to_string(), "list".to_string()]);
-        assert!(!plan.iter().any(|s| s == "api"), "{plan:?}");
+        args.limit = limit;
+        args
     }
 
     #[test]
-    fn build_list_call_github_without_repo_slug_falls_back_to_issue_list() {
-        // No derivable slug means we cannot build a REST path; fall back to the
-        // existing `gh issue list` best effort rather than failing.
-        let mut args = default_args();
-        args.labels = vec!["plan".into()];
-        let call = build_list_call(&ctx(Provider::GitHub), &args);
-        let plan = call.plan_argv();
-        assert_eq!(plan[1..3], ["issue".to_string(), "list".to_string()]);
-    }
-
-    #[test]
-    fn parse_rest_list_output_flattens_pages_excludes_prs_and_maps_rest_fields() {
-        // `gh api --paginate --slurp` wraps each page's array in an outer array.
-        // REST issue objects use `html_url`/`user`, and the issues endpoint also
-        // returns PRs (which carry a `pull_request` key) that must be dropped.
-        let stdout = r#"[
-          [
-            {"number":10,"html_url":"h10","state":"open","title":"tracker",
-             "labels":[{"name":"plan"}],"user":{"login":"alice"},
-             "assignees":[{"login":"bob"}]},
-            {"number":11,"html_url":"h11","state":"open","title":"a pr",
-             "labels":[],"user":{"login":"carol"},"assignees":[],
-             "pull_request":{"url":"p"}}
-          ],
-          [
-            {"number":12,"html_url":"h12","state":"closed","title":"old",
-             "labels":[],"user":{"login":"dave"},"assignees":[]}
-          ]
-        ]"#;
-        let payload = parse_rest_list_output(
-            &ctx_with_repo(Provider::GitHub),
-            &BackendSuccess {
-                stdout: stdout.into(),
-                stderr: String::new(),
-            },
-        )
-        .unwrap();
-        // PR #11 excluded; issues #10 and #12 kept, flattened across both pages.
+    fn run_github_rest_list_stops_at_short_page() {
+        // A page shorter than `per_page` is the final page: one request, done.
+        let runner = PagedRunner::new(&[page_of(vec![issue_json(1), issue_json(2)])]);
+        let payload =
+            run_github_rest_list(&runner, &ctx_with_repo(Provider::GitHub), &rest_args(30))
+                .unwrap();
+        assert_eq!(runner.requested_pages(), vec![1]);
         assert_eq!(
             payload.items.iter().map(|i| i.number).collect::<Vec<_>>(),
-            vec![10, 12]
+            vec![1, 2]
         );
-        assert_eq!(payload.items[0].url, "h10");
-        assert_eq!(payload.items[0].state, "open");
-        assert_eq!(payload.items[0].labels, vec!["plan".to_string()]);
-        assert_eq!(payload.items[0].author.as_deref(), Some("alice"));
-        assert_eq!(payload.items[0].assignees, vec!["bob".to_string()]);
-        assert_eq!(payload.items[1].state, "closed");
     }
 
     #[test]
-    fn parse_rest_list_output_accepts_flat_single_page() {
-        // A non-paginated request returns a flat array of issue objects (no
-        // `--slurp` wrapper); each object must be read as a row directly.
-        let stdout = r#"[
-          {"number":7,"html_url":"h7","state":"open","title":"tracker",
-           "labels":[{"name":"plan"}],"user":{"login":"alice"},"assignees":[]}
-        ]"#;
-        let payload = parse_rest_list_output(
-            &ctx_with_repo(Provider::GitHub),
-            &BackendSuccess {
-                stdout: stdout.into(),
-                stderr: String::new(),
-            },
-        )
-        .unwrap();
+    fn run_github_rest_list_keeps_paging_past_a_pr_dominated_page() {
+        // A full page of only PRs yields zero issues but is not the final page,
+        // so the scan must continue and fill the limit from later pages — else
+        // a labeled list could return fewer issues than `--limit`.
+        let all_prs = page_of(vec![
+            r#"{"pull_request":{}}"#.to_string();
+            REST_PER_PAGE as usize
+        ]);
+        let page_two = page_of(vec![issue_json(1), issue_json(2), issue_json(3)]);
+        let runner = PagedRunner::new(&[all_prs, page_two]);
+        let payload =
+            run_github_rest_list(&runner, &ctx_with_repo(Provider::GitHub), &rest_args(2)).unwrap();
+        assert_eq!(
+            runner.requested_pages(),
+            vec![1, 2],
+            "must not stop after an all-PR full page"
+        );
         assert_eq!(
             payload.items.iter().map(|i| i.number).collect::<Vec<_>>(),
-            vec![7]
+            vec![1, 2],
+            "collected issues truncated to --limit"
         );
-        assert_eq!(payload.items[0].url, "h7");
-        assert_eq!(payload.items[0].labels, vec!["plan".to_string()]);
+    }
+
+    #[test]
+    fn run_github_rest_list_stops_once_limit_reached_without_walking_all_pages() {
+        // Once `--limit` issues are collected the scan stops, even though a full
+        // first page means more could exist — it must not walk the whole set.
+        let full = page_of((1..=REST_PER_PAGE as u64).map(issue_json).collect());
+        let unexpected = page_of(vec![issue_json(999)]);
+        let runner = PagedRunner::new(&[full, unexpected]);
+        let payload =
+            run_github_rest_list(&runner, &ctx_with_repo(Provider::GitHub), &rest_args(50))
+                .unwrap();
+        assert_eq!(
+            runner.requested_pages(),
+            vec![1],
+            "must stop after the limit is reached without fetching page 2"
+        );
+        assert_eq!(payload.items.len(), 50);
     }
 }
