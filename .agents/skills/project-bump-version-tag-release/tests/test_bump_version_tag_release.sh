@@ -125,6 +125,15 @@ case "${1:-}" in
     }
     echo "# mock lockfile" > Cargo.lock
     ;;
+  update)
+    # Release bumps re-pin workspace crate versions via `cargo update
+    # --workspace`, which also writes Cargo.lock if absent.
+    [[ -z "${RUSTC_WRAPPER:-}" ]] || {
+      echo "RUSTC_WRAPPER should be unset before cargo update" >&2
+      exit 1
+    }
+    echo "# mock lockfile" > Cargo.lock
+    ;;
   check)
     [[ -f Cargo.lock ]] || {
       echo "missing Cargo.lock before cargo check" >&2
@@ -313,8 +322,8 @@ test_full_checks_refresh_lockfile_and_disable_bad_wrapper() {
   ) >"${tmp}/stdout.log" 2>"${stderr_file}"
 
   local order_file="${tmp}/order.log"
-  rg -n 'cargo:generate-lockfile|checks:start' "$log_file" >"$order_file"
-  assert_contains "$order_file" '1:cargo:generate-lockfile'
+  rg -n 'cargo:update --workspace|checks:start' "$log_file" >"$order_file"
+  assert_contains "$order_file" '1:cargo:update --workspace'
   assert_contains "$order_file" '3:checks:start'
   assert_not_contains "$log_file" 'cargo:RUSTC_WRAPPER=bad-wrapper'
   assert_contains "$stderr_file" 'disabling it for release commands'
@@ -346,7 +355,7 @@ test_default_path_skips_full_audit_and_runs_locked_check() {
       "$entrypoint" --version v0.6.5 --skip-push
   ) >"${tmp}/stdout.log" 2>"${stderr_file}"
 
-  assert_contains "$log_file" 'cargo:generate-lockfile'
+  assert_contains "$log_file" 'cargo:update --workspace'
   assert_contains "$log_file" 'cargo:check --workspace --locked'
   # Full audit stack must NOT run in the new default path.
   if rg -q 'checks:start' "$log_file"; then
@@ -410,7 +419,7 @@ test_readme_already_at_target_is_not_warned() {
 
   assert_not_contains "$stderr_file" 'warning: README release tag example not updated'
   assert_contains "${repo}/README.md" 'v0.6.5'
-  assert_contains "$log_file" 'cargo:generate-lockfile'
+  assert_contains "$log_file" 'cargo:update --workspace'
   assert_contains "$log_file" 'cargo:check --workspace --locked'
 }
 
@@ -835,6 +844,84 @@ test_pr_mode_default_opens_pr_and_tags_merge_commit() {
   fi
 }
 
+test_pr_mode_from_linked_worktree_tags_without_checkout_main() {
+  local tmp repo remote wt bin_dir log_file stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  remote="${tmp}/repo.git"
+  wt="${tmp}/release-wt"
+  bin_dir="${tmp}/bin"
+  log_file="${tmp}/mock.log"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_cargo "$bin_dir"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+
+  git init --bare "$remote" >/dev/null
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null
+
+  create_mock_forge_cli_deliver "$bin_dir" "$remote"
+
+  # Dedicated release worktree on the release branch, while the primary checkout
+  # ($repo) keeps `main` checked out. This is the shared-worktree-isolation
+  # setup that used to abort at the post-merge `git checkout main` with
+  # "fatal: 'main' is already used by worktree at ...".
+  git -C "$repo" worktree add "$wt" -b chore/release-0-6-5 >/dev/null
+
+  # --skip-tap keeps the scope on the post-merge tag step (the #1049 fix): the
+  # bump PR is merged, the worktree is reconciled, and the tag is created +
+  # pushed, then the tap stage is skipped (it needs a real provider remote,
+  # which this bare local remote is not).
+  local rc=0
+  (
+    cd "$wt"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_LOG="$log_file" \
+      "$entrypoint" --version v0.6.5 --skip-tap
+  ) >"${tmp}/stdout.log" 2>"${stderr_file}" || rc=$?
+
+  if [[ "$rc" -ne 0 ]]; then
+    echo "release run aborted from a linked worktree (exit ${rc}); stderr tail:" >&2
+    tail -12 "${stderr_file}" >&2 || true
+    fail "release run must not abort when launched from a dedicated worktree"
+  fi
+
+  # The primary checkout is untouched and still holds main.
+  local primary_branch
+  primary_branch="$(git -C "$repo" branch --show-current)"
+  if [[ "$primary_branch" != "main" ]]; then
+    fail "primary checkout should remain on main (got: ${primary_branch})"
+  fi
+
+  # main on the remote contains the bump commit (merge succeeded).
+  local remote_main_msg
+  remote_main_msg="$(git -C "$remote" log -1 --pretty=%s main)"
+  if [[ "$remote_main_msg" != "chore(release): bump cli versions to 0.6.5" ]]; then
+    fail "remote main does not point at the bump commit (got: ${remote_main_msg})"
+  fi
+
+  # Tag v0.6.5 was created from the worktree and points at the merged bump
+  # commit (== remote main), even though `git checkout main` was never run there.
+  local tagged_sha remote_main_sha
+  tagged_sha="$(git -C "$wt" rev-parse --verify "refs/tags/v0.6.5^{}")"
+  remote_main_sha="$(git -C "$remote" rev-parse --verify main)"
+  if [[ "$tagged_sha" != "$remote_main_sha" ]]; then
+    fail "tag v0.6.5 (${tagged_sha}) does not point at merged remote main (${remote_main_sha})"
+  fi
+
+  # The worktree must not be left on the (now-merged) release branch.
+  local wt_branch
+  wt_branch="$(git -C "$wt" branch --show-current || true)"
+  if [[ "$wt_branch" == "chore/release-0-6-5" ]]; then
+    fail "release worktree left on the merged release branch"
+  fi
+}
+
 test_pr_mode_rejects_non_chore_release_branch() {
   local tmp repo bin_dir stderr_file
   tmp="$(mktemp -d)"
@@ -873,24 +960,64 @@ EOF
   assert_contains "$stderr_file" "must start with 'chore/'"
 }
 
-if [[ ! -f "${skill_root}/SKILL.md" ]]; then
-  fail "missing SKILL.md"
-fi
-if [[ ! -f "$entrypoint" ]]; then
-  fail "missing entrypoint script"
-fi
+run_all() {
+  if [[ ! -f "${skill_root}/SKILL.md" ]]; then
+    fail "missing SKILL.md"
+  fi
+  if [[ ! -f "$entrypoint" ]]; then
+    fail "missing entrypoint script"
+  fi
 
-test_full_checks_refresh_lockfile_and_disable_bad_wrapper
-test_default_path_skips_full_audit_and_runs_locked_check
-test_skip_checks_is_deprecated_alias_of_default
-test_readme_already_at_target_is_not_warned
-test_allow_dirty_rejects_non_release_managed_paths
-test_skip_push_skips_tap_stage_with_note
-test_from_tap_without_tag_fails
-test_from_tap_with_skip_tap_is_mutually_exclusive
-test_from_tap_upgrades_installed_local_brew_formula
-test_formula_inplace_editor_idempotent
-test_pr_mode_default_opens_pr_and_tags_merge_commit
-test_pr_mode_rejects_non_chore_release_branch
+  local tests=(
+    test_full_checks_refresh_lockfile_and_disable_bad_wrapper
+    test_default_path_skips_full_audit_and_runs_locked_check
+    test_skip_checks_is_deprecated_alias_of_default
+    test_readme_already_at_target_is_not_warned
+    test_allow_dirty_rejects_non_release_managed_paths
+    test_skip_push_skips_tap_stage_with_note
+    test_from_tap_without_tag_fails
+    test_from_tap_with_skip_tap_is_mutually_exclusive
+    test_from_tap_upgrades_installed_local_brew_formula
+    test_formula_inplace_editor_idempotent
+    test_pr_mode_default_opens_pr_and_tags_merge_commit
+    test_pr_mode_from_linked_worktree_tags_without_checkout_main
+    test_pr_mode_rejects_non_chore_release_branch
+  )
 
-echo "ok: project skill smoke checks passed"
+  # A couple of tests drive the real toolchain: `test_full_checks...` probes the
+  # active `rustc` (RUSTC_WRAPPER compatibility check) and
+  # `test_from_tap_upgrades...` requires `cargo` on PATH. Skip them (rather than
+  # fail) when the Rust toolchain is not installed, so the mock-driven suite
+  # still runs on toolchain-less hosts.
+  local toolchain_ready=1
+  if ! command -v rustc >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+    toolchain_ready=0
+  fi
+
+  local failed=0 t
+  for t in "${tests[@]}"; do
+    case "$t" in
+      test_full_checks_refresh_lockfile_and_disable_bad_wrapper|test_from_tap_upgrades_installed_local_brew_formula)
+        if [[ "$toolchain_ready" -eq 0 ]]; then
+          echo "SKIP ${t} (requires rustc+cargo on PATH)"
+          continue
+        fi
+        ;;
+    esac
+    if ( set -e; "$t" ); then
+      echo "PASS ${t}"
+    else
+      echo "FAIL ${t}" >&2
+      failed=1
+    fi
+  done
+
+  if [[ "$failed" -ne 0 ]]; then
+    exit 1
+  fi
+  echo "ok: project skill smoke checks passed"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  run_all
+fi
