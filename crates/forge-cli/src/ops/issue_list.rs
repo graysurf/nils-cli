@@ -184,6 +184,18 @@ fn effective_labels(args: &IssueListArgs) -> Vec<&str> {
         .collect()
 }
 
+/// Whether the author/assignee filter uses gh's `@me` authenticated-user
+/// shortcut. `gh issue list` resolves `@me`, but the REST issues endpoint's
+/// `creator`/`assignee` params take a literal login, so a REST route would send
+/// `@me` verbatim and match nothing. Such lookups stay on `gh issue list`.
+fn uses_me_shortcut(args: &IssueListArgs) -> bool {
+    let is_me = |v: &Option<String>| {
+        v.as_deref()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("@me"))
+    };
+    is_me(&args.author) || is_me(&args.assignee)
+}
+
 /// Whether a GitHub issue-list lookup should route through the REST
 /// `repos/<slug>/issues` endpoint instead of `gh issue list`.
 ///
@@ -193,12 +205,15 @@ fn effective_labels(args: &IssueListArgs) -> Vec<&str> {
 /// day even while the real quota is healthy (cli/cli#12812) — which hard-blocks
 /// `plan-issue record open` dedup (sympoies/nils-cli#1050). A REST list never
 /// touches that cache path. Only the labeled GitHub path is affected: the
-/// no-label list and GitLab are already safe, and REST needs a repo slug to
-/// build the endpoint (fall back to `gh issue list` when none is known).
+/// no-label list and GitLab are already safe, REST needs a repo slug to build
+/// the endpoint (fall back to `gh issue list` when none is known), and an
+/// `@me` author/assignee filter stays on `gh issue list` so the shortcut still
+/// resolves (see `uses_me_shortcut`).
 fn github_rest_list(ctx: &ProviderContext, args: &IssueListArgs) -> bool {
     matches!(ctx.provider, Provider::GitHub)
         && ctx.repo.is_some()
         && !effective_labels(args).is_empty()
+        && !uses_me_shortcut(args)
 }
 
 /// Build the `gh api` REST call for a labeled GitHub issue-list lookup.
@@ -768,6 +783,20 @@ mod tests {
         // Only the labeled path triggers the SearchType cache; a no-label list
         // is already safe, so leave it on `gh issue list` untouched.
         let call = build_list_call(&ctx_with_repo(Provider::GitHub), &default_args());
+        let plan = call.plan_argv();
+        assert_eq!(plan[1..3], ["issue".to_string(), "list".to_string()]);
+        assert!(!plan.iter().any(|s| s == "api"), "{plan:?}");
+    }
+
+    #[test]
+    fn build_list_call_github_at_me_filter_falls_back_to_issue_list() {
+        // REST's `creator`/`assignee` take a literal login and cannot resolve
+        // gh's `@me` shortcut, so a labeled list with `--assignee @me` must stay
+        // on `gh issue list` (which does resolve it) rather than route to REST.
+        let mut args = default_args();
+        args.labels = vec!["plan".into()];
+        args.assignee = Some("@me".into());
+        let call = build_list_call(&ctx_with_repo(Provider::GitHub), &args);
         let plan = call.plan_argv();
         assert_eq!(plan[1..3], ["issue".to_string(), "list".to_string()]);
         assert!(!plan.iter().any(|s| s == "api"), "{plan:?}");
