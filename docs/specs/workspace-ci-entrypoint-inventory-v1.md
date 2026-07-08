@@ -89,6 +89,7 @@ records the keep/delete decision plus the active caller evidence.
 | `scripts/ci/plan-bundle-validate.sh` | keep | `DEVELOPMENT.md` docs-only/full checks list + `project-verify-required-checks.sh` docs-only and full passes |
 | `scripts/ci/publish-order-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step + `scripts/ci/tests/publish-order-audit.test.sh` |
 | `scripts/ci/release-tarball-third-party-audit.sh` | keep | `.github/workflows/release.yml` `build` job |
+| `scripts/ci/skill-shell-suites.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step (runs every `.agents/skills/*/tests/test_*.sh` suite) |
 | `scripts/ci/test-stale-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 | `scripts/ci/third-party-artifacts-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step + dependabot bump skill |
 | `scripts/ci/verify-signed-commits.sh` | keep | `lefthook.yml` pre-push hook |
