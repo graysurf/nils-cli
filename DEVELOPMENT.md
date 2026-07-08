@@ -218,6 +218,8 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/tests/shared-helper-adoption-audit.test.sh`
 - `bash scripts/ci/tests/publish-order-audit.test.sh`
 - `bash scripts/ci/tests/docs-hygiene-audit.test.sh`
+- `bash scripts/ci/skill-shell-suites.sh` (runs every
+  `.agents/skills/*/tests/test_*.sh` smoke suite)
 - `bash scripts/ci/test-stale-audit.sh --strict`
 - `bash scripts/ci/workspace-version-lockstep.sh --strict`
 - `bash scripts/ci/crate-naming-audit.sh`
