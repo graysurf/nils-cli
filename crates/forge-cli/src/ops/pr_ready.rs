@@ -10,12 +10,13 @@ use std::path::PathBuf;
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, PrReadyArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_view::{self, PrViewPayload};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::RateLimitedRunner;
 use crate::validations::{git_status_porcelain, worktree_clean};
 
 const SCHEMA: &str = "pr.ready";
@@ -26,7 +27,7 @@ pub fn run(
     args: PrReadyArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = RateLimitedRunner::production();
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     run_with(
         &runner,

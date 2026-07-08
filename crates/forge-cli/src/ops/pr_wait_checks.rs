@@ -19,12 +19,13 @@ use std::time::{Duration, Instant};
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, schema_version_for};
 use serde_json::json;
 
-use crate::backend::{BackendRunner, DryRunPayload, ProcessRunner};
+use crate::backend::{BackendRunner, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, PrChecksArgs, PrWaitChecksArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_checks::{self, PrChecksPayload, SCHEMA, SCHEMA_VERSION};
 use crate::provider::{ProviderContext, detect, git_remote_url};
+use crate::rate_limit::RateLimitedRunner;
 
 /// Trait abstracting `now()` and `sleep` so tests can step time without
 /// `std::thread::sleep`.
@@ -45,12 +46,23 @@ impl Clock for SystemClock {
     }
 }
 
+/// Blanket impl so a shared reference to a clock is itself a clock, letting
+/// wrappers borrow a clock without taking ownership.
+impl<T: Clock + ?Sized> Clock for &T {
+    fn now(&self) -> Instant {
+        (**self).now()
+    }
+    fn sleep(&self, dur: Duration) {
+        (**self).sleep(dur)
+    }
+}
+
 pub fn run(
     global: &GlobalFlags,
     args: PrWaitChecksArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = RateLimitedRunner::production();
     let clock = SystemClock;
     run_with(&runner, &clock, global, &args, format, git_remote_url)
 }

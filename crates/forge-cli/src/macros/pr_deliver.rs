@@ -27,7 +27,7 @@ use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, schema_ve
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner};
 use crate::cli::{
     BINARY, GlobalFlags, PrCreateArgs, PrDeliverArgs, PrListArgs, PrMergeArgs, PrStateFilter,
     PrWaitChecksArgs,
@@ -42,6 +42,7 @@ use crate::ops::{
     pr_wait_checks, repo_view,
 };
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::RateLimitedRunner;
 use crate::validations::{
     BodyHeadings, PreflightInputs, RuleVerdict, body_sections, branch_kind_matches, branch_name,
     branch_pushed, git_branch_state, git_current_branch, git_status_porcelain, run_local_preflight,
@@ -108,7 +109,7 @@ pub fn run(
     args: PrDeliverArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = RateLimitedRunner::production();
     let clock = SystemClock;
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     run_with(&runner, &clock, global, args, format, &workdir)

@@ -154,6 +154,36 @@ pub trait BackendRunner {
     }
 }
 
+/// Blanket impl so a shared reference to a runner is itself a runner. Lets
+/// wrappers (e.g. [`crate::rate_limit::RateLimitedRunner`]) borrow an inner
+/// runner without taking ownership, which tests rely on to inspect the inner
+/// runner after a gated call.
+impl<T: BackendRunner + ?Sized> BackendRunner for &T {
+    fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+        (**self).run(call)
+    }
+
+    fn run_with_timeout(
+        &self,
+        call: &BackendCall,
+        timeout: Option<Duration>,
+    ) -> Result<BackendSuccess, ForgeError> {
+        (**self).run_with_timeout(call, timeout)
+    }
+
+    fn run_raw(&self, call: &BackendCall) -> Result<BackendOutput, ForgeError> {
+        (**self).run_raw(call)
+    }
+
+    fn run_raw_with_timeout(
+        &self,
+        call: &BackendCall,
+        timeout: Option<Duration>,
+    ) -> Result<BackendOutput, ForgeError> {
+        (**self).run_raw_with_timeout(call, timeout)
+    }
+}
+
 /// Production runner that actually spawns the backend.
 #[derive(Debug, Default)]
 pub struct ProcessRunner;
@@ -263,6 +293,22 @@ impl BackendRunner for ProcessRunner {
             ));
         }
 
+        // Distinguish an exhausted API rate-limit budget (notably the GraphQL
+        // budget, which is metered separately from REST/core) from a generic
+        // backend failure. Without this, a drained GraphQL budget surfaces as a
+        // misleading "not available" / not-found error and risks a wrong
+        // conclusion (sympoies/nils-cli#1051). The
+        // `crate::rate_limit::RateLimitedRunner` gate keys its reactive retry
+        // off this `backend_rate_limited` discriminator.
+        if !status_success && is_rate_limit_stderr(&stderr) {
+            return Err(ForgeError::unavailable(
+                schema(),
+                crate::rate_limit::RATE_LIMITED_KIND,
+                "backend reports the GitHub API rate limit is exhausted",
+                (!stderr.is_empty()).then_some(stderr),
+            ));
+        }
+
         Ok(BackendOutput {
             stdout,
             stderr,
@@ -367,6 +413,22 @@ impl DryRunPayload {
 
 fn schema() -> String {
     nils_common::cli_contract::schema_version_for(BINARY, "error", 1)
+}
+
+/// Detect whether backend stderr reports an exhausted GitHub API rate-limit
+/// budget (primary or secondary). Matches the phrasings `gh` surfaces for both
+/// REST and GraphQL throttling, e.g. `API rate limit exceeded`,
+/// `You have exceeded a secondary rate limit`, and
+/// `GraphQL: API rate limit exceeded`.
+///
+/// The release skill re-implements the same intent as a shell `grep` in
+/// `.agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh`
+/// (`assert_release_assets_available`); keep the two phrasing sets in sync.
+pub fn is_rate_limit_stderr(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("api rate limit exceeded")
+        || s.contains("secondary rate limit")
+        || (s.contains("rate limit") && s.contains("exceeded"))
 }
 
 /// Replace token-shaped strings in `s` with `<redacted-token>`. Patterns
@@ -592,5 +654,81 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "timeout should kill the child promptly"
         );
+    }
+
+    #[test]
+    fn is_rate_limit_stderr_matches_known_phrasings() {
+        assert!(is_rate_limit_stderr("API rate limit exceeded for user"));
+        assert!(is_rate_limit_stderr(
+            "You have exceeded a secondary rate limit"
+        ));
+        assert!(is_rate_limit_stderr("GraphQL: API rate limit exceeded"));
+        // Matched only by the generic third clause (contains "rate limit"
+        // AND "exceeded", but neither of the two specific phrasings).
+        assert!(is_rate_limit_stderr(
+            "your rate limit for this resource has been exceeded"
+        ));
+        // Non-throttling failures must not be misclassified.
+        assert!(!is_rate_limit_stderr("Could not resolve to a Repository"));
+        assert!(!is_rate_limit_stderr("rate limit remaining: 4821"));
+        assert!(!is_rate_limit_stderr("not found"));
+        assert!(!is_rate_limit_stderr(""));
+    }
+
+    #[test]
+    fn process_runner_classifies_rate_limit_exit_as_backend_rate_limited() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'GraphQL: API rate limit exceeded' >&2\nexit 1\n",
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let runner = ProcessRunner;
+        unsafe {
+            std::env::set_var(ENV_GH_BIN, &stub);
+        }
+        let call = BackendCall::new(BackendProgram::Gh, ["pr", "view", "1"]);
+        let err = runner.run(&call).expect_err("rate limited");
+        unsafe {
+            std::env::remove_var(ENV_GH_BIN);
+        }
+        assert_eq!(err.kind(), "backend_rate_limited");
+    }
+
+    #[test]
+    fn process_runner_non_rate_limit_failure_keeps_generic_kind() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'Could not resolve to a Repository' >&2\nexit 1\n",
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let runner = ProcessRunner;
+        unsafe {
+            std::env::set_var(ENV_GH_BIN, &stub);
+        }
+        let call = BackendCall::new(BackendProgram::Gh, ["pr", "view", "1"]);
+        let err = runner.run(&call).expect_err("generic failure");
+        unsafe {
+            std::env::remove_var(ENV_GH_BIN);
+        }
+        // A non-throttling failure must not be classified as rate-limited.
+        assert_eq!(err.kind(), "backend_error");
     }
 }

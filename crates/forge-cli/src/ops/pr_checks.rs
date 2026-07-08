@@ -17,14 +17,13 @@ use std::ffi::OsString;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{
-    BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload, ProcessRunner,
-};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, PrChecksArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_checks_gitlab;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::RateLimitedRunner;
 
 pub const SCHEMA: &str = "pr.checks";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -139,7 +138,7 @@ pub fn run(
     args: PrChecksArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = RateLimitedRunner::production();
     run_with(&runner, global, &args, format, git_remote_url)
 }
 
