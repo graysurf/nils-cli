@@ -86,7 +86,15 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     }
 
     let output = runner.run(&call)?;
-    let payload = parse_list_output(&ctx, &output)?;
+    let payload = if github_rest_list(&ctx, &args) {
+        let mut rest = parse_rest_list_output(&ctx, &output)?;
+        // REST fetches whole pages; honour `--limit` client-side so the scan
+        // window matches the prior `gh issue list --limit` behaviour.
+        rest.items.truncate(args.limit.max(1) as usize);
+        rest
+    } else {
+        parse_list_output(&ctx, &output)?
+    };
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
         payload,
@@ -96,6 +104,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 }
 
 fn build_list_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
+    // A labeled GitHub lookup goes through REST to dodge the SearchType cache
+    // (see `github_rest_list`). This path carries the slug in the endpoint, so
+    // it must not also push `--repo`.
+    if github_rest_list(ctx, args) {
+        return build_github_rest_call(ctx, args);
+    }
     let program = BackendProgram::for_provider(ctx.provider);
     let limit = args.limit.max(1);
     let mut argv: Vec<OsString> = Vec::new();
@@ -159,6 +173,133 @@ fn gitlab_state_flag(state: IssueStateFilter) -> Option<&'static str> {
         IssueStateFilter::Closed => Some("--closed"),
         IssueStateFilter::All => Some("--all"),
     }
+}
+
+/// Labels with surrounding whitespace trimmed and blanks dropped.
+fn effective_labels(args: &IssueListArgs) -> Vec<&str> {
+    args.labels
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Whether a GitHub issue-list lookup should route through the REST
+/// `repos/<slug>/issues` endpoint instead of `gh issue list`.
+///
+/// `gh issue list --label` resolves through gh's GraphQL `SearchType` query,
+/// which gh caches for 24h. If that cache captures a transient
+/// `X-Ratelimit-Remaining: 0`, every later labeled list is refused for up to a
+/// day even while the real quota is healthy (cli/cli#12812) — which hard-blocks
+/// `plan-issue record open` dedup (sympoies/nils-cli#1050). A REST list never
+/// touches that cache path. Only the labeled GitHub path is affected: the
+/// no-label list and GitLab are already safe, and REST needs a repo slug to
+/// build the endpoint (fall back to `gh issue list` when none is known).
+fn github_rest_list(ctx: &ProviderContext, args: &IssueListArgs) -> bool {
+    matches!(ctx.provider, Provider::GitHub)
+        && ctx.repo.is_some()
+        && !effective_labels(args).is_empty()
+}
+
+/// Build the `gh api` REST call for a labeled GitHub issue-list lookup.
+/// Callers must have confirmed [`github_rest_list`] first (repo slug present).
+fn build_github_rest_call(ctx: &ProviderContext, args: &IssueListArgs) -> BackendCall {
+    let slug = ctx.repo.as_deref().unwrap_or_default();
+    let labels_csv = effective_labels(args).join(",");
+    // `-X GET` keeps `-f` params in the query string; without it, `gh api`
+    // switches to POST once any field is present. `--paginate --slurp` walks
+    // every page and wraps them in an outer array so `--limit` (applied
+    // client-side after parsing) still bounds the scan the way `gh issue list
+    // --limit` did.
+    let mut argv: Vec<OsString> = vec![
+        OsString::from("api"),
+        OsString::from("-X"),
+        OsString::from("GET"),
+        OsString::from(format!("repos/{slug}/issues")),
+        OsString::from("-f"),
+        OsString::from(format!("state={}", args.state.as_str())),
+        OsString::from("-f"),
+        OsString::from(format!("labels={labels_csv}")),
+    ];
+    if let Some(a) = &args.author {
+        argv.push(OsString::from("-f"));
+        argv.push(OsString::from(format!("creator={a}")));
+    }
+    if let Some(a) = &args.assignee {
+        argv.push(OsString::from("-f"));
+        argv.push(OsString::from(format!("assignee={a}")));
+    }
+    argv.push(OsString::from("-f"));
+    argv.push(OsString::from("per_page=100"));
+    argv.push(OsString::from("--paginate"));
+    argv.push(OsString::from("--slurp"));
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+/// Parse the `gh api --paginate --slurp repos/<slug>/issues` response.
+///
+/// `--slurp` wraps each page's JSON array in an outer array, so the top level
+/// is an array of pages. The REST issues endpoint also returns pull requests
+/// (which carry a `pull_request` key that plain issues never have); drop them.
+/// REST field names differ from `gh issue list --json`: `html_url` for the URL
+/// and `user` for the author.
+fn parse_rest_list_output(
+    ctx: &ProviderContext,
+    output: &BackendSuccess,
+) -> Result<IssueListPayload, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "issue list JSON is invalid",
+            Some(e.to_string()),
+        )
+    })?;
+    let pages = value.as_array().ok_or_else(|| {
+        ForgeError::software(
+            schema_err(),
+            "issue list JSON is not an array",
+            Some(format!("got: {value}")),
+        )
+    })?;
+    let mut items = Vec::new();
+    for page in pages {
+        // Tolerate both the `--slurp` array-of-pages shape and a bare array.
+        let rows: Vec<&serde_json::Value> = match page.as_array() {
+            Some(arr) => arr.iter().collect(),
+            None => vec![page],
+        };
+        for raw in rows {
+            if raw.get("pull_request").is_some() {
+                continue;
+            }
+            items.push(parse_item_github_rest(raw)?);
+        }
+    }
+    Ok(IssueListPayload {
+        provider: ctx.provider.as_str(),
+        items,
+    })
+}
+
+fn parse_item_github_rest(raw: &serde_json::Value) -> Result<IssueListItem, ForgeError> {
+    Ok(IssueListItem {
+        number: raw
+            .get("number")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| missing("number"))?,
+        url: required_str(raw, "html_url")?,
+        state: normalize_state(
+            raw.get("state").and_then(|v| v.as_str()).unwrap_or(""),
+            Provider::GitHub,
+        )?,
+        title: required_str(raw, "title")?,
+        labels: github_name_list(raw, "labels"),
+        author: raw
+            .get("user")
+            .and_then(|v| v.get("login").and_then(|n| n.as_str()))
+            .map(str::to_string),
+        assignees: github_login_list(raw, "assignees"),
+    })
 }
 
 pub fn parse_list_output(
@@ -346,6 +487,15 @@ mod tests {
         }
     }
 
+    fn ctx_with_repo(p: Provider) -> ProviderContext {
+        ProviderContext {
+            provider: p,
+            host: "example.com".into(),
+            source: DetectionSource::Flag,
+            repo: Some("acme/widgets".into()),
+        }
+    }
+
     fn default_args() -> IssueListArgs {
         IssueListArgs {
             state: IssueStateFilter::Open,
@@ -525,5 +675,101 @@ mod tests {
             rendered.contains("not an array"),
             "expected 'not an array' in error, got {rendered}"
         );
+    }
+
+    #[test]
+    fn build_list_call_github_with_repo_and_labels_routes_through_rest_api() {
+        // sympoies/nils-cli#1050: `gh issue list --label` resolves through gh's
+        // GraphQL `SearchType` query, which gh caches for 24h. A stale
+        // `X-Ratelimit-Remaining: 0` in that cache hard-blocks `plan-issue
+        // record open` dedup for up to a day. A REST list
+        // (`gh api repos/<slug>/issues`) never touches that cache path.
+        let mut args = default_args();
+        args.labels = vec!["plan".into(), "state::tracking".into()];
+        let call = build_list_call(&ctx_with_repo(Provider::GitHub), &args);
+        let plan = call.plan_argv();
+        assert_eq!(plan[1], "api", "expected a gh REST call, got {plan:?}");
+        assert!(
+            !plan.iter().any(|s| s == "list"),
+            "must not use the SearchType-backed `gh issue list` for a labeled \
+             GitHub lookup: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|s| s == "repos/acme/widgets/issues"),
+            "REST call must target the repo issues endpoint: {plan:?}"
+        );
+        // `-X GET` keeps `-f` params in the query string instead of a POST body.
+        let m_idx = plan.iter().position(|s| s == "-X").expect("method flag");
+        assert_eq!(plan[m_idx + 1], "GET");
+        assert!(
+            plan.iter().any(|s| s == "labels=plan,state::tracking"),
+            "labels must stay a server-side comma filter: {plan:?}"
+        );
+        assert!(plan.iter().any(|s| s == "state=open"), "{plan:?}");
+        assert!(
+            plan.iter().any(|s| s == "--paginate") && plan.iter().any(|s| s == "--slurp"),
+            "must paginate + slurp so the scan window is fully honoured: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn build_list_call_github_with_repo_no_labels_stays_on_issue_list() {
+        // Only the labeled path triggers the SearchType cache; a no-label list
+        // is already safe, so leave it on `gh issue list` untouched.
+        let call = build_list_call(&ctx_with_repo(Provider::GitHub), &default_args());
+        let plan = call.plan_argv();
+        assert_eq!(plan[1..3], ["issue".to_string(), "list".to_string()]);
+        assert!(!plan.iter().any(|s| s == "api"), "{plan:?}");
+    }
+
+    #[test]
+    fn build_list_call_github_without_repo_slug_falls_back_to_issue_list() {
+        // No derivable slug means we cannot build a REST path; fall back to the
+        // existing `gh issue list` best effort rather than failing.
+        let mut args = default_args();
+        args.labels = vec!["plan".into()];
+        let call = build_list_call(&ctx(Provider::GitHub), &args);
+        let plan = call.plan_argv();
+        assert_eq!(plan[1..3], ["issue".to_string(), "list".to_string()]);
+    }
+
+    #[test]
+    fn parse_rest_list_output_flattens_pages_excludes_prs_and_maps_rest_fields() {
+        // `gh api --paginate --slurp` wraps each page's array in an outer array.
+        // REST issue objects use `html_url`/`user`, and the issues endpoint also
+        // returns PRs (which carry a `pull_request` key) that must be dropped.
+        let stdout = r#"[
+          [
+            {"number":10,"html_url":"h10","state":"open","title":"tracker",
+             "labels":[{"name":"plan"}],"user":{"login":"alice"},
+             "assignees":[{"login":"bob"}]},
+            {"number":11,"html_url":"h11","state":"open","title":"a pr",
+             "labels":[],"user":{"login":"carol"},"assignees":[],
+             "pull_request":{"url":"p"}}
+          ],
+          [
+            {"number":12,"html_url":"h12","state":"closed","title":"old",
+             "labels":[],"user":{"login":"dave"},"assignees":[]}
+          ]
+        ]"#;
+        let payload = parse_rest_list_output(
+            &ctx_with_repo(Provider::GitHub),
+            &BackendSuccess {
+                stdout: stdout.into(),
+                stderr: String::new(),
+            },
+        )
+        .unwrap();
+        // PR #11 excluded; issues #10 and #12 kept, flattened across both pages.
+        assert_eq!(
+            payload.items.iter().map(|i| i.number).collect::<Vec<_>>(),
+            vec![10, 12]
+        );
+        assert_eq!(payload.items[0].url, "h10");
+        assert_eq!(payload.items[0].state, "open");
+        assert_eq!(payload.items[0].labels, vec!["plan".to_string()]);
+        assert_eq!(payload.items[0].author.as_deref(), Some("alice"));
+        assert_eq!(payload.items[0].assignees, vec!["bob".to_string()]);
+        assert_eq!(payload.items[1].state, "closed");
     }
 }
