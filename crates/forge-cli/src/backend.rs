@@ -420,6 +420,10 @@ fn schema() -> String {
 /// REST and GraphQL throttling, e.g. `API rate limit exceeded`,
 /// `You have exceeded a secondary rate limit`, and
 /// `GraphQL: API rate limit exceeded`.
+///
+/// The release skill re-implements the same intent as a shell `grep` in
+/// `.agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh`
+/// (`assert_release_assets_available`); keep the two phrasing sets in sync.
 pub fn is_rate_limit_stderr(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("api rate limit exceeded")
@@ -659,8 +663,14 @@ mod tests {
             "You have exceeded a secondary rate limit"
         ));
         assert!(is_rate_limit_stderr("GraphQL: API rate limit exceeded"));
+        // Matched only by the generic third clause (contains "rate limit"
+        // AND "exceeded", but neither of the two specific phrasings).
+        assert!(is_rate_limit_stderr(
+            "your rate limit for this resource has been exceeded"
+        ));
         // Non-throttling failures must not be misclassified.
         assert!(!is_rate_limit_stderr("Could not resolve to a Repository"));
+        assert!(!is_rate_limit_stderr("rate limit remaining: 4821"));
         assert!(!is_rate_limit_stderr("not found"));
         assert!(!is_rate_limit_stderr(""));
     }
@@ -691,5 +701,34 @@ mod tests {
             std::env::remove_var(ENV_GH_BIN);
         }
         assert_eq!(err.kind(), "backend_rate_limited");
+    }
+
+    #[test]
+    fn process_runner_non_rate_limit_failure_keeps_generic_kind() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'Could not resolve to a Repository' >&2\nexit 1\n",
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let runner = ProcessRunner;
+        unsafe {
+            std::env::set_var(ENV_GH_BIN, &stub);
+        }
+        let call = BackendCall::new(BackendProgram::Gh, ["pr", "view", "1"]);
+        let err = runner.run(&call).expect_err("generic failure");
+        unsafe {
+            std::env::remove_var(ENV_GH_BIN);
+        }
+        // A non-throttling failure must not be classified as rate-limited.
+        assert_eq!(err.kind(), "backend_error");
     }
 }

@@ -21,6 +21,16 @@
 //! blocks real work. Timing is driven through the [`Clock`] trait (shared with
 //! `pr wait-checks`) so tests step time deterministically instead of sleeping.
 //!
+//! **Wiring scope.** For #1051 the decorator is applied only to the PR-lifecycle
+//! ops that the documented failures exercised — `pr view`/`ready`/`merge`/
+//! `checks`/`wait-checks` and the `pr deliver` macro (which threads one gated
+//! runner through the whole chain). Other GraphQL-backed standalone ops
+//! (`issue_*`, `search`, `repo view`, `pr list`/`create`/`review*`, …) still
+//! use a bare runner and can adopt [`RateLimitedRunner::production`] the same
+//! one-line way. [`is_graphql_backed`] is intentionally broader than this
+//! wiring: it answers "does this call draw on the GraphQL budget", not "is this
+//! op gated".
+//!
 //! The gate is enabled by default and tuned through the environment:
 //!   - `FORGE_CLI_RATE_LIMIT_GATE=off|0|false|no` disables it entirely.
 //!   - `FORGE_CLI_RATE_LIMIT_MIN_REMAINING` (default 50) — proceed immediately
@@ -29,7 +39,8 @@
 //!   - `FORGE_CLI_RATE_LIMIT_POLL_SECS` (default 15) — re-probe interval while
 //!     throttled.
 
-use std::time::Duration;
+use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
 use crate::backend::{
     BackendCall, BackendOutput, BackendProgram, BackendRunner, BackendSuccess, ProcessRunner,
@@ -41,6 +52,11 @@ use crate::ops::pr_wait_checks::{Clock, SystemClock};
 /// its reactive retry off this discriminator.
 pub const RATE_LIMITED_KIND: &str = "backend_rate_limited";
 
+/// Hard timeout for the best-effort `gh api rate_limit` probe. A stalled probe
+/// must never block real work, so it is bounded independently of the gated
+/// call and a probe timeout is treated like an unreadable probe (proceed).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Tunable gate policy resolved from the environment.
 #[derive(Debug, Clone)]
 pub struct GateConfig {
@@ -50,10 +66,16 @@ pub struct GateConfig {
     /// Proceed immediately when `graphql.remaining` is strictly greater than
     /// this. Keeps the healthy path to a single fast probe.
     pub min_remaining: u64,
-    /// Upper bound on the total time spent waiting for the budget to recover,
-    /// per gated attempt.
+    /// Upper bound on a single wait-for-recovery phase. Note that a gated call
+    /// has two independent wait phases — the preflight and, after a
+    /// `backend_rate_limited` failure, one reactive wait — so a single gated
+    /// call can block up to `2 * max_wait`, and a multi-call op (`pr deliver`,
+    /// `pr wait-checks`) bounds each of its calls independently rather than
+    /// end-to-end.
     pub max_wait: Duration,
     /// Interval between re-probes while the budget is below `min_remaining`.
+    /// Doubles as the freshness window for the cached probe reading and as the
+    /// minimum backoff before a reactive retry.
     pub poll_interval: Duration,
 }
 
@@ -110,6 +132,19 @@ fn env_u64(key: &str) -> Option<u64> {
 /// the GraphQL budget. Only GitHub (`gh`) calls qualify; the free
 /// `gh api rate_limit` probe and REST `gh api repos/…` calls are excluded so
 /// the gate never gates itself or a call that draws on the core budget.
+///
+/// Classification is **verb-coarse**: it treats an entire `gh` verb as
+/// GraphQL-backed rather than distinguishing per-subcommand (e.g. the
+/// REST-backed `gh release download` / `gh repo clone` would be classified
+/// GraphQL here). That is safe today because only the GraphQL-heavy
+/// PR-lifecycle verbs are ever routed through [`RateLimitedRunner`] (see the
+/// module docs); a future caller that wraps a REST-backed subcommand of these
+/// verbs should refine the matching first.
+///
+/// Note this predicate is broader than the current wiring: it returns `true`
+/// for verbs whose standalone ops are not yet wrapped by the gate. It answers
+/// "would this call draw on the GraphQL budget", not "is this call gated" — the
+/// latter also depends on the op having opted into the decorator.
 pub fn is_graphql_backed(call: &BackendCall) -> bool {
     if call.program != BackendProgram::Gh {
         return false;
@@ -149,6 +184,11 @@ pub struct RateLimitedRunner<R, C> {
     inner: R,
     clock: C,
     config: GateConfig,
+    /// Last probe reading `(taken_at, remaining)`, reused within
+    /// `config.poll_interval` so a burst of closely-spaced gated calls (e.g.
+    /// the `pr deliver` chain, or the two `pr checks` calls per wait-checks
+    /// poll) collapses to a single probe instead of one per call.
+    probe_cache: RefCell<Option<(Instant, u64)>>,
 }
 
 impl RateLimitedRunner<ProcessRunner, SystemClock> {
@@ -165,6 +205,7 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
             inner,
             clock,
             config,
+            probe_cache: RefCell::new(None),
         }
     }
 
@@ -173,10 +214,36 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
     }
 
     /// Best-effort read of the current GraphQL remaining budget. `None` when
-    /// the probe fails or is unparseable.
+    /// the probe fails, times out, or is unparseable. Bounded by
+    /// [`PROBE_TIMEOUT`] so a stalled endpoint never blocks the gated call.
     fn probe_remaining(&self) -> Option<u64> {
-        let output = self.inner.run(&probe_call()).ok()?;
+        let output = self
+            .inner
+            .run_with_timeout(&probe_call(), Some(PROBE_TIMEOUT))
+            .ok()?;
         parse_graphql_remaining(&output.stdout)
+    }
+
+    /// A GraphQL-remaining reading, reusing the cached probe when it is younger
+    /// than `poll_interval` and otherwise re-probing (and refreshing the
+    /// cache). An unreadable probe is not cached, so the next call re-probes.
+    fn cached_remaining(&self) -> Option<u64> {
+        let cached = *self.probe_cache.borrow();
+        if let Some((taken_at, remaining)) = cached
+            && self.clock.now().saturating_duration_since(taken_at) < self.config.poll_interval
+        {
+            return Some(remaining);
+        }
+        let remaining = self.probe_remaining()?;
+        *self.probe_cache.borrow_mut() = Some((self.clock.now(), remaining));
+        Some(remaining)
+    }
+
+    /// Drop the cached probe reading. Called after a `backend_rate_limited`
+    /// failure so the reactive wait re-probes fresh rather than trusting a
+    /// reading that predates the throttling.
+    fn invalidate_cache(&self) {
+        *self.probe_cache.borrow_mut() = None;
     }
 
     /// Poll `gh api rate_limit` until `graphql.remaining` exceeds the
@@ -185,7 +252,7 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
     fn wait_until_healthy(&self) {
         let start = self.clock.now();
         loop {
-            match self.probe_remaining() {
+            match self.cached_remaining() {
                 // Cannot read the budget — do not block; proceed and let the
                 // real call (and its reactive retry) handle any throttling.
                 None => return,
@@ -207,8 +274,17 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
     }
 
     /// Run `call` through `run`, gating GraphQL-backed calls: preflight for a
-    /// healthy budget, then on a `backend_rate_limited` failure wait for
-    /// recovery and retry exactly once.
+    /// healthy budget, then on a `backend_rate_limited` failure back off and
+    /// retry exactly once.
+    ///
+    /// The single retry replays the individual failing backend call. For the
+    /// mutating lifecycle ops (`pr merge`/`pr ready`) that is safe: a
+    /// rate-limited call did not execute server-side, and these ops are
+    /// effectively idempotent. Before retrying we drop the stale cached reading
+    /// and always sleep at least one `poll_interval` — a floor that gives
+    /// secondary/abuse rate limits (which do not deplete `graphql.remaining`,
+    /// so `wait_until_healthy` would return immediately) a real backoff instead
+    /// of an instant hammer.
     fn gated<T>(
         &self,
         call: &BackendCall,
@@ -220,6 +296,8 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
         self.wait_until_healthy();
         match run(call) {
             Err(err) if err.kind() == RATE_LIMITED_KIND => {
+                self.invalidate_cache();
+                self.clock.sleep(self.config.poll_interval);
                 self.wait_until_healthy();
                 run(call)
             }
@@ -262,16 +340,14 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    /// Scripted runner that returns queued rate-limit-probe responses and
-    /// records every call's argv. Non-probe calls return a fixed success (or a
-    /// scripted rate-limit error, once) so the decorator's gating path can be
-    /// observed without a real subprocess.
+    /// Scripted runner that serves queued `graphql.remaining` probe values and
+    /// records every call's argv. The first `fail_remaining` non-probe calls
+    /// fail with `fail_kind`; the rest succeed. This lets tests drive the
+    /// preflight, reactive-retry, and passthrough paths without a subprocess.
     struct FakeRunner {
-        /// Queue of `graphql.remaining` values served by successive probes.
         probe_remaining: RefCell<Vec<u64>>,
-        /// When true, the first non-probe call fails with `backend_rate_limited`.
-        fail_once: RefCell<bool>,
-        /// Recorded argv of every call (probe and real).
+        fail_remaining: RefCell<usize>,
+        fail_kind: &'static str,
         calls: RefCell<Vec<Vec<String>>>,
     }
 
@@ -279,15 +355,25 @@ mod tests {
         fn new(probe_remaining: Vec<u64>) -> Self {
             Self {
                 probe_remaining: RefCell::new(probe_remaining),
-                fail_once: RefCell::new(false),
+                fail_remaining: RefCell::new(0),
+                fail_kind: RATE_LIMITED_KIND,
                 calls: RefCell::new(Vec::new()),
             }
         }
 
+        /// The first non-probe call fails with `backend_rate_limited`.
         fn with_fail_once(probe_remaining: Vec<u64>) -> Self {
+            Self::with_fails(probe_remaining, 1, RATE_LIMITED_KIND)
+        }
+
+        /// The first `count` non-probe calls fail with `kind`.
+        fn with_fails(probe_remaining: Vec<u64>, count: usize, kind: &'static str) -> Self {
             let r = Self::new(probe_remaining);
-            *r.fail_once.borrow_mut() = true;
-            r
+            *r.fail_remaining.borrow_mut() = count;
+            Self {
+                fail_kind: kind,
+                ..r
+            }
         }
 
         fn is_probe(call: &BackendCall) -> bool {
@@ -334,11 +420,12 @@ mod tests {
                     stderr: String::new(),
                 });
             }
-            if *self.fail_once.borrow() {
-                *self.fail_once.borrow_mut() = false;
+            let mut fails = self.fail_remaining.borrow_mut();
+            if *fails > 0 {
+                *fails -= 1;
                 return Err(ForgeError::unavailable(
                     "cli.forge-cli.error.v1",
-                    RATE_LIMITED_KIND,
+                    self.fail_kind,
                     "throttled",
                     None,
                 ));
@@ -489,17 +576,176 @@ mod tests {
     }
 
     #[test]
-    fn rate_limited_failure_waits_and_retries_once() {
-        // Healthy preflight, the real call fails once with backend_rate_limited,
-        // the gate re-checks (healthy) and retries, which succeeds.
-        let runner = FakeRunner::with_fail_once(vec![4821, 4821]);
+    fn rate_limited_failure_backs_off_waits_and_retries_once() {
+        // Healthy preflight; the real call fails once with backend_rate_limited;
+        // the reactive path drops the stale reading, sleeps the floor, then
+        // waits for the (initially still-throttled) budget to recover before a
+        // single successful retry. Non-vacuous: removing the reactive
+        // wait_until_healthy would change the sleep/probe counts asserted here.
+        let runner = FakeRunner::with_fail_once(vec![4821, 0, 500]);
         let clock = FakeClock::new();
         let gate = RateLimitedRunner::new(&runner, &clock, cfg());
 
         let out = gate.run(&pr_ready_call()).expect("retry succeeds");
         assert_eq!(out.stdout, "ok");
-        assert_eq!(runner.real_count(), 2, "one failure + one retry");
+        assert_eq!(runner.real_count(), 2, "one failure + exactly one retry");
+        // floor backoff (15s) + one recovery poll (15s).
+        assert_eq!(clock.sleep_count(), 2);
+        assert_eq!(clock.total_slept(), Duration::from_secs(30));
+        // preflight + two reactive probes (throttled, then recovered).
+        assert_eq!(runner.probe_count(), 3);
     }
+
+    #[test]
+    fn persistent_throttle_retries_once_then_surfaces_rate_limit_error() {
+        // The real call fails on every attempt. The gate must retry exactly
+        // once (not loop) and then surface the backend_rate_limited error
+        // rather than swallow it — the core #1051 signal.
+        let runner = FakeRunner::with_fails(vec![4821, 4821], 5, RATE_LIMITED_KIND);
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        let err = gate.run(&pr_ready_call()).expect_err("persistent throttle");
+        assert_eq!(
+            err.kind(),
+            RATE_LIMITED_KIND,
+            "error is surfaced, not swallowed"
+        );
+        assert_eq!(runner.real_count(), 2, "bounded to a single retry");
+    }
+
+    #[test]
+    fn non_rate_limit_error_passes_through_without_retry_or_extra_probe() {
+        // A generic (non-throttle) failure must be returned as-is: no reactive
+        // wait, no second probe, no retry.
+        let runner = FakeRunner::with_fails(vec![4821], 1, "backend_error");
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        let err = gate.run(&pr_ready_call()).expect_err("generic failure");
+        assert_eq!(err.kind(), "backend_error");
+        assert_eq!(runner.real_count(), 1, "not retried");
+        assert_eq!(runner.probe_count(), 1, "only the preflight probe");
+        assert_eq!(clock.sleep_count(), 0);
+    }
+
+    #[test]
+    fn run_raw_is_gated_like_run() {
+        // The run_raw path (used by pr checks) must preflight identically.
+        let runner = FakeRunner::new(vec![0, 500]);
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        gate.run_raw(&pr_ready_call()).expect("run_raw");
+        assert_eq!(runner.probe_count(), 2, "re-probed after sleeping");
+        assert_eq!(clock.sleep_count(), 1);
+        assert_eq!(runner.real_count(), 1);
+    }
+
+    #[test]
+    fn min_remaining_boundary_is_strict_greater_than() {
+        // remaining == min_remaining is throttled; min_remaining + 1 proceeds.
+        let at_threshold = FakeRunner::new(vec![50, 500]);
+        let clock = FakeClock::new();
+        RateLimitedRunner::new(&at_threshold, &clock, cfg())
+            .run(&pr_ready_call())
+            .expect("run");
+        assert_eq!(clock.sleep_count(), 1, "remaining == min_remaining waits");
+
+        let above = FakeRunner::new(vec![51]);
+        let clock2 = FakeClock::new();
+        RateLimitedRunner::new(&above, &clock2, cfg())
+            .run(&pr_ready_call())
+            .expect("run");
+        assert_eq!(
+            clock2.sleep_count(),
+            0,
+            "remaining > min_remaining proceeds"
+        );
+    }
+
+    #[test]
+    fn partial_final_nap_never_overshoots_max_wait() {
+        // max_wait (100s) is not a multiple of poll_interval (15s): the final
+        // nap must be clamped to the remaining budget so total == max_wait.
+        let runner = FakeRunner::new(vec![0; 32]);
+        let clock = FakeClock::new();
+        let config = GateConfig {
+            max_wait: Duration::from_secs(100),
+            poll_interval: Duration::from_secs(15),
+            ..cfg()
+        };
+        RateLimitedRunner::new(&runner, &clock, config)
+            .run(&pr_ready_call())
+            .expect("run");
+        assert_eq!(clock.total_slept(), Duration::from_secs(100));
+    }
+
+    #[test]
+    fn cached_probe_reused_within_poll_interval() {
+        // Two back-to-back gated calls within the freshness window issue exactly
+        // one probe, not one per call. Only one probe value is queued, so a
+        // second probe would be provable via probe_count.
+        let runner = FakeRunner::new(vec![4821]);
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        gate.run(&pr_ready_call()).expect("first");
+        gate.run(&pr_ready_call()).expect("second");
+        assert_eq!(
+            runner.probe_count(),
+            1,
+            "second call reused the cached probe"
+        );
+        assert_eq!(runner.real_count(), 2);
+        assert_eq!(clock.sleep_count(), 0);
+    }
+
+    #[test]
+    fn from_env_parses_disable_tokens_fallbacks_and_clamp() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = [
+            "FORGE_CLI_RATE_LIMIT_GATE",
+            "FORGE_CLI_RATE_LIMIT_MIN_REMAINING",
+            "FORGE_CLI_RATE_LIMIT_MAX_WAIT_SECS",
+            "FORGE_CLI_RATE_LIMIT_POLL_SECS",
+        ];
+        let clear = || unsafe {
+            for k in keys {
+                std::env::remove_var(k);
+            }
+        };
+
+        clear();
+        for token in ["off", "0", "false", "no", "OFF"] {
+            unsafe { std::env::set_var("FORGE_CLI_RATE_LIMIT_GATE", token) };
+            assert!(!GateConfig::from_env().enabled, "token {token} disables");
+        }
+        unsafe { std::env::set_var("FORGE_CLI_RATE_LIMIT_GATE", "on") };
+        assert!(
+            GateConfig::from_env().enabled,
+            "any other value stays enabled"
+        );
+
+        // Garbage numeric values fall back to the defaults.
+        unsafe {
+            std::env::set_var("FORGE_CLI_RATE_LIMIT_MIN_REMAINING", "not-a-number");
+            std::env::set_var("FORGE_CLI_RATE_LIMIT_MAX_WAIT_SECS", "");
+        }
+        let cfg = GateConfig::from_env();
+        assert_eq!(cfg.min_remaining, 50);
+        assert_eq!(cfg.max_wait, Duration::from_secs(120));
+
+        // A zero poll interval is clamped to 1s to avoid a busy-loop.
+        unsafe { std::env::set_var("FORGE_CLI_RATE_LIMIT_POLL_SECS", "0") };
+        assert_eq!(GateConfig::from_env().poll_interval, Duration::from_secs(1));
+
+        clear();
+    }
+
+    /// Serializes the env-mutating `from_env` test against any future
+    /// env-mutating unit test in this module.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn non_graphql_call_is_not_gated() {

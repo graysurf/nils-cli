@@ -434,6 +434,8 @@ assert_release_assets_available() {
   if ! release_json="$(gh api "repos/${repo}/releases/tags/${tag}" 2>"$err_file")"; then
     err="$(cat "$err_file")"
     rm -f "$err_file"
+    # Mirrors forge-cli's `is_rate_limit_stderr` (crates/forge-cli/src/backend.rs);
+    # keep the two phrasing sets in sync.
     if printf '%s' "$err" | grep -qiE 'rate limit|api rate limit exceeded|secondary rate limit'; then
       die "GitHub API rate limit hit while checking release ${repo} ${tag}; wait for the reset and retry (inspect with: gh api rate_limit)"
     fi
