@@ -136,15 +136,15 @@ fn env_u64(key: &str) -> Option<u64> {
 /// Classification is **verb-coarse**: it treats an entire `gh` verb as
 /// GraphQL-backed rather than distinguishing per-subcommand (e.g. the
 /// REST-backed `gh release download` / `gh repo clone` would be classified
-/// GraphQL here). That is safe today because only the GraphQL-heavy
-/// PR-lifecycle verbs are ever routed through [`RateLimitedRunner`] (see the
-/// module docs); a future caller that wraps a REST-backed subcommand of these
-/// verbs should refine the matching first.
-///
-/// Note this predicate is broader than the current wiring: it returns `true`
-/// for verbs whose standalone ops are not yet wrapped by the gate. It answers
-/// "would this call draw on the GraphQL budget", not "is this call gated" — the
-/// latter also depends on the op having opted into the decorator.
+/// GraphQL here). Every op is now routed through [`RateLimitedRunner`] via
+/// [`default_runner`], so this predicate is the sole thing that decides whether
+/// a call is actually gated. It is safe today only because no op issues a
+/// REST-backed subcommand of these verbs — the only `repo` call in the tree is
+/// `gh repo view`, which is genuinely GraphQL-backed. Before adding an op that
+/// shells a REST-backed subcommand of `pr`/`issue`/`search`/`repo`/`release`
+/// (e.g. `gh release download`, `gh repo clone`), refine this matcher to key on
+/// the subcommand, or that call would needlessly preflight and back off against
+/// the GraphQL budget for a request that spends the core budget.
 pub fn is_graphql_backed(call: &BackendCall) -> bool {
     if call.program != BackendProgram::Gh {
         return false;
@@ -185,27 +185,24 @@ pub struct RateLimitedRunner<R, C> {
     clock: C,
     config: GateConfig,
     /// Last probe reading `(taken_at, remaining)`, reused within
-    /// `config.poll_interval` so a burst of closely-spaced gated calls (e.g.
-    /// the `pr deliver` chain, or the two `pr checks` calls per wait-checks
-    /// poll) collapses to a single probe instead of one per call.
+    /// `config.poll_interval` so a burst of *sequential* closely-spaced gated
+    /// calls (e.g. the `pr deliver` chain, or the two `pr checks` calls per
+    /// wait-checks poll) collapses to a single probe instead of one per call.
     ///
     /// A `Mutex` (not `RefCell`) so the runner stays `Sync`: ops that fan out
     /// across threads (`inbox`'s parallel provider queries) share one runner
-    /// and require `R: Sync`. Critical sections only copy the small reading in
-    /// or out, never spanning a backend call, so there is no lock contention on
-    /// the hot path.
+    /// and require `R: Sync`. There is no single-flight coordination, so a
+    /// *concurrent* cold-cache fan-out issues up to one probe per thread rather
+    /// than one total — bounded, and against the free `rate_limit` endpoint, so
+    /// it is a small request burst, not a latency or correctness risk. Critical
+    /// sections only copy the small reading in or out, never spanning a backend
+    /// call, so the lock is never held across I/O.
     probe_cache: Mutex<Option<(Instant, u64)>>,
 }
 
-impl RateLimitedRunner<ProcessRunner, SystemClock> {
-    /// Production runner: wraps a real [`ProcessRunner`] with the system clock
-    /// and the environment-resolved policy.
-    pub fn production() -> Self {
-        Self::new(ProcessRunner, SystemClock, GateConfig::from_env())
-    }
-}
-
-/// The default backend runner for every production op `run()` entrypoint.
+/// The default backend runner for every production op `run()` entrypoint, and
+/// the sole sanctioned way to build a live runner. It wraps a real
+/// [`ProcessRunner`] with the system clock and the environment-resolved policy.
 ///
 /// This is the one place the "which runner do live ops use" decision lives.
 /// Every op routes its live (non-local) backend calls through the returned
@@ -216,7 +213,7 @@ impl RateLimitedRunner<ProcessRunner, SystemClock> {
 /// op is safe. A guard test enforces that ops use this factory rather than a
 /// bare runner.
 pub fn default_runner() -> RateLimitedRunner<ProcessRunner, SystemClock> {
-    RateLimitedRunner::production()
+    RateLimitedRunner::new(ProcessRunner, SystemClock, GateConfig::from_env())
 }
 
 impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
@@ -666,6 +663,22 @@ mod tests {
     }
 
     #[test]
+    fn run_with_timeout_is_gated_like_run() {
+        // The run_with_timeout path (used by inbox's threaded fan-out) must
+        // preflight identically to run/run_raw — its outer wrapper is otherwise
+        // exercised by no other test.
+        let runner = FakeRunner::new(vec![0, 500]);
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        gate.run_with_timeout(&pr_ready_call(), Some(Duration::from_secs(5)))
+            .expect("run_with_timeout");
+        assert_eq!(runner.probe_count(), 2, "re-probed after sleeping");
+        assert_eq!(clock.sleep_count(), 1);
+        assert_eq!(runner.real_count(), 1);
+    }
+
+    #[test]
     fn min_remaining_boundary_is_strict_greater_than() {
         // remaining == min_remaining is throttled; min_remaining + 1 proceeds.
         let at_threshold = FakeRunner::new(vec![50, 500]);
@@ -832,21 +845,95 @@ mod tests {
         assert_eq!(out.stdout, "ok");
         assert_eq!(clock.sleep_count(), 0, "unreadable probe never sleeps");
     }
+
+    #[test]
+    fn shared_runner_is_sync_across_threads() {
+        // The RefCell->Mutex change exists so one gated runner can be shared
+        // across threads: `inbox` fans its provider queries out via
+        // `thread::scope` and requires `R: BackendRunner + Sync`. Prove the
+        // shared runner gates correctly under a concurrent fan-out — every call
+        // succeeds, and the cold-cache burst issues at most one probe per thread
+        // (bounded, not runaway; there is no single-flight coordination).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SyncFake {
+            probes: AtomicUsize,
+            reals: AtomicUsize,
+        }
+        impl BackendRunner for SyncFake {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                let argv: Vec<String> = call
+                    .argv
+                    .iter()
+                    .map(|a| a.to_string_lossy().into())
+                    .collect();
+                if argv == ["api", "rate_limit"] {
+                    self.probes.fetch_add(1, Ordering::SeqCst);
+                    return Ok(BackendSuccess {
+                        stdout:
+                            r#"{"resources":{"graphql":{"limit":5000,"remaining":5000,"reset":1}}}"#
+                                .into(),
+                        stderr: String::new(),
+                    });
+                }
+                self.reals.fetch_add(1, Ordering::SeqCst);
+                Ok(BackendSuccess {
+                    stdout: "ok".into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        const THREADS: usize = 8;
+        let fake = SyncFake {
+            probes: AtomicUsize::new(0),
+            reals: AtomicUsize::new(0),
+        };
+        // SystemClock never sleeps here: the probed budget is always healthy.
+        let gate = RateLimitedRunner::new(&fake, SystemClock, cfg());
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    gate.run(&pr_ready_call()).expect("gated call in thread");
+                });
+            }
+        });
+
+        assert_eq!(fake.reals.load(Ordering::SeqCst), THREADS, "every call ran");
+        let probes = fake.probes.load(Ordering::SeqCst);
+        assert!(
+            (1..=THREADS).contains(&probes),
+            "cold-cache fan-out issues 1..=THREADS probes, got {probes}"
+        );
+    }
 }
 
-/// Structural guard: op entrypoints must build their live runner via
+/// Structural guard: dispatch/op entrypoints must build their live runner via
 /// [`default_runner`], never a bare [`ProcessRunner`]. This is what keeps the
 /// GraphQL rate-limit gate wired to *every* op — the classifier's breadth and
 /// the wiring cannot drift, because there is only one place a runner is built
 /// (sympoies/nils-cli#1063).
+///
+/// This is a textual guard, not an AST check: it verifies the *absence* of the
+/// `ProcessRunner` token (a necessary condition for routing through the
+/// factory), not the *presence* of a `default_runner()` call. It cannot catch
+/// every conceivable bypass (e.g. a hand-rolled `std::process::Command` or a
+/// disabled-config runner), but it does catch the realistic regression — an op
+/// reaching for the bare runner the way every op used to.
 #[cfg(test)]
 mod wiring_guard {
     use std::fs;
     use std::path::Path;
 
-    /// Directories whose `run()` entrypoints dispatch live backend calls. A
-    /// bare `ProcessRunner` here would silently bypass the rate-limit gate.
+    /// Directories that hold live-dispatching `run()` entrypoints. A bare
+    /// `ProcessRunner` here would silently bypass the rate-limit gate. Extend
+    /// this list (or `GATED_FILES`) whenever live dispatch grows a new home.
     const GATED_DIRS: &[&str] = &["src/ops", "src/macros"];
+
+    /// Individual files (outside the gated dirs) that also dispatch live calls
+    /// — chiefly the CLI dispatcher, which routes some paths directly.
+    const GATED_FILES: &[&str] = &["src/cli.rs"];
 
     fn rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -862,32 +949,45 @@ mod wiring_guard {
         }
     }
 
+    /// Drop line and trailing `//` comments so a doc-comment or inline mention
+    /// of `ProcessRunner` does not trip the guard — only code text is scanned.
+    fn strip_comments(body: &str) -> String {
+        body.lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn ops_construct_runner_via_factory() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut offenders = Vec::new();
+        let mut files = Vec::new();
         for rel in GATED_DIRS {
-            let mut files = Vec::new();
             rs_files(&root.join(rel), &mut files);
-            for file in files {
-                let body = fs::read_to_string(&file).expect("read op source");
-                if body.contains("ProcessRunner") {
-                    offenders.push(
-                        file.strip_prefix(root)
-                            .unwrap_or(&file)
-                            .display()
-                            .to_string(),
-                    );
-                }
+        }
+        files.extend(GATED_FILES.iter().map(|rel| root.join(rel)));
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let body = fs::read_to_string(&file).expect("read dispatch/op source");
+            if strip_comments(&body).contains("ProcessRunner") {
+                offenders.push(
+                    file.strip_prefix(root)
+                        .unwrap_or(&file)
+                        .display()
+                        .to_string(),
+                );
             }
         }
         offenders.sort();
         assert!(
             offenders.is_empty(),
-            "op/macro entrypoints must build the live runner via \
+            "dispatch/op entrypoints must build the live runner via \
              `crate::rate_limit::default_runner()`, not a bare `ProcessRunner`, \
-             so the GraphQL rate-limit gate stays wired to every op. Offending \
-             files: {offenders:?}"
+             so the GraphQL rate-limit gate stays wired to every op. (Comments \
+             are ignored; a match is a real construction in code, including in a \
+             `#[cfg(test)]` module — route it through the factory or move the \
+             test off the bare runner.) Offending files: {offenders:?}"
         );
     }
 }

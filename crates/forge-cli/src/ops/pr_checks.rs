@@ -1028,12 +1028,7 @@ pub(super) fn schema_err() -> String {
 }
 
 /// Render the dry-run plan and emit it as the standard dry-run envelope.
-pub fn emit_dry_run<R: BackendRunner>(
-    _runner: &R,
-    ctx: &ProviderContext,
-    args: &PrChecksArgs,
-    format: OutputFormat,
-) -> i32 {
+pub fn emit_dry_run(ctx: &ProviderContext, args: &PrChecksArgs, format: OutputFormat) -> i32 {
     let call = build_dry_run_call(ctx, args);
     let payload = DryRunPayload::new(ctx.provider, &call);
     emit_success(

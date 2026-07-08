@@ -1444,11 +1444,7 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
                     Ok(ctx) => ctx,
                     Err(err) => return err.emit(format),
                 };
-                // Inert placeholder: `emit_dry_run` never invokes the runner
-                // (it only renders the plan), so this dry-run path does not use
-                // the gated `default_runner()` the live ops route through.
-                let runner = crate::backend::ProcessRunner;
-                let code = ops::pr_checks::emit_dry_run(&runner, &ctx, &args, format);
+                let code = ops::pr_checks::emit_dry_run(&ctx, &args, format);
                 return code;
             }
             ops::pr_checks::run(&global, args, format)
