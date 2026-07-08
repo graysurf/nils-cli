@@ -74,8 +74,13 @@ impl ProviderContext {
 
     /// Push `gh api --hostname <host>` for GitHub Enterprise hosts. `gh api`
     /// defaults to github.com unless this flag is present.
+    ///
+    /// github.com transport aliases — notably the SSH-over-443 host
+    /// `ssh.github.com` — share the github.com API host, so they must not get a
+    /// `--hostname` override (that would point `gh api` at the SSH host, not the
+    /// API). Real GitHub Enterprise hosts are distinct API hosts and keep it.
     pub fn push_github_api_hostname(&self, argv: &mut Vec<OsString>) {
-        if matches!(self.provider, Provider::GitHub) && self.host != "github.com" {
+        if matches!(self.provider, Provider::GitHub) && !is_github_com_api_host(&self.host) {
             argv.push(OsString::from("--hostname"));
             argv.push(OsString::from(&self.host));
         }
@@ -183,6 +188,15 @@ pub fn classify_host(host: &str) -> Option<Provider> {
     None
 }
 
+/// Whether `host` resolves to the github.com API host: github.com itself or a
+/// transport alias such as the SSH-over-443 host `ssh.github.com`. GitHub
+/// Enterprise hosts (`*.ghe.com`, custom domains) are distinct API hosts, not
+/// aliases, so they are not included here.
+fn is_github_com_api_host(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    host == "github.com" || host == "ssh.github.com"
+}
+
 /// Parse the host out of a remote URL. Delegates to
 /// [`nils_common::git::parse_git_remote_url`] so the supported shapes match the
 /// rest of the workspace (https/http with optional userinfo+port, ssh with
@@ -246,6 +260,51 @@ mod tests {
     fn classify_host_rejects_unknown() {
         assert_eq!(classify_host("bitbucket.org"), None);
         assert_eq!(classify_host("codeberg.org"), None);
+    }
+
+    fn github_ctx(host: &str) -> ProviderContext {
+        ProviderContext {
+            provider: Provider::GitHub,
+            host: host.into(),
+            source: DetectionSource::Remote,
+            repo: None,
+        }
+    }
+
+    #[test]
+    fn push_github_api_hostname_omitted_for_github_com() {
+        let mut argv = Vec::new();
+        github_ctx("github.com").push_github_api_hostname(&mut argv);
+        assert!(
+            argv.is_empty(),
+            "github.com is the default API host: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn push_github_api_hostname_omitted_for_ssh_github_com_alias() {
+        // `ssh.github.com` (SSH over 443) shares the github.com API host, so it
+        // must not become a `--hostname` override pointing at the SSH host.
+        let mut argv = Vec::new();
+        github_ctx("ssh.github.com").push_github_api_hostname(&mut argv);
+        assert!(
+            argv.is_empty(),
+            "ssh.github.com must resolve to the github.com API host: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn push_github_api_hostname_set_for_enterprise_host() {
+        // A real GHE host is a distinct API host and keeps the override.
+        let mut argv = Vec::new();
+        github_ctx("internal.ghe.com").push_github_api_hostname(&mut argv);
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("--hostname"),
+                OsString::from("internal.ghe.com")
+            ]
+        );
     }
 
     #[test]
