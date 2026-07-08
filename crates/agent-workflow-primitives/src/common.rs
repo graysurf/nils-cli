@@ -229,7 +229,32 @@ pub fn absolute_path(path: &Path) -> Result<PathBuf, CliError> {
     Ok(cwd.join(path))
 }
 
+/// Returns true when `value` begins with a URI scheme (`^[A-Za-z][A-Za-z0-9+.-]*://`),
+/// e.g. `https://`, `http://`, `git+ssh://`. Used to keep URLs out of the
+/// filesystem-path normalizer, which would otherwise collapse the scheme's `//`.
+fn is_url_like(value: &str) -> bool {
+    let Some((scheme, _rest)) = value.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+}
+
 pub fn display_path(path: &Path) -> String {
+    // A URL (https://…, git+ssh://…) carried through this normalizer would have
+    // its scheme separator collapsed by Path::components() (https://host →
+    // https:/host) and the trailing .replace("//", "/"). Detect a leading URI
+    // scheme and return the value unchanged so retained records keep lossless,
+    // clickable provider links (nils-cli#1054). The PathBuf holds the original
+    // bytes, so to_string_lossy recovers the URL as typed.
+    let raw = path.to_string_lossy();
+    if is_url_like(&raw) {
+        return raw.into_owned();
+    }
     let mut parts = Vec::new();
     for component in path.components() {
         match component {
@@ -323,7 +348,41 @@ pub fn preview_text(bytes: &[u8], limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::preview_text;
+    use super::{display_path, preview_text};
+    use std::path::Path;
+
+    #[test]
+    fn display_path_preserves_url_scheme_double_slash() {
+        // A URL routed through display_path must keep its scheme separator; the
+        // Path::components() normalizer would otherwise collapse https:// to
+        // https:/ (nils-cli#1054), breaking retained provider links.
+        assert_eq!(
+            display_path(Path::new(
+                "https://github.com/sympoies/nils-cli/issues/1046#issuecomment-4909586590"
+            )),
+            "https://github.com/sympoies/nils-cli/issues/1046#issuecomment-4909586590"
+        );
+        assert_eq!(
+            display_path(Path::new("http://example.com/a/b")),
+            "http://example.com/a/b"
+        );
+        assert_eq!(
+            display_path(Path::new("git+ssh://git@host/repo.git")),
+            "git+ssh://git@host/repo.git"
+        );
+    }
+
+    #[test]
+    fn display_path_still_normalizes_filesystem_paths() {
+        // Non-URL paths keep the existing normalization, including the
+        // scheme-like ":" that is not a leading URI scheme.
+        assert_eq!(
+            display_path(Path::new("./docs/./runbook.md")),
+            "docs/runbook.md"
+        );
+        assert_eq!(display_path(Path::new("a/b://c")), "a/b:/c");
+        assert_eq!(display_path(Path::new(".")), ".");
+    }
 
     #[test]
     fn preview_text_truncates_on_utf8_char_boundary() {
