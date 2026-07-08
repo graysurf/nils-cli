@@ -175,7 +175,7 @@ operations:
       - { name: <id>, type: integer-or-branch, required: true }
     validations: []
     backends:
-      github: { program: gh,   argv: [pr,   view, "{id}", --json, "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels,body"] }
+      github: { program: gh,   argv: [pr,   view, "{id}", --json, "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels,body,closingIssuesReferences"] }
       gitlab: { program: glab, argv: [mr,   view, "{id}", -F, json] }
     output:
       data:
@@ -191,6 +191,7 @@ operations:
         merge_commit_sha: optional<string>
         labels: list<string>
         body: optional<string>   # GitHub `body` / GitLab `description`; null when the response omits it
+        closing_issue_refs: list<{ number, url }>  # GitHub closingIssuesReferences (Closes/Fixes #N); always [] on GitLab / when absent
 
   - id: pr.list
     schema_version: cli.forge-cli.pr.list.v1
@@ -861,6 +862,7 @@ macros:
       - { name: --strict-labels,            type: bool,                         default: false }
       - { name: --timeout,                  type: duration,                     default: 30m }
       - { name: --no-merge,                 type: bool,                         default: false }
+      - { name: --no-issue-closeout,        type: bool,                         default: false } # skip the post-merge deterministic linked-issue closeout
       - { name: --allow-non-default-base,   type: bool,                         default: false }
       - { name: --allow-unresolved-threads, type: bool,                         default: false }
       - { name: --allow-unchecked-tasks,    type: bool,                         default: false }
@@ -881,6 +883,14 @@ macros:
       - { step: wait_checks,        op: pr.wait-checks }
       - { step: ready,              op: pr.ready,  skip_when: "--no-merge" }
       - { step: merge,              op: pr.merge,  skip_when: "--no-merge" }
+      # After merge, deterministically close every still-open issue the PR
+      # references through a `Closes/Fixes #N` closing keyword (GitHub
+      # `closingIssuesReferences`), rather than depending on GitHub's
+      # asynchronous auto-close. Best-effort: the merge already landed, so a
+      # closeout fetch/close failure records an `ok:false` step but never
+      # short-circuits. Non-closing `Refs #N` references never appear in
+      # `closingIssuesReferences`, so plan-tracking flows are untouched.
+      - { step: issue_closeout,     op: issue.closeout, schema_version: cli.forge-cli.issue.closeout.v1, skip_when: "--no-merge or --no-issue-closeout" }
     output:
       data:
         kind: enum<feature|bug>
@@ -892,9 +902,12 @@ macros:
           merge_sha: optional<string>
         steps: "list of { step, ok, schema_version, payload }"
     notes: |
-      Failure of any step short-circuits the macro. The outer exit
-      code is the failing step's exit code (no remapping). Steps
-      that did not run are omitted from `data.steps`.
+      Failure of a *pre-merge* step short-circuits the macro. The outer exit
+      code is the failing step's exit code (no remapping). Steps that did not
+      run are omitted from `data.steps`. The post-merge `issue_closeout` step
+      is best-effort: it cannot short-circuit (the merge already landed) and
+      surfaces per-issue outcomes (`closed` / `already_closed` / `error`) plus
+      an aggregate `ok`.
 
 # ---------------------------------------------------------------------------
 # Output envelope (matches cli-output-contract-v1).

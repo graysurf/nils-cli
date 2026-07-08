@@ -7,6 +7,7 @@ pub mod auth_status;
 pub mod gitlab_api;
 pub mod inbox;
 pub mod issue_close;
+pub mod issue_closeout;
 pub mod issue_comment;
 pub mod issue_create;
 pub mod issue_edit;

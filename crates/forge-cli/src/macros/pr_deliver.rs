@@ -38,7 +38,8 @@ use crate::ops::pr_create::{self, Environment, find_git_toplevel, test_first_gat
 use crate::ops::pr_view::PrViewPayload;
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
 use crate::ops::{
-    auth_status, pr_checks, pr_list, pr_merge, pr_ready, pr_view, pr_wait_checks, repo_view,
+    auth_status, issue_close, issue_closeout, pr_checks, pr_list, pr_merge, pr_ready, pr_view,
+    pr_wait_checks, repo_view,
 };
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::validations::{
@@ -400,9 +401,34 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         payload: to_value(&merge_payload),
     });
 
+    // 7. issue closeout — deterministic linked-issue close. The merge has
+    //    already landed, so this step is best-effort and never short-circuits
+    //    the macro: a fetch/close failure is recorded as an `ok:false` step
+    //    (or captured per-issue) but the delivery still reports the merge that
+    //    happened. See ops/issue_closeout.rs and #1052.
+    if !args.no_issue_closeout {
+        let closeout_step = run_issue_closeout(runner, ctx, pr_number);
+        steps.push(closeout_step);
+    }
+
     Ok(emit_success_envelope(
         steps, args, ctx, pr_number, pr_url, merged, merge_sha, format,
     ))
+}
+
+/// Run the post-merge closeout and build its `data.steps[]` entry.
+/// [`issue_closeout::run`] re-fetches `closingIssuesReferences` and closes each
+/// still-open one, returning one stable payload shape whether the re-fetch or a
+/// per-issue close failed. It never returns `Err`, so the delivered merge is
+/// never misreported as failed; the step's `ok` mirrors `all_ok()`.
+fn run_issue_closeout<R: BackendRunner>(runner: &R, ctx: &ProviderContext, pr_number: u64) -> Step {
+    let payload = issue_closeout::run(runner, ctx, pr_number);
+    Step {
+        step: "issue_closeout",
+        ok: payload.all_ok(),
+        schema_version: issue_closeout::schema_version(),
+        payload: to_value(&payload),
+    }
 }
 
 /// Lookup filter for the adopt step: open PRs whose head / source branch is
@@ -549,6 +575,12 @@ fn emit_dry_run(
             step: "merge",
             plan: pr_merge_dry_plan(ctx, args),
         });
+        if !args.no_issue_closeout {
+            plan_steps.push(DryRunStep {
+                step: "issue_closeout",
+                plan: pr_issue_closeout_dry_plan(ctx),
+            });
+        }
     }
     // Faithful local preflight: evaluate every non-mutating lock-down rule
     // and report each verdict. This runs local string / `git` checks only —
@@ -747,6 +779,23 @@ fn pr_merge_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String>
     out
 }
 
+/// Dry-run plan for the post-merge closeout step. Two-phase at run time
+/// (probe `closingIssuesReferences`, then close each still-open issue);
+/// rendered here as the mutating close template so the dry-run surfaces the
+/// action it will take. Built from the real [`issue_close::build_close_call`]
+/// so the per-provider argv (only GitHub carries `--reason completed`) can
+/// never drift from what the step actually runs.
+fn pr_issue_closeout_dry_plan(ctx: &ProviderContext) -> Vec<String> {
+    let mut plan =
+        issue_close::build_close_call(ctx, 0, Some(crate::cli::CloseReasonFlag::Completed))
+            .plan_argv();
+    // argv index 3 is the numeric issue-id placeholder.
+    if let Some(id) = plan.get_mut(3) {
+        *id = "<closing-issue>".to_string();
+    }
+    plan
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_success_envelope(
     steps: Vec<Step>,
@@ -866,6 +915,7 @@ mod tests {
             test_first_evidence: None,
             timeout: std::time::Duration::from_secs(30 * 60),
             no_merge,
+            no_issue_closeout: false,
             allow_non_default_base: false,
             allow_unresolved_threads: false,
             allow_unchecked_tasks: false,
@@ -874,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_full_chain_lists_seven_steps() {
+    fn dry_run_full_chain_lists_eight_steps() {
         let format = OutputFormat::Json;
         // Capture stdout would complicate this test; instead validate the
         // plan_steps[] vector via the dry-run helper directly.
@@ -909,9 +959,55 @@ mod tests {
             step: "merge",
             plan: pr_merge_dry_plan(&c, &a),
         });
-        assert_eq!(plan_steps.len(), 7);
-        // Skip-when --no-merge collapses to 5 steps.
+        plan_steps.push(DryRunStep {
+            step: "issue_closeout",
+            plan: pr_issue_closeout_dry_plan(&c),
+        });
+        assert_eq!(plan_steps.len(), 8);
+        // Skip-when --no-merge collapses to 5 steps (closeout is merge-gated).
         let _ = format;
+    }
+
+    #[test]
+    fn issue_closeout_dry_plan_renders_exact_completed_close_on_github() {
+        // Exact ordered argv (skip index 0, the program name) — mirrors the
+        // real `issue close --reason completed` on GitHub.
+        let plan = pr_issue_closeout_dry_plan(&ctx());
+        assert_eq!(
+            plan[1..],
+            [
+                "issue".to_string(),
+                "close".to_string(),
+                "<closing-issue>".to_string(),
+                "--reason".to_string(),
+                "completed".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_closeout_dry_plan_omits_reason_off_github() {
+        // GitLab / Local have no `--reason` state-reason concept, so the dry
+        // plan must not advertise a flag the real close never sends.
+        let gitlab = ProviderContext {
+            provider: Provider::GitLab,
+            host: "gitlab.example.com".into(),
+            source: DetectionSource::Flag,
+            repo: None,
+        };
+        let plan = pr_issue_closeout_dry_plan(&gitlab);
+        assert!(
+            !plan.iter().any(|s| s == "--reason"),
+            "off-GitHub dry plan must omit --reason: {plan:?}"
+        );
+        assert_eq!(
+            plan[1..],
+            [
+                "issue".to_string(),
+                "close".to_string(),
+                "<closing-issue>".to_string(),
+            ]
+        );
     }
 
     #[test]
