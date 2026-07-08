@@ -64,6 +64,17 @@ fn github_call(stub_body: &str, args: &[&str]) -> Value {
     parse_envelope(&run_forge_cli(&stub, &argv).stdout)
 }
 
+/// Like [`github_call`] but pins an explicit `--repo` slug. The issue-list
+/// REST route (sympoies/nils-cli#1050) only engages when a slug is known, so
+/// pinning it keeps the scenario deterministic regardless of the test cwd's
+/// git remote.
+fn github_call_repo(stub_body: &str, repo: &str, args: &[&str]) -> Value {
+    let stub = StubEnv::new().gh_stub(stub_body);
+    let mut argv: Vec<&str> = vec!["--provider", "github", "--repo", repo, "--format", "json"];
+    argv.extend_from_slice(args);
+    parse_envelope(&run_forge_cli(&stub, &argv).stdout)
+}
+
 /// Run a `--provider gitlab` op against a `glab` stub with the given script.
 fn gitlab_call(stub_body: &str, args: &[&str]) -> Value {
     let stub = StubEnv::new().glab_stub(stub_body);
@@ -175,31 +186,37 @@ esac
     )
 }
 
-/// `gh` stub for `issue list`: returns `filtered_json` when the joined
-/// `--label` arg contains the AND-pair `plan,p1`, else `all_json`. Faithful to
-/// gh's server-side label filtering.
+/// `gh` stub for an issue-list lookup (`gh issue list` or the REST
+/// `gh api repos/<slug>/issues`): returns `filtered_json` when the joined label
+/// filter contains the AND-pair `plan,p1`, else `all_json`. Faithful to gh's
+/// server-side label filtering.
 fn gh_issue_list_stub(all_json: &str, filtered_json: &str) -> String {
+    // A labeled GitHub issue list now routes through `gh api`
+    // (`repos/<slug>/issues`) to dodge the SearchType cache
+    // (sympoies/nils-cli#1050); the no-label path is still
+    // `gh issue list`. Answer both invocations, selecting the filtered body
+    // when the AND-pair `plan,p1` label filter is present (comma-joined in both
+    // the `--label plan,p1` and REST `labels=plan,p1` forms).
     format!(
         r#"#!/bin/sh
 set -e
-case "$1 $2" in
-  "issue list")
-    case " $* " in
-      *"plan,p1"*)
-        cat <<'EOF'
+if [ "$1" = "api" ] || [ "$1 $2" = "issue list" ]; then
+  case " $* " in
+    *"plan,p1"*)
+      cat <<'EOF'
 {filtered_json}
 EOF
-        ;;
-      *)
-        cat <<'EOF'
+      ;;
+    *)
+      cat <<'EOF'
 {all_json}
 EOF
-        ;;
-    esac ;;
-  *)
-    echo "stub: unexpected gh args: $*" >&2
-    exit 99 ;;
-esac
+      ;;
+  esac
+else
+  echo "stub: unexpected gh args: $*" >&2
+  exit 99
+fi
 "#
     )
 }
@@ -548,12 +565,20 @@ fn issue_list_label_filter_conforms_across_providers() {
         &["issue", "list", "--label", "plan", "--label", "p1"],
     );
 
-    let gh_all = r#"[{"number":1,"url":"https://github.com/acme/widgets/issues/1","state":"OPEN","title":"Issue one","labels":[{"name":"plan"},{"name":"p1"}],"author":{"login":"local"},"assignees":[]},{"number":2,"url":"https://github.com/acme/widgets/issues/2","state":"OPEN","title":"Issue two","labels":[{"name":"plan"}],"author":{"login":"local"},"assignees":[]}]"#;
-    let gh_filtered = r#"[{"number":1,"url":"https://github.com/acme/widgets/issues/1","state":"OPEN","title":"Issue one","labels":[{"name":"plan"},{"name":"p1"}],"author":{"login":"local"},"assignees":[]}]"#;
+    // REST shape (`gh api repos/<slug>/issues`): the default `--limit 30` fits
+    // one page, so the response is a flat array of issue objects (no `--slurp`
+    // wrapper). URLs are `html_url` and the author is `user`.
+    let gh_all = r#"[{"number":1,"html_url":"https://github.com/acme/widgets/issues/1","state":"open","title":"Issue one","labels":[{"name":"plan"},{"name":"p1"}],"user":{"login":"local"},"assignees":[]},{"number":2,"html_url":"https://github.com/acme/widgets/issues/2","state":"open","title":"Issue two","labels":[{"name":"plan"}],"user":{"login":"local"},"assignees":[]}]"#;
+    let gh_filtered = r#"[{"number":1,"html_url":"https://github.com/acme/widgets/issues/1","state":"open","title":"Issue one","labels":[{"name":"plan"},{"name":"p1"}],"user":{"login":"local"},"assignees":[]}]"#;
     let gh_stub = gh_issue_list_stub(gh_all, gh_filtered);
-    let github_all = github_call(&gh_stub, &["issue", "list", "--label", "plan"]);
-    let github_filtered = github_call(
+    let github_all = github_call_repo(
         &gh_stub,
+        "acme/widgets",
+        &["issue", "list", "--label", "plan"],
+    );
+    let github_filtered = github_call_repo(
+        &gh_stub,
+        "acme/widgets",
         &["issue", "list", "--label", "plan", "--label", "p1"],
     );
 
@@ -603,8 +628,10 @@ fn issue_list_empty_conforms_across_providers() {
     let store = stub.tempdir.path();
     // Store has no issues — listing any label yields an empty set.
     let local = local_call(&stub, store, &["issue", "list", "--label", "zznope"]);
-    let github = github_call(
+    let github = github_call_repo(
+        // Single-page REST empty result is a flat empty array.
         &gh_issue_list_stub("[]", "[]"),
+        "acme/widgets",
         &["issue", "list", "--label", "zznope"],
     );
     let gitlab = gitlab_call(
