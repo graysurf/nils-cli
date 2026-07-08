@@ -997,6 +997,36 @@ Environment variables (read once at startup, all optional):
   `FORGE_CLI_INBOX_CACHE_DIR` — inbox timeout/cache controls.
 - `FORGE_CLI_DEFAULT_PROVIDER` — fallback provider when remote URL
   doesn't auto-detect.
+- `FORGE_CLI_RATE_LIMIT_GATE` — set to `off`/`0`/`false`/`no` to disable the
+  GraphQL rate-limit gate (default enabled).
+- `FORGE_CLI_RATE_LIMIT_MIN_REMAINING` — GraphQL budget headroom below which the
+  gate waits before a GraphQL-backed call (default `50`).
+- `FORGE_CLI_RATE_LIMIT_MAX_WAIT_SECS` — upper bound on the gate's wait for the
+  GraphQL budget to recover, per gated attempt (default `120`).
+- `FORGE_CLI_RATE_LIMIT_POLL_SECS` — re-probe interval while the GraphQL budget
+  is below the threshold (default `15`, minimum `1`).
+
+## GraphQL rate-limit gate
+
+GitHub meters the GraphQL API on a budget separate from REST/core, so the
+shared GraphQL budget can be drained by other consumers while REST/core still
+has thousands of requests remaining. A subsequent GraphQL-backed call then
+fails — historically surfacing as a misleading "not available"/not-found error
+that risks a wrong conclusion (sympoies/nils-cli#1051).
+
+Two mechanisms harden this:
+
+- Backend stderr that reports an exhausted rate limit is classified as an
+  explicit `backend_rate_limited` error (`UNAVAILABLE 69`) rather than a generic
+  `backend_error`, so throttling is never mistaken for a missing resource.
+- GraphQL-backed calls in the PR lifecycle ops (`pr view`/`ready`/`merge`/
+  `checks`/`wait-checks`) and the `pr deliver` macro are wrapped so they
+  preflight the FREE `gh api rate_limit` endpoint (which consumes no quota) and
+  wait, bounded by `FORGE_CLI_RATE_LIMIT_MAX_WAIT_SECS`, for
+  `resources.graphql.remaining` to recover before issuing the call; a
+  `backend_rate_limited` failure then triggers one wait-and-retry. REST calls
+  (`gh api repos/…`), the probe itself, and non-GitHub backends are never gated.
+  The gate is best-effort: an unreadable probe never blocks real work.
 
 ## Provider detection
 

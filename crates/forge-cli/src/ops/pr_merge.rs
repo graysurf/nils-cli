@@ -27,9 +27,7 @@ use std::path::PathBuf;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{
-    BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload, ProcessRunner,
-};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, PrMergeArgs};
 use crate::config::{ForgeConfig, MergeMethod};
 use crate::envelope::emit_success;
@@ -41,6 +39,7 @@ use crate::ops::pr_view;
 use crate::ops::repo_view::{self, RepoViewPayload};
 use crate::ops::required_check_gate::ensure_required_checks_green;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::RateLimitedRunner;
 use crate::validations::{git_status_porcelain, worktree_clean};
 
 pub const SCHEMA: &str = "pr.merge";
@@ -68,7 +67,7 @@ pub fn run(
     args: PrMergeArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = RateLimitedRunner::production();
     let workdir = std::env::current_dir().map_err(|e| {
         ForgeError::software(
             schema_err(),

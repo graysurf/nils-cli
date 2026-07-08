@@ -17,6 +17,7 @@ pub mod local;
 pub mod macros;
 pub mod ops;
 pub mod provider;
+pub mod rate_limit;
 pub mod validations;
 
 use std::ffi::OsString;

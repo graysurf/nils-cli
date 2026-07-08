@@ -206,6 +206,25 @@ EOF
   chmod +x "${bin_dir}/gh"
 }
 
+# gh stub whose REST releases lookup fails with a rate-limit error, to exercise
+# the rate-limit-aware branch of assert_release_assets_available.
+create_mock_gh_rate_limited() {
+  local bin_dir="$1"
+  cat > "${bin_dir}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+if [[ "$*" == *"api repos/"*"/releases/tags/"* ]]; then
+  echo "gh: API rate limit exceeded for user ID 12345. (HTTP 403)" >&2
+  exit 1
+fi
+
+echo "unexpected gh command: $*" >&2
+exit 1
+EOF
+  chmod +x "${bin_dir}/gh"
+}
+
 create_mock_curl() {
   local bin_dir="$1"
   cat > "${bin_dir}/curl" <<'EOF'
@@ -544,6 +563,42 @@ test_from_tap_with_skip_tap_is_mutually_exclusive() {
     fail "expected mutually-exclusive flags to exit non-zero"
   fi
   assert_contains "$stderr_file" 'mutually exclusive'
+}
+
+# Regression for sympoies/nils-cli#1051: when the release lookup is rate-limited,
+# the script must say so explicitly and must NOT report a false "not available".
+test_from_tap_reports_rate_limit_instead_of_not_available() {
+  local tmp repo bin_dir stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  bin_dir="${tmp}/bin"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+  create_mock_gh_rate_limited "$bin_dir"
+
+  git -C "$repo" remote add origin git@github.com:test-org/test-repo.git
+  git -C "$repo" tag -a v0.9.9 -m "v0.9.9"
+
+  set +e
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${bin_dir}:$PATH" \
+      "$entrypoint" --version 0.9.9 --from-tap --tap-dir "${tmp}/tap" --skip-tap-tag \
+      >"${tmp}/stdout.log" 2>"${stderr_file}"
+  )
+  local rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    fail "expected a rate-limited release check to exit non-zero"
+  fi
+  assert_contains "$stderr_file" 'rate limit'
+  assert_not_contains "$stderr_file" 'is not available'
 }
 
 test_from_tap_upgrades_installed_local_brew_formula() {
@@ -977,6 +1032,7 @@ run_all() {
     test_skip_push_skips_tap_stage_with_note
     test_from_tap_without_tag_fails
     test_from_tap_with_skip_tap_is_mutually_exclusive
+    test_from_tap_reports_rate_limit_instead_of_not_available
     test_from_tap_upgrades_installed_local_brew_formula
     test_formula_inplace_editor_idempotent
     test_pr_mode_default_opens_pr_and_tags_merge_commit

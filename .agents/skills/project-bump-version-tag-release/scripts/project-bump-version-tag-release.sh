@@ -423,9 +423,23 @@ assert_release_assets_available() {
 
   command -v gh >/dev/null 2>&1 || die "gh is required to inspect release assets"
 
-  local release_json
-  release_json="$(gh -R "$repo" release view "$tag" --json assets,url 2>/dev/null)" \
-    || die "GitHub Release ${repo} ${tag} is not available"
+  # Route the release/asset existence check through the REST releases endpoint
+  # (core budget) instead of the GraphQL-backed `gh release view`. GitHub meters
+  # the GraphQL API on a budget separate from REST/core, and a GraphQL budget
+  # drained by other consumers must not surface here as a false "release not
+  # available" (sympoies/nils-cli#1051). If the REST call itself is throttled,
+  # say so explicitly rather than concluding the release is missing.
+  local release_json err_file err
+  err_file="$(mktemp)"
+  if ! release_json="$(gh api "repos/${repo}/releases/tags/${tag}" 2>"$err_file")"; then
+    err="$(cat "$err_file")"
+    rm -f "$err_file"
+    if printf '%s' "$err" | grep -qiE 'rate limit|api rate limit exceeded|secondary rate limit'; then
+      die "GitHub API rate limit hit while checking release ${repo} ${tag}; wait for the reset and retry (inspect with: gh api rate_limit)"
+    fi
+    die "GitHub Release ${repo} ${tag} is not available"
+  fi
+  rm -f "$err_file"
 
   local release_url
   release_url="$(
@@ -455,7 +469,9 @@ missing = sorted(required - asset_names)
 if missing:
     print("error:missing release assets: " + ", ".join(missing))
     raise SystemExit(2)
-print("ok:" + (release.get("url") or ""))
+# The REST releases endpoint exposes the browser URL as `html_url`; fall back
+# to `url` (the API URL) so the note still renders if the shape changes.
+print("ok:" + (release.get("html_url") or release.get("url") or ""))
 PY
   )" || die "${release_url#error:}"
 

@@ -24,6 +24,7 @@ mod integration {
     mod pr_merge;
     mod pr_review;
     mod pr_wait_checks;
+    mod rate_limit_gate;
     mod repo_view;
     mod required_check_gate;
     mod search;
