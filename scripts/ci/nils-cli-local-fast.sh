@@ -11,6 +11,10 @@ Description:
   - Detects changed files against a merge-base with <ref> plus staged,
     unstaged, and untracked files.
   - Runs docs-only checks for documentation-only changes.
+  - Runs the docs-hygiene audit for every non-empty change set (it scans
+    runtime surfaces such as crates/**/*.rs, not just doc paths), mirroring the
+    unconditional CI run so a code-only diff that trips a hygiene guardrail
+    fails here too.
   - Runs third-party artifact audit when Cargo manifests, Cargo.lock, the
     generator scripts, or the generated third-party artifact files change.
   - Runs package-scoped fmt/clippy/tests for non-shared crate changes.
@@ -165,6 +169,7 @@ def emit(key, value):
 if not changed:
     emit("mode", "none")
     emit("docs_checks", "0")
+    emit("docs_hygiene", "0")
     emit("changed_count", "0")
     sys.exit(0)
 
@@ -173,6 +178,8 @@ third_party_artifacts = any(affects_third_party_artifacts(path) for path in chan
 if all(is_doc_path(path) for path in changed) and not third_party_artifacts:
     emit("mode", "docs-only")
     emit("docs_checks", "1")
+    # docs-hygiene runs as part of the docs-only battery on this lane.
+    emit("docs_hygiene", "1")
     emit("third_party_artifacts", "0")
     emit("changed_count", str(len(changed)))
     for path in changed:
@@ -256,6 +263,11 @@ else:
 
 emit("mode", mode)
 emit("docs_checks", "1" if docs_checks else "0")
+# docs-hygiene-audit scans runtime surfaces (crates/**/*.rs and specific source
+# files), not just doc paths, and CI runs it unconditionally for every
+# non-docs-only change. Signal it for every non-empty change set so a Rust-only
+# diff that trips a docs-hygiene guardrail fails local-fast, not just full CI.
+emit("docs_hygiene", "0" if mode == "none" else "1")
 emit("third_party_artifacts", "1" if third_party_artifacts else "0")
 emit("changed_count", str(len(changed)))
 for path in changed:
@@ -273,6 +285,7 @@ PY
 
 mode=""
 docs_checks=0
+docs_hygiene=0
 third_party_artifacts=0
 changed_count=0
 declare -a packages=()
@@ -285,6 +298,7 @@ while IFS=$'\t' read -r key value; do
   case "$key" in
     mode) mode="$value" ;;
     docs_checks) docs_checks="$value" ;;
+    docs_hygiene) docs_hygiene="$value" ;;
     third_party_artifacts) third_party_artifacts="$value" ;;
     changed_count) changed_count="$value" ;;
     package) packages+=("$value") ;;
@@ -304,6 +318,7 @@ print_plan() {
   echo "LOCAL_FAST_MODE=$mode"
   echo "LOCAL_FAST_BASE=$base"
   echo "LOCAL_FAST_DOCS_CHECKS=$docs_checks"
+  echo "LOCAL_FAST_DOCS_HYGIENE=$docs_hygiene"
   echo "LOCAL_FAST_THIRD_PARTY_ARTIFACTS=$third_party_artifacts"
   echo "LOCAL_FAST_CHANGED_COUNT=$changed_count"
   for path in "${changed_files[@]}"; do
@@ -406,6 +421,19 @@ esac
 
 if [[ "$docs_checks" -eq 1 ]]; then
   run_docs_checks
+elif [[ "$docs_hygiene" -eq 1 ]]; then
+  # No doc path changed, so the full docs-only battery is not selected, but
+  # docs-hygiene-audit scans runtime surfaces (crates/**/*.rs and specific
+  # source files) that a code-only diff can trip. CI runs docs-hygiene
+  # unconditionally for non-docs-only changes; run it standalone here to match,
+  # keeping this code-only path free of the battery's extra tool requirements.
+  #
+  # docs-hygiene-audit.sh guards its keyword scans with `rg ... || true`, so a
+  # missing rg is swallowed and the audit prints PASS. Require rg first so this
+  # code-only branch cannot report a false green while silently skipping the
+  # Rust-source guardrail it exists to enforce.
+  require_cmd rg
+  run bash scripts/ci/docs-hygiene-audit.sh --strict
 fi
 
 for shell_file in "${shell_files[@]}"; do
