@@ -229,14 +229,6 @@ fn github_rest_list(ctx: &ProviderContext, args: &IssueListArgs) -> bool {
 /// trips during the scan.
 const REST_PER_PAGE: u32 = 100;
 
-/// Safety cap on pages walked by [`run_github_rest_list`]. The scan already
-/// stops as soon as it has enough issues or reaches the final page; this only
-/// bounds the degenerate case of a label shared by thousands of pull requests
-/// and almost no issues, so it never walks unboundedly. Issue-only tracker
-/// scans (`record open` uses `--limit 200`) settle in one or two pages and
-/// never approach it.
-const REST_MAX_PAGES: u32 = 20;
-
 /// Build the page-`page` `gh api` REST call for a labeled GitHub issue-list
 /// lookup. Callers must have confirmed [`github_rest_list`] first (repo slug
 /// present).
@@ -275,12 +267,16 @@ fn build_github_rest_call(ctx: &ProviderContext, args: &IssueListArgs, page: u32
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
-/// Scan `repos/<slug>/issues` page by page until `--limit` issues are
-/// collected, `--limit` cannot be satisfied (a short final page), or the page
-/// cap is hit. Fetching one page at a time and stopping early keeps a small
-/// `--limit` cheap even on repositories with a huge matching set, and keeps
-/// paging when a page is dominated by pull requests so the limit is still
-/// filled with real issues.
+/// Scan `repos/<slug>/issues` page by page until `--limit` issues are collected
+/// or the matching set is exhausted (a short final page). Fetching one page at
+/// a time and stopping early keeps a small `--limit` cheap even on a repo with
+/// a huge matching set, while paging past pull-request-heavy pages so the limit
+/// is still filled with real issues.
+///
+/// There is deliberately no fixed page cap: GitHub returns fewer than
+/// `per_page` rows only on the final page, so the finite matching set
+/// guarantees termination, and any `--limit` the CLI accepts is honoured in
+/// full rather than silently truncated.
 fn run_github_rest_list<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -288,16 +284,19 @@ fn run_github_rest_list<R: BackendRunner>(
 ) -> Result<IssueListPayload, ForgeError> {
     let limit = args.limit.max(1) as usize;
     let mut items: Vec<IssueListItem> = Vec::new();
-    for page in 1..=REST_MAX_PAGES {
+    let mut page = 1u32;
+    loop {
         let call = build_github_rest_call(ctx, args, page);
         let output = runner.run(&call)?;
         let (rows, mut issues) = parse_rest_page(&output)?;
         items.append(&mut issues);
-        // The REST endpoint returns fewer than `per_page` rows only on the
-        // final page, so a short page means the matching set is exhausted.
+        // Stop once the limit is met, or on a short page: the REST endpoint
+        // returns fewer than `per_page` rows only on the final page, so a short
+        // page means the matching set (issues + PRs) is exhausted.
         if items.len() >= limit || (rows as u32) < REST_PER_PAGE {
             break;
         }
+        page += 1;
     }
     items.truncate(limit);
     Ok(IssueListPayload {
@@ -990,5 +989,31 @@ mod tests {
             "must stop after the limit is reached without fetching page 2"
         );
         assert_eq!(payload.items.len(), 50);
+    }
+
+    #[test]
+    fn run_github_rest_list_honors_limit_beyond_two_thousand() {
+        // Regression: a fixed 20-page cap silently truncated to 2000 issues.
+        // With 25 full pages available and `--limit 2500`, the scan must page
+        // past 20 and return all 2500.
+        let pages: Vec<String> = (0..25)
+            .map(|p| {
+                page_of(
+                    (1..=REST_PER_PAGE as u64)
+                        .map(|i| issue_json(p * 100 + i))
+                        .collect(),
+                )
+            })
+            .collect();
+        let runner = PagedRunner::new(&pages);
+        let payload =
+            run_github_rest_list(&runner, &ctx_with_repo(Provider::GitHub), &rest_args(2500))
+                .unwrap();
+        assert_eq!(payload.items.len(), 2500, "must not cap below --limit");
+        assert_eq!(
+            runner.requested_pages().len(),
+            25,
+            "must page past the old 20-page cap"
+        );
     }
 }
