@@ -101,6 +101,26 @@ assert_docs_only_uses_docs_mode() {
   output="$(plan_for --changed-file docs/runbooks/example.md)"
   assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=docs-only"
   assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_CHECKS=1"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_HYGIENE=1"
+  echo "ok"
+}
+
+assert_rust_only_change_runs_docs_hygiene() {
+  echo "== Rust-only change runs docs-hygiene audit (matches unconditional CI run) =="
+  local output
+  output="$(plan_for --changed-file crates/plan-tooling/src/validate.rs)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=packages"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_CHECKS=0"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_HYGIENE=1"
+  echo "ok"
+}
+
+assert_shared_crate_change_runs_docs_hygiene() {
+  echo "== shared-crate (workspace) change runs docs-hygiene audit =="
+  local output
+  output="$(plan_for --changed-file crates/nils-common/src/lib.rs)"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=workspace"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_HYGIENE=1"
   echo "ok"
 }
 
@@ -215,6 +235,7 @@ assert_docs_plus_package_runs_both() {
     --changed-file crates/plan-tooling/src/validate.rs)"
   assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_MODE=packages"
   assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_CHECKS=1"
+  assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_DOCS_HYGIENE=1"
   assert_contains "$FUNCNAME" "$output" "LOCAL_FAST_PACKAGE=nils-plan-tooling"
   echo "ok"
 }
@@ -244,6 +265,8 @@ assert_library_package_keeps_doctests
 assert_shared_crate_escalates_to_workspace
 assert_shared_scrub_crate_escalates_to_workspace
 assert_docs_only_uses_docs_mode
+assert_rust_only_change_runs_docs_hygiene
+assert_shared_crate_change_runs_docs_hygiene
 assert_docs_only_plan_does_not_require_cargo
 assert_crate_src_asset_md_runs_package
 assert_crate_root_embedded_md_runs_package
