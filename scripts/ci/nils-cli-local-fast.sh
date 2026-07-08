@@ -427,6 +427,12 @@ elif [[ "$docs_hygiene" -eq 1 ]]; then
   # source files) that a code-only diff can trip. CI runs docs-hygiene
   # unconditionally for non-docs-only changes; run it standalone here to match,
   # keeping this code-only path free of the battery's extra tool requirements.
+  #
+  # docs-hygiene-audit.sh guards its keyword scans with `rg ... || true`, so a
+  # missing rg is swallowed and the audit prints PASS. Require rg first so this
+  # code-only branch cannot report a false green while silently skipping the
+  # Rust-source guardrail it exists to enforce.
+  require_cmd rg
   run bash scripts/ci/docs-hygiene-audit.sh --strict
 fi
 
