@@ -189,14 +189,40 @@ EOF
   chmod +x "${bin_dir}/bad-wrapper"
 }
 
+# Happy-path gh stub for the `--from-tap` flow. It answers the two gh calls that
+# path now makes: the REST release-asset check
+# (`gh api repos/<repo>/releases/tags/v0.9.9`, returning all eight required
+# assets + an `html_url`) and the tap-update workflow poll (`gh -R <tap> run
+# list …`, returning a completed/success run whose `displayTitle` carries the
+# tag — the field `wait_for_homebrew_tap_update` matches on). Tailored to the
+# v0.9.9 fixture used by test_from_tap_upgrades_installed_local_brew_formula.
 create_mock_gh() {
   local bin_dir="$1"
   cat > "${bin_dir}/gh" <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
+
+if [[ "$*" == *"api repos/"*"/releases/tags/"* ]]; then
+  cat <<'JSON'
+{
+  "html_url": "https://github.com/test-org/test-repo/releases/tag/v0.9.9",
+  "assets": [
+    {"name": "nils-cli-v0.9.9-aarch64-apple-darwin.tar.gz"},
+    {"name": "nils-cli-v0.9.9-aarch64-apple-darwin.tar.gz.sha256"},
+    {"name": "nils-cli-v0.9.9-x86_64-apple-darwin.tar.gz"},
+    {"name": "nils-cli-v0.9.9-x86_64-apple-darwin.tar.gz.sha256"},
+    {"name": "nils-cli-v0.9.9-aarch64-unknown-linux-gnu.tar.gz"},
+    {"name": "nils-cli-v0.9.9-aarch64-unknown-linux-gnu.tar.gz.sha256"},
+    {"name": "nils-cli-v0.9.9-x86_64-unknown-linux-gnu.tar.gz"},
+    {"name": "nils-cli-v0.9.9-x86_64-unknown-linux-gnu.tar.gz.sha256"}
+  ]
+}
+JSON
+  exit 0
+fi
 
 if [[ "$*" == *"run list"* ]]; then
-  printf '[{"databaseId":1,"status":"completed","conclusion":"success","url":"https://example.test/run","headBranch":"v0.9.9","headSha":"abc123"}]\n'
+  printf '[{"databaseId":1,"status":"completed","conclusion":"success","url":"https://example.test/run","displayTitle":"Update nils-cli formula to v0.9.9","event":"repository_dispatch","createdAt":"2026-07-08T00:00:00Z"}]\n'
   exit 0
 fi
 
@@ -225,54 +251,6 @@ EOF
   chmod +x "${bin_dir}/gh"
 }
 
-create_mock_curl() {
-  local bin_dir="$1"
-  cat > "${bin_dir}/curl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-url=""
-for arg in "$@"; do
-  url="$arg"
-done
-case "$url" in
-  *aarch64-apple-darwin.tar.gz.sha256)
-    printf '%s  dist/nils-cli-aarch64-apple-darwin.tar.gz\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    ;;
-  *x86_64-apple-darwin.tar.gz.sha256)
-    printf '%s  dist/nils-cli-x86_64-apple-darwin.tar.gz\n' "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    ;;
-  *aarch64-unknown-linux-gnu.tar.gz.sha256)
-    printf '%s  dist/nils-cli-aarch64-unknown-linux-gnu.tar.gz\n' "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-    ;;
-  *x86_64-unknown-linux-gnu.tar.gz.sha256)
-    printf '%s  dist/nils-cli-x86_64-unknown-linux-gnu.tar.gz\n' "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-    ;;
-  *)
-    echo "unexpected curl URL: $url" >&2
-    exit 1
-    ;;
-esac
-EOF
-  chmod +x "${bin_dir}/curl"
-}
-
-create_mock_ruby() {
-  local bin_dir="$1"
-  cat > "${bin_dir}/ruby" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ "${1:-}" == "-c" ]]; then
-  exit 0
-fi
-
-echo "unexpected ruby command: $*" >&2
-exit 1
-EOF
-  chmod +x "${bin_dir}/ruby"
-}
-
 create_mock_brew() {
   local bin_dir="$1"
   cat > "${bin_dir}/brew" <<'EOF'
@@ -282,6 +260,13 @@ set -euo pipefail
 log_file="${MOCK_LOG:?}"
 
 case "${1:-}" in
+  tap)
+    # `brew tap` (no args) lists installed taps — emit nothing so the caller
+    # treats the tap as absent and taps it; `brew tap <name> <url>` adds it.
+    if [[ -n "${2:-}" ]]; then
+      echo "brew:tap ${2}" >> "$log_file"
+    fi
+    ;;
   style)
     echo "brew:style ${2:-}" >> "$log_file"
     ;;
@@ -579,6 +564,9 @@ test_from_tap_reports_rate_limit_instead_of_not_available() {
   create_mock_semantic_commit "$bin_dir"
   create_mock_git_scope "$bin_dir"
   create_mock_gh_rate_limited "$bin_dir"
+  # `--from-tap` preflights `command -v cargo` before the release-asset check;
+  # stub it so this test is hermetic on toolchain-less hosts too.
+  create_mock_cargo "$bin_dir"
 
   git -C "$repo" remote add origin git@github.com:test-org/test-repo.git
   git -C "$repo" tag -a v0.9.9 -m "v0.9.9"
@@ -616,9 +604,11 @@ test_from_tap_upgrades_installed_local_brew_formula() {
   create_mock_semantic_commit "$bin_dir"
   create_mock_git_scope "$bin_dir"
   create_mock_gh "$bin_dir"
-  create_mock_curl "$bin_dir"
-  create_mock_ruby "$bin_dir"
   create_mock_brew "$bin_dir"
+  # The script preflights `command -v cargo` for every path (including
+  # `--from-tap`), so a stub must be on PATH even though `--from-tap` skips the
+  # build stages and never invokes it.
+  create_mock_cargo "$bin_dir"
 
   git -C "$repo" remote add origin git@github.com:test-org/test-repo.git
   git -C "$repo" tag -a v0.9.9 -m "v0.9.9"
@@ -675,12 +665,18 @@ EOF
       PATH="${bin_dir}:$PATH" \
       MOCK_LOG="$log_file" \
       MOCK_BREW_VERSION="0.9.9" \
-      NILS_CLI_RELEASE_WAIT_SECONDS=1 \
+      NILS_CLI_TAP_WAIT_SECONDS=30 \
       "$entrypoint" --version 0.9.9 --from-tap --tap-dir "$tap" --skip-tap-tag
   ) >"${tmp}/stdout.log" 2>"${stderr_file}"
 
-  assert_contains "${tap}/Formula/nils-cli.rb" 'v0.9.9/nils-cli-v0.9.9-aarch64-apple-darwin'
-  assert_contains "$log_file" 'brew:style'
+  # The `--from-tap` path delegates the formula edit to the remote
+  # `update-nils-cli-formula.yml` workflow (it only *waits* for that run), so it
+  # must NOT edit the local formula — the seeded tap stays at v0.9.8. It asserts
+  # the release assets exist (REST), the tap-update run succeeded, and the local
+  # brew install was upgraded to the target version.
+  assert_contains "$stderr_file" 'GitHub Release assets are available'
+  assert_contains "$stderr_file" 'update-nils-cli-formula.yml run 1 completed'
+  assert_not_contains "${tap}/Formula/nils-cli.rb" 'v0.9.9'
   assert_contains "$log_file" 'brew:list_formula nils-cli'
   assert_contains "$log_file" 'brew:update'
   assert_contains "$log_file" 'brew:upgrade nils-cli'
@@ -1040,11 +1036,12 @@ run_all() {
     test_pr_mode_rejects_non_chore_release_branch
   )
 
-  # A couple of tests drive the real toolchain: `test_full_checks...` probes the
-  # active `rustc` (RUSTC_WRAPPER compatibility check) and
-  # `test_from_tap_upgrades...` requires `cargo` on PATH. Skip them (rather than
-  # fail) when the Rust toolchain is not installed, so the mock-driven suite
-  # still runs on toolchain-less hosts.
+  # `test_full_checks...` drives the real toolchain: it probes the active
+  # `rustc` (RUSTC_WRAPPER compatibility check). Skip it (rather than fail) when
+  # the Rust toolchain is not installed, so the mock-driven suite still runs on
+  # toolchain-less hosts. (`test_from_tap_upgrades...` used to be gated here too,
+  # but the current `--from-tap` path skips the build stages and needs no
+  # toolchain, so it now runs everywhere.)
   local toolchain_ready=1
   if ! command -v rustc >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
     toolchain_ready=0
@@ -1053,7 +1050,7 @@ run_all() {
   local failed=0 t
   for t in "${tests[@]}"; do
     case "$t" in
-      test_full_checks_refresh_lockfile_and_disable_bad_wrapper|test_from_tap_upgrades_installed_local_brew_formula)
+      test_full_checks_refresh_lockfile_and_disable_bad_wrapper)
         if [[ "$toolchain_ready" -eq 0 ]]; then
           echo "SKIP ${t} (requires rustc+cargo on PATH)"
           continue
