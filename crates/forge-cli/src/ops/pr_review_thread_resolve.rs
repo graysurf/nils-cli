@@ -18,13 +18,14 @@ use std::ffi::OsString;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, PrReviewThreadResolveArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_comment::read_body_with_file_flag;
 use crate::ops::pr_review_threads;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::default_runner;
 use crate::validations::no_local_path;
 
 const SCHEMA: &str = "pr.review-threads.resolve";
@@ -51,7 +52,7 @@ pub fn run(
     args: PrReviewThreadResolveArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, args, format, git_remote_url)
 }
 

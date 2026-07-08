@@ -1444,8 +1444,7 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
                     Ok(ctx) => ctx,
                     Err(err) => return err.emit(format),
                 };
-                let runner = crate::backend::ProcessRunner;
-                let code = ops::pr_checks::emit_dry_run(&runner, &ctx, &args, format);
+                let code = ops::pr_checks::emit_dry_run(&ctx, &args, format);
                 return code;
             }
             ops::pr_checks::run(&global, args, format)

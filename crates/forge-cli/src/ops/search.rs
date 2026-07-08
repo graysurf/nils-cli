@@ -18,13 +18,14 @@ use std::ffi::OsString;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess};
 use crate::cli::{
     BINARY, GlobalFlags, SearchCommand, SearchMatchField, SearchQueryArgs, SearchRefsToArgs,
 };
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::default_runner;
 
 const SCHEMA_VERSION: u32 = 1;
 /// Upper bound `gh search` accepts for `--limit`.
@@ -101,7 +102,7 @@ pub fn run(
     command: SearchCommand,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, command, format, git_remote_url)
 }
 

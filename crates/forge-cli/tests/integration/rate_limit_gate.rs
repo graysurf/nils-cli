@@ -23,6 +23,16 @@ const PR_VIEW_JSON: &str = r#"{
   "labels": []
 }"#;
 
+const ISSUE_VIEW_JSON: &str = r#"{
+  "number": 7,
+  "url": "https://github.com/o/r/issues/7",
+  "state": "OPEN",
+  "title": "t",
+  "body": "b",
+  "labels": [],
+  "assignees": []
+}"#;
+
 /// A `gh api rate_limit` document with a healthy GraphQL budget (well above the
 /// default `min_remaining`), so the preflight proceeds without sleeping.
 const HEALTHY_RATE_LIMIT: &str = r#"{"resources":{"core":{"remaining":4821},"graphql":{"limit":5000,"remaining":4999,"reset":1700000000}}}"#;
@@ -90,6 +100,67 @@ esac
     assert!(
         lines.contains(&"pr view"),
         "the gated pr view call still ran; calls={lines:?}"
+    );
+}
+
+#[test]
+fn issue_view_preflights_rate_limit_when_gate_enabled() {
+    // A non-`pr view` GraphQL-backed op must also preflight the free
+    // `gh api rate_limit` probe. This pins that gating is wired centrally for
+    // every op, not hand-picked per PR-lifecycle command (sympoies/nils-cli#1063).
+    let stub = StubEnv::new();
+    let log = stub.tempdir.path().join("gh-calls.log");
+    let body = format!(
+        r#"#!/bin/sh
+set -e
+echo "$1 $2" >> "{log}"
+case "$1 $2" in
+  "api rate_limit")
+    cat <<'EOF'
+{rl}
+EOF
+    ;;
+  "issue view")
+    cat <<'EOF'
+{view}
+EOF
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+        log = log.display(),
+        rl = HEALTHY_RATE_LIMIT,
+        view = ISSUE_VIEW_JSON,
+    );
+    let stub = with_gate_on(stub.gh_stub(&body));
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "issue",
+            "view",
+            "7",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    assert_eq!(parse_envelope(&out.stdout)["data"]["number"], 7);
+
+    let calls = std::fs::read_to_string(&log).expect("read gh call log");
+    let lines: Vec<&str> = calls.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("api rate_limit"),
+        "the free rate-limit probe must run before the GraphQL-backed issue view; calls={lines:?}"
+    );
+    assert!(
+        lines.contains(&"issue view"),
+        "the gated issue view call still ran; calls={lines:?}"
     );
 }
 

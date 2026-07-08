@@ -19,7 +19,7 @@ use crate::ops::pr_state::{
     normalize_mergeable_github, normalize_mergeable_gitlab, normalize_state,
 };
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::rate_limit::RateLimitedRunner;
+use crate::rate_limit::default_runner;
 
 const SCHEMA: &str = "pr.view";
 const SCHEMA_VERSION: u32 = 1;
@@ -74,7 +74,7 @@ pub fn run(global: &GlobalFlags, id: String, format: OutputFormat) -> Result<i32
         let runner = crate::local::LocalRunner::from_global(global)?;
         return run_with(&runner, global, &id, format, git_remote_url);
     }
-    let runner = RateLimitedRunner::production();
+    let runner = default_runner();
     run_with(&runner, global, &id, format, git_remote_url)
 }
 

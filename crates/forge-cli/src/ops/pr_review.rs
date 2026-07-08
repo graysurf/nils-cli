@@ -10,7 +10,7 @@ use std::{collections::HashMap, ffi::OsString, fs, io::Read};
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner};
 use crate::cli::{
     BINARY, GlobalFlags, PrReviewArgs, PrReviewCommand, PrReviewDecision, PrReviewValidateArgs,
 };
@@ -18,6 +18,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_comment;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::default_runner;
 use crate::validations::{no_escaped_control_markdown, no_local_path};
 
 const SCHEMA: &str = "pr.review";
@@ -228,7 +229,7 @@ pub fn run(
     args: PrReviewArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, args, format, git_remote_url)
 }
 

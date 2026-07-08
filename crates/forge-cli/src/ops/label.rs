@@ -11,11 +11,12 @@ use std::fs;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess};
 use crate::cli::{BINARY, GlobalFlags, LabelAuditArgs, LabelCommand, LabelEnsureArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::default_runner;
 
 const LIST_SCHEMA: &str = "label.list";
 const AUDIT_SCHEMA: &str = "label.audit";
@@ -145,7 +146,7 @@ pub fn run(
     command: LabelCommand,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, command, format, git_remote_url)
 }
 

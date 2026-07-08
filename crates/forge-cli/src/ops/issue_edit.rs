@@ -12,12 +12,13 @@ use std::io::Read as _;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, IssueEditArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::issue_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::default_runner;
 use crate::validations::{no_escaped_control_markdown, no_local_path, title_length};
 
 const SCHEMA: &str = "issue.edit";
@@ -43,7 +44,7 @@ pub fn run(
         let runner = crate::local::LocalRunner::from_global(global)?;
         return run_with(&runner, global, args, format, git_remote_url);
     }
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, args, format, git_remote_url)
 }
 

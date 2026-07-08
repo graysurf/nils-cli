@@ -14,12 +14,13 @@ use std::path::Path;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use tempfile::NamedTempFile;
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, PrEditArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_view::{self, PrViewPayload};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::rate_limit::default_runner;
 use crate::validations::{BodyHeadings, body_summary, body_test_plan, no_local_path, title_length};
 
 const SCHEMA: &str = "pr.edit";
@@ -30,7 +31,7 @@ pub fn run(
     args: PrEditArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, args, format, git_remote_url)
 }
 

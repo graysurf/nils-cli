@@ -23,7 +23,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_checks_gitlab;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
-use crate::rate_limit::RateLimitedRunner;
+use crate::rate_limit::default_runner;
 
 pub const SCHEMA: &str = "pr.checks";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -138,7 +138,7 @@ pub fn run(
     args: PrChecksArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = RateLimitedRunner::production();
+    let runner = default_runner();
     run_with(&runner, global, &args, format, git_remote_url)
 }
 
@@ -1028,12 +1028,7 @@ pub(super) fn schema_err() -> String {
 }
 
 /// Render the dry-run plan and emit it as the standard dry-run envelope.
-pub fn emit_dry_run<R: BackendRunner>(
-    _runner: &R,
-    ctx: &ProviderContext,
-    args: &PrChecksArgs,
-    format: OutputFormat,
-) -> i32 {
+pub fn emit_dry_run(ctx: &ProviderContext, args: &PrChecksArgs, format: OutputFormat) -> i32 {
     let call = build_dry_run_call(ctx, args);
     let payload = DryRunPayload::new(ctx.provider, &call);
     emit_success(

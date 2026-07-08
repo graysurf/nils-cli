@@ -23,7 +23,7 @@ use std::os::unix::process::CommandExt;
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, ProcessRunner};
+use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess};
 use crate::cli::{
     BINARY, GitlabVpnModeFlag, GlobalFlags, InboxCommand, InboxItemTypeFlag, InboxKindFlag,
     InboxNextArgs, InboxQueryArgs, parse_duration,
@@ -32,6 +32,7 @@ use crate::config::ForgeConfig;
 use crate::envelope::emit_success_with_warnings;
 use crate::error::ForgeError;
 use crate::provider::{Provider, classify_host, git_remote_url, parse_host};
+use crate::rate_limit::default_runner;
 
 const LIST_SCHEMA: &str = "inbox.list";
 const STATUS_SCHEMA: &str = "inbox.status";
@@ -307,7 +308,7 @@ pub fn run(
     command: InboxCommand,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let runner = ProcessRunner;
+    let runner = default_runner();
     run_with(&runner, global, command, format)
 }
 
