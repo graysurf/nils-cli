@@ -282,6 +282,10 @@ pub struct ServeArgs {
     #[arg(long, value_name = "TOKEN")]
     pub token: Option<String>,
 
+    /// Read the bearer token once from stdin instead of process arguments.
+    #[arg(long = "token-stdin", conflicts_with = "token")]
+    pub token_stdin: bool,
+
     /// Machine identity reported in responses. Falls back to
     /// AGENT_SESSION_MACHINE, then --host, then the short hostname.
     #[arg(long, value_name = "NAME")]

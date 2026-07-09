@@ -23,7 +23,7 @@ agent-session glance <id> --tail 40
 agent-session send <id> --text yes --key enter
 agent-session send <id> --key c-c
 agent-session resume <id>
-agent-session serve --bind 127.0.0.1:8781 --token "$AGENT_SESSION_TOKEN"
+printf '%s' "$AGENT_SESSION_TOKEN" | agent-session serve --bind 127.0.0.1:8781 --token-stdin
 agent-session command <id>
 agent-session attach <id>
 agent-session logs <id>
@@ -68,8 +68,12 @@ is no second state model.
 
 Every response uses the `cli.agent-session.serve.v1` envelope and carries a `machine` identity (`--machine` /
 `AGENT_SESSION_MACHINE` / `--host` / hostname) so an edge can aggregate several machines. Auth is a bearer token
-(`--token` / `AGENT_SESSION_TOKEN`) on all write and attach endpoints, compared without an early-exit on the token bytes;
-when no token is configured (or it is empty) those endpoints fail closed (503). Use a strong, high-entropy token.
+(`--token-stdin`, `--token`, or `AGENT_SESSION_TOKEN`) on all write and attach endpoints, compared without an early-exit
+on the token bytes; when no token is configured (or it is empty) those endpoints fail closed (503). Prefer
+`--token-stdin` for launcher integrations so token material does not appear in process arguments. It reads one trimmed
+token from stdin, rejects empty input, rejects multiple newline-separated tokens, and rejects input over 8192 bytes.
+`--token-stdin` conflicts with `--token`; both forms avoid printing token material in errors. Use a strong,
+high-entropy token.
 
 Trust model: the daemon binds loopback and *refuses* a non-loopback bind unless `--allow-non-loopback` is passed, because
 it drives a remote shell. Session reads (`list` / `glance`) are intentionally open on the bind address, while path-bearing

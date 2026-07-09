@@ -544,7 +544,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__serve)
-            opts="-h --bind --token --machine --allow-non-loopback --tmux-bin --state-dir --host --help"
+            opts="-h --bind --token --token-stdin --machine --allow-non-loopback --tmux-bin --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

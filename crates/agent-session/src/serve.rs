@@ -9,6 +9,8 @@
 //! Every response carries the daemon's `machine` identity so the edge can
 //! aggregate multiple machines. Literal keystroke text is never echoed.
 
+use std::fmt;
+use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -45,6 +47,7 @@ use crate::{
 /// concurrent attaches to one session never delete each other's file.
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
 const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_STDIN_TOKEN_BYTES: u64 = 8 * 1024;
 
 /// Shared daemon state handed to every request handler.
 struct ServeState {
@@ -77,13 +80,16 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
         );
     }
 
-    // Sanitize the explicit --token the same way the env fallback is sanitized,
-    // so an empty/whitespace `--token ""` fails closed instead of authorizing an
-    // empty bearer.
-    let token = sanitize_token(args.token.clone()).or_else(|| non_empty_env("AGENT_SESSION_TOKEN"));
+    let token = match resolve_serve_token(&args) {
+        Ok(token) => token,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return exit::USAGE;
+        }
+    };
     if token.is_none() {
         eprintln!(
-            "warning: no --token / AGENT_SESSION_TOKEN set; write and attach endpoints are disabled"
+            "warning: no --token / --token-stdin / AGENT_SESSION_TOKEN set; write and attach endpoints are disabled"
         );
     }
 
@@ -164,6 +170,52 @@ fn router(state: Arc<ServeState>) -> Router {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[derive(Debug)]
+enum ServeTokenError {
+    EmptyStdin,
+    MultipleStdinTokens,
+    StdinTooLarge,
+    ReadStdin(io::Error),
+}
+
+impl fmt::Display for ServeTokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyStdin => write!(f, "--token-stdin received an empty token"),
+            Self::MultipleStdinTokens => write!(f, "--token-stdin expects exactly one token"),
+            Self::StdinTooLarge => write!(f, "--token-stdin input exceeds 8192 bytes"),
+            Self::ReadStdin(err) => write!(f, "failed to read --token-stdin input: {err}"),
+        }
+    }
+}
+
+fn resolve_serve_token(args: &cli::ServeArgs) -> Result<Option<String>, ServeTokenError> {
+    if args.token_stdin {
+        return read_token_from_stdin(io::stdin().lock()).map(Some);
+    }
+    Ok(sanitize_token(args.token.clone()).or_else(|| non_empty_env("AGENT_SESSION_TOKEN")))
+}
+
+fn read_token_from_stdin<R: Read>(reader: R) -> Result<String, ServeTokenError> {
+    let mut input = String::new();
+    let mut limited = reader.take(MAX_STDIN_TOKEN_BYTES + 1);
+    limited
+        .read_to_string(&mut input)
+        .map_err(ServeTokenError::ReadStdin)?;
+    if input.len() as u64 > MAX_STDIN_TOKEN_BYTES {
+        return Err(ServeTokenError::StdinTooLarge);
+    }
+
+    let token = input.trim();
+    if token.is_empty() {
+        return Err(ServeTokenError::EmptyStdin);
+    }
+    if token.contains(['\n', '\r']) {
+        return Err(ServeTokenError::MultipleStdinTokens);
+    }
+    Ok(token.to_string())
 }
 
 /// Treat an empty/whitespace explicit `--token` as "no token" (fail closed),
@@ -2483,6 +2535,63 @@ mod tests {
         };
         let addr: SocketAddr = args.bind.parse().unwrap();
         assert!(addr.ip().is_loopback(), "default bind must be loopback");
+    }
+
+    #[test]
+    fn serve_token_stdin_conflicts_with_token_without_leaking_token() {
+        use crate::cli::Cli;
+        use clap::Parser;
+
+        let err = Cli::try_parse_from([
+            "agent-session",
+            "serve",
+            "--token",
+            "secret-from-argv",
+            "--token-stdin",
+        ])
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("--token"));
+        assert!(message.contains("--token-stdin"));
+        assert!(
+            !message.contains("secret-from-argv"),
+            "parse error leaked token material: {message}"
+        );
+    }
+
+    #[test]
+    fn token_stdin_reads_single_trimmed_token() {
+        assert_eq!(
+            read_token_from_stdin("  stdin-token\n".as_bytes()).unwrap(),
+            "stdin-token"
+        );
+    }
+
+    #[test]
+    fn token_stdin_rejects_empty_input_without_leaking_material() {
+        let err = read_token_from_stdin("   \n".as_bytes()).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("empty"));
+        assert!(!message.contains("\\n"));
+    }
+
+    #[test]
+    fn token_stdin_rejects_multiple_lines_without_leaking_material() {
+        let err = read_token_from_stdin("first-token\nsecond-token\n".as_bytes()).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("exactly one token"));
+        assert!(!message.contains("first-token"));
+        assert!(!message.contains("second-token"));
+    }
+
+    #[test]
+    fn token_stdin_rejects_oversized_input() {
+        let oversized = "a".repeat((MAX_STDIN_TOKEN_BYTES + 1) as usize);
+        let err = read_token_from_stdin(oversized.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("8192 bytes"));
     }
 
     #[tokio::test]
