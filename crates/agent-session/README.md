@@ -50,8 +50,9 @@ is no second state model.
   envelope contains `data.usage.schema_version: "agent-session.usage.v1"` and
   provider entries for Codex and Claude. Provider readers are bounded by
   `AGENT_SESSION_USAGE_TIMEOUT_MS` (default 12000), preserve partial success,
-  and redact tokens, local auth paths, and private account identifiers from
-  scoped error messages.
+  preserve reset timestamps as `reset_at_epoch` epoch seconds plus textual
+  `reset_at` when supplied by the helper, and redact tokens, local auth paths,
+  and private account identifiers from scoped error messages.
 - `GET /workdirs?q=...&limit=N` — authenticated read; searches only the default operator roots (`$HOME/Project` and
   `$HOME/.config`) with bounded depth, count, and elapsed-time limits. Add `git_only=true&exclude_worktrees=true` for
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage
