@@ -13,10 +13,10 @@ use std::fmt;
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
@@ -30,7 +30,7 @@ use axum::routing::{get, patch, post};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use nils_common::cli_contract::{exit, schema_version_for};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cli::{self, AgentKind, SpecialKey};
@@ -48,6 +48,8 @@ use crate::{
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
 const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_STDIN_TOKEN_BYTES: u64 = 8 * 1024;
+const USAGE_SCHEMA_VERSION: &str = "agent-session.usage.v1";
+const DEFAULT_USAGE_TIMEOUT_MS: u64 = 12_000;
 
 /// Shared daemon state handed to every request handler.
 struct ServeState {
@@ -150,6 +152,7 @@ fn router(state: Arc<ServeState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/sessions", get(list_handler).post(create_handler))
+        .route("/usage", get(usage_handler))
         .route("/workdirs", get(workdirs_handler))
         .route("/repos/remote-url", get(repo_remote_url_handler))
         .route("/sessions/{id}/glance", get(glance_handler))
@@ -292,6 +295,415 @@ fn join_err() -> Response {
         "internal task failed",
         None,
     ))
+}
+
+#[derive(Debug, Serialize)]
+struct UsageReport {
+    schema_version: String,
+    ok: bool,
+    providers: Vec<UsageProvider>,
+}
+
+#[derive(Debug, Serialize)]
+struct UsageProvider {
+    id: String,
+    label: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    windows: Vec<UsageWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<UsageProviderError>,
+}
+
+#[derive(Debug, Serialize)]
+struct UsageWindow {
+    label: String,
+    used_percent: i64,
+    remaining_percent: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reset_at_epoch: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct UsageProviderError {
+    code: String,
+    message: String,
+}
+
+struct UsageHelperOutput {
+    status_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+async fn usage_handler(State(state): State<Arc<ServeState>>) -> Response {
+    let timeout = usage_timeout();
+    let codex = tokio::task::spawn_blocking(move || collect_codex_usage(timeout));
+    let claude = tokio::task::spawn_blocking(move || collect_claude_usage(timeout));
+    let (codex, claude) = tokio::join!(codex, claude);
+
+    let providers = vec![
+        codex.unwrap_or_else(|_| provider_internal_error("codex", "Codex")),
+        claude.unwrap_or_else(|_| provider_internal_error("claude", "Claude")),
+    ];
+    let ok = providers.iter().all(|provider| provider.ok);
+    envelope_ok(json!({
+        "machine": state.machine,
+        "usage": UsageReport {
+            schema_version: USAGE_SCHEMA_VERSION.to_string(),
+            ok,
+            providers,
+        },
+    }))
+}
+
+fn usage_timeout() -> Duration {
+    std::env::var("AGENT_SESSION_USAGE_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_USAGE_TIMEOUT_MS))
+}
+
+fn collect_codex_usage(timeout: Duration) -> UsageProvider {
+    match run_usage_helper(
+        "codex-cli",
+        &[
+            "diag",
+            "rate-limits",
+            "--all",
+            "--format",
+            "json",
+            "--no-refresh-auth",
+        ],
+        timeout,
+    ) {
+        Ok(output) => normalize_codex_usage(output),
+        Err(message) => provider_error("codex", "Codex", "helper-spawn-failed", message),
+    }
+}
+
+fn collect_claude_usage(timeout: Duration) -> UsageProvider {
+    match run_usage_helper(
+        "claude-cli",
+        &["usage", "--format", "json", "--source", "auto"],
+        timeout,
+    ) {
+        Ok(output) => normalize_claude_usage(output),
+        Err(message) => provider_error("claude", "Claude", "helper-spawn-failed", message),
+    }
+}
+
+fn run_usage_helper(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<UsageHelperOutput, String> {
+    let mut child = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to start {program}: {err}"))?;
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status.code().unwrap_or(1)),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                return Err(format!("failed to wait for {program}: {err}"));
+            }
+        }
+    };
+
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_end(&mut stdout);
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr);
+    }
+
+    Ok(UsageHelperOutput {
+        status_code: status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn normalize_codex_usage(output: UsageHelperOutput) -> UsageProvider {
+    if output.timed_out {
+        return provider_error(
+            "codex",
+            "Codex",
+            "helper-timeout",
+            "codex usage helper timed out".to_string(),
+        );
+    }
+
+    let value: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(_) => {
+            return provider_error(
+                "codex",
+                "Codex",
+                "helper-invalid-json",
+                helper_failure_message("codex usage unavailable", &output),
+            );
+        }
+    };
+
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| value.get("result").map(|result| vec![result.clone()]))
+        .unwrap_or_default();
+
+    let mut windows = Vec::new();
+    for result in results.iter().filter(|result| {
+        result
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| result.get("status").and_then(Value::as_str) == Some("ok"))
+    }) {
+        windows.extend(windows_from_value(result));
+        if windows.is_empty()
+            && let Some(summary) = result.get("summary")
+        {
+            windows.extend(windows_from_codex_summary(summary));
+        }
+    }
+
+    if !windows.is_empty() {
+        return UsageProvider {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            ok: true,
+            source: Some("codex-cli".to_string()),
+            windows,
+            error: None,
+        };
+    }
+
+    let (code, message) =
+        error_from_helper_json(&value, output.status_code, "codex usage unavailable");
+    provider_error("codex", "Codex", &code, message)
+}
+
+fn normalize_claude_usage(output: UsageHelperOutput) -> UsageProvider {
+    if output.timed_out {
+        return provider_error(
+            "claude",
+            "Claude",
+            "helper-timeout",
+            "claude usage helper timed out".to_string(),
+        );
+    }
+
+    let value: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(_) => {
+            return provider_error(
+                "claude",
+                "Claude",
+                "helper-invalid-json",
+                helper_failure_message("claude usage unavailable", &output),
+            );
+        }
+    };
+
+    let result = value.get("result").unwrap_or(&value);
+    let windows = windows_from_value(result);
+    if !windows.is_empty() {
+        return UsageProvider {
+            id: "claude".to_string(),
+            label: "Claude".to_string(),
+            ok: true,
+            source: Some("claude-cli".to_string()),
+            windows,
+            error: None,
+        };
+    }
+
+    let (code, message) =
+        error_from_helper_json(&value, output.status_code, "claude usage unavailable");
+    provider_error("claude", "Claude", &code, message)
+}
+
+fn windows_from_value(value: &Value) -> Vec<UsageWindow> {
+    value
+        .get("windows")
+        .and_then(Value::as_array)
+        .map(|windows| windows.iter().filter_map(usage_window_from_value).collect())
+        .unwrap_or_default()
+}
+
+fn usage_window_from_value(value: &Value) -> Option<UsageWindow> {
+    let label = value.get("label").and_then(Value::as_str)?.to_string();
+    let used_percent = i64_field(value, &["used_percent"])?;
+    let remaining_percent = i64_field(value, &["remaining_percent"])
+        .unwrap_or_else(|| (100 - used_percent).clamp(0, 100));
+    let reset_at_epoch = i64_field(value, &["reset_at_epoch", "reset_at"]);
+    Some(UsageWindow {
+        label,
+        used_percent,
+        remaining_percent,
+        reset_at_epoch,
+    })
+}
+
+fn windows_from_codex_summary(summary: &Value) -> Vec<UsageWindow> {
+    let mut windows = Vec::new();
+    if let Some(remaining) = i64_field(summary, &["non_weekly_remaining"]) {
+        windows.push(UsageWindow {
+            label: summary
+                .get("non_weekly_label")
+                .and_then(Value::as_str)
+                .unwrap_or("Non-weekly")
+                .to_string(),
+            used_percent: (100 - remaining).clamp(0, 100),
+            remaining_percent: remaining,
+            reset_at_epoch: i64_field(
+                summary,
+                &["non_weekly_reset_epoch", "non_weekly_reset_at_epoch"],
+            ),
+        });
+    }
+    if let Some(remaining) = i64_field(summary, &["weekly_remaining"]) {
+        windows.push(UsageWindow {
+            label: "Weekly".to_string(),
+            used_percent: (100 - remaining).clamp(0, 100),
+            remaining_percent: remaining,
+            reset_at_epoch: i64_field(summary, &["weekly_reset_epoch", "weekly_reset_at_epoch"]),
+        });
+    }
+    windows
+}
+
+fn i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_f64().map(|n| n.round() as i64))
+        })
+    })
+}
+
+fn error_from_helper_json(
+    value: &Value,
+    status_code: Option<i32>,
+    fallback: &str,
+) -> (String, String) {
+    let code = value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if status_code.unwrap_or(0) == 0 {
+                "usage-unavailable"
+            } else {
+                "helper-failed"
+            }
+        })
+        .to_string();
+    let message = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or(fallback);
+    (code, sanitize_helper_message(message))
+}
+
+fn helper_failure_message(prefix: &str, output: &UsageHelperOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(prefix);
+    sanitize_helper_message(message)
+}
+
+fn provider_internal_error(id: &str, label: &str) -> UsageProvider {
+    provider_error(
+        id,
+        label,
+        "serve-task-failed",
+        "usage provider task failed".to_string(),
+    )
+}
+
+fn provider_error(id: &str, label: &str, code: &str, message: String) -> UsageProvider {
+    UsageProvider {
+        id: id.to_string(),
+        label: label.to_string(),
+        ok: false,
+        source: None,
+        windows: Vec::new(),
+        error: Some(UsageProviderError {
+            code: code.to_string(),
+            message: sanitize_helper_message(&message),
+        }),
+    }
+}
+
+fn sanitize_helper_message(message: &str) -> String {
+    let normalized = message.replace(['\n', '\r', '\t'], " ");
+    let mut cleaned = Vec::new();
+    let mut redact_next = false;
+    for token in normalized.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        let should_redact = redact_next
+            || lower.contains("access_token")
+            || lower.contains("refresh_token")
+            || lower.contains("authorization")
+            || lower.contains("bearer")
+            || lower.contains("sk-")
+            || lower.contains("account_id")
+            || lower.contains("account-id")
+            || lower.contains("acct_")
+            || token.contains('@');
+        redact_next = lower.contains("bearer") || lower.contains("authorization:");
+
+        if should_redact {
+            cleaned.push("[redacted]".to_string());
+        } else if token.starts_with('/')
+            || token.starts_with("~/")
+            || token.starts_with("$HOME/")
+            || token.contains("/home/")
+            || token.contains("/Users/")
+        {
+            cleaned.push("[path]".to_string());
+        } else {
+            cleaned.push(token.to_string());
+        }
+        if cleaned.len() >= 24 {
+            break;
+        }
+    }
+    if cleaned.is_empty() {
+        "usage unavailable".to_string()
+    } else {
+        cleaned.join(" ")
+    }
 }
 
 /// XOR-accumulating byte comparison so a correct-length wrong token is compared

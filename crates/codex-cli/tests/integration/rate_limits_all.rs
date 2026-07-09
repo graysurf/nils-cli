@@ -23,6 +23,11 @@ fn run(args: &[&str], envs: &[(&str, &Path)], vars: &[(&str, &str)]) -> CmdOutpu
     cmd::run_with(&bin, args, &options)
 }
 
+fn run_with_options(args: &[&str], options: &CmdOptions) -> CmdOutput {
+    let bin = codex_cli_bin();
+    cmd::run_with(&bin, args, options)
+}
+
 fn stdout(output: &CmdOutput) -> String {
     output.stdout_text()
 }
@@ -152,6 +157,92 @@ fn rate_limits_all_json_outputs_results() {
         results
             .iter()
             .all(|entry| entry["raw_usage"]["rate_limit"].is_object())
+    );
+}
+
+#[test]
+fn rate_limits_all_json_falls_back_to_official_codex_auth_file() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let home = dir.path().join("home");
+    let codex_home = home.join(".codex");
+    fs::create_dir_all(&codex_home).expect("codex home");
+    fs::write(
+        codex_home.join("auth.json"),
+        r#"{"access_token":"tok-official","account_id":"acct_official"}"#,
+    )
+    .expect("write official auth");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(
+            200,
+            r#"{
+  "rate_limit": {
+    "primary_window": { "limit_window_seconds": 18000, "used_percent": 6, "reset_at": 1700003600 },
+    "secondary_window": { "limit_window_seconds": 604800, "used_percent": 12, "reset_at": 1700600000 }
+  }
+}"#,
+        ),
+    );
+
+    let options = CmdOptions::new()
+        .with_env("HOME", home.to_str().expect("home"))
+        .with_env("CODEX_CHATGPT_BASE_URL", &server.url())
+        .with_env("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false")
+        .with_env("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1")
+        .with_env("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3")
+        .with_env_remove("CODEX_HOME")
+        .with_env_remove("CODEX_SECRET_DIR")
+        .with_env_remove("CODEX_AUTH_FILE");
+
+    let output = run_with_options(
+        &[
+            "diag",
+            "rate-limits",
+            "--all",
+            "--format",
+            "json",
+            "--no-refresh-auth",
+        ],
+        &options,
+    );
+    assert_exit(&output, 0);
+    assert!(!stdout(&output).contains("tok-official"));
+    assert!(!stdout(&output).contains(codex_home.to_str().expect("codex home")));
+
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["schema_version"], "codex-cli.diag.rate-limits.v1");
+    assert_eq!(payload["ok"], true);
+    let results = payload["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert_eq!(result["provider"], "codex");
+    assert_eq!(result["target_file"], "auth.json");
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["summary"]["weekly_remaining"], 88);
+    assert_eq!(result["windows"][0]["label"], "5h");
+    assert_eq!(result["windows"][0]["used_percent"], 6);
+    assert_eq!(result["windows"][0]["remaining_percent"], 94);
+    assert_eq!(result["windows"][1]["label"], "Weekly");
+    assert_eq!(result["windows"][1]["used_percent"], 12);
+    assert_eq!(result["windows"][1]["remaining_percent"], 88);
+    assert!(
+        !fs::read_to_string(codex_home.join("auth.json"))
+            .expect("auth")
+            .contains("codex_rate_limits")
+    );
+
+    let requests = server.take_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].header_value("authorization"),
+        Some("Bearer tok-official".to_string())
+    );
+    assert_eq!(
+        requests[0].header_value("chatgpt-account-id"),
+        Some("acct_official".to_string())
     );
 }
 

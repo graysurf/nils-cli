@@ -46,6 +46,12 @@ is no second state model.
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
   the recorded `cwd`.
+- `GET /usage` — read-only provider usage report, open on loopback. The serve
+  envelope contains `data.usage.schema_version: "agent-session.usage.v1"` and
+  provider entries for Codex and Claude. Provider readers are bounded by
+  `AGENT_SESSION_USAGE_TIMEOUT_MS` (default 12000), preserve partial success,
+  and redact tokens, local auth paths, and private account identifiers from
+  scoped error messages.
 - `GET /workdirs?q=...&limit=N` — authenticated read; searches only the default operator roots (`$HOME/Project` and
   `$HOME/.config`) with bounded depth, count, and elapsed-time limits. Add `git_only=true&exclude_worktrees=true` for
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage

@@ -40,6 +40,7 @@ pub enum UsageSource {
 
 #[derive(Debug, Clone, Serialize)]
 struct UsageResult {
+    provider: String,
     source: String,
     stale: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +165,7 @@ fn read_cache(cache_file: Option<&PathBuf>) -> Option<UsageResult> {
 
 fn empty_result(cache_file: Option<PathBuf>, note: &str) -> UsageResult {
     UsageResult {
+        provider: "claude".to_string(),
         source: "none".to_string(),
         stale: true,
         cache_file: cache_file.as_ref().map(|path| display_path(path)),
@@ -191,6 +193,7 @@ fn result_from_usage(
     }
 
     UsageResult {
+        provider: "claude".to_string(),
         source: source.to_string(),
         stale,
         cache_file: cache_file.map(|path| display_path(path)),

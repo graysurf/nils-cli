@@ -83,8 +83,11 @@ Stable (safe for strict parsing):
   - `results[*].name`
   - `results[*].status` (`ok|error`)
   - `summary.non_weekly_label`, `summary.non_weekly_remaining`,
-    `summary.weekly_remaining`, `summary.weekly_reset_at_epoch`,
-    `summary.non_weekly_reset_at_epoch`
+    `summary.weekly_remaining`, `summary.weekly_reset_epoch`,
+    `summary.non_weekly_reset_epoch`
+  - `results[*].provider` (`codex`)
+  - `results[*].windows[*].label`, `used_percent`, `remaining_percent`,
+    optional `reset_at_epoch`
 - Auth:
   - `auth login`: `method` (`chatgpt-browser|chatgpt-device-code|api-key`),
     `provider` (`chatgpt|openai-api`), `completed`
@@ -134,15 +137,30 @@ Informational (do not hard-depend for schema validation):
   "ok": true,
   "result": {
     "mode": "single",
+    "provider": "codex",
     "target_file": "alpha.json",
     "source": "network",
     "summary": {
       "non_weekly_label": "5h",
       "non_weekly_remaining": 94,
       "weekly_remaining": 88,
-      "weekly_reset_at_epoch": 1700600000,
-      "non_weekly_reset_at_epoch": 1700003600
+      "weekly_reset_epoch": 1700600000,
+      "non_weekly_reset_epoch": 1700003600
     },
+    "windows": [
+      {
+        "label": "5h",
+        "used_percent": 6,
+        "remaining_percent": 94,
+        "reset_at_epoch": 1700003600
+      },
+      {
+        "label": "Weekly",
+        "used_percent": 12,
+        "remaining_percent": 88,
+        "reset_at_epoch": 1700600000
+      }
+    ],
     "raw_usage": {
       "rate_limit": {}
     }
@@ -161,6 +179,7 @@ Informational (do not hard-depend for schema validation):
   "results": [
     {
       "name": "alpha",
+      "provider": "codex",
       "target_file": "alpha.json",
       "status": "ok",
       "source": "network",
@@ -168,9 +187,23 @@ Informational (do not hard-depend for schema validation):
         "non_weekly_label": "5h",
         "non_weekly_remaining": 94,
         "weekly_remaining": 88,
-        "weekly_reset_at_epoch": 1700600000,
-        "non_weekly_reset_at_epoch": 1700003600
+        "weekly_reset_epoch": 1700600000,
+        "non_weekly_reset_epoch": 1700003600
       },
+      "windows": [
+        {
+          "label": "5h",
+          "used_percent": 6,
+          "remaining_percent": 94,
+          "reset_at_epoch": 1700003600
+        },
+        {
+          "label": "Weekly",
+          "used_percent": 12,
+          "remaining_percent": 88,
+          "reset_at_epoch": 1700600000
+        }
+      ],
       "raw_usage": {
         "rate_limit": {}
       }
@@ -190,6 +223,13 @@ Informational (do not hard-depend for schema validation):
   ]
 }
 ```
+
+When no explicit `CODEX_SECRET_DIR` is configured and the default nils-managed
+secret store is missing or empty, `diag rate-limits` may fall back read-only to
+official Codex auth (`$CODEX_HOME/auth.json`, or `$HOME/.codex/auth.json` when
+`CODEX_HOME` is unset). Explicit env/config overrides and nils-managed secrets
+still take precedence. Official auth fallback is never written back with
+`codex_rate_limits`; prompt-segment cache writeback remains allowed.
 
 ### diag rate-limits (command-level failure)
 

@@ -62,7 +62,17 @@ struct RateLimitSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct RateLimitWindow {
+    label: String,
+    used_percent: i64,
+    remaining_percent: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reset_at_epoch: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct RateLimitJsonResult {
+    provider: String,
     name: String,
     target_file: String,
     status: String,
@@ -70,6 +80,8 @@ struct RateLimitJsonResult {
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<RateLimitSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    windows: Option<Vec<RateLimitWindow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_usage: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -352,7 +364,34 @@ fn emit_collection_envelope(mode: &str, ok: bool, results: Vec<RateLimitJsonResu
 }
 
 fn collect_secret_files() -> std::result::Result<Vec<PathBuf>, (i32, String, Option<Value>)> {
+    if std::env::var_os(CODEX_PROVIDER_PROFILE.env.secret_dir).is_some() {
+        let secret_dir = crate::paths::resolve_secret_dir().unwrap_or_default();
+        return collect_json_secret_files_from_dir(&secret_dir, true);
+    }
+
     let secret_dir = crate::paths::resolve_secret_dir().unwrap_or_default();
+    if secret_dir.is_dir()
+        && let Ok(secret_files) = collect_json_secret_files_from_dir(&secret_dir, false)
+        && !secret_files.is_empty()
+    {
+        return Ok(secret_files);
+    }
+
+    if let Some(auth_file) = existing_active_auth_file() {
+        return Ok(vec![auth_file]);
+    }
+
+    if let Some(auth_file) = official_codex_auth_file() {
+        return Ok(vec![auth_file]);
+    }
+
+    no_secret_files_error(&secret_dir)
+}
+
+fn collect_json_secret_files_from_dir(
+    secret_dir: &Path,
+    strict: bool,
+) -> std::result::Result<Vec<PathBuf>, (i32, String, Option<Value>)> {
     if !secret_dir.is_dir() {
         return Err((
             1,
@@ -366,7 +405,7 @@ fn collect_secret_files() -> std::result::Result<Vec<PathBuf>, (i32, String, Opt
         ));
     }
 
-    let mut secret_files: Vec<PathBuf> = std::fs::read_dir(&secret_dir)
+    let mut secret_files: Vec<PathBuf> = std::fs::read_dir(secret_dir)
         .map_err(|err| {
             (
                 1,
@@ -381,21 +420,54 @@ fn collect_secret_files() -> std::result::Result<Vec<PathBuf>, (i32, String, Opt
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
         .collect();
 
-    if secret_files.is_empty() {
-        return Err((
-            1,
-            format!(
-                "codex-rate-limits: no secrets found in {}",
-                secret_dir.display()
-            ),
-            Some(serde_json::json!({
-                "secret_dir": secret_dir.display().to_string(),
-            })),
-        ));
+    if strict && secret_files.is_empty() {
+        return no_secret_files_error(secret_dir);
     }
 
     secret_files.sort();
     Ok(secret_files)
+}
+
+fn no_secret_files_error(
+    secret_dir: &Path,
+) -> std::result::Result<Vec<PathBuf>, (i32, String, Option<Value>)> {
+    Err((
+        1,
+        format!(
+            "codex-rate-limits: no secrets found in {}",
+            secret_dir.display()
+        ),
+        Some(serde_json::json!({
+            "secret_dir": secret_dir.display().to_string(),
+        })),
+    ))
+}
+
+fn existing_active_auth_file() -> Option<PathBuf> {
+    crate::paths::resolve_auth_file().filter(|path| path.is_file())
+}
+
+fn official_codex_auth_file() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("auth.json"))
+        .filter(|path| path.is_file())
+    {
+        return Some(path);
+    }
+
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".codex").join("auth.json"))
+        .filter(|path| path.is_file())
+}
+
+fn is_official_codex_auth_file(target_file: &Path) -> bool {
+    official_codex_auth_file().as_deref() == Some(target_file)
+}
+
+fn should_writeback_usage(target_file: &Path) -> bool {
+    !is_official_codex_auth_file(target_file)
 }
 
 fn collect_json_result_for_secret(
@@ -423,7 +495,9 @@ fn collect_json_result_for_secret(
 
     match fetch_usage(&usage_request) {
         Ok(usage) => {
-            if let Err(err) = writeback::write_weekly(target_file, &usage.json) {
+            if should_writeback_usage(target_file)
+                && let Err(err) = writeback::write_weekly(target_file, &usage.json)
+            {
                 return json_result_error(
                     target_file,
                     "network",
@@ -444,8 +518,8 @@ fn collect_json_result_for_secret(
                     None,
                 );
             }
-            match summary_from_usage(&usage.json) {
-                Some(summary) => {
+            match summary_and_windows_from_usage(&usage.json) {
+                Some((summary, windows)) => {
                     let fetched_at_epoch = Utc::now().timestamp();
                     if fetched_at_epoch > 0 {
                         let _ = cache::write_prompt_segment_cache(
@@ -459,12 +533,14 @@ fn collect_json_result_for_secret(
                         );
                     }
                     RateLimitJsonResult {
+                        provider: "codex".to_string(),
                         name: secret_display_name(target_file),
                         target_file: target_file_name(target_file),
                         status: "ok".to_string(),
                         ok: true,
                         source: "network".to_string(),
                         summary: Some(summary),
+                        windows: Some(windows),
                         raw_usage: Some(redact_sensitive_json(&usage.json)),
                         error: None,
                     }
@@ -524,12 +600,14 @@ fn collect_json_from_cache(
 
     match cache_entry {
         Ok(entry) => RateLimitJsonResult {
+            provider: "codex".to_string(),
             name: secret_display_name(target_file),
             target_file: target_file_name(target_file),
             status: "ok".to_string(),
             ok: true,
             source: source.to_string(),
             summary: Some(summary_from_cache(&entry)),
+            windows: Some(windows_from_cache(&entry)),
             raw_usage: None,
             error: None,
         },
@@ -551,12 +629,14 @@ fn json_result_error(
     details: Option<Value>,
 ) -> RateLimitJsonResult {
     RateLimitJsonResult {
+        provider: "codex".to_string(),
         name: secret_display_name(target_file),
         target_file: target_file_name(target_file),
         status: "error".to_string(),
         ok: false,
         source: source.to_string(),
         summary: None,
+        windows: None,
         raw_usage: None,
         error: Some(diag_output::ErrorEnvelope {
             code: code.to_string(),
@@ -570,12 +650,14 @@ fn json_result_error(
 /// with no cache to fall back to. Reported as a success, not an error.
 fn json_result_no_window(target_file: &Path) -> RateLimitJsonResult {
     RateLimitJsonResult {
+        provider: "codex".to_string(),
         name: secret_display_name(target_file),
         target_file: target_file_name(target_file),
         status: "no-rate-limit-window".to_string(),
         ok: true,
         source: "network".to_string(),
         summary: None,
+        windows: Some(Vec::new()),
         raw_usage: None,
         error: None,
     }
@@ -600,11 +682,13 @@ fn target_file_name(target_file: &Path) -> String {
         .to_string()
 }
 
-fn summary_from_usage(usage_json: &Value) -> Option<RateLimitSummary> {
+fn summary_and_windows_from_usage(
+    usage_json: &Value,
+) -> Option<(RateLimitSummary, Vec<RateLimitWindow>)> {
     let usage_data = render::parse_usage(usage_json)?;
     let values = render::render_values(&usage_data);
     let weekly = render::weekly_values(&values);
-    Some(RateLimitSummary {
+    let summary = RateLimitSummary {
         non_weekly_label: weekly.non_weekly_label,
         non_weekly_remaining: weekly.non_weekly_remaining,
         non_weekly_reset_epoch: weekly.non_weekly_reset_epoch,
@@ -613,7 +697,29 @@ fn summary_from_usage(usage_json: &Value) -> Option<RateLimitSummary> {
         weekly_reset_local: render::format_epoch_local_datetime_with_offset(
             weekly.weekly_reset_epoch,
         ),
-    })
+    };
+    let windows = windows_from_usage_values(&usage_data, &values);
+    Some((summary, windows))
+}
+
+fn windows_from_usage_values(
+    usage_data: &render::UsageData,
+    values: &render::RenderValues,
+) -> Vec<RateLimitWindow> {
+    vec![
+        RateLimitWindow {
+            label: values.primary_label.clone(),
+            used_percent: percent_i64(usage_data.primary.used_percent),
+            remaining_percent: values.primary_remaining,
+            reset_at_epoch: Some(values.primary_reset_epoch).filter(|epoch| *epoch > 0),
+        },
+        RateLimitWindow {
+            label: values.secondary_label.clone(),
+            used_percent: percent_i64(usage_data.secondary.used_percent),
+            remaining_percent: values.secondary_remaining,
+            reset_at_epoch: Some(values.secondary_reset_epoch).filter(|epoch| *epoch > 0),
+        },
+    ]
 }
 
 fn summary_from_cache(entry: &cache::CacheEntry) -> RateLimitSummary {
@@ -627,6 +733,35 @@ fn summary_from_cache(entry: &cache::CacheEntry) -> RateLimitSummary {
             entry.weekly_reset_epoch,
         ),
     }
+}
+
+fn windows_from_cache(entry: &cache::CacheEntry) -> Vec<RateLimitWindow> {
+    vec![
+        RateLimitWindow {
+            label: entry.non_weekly_label.clone(),
+            used_percent: remaining_to_used_percent(entry.non_weekly_remaining),
+            remaining_percent: entry.non_weekly_remaining,
+            reset_at_epoch: entry.non_weekly_reset_epoch,
+        },
+        RateLimitWindow {
+            label: "Weekly".to_string(),
+            used_percent: remaining_to_used_percent(entry.weekly_remaining),
+            remaining_percent: entry.weekly_remaining,
+            reset_at_epoch: Some(entry.weekly_reset_epoch).filter(|epoch| *epoch > 0),
+        },
+    ]
+}
+
+fn percent_i64(percent: f64) -> i64 {
+    if percent.is_finite() {
+        (percent.round() as i64).clamp(0, 100)
+    } else {
+        0
+    }
+}
+
+fn remaining_to_used_percent(remaining: i64) -> i64 {
+    (100 - remaining).clamp(0, 100)
 }
 
 fn redact_sensitive_json(value: &Value) -> Value {
@@ -1327,7 +1462,9 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
         }
     };
 
-    if let Err(err) = writeback::write_weekly(target_file, &usage.json) {
+    if should_writeback_usage(target_file)
+        && let Err(err) = writeback::write_weekly(target_file, &usage.json)
+    {
         return AsyncFetchResult {
             line: None,
             rc: 4,
@@ -1841,7 +1978,9 @@ fn run_single_mode(
         }
     };
 
-    if let Err(err) = writeback::write_weekly(&target_file, &usage.json) {
+    if should_writeback_usage(&target_file)
+        && let Err(err) = writeback::write_weekly(&target_file, &usage.json)
+    {
         if output_json {
             diag_output::emit_error(
                 DIAG_SCHEMA_VERSION,
@@ -1917,7 +2056,9 @@ fn run_single_mode(
     }
 
     if output_json {
+        let windows = windows_from_usage_values(&usage_data, &values);
         let result = RateLimitJsonResult {
+            provider: "codex".to_string(),
             name: secret_display_name(&target_file),
             target_file: target_file_name(&target_file),
             status: "ok".to_string(),
@@ -1933,6 +2074,7 @@ fn run_single_mode(
                     weekly.weekly_reset_epoch,
                 ),
             }),
+            windows: Some(windows),
             raw_usage: Some(redact_sensitive_json(&usage.json)),
             error: None,
         };
@@ -2103,7 +2245,9 @@ fn single_one_line(
         }
     };
 
-    let _ = writeback::write_weekly(target_file, &usage.json);
+    if should_writeback_usage(target_file) {
+        let _ = writeback::write_weekly(target_file, &usage.json);
+    }
     if is_auth_file(target_file) {
         let _ = auth::sync::run();
     }
@@ -2146,6 +2290,14 @@ fn resolve_target(secret: Option<&str>) -> std::result::Result<PathBuf, i32> {
         }
         let secret_dir = crate::paths::resolve_secret_dir().unwrap_or_default();
         return Ok(secret_dir.join(secret_name));
+    }
+
+    if let Some(auth_file) = existing_active_auth_file() {
+        return Ok(auth_file);
+    }
+
+    if let Some(auth_file) = official_codex_auth_file() {
+        return Ok(auth_file);
     }
 
     if let Some(auth_file) = crate::paths::resolve_auth_file() {
@@ -2458,12 +2610,19 @@ mod tests {
     }
 
     #[test]
-    fn rate_limits_helper_resolve_target_without_auth_returns_err() {
+    fn rate_limits_helper_resolve_target_without_auth_returns_default_active_path() {
         let lock = GlobalStateLock::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir.path().join("home");
+        let codex_home = dir.path().join("codex-home");
         let _auth = EnvGuard::remove(&lock, "CODEX_AUTH_FILE");
-        let _home = EnvGuard::set(&lock, "HOME", "");
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().expect("home"));
+        let _home = EnvGuard::set(&lock, "HOME", home.to_str().expect("home"));
 
-        assert_eq!(resolve_target(None).expect_err("missing auth"), 1);
+        assert_eq!(
+            resolve_target(None).expect("default active auth"),
+            home.join(".agents").join("auth.json")
+        );
     }
 
     #[test]

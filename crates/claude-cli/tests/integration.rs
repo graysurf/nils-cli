@@ -162,6 +162,7 @@ OUT
     assert_eq!(payload["schema_version"], "claude-cli.usage.v1");
     assert_eq!(payload["command"], "usage");
     assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["provider"], "claude");
     assert_eq!(payload["result"]["source"], "cli");
     assert_eq!(payload["result"]["stale"], false);
     assert_eq!(payload["result"]["windows"][0]["key"], "5h");

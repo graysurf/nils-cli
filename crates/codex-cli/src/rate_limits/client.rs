@@ -73,6 +73,7 @@ pub fn read_tokens(target_file: &Path) -> Result<(String, Option<String>)> {
 
 fn read_tokens_from_value(value: &Value) -> Result<(String, Option<String>)> {
     let access_token = json::string_at(value, &["tokens", "access_token"])
+        .or_else(|| json::string_at(value, &["access_token"]))
         .ok_or_else(|| anyhow::anyhow!("missing access_token"))?;
     let account_id = json::string_at(value, &["tokens", "account_id"])
         .or_else(|| json::string_at(value, &["account_id"]));
