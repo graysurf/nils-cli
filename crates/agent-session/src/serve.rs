@@ -29,6 +29,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use jiff::Timestamp;
 use nils_common::cli_contract::{exit, schema_version_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -50,6 +51,17 @@ const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_STDIN_TOKEN_BYTES: u64 = 8 * 1024;
 const USAGE_SCHEMA_VERSION: &str = "agent-session.usage.v1";
 const DEFAULT_USAGE_TIMEOUT_MS: u64 = 12_000;
+const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
+const RESET_AT_EPOCH_KEYS: &[&str] = &[
+    "reset_at_epoch",
+    "resetAtEpoch",
+    "resets_at_epoch",
+    "resetsAtEpoch",
+    "reset_at",
+    "resetAt",
+    "resets_at",
+    "resetsAt",
+];
 
 /// Shared daemon state handed to every request handler.
 struct ServeState {
@@ -322,6 +334,8 @@ struct UsageWindow {
     used_percent: i64,
     remaining_percent: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reset_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reset_at_epoch: Option<i64>,
 }
 
@@ -561,11 +575,13 @@ fn usage_window_from_value(value: &Value) -> Option<UsageWindow> {
     let used_percent = i64_field(value, &["used_percent"])?;
     let remaining_percent = i64_field(value, &["remaining_percent"])
         .unwrap_or_else(|| (100 - used_percent).clamp(0, 100));
-    let reset_at_epoch = i64_field(value, &["reset_at_epoch", "reset_at"]);
+    let reset_at = reset_at_text_field(value, RESET_AT_KEYS);
+    let reset_at_epoch = epoch_field(value, RESET_AT_EPOCH_KEYS);
     Some(UsageWindow {
         label,
         used_percent,
         remaining_percent,
+        reset_at,
         reset_at_epoch,
     })
 }
@@ -581,6 +597,7 @@ fn windows_from_codex_summary(summary: &Value) -> Vec<UsageWindow> {
                 .to_string(),
             used_percent: (100 - remaining).clamp(0, 100),
             remaining_percent: remaining,
+            reset_at: None,
             reset_at_epoch: i64_field(
                 summary,
                 &["non_weekly_reset_epoch", "non_weekly_reset_at_epoch"],
@@ -592,10 +609,92 @@ fn windows_from_codex_summary(summary: &Value) -> Vec<UsageWindow> {
             label: "Weekly".to_string(),
             used_percent: (100 - remaining).clamp(0, 100),
             remaining_percent: remaining,
+            reset_at: None,
             reset_at_epoch: i64_field(summary, &["weekly_reset_epoch", "weekly_reset_at_epoch"]),
         });
     }
     windows
+}
+
+fn reset_at_text_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .filter(|raw| safe_reset_at_text(raw))
+            .map(ToString::to_string)
+    })
+}
+
+fn safe_reset_at_text(raw: &str) -> bool {
+    if raw.len() > 256 || raw.chars().any(char::is_control) {
+        return false;
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("access_token")
+        || lower.contains("refresh_token")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("sk-")
+        || lower.contains("account_id")
+        || lower.contains("account-id")
+        || lower.contains("acct_")
+        || raw.contains('@')
+    {
+        return false;
+    }
+    !(raw.starts_with('/')
+        || raw.starts_with("~/")
+        || raw.starts_with("$HOME/")
+        || raw.contains("/home/")
+        || raw.contains("/Users/"))
+}
+
+fn epoch_field(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(epoch_seconds_from_value))
+}
+
+fn epoch_seconds_from_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().and_then(epoch_seconds_from_f64))
+            .map(normalize_epoch_seconds),
+        Value::String(raw) => epoch_seconds_from_str(raw),
+        _ => None,
+    }
+}
+
+fn epoch_seconds_from_str(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse::<i64>()
+        .ok()
+        .map(normalize_epoch_seconds)
+        .or_else(|| raw.parse::<f64>().ok().and_then(epoch_seconds_from_f64))
+        .or_else(|| {
+            raw.parse::<Timestamp>()
+                .ok()
+                .map(|timestamp| timestamp.as_second())
+        })
+}
+
+fn epoch_seconds_from_f64(raw: f64) -> Option<i64> {
+    raw.is_finite()
+        .then(|| normalize_epoch_seconds(raw.round() as i64))
+}
+
+fn normalize_epoch_seconds(raw: i64) -> i64 {
+    if raw.unsigned_abs() >= 10_000_000_000 {
+        raw / 1_000
+    } else {
+        raw
+    }
 }
 
 fn i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
@@ -1560,6 +1659,48 @@ mod tests {
             "git remote add failed: {}",
             String::from_utf8_lossy(&add_remote.stderr)
         );
+    }
+
+    #[test]
+    fn normalize_claude_usage_preserves_reset_aliases() {
+        let provider = normalize_claude_usage(UsageHelperOutput {
+            status_code: Some(0),
+            stdout: br#"{
+  "schema_version": "claude-cli.usage.v1",
+  "command": "usage",
+  "ok": true,
+  "result": {
+    "windows": [
+      { "label": "5h", "used_percent": 3, "remaining_percent": 97, "resets_at": "2030-01-01T00:00:00Z" },
+      { "label": "Weekly", "used_percent": 0, "remaining_percent": 100, "resetsAtEpoch": 1805000000 },
+      { "label": "Month", "used_percent": 9, "remaining_percent": 91, "resetsAt": "2030-01-01T00:00:00.950339+00:00" },
+      { "label": "Year", "used_percent": 1, "remaining_percent": 99, "resets_at_epoch": "1893456000000" },
+      { "label": "Human", "used_percent": 4, "remaining_percent": 96, "resets_at": "Jul 12, 9pm (Asia/Taipei)" },
+      { "label": "Invalid", "used_percent": 2, "remaining_percent": 98, "resets_at": "/Users/terry/.claude/token" }
+    ]
+  }
+}"#
+            .to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+
+        let value = serde_json::to_value(provider).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["windows"][0]["reset_at"], "2030-01-01T00:00:00Z");
+        assert_eq!(value["windows"][0]["reset_at_epoch"], 1_893_456_000);
+        assert_eq!(value["windows"][1]["reset_at_epoch"], 1_805_000_000);
+        assert!(value["windows"][1].get("reset_at").is_none());
+        assert_eq!(
+            value["windows"][2]["reset_at"],
+            "2030-01-01T00:00:00.950339+00:00"
+        );
+        assert_eq!(value["windows"][2]["reset_at_epoch"], 1_893_456_000);
+        assert_eq!(value["windows"][3]["reset_at_epoch"], 1_893_456_000);
+        assert_eq!(value["windows"][4]["reset_at"], "Jul 12, 9pm (Asia/Taipei)");
+        assert!(value["windows"][4].get("reset_at_epoch").is_none());
+        assert!(value["windows"][5].get("reset_at").is_none());
+        assert!(value["windows"][5].get("reset_at_epoch").is_none());
     }
 
     fn write_codex_session_meta(codex_home: &Path, session_id: &str, cwd: &Path) {

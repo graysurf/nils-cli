@@ -258,6 +258,66 @@ exit 1
     assert!(!message.contains("user@example.com"));
 }
 
+#[test]
+fn serve_usage_preserves_claude_reset_aliases_from_helper() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fake_bin = tmp.path().join("bin");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    write_executable(
+        &fake_bin.join("codex-cli"),
+        r#"#!/usr/bin/env sh
+cat <<'JSON'
+{"schema_version":"codex-cli.diag.rate-limits.v1","command":"diag rate-limits","mode":"all","ok":false,"error":{"code":"auth-unavailable","message":"missing codex auth"}}
+JSON
+exit 1
+"#,
+    );
+    write_executable(
+        &fake_bin.join("claude-cli"),
+        r#"#!/usr/bin/env sh
+cat <<'JSON'
+{"schema_version":"claude-cli.usage.v1","command":"usage","ok":true,"result":{"windows":[{"label":"5h","used_percent":3,"remaining_percent":97,"resets_at":"2030-01-01T00:00:00Z"},{"label":"Weekly","used_percent":0,"remaining_percent":100,"resetsAtEpoch":1805000000}]}}
+JSON
+"#,
+    );
+
+    let (tmux, _tmux_log) = fake_tmux(tmp.path());
+    let addr = unused_loopback_addr();
+    let mut paths = vec![fake_bin];
+    if let Some(current_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current_path));
+    }
+    let path = std::env::join_paths(paths).expect("join PATH");
+    let mut child = Command::new(nils_test_support::bin::resolve("agent-session"))
+        .arg("serve")
+        .arg("--bind")
+        .arg(addr.to_string())
+        .env("AGENT_SESSION_TMUX_BIN", tmux)
+        .env("AGENT_SESSION_USAGE_TIMEOUT_MS", "1000")
+        .env("PATH", path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+
+    let payload = wait_for_http_json(addr, "/usage", Duration::from_secs(5));
+    stop_child(&mut child);
+
+    let usage = &payload["data"]["usage"];
+    let providers = usage["providers"].as_array().expect("providers");
+    let claude = providers
+        .iter()
+        .find(|provider| provider["id"] == "claude")
+        .expect("claude provider");
+    assert_eq!(claude["ok"], true);
+    assert_eq!(claude["source"], "claude-cli");
+    assert_eq!(claude["windows"][0]["label"], "5h");
+    assert_eq!(claude["windows"][0]["reset_at"], "2030-01-01T00:00:00Z");
+    assert_eq!(claude["windows"][0]["reset_at_epoch"], 1_893_456_000);
+    assert_eq!(claude["windows"][1]["label"], "Weekly");
+    assert_eq!(claude["windows"][1]["reset_at_epoch"], 1_805_000_000);
+}
+
 fn data(value: &Value) -> &Value {
     assert_eq!(value["ok"], true);
     assert!(
