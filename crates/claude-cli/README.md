@@ -59,10 +59,10 @@ The cache remains compatible with the former shell script:
   focused debugging.
 
 JSON output uses `schema_version: "claude-cli.usage.v1"` and never includes
-tokens or credential material. The `result.windows` array contains 5h and weekly
-windows when available, each with used/remaining percentages and optional reset
-timestamps. CLI-derived usage is normalized back into the same cache shape used
-by `prompt-segment`.
+tokens or credential material. The result includes `provider: "claude"` and a
+`windows` array containing 5h and weekly windows when available, each with
+used/remaining percentages and optional reset timestamps. CLI-derived usage is
+normalized back into the same cache shape used by `prompt-segment`.
 
 ### completion
 

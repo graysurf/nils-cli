@@ -1,6 +1,11 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use pretty_assertions::assert_eq;
@@ -122,6 +127,54 @@ sleep 60
     bin
 }
 
+fn unused_loopback_addr() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    listener.local_addr().expect("local addr")
+}
+
+fn http_get(addr: std::net::SocketAddr, path: &str) -> std::io::Result<Value> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or(response.as_str());
+    serde_json::from_str(body).map_err(std::io::Error::other)
+}
+
+fn wait_for_http_json(addr: std::net::SocketAddr, path: &str, timeout: Duration) -> Value {
+    let start = Instant::now();
+    let mut last_err = None;
+    while start.elapsed() < timeout {
+        match http_get(addr, path) {
+            Ok(value) => return value,
+            Err(err) => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!(
+        "timed out waiting for {path}: {}",
+        last_err
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "no attempt".to_string())
+    );
+}
+
+fn stop_child(child: &mut Child) {
+    if child.try_wait().expect("try_wait").is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
 fn tmux_calls(log: &Path) -> Vec<Vec<String>> {
     let text = fs::read_to_string(log).unwrap_or_default();
     text.split('\u{001e}')
@@ -133,6 +186,76 @@ fn tmux_calls(log: &Path) -> Vec<Vec<String>> {
                 .collect()
         })
         .collect()
+}
+
+#[test]
+fn serve_usage_returns_partial_provider_results_from_helpers() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fake_bin = tmp.path().join("bin");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    write_executable(
+        &fake_bin.join("codex-cli"),
+        r#"#!/usr/bin/env sh
+cat <<'JSON'
+{"schema_version":"codex-cli.diag.rate-limits.v1","command":"diag rate-limits","mode":"all","ok":true,"results":[{"provider":"codex","name":"auth","target_file":"auth.json","status":"ok","ok":true,"source":"network","windows":[{"label":"5h","used_percent":15,"remaining_percent":85,"reset_at_epoch":1780000000},{"label":"Weekly","used_percent":25,"remaining_percent":75,"reset_at_epoch":1780600000}]}]}
+JSON
+"#,
+    );
+    write_executable(
+        &fake_bin.join("claude-cli"),
+        r#"#!/usr/bin/env sh
+cat <<'JSON'
+{"schema_version":"claude-cli.usage.v1","command":"usage","ok":false,"error":{"code":"auth-unavailable","message":"missing auth at /Users/terry/.claude/token for user@example.com"}}
+JSON
+exit 1
+"#,
+    );
+
+    let (tmux, _tmux_log) = fake_tmux(tmp.path());
+    let addr = unused_loopback_addr();
+    let mut paths = vec![fake_bin];
+    if let Some(current_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current_path));
+    }
+    let path = std::env::join_paths(paths).expect("join PATH");
+    let mut child = Command::new(nils_test_support::bin::resolve("agent-session"))
+        .arg("serve")
+        .arg("--bind")
+        .arg(addr.to_string())
+        .env("AGENT_SESSION_TMUX_BIN", tmux)
+        .env("AGENT_SESSION_USAGE_TIMEOUT_MS", "1000")
+        .env("PATH", path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+
+    let payload = wait_for_http_json(addr, "/usage", Duration::from_secs(5));
+    stop_child(&mut child);
+
+    assert_eq!(payload["ok"], true);
+    let usage = &payload["data"]["usage"];
+    assert_eq!(usage["schema_version"], "agent-session.usage.v1");
+    assert_eq!(usage["ok"], false);
+    let providers = usage["providers"].as_array().expect("providers");
+    let codex = providers
+        .iter()
+        .find(|provider| provider["id"] == "codex")
+        .expect("codex provider");
+    assert_eq!(codex["ok"], true);
+    assert_eq!(codex["source"], "codex-cli");
+    assert_eq!(codex["windows"][0]["label"], "5h");
+    assert_eq!(codex["windows"][0]["remaining_percent"], 85);
+
+    let claude = providers
+        .iter()
+        .find(|provider| provider["id"] == "claude")
+        .expect("claude provider");
+    assert_eq!(claude["ok"], false);
+    assert_eq!(claude["error"]["code"], "auth-unavailable");
+    let message = claude["error"]["message"].as_str().expect("message");
+    assert!(!message.contains("/Users/terry"));
+    assert!(!message.contains("user@example.com"));
 }
 
 fn data(value: &Value) -> &Value {
