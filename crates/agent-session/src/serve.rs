@@ -50,7 +50,7 @@ static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
 const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_STDIN_TOKEN_BYTES: u64 = 8 * 1024;
 const USAGE_SCHEMA_VERSION: &str = "agent-session.usage.v1";
-const DEFAULT_USAGE_TIMEOUT_MS: u64 = 12_000;
+const DEFAULT_USAGE_TIMEOUT_MS: u64 = 45_000;
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
 const RESET_AT_EPOCH_KEYS: &[&str] = &[
     "reset_at_epoch",
@@ -1701,6 +1701,14 @@ mod tests {
         assert!(value["windows"][4].get("reset_at_epoch").is_none());
         assert!(value["windows"][5].get("reset_at").is_none());
         assert!(value["windows"][5].get("reset_at_epoch").is_none());
+    }
+
+    #[test]
+    fn default_usage_timeout_covers_slow_claude_usage_helpers() {
+        assert!(
+            Duration::from_millis(DEFAULT_USAGE_TIMEOUT_MS) >= Duration::from_secs(30),
+            "m4 claude-cli usage can take more than 20s before returning reset-bearing windows"
+        );
     }
 
     fn write_codex_session_meta(codex_home: &Path, session_id: &str, cwd: &Path) {
