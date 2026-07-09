@@ -761,13 +761,13 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
     let now = Zoned::now();
     let timestamp = now.strftime("%Y%m%d-%H%M%S").to_string();
     let iso = now.timestamp().to_string();
-    let slug = slugify(request.title.unwrap_or(request.agent.as_str()));
+    let title_slug = request.title.map(slugify);
     let id = resolve_session_id(
         request.context,
         request.explicit_id,
         request.agent,
         &timestamp,
-        &slug,
+        title_slug.as_deref(),
     )?;
     let tmux_session = format!("hs-{}-{id}", request.agent.as_str());
     let session_dir = session_dir(request.context, &id);
@@ -3545,7 +3545,7 @@ fn resolve_session_id(
     explicit_id: Option<&str>,
     agent: AgentKind,
     timestamp: &str,
-    slug: &str,
+    title_slug: Option<&str>,
 ) -> Result<String, CliError> {
     if let Some(id) = explicit_id {
         validate_id(id)?;
@@ -3558,7 +3558,7 @@ fn resolve_session_id(
         }
         return Ok(id.to_string());
     }
-    let base = format!("{timestamp}-{}-{slug}", agent.as_str());
+    let base = default_session_id_base(timestamp, agent, title_slug);
     for index in 0..100 {
         let id = if index == 0 {
             base.clone()
@@ -3574,6 +3574,13 @@ fn resolve_session_id(
         "failed to allocate a unique session id",
         Some(json!({ "base": base })),
     ))
+}
+
+fn default_session_id_base(timestamp: &str, agent: AgentKind, title_slug: Option<&str>) -> String {
+    match title_slug {
+        Some(slug) => format!("{timestamp}-{}-{slug}", agent.as_str()),
+        None => format!("{timestamp}-{}", agent.as_str()),
+    }
 }
 
 fn validate_id(id: &str) -> Result<(), CliError> {
@@ -3906,7 +3913,104 @@ fn tail_lines(text: &str, tail: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_trailing_blank_lines;
+    use super::{
+        AgentKind, CliContext, RecordRequest, create_record, resolve_session_id,
+        strip_trailing_blank_lines,
+    };
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use std::path::Path;
+
+    fn test_context(state_dir: &Path) -> CliContext {
+        CliContext {
+            state_dir: state_dir.to_path_buf(),
+            host: None,
+        }
+    }
+
+    fn create_test_record_id(
+        context: &CliContext,
+        agent: AgentKind,
+        title: Option<&str>,
+        explicit_id: Option<&str>,
+    ) -> String {
+        create_record(RecordRequest {
+            context,
+            agent,
+            mode: "interactive",
+            title,
+            explicit_id,
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap()
+        .record
+        .id
+    }
+
+    #[test]
+    fn create_record_untitled_default_ids_do_not_repeat_agent_slug() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        for (agent, slug) in [
+            (AgentKind::Codex, "codex"),
+            (AgentKind::Claude, "claude"),
+            (AgentKind::Hermes, "hermes"),
+        ] {
+            let context = test_context(&tmp.path().join(slug));
+            let id = create_test_record_id(&context, agent, None, None);
+
+            assert!(
+                !id.contains(&format!("{slug}-{slug}")),
+                "untitled {slug} id should not repeat the agent slug: {id}"
+            );
+            assert_eq!(
+                id.matches(slug).count(),
+                1,
+                "untitled {slug} id should include the agent slug once: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_session_id_appends_collision_suffix_to_untitled_agent_base() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let timestamp = "20260709-121932";
+        let existing_id = format!("{timestamp}-codex");
+        fs::create_dir_all(super::session_dir(&context, &existing_id)).unwrap();
+
+        let id = resolve_session_id(&context, None, AgentKind::Codex, timestamp, None).unwrap();
+
+        assert_eq!(id, format!("{existing_id}-1"));
+    }
+
+    #[test]
+    fn create_record_title_derived_default_ids_keep_title_slug() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+
+        let id = create_test_record_id(&context, AgentKind::Codex, Some("New Codex session"), None);
+
+        assert!(
+            id.ends_with("-codex-new-codex-session"),
+            "title-derived id should preserve the title slug: {id}"
+        );
+    }
+
+    #[test]
+    fn create_record_explicit_ids_are_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+
+        let id = create_test_record_id(&context, AgentKind::Codex, None, Some("custom-id"));
+
+        assert_eq!(id, "custom-id");
+    }
 
     #[test]
     fn strip_trailing_blank_lines_preserves_content_and_internal_blanks() {
