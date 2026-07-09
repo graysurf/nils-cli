@@ -437,10 +437,9 @@ fn gitlab_project_path_from_url(url: &str) -> Option<String> {
         &path[..idx]
     } else if let Some(idx) = path.find("/-/work_items/") {
         &path[..idx]
-    } else if let Some(idx) = path.find("/issues/") {
-        &path[..idx]
     } else {
-        return None;
+        let idx = path.find("/issues/")?;
+        &path[..idx]
     };
     if project_path.is_empty() {
         None

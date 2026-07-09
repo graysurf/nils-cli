@@ -316,7 +316,7 @@ fn open_pulls(args: &[String]) -> i32 {
     }
 
     if let Some(value) = args.first() {
-        return open_pr(&[value.to_string()]);
+        return open_pr(std::slice::from_ref(value));
     }
 
     let ctx = match resolve_context() {
