@@ -23,6 +23,8 @@ nils-build-info = { version = "1.21.6", path = "../nils-build-info" }
 nils-common = { version = "1.21.6", path = "../nils-common", package = "nils-common" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+sha2 = { workspace = true }
 shell-words = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 # `serve` daemon (control plane + WebSocket PTY attach).

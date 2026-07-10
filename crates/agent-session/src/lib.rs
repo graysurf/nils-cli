@@ -1,3 +1,4 @@
+mod activity;
 mod cli;
 pub mod completion;
 mod provider_prompt;
@@ -40,6 +41,10 @@ const LOGS_COMMAND: &str = "logs";
 const SEND_COMMAND: &str = "send";
 const GLANCE_COMMAND: &str = "glance";
 const RESUME_COMMAND: &str = "resume";
+const ACTIVITY_EVENT_COMMAND: &str = "activity-event";
+const ACTIVITY_STATUS_COMMAND: &str = "activity-status";
+const ACTIVITY_DOCTOR_COMMAND: &str = "activity-doctor";
+const ACTIVITY_SETUP_COMMAND: &str = "activity-setup";
 const DELETE_COMMAND: &str = "delete";
 const WORKDIR_USAGE_FILE: &str = "workdir-usage.json";
 const CODEX_RESUME_CAPTURE_TIMEOUT_MS: u64 = 1500;
@@ -115,6 +120,7 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Send(args) => run_send(&context, args),
         Command::Glance(args) => run_glance(&context, args),
         Command::Resume(args) => run_resume(&context, args),
+        Command::Activity(args) => run_activity(&context, args),
         Command::Serve(args) => serve::run_serve(&context, args),
         Command::Delete(args) => run_delete(&context, args),
         Command::Completion(_) => unreachable!("completion is handled before context resolution"),
@@ -131,6 +137,13 @@ fn command_format(command: &Command) -> OutputFormat {
         Command::Send(args) => args.format,
         Command::Glance(args) => args.format,
         Command::Resume(args) => args.format,
+        Command::Activity(args) => match &args.command {
+            cli::ActivityCommand::Event(args) => args.format,
+            cli::ActivityCommand::Status(args) => args.format,
+            cli::ActivityCommand::Hook(_) => OutputFormat::Text,
+            cli::ActivityCommand::Doctor(args) => args.format,
+            cli::ActivityCommand::Setup(args) => args.format,
+        },
         Command::Delete(args) => args.format,
         Command::Attach(_) | Command::Serve(_) | Command::Completion(_) => OutputFormat::Text,
     }
@@ -278,6 +291,69 @@ fn run_resume(context: &CliContext, args: cli::ResumeArgs) -> i32 {
     }
 }
 
+fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
+    match args.command {
+        cli::ActivityCommand::Event(args) => {
+            let format = args.format;
+            let result = activity::read_event_from_stdin()
+                .and_then(|event| activity::ingest_event(context, &args.id, event));
+            match result {
+                Ok(result) => render_single_success(
+                    ACTIVITY_EVENT_COMMAND,
+                    format,
+                    &result,
+                    render_activity_text,
+                ),
+                Err(err) => render_error(ACTIVITY_EVENT_COMMAND, format, err),
+            }
+        }
+        cli::ActivityCommand::Status(args) => match activity::activity_status(context, &args.id) {
+            Ok(result) => render_single_success(
+                ACTIVITY_STATUS_COMMAND,
+                args.format,
+                &result,
+                render_activity_text,
+            ),
+            Err(err) => render_error(ACTIVITY_STATUS_COMMAND, args.format, err),
+        },
+        cli::ActivityCommand::Hook(args) => {
+            // Provider telemetry is deliberately fail-open: malformed or stale
+            // hook input must never block a prompt, permission, or turn.
+            activity::ingest_provider_hook_fail_open(context, args.agent, args.event.as_deref());
+            exit::SUCCESS
+        }
+        cli::ActivityCommand::Doctor(args) => match activity::doctor(context, args.agent) {
+            Ok(result) => render_single_success(
+                ACTIVITY_DOCTOR_COMMAND,
+                args.format,
+                &result,
+                render_doctor_text,
+            ),
+            Err(err) => render_error(ACTIVITY_DOCTOR_COMMAND, args.format, err),
+        },
+        cli::ActivityCommand::Setup(args) => {
+            let action = if args.dry_run {
+                activity::SetupAction::DryRun
+            } else if args.apply {
+                activity::SetupAction::Apply
+            } else if args.remove {
+                activity::SetupAction::Remove
+            } else {
+                activity::SetupAction::Repair
+            };
+            match activity::setup(args.agent, action) {
+                Ok(result) => render_single_success(
+                    ACTIVITY_SETUP_COMMAND,
+                    args.format,
+                    &result,
+                    render_setup_text,
+                ),
+                Err(err) => render_error(ACTIVITY_SETUP_COMMAND, args.format, err),
+            }
+        }
+    }
+}
+
 fn run_delete(context: &CliContext, args: cli::DeleteArgs) -> i32 {
     match delete_session(
         context,
@@ -373,6 +449,8 @@ struct RuntimeInfo {
     tmux_session: String,
     generation: u64,
     started_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    launch_id: String,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     extra: BTreeMap<String, Value>,
 }
@@ -413,6 +491,10 @@ struct SessionView {
     updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_terminal_activity_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_state: Option<activity::TurnState>,
 }
 
 #[derive(Debug)]
@@ -472,6 +554,10 @@ struct GlanceResult {
     updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_terminal_activity_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_state: Option<activity::TurnState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -515,6 +601,10 @@ struct CliErrorData {
 }
 
 impl CliError {
+    fn code(&self) -> &str {
+        &self.0.code
+    }
+
     fn usage(code: impl Into<String>, message: impl Into<String>, details: Option<Value>) -> Self {
         Self(Box::new(CliErrorData {
             code: code.into(),
@@ -577,8 +667,8 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         &tmux_bin,
         &agent_bin,
         args.agent,
+        &context.state_dir,
         &created.record,
-        args.title.as_deref(),
         &provider_plan.launch_args,
         &args.agent_args,
     ) {
@@ -650,6 +740,7 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         &tmux_bin,
         &agent_bin,
         args.agent,
+        &context.state_dir,
         &created.record,
         &args.agent_args,
     ) {
@@ -718,6 +809,7 @@ pub(crate) fn start_provider_resume_session(
     if let Err(err) = start_resume_tmux(
         &tmux_bin,
         &agent_bin,
+        &context.state_dir,
         &created.record,
         &provider_resume.resume_args,
     ) {
@@ -801,6 +893,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
             tmux_session: tmux_session.clone(),
             generation: 1,
             started_at: now.timestamp().to_string(),
+            launch_id: uuid::Uuid::new_v4().to_string(),
             extra: BTreeMap::new(),
         }),
         agent_args: request.agent_args,
@@ -810,6 +903,10 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
     };
 
     write_session_record(request.context, &record)?;
+    if let Err(err) = activity::activate_runtime(request.context, &record) {
+        let _ = fs::remove_dir_all(&session_dir);
+        return Err(err);
+    }
     Ok(CreatedRecord {
         record,
         prompt_file,
@@ -1375,8 +1472,8 @@ fn start_interactive_tmux(
     tmux_bin: &Path,
     agent_bin: &Path,
     agent: AgentKind,
+    state_dir: &Path,
     record: &SessionRecord,
-    title: Option<&str>,
     provider_launch_args: &[String],
     agent_args: &[String],
 ) -> Result<(), CliError> {
@@ -1387,9 +1484,9 @@ fn start_interactive_tmux(
         .arg("-s")
         .arg(&record.tmux_session)
         .arg("-c")
-        .arg(&record.cwd)
-        .arg("--")
-        .arg(agent_bin);
+        .arg(&record.cwd);
+    add_runtime_tmux_environment(&mut command, state_dir, record)?;
+    command.arg("--").arg(agent_bin);
 
     match agent {
         AgentKind::Codex => {
@@ -1397,7 +1494,11 @@ fn start_interactive_tmux(
         }
         AgentKind::Claude => {
             command.args(provider_launch_args);
-            if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+            if let Some(title) = record
+                .title
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
                 command.arg("--name").arg(title);
             }
         }
@@ -1413,6 +1514,7 @@ fn start_run_tmux(
     tmux_bin: &Path,
     agent_bin: &Path,
     agent: AgentKind,
+    state_dir: &Path,
     record: &SessionRecord,
     agent_args: &[String],
 ) -> Result<(), CliError> {
@@ -1464,11 +1566,9 @@ fn start_run_tmux(
         .arg("-s")
         .arg(&record.tmux_session)
         .arg("-c")
-        .arg(&record.cwd)
-        .arg("--")
-        .arg("sh")
-        .arg("-lc")
-        .arg(script);
+        .arg(&record.cwd);
+    add_runtime_tmux_environment(&mut command, state_dir, record)?;
+    command.arg("--").arg("sh").arg("-lc").arg(script);
     run_status(command, "tmux new-session")
 }
 
@@ -1943,6 +2043,11 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
         last_terminal_activity_at,
+        runtime_started_at: record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.started_at.clone()),
+        turn_state: activity::state_for_view(context, &record),
     })
 }
 
@@ -2217,14 +2322,14 @@ fn resume_session_by_id(
         _ => {}
     }
     let (provider_resume, agent) = validate_resume_metadata(&record)?;
+    let previous_record = record.clone();
+    let previous_activity = activity::capture_snapshot(context, &record.id)?;
     let resume_args = provider_resume.resume_args.clone();
     let agent_bin = record
         .agent_bin
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| resolve_agent_bin(agent, None));
-    start_resume_tmux(tmux_bin, &agent_bin, &record, &resume_args)?;
-
     let now = Zoned::now();
     let next_generation = record
         .runtime
@@ -2236,6 +2341,7 @@ fn resume_session_by_id(
         tmux_session: record.tmux_session.clone(),
         generation: next_generation,
         started_at: now.timestamp().to_string(),
+        launch_id: uuid::Uuid::new_v4().to_string(),
         extra: record
             .runtime
             .as_ref()
@@ -2243,7 +2349,31 @@ fn resume_session_by_id(
             .unwrap_or_default(),
     });
     record.updated_at = now.timestamp().to_string();
-    record = persist_or_reload_session_record(context, &record);
+    write_session_record(context, &record)?;
+    activity::activate_runtime(context, &record)?;
+    if let Err(launch_err) = start_resume_tmux(
+        tmux_bin,
+        &agent_bin,
+        &context.state_dir,
+        &record,
+        &resume_args,
+    ) {
+        let record_restore = write_session_record(context, &previous_record);
+        let activity_restore = activity::restore_snapshot(context, &record.id, &previous_activity);
+        if record_restore.is_err() || activity_restore.is_err() {
+            return Err(CliError::runtime(
+                "resume-launch-rollback-failed",
+                "provider resume launch failed and the prior durable runtime could not be fully restored",
+                Some(json!({
+                    "id": record.id,
+                    "launch_error": launch_err.code(),
+                    "record_restored": record_restore.is_ok(),
+                    "activity_restored": activity_restore.is_ok()
+                })),
+            ));
+        }
+        return Err(launch_err);
+    }
     Ok(session_view(
         context,
         &record,
@@ -2255,6 +2385,7 @@ fn resume_session_by_id(
 fn start_resume_tmux(
     tmux_bin: &Path,
     agent_bin: &Path,
+    state_dir: &Path,
     record: &SessionRecord,
     resume_args: &[String],
 ) -> Result<(), CliError> {
@@ -2265,12 +2396,41 @@ fn start_resume_tmux(
         .arg("-s")
         .arg(&record.tmux_session)
         .arg("-c")
-        .arg(&record.cwd)
+        .arg(&record.cwd);
+    add_runtime_tmux_environment(&mut command, state_dir, record)?;
+    command
         .arg("--")
         .arg(agent_bin)
         .args(resume_args)
         .args(&record.agent_args);
     run_status(command, "tmux new-session")
+}
+
+fn add_runtime_tmux_environment(
+    command: &mut ProcessCommand,
+    state_dir: &Path,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    let runtime_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::data(
+                "runtime-id-missing",
+                "session runtime is missing its launch id",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+    for value in [
+        format!("AGENT_SESSION_ID={}", record.id),
+        format!("AGENT_SESSION_STATE_DIR={}", display_path(state_dir)),
+        format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
+    ] {
+        command.arg("-e").arg(value);
+    }
+    Ok(())
 }
 
 fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
@@ -3023,6 +3183,11 @@ fn session_view_from_parts(
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
         last_terminal_activity_at,
+        runtime_started_at: record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.started_at.clone()),
+        turn_state: activity::state_for_view(context, record),
     }
 }
 
@@ -3864,6 +4029,59 @@ fn render_resumed_text(result: &SessionView) -> String {
     format!(
         "resumed {} session {}\ntmux: {}\nattach: {}\n",
         result.agent, result.id, result.tmux_session, result.attach_command
+    )
+}
+
+fn render_activity_text(result: &activity::ActivityResult) -> String {
+    format!(
+        "{}: {:?} (revision {})\n",
+        result.id, result.turn_state.phase, result.turn_state.revision
+    )
+}
+
+fn render_doctor_text(result: &activity::DoctorResult) -> String {
+    let mut text = String::new();
+    for provider in &result.providers {
+        text.push_str(&format!(
+            "{}: {} (configured: {})\n",
+            provider.provider,
+            provider.classification,
+            if provider.configured { "yes" } else { "no" }
+        ));
+        text.push_str(&format!("  completion: {}\n", provider.completion));
+        text.push_str(&format!(
+            "  attention: {}\n",
+            provider.attention_correlation
+        ));
+        text.push_str(&format!("  next: {}\n", provider.guidance));
+    }
+    text
+}
+
+fn render_setup_text(result: &activity::SetupResult) -> String {
+    if result.action == "dry-run" {
+        return format!(
+            "{} activity setup preview: {} (configured now: {}; would configure: {})\n",
+            result.provider,
+            if result.would_change {
+                "changes required"
+            } else {
+                "no change"
+            },
+            if result.configured { "yes" } else { "no" },
+            if result.would_configure { "yes" } else { "no" }
+        );
+    }
+    format!(
+        "{} activity setup {}: {} (configured: {})\n",
+        result.provider,
+        result.action,
+        if result.changed {
+            "updated"
+        } else {
+            "no change"
+        },
+        if result.configured { "yes" } else { "no" }
     )
 }
 

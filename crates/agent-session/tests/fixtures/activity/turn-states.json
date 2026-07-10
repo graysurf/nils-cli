@@ -1,0 +1,33 @@
+[
+  {
+    "schema_version": "agent-session.turn-state.v1",
+    "phase": "starting",
+    "phase_changed_at": "2026-07-10T00:00:00Z",
+    "revision": 1,
+    "source": { "kind": "runtime", "confidence": "authoritative" }
+  },
+  {
+    "schema_version": "agent-session.turn-state.v1",
+    "phase": "needs_input",
+    "phase_changed_at": "2026-07-10T00:00:02Z",
+    "revision": 4,
+    "source": { "kind": "provider_hook", "provider": "codex", "confidence": "observed" },
+    "current_turn": {
+      "provider_turn_id": "turn-1",
+      "started_at": "2026-07-10T00:00:01Z",
+      "attention": { "kind": "approval", "requested_at": "2026-07-10T00:00:02Z", "pending_count": 2 }
+    }
+  },
+  {
+    "schema_version": "agent-session.turn-state.v1",
+    "phase": "waiting",
+    "phase_changed_at": "2026-07-10T00:00:06Z",
+    "revision": 7,
+    "source": { "kind": "provider_hook", "provider": "hermes", "confidence": "authoritative" },
+    "last_turn": {
+      "started_at": "2026-07-10T00:00:01Z",
+      "completed_at": "2026-07-10T00:00:06Z",
+      "outcome": "completed"
+    }
+  }
+]

@@ -1,0 +1,4 @@
+{"hook_event_name":"UserPromptSubmit","session_id":"codex-session","turn_id":"codex-turn-1","permission_mode":"default"}
+{"hook_event_name":"PermissionRequest","session_id":"codex-session","turn_id":"codex-turn-1","permission_mode":"default"}
+{"hook_event_name":"PostToolUse","session_id":"codex-session","turn_id":"codex-turn-1","tool_use_id":"tool-1","permission_mode":"default"}
+{"hook_event_name":"Stop","session_id":"codex-session","turn_id":"codex-turn-1","stop_hook_active":false,"permission_mode":"default"}

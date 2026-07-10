@@ -23,6 +23,9 @@ agent-session glance <id> --tail 40
 agent-session send <id> --text yes --key enter
 agent-session send <id> --key c-c
 agent-session resume <id>
+agent-session activity status <id> --format json
+agent-session activity doctor --format json
+agent-session activity setup --agent codex --dry-run
 printf '%s' "$AGENT_SESSION_TOKEN" | agent-session serve --bind 127.0.0.1:8781 --token-stdin
 agent-session command <id>
 agent-session attach <id>
@@ -34,8 +37,48 @@ agent-session delete <id>
 (`--key enter|escape|c-c|up|down|left|right|tab`), so codex/claude approval prompts are answerable from a phone.
 `glance` returns the recent pane tail plus live status as a JSON contract for dashboard tiles (cheaper than a full attach).
 `resume` recreates a missing tmux runtime only when the session has exact provider resume metadata; it never resumes the
-latest provider conversation implicitly. `send` bumps `updated_at`, so `list` orders by real control-plane activity.
+latest provider conversation implicitly. Runtime metadata is persisted before launch so hooks see the new generation;
+if tmux launch fails, the prior runtime and activity snapshot are restored. `send` bumps `updated_at`, so `list` orders
+by real control-plane activity.
 `--agent hermes` launches `hermes chat` interactively (one-shot `run` mode is codex/claude only).
+
+## Durable turn state
+
+Every new runtime receives a fresh opaque `AGENT_SESSION_RUNTIME_ID` alongside
+`AGENT_SESSION_ID` and `AGENT_SESSION_STATE_DIR`. Supported provider hooks
+project lifecycle metadata into a private, atomic activity snapshot and bounded
+journal. Provider identifiers are runtime-scoped opaque projections, attention
+and replay state are explicitly bounded, and interrupted snapshot/journal
+writes repair before the next event or runtime transition. State is bound to
+both the launch id and persisted runtime generation so a stale snapshot is
+never shown after an interrupted resume. The replay index carries the same
+runtime binding and a missing or swapped index degrades safely to Unknown
+instead of reopening the dedupe horizon. Session views add optional
+`runtime_started_at` and `turn_state`
+fields, distinguishing `starting`, `working`, `waiting`, `needs_input`, and
+`unknown` without storing prompt, assistant, terminal, command, tool, or
+transcript content.
+
+Provider setup is explicit and reversible. Preview it first, then apply only
+after reviewing the provider trust/consent boundary:
+
+```bash
+agent-session activity setup --agent codex --dry-run
+agent-session activity setup --agent codex --apply
+agent-session activity doctor --agent codex --format json
+agent-session activity setup --agent codex --remove
+```
+
+The same commands support `claude` and `hermes`. Setup merges exact
+agent-session-owned handlers into existing provider configuration, repeated
+apply/repair is idempotent, and removal preserves unrelated hooks. Provider
+setup also refuses an observed concurrent config change. Provider hook failure
+is fail-open and old/unsupported providers retain the activity
+fallback. Doctor scans local session evidence once and probes provider versions
+concurrently with a bounded timeout, verifies the exact owned hook timeout, and
+checks that the configured helper resolves to an executable on the hook PATH.
+See [the stable turn-state contract](docs/turn-state-contract.md) and
+[provider evidence matrix](docs/provider-turn-signal-evidence.md).
 
 ## Serve daemon
 
@@ -45,7 +88,8 @@ is no second state model.
 
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
-  the recorded `cwd`.
+  the recorded `cwd`. New records also expose optional `runtime_started_at` and
+  `turn_state`; old records omit them.
 - `GET /usage` — read-only provider usage report, open on loopback. The serve
   envelope contains `data.usage.schema_version: "agent-session.usage.v1"` and
   provider entries for Codex and Claude. Provider readers are bounded by
