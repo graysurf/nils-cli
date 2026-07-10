@@ -1,6 +1,6 @@
 [package]
 name = "nils-web-evidence"
-version = "1.21.5"
+version = "1.21.6"
 edition.workspace = true
 license.workspace = true
 
@@ -18,13 +18,13 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.21.5", path = "../nils-build-info" }
-nils-common = { version = "1.21.5", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.21.6", path = "../nils-build-info" }
+nils-common = { version = "1.21.6", path = "../nils-common", package = "nils-common" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "1.21.5", path = "../nils-test-support" }
+nils-test-support = { version = "1.21.6", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
