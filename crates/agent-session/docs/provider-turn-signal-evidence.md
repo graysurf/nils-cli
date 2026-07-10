@@ -23,10 +23,12 @@ normalized event is created.
 - [Codex notifications](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)
   documents the `agent-turn-complete` notify surface and its `thread-id` and
   `turn-id`. Setup installs the exact agent-session argv when `notify` is absent
-  or already owned; a different singular user command is preserved and blocks
-  automatic setup. Codex appends its full notification JSON to that argv;
-  agent-session discards content after parsing and never persists it, but the
-  provider-supplied argv is transiently visible to same-host process inspection.
+  or already owned. A bounded safe singular user argv is composed through the
+  owned helper only when later removal can restore the complete config bytes;
+  unsafe, oversized, nested-forward, or non-reversible values remain unchanged
+  and block automatic setup. Codex appends its full notification JSON to that
+  argv; agent-session discards content after parsing and never persists it, but
+  the provider-supplied argv is transiently visible to same-host process inspection.
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks) documents parallel
   matching hooks, exact `AskUserQuestion` matching, shared `tool_use_id` on
   `PreToolUse`/`PostToolUse`/`PostToolUseFailure`, `PermissionRequest` without
@@ -156,12 +158,24 @@ Codex setup owns two distinct files. Hooks remain an additive JSON merge in
 `~/.codex/hooks.json`. Completion uses the provider's singular top-level TOML
 `notify` argv in `~/.codex/config.toml`. Setup inserts only
 `["agent-session", "activity", "notify", "--agent", "codex"]`, recognizes that
-exact argv idempotently, and removes only that exact argv. Any other `notify`
-value is user-owned: dry-run/apply/repair return a content-free conflict before
-mutating the hooks file. Apply/repair/remove parse and plan both files before
-either mutation; a guarded second-write failure restores the first write, while
-a rollback race surfaces an explicit error naming both metadata-only paths. The
-CLI never shells or retains a downstream command.
+exact argv idempotently, and removes only that exact argv. A safe user-owned
+string argv is encoded into the owned command only after a simulated removal
+reproduces the full original TOML bytes. The helper executes that argv directly
+without a shell, appends the provider payload literally, suppresses child I/O,
+and kills the child process group after two seconds. A depth marker and nested
+forward-flag rejection prevent recursive fan-out. Notification ingestion uses a
+non-blocking activity lock so contention cannot postpone the preserved notifier;
+on contention, a detached `activity event` retry receives only the normalized
+metadata through stdin and waits up to five seconds for that lock. It clears the
+diagnostic after durable success or records a sanitized timeout/ingest code on
+terminal failure, preventing unbounded blocked workers while preserving the
+authoritative completion across transient contention. Removal decodes and
+restores the original argv. Unsafe, oversized, non-string, nested-forward, or
+non-reversible
+values return a content-free conflict before mutating the hooks file.
+Apply/repair/remove parse and plan both files before either mutation; a guarded
+second-write failure restores the first write, while a rollback race surfaces an
+explicit error naming both metadata-only paths.
 
 Claude setup adds exact `AskUserQuestion` matcher groups for `PreToolUse`,
 `PostToolUse`, and `PostToolUseFailure` while retaining the general PostToolUse

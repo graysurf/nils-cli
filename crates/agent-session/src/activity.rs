@@ -39,9 +39,12 @@ const MAX_PENDING_ATTENTION: usize = 64;
 const MAX_ID_CHARS: usize = 256;
 const CODEX_NOTIFY_ARGV: [&str; 5] = ["agent-session", "activity", "notify", "--agent", "codex"];
 const CODEX_NOTIFY_FORWARD_FLAG: &str = "--forward-notify-argv-json";
+const CODEX_NOTIFY_FORWARD_ACTIVE_ENV: &str = "AGENT_SESSION_CODEX_NOTIFY_FANOUT_ACTIVE";
+pub(crate) const ACTIVITY_RETRY_PROVIDER_ENV: &str = "AGENT_SESSION_ACTIVITY_RETRY_PROVIDER";
 const MAX_CODEX_FORWARD_ARGS: usize = 64;
 const MAX_CODEX_FORWARD_ARGV_BYTES: usize = 16 * 1024;
 const CODEX_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_COMPLETION_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -306,6 +309,25 @@ impl Drop for ActivityLock {
 }
 
 fn acquire_lock(dir: &Path) -> Result<ActivityLock, CliError> {
+    acquire_lock_with_mode(dir, ActivityLockMode::Blocking)
+}
+
+fn acquire_lock_nonblocking(dir: &Path) -> Result<ActivityLock, CliError> {
+    acquire_lock_with_mode(dir, ActivityLockMode::NonBlocking)
+}
+
+fn acquire_lock_with_timeout(dir: &Path, timeout: Duration) -> Result<ActivityLock, CliError> {
+    acquire_lock_with_mode(dir, ActivityLockMode::Timed(timeout))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ActivityLockMode {
+    Blocking,
+    NonBlocking,
+    Timed(Duration),
+}
+
+fn acquire_lock_with_mode(dir: &Path, mode: ActivityLockMode) -> Result<ActivityLock, CliError> {
     let path = dir.join(ACTIVITY_LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -317,15 +339,40 @@ fn acquire_lock(dir: &Path) -> Result<ActivityLock, CliError> {
     fs::set_permissions(&path, fs::Permissions::from_mode(SECRET_FILE_MODE))
         .map_err(|err| activity_io_error("activity-lock-permission-failed", &path, err))?;
     // SAFETY: flock only observes the valid file descriptor owned by file.
-    let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if status != 0 {
-        return Err(activity_io_error(
-            "activity-lock-failed",
-            &path,
-            io::Error::last_os_error(),
-        ));
+    if matches!(mode, ActivityLockMode::Blocking) {
+        // SAFETY: flock only observes the valid file descriptor owned by file.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(activity_io_error(
+                "activity-lock-failed",
+                &path,
+                io::Error::last_os_error(),
+            ));
+        }
+        return Ok(ActivityLock(file));
     }
-    Ok(ActivityLock(file))
+
+    let deadline = match mode {
+        ActivityLockMode::Timed(timeout) => Some(Instant::now() + timeout),
+        ActivityLockMode::NonBlocking => None,
+        ActivityLockMode::Blocking => unreachable!("blocking mode returned above"),
+    };
+    loop {
+        // SAFETY: flock only observes the valid file descriptor owned by file.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(ActivityLock(file));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::WouldBlock {
+            return Err(activity_io_error("activity-lock-failed", &path, err));
+        }
+        let Some(deadline) = deadline else {
+            return Err(activity_io_error("activity-lock-busy", &path, err));
+        };
+        if Instant::now() >= deadline {
+            return Err(activity_io_error("activity-lock-timeout", &path, err));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn activity_io_error(code: &str, path: &Path, err: io::Error) -> CliError {
@@ -800,7 +847,37 @@ pub(crate) fn read_event_from_stdin() -> Result<TurnEvent, CliError> {
 pub(crate) fn ingest_event(
     context: &CliContext,
     id: &str,
+    event: TurnEvent,
+) -> Result<ActivityResult, CliError> {
+    ingest_event_with_lock(context, id, event, ActivityLockMode::Blocking)
+}
+
+fn ingest_event_nonblocking(
+    context: &CliContext,
+    id: &str,
+    event: TurnEvent,
+) -> Result<ActivityResult, CliError> {
+    ingest_event_with_lock(context, id, event, ActivityLockMode::NonBlocking)
+}
+
+pub(crate) fn ingest_event_retry(
+    context: &CliContext,
+    id: &str,
+    event: TurnEvent,
+) -> Result<ActivityResult, CliError> {
+    ingest_event_with_lock(
+        context,
+        id,
+        event,
+        ActivityLockMode::Timed(CODEX_COMPLETION_RETRY_TIMEOUT),
+    )
+}
+
+fn ingest_event_with_lock(
+    context: &CliContext,
+    id: &str,
     mut event: TurnEvent,
+    lock_mode: ActivityLockMode,
 ) -> Result<ActivityResult, CliError> {
     validate_event(&event)?;
     let record = load_session_record(context, id)?;
@@ -862,7 +939,11 @@ pub(crate) fn ingest_event(
     }
 
     let dir = session_dir(context, &record.id);
-    let _lock = acquire_lock(&dir)?;
+    let _lock = match lock_mode {
+        ActivityLockMode::Blocking => acquire_lock(&dir)?,
+        ActivityLockMode::NonBlocking => acquire_lock_nonblocking(&dir)?,
+        ActivityLockMode::Timed(timeout) => acquire_lock_with_timeout(&dir, timeout)?,
+    };
     let path = dir.join(ACTIVITY_FILE);
     let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
     let replay_path = dir.join(ACTIVITY_REPLAY_FILE);
@@ -1039,22 +1120,29 @@ pub(crate) fn ingest_provider_hook_fail_open(
     }
 }
 
-pub(crate) fn ingest_provider_notification(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderNotificationIngest {
+    Ignored,
+    Ingested,
+    Deferred,
+}
+
+fn ingest_provider_notification(
     context: &CliContext,
     agent: AgentKind,
     payload: &str,
-) -> Result<bool, CliError> {
+) -> Result<ProviderNotificationIngest, CliError> {
     let Some(id) = std::env::var("AGENT_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {
-        return Ok(false);
+        return Ok(ProviderNotificationIngest::Ignored);
     };
     let Some(runtime_id) = std::env::var("AGENT_SESSION_RUNTIME_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {
-        return Ok(false);
+        return Ok(ProviderNotificationIngest::Ignored);
     };
     if payload.len() as u64 > MAX_EVENT_BYTES {
         return Err(CliError::data(
@@ -1071,10 +1159,79 @@ pub(crate) fn ingest_provider_notification(
         )
     })?;
     let Some(event) = normalize_provider_notification(agent, &runtime_id, &raw)? else {
-        return Ok(false);
+        return Ok(ProviderNotificationIngest::Ignored);
     };
-    let _ = ingest_event(context, &id, event)?;
-    Ok(true)
+    if let Err(error) = ingest_event_nonblocking(context, &id, event.clone()) {
+        if error.code() != "activity-lock-busy" {
+            return Err(error);
+        }
+        spawn_activity_event_retry(context, &id, &event)?;
+        return Ok(ProviderNotificationIngest::Deferred);
+    }
+    Ok(ProviderNotificationIngest::Ingested)
+}
+
+fn spawn_activity_event_retry(
+    context: &CliContext,
+    id: &str,
+    event: &TurnEvent,
+) -> Result<(), CliError> {
+    let executable = std::env::current_exe().map_err(|err| {
+        CliError::runtime(
+            "provider-notification-retry-executable-failed",
+            format!("failed to resolve the activity retry executable: {err}"),
+            None,
+        )
+    })?;
+    let bytes = serde_json::to_vec(event).map_err(|_| {
+        CliError::data(
+            "provider-notification-retry-event-invalid",
+            "normalized provider notification could not be encoded for activity retry",
+            None,
+        )
+    })?;
+    let mut child = ProcessCommand::new(executable)
+        .arg("--state-dir")
+        .arg(&context.state_dir)
+        .args(["activity", "event", id, "--stdin", "--format", "json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env(ACTIVITY_RETRY_PROVIDER_ENV, event.provider.as_str())
+        .process_group(0)
+        .spawn()
+        .map_err(|err| {
+            CliError::runtime(
+                "provider-notification-retry-spawn-failed",
+                format!("failed to spawn the metadata-only activity retry: {err}"),
+                None,
+            )
+        })?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| {
+            CliError::runtime(
+                "provider-notification-retry-stdin-failed",
+                "metadata-only activity retry stdin was unavailable",
+                None,
+            )
+        })?
+        .write_all(&bytes);
+    if let Err(err) = write_result {
+        unsafe {
+            let pgid = -(child.id() as libc::pid_t);
+            let _ = libc::kill(pgid, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CliError::runtime(
+            "provider-notification-retry-write-failed",
+            format!("failed to write metadata-only activity retry input: {err}"),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn ingest_provider_notification_fail_open(
@@ -1083,8 +1240,8 @@ pub(crate) fn ingest_provider_notification_fail_open(
     payload: &str,
 ) {
     match ingest_provider_notification(context, agent, payload) {
-        Ok(true) => clear_hook_diagnostic(context, agent),
-        Ok(false) => {}
+        Ok(ProviderNotificationIngest::Ingested) => clear_hook_diagnostic(context, agent),
+        Ok(ProviderNotificationIngest::Ignored | ProviderNotificationIngest::Deferred) => {}
         Err(err) => record_hook_diagnostic(context, agent, err.code()),
     }
 }
@@ -1095,6 +1252,9 @@ pub(crate) fn forward_provider_notification_fail_open(
     payload: &str,
 ) {
     if agent != AgentKind::Codex {
+        return;
+    }
+    if std::env::var_os(CODEX_NOTIFY_FORWARD_ACTIVE_ENV).is_some() {
         return;
     }
     let Some(encoded_argv) = encoded_argv else {
@@ -1117,6 +1277,7 @@ pub(crate) fn forward_provider_notification_fail_open(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .env(CODEX_NOTIFY_FORWARD_ACTIVE_ENV, "1")
         .process_group(0);
     let Ok(mut child) = command.spawn() else {
         return;
@@ -1139,7 +1300,7 @@ pub(crate) fn forward_provider_notification_fail_open(
     }
 }
 
-fn record_hook_diagnostic(context: &CliContext, agent: AgentKind, code: &str) {
+pub(crate) fn record_hook_diagnostic(context: &CliContext, agent: AgentKind, code: &str) {
     let Some(id) = std::env::var("AGENT_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -1176,7 +1337,7 @@ fn record_hook_diagnostic(context: &CliContext, agent: AgentKind, code: &str) {
     );
 }
 
-fn clear_hook_diagnostic(context: &CliContext, agent: AgentKind) {
+pub(crate) fn clear_hook_diagnostic(context: &CliContext, agent: AgentKind) {
     let Some(id) = std::env::var("AGENT_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -1429,12 +1590,32 @@ pub(crate) fn doctor(
         let notification_path = (agent == AgentKind::Codex)
             .then(codex_notification_config_path)
             .transpose()?;
-        let notification_mode = notification_path
-            .as_deref()
-            .and_then(|path| codex_notify_mode_label(path).ok());
-        let (configured, configuration_error) = match provider_configured(agent, &path) {
-            Ok(configured) => (configured, None),
-            Err(error) => (false, Some(error.code().to_string())),
+        let (configured, configuration_error, notification_mode) = match agent {
+            AgentKind::Codex => {
+                let hooks = json_provider_configured(agent, &path);
+                let notification = codex_notification_status(
+                    notification_path
+                        .as_deref()
+                        .expect("Codex notification path is resolved above"),
+                );
+                let configured = hooks.as_ref().is_ok_and(|configured| *configured)
+                    && notification.as_ref().is_ok_and(|status| status.configured);
+                let configuration_error = hooks
+                    .as_ref()
+                    .err()
+                    .or_else(|| notification.as_ref().err())
+                    .map(|error| error.code().to_string());
+                let notification_mode = Some(
+                    notification
+                        .map(|status| status.mode)
+                        .unwrap_or_else(|_| "invalid".to_string()),
+                );
+                (configured, configuration_error, notification_mode)
+            }
+            AgentKind::Claude | AgentKind::Hermes => match provider_configured(agent, &path) {
+                Ok(configured) => (configured, None, None),
+                Err(error) => (false, Some(error.code().to_string()), None),
+            },
         };
         let activity_summary = activity_by_provider
             .get(agent.as_str())
@@ -1909,28 +2090,37 @@ fn provider_configured(agent: AgentKind, path: &Path) -> Result<bool, CliError> 
     match agent {
         AgentKind::Codex => {
             let hooks_configured = json_provider_configured(agent, path)?;
-            let notification_configured =
-                codex_notification_configured(&codex_notification_config_path()?)?;
-            Ok(hooks_configured && notification_configured)
+            let notification = codex_notification_status(&codex_notification_config_path()?)?;
+            Ok(hooks_configured && notification.configured)
         }
         AgentKind::Claude => json_provider_configured(agent, path),
         AgentKind::Hermes => hermes_configured(path),
     }
 }
 
-fn codex_notification_configured(path: &Path) -> Result<bool, CliError> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodexNotificationStatus {
+    configured: bool,
+    mode: String,
+}
+
+fn codex_notification_status(path: &Path) -> Result<CodexNotificationStatus, CliError> {
     if !path.is_file() {
-        return Ok(false);
+        return Ok(CodexNotificationStatus {
+            configured: false,
+            mode: "absent".to_string(),
+        });
     }
     let document = parse_codex_notification_config(
         path,
         &fs::read_to_string(path)
             .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
     )?;
-    Ok(matches!(
-        codex_notify_mode(&document),
-        CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
-    ))
+    let mode = codex_notify_mode(&document);
+    Ok(CodexNotificationStatus {
+        configured: matches!(mode, CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)),
+        mode: codex_notify_mode_name(&mode).to_string(),
+    })
 }
 
 fn parse_codex_notification_config(path: &Path, raw: &str) -> Result<TomlDocument, CliError> {
@@ -1994,25 +2184,19 @@ fn codex_forward_argv_is_safe(argv: &[String]) -> bool {
         && argv.len() <= MAX_CODEX_FORWARD_ARGS
         && !argv[0].trim().is_empty()
         && argv.iter().map(String::len).sum::<usize>() <= MAX_CODEX_FORWARD_ARGV_BYTES
-        && !(argv.len() >= CODEX_NOTIFY_ARGV.len()
-            && argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV))
+        && !argv.iter().any(|value| value == CODEX_NOTIFY_FORWARD_FLAG)
+        && (argv.len() < CODEX_NOTIFY_ARGV.len()
+            || !argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV))
 }
 
-fn codex_notify_mode_label(path: &Path) -> Result<String, CliError> {
-    if !path.is_file() {
-        return Ok("absent".to_string());
-    }
-    let raw = fs::read_to_string(path)
-        .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?;
-    let document = parse_codex_notification_config(path, &raw)?;
-    Ok(match codex_notify_mode(&document) {
+fn codex_notify_mode_name(mode: &CodexNotifyMode) -> &'static str {
+    match mode {
         CodexNotifyMode::Absent => "absent",
         CodexNotifyMode::Owned => "owned",
         CodexNotifyMode::Composed(_) => "composed",
         CodexNotifyMode::Foreign(_) => "conflict",
         CodexNotifyMode::Invalid => "invalid",
     }
-    .to_string())
 }
 
 fn plan_codex_notification(
@@ -2087,6 +2271,18 @@ fn plan_codex_notification(
                 argv.push(CODEX_NOTIFY_FORWARD_FLAG);
                 argv.push(encoded);
                 document["notify"] = toml_value(argv);
+
+                let mut restored = document.clone();
+                let mut restored_argv = TomlArray::new();
+                restored_argv.extend(forwarded);
+                restored["notify"] = toml_value(restored_argv);
+                if Some(restored.to_string().as_bytes()) != original_bytes.as_deref() {
+                    return Err(CliError::data(
+                        "provider-notification-config-conflict",
+                        "Codex user-owned notify argv cannot be composed with byte-exact removal; it was preserved and activity setup made no changes",
+                        Some(json!({ "path": display_path(path) })),
+                    ));
+                }
             }
             CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {
                 return Err(CliError::data(
@@ -2619,6 +2815,17 @@ mod tests {
             pending_journal: None,
             extra: Map::new(),
         }
+    }
+
+    #[test]
+    fn timed_activity_lock_wait_is_bounded() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _held = acquire_lock(tmp.path()).expect("held lock");
+        let started = Instant::now();
+        let error = acquire_lock_with_timeout(tmp.path(), Duration::from_millis(50))
+            .expect_err("timed lock must not wait forever");
+        assert_eq!(error.code(), "activity-lock-timeout");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     fn test_session(tmp: &tempfile::TempDir) -> (CliContext, crate::CreatedRecord) {

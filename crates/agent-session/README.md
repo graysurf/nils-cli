@@ -77,10 +77,17 @@ the official `agent-turn-complete` notify argv to `~/.codex/config.toml` when
 `notify` is absent, recognizes exact ownership idempotently, or wraps a safe
 user-owned singular argv in an agent-session-owned fan-out. The fan-out invokes
 the preserved argv directly without a shell, suppresses its output, and kills
-it after a two-second bound; downstream failure never blocks Codex. Removal
-deletes an exact owned argv or restores every composed argv string exactly.
-Unsafe, oversized, non-string, or recursive values are preserved and reported
-as conflicts. Both Codex files are parsed and planned before either is
+it after a two-second bound. A depth marker prevents nested fan-out, and
+activity lock contention cannot delay the preserved notifier; downstream or
+telemetry failure never blocks Codex. A contended authoritative completion is
+handed to a detached metadata-only `activity event` retry that waits up to five
+seconds for the same durable transaction lock without retaining provider
+content. The worker clears diagnostics only after durable ingestion and records
+a sanitized terminal code on timeout or failure. Setup composes
+only when simulated removal proves the complete original TOML bytes can be
+restored. Unsafe, oversized,
+non-string, recursive, or non-reversible values are preserved and reported as
+conflicts. Both Codex files are parsed and planned before either is
 written; if the guarded second write fails, the first write is restored or a
 loud rollback error identifies the partial state. That provider-authored
 notification must match the exact open runtime/thread/turn and is the

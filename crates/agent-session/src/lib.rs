@@ -299,8 +299,22 @@ fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
     match args.command {
         cli::ActivityCommand::Event(args) => {
             let format = args.format;
-            let result = activity::read_event_from_stdin()
-                .and_then(|event| activity::ingest_event(context, &args.id, event));
+            let retry_agent = std::env::var(activity::ACTIVITY_RETRY_PROVIDER_ENV)
+                .ok()
+                .and_then(|provider| AgentKind::from_name(&provider));
+            let result = activity::read_event_from_stdin().and_then(|event| {
+                if retry_agent.is_some() {
+                    activity::ingest_event_retry(context, &args.id, event)
+                } else {
+                    activity::ingest_event(context, &args.id, event)
+                }
+            });
+            if let Some(agent) = retry_agent {
+                match &result {
+                    Ok(_) => activity::clear_hook_diagnostic(context, agent),
+                    Err(error) => activity::record_hook_diagnostic(context, agent, error.code()),
+                }
+            }
             match result {
                 Ok(result) => render_single_success(
                     ACTIVITY_EVENT_COMMAND,

@@ -235,9 +235,18 @@ when absent, recognizes it idempotently, and composes a bounded safe user-owned
 argv through the hidden `--forward-notify-argv-json` transport. Composition
 executes the original argv directly without a shell, passes the provider JSON
 as its final argument, suppresses child output, and kills it after two seconds.
-Remove deletes an exact owned value or restores every composed argv string;
-unsafe, oversized, non-string, and recursive values fail closed before hooks
-mutation. The two
+The helper marks fan-out depth, rejects nested forwarding metadata, and uses a
+non-blocking activity lock so local state contention cannot delay the preserved
+notifier. On contention, the normalized metadata-only completion is piped to a
+detached `activity event` retry that waits for the same transaction lock, so the
+single-shot authoritative signal survives transient contention without holding
+up Codex. The retry has a five-second lock deadline, clears diagnostics after
+durable success, and records a sanitized timeout or ingest failure instead of
+accumulating an unbounded worker. Remove deletes an exact owned value or restores
+the original full
+config bytes; setup accepts composition only when that byte-exact reversal is
+proven in memory. Unsafe, oversized, non-string, recursive, and non-reversible
+values fail closed before hooks mutation. The two
 Codex files are fully planned before mutation and the first guarded write is
 rolled back if the second guarded write fails. Doctor scans session records
 once, probes provider versions concurrently with a two-second bound per
