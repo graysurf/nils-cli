@@ -1934,6 +1934,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "toml_edit",
  "tower",
  "uuid",
 ]

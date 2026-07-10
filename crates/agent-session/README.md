@@ -72,11 +72,17 @@ agent-session activity setup --agent codex --remove
 The same commands support `claude` and `hermes`. Setup merges exact
 agent-session-owned handlers into existing provider configuration, repeated
 apply/repair is idempotent, and removal preserves unrelated hooks. Provider
-setup also refuses an observed concurrent config change. Provider hook failure
-is fail-open and old/unsupported providers retain the activity
-fallback. Doctor scans local session evidence once and probes provider versions
-concurrently with a bounded timeout, verifies the exact owned hook timeout, and
-checks that the configured helper resolves to an executable on the hook PATH.
+setup also refuses an observed concurrent config change. For Codex, setup adds
+the official `agent-turn-complete` notify argv to `~/.codex/config.toml` only
+when `notify` is absent or already agent-session-owned. A user-owned singular
+notify command is preserved and reported as a conflict; removal deletes only
+the exact owned argv. That provider-authored notification is correlated to the
+active runtime/thread/turn and is the authoritative completion input. Raw Codex
+`Stop` remains non-final observation. Hook/notification failure is fail-open and
+old/unsupported providers retain the activity fallback. Doctor scans local
+session evidence once and probes provider versions concurrently with a bounded
+timeout, verifies the exact owned hook timeout and Codex notify argv, and checks
+that the configured helper resolves to an executable on the provider PATH.
 See [the stable turn-state contract](docs/turn-state-contract.md) and
 [provider evidence matrix](docs/provider-turn-signal-evidence.md).
 

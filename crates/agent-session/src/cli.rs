@@ -286,9 +286,12 @@ pub enum ActivityCommand {
     /// Translate one provider hook payload into a safe normalized event.
     #[command(hide = true)]
     Hook(ActivityHookArgs),
+    /// Translate one provider notification payload into a safe normalized event.
+    #[command(hide = true)]
+    Notify(ActivityNotifyArgs),
     /// Report provider support, version, configuration, and repair guidance.
     Doctor(ActivityDoctorArgs),
-    /// Preview or apply additive provider hook configuration.
+    /// Preview or apply additive provider lifecycle configuration.
     Setup(ActivitySetupArgs),
 }
 
@@ -327,6 +330,17 @@ pub struct ActivityHookArgs {
     /// Provider event name when the raw payload does not carry one.
     #[arg(long, hide = true)]
     pub event: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ActivityNotifyArgs {
+    /// Provider whose notification payload is supplied as the final argument.
+    #[arg(long, value_enum)]
+    pub agent: AgentKind,
+
+    /// Provider-authored JSON notification payload.
+    #[arg(value_name = "PAYLOAD")]
+    pub payload: String,
 }
 
 #[derive(Debug, Args)]

@@ -596,6 +596,7 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
     fs::create_dir_all(home.join(".claude")).expect("claude dir");
     fs::create_dir_all(home.join(".hermes")).expect("hermes dir");
     let codex_path = home.join(".codex/hooks.json");
+    let codex_notify_path = home.join(".codex/config.toml");
     let claude_path = home.join(".claude/settings.json");
     let hermes_path = home.join(".hermes/config.yaml");
     fs::write(
@@ -603,6 +604,11 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
         r#"{"keep":"codex","hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep-codex-hook"}]}]}}"#,
     )
     .expect("codex config");
+    fs::write(
+        &codex_notify_path,
+        "model = \"gpt-test\"\n\n[features]\nkeep = true\n",
+    )
+    .expect("Codex notify config");
     fs::write(
         &claude_path,
         r#"{"keep":"claude","hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep-claude-hook"}]}]}}"#,
@@ -622,6 +628,8 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
         ("hermes", hermes_path.as_path(), "keep-hermes-hook"),
     ] {
         let before = fs::read(path).expect("before config");
+        let notify_before = (agent == "codex")
+            .then(|| fs::read(&codex_notify_path).expect("before Codex notify config"));
         let dry_run = run(
             tmp.path(),
             &[
@@ -647,6 +655,12 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
         assert_eq!(data(&dry_run_json)["configured"], false);
         assert_eq!(data(&dry_run_json)["would_configure"], true);
         assert_eq!(fs::read(path).expect("dry-run config"), before);
+        if let Some(notify_before) = notify_before.as_ref() {
+            assert_eq!(
+                fs::read(&codex_notify_path).expect("dry-run Codex notify config"),
+                *notify_before
+            );
+        }
 
         let dry_run_text = run(
             tmp.path(),
@@ -677,6 +691,17 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
         assert_eq!(data(&apply_json)["would_configure"], true);
         let applied = fs::read(path).expect("applied config");
         assert!(String::from_utf8_lossy(&applied).contains(keep));
+        let applied_notify = (agent == "codex").then(|| {
+            let contents =
+                fs::read_to_string(&codex_notify_path).expect("applied Codex notify config");
+            assert!(contents.contains(
+                "notify = [\"agent-session\", \"activity\", \"notify\", \"--agent\", \"codex\"]"
+            ));
+            assert!(contents.contains("model = \"gpt-test\""));
+            assert!(contents.contains("[features]"));
+            assert!(contents.contains("keep = true"));
+            contents
+        });
 
         let second = run(
             tmp.path(),
@@ -696,6 +721,12 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
         assert_eq!(data(&second.stdout_json())["configured"], true);
         assert_eq!(data(&second.stdout_json())["would_configure"], true);
         assert_eq!(fs::read(path).expect("second config"), applied);
+        if let Some(applied_notify) = applied_notify.as_ref() {
+            assert_eq!(
+                fs::read_to_string(&codex_notify_path).expect("second Codex notify config"),
+                *applied_notify
+            );
+        }
 
         let remove = run(
             tmp.path(),
@@ -718,11 +749,59 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
         let removed = fs::read_to_string(path).expect("removed config");
         assert!(removed.contains(keep));
         assert!(!removed.contains("agent-session activity hook"));
+        if agent == "codex" {
+            let removed_notify_bytes =
+                fs::read(&codex_notify_path).expect("removed Codex notify config");
+            assert_eq!(
+                removed_notify_bytes,
+                *notify_before
+                    .as_ref()
+                    .expect("original Codex notify config"),
+                "owned notify apply/remove must preserve the original config bytes"
+            );
+            let removed_notify = String::from_utf8(removed_notify_bytes).expect("UTF-8 config");
+            assert!(!removed_notify.contains("notify ="));
+            assert!(removed_notify.contains("model = \"gpt-test\""));
+            assert!(removed_notify.contains("[features]"));
+            assert!(removed_notify.contains("keep = true"));
+        }
     }
 }
 
 #[test]
-fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
+fn codex_activity_setup_refuses_a_user_owned_notify_without_mutating_configs() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(&hooks_path, r#"{"keep":"hooks"}"#).expect("hooks config");
+    fs::write(
+        &notify_path,
+        "model = \"gpt-test\"\nnotify = [\"user-notifier\", \"--keep\"]\n",
+    )
+    .expect("notify config");
+    let hooks_before = fs::read(&hooks_path).expect("hooks before");
+    let notify_before = fs::read(&notify_path).expect("notify before");
+    let home_arg = home.to_string_lossy().to_string();
+    let result = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(result.code, 0);
+    assert_eq!(
+        result.stdout_json()["error"]["code"],
+        "provider-notification-config-conflict"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
+fn codex_adapter_uses_authoritative_notify_after_conservative_raw_stop() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let cwd = tmp.path().join("repo");
@@ -853,6 +932,204 @@ fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
         assert!(!contents.contains(provider_turn_secret));
     }
 
+    let notify = |payload: Value, envs: &[(&str, &str)]| {
+        run(
+            tmp.path(),
+            &[
+                "activity",
+                "notify",
+                "--agent",
+                "codex",
+                &payload.to_string(),
+            ],
+            envs,
+        )
+    };
+    let missing_turn = notify(
+        json!({
+            "type": "agent-turn-complete",
+            "thread-id": provider_session_secret,
+            "last-assistant-message": secret
+        }),
+        &hook_env,
+    );
+    assert_eq!(missing_turn.code, 0);
+    let diagnostic_path = state_dir
+        .join("sessions")
+        .join(&id)
+        .join("activity.diagnostic.json");
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("missing turn diagnostic");
+    assert!(diagnostic.contains("provider-notification-turn-id-missing"));
+    assert!(!diagnostic.contains(secret));
+
+    let stale_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", "prior-runtime"),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let stale = notify(
+        json!({
+            "type": "agent-turn-complete",
+            "thread-id": provider_session_secret,
+            "turn-id": provider_turn_secret
+        }),
+        &stale_env,
+    );
+    assert_eq!(stale.code, 0);
+    let malformed_notify = run(
+        tmp.path(),
+        &[
+            "activity",
+            "notify",
+            "--agent",
+            "codex",
+            "{invalid-notification",
+        ],
+        &hook_env,
+    );
+    assert_eq!(malformed_notify.code, 0);
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("invalid notify diagnostic");
+    assert!(diagnostic.contains("provider-notification-invalid"));
+
+    let oversized_secret = "sensitive-notification-content";
+    let oversized = notify(
+        json!({
+            "type": "agent-turn-complete",
+            "thread-id": provider_session_secret,
+            "turn-id": provider_turn_secret,
+            "last-assistant-message": oversized_secret.repeat(3_000)
+        }),
+        &hook_env,
+    );
+    assert_eq!(oversized.code, 0);
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("oversized notify diagnostic");
+    assert!(diagnostic.contains("provider-notification-too-large"));
+    assert!(!diagnostic.contains(oversized_secret));
+    let wrong_thread = notify(
+        json!({
+            "type": "agent-turn-complete",
+            "thread-id": "different-thread",
+            "turn-id": provider_turn_secret
+        }),
+        &hook_env,
+    );
+    assert_eq!(wrong_thread.code, 0);
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&status.stdout_json())["turn_state"]["phase"],
+        "working"
+    );
+
+    let wrong_turn = notify(
+        json!({
+            "type": "agent-turn-complete",
+            "thread-id": provider_session_secret,
+            "turn-id": "different-turn"
+        }),
+        &hook_env,
+    );
+    assert_eq!(wrong_turn.code, 0);
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&status.stdout_json())["turn_state"]["phase"],
+        "working"
+    );
+
+    let notification = json!({
+        "type": "agent-turn-complete",
+        "thread-id": provider_session_secret,
+        "turn-id": provider_turn_secret,
+        "cwd": "/secret/cwd",
+        "input-messages": [secret],
+        "last-assistant-message": secret
+    });
+    let completed_notify = notify(notification.clone(), &hook_env);
+    assert_eq!(
+        completed_notify.code,
+        0,
+        "official completion notification must be fail-open: stderr={}",
+        completed_notify.stderr_text()
+    );
+    assert!(completed_notify.stdout_text().is_empty());
+    assert!(completed_notify.stderr_text().is_empty());
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    let status_json = status.stdout_json();
+    assert_eq!(data(&status_json)["turn_state"]["phase"], "waiting");
+    assert_eq!(
+        data(&status_json)["turn_state"]["last_turn"]["outcome"],
+        "completed"
+    );
+    let completed_revision = data(&status_json)["turn_state"]["revision"].clone();
+    let duplicate = notify(notification, &hook_env);
+    assert_eq!(duplicate.code, 0);
+    let duplicate_status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&duplicate_status.stdout_json())["turn_state"]["revision"],
+        completed_revision
+    );
+    for file in ["activity.json", "activity.journal.jsonl"] {
+        let contents = fs::read_to_string(state_dir.join("sessions").join(&id).join(file))
+            .expect("activity file after notify");
+        for forbidden in [
+            secret,
+            provider_session_secret,
+            provider_turn_secret,
+            "/secret/cwd",
+            "input-messages",
+            "last-assistant-message",
+        ] {
+            assert!(!contents.contains(forbidden), "forbidden {forbidden}");
+        }
+    }
+
     let malformed = format!(r#"{{"prompt":"{secret}""#);
     let hook = run_with_stdin(
         tmp.path(),
@@ -861,10 +1138,6 @@ fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
         &malformed,
     );
     assert_eq!(hook.code, 0, "provider hooks must remain fail-open");
-    let diagnostic_path = state_dir
-        .join("sessions")
-        .join(&id)
-        .join("activity.diagnostic.json");
     let diagnostic = fs::read_to_string(&diagnostic_path).expect("safe diagnostic");
     assert!(diagnostic.contains("provider-hook-invalid"));
     assert!(!diagnostic.contains(secret));

@@ -5,7 +5,7 @@
 This report freezes the provider lifecycle evidence used by
 `agent-session.turn-event.v1` and `agent-session.turn-state.v1`. It was audited
 on 2026-07-11 against Codex CLI 0.144.1, Claude Code 2.1.206, Hermes Agent
-0.18.0, and agent-session 1.21.7. The support floors are deliberately the
+0.18.0, and the agent-session 1.21.8 implementation baseline. The support floors are deliberately the
 oldest versions directly covered by this audit, not guesses about earlier
 releases.
 
@@ -21,8 +21,10 @@ normalized event is created.
   `turn_id`, and the `UserPromptSubmit`, `PermissionRequest`, `PostToolUse`, and
   `Stop` payloads.
 - [Codex notifications](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)
-  documents the older `agent-turn-complete`-only notify surface. It is not
-  installed automatically because `notify` is a singular user-owned command.
+  documents the `agent-turn-complete` notify surface and its `thread-id` and
+  `turn-id`. Setup installs the exact agent-session argv when `notify` is absent
+  or already owned; a different singular user command is preserved and blocks
+  automatic setup.
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks) documents parallel
   matching hooks, exact `AskUserQuestion` matching, shared `tool_use_id` on
   `PreToolUse`/`PostToolUse`/`PostToolUseFailure`, `PermissionRequest` without
@@ -37,7 +39,7 @@ normalized event is created.
 
 | Provider | Audited floor | Classification | Start | Completion | Attention | Failure | Setup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Codex | 0.144.1 | partial | `UserPromptSubmit`, observed | raw `Stop` is journal evidence only; no Waiting transition | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive merge into `~/.codex/hooks.json`; Codex trust review remains mandatory |
+| Codex | 0.144.1 | supported | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive hooks in `~/.codex/hooks.json` plus exact owned notify argv in `~/.codex/config.toml`; user-owned notify conflicts fail closed |
 | Claude Code | 2.1.206 | partial | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | `StopFailure`, observed; `AskUserQuestion` tool failure clears only its clarification | additive merge into `~/.claude/settings.json` |
 | Hermes | 0.18.0 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | pre/post approval hooks exist, but clearing remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
@@ -52,8 +54,13 @@ than fabricating a phase.
 Matching hooks from multiple sources run concurrently. A `Stop` observer cannot
 know whether another matching hook will return a continuation decision, so raw
 `Stop` cannot produce Waiting. The event is retained as `stop_observed` with
-observed confidence. A later new turn, runtime boundary, or separately proven
-completion source may reconcile it.
+observed confidence. The official `agent-turn-complete` notification fires after
+the completed agent turn and carries both thread and turn identifiers. The
+adapter requires both, projects them through the same active-runtime namespace
+as hook identifiers, and emits authoritative `turn_completed` only when the
+runtime, provider session/thread, and open turn all match. A missing, malformed,
+stale-runtime, wrong-thread, or wrong-turn notification cannot complete the
+turn. Duplicate completion is idempotent.
 
 `PermissionRequest` has `turn_id` but no request identifier shared with
 `PostToolUse`; `PostToolUse.tool_use_id` cannot be correlated to the preceding
@@ -102,6 +109,9 @@ The executable fixtures cover:
 - unrelated progress while attention is pending, including monotonic
   `current_turn.last_progress_at` without phase relaxation;
 - Stop followed by continuation/new-turn evidence;
+- raw Codex Stop followed by matching authoritative completion, plus wrong
+  thread/turn, missing identifier, duplicate, stale-runtime, malformed, and
+  oversized notification cases;
 - duplicate and out-of-order normalized events;
 - rejection of a delayed prior-runtime event before host timestamping;
 - runtime/provider-session binding and runtime-scoped projection of raw
@@ -115,7 +125,8 @@ The executable fixtures cover:
   quarantine, deterministic current-runtime diagnostics, and mode-0600
   snapshot, replay, journal, diagnostic, and lock files;
 - dry-run, additive apply, repeated apply, repair, and owned-entry-only removal
-  for all three provider configs.
+  for all three provider configs, including Codex notify absence/ownership and
+  user-owned notify conflict preservation.
 
 The live release probe uses a no-content marker turn for each installed provider
 after the released binary is installed. Retained evidence records only provider
@@ -131,13 +142,22 @@ unrelated config keys are preserved; removal deletes only the exact
 agent-session-owned command entries. Setup refuses an observed concurrent
 source-file change instead of replacing the newer configuration.
 
+Codex setup owns two distinct files. Hooks remain an additive JSON merge in
+`~/.codex/hooks.json`. Completion uses the provider's singular top-level TOML
+`notify` argv in `~/.codex/config.toml`. Setup inserts only
+`["agent-session", "activity", "notify", "--agent", "codex"]`, recognizes that
+exact argv idempotently, and removes only that exact argv. Any other `notify`
+value is user-owned: dry-run/apply/repair return a content-free conflict before
+mutating the hooks file. The CLI never shells or retains a downstream command.
+
 Claude setup adds exact `AskUserQuestion` matcher groups for `PreToolUse`,
 `PostToolUse`, and `PostToolUseFailure` while retaining the general PostToolUse
 progress hook. Claude Code deduplicates identical matching command handlers, so
 an AskUserQuestion completion is ingested once even though the exact and general
 PostToolUse groups both match.
 
-Provider hooks invoke the local binary without network access. They no-op when
+Provider hooks and the Codex completion notification invoke the local binary
+without network access. They no-op when
 `AGENT_SESSION_ID` or `AGENT_SESSION_RUNTIME_ID` is absent, accept at most 64 KiB
 of JSON, project only allowlisted metadata into a normalized event, and always
 exit successfully to the provider. Telemetry failure can make state unknown or

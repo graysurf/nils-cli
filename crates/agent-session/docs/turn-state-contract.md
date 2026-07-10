@@ -51,6 +51,21 @@ The host receive time is canonical. Provider time is accepted only as inert
 metadata in v1 and never advances state ahead of host observation. Runtime id
 and provider mismatch are rejected before timestamping, journaling, or reducing.
 
+For the existing Codex tmux/TUI integration, the provider appends one bounded
+JSON argument to this owned command:
+
+```text
+agent-session activity notify --agent codex <payload>
+```
+
+Only `type == "agent-turn-complete"` is recognized. Both `thread-id` and
+`turn-id` are required and projected through the same runtime-scoped namespace
+as hook identifiers. A matching notification emits authoritative
+`turn_completed`; raw `Stop` remains `stop_observed`. Fields such as `cwd`,
+`input-messages`, and `last-assistant-message` are discarded before the
+normalized event is built. Unknown notification types no-op; invalid, oversized,
+stale, or mismatched payloads fail open to Codex and cannot complete the turn.
+
 ## Turn state
 
 Example:
@@ -181,7 +196,8 @@ directory.
 The schemas forbid prompt/assistant/terminal/transcript text, commands, tool
 arguments/results, paths from provider transcripts, credentials, tokens, and
 free-form provider errors. Raw hook payloads are parsed in memory and projected
-onto the allowlist; content fields are never serialized.
+onto the allowlist; the Codex notification adapter applies the same boundary to
+the provider's single JSON argv. Content fields are never serialized.
 
 `provider-prompt.v1` is a separate, advisory attach/title protocol. It is not a
 turn event source, it is not persisted into activity files, and a prompt-event
@@ -199,13 +215,18 @@ agent-session activity doctor [--agent <provider>] --format json
 
 Setup is explicit, additive, idempotent, and reversible. It preserves unrelated
 provider config, detects an observed concurrent modification before replacement,
-and never auto-accepts Codex trust or Hermes consent. Doctor scans session
+and never auto-accepts Codex trust or Hermes consent. Codex setup additionally
+owns the exact `agent-session activity notify --agent codex` argv in the
+singular top-level `notify` field of `~/.codex/config.toml`: it inserts the argv
+only when absent, recognizes it idempotently, removes only that exact value, and
+preserves/refuses every user-owned value before changing the hooks file. Doctor scans session
 records once, probes provider versions concurrently with a two-second bound per
 provider, and reports installed version or a bounded probe error, audited
 classification, config status, finality and correlation limits, trust
 requirements, and repair guidance without emitting provider config content.
-Configured status requires the exact owned command and timeout; helper health
-resolves that bare command on PATH. Hook diagnostics are bound to the active
+Configured status requires every exact owned hook command/timeout and, for
+Codex, the exact notify argv; helper health resolves the bare `agent-session`
+command on PATH. Hook/notification diagnostics are bound to the active
 launch id/generation and the newest current-runtime diagnostic is selected
 deterministically across sessions.
 
