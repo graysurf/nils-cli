@@ -47,12 +47,11 @@ use crate::provider_prompt::{
     ProviderPromptTail,
 };
 use crate::{
-    BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions,
-    backfill_provider_resume, delete_session, glance_session, list_sessions, load_session_record,
-    non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
-    search_workdirs, send_input, session_clipboard_buffer, session_dir, session_status,
-    short_hostname, start_provider_resume_session, start_session, update_session_title,
-    write_session_attachment,
+    BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
+    glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
+    resolve_tmux_bin, resume_session_by_id, search_workdirs, send_input, session_clipboard_buffer,
+    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
+    update_session_title, write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -2110,10 +2109,7 @@ async fn attach_socket(
 
                 if provider_refresh_pending {
                     provider_refresh_pending = false;
-                    provider_open_task = Some(open_provider_prompt_task(
-                        state.context.clone(),
-                        record.clone(),
-                    ));
+                    provider_open_task = Some(open_provider_prompt_task(record.clone()));
                 } else if let Some(tail) = prompt_tail {
                     provider_prompt_task = Some(AbortOnDropTask::new(tokio::spawn(
                         provider_prompt_loop(tail, control_tx.clone()),
@@ -2134,10 +2130,7 @@ async fn attach_socket(
                                 // transcript scans for repeated subscriptions.
                                 provider_refresh_pending = true;
                             } else {
-                                provider_open_task = Some(open_provider_prompt_task(
-                                    state.context.clone(),
-                                    record.clone(),
-                                ));
+                                provider_open_task = Some(open_provider_prompt_task(record.clone()));
                             }
                             continue;
                         }
@@ -2177,11 +2170,9 @@ async fn attach_socket(
 }
 
 fn open_provider_prompt_task(
-    context: CliContext,
     record: crate::SessionRecord,
 ) -> AbortOnDropTask<(crate::SessionRecord, Option<ProviderPromptTail>)> {
     AbortOnDropTask::new(tokio::task::spawn_blocking(move || {
-        let record = backfill_provider_resume(&context, record);
         let tail = ProviderPromptTail::open(&record);
         (record, tail)
     }))
@@ -2870,7 +2861,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn websocket_defers_codex_backfill_until_subscription() {
+    async fn websocket_subscription_rejects_heuristic_same_cwd_codex_backfill() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let state_dir = tmp.path().join("state");
@@ -2947,12 +2938,38 @@ mod tests {
             panic!("capability must be a text frame");
         };
         let capability: Value = serde_json::from_str(capability.as_str()).expect("capability json");
-        assert_eq!(capability["supported"], true);
+        assert_eq!(capability["supported"], false);
         let after: Value = serde_json::from_slice(
             &std::fs::read(&record_path).expect("record after subscription"),
         )
         .expect("record json");
-        assert_eq!(after["provider_resume"]["session_id"], "backfill-resume-id");
+        assert!(after.get("provider_resume").is_none());
+
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("open unrelated transcript")
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "timestamp":"2099-01-01T00:00:00Z",
+                        "type":"event_msg",
+                        "payload":{
+                            "type":"user_message",
+                            "message":"unrelated same-cwd prompt"
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .expect("append unrelated prompt");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), socket.next())
+                .await
+                .is_err(),
+            "an unrelated same-cwd transcript must not emit prompt events"
+        );
         let _ = socket.close(None).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         server.abort();

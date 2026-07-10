@@ -96,7 +96,9 @@ is no second state model.
   ```
 
   `provider` is `"codex"` or `"claude"` when supported and `null` otherwise; an unsupported provider, unresolved exact
-  transcript, unsafe transcript path, or exhausted discovery budget returns the same object with `supported:false`.
+  transcript, unsafe transcript path, exhausted discovery budget, or session without already persisted exact provider
+  identity returns the same object with `supported:false`. Prompt subscription never uses cwd/time-window history
+  heuristics to invent provider identity; sessions without exact identity remain on the consumer's fallback path.
   Clients that do not subscribe receive no event text frames. The normative event is:
 
   ```json
