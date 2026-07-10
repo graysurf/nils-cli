@@ -72,7 +72,11 @@ is no second state model.
   daemon-owned `tmux pipe-pane` broker per session (binary frames, renderable by xterm.js). Concurrent clients fan out
   from the same bounded in-memory stream; disconnecting one client leaves the others live, while a lagging client is
   disconnected so it cannot stall tmux or other clients. The broker uses a private ephemeral FIFO and retains no
-  interactive-session terminal bytes after the final client disconnects. The client sends JSON control frames
+  interactive-session terminal bytes after the final client disconnects. Snapshot capture drains live output into a
+  bounded handoff buffer and performs one bounded fresh-snapshot recovery if that buffer overflows. After handoff, a
+  supervised per-client pump keeps draining broker output independently of provider discovery, input, and resize work;
+  a normal broker close drains already accepted frames under the WebSocket send bound, while lag/error teardown remains
+  immediate. The client sends JSON control frames
   `{ "text": "...", "key": "enter", "keys": ["c-c"], "resize": { "cols": 80, "rows": 24 } }`. Token-gated; disconnect
   leaves the tmux session alive. Concurrent clients share the pane geometry; resize sequences are serialized and the
   last completed resize wins. A client may opt into authoritative Codex/Claude prompt events by sending
