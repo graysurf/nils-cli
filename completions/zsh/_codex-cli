@@ -78,6 +78,14 @@ _arguments "${_arguments_options[@]}" : \
 '*::extra -- Extra prompt text:_default' \
 && ret=0
 ;;
+(resume)
+_arguments "${_arguments_options[@]}" : \
+'--cd=[Override the recorded working directory (for a moved repository)]:dir:_files -/' \
+'-h[Print help]' \
+'--help[Print help]' \
+':session_id -- Codex session id to resume:_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_codex-cli__subcmd__agent__subcmd__help_commands" \
@@ -103,6 +111,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (commit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(resume)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -601,6 +613,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(resume)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -786,6 +802,7 @@ _codex-cli__subcmd__agent_commands() {
 'advice:Get actionable engineering advice' \
 'knowledge:Get an explanation for a concept' \
 'commit:Run the semantic-commit workflow' \
+'resume:Resume a Codex session in its recorded working directory' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'codex-cli agent commands' commands "$@"
@@ -807,6 +824,7 @@ _codex-cli__subcmd__agent__subcmd__help_commands() {
 'advice:Get actionable engineering advice' \
 'knowledge:Get an explanation for a concept' \
 'commit:Run the semantic-commit workflow' \
+'resume:Resume a Codex session in its recorded working directory' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'codex-cli agent help commands' commands "$@"
@@ -836,6 +854,11 @@ _codex-cli__subcmd__agent__subcmd__help__subcmd__prompt_commands() {
     local commands; commands=()
     _describe -t commands 'codex-cli agent help prompt commands' commands "$@"
 }
+(( $+functions[_codex-cli__subcmd__agent__subcmd__help__subcmd__resume_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__help__subcmd__resume_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent help resume commands' commands "$@"
+}
 (( $+functions[_codex-cli__subcmd__agent__subcmd__knowledge_commands] )) ||
 _codex-cli__subcmd__agent__subcmd__knowledge_commands() {
     local commands; commands=()
@@ -845,6 +868,11 @@ _codex-cli__subcmd__agent__subcmd__knowledge_commands() {
 _codex-cli__subcmd__agent__subcmd__prompt_commands() {
     local commands; commands=()
     _describe -t commands 'codex-cli agent prompt commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__resume_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__resume_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent resume commands' commands "$@"
 }
 (( $+functions[_codex-cli__subcmd__auth_commands] )) ||
 _codex-cli__subcmd__auth_commands() {
@@ -1117,6 +1145,7 @@ _codex-cli__subcmd__help__subcmd__agent_commands() {
 'advice:Get actionable engineering advice' \
 'knowledge:Get an explanation for a concept' \
 'commit:Run the semantic-commit workflow' \
+'resume:Resume a Codex session in its recorded working directory' \
     )
     _describe -t commands 'codex-cli help agent commands' commands "$@"
 }
@@ -1139,6 +1168,11 @@ _codex-cli__subcmd__help__subcmd__agent__subcmd__knowledge_commands() {
 _codex-cli__subcmd__help__subcmd__agent__subcmd__prompt_commands() {
     local commands; commands=()
     _describe -t commands 'codex-cli help agent prompt commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__agent__subcmd__resume_commands] )) ||
+_codex-cli__subcmd__help__subcmd__agent__subcmd__resume_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help agent resume commands' commands "$@"
 }
 (( $+functions[_codex-cli__subcmd__help__subcmd__auth_commands] )) ||
 _codex-cli__subcmd__help__subcmd__auth_commands() {

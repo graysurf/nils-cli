@@ -1,4 +1,6 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 
 const ROOT_AFTER_HELP: &str = "\
 EXAMPLES:
@@ -104,6 +106,15 @@ pub enum AgentCommand {
         /// Extra prompt text
         #[arg(value_name = "extra", num_args = 0..)]
         extra: Vec<String>,
+    },
+    /// Resume a Codex session in its recorded working directory
+    Resume {
+        /// Codex session id to resume
+        #[arg(value_name = "session_id")]
+        session_id: String,
+        /// Override the recorded working directory (for a moved repository)
+        #[arg(long = "cd", value_name = "dir", value_hint = ValueHint::DirPath)]
+        cd: Option<PathBuf>,
     },
 }
 

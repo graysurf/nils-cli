@@ -2,6 +2,7 @@ use std::io::{self, BufRead, Write};
 
 pub mod commit;
 pub mod exec;
+pub mod resume;
 
 pub fn prompt(prompt_args: &[String]) -> i32 {
     prompt_with_options(prompt_args, exec::ExecOptions::default())
