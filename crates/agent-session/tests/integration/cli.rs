@@ -584,7 +584,7 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
     );
     assert_eq!(
         fs::metadata(replay_path).expect("replay size").len(),
-        4096 * 2 * 32
+        64 + 4096 * 2 * 32
     );
 }
 

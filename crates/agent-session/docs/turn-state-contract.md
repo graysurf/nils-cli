@@ -125,7 +125,8 @@ Each session owns:
 - `activity.journal.jsonl`: atomic mode-0600 metadata journal, bounded to 256
   events and 64 KiB;
 - `activity.replay.bin`: fixed-size mode-0600 open-addressed replay index for
-  4096 runtime-scoped event-id digests;
+  4096 runtime-scoped event-id digests, with a versioned launch-id/generation
+  header;
 - `.activity.lock`: mode-0600 cross-process advisory lock.
 
 Activity files are separate from `session.json`, so title/resume writes and hook
@@ -137,6 +138,12 @@ transition repairs an interrupted split write before reduction. The replay
 index is separate from the shorter journal retention, gives expected O(1)
 duplicate checks without growing the JSON snapshot, and rejects further events
 at its 4096-event capacity with resume guidance instead of forgetting old ids.
+The replay file header must match the snapshot runtime tuple. A missing,
+truncated, or swapped index for a nonempty snapshot fails closed and exposes
+Unknown; creating the index also syncs its parent directory. Provider-hook
+events additionally use a short metadata-only semantic replay guard so
+concurrent duplicate delivery cannot interrupt the same turn, inflate an
+uncorrelated attention latch, or rewrite an already observed completion.
 Unknown additive JSON fields survive supported reads and writes. A corrupt or
 future-version snapshot is moved to a private quarantine file before a fresh
 runtime snapshot is written. Session deletion removes the entire session
@@ -170,6 +177,10 @@ records once, probes provider versions concurrently with a two-second bound per
 provider, and reports installed version or a bounded probe error, audited
 classification, config status, finality and correlation limits, trust
 requirements, and repair guidance without emitting provider config content.
+Configured status requires the exact owned command and timeout; helper health
+resolves that bare command on PATH. Hook diagnostics are bound to the active
+launch id/generation and the newest current-runtime diagnostic is selected
+deterministically across sessions.
 
 Setup JSON distinguishes current and prospective state: `configured` and
 `changed` describe the file after the command, while `would_configure` and

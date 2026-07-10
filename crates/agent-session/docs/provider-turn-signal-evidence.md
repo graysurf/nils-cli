@@ -96,8 +96,10 @@ The executable fixtures cover:
   enter the snapshot or journal;
 - bounded attention overflow, a fixed-size replay index independent from the
   journal horizon, recoverable split writes before events or runtime changes,
-  runtime-generation binding, additive-field preservation, private quarantine,
-  and mode-0600 snapshot, replay, journal, diagnostic, and lock files;
+  runtime-generation/header binding, missing/swapped replay fail-safe behavior,
+  repeated-hook semantic idempotency, additive-field preservation, private
+  quarantine, deterministic current-runtime diagnostics, and mode-0600
+  snapshot, replay, journal, diagnostic, and lock files;
 - dry-run, additive apply, repeated apply, repair, and owned-entry-only removal
   for all three provider configs.
 

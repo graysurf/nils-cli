@@ -31,6 +31,8 @@ const MAX_JOURNAL_BYTES: usize = 64 * 1024;
 const MAX_DEDUPE_EVENTS: usize = 4096;
 const REPLAY_SLOT_COUNT: usize = MAX_DEDUPE_EVENTS * 2;
 const REPLAY_SLOT_BYTES: usize = 32;
+const REPLAY_HEADER_BYTES: usize = 64;
+const REPLAY_MAGIC: &[u8; 16] = b"agent-session-r1";
 const MAX_PENDING_ATTENTION: usize = 64;
 const MAX_ID_CHARS: usize = 256;
 
@@ -152,6 +154,10 @@ struct ActivityDocument {
     #[serde(default)]
     seen_event_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_semantic_event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_semantic_event_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_event_at: Option<String>,
@@ -253,6 +259,8 @@ pub(crate) struct SetupResult {
 struct ActivityDiagnostic {
     schema_version: String,
     provider: String,
+    runtime_id: String,
+    runtime_generation: u64,
     code: String,
     observed_at: String,
 }
@@ -374,6 +382,73 @@ fn event_dedupe_key(runtime_id: &str, event_id: &str) -> [u8; REPLAY_SLOT_BYTES]
     key
 }
 
+fn semantic_event_key(event: &TurnEvent) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"agent-session.semantic-event.v1\0");
+    for value in [
+        event.provider.as_str(),
+        event.provider_session_id.as_deref().unwrap_or(""),
+        event.provider_turn_id.as_deref().unwrap_or(""),
+        match event.kind {
+            TurnEventKind::TurnStarted => "turn_started",
+            TurnEventKind::AttentionRequested => "attention_requested",
+            TurnEventKind::AttentionCleared => "attention_cleared",
+            TurnEventKind::Progress => "progress",
+            TurnEventKind::StopObserved => "stop_observed",
+            TurnEventKind::TurnCompleted => "turn_completed",
+            TurnEventKind::TurnFailed => "turn_failed",
+        },
+        event.attention_kind.as_deref().unwrap_or(""),
+    ] {
+        digest.update(value.as_bytes());
+        digest.update(b"\0");
+    }
+    format!("sha256:{}", hex_digest(digest.finalize()))
+}
+
+fn semantic_event_is_duplicate(
+    document: &ActivityDocument,
+    event: &TurnEvent,
+    key: &str,
+    received_at: &str,
+) -> bool {
+    if event.source_kind != SourceKind::ProviderHook {
+        return false;
+    }
+    if event.kind == TurnEventKind::TurnStarted
+        && event.provider_turn_id.is_some()
+        && document
+            .state
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_turn_id.as_ref())
+            == event.provider_turn_id.as_ref()
+    {
+        return true;
+    }
+    if document.last_semantic_event.as_deref() != Some(key) {
+        return false;
+    }
+    if matches!(
+        event.kind,
+        TurnEventKind::TurnCompleted | TurnEventKind::TurnFailed
+    ) {
+        return true;
+    }
+    let Some(previous) = document
+        .last_semantic_event_at
+        .as_deref()
+        .and_then(|value| value.parse::<jiff::Timestamp>().ok())
+    else {
+        return false;
+    };
+    let Ok(current) = received_at.parse::<jiff::Timestamp>() else {
+        return false;
+    };
+    let elapsed = current.as_second().saturating_sub(previous.as_second());
+    (0..=1).contains(&elapsed)
+}
+
 fn normalize_provider_identifier(
     runtime_id: &str,
     agent: AgentKind,
@@ -458,9 +533,13 @@ pub(crate) fn activate_runtime(
         && existing.runtime_id == runtime_id
         && existing.runtime_generation == runtime_generation
     {
-        return Ok(existing.state.clone());
+        return Ok(if replay_matches_document(&dir, existing) {
+            existing.state.clone()
+        } else {
+            unknown_state(record)
+        });
     }
-    reset_replay_index(&replay_path)?;
+    initialize_replay_index(&replay_path, runtime_id, runtime_generation)?;
     let at = runtime.started_at.clone();
     let mut last_turn = existing
         .as_ref()
@@ -494,6 +573,8 @@ pub(crate) fn activate_runtime(
         pending_attention: Vec::new(),
         overflow_attention: None,
         seen_event_count: 0,
+        last_semantic_event: None,
+        last_semantic_event_at: None,
         provider_session_id: record
             .provider_resume
             .as_ref()
@@ -566,13 +647,33 @@ fn activity_matches_runtime(document: &ActivityDocument, record: &SessionRecord)
     })
 }
 
+fn replay_matches_document(dir: &Path, document: &ActivityDocument) -> bool {
+    let replay_path = dir.join(ACTIVITY_REPLAY_FILE);
+    if document.seen_event_count == 0 && !replay_path.is_file() {
+        return true;
+    }
+    open_replay_index(
+        &replay_path,
+        &document.runtime_id,
+        document.runtime_generation,
+        false,
+    )
+    .is_ok()
+}
+
 pub(crate) fn state_for_view(context: &CliContext, record: &SessionRecord) -> Option<TurnState> {
-    let path = session_dir(context, &record.id).join(ACTIVITY_FILE);
+    let dir = session_dir(context, &record.id);
+    let path = dir.join(ACTIVITY_FILE);
     if !path.is_file() {
         return None;
     }
     match read_document(&path) {
-        Ok(document) if activity_matches_runtime(&document, record) => Some(document.state),
+        Ok(document)
+            if activity_matches_runtime(&document, record)
+                && replay_matches_document(&dir, &document) =>
+        {
+            Some(document.state)
+        }
         Ok(_) | Err(_) => Some(unknown_state(record)),
     }
 }
@@ -753,7 +854,13 @@ pub(crate) fn ingest_event(
         ));
     }
     let dedupe_key = event_dedupe_key(&event.runtime_id, &event.event_id);
-    if replay_contains(&replay_path, &dedupe_key)? {
+    if replay_contains(
+        &replay_path,
+        &document.runtime_id,
+        document.runtime_generation,
+        document.seen_event_count == 0,
+        &dedupe_key,
+    )? {
         return Ok(ActivityResult {
             id: record.id,
             turn_state: document.state,
@@ -769,8 +876,20 @@ pub(crate) fn ingest_event(
     }
 
     let received_at = now();
+    let semantic_key = semantic_event_key(&event);
+    if semantic_event_is_duplicate(&document, &event, &semantic_key, &received_at) {
+        return Ok(ActivityResult {
+            id: record.id,
+            turn_state: document.state,
+            duplicate: true,
+        });
+    }
     reduce(&mut document, &event, &received_at);
     document.last_event_at = Some(received_at.clone());
+    if event.source_kind == SourceKind::ProviderHook {
+        document.last_semantic_event = Some(semantic_key);
+        document.last_semantic_event_at = Some(received_at.clone());
+    }
     if document.provider_session_id.is_none() {
         document.provider_session_id = event.provider_session_id.clone();
     }
@@ -781,7 +900,13 @@ pub(crate) fn ingest_event(
     };
     document.pending_journal = Some(journal_entry.clone());
     write_document(&path, &document)?;
-    replay_insert(&replay_path, &dedupe_key)?;
+    replay_insert(
+        &replay_path,
+        &document.runtime_id,
+        document.runtime_generation,
+        false,
+        &dedupe_key,
+    )?;
     append_journal_entry(&journal_path, journal_entry)?;
     document.pending_journal = None;
     write_document(&path, &document)?;
@@ -882,21 +1007,20 @@ fn record_hook_diagnostic(context: &CliContext, agent: AgentKind, code: &str) {
     let Ok(record) = load_session_record(context, &id) else {
         return;
     };
-    let runtime_matches =
-        std::env::var("AGENT_SESSION_RUNTIME_ID")
-            .ok()
-            .is_some_and(|runtime_id| {
-                record
-                    .runtime
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.launch_id == runtime_id)
-            });
+    let Some(runtime) = record.runtime.as_ref() else {
+        return;
+    };
+    let runtime_matches = std::env::var("AGENT_SESSION_RUNTIME_ID")
+        .ok()
+        .is_some_and(|runtime_id| runtime.launch_id == runtime_id);
     if record.agent != agent.as_str() || !runtime_matches {
         return;
     }
     let diagnostic = ActivityDiagnostic {
         schema_version: "agent-session.activity-diagnostic.v1".to_string(),
         provider: agent.as_str().to_string(),
+        runtime_id: runtime.launch_id.clone(),
+        runtime_generation: runtime.generation,
         code: code.to_string(),
         observed_at: now(),
     };
@@ -1058,11 +1182,13 @@ pub(crate) fn doctor(
             })
             .collect::<BTreeMap<_, _>>()
     });
+    let helper_executable =
+        command_resolves_on_path("agent-session", std::env::var_os("PATH").as_deref());
     let mut providers = Vec::new();
     for agent in agents {
         let path = provider_config_path(agent)?;
         let configured = provider_configured(agent, &path).unwrap_or(false);
-        let (last_event_at, last_error) = activity_by_provider
+        let activity_summary = activity_by_provider
             .get(agent.as_str())
             .cloned()
             .unwrap_or_default();
@@ -1109,7 +1235,7 @@ pub(crate) fn doctor(
         } else {
             "unverified"
         };
-        let guidance = if matches!(classification, "unavailable" | "unverified") {
+        let mut guidance = if matches!(classification, "unavailable" | "unverified") {
             format!(
                 "Provider version is outside the audited floor {}; upgrade or validate it before relying on lifecycle state. {base_guidance}",
                 format_version(audited_floor(agent))
@@ -1117,6 +1243,16 @@ pub(crate) fn doctor(
         } else {
             base_guidance.to_string()
         };
+        if !configured {
+            guidance.push_str(
+                " The installed hook specification is missing or drifted; run activity setup --repair after reviewing the dry-run.",
+            );
+        }
+        if !helper_executable {
+            guidance.push_str(
+                " The configured agent-session helper does not resolve to an executable on PATH; install it on the provider hook PATH before relying on activity state.",
+            );
+        }
         providers.push(ProviderDoctor {
             provider: agent.as_str().to_string(),
             classification: classification.to_string(),
@@ -1128,25 +1264,56 @@ pub(crate) fn doctor(
             attention_correlation: attention_correlation.to_string(),
             trust: trust.to_string(),
             guidance,
-            last_event_at,
-            last_error,
-            helper_executable: std::env::current_exe()
-                .ok()
-                .and_then(|path| fs::metadata(path).ok())
-                .is_some_and(|metadata| metadata.is_file()),
+            last_event_at: activity_summary.last_event_at,
+            last_error: activity_summary.last_error.map(|(_, code)| code),
+            helper_executable,
         });
     }
     Ok(DoctorResult { providers })
 }
 
-fn latest_provider_activity(
-    context: &CliContext,
-) -> BTreeMap<String, (Option<String>, Option<String>)> {
+fn command_resolves_on_path(command: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    std::env::split_paths(path).any(|directory| {
+        fs::metadata(directory.join(command))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProviderActivitySummary {
+    last_event_at: Option<String>,
+    last_error: Option<(String, String)>,
+}
+
+fn update_latest_error(summary: &mut ProviderActivitySummary, observed_at: String, code: String) {
+    let replace = summary
+        .last_error
+        .as_ref()
+        .is_none_or(|(current, _)| timestamp_is_later(&observed_at, current));
+    if replace {
+        summary.last_error = Some((observed_at, code));
+    }
+}
+
+fn timestamp_is_later(candidate: &str, current: &str) -> bool {
+    match (
+        candidate.parse::<jiff::Timestamp>(),
+        current.parse::<jiff::Timestamp>(),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate > current,
+        _ => candidate > current,
+    }
+}
+
+fn latest_provider_activity(context: &CliContext) -> BTreeMap<String, ProviderActivitySummary> {
     let root = context.state_dir.join("sessions");
     let Ok(entries) = fs::read_dir(root) else {
         return BTreeMap::new();
     };
-    let mut activity = BTreeMap::<String, (Option<String>, Option<String>)>::new();
+    let mut activity = BTreeMap::<String, ProviderActivitySummary>::new();
     for entry in entries.flatten() {
         let record_path = entry.path().join("session.json");
         let Ok(record_bytes) = fs::read(&record_path) else {
@@ -1158,32 +1325,35 @@ fn latest_provider_activity(
         if !matches!(record.agent.as_str(), "codex" | "claude" | "hermes") {
             continue;
         }
-        let (latest, error) = activity.entry(record.agent.clone()).or_default();
+        let summary = activity.entry(record.agent.clone()).or_default();
         let diagnostic_path = entry.path().join(ACTIVITY_DIAGNOSTIC_FILE);
-        if let Ok(bytes) = fs::read(&diagnostic_path) {
-            match serde_json::from_slice::<ActivityDiagnostic>(&bytes) {
-                Ok(diagnostic)
-                    if diagnostic.schema_version == "agent-session.activity-diagnostic.v1"
-                        && diagnostic.provider == record.agent =>
-                {
-                    *error = Some(diagnostic.code);
-                }
-                _ => *error = Some("activity diagnostic unreadable".to_string()),
-            }
+        if let Ok(bytes) = fs::read(&diagnostic_path)
+            && let Ok(diagnostic) = serde_json::from_slice::<ActivityDiagnostic>(&bytes)
+            && diagnostic.schema_version == "agent-session.activity-diagnostic.v1"
+            && diagnostic.provider == record.agent
+            && record.runtime.as_ref().is_some_and(|runtime| {
+                diagnostic.runtime_id == runtime.launch_id
+                    && diagnostic.runtime_generation == runtime.generation
+            })
+        {
+            update_latest_error(summary, diagnostic.observed_at, diagnostic.code);
         }
         let activity_path = entry.path().join(ACTIVITY_FILE);
         if !activity_path.is_file() {
             continue;
         }
         match read_document(&activity_path) {
-            Ok(document) => {
+            Ok(document) if activity_matches_runtime(&document, &record) => {
                 if let Some(observed) = document.last_event_at
-                    && latest.as_ref().is_none_or(|current| &observed > current)
+                    && summary
+                        .last_event_at
+                        .as_ref()
+                        .is_none_or(|current| timestamp_is_later(&observed, current))
                 {
-                    *latest = Some(observed);
+                    summary.last_event_at = Some(observed);
                 }
             }
-            Err(_) => *error = Some("activity snapshot unreadable".to_string()),
+            Ok(_) | Err(_) => {}
         }
     }
     activity
@@ -1536,6 +1706,7 @@ fn json_has_spec(value: &Value, agent: AgentKind, spec: ProviderSpec) -> bool {
                                 handler.get("type").and_then(Value::as_str) == Some("command")
                                     && handler.get("command").and_then(Value::as_str)
                                         == Some(owned_command(agent, None).as_str())
+                                    && handler.get("timeout").and_then(Value::as_u64) == Some(5)
                             })
                         })
             })
@@ -1639,6 +1810,10 @@ fn yaml_has_spec(value: &serde_yaml_ng::Value, spec: ProviderSpec) -> bool {
                     .get("command")
                     .and_then(serde_yaml_ng::Value::as_str)
                     == Some(owned_command(AgentKind::Hermes, Some(spec.event)).as_str())
+                    && handler
+                        .get("timeout")
+                        .and_then(serde_yaml_ng::Value::as_i64)
+                        == Some(5)
             })
         })
 }
@@ -1813,6 +1988,8 @@ mod tests {
             pending_attention: Vec::new(),
             overflow_attention: None,
             seen_event_count: 0,
+            last_semantic_event: None,
+            last_semantic_event_at: None,
             provider_session_id: None,
             last_event_at: None,
             pending_journal: None,
@@ -2346,6 +2523,245 @@ mod tests {
     }
 
     #[test]
+    fn repeated_provider_hook_semantics_are_idempotent() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session(&tmp);
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        let mut start = event(TurnEventKind::TurnStarted, "hook-start-1");
+        start.runtime_id = runtime_id.clone();
+        let first = ingest_event(&context, &created.record.id, start.clone()).expect("first start");
+        start.event_id = "hook-start-2".to_string();
+        let repeated = ingest_event(&context, &created.record.id, start).expect("repeated start");
+        assert!(repeated.duplicate);
+        assert_eq!(repeated.turn_state.revision, first.turn_state.revision);
+
+        let mut attention = event(TurnEventKind::AttentionRequested, "hook-attention-1");
+        attention.runtime_id = runtime_id.clone();
+        attention.attention_id = Some("generated-attention-1".to_string());
+        attention.attention_kind = Some("approval".to_string());
+        let first =
+            ingest_event(&context, &created.record.id, attention.clone()).expect("first attention");
+        attention.event_id = "hook-attention-2".to_string();
+        attention.attention_id = Some("generated-attention-2".to_string());
+        let repeated =
+            ingest_event(&context, &created.record.id, attention).expect("repeated attention");
+        assert!(repeated.duplicate);
+        assert_eq!(repeated.turn_state.revision, first.turn_state.revision);
+        assert_eq!(
+            repeated
+                .turn_state
+                .current_turn
+                .and_then(|turn| turn.attention)
+                .map(|attention| attention.pending_count),
+            Some(1)
+        );
+
+        let mut complete = event(TurnEventKind::TurnCompleted, "hook-complete-1");
+        complete.runtime_id = runtime_id;
+        let first =
+            ingest_event(&context, &created.record.id, complete.clone()).expect("first completion");
+        complete.event_id = "hook-complete-2".to_string();
+        let repeated =
+            ingest_event(&context, &created.record.id, complete).expect("repeated completion");
+        assert!(repeated.duplicate);
+        assert_eq!(repeated.turn_state.revision, first.turn_state.revision);
+    }
+
+    #[test]
+    fn missing_replay_index_never_reopens_a_nonempty_dedupe_horizon() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session(&tmp);
+        let mut progress = event(TurnEventKind::Progress, "durable-event");
+        progress.runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        ingest_event(&context, &created.record.id, progress.clone()).expect("first event");
+        fs::remove_file(session_dir(&context, &created.record.id).join(ACTIVITY_REPLAY_FILE))
+            .expect("remove replay index");
+
+        assert!(ingest_event(&context, &created.record.id, progress).is_err());
+        assert_eq!(
+            state_for_view(&context, &created.record)
+                .expect("safe state")
+                .phase,
+            TurnPhase::Unknown
+        );
+    }
+
+    #[test]
+    fn replay_index_from_another_runtime_is_rejected() {
+        let first_tmp = tempfile::TempDir::new().expect("first tempdir");
+        let (first_context, first) = test_session(&first_tmp);
+        let mut first_event = event(TurnEventKind::Progress, "first-event");
+        first_event.runtime_id = first
+            .record
+            .runtime
+            .as_ref()
+            .expect("first runtime")
+            .launch_id
+            .clone();
+        ingest_event(&first_context, &first.record.id, first_event.clone()).expect("first event");
+
+        let second_tmp = tempfile::TempDir::new().expect("second tempdir");
+        let (second_context, second) = test_session(&second_tmp);
+        let mut second_event = event(TurnEventKind::Progress, "second-event");
+        second_event.runtime_id = second
+            .record
+            .runtime
+            .as_ref()
+            .expect("second runtime")
+            .launch_id
+            .clone();
+        ingest_event(&second_context, &second.record.id, second_event).expect("second event");
+
+        fs::copy(
+            session_dir(&second_context, &second.record.id).join(ACTIVITY_REPLAY_FILE),
+            session_dir(&first_context, &first.record.id).join(ACTIVITY_REPLAY_FILE),
+        )
+        .expect("swap same-size replay index");
+        assert!(ingest_event(&first_context, &first.record.id, first_event).is_err());
+        assert_eq!(
+            state_for_view(&first_context, &first.record)
+                .expect("safe state")
+                .phase,
+            TurnPhase::Unknown
+        );
+    }
+
+    #[test]
+    fn configured_provider_specs_require_the_owned_timeout() {
+        let codex = json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": owned_command(AgentKind::Codex, None),
+                        "timeout": 1
+                    }]
+                }]
+            }
+        });
+        assert!(!json_has_spec(
+            &codex,
+            AgentKind::Codex,
+            provider_specs(AgentKind::Codex)[0]
+        ));
+
+        let hermes: serde_yaml_ng::Value = serde_yaml_ng::from_str(&format!(
+            "hooks:\n  pre_llm_call:\n    - command: {}\n      timeout: 1\n",
+            owned_command(AgentKind::Hermes, Some("pre_llm_call"))
+        ))
+        .expect("Hermes config");
+        assert!(!yaml_has_spec(
+            &hermes,
+            provider_specs(AgentKind::Hermes)[0]
+        ));
+    }
+
+    #[test]
+    fn helper_resolution_requires_an_executable_on_the_hook_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let helper = tmp.path().join("agent-session");
+        fs::write(&helper, "fixture").expect("helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o600)).expect("non-executable");
+        assert!(!command_resolves_on_path(
+            "agent-session",
+            Some(tmp.path().as_os_str())
+        ));
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("executable");
+        assert!(command_resolves_on_path(
+            "agent-session",
+            Some(tmp.path().as_os_str())
+        ));
+        assert!(!command_resolves_on_path("agent-session", None));
+    }
+
+    #[test]
+    fn doctor_selects_the_newest_active_runtime_diagnostic() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session(&tmp);
+        let write_diagnostic =
+            |record: &SessionRecord, observed_at: &str, code: &str, runtime_id: &str| {
+                let diagnostic = ActivityDiagnostic {
+                    schema_version: "agent-session.activity-diagnostic.v1".to_string(),
+                    provider: record.agent.clone(),
+                    runtime_id: runtime_id.to_string(),
+                    runtime_generation: record.runtime.as_ref().expect("runtime").generation,
+                    code: code.to_string(),
+                    observed_at: observed_at.to_string(),
+                };
+                write_atomic(
+                    &session_dir(&context, &record.id).join(ACTIVITY_DIAGNOSTIC_FILE),
+                    &serde_json::to_vec_pretty(&diagnostic).expect("diagnostic json"),
+                    SECRET_FILE_MODE,
+                )
+                .expect("diagnostic");
+            };
+        let first_runtime = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("first runtime")
+            .launch_id
+            .clone();
+        write_diagnostic(
+            &created.record,
+            "2026-07-10T00:01:00Z",
+            "older-error",
+            &first_runtime,
+        );
+
+        let mut second = created.record.clone();
+        second.id = "activity-test-2".to_string();
+        second.tmux_session = "activity-test-2".to_string();
+        let runtime = second.runtime.as_mut().expect("second runtime");
+        runtime.launch_id = "runtime-second".to_string();
+        runtime.generation = 2;
+        fs::create_dir_all(session_dir(&context, &second.id)).expect("second session dir");
+        write_session_record(&context, &second).expect("second record");
+        write_diagnostic(
+            &second,
+            "2026-07-10T00:02:00Z",
+            "newer-error",
+            "runtime-second",
+        );
+
+        let mut stale = second.clone();
+        stale.id = "activity-test-3".to_string();
+        stale.tmux_session = "activity-test-3".to_string();
+        stale.runtime.as_mut().expect("stale runtime").launch_id = "runtime-third".to_string();
+        fs::create_dir_all(session_dir(&context, &stale.id)).expect("third session dir");
+        write_session_record(&context, &stale).expect("third record");
+        write_diagnostic(
+            &stale,
+            "2026-07-10T00:03:00Z",
+            "stale-error",
+            "wrong-runtime",
+        );
+
+        let summary = latest_provider_activity(&context)
+            .remove("codex")
+            .expect("Codex summary");
+        assert_eq!(
+            summary.last_error,
+            Some((
+                "2026-07-10T00:02:00Z".to_string(),
+                "newer-error".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn journal_is_bounded_and_metadata_only() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().join(ACTIVITY_JOURNAL_FILE);
@@ -2812,23 +3228,69 @@ fn repair_pending_transaction(
         return Ok(());
     };
     let key = event_dedupe_key(&entry.event.runtime_id, &entry.event.event_id);
-    replay_insert(replay_path, &key)?;
+    replay_insert(
+        replay_path,
+        &document.runtime_id,
+        document.runtime_generation,
+        false,
+        &key,
+    )?;
     append_journal_entry(journal_path, entry)?;
     document.pending_journal = None;
     write_document(document_path, document)
 }
 
-fn reset_replay_index(path: &Path) -> Result<(), CliError> {
+fn initialize_replay_index(
+    path: &Path,
+    runtime_id: &str,
+    runtime_generation: u64,
+) -> Result<(), CliError> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(activity_io_error("activity-replay-reset-failed", path, err)),
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(activity_io_error("activity-replay-reset-failed", path, err)),
     }
+    let _ = open_replay_index(path, runtime_id, runtime_generation, true)?;
+    sync_parent_directory(path)
 }
 
-fn open_replay_index(path: &Path) -> Result<fs::File, CliError> {
+fn replay_header(runtime_id: &str, runtime_generation: u64) -> [u8; REPLAY_HEADER_BYTES] {
+    let mut header = [0_u8; REPLAY_HEADER_BYTES];
+    header[..REPLAY_MAGIC.len()].copy_from_slice(REPLAY_MAGIC);
+    let mut digest = Sha256::new();
+    digest.update(b"agent-session.replay-runtime.v1\0");
+    digest.update(runtime_id.as_bytes());
+    header[16..48].copy_from_slice(&digest.finalize());
+    header[48..56].copy_from_slice(&runtime_generation.to_be_bytes());
+    header
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), CliError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| activity_io_error("activity-replay-directory-sync-failed", parent, err))
+}
+
+fn open_replay_index(
+    path: &Path,
+    runtime_id: &str,
+    runtime_generation: u64,
+    allow_create: bool,
+) -> Result<fs::File, CliError> {
+    let existed = path.is_file();
+    if !existed && !allow_create {
+        return Err(CliError::data(
+            "activity-replay-missing",
+            "activity replay index is missing for a nonempty durable activity snapshot",
+            Some(json!({ "path": display_path(path) })),
+        ));
+    }
     let file = OpenOptions::new()
-        .create(true)
+        .create(allow_create)
+        .truncate(false)
         .read(true)
         .write(true)
         .mode(SECRET_FILE_MODE)
@@ -2836,31 +3298,60 @@ fn open_replay_index(path: &Path) -> Result<fs::File, CliError> {
         .map_err(|err| activity_io_error("activity-replay-open-failed", path, err))?;
     fs::set_permissions(path, fs::Permissions::from_mode(SECRET_FILE_MODE))
         .map_err(|err| activity_io_error("activity-replay-permission-failed", path, err))?;
-    let expected_len = (REPLAY_SLOT_COUNT * REPLAY_SLOT_BYTES) as u64;
+    let expected_len = (REPLAY_HEADER_BYTES + REPLAY_SLOT_COUNT * REPLAY_SLOT_BYTES) as u64;
     let actual_len = file
         .metadata()
         .map_err(|err| activity_io_error("activity-replay-metadata-failed", path, err))?
         .len();
-    if actual_len == 0 {
+    if actual_len == 0 && allow_create {
         file.set_len(expected_len)
             .map_err(|err| activity_io_error("activity-replay-size-failed", path, err))?;
+        let mut writer = &file;
+        writer
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| writer.write_all(&replay_header(runtime_id, runtime_generation)))
+            .and_then(|()| writer.sync_data())
+            .map_err(|err| activity_io_error("activity-replay-header-write-failed", path, err))?;
+        if !existed {
+            sync_parent_directory(path)?;
+        }
     } else if actual_len != expected_len {
         return Err(CliError::data(
             "activity-replay-size-invalid",
             "activity replay index has an unexpected size",
             Some(json!({ "path": display_path(path), "expected_bytes": expected_len })),
         ));
+    } else {
+        let mut reader = &file;
+        let mut observed = [0_u8; REPLAY_HEADER_BYTES];
+        reader
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| reader.read_exact(&mut observed))
+            .map_err(|err| activity_io_error("activity-replay-header-read-failed", path, err))?;
+        if observed != replay_header(runtime_id, runtime_generation) {
+            return Err(CliError::data(
+                "activity-replay-runtime-mismatch",
+                "activity replay index does not match the durable runtime generation",
+                Some(json!({ "path": display_path(path) })),
+            ));
+        }
     }
     Ok(file)
 }
 
 fn replay_slot(key: &[u8; REPLAY_SLOT_BYTES], probe: usize) -> u64 {
     let start = u64::from_be_bytes(key[..8].try_into().expect("eight-byte replay prefix"));
-    ((start as usize + probe) % REPLAY_SLOT_COUNT * REPLAY_SLOT_BYTES) as u64
+    (REPLAY_HEADER_BYTES + (start as usize + probe) % REPLAY_SLOT_COUNT * REPLAY_SLOT_BYTES) as u64
 }
 
-fn replay_contains(path: &Path, key: &[u8; REPLAY_SLOT_BYTES]) -> Result<bool, CliError> {
-    let mut file = open_replay_index(path)?;
+fn replay_contains(
+    path: &Path,
+    runtime_id: &str,
+    runtime_generation: u64,
+    allow_create: bool,
+    key: &[u8; REPLAY_SLOT_BYTES],
+) -> Result<bool, CliError> {
+    let mut file = open_replay_index(path, runtime_id, runtime_generation, allow_create)?;
     let mut slot = [0_u8; REPLAY_SLOT_BYTES];
     for probe in 0..REPLAY_SLOT_COUNT {
         file.seek(SeekFrom::Start(replay_slot(key, probe)))
@@ -2877,8 +3368,14 @@ fn replay_contains(path: &Path, key: &[u8; REPLAY_SLOT_BYTES]) -> Result<bool, C
     Ok(false)
 }
 
-fn replay_insert(path: &Path, key: &[u8; REPLAY_SLOT_BYTES]) -> Result<(), CliError> {
-    let mut file = open_replay_index(path)?;
+fn replay_insert(
+    path: &Path,
+    runtime_id: &str,
+    runtime_generation: u64,
+    allow_create: bool,
+    key: &[u8; REPLAY_SLOT_BYTES],
+) -> Result<(), CliError> {
+    let mut file = open_replay_index(path, runtime_id, runtime_generation, allow_create)?;
     let mut slot = [0_u8; REPLAY_SLOT_BYTES];
     for probe in 0..REPLAY_SLOT_COUNT {
         let offset = replay_slot(key, probe);
