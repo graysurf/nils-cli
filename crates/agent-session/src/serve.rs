@@ -44,16 +44,19 @@ use crate::cli::{self, AgentKind, SpecialKey};
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
     glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
-    resolve_tmux_bin, resume_session_by_id, run_capture_pane, search_workdirs, send_input,
-    session_clipboard_buffer, session_dir, session_status, short_hostname,
-    start_provider_resume_session, start_session, update_session_title, write_session_attachment,
+    resolve_tmux_bin, resume_session_by_id, search_workdirs, send_input, session_clipboard_buffer,
+    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
+    update_session_title, write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
 const ATTACH_BROADCAST_CAPACITY: usize = 128;
 const ATTACH_PIPE_STARTUP_GRACE: Duration = Duration::from_secs(2);
+const ATTACH_FIFO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ATTACH_READER_STOP_TIMEOUT: Duration = Duration::from_millis(250);
 const ATTACH_TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const ATTACH_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+const ATTACH_RESIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_STDIN_TOKEN_BYTES: u64 = 8 * 1024;
@@ -1327,6 +1330,29 @@ struct AttachBroker {
     resize_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+struct AttachFifoCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl AttachFifoCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AttachFifoCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 impl Default for AttachBrokerSlot {
     fn default() -> Self {
         Self {
@@ -1504,20 +1530,33 @@ impl AttachBroker {
         tmux: &Path,
         record: &crate::SessionRecord,
     ) -> io::Result<(Self, tokio::sync::broadcast::Receiver<AttachEvent>)> {
+        Self::start_with_fifo_opener(context, tmux, record, |fifo_path| {
+            let fifo = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo_path)?;
+            tokio::io::unix::AsyncFd::new(fifo)
+        })
+        .await
+    }
+
+    async fn start_with_fifo_opener<F>(
+        context: &CliContext,
+        tmux: &Path,
+        record: &crate::SessionRecord,
+        open_fifo: F,
+    ) -> io::Result<(Self, tokio::sync::broadcast::Receiver<AttachEvent>)>
+    where
+        F: FnOnce(&Path) -> io::Result<tokio::io::unix::AsyncFd<std::fs::File>>,
+    {
         let target = format!("{}:0.0", record.tmux_session);
         let fifo_path = session_dir(context, &record.id).join(ATTACH_LIVE_FIFO_NAME);
         create_private_fifo(&fifo_path)?;
-        let fifo = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&fifo_path)?;
-        let fifo = tokio::io::unix::AsyncFd::new(fifo)?;
+        let mut fifo_cleanup = AttachFifoCleanup::new(fifo_path.clone());
+        let fifo = open_fifo(&fifo_path)?;
 
         let (sender, receiver) = tokio::sync::broadcast::channel(ATTACH_BROADCAST_CAPACITY);
-        if let Err(err) = enable_tmux_pipe(tmux, &target, &fifo_path).await {
-            let _ = std::fs::remove_file(&fifo_path);
-            return Err(err);
-        }
+        enable_tmux_pipe(tmux, &target, &fifo_path).await?;
 
         let reader_sender = sender.clone();
         let closed = Arc::new(AtomicBool::new(false));
@@ -1526,6 +1565,7 @@ impl AttachBroker {
             read_attach_fifo(fifo, reader_sender, reader_closed).await;
         });
         let resize_lock = Arc::new(tokio::sync::Mutex::new(()));
+        fifo_cleanup.disarm();
         Ok((
             Self {
                 target,
@@ -1615,6 +1655,38 @@ fn run_process_with_timeout(
     timeout: Duration,
 ) -> io::Result<std::process::ExitStatus> {
     let mut child = command.spawn()?;
+    wait_process_with_timeout(&mut child, timeout)
+}
+
+fn run_process_output_with_timeout(
+    command: &mut ProcessCommand,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("child stdout pipe is unavailable"))?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let status = wait_process_with_timeout(&mut child, timeout);
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("child stdout reader panicked"))??;
+    Ok(std::process::Output {
+        status: status?,
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+fn wait_process_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> io::Result<std::process::ExitStatus> {
     let started_at = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -1632,6 +1704,40 @@ fn run_process_with_timeout(
     }
 }
 
+async fn capture_attach_snapshot(
+    tmux: &Path,
+    record: &crate::SessionRecord,
+) -> io::Result<Option<String>> {
+    capture_attach_snapshot_with_timeout(tmux, record, ATTACH_SNAPSHOT_TIMEOUT).await
+}
+
+async fn capture_attach_snapshot_with_timeout(
+    tmux: &Path,
+    record: &crate::SessionRecord,
+    timeout: Duration,
+) -> io::Result<Option<String>> {
+    let tmux = tmux.to_path_buf();
+    let tmux_session = record.tmux_session.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut command = ProcessCommand::new(&tmux);
+        command
+            .arg("capture-pane")
+            .arg("-p")
+            .arg("-t")
+            .arg(&tmux_session)
+            .arg("-S")
+            .arg("-200");
+        let output = run_process_output_with_timeout(&mut command, timeout)?;
+        if output.status.success() {
+            Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
+        } else {
+            Ok(None)
+        }
+    })
+    .await
+    .map_err(|err| io::Error::other(format!("tmux capture task failed: {err}")))?
+}
+
 async fn read_attach_fifo(
     fifo: tokio::io::unix::AsyncFd<std::fs::File>,
     sender: tokio::sync::broadcast::Sender<AttachEvent>,
@@ -1641,29 +1747,38 @@ async fn read_attach_fifo(
     let started_at = Instant::now();
     let mut writer_seen = false;
     loop {
-        let mut ready = match fifo.readable().await {
-            Ok(ready) => ready,
-            Err(_) => break,
+        let read = match tokio::time::timeout(ATTACH_FIFO_POLL_INTERVAL, fifo.readable()).await {
+            Ok(Ok(mut ready)) => match ready.try_io(|inner| {
+                let mut file = inner.get_ref();
+                file.read(&mut buf)
+            }) {
+                Ok(read) => read,
+                Err(_would_block) => continue,
+            },
+            Ok(Err(err)) => Err(err),
+            Err(_) => {
+                // Some kqueue implementations do not emit another readable
+                // notification when a FIFO's final writer disappears. The
+                // descriptor is nonblocking, so a low-frequency direct read
+                // distinguishes an idle writer (WouldBlock) from EOF without
+                // tying up the async runtime.
+                let mut file = fifo.get_ref();
+                file.read(&mut buf)
+            }
         };
-        let read = ready.try_io(|inner| {
-            let mut file = inner.get_ref();
-            file.read(&mut buf)
-        });
         match read {
-            Ok(Ok(0)) if !writer_seen && started_at.elapsed() < ATTACH_PIPE_STARTUP_GRACE => {
+            Ok(0) if !writer_seen && started_at.elapsed() < ATTACH_PIPE_STARTUP_GRACE => {
                 // `pipe-pane` starts its shell asynchronously. A nonblocking
                 // FIFO reader briefly sees EOF until that writer opens.
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => {
+            Ok(0) => break,
+            Ok(n) => {
                 writer_seen = true;
                 let _ = sender.send(AttachEvent::Output(Bytes::copy_from_slice(&buf[..n])));
             }
-            Ok(Err(_)) => break,
-            Err(_would_block) => {
-                writer_seen = true;
-            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
         }
     }
     closed.store(true, Ordering::Release);
@@ -1713,22 +1828,28 @@ async fn attach_socket(socket: WebSocket, state: Arc<ServeState>, record: crate:
         }
     };
 
-    let snapshot = tokio::task::spawn_blocking({
-        let record = record.clone();
-        let tmux = state.tmux_bin.clone();
-        move || run_capture_pane(&record, 200, &tmux)
-    })
-    .await;
-    if let Ok(Ok(Some(text))) = snapshot
-        && !send_attach_message(
-            &mut sender,
-            Message::Binary(text.into_bytes().into()),
-            ATTACH_WEBSOCKET_SEND_TIMEOUT,
-        )
-        .await
-    {
-        subscription.release().await;
-        return;
+    match capture_attach_snapshot(&state.tmux_bin, &record).await {
+        Ok(Some(text)) => {
+            if !send_attach_message(
+                &mut sender,
+                Message::Binary(text.into_bytes().into()),
+                ATTACH_WEBSOCKET_SEND_TIMEOUT,
+            )
+            .await
+            {
+                subscription.release().await;
+                return;
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!(
+                "warning: failed to capture initial attach snapshot for {}: {err}",
+                record.id
+            );
+            subscription.release().await;
+            return;
+        }
     }
 
     // Client -> pane: JSON control frames { text?, key?, keys?, resize{cols,rows} }.
@@ -1788,29 +1909,56 @@ const INITIAL_REPAINT_NUDGE_DELAY: Duration = Duration::from_millis(150);
 /// `rows` is always a real change that repaints the agent's frame; afterwards a
 /// single `resize-window` is issued so ordinary mid-session resizes don't flicker.
 async fn resize_pane(tmux: &Path, target: &str, cols: u64, rows: u64, force_repaint: bool) {
-    if force_repaint {
-        let nudge_rows = if rows > 1 { rows - 1 } else { rows + 1 };
-        run_resize_window(tmux, target, cols, nudge_rows).await;
-        tokio::time::sleep(INITIAL_REPAINT_NUDGE_DELAY).await;
-    }
-    run_resize_window(tmux, target, cols, rows).await;
+    resize_pane_with_timeout(
+        tmux,
+        target,
+        cols,
+        rows,
+        force_repaint,
+        ATTACH_RESIZE_TIMEOUT,
+    )
+    .await;
 }
 
-async fn run_resize_window(tmux: &Path, target: &str, cols: u64, rows: u64) {
+async fn resize_pane_with_timeout(
+    tmux: &Path,
+    target: &str,
+    cols: u64,
+    rows: u64,
+    force_repaint: bool,
+    timeout: Duration,
+) {
+    if force_repaint {
+        let nudge_rows = if rows > 1 { rows - 1 } else { rows + 1 };
+        let _ = run_resize_window(tmux, target, cols, nudge_rows, timeout).await;
+        tokio::time::sleep(INITIAL_REPAINT_NUDGE_DELAY).await;
+    }
+    let _ = run_resize_window(tmux, target, cols, rows, timeout).await;
+}
+
+async fn run_resize_window(
+    tmux: &Path,
+    target: &str,
+    cols: u64,
+    rows: u64,
+    timeout: Duration,
+) -> io::Result<()> {
     let tmux = tmux.to_path_buf();
     let target = target.to_string();
-    let _ = tokio::task::spawn_blocking(move || {
-        ProcessCommand::new(&tmux)
+    tokio::task::spawn_blocking(move || {
+        let mut command = ProcessCommand::new(&tmux);
+        command
             .arg("resize-window")
             .arg("-t")
             .arg(&target)
             .arg("-x")
             .arg(cols.to_string())
             .arg("-y")
-            .arg(rows.to_string())
-            .status()
+            .arg(rows.to_string());
+        run_process_with_timeout(&mut command, timeout).map(|_| ())
     })
-    .await;
+    .await
+    .map_err(|err| io::Error::other(format!("tmux resize task failed: {err}")))?
 }
 
 async fn handle_input(
@@ -3835,6 +3983,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn timed_out_resize_releases_the_shared_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("calls.log");
+        let first_started = tmp.path().join("first-started");
+        let tmux = executable(
+            &tmp.path().join("tmux"),
+            &format!(
+                r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {}
+if [ "$1" = "resize-window" ] && [ ! -e {} ]; then
+  : > {}
+  sleep 1
+fi
+exit 0
+"#,
+                shell_words::quote(&log.to_string_lossy()),
+                shell_words::quote(&first_started.to_string_lossy()),
+                shell_words::quote(&first_started.to_string_lossy()),
+            ),
+        );
+        let resize_lock = tokio::sync::Mutex::new(());
+
+        let first = async {
+            let _guard = resize_lock.lock().await;
+            resize_pane_with_timeout(
+                &tmux,
+                "hs-codex-look:0.0",
+                80,
+                24,
+                false,
+                Duration::from_millis(20),
+            )
+            .await;
+        };
+        let second = async {
+            while !first_started.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::timeout(Duration::from_millis(250), async {
+                let _guard = resize_lock.lock().await;
+                resize_pane_with_timeout(
+                    &tmux,
+                    "hs-codex-look:0.0",
+                    100,
+                    40,
+                    false,
+                    Duration::from_millis(20),
+                )
+                .await;
+            })
+            .await
+            .expect("a timed-out resize kept the shared lock");
+        };
+        tokio::join!(first, second);
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains("resize-window"))
+                .count(),
+            2,
+            "the second resize must run after the first command times out: {calls:?}"
+        );
+    }
+
     #[test]
     fn from_name_round_trips_agent_and_key() {
         use clap::ValueEnum;
@@ -4046,6 +4261,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_attach_buffers_live_output_during_snapshot_capture() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let calls = tmp.path().join("calls.log");
+        let fifo_destination = tmp.path().join("fifo-destination");
+        let writer_pid = tmp.path().join("writer.pid");
+        let capture_started = tmp.path().join("capture-started");
+        let capture_release = tmp.path().join("capture-release");
+        seed_session(&state_dir, "handoff", "codex", "hs-codex-handoff");
+
+        let tmux = snapshot_handoff_tmux(
+            tmp.path(),
+            &calls,
+            &fifo_destination,
+            &writer_pid,
+            &capture_started,
+            &capture_release,
+        );
+        let state = state(&state_dir, Some(TOKEN), tmux);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut request = format!("ws://{address}/sessions/handoff/attach")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        let mut socket = tokio_tungstenite::connect_async(request).await.unwrap().0;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !capture_started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("capture-pane never reached its controlled wait");
+
+        let live_fifo = PathBuf::from(std::fs::read_to_string(&fifo_destination).unwrap());
+        let mut live_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(live_fifo)
+            .unwrap();
+        live_writer.write_all(b"during-capture").unwrap();
+        live_writer.flush().unwrap();
+        std::fs::write(&capture_release, b"").unwrap();
+
+        assert_eq!(recv_websocket_binary(&mut socket).await, b"pane\n");
+        assert_eq!(recv_websocket_binary(&mut socket).await, b"during-capture");
+        socket.close(None).await.unwrap();
+        wait_for_subscriber_count(&state.attach_brokers, "handoff", 0).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_timeout_releases_the_final_attach_broker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let calls = tmp.path().join("calls.log");
+        let fifo_destination = tmp.path().join("fifo-destination");
+        let writer_pid = tmp.path().join("writer.pid");
+        let capture_started = tmp.path().join("capture-started");
+        let capture_release = tmp.path().join("never-release");
+        seed_session(&state_dir, "timeout", "codex", "hs-codex-timeout");
+
+        let tmux = snapshot_handoff_tmux(
+            tmp.path(),
+            &calls,
+            &fifo_destination,
+            &writer_pid,
+            &capture_started,
+            &capture_release,
+        );
+        let state = state(&state_dir, Some(TOKEN), tmux);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut request = format!("ws://{address}/sessions/timeout/attach")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        let mut socket = tokio_tungstenite::connect_async(request).await.unwrap().0;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !capture_started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("capture-pane never started");
+        assert_eq!(state.attach_brokers.subscriber_count("timeout").await, 1);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if state.attach_brokers.subscriber_count("timeout").await == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("snapshot timeout did not release the final broker lease");
+        assert!(
+            !session_dir(&state.context, "timeout")
+                .join(ATTACH_LIVE_FIFO_NAME)
+                .exists(),
+            "snapshot timeout must remove the broker FIFO"
+        );
+        let _ = socket.close(None).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn dropping_last_attach_subscription_releases_the_broker() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state_dir = tmp.path().join("state");
@@ -4223,8 +4560,9 @@ exit 0
         source_writer.flush().unwrap();
         assert_eq!(recv_attach_bytes(&mut first).await, b"before-close");
         drop(source_writer);
+        terminate_process_from_file(&writer_pid);
 
-        let closed = tokio::time::timeout(Duration::from_secs(2), first.receiver.recv())
+        let closed = tokio::time::timeout(Duration::from_secs(5), first.receiver.recv())
             .await
             .expect("timed out waiting for the old broker to close");
         assert!(attach_event_bytes(closed).is_none());
@@ -4302,6 +4640,20 @@ exit 0
             .count()
     }
 
+    fn terminate_process_from_file(pid_file: &Path) {
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        // SAFETY: the pid comes from the test-owned tmux stub. ESRCH is fine:
+        // closing the source FIFO may have already ended the writer naturally.
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            let err = io::Error::last_os_error();
+            assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
+        }
+    }
+
     fn fanout_tmux(dir: &Path, calls: &Path, source: &Path, writer_pid: &Path) -> PathBuf {
         executable(
             &dir.join("tmux"),
@@ -4318,7 +4670,7 @@ if [ "$1" = "pipe-pane" ]; then
   case "$last" in
     "cat > "*)
       dest=${{last#cat > }}
-      (exec 3>"$dest"; cat {} >&3) &
+      (exec 3>"$dest"; exec cat {} >&3) &
       printf '%s\n' "$!" > {}
       ;;
     *)
@@ -4333,6 +4685,57 @@ exit 0
 "#,
                 shell_words::quote(&calls.to_string_lossy()),
                 shell_words::quote(&source.to_string_lossy()),
+                shell_words::quote(&writer_pid.to_string_lossy()),
+                shell_words::quote(&writer_pid.to_string_lossy()),
+                shell_words::quote(&writer_pid.to_string_lossy()),
+                shell_words::quote(&writer_pid.to_string_lossy()),
+            ),
+        )
+    }
+
+    fn snapshot_handoff_tmux(
+        dir: &Path,
+        calls: &Path,
+        fifo_destination: &Path,
+        writer_pid: &Path,
+        capture_started: &Path,
+        capture_release: &Path,
+    ) -> PathBuf {
+        executable(
+            &dir.join("tmux"),
+            &format!(
+                r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {}
+if [ "$1" = "capture-pane" ]; then
+  : > {}
+  while [ ! -e {} ]; do sleep 0.01; done
+  printf 'pane\n'
+  exit 0
+fi
+if [ "$1" = "pipe-pane" ]; then
+  last=""
+  for arg in "$@"; do last="$arg"; done
+  case "$last" in
+    "cat > "*)
+      dest=${{last#cat > }}
+      printf '%s' "$dest" > {}
+      (exec 3>"$dest"; exec sleep 30) &
+      printf '%s\n' "$!" > {}
+      ;;
+    *)
+      if [ -s {} ]; then
+        kill "$(cat {})" 2>/dev/null || true
+        rm -f {}
+      fi
+      ;;
+  esac
+fi
+exit 0
+"#,
+                shell_words::quote(&calls.to_string_lossy()),
+                shell_words::quote(&capture_started.to_string_lossy()),
+                shell_words::quote(&capture_release.to_string_lossy()),
+                shell_words::quote(&fifo_destination.to_string_lossy()),
                 shell_words::quote(&writer_pid.to_string_lossy()),
                 shell_words::quote(&writer_pid.to_string_lossy()),
                 shell_words::quote(&writer_pid.to_string_lossy()),
@@ -4361,6 +4764,32 @@ exit 0
             metadata.permissions().mode() & 0o077,
             0,
             "live terminal FIFO must not be group/world readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_start_removes_fifo_after_post_create_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        seed_session(&state_dir, "rollback", "codex", "hs-codex-rollback");
+        let context = CliContext {
+            state_dir,
+            host: None,
+        };
+        let record = load_session_record(&context, "rollback").unwrap();
+        let fifo_path = session_dir(&context, "rollback").join(ATTACH_LIVE_FIFO_NAME);
+
+        let result = AttachBroker::start_with_fifo_opener(
+            &context,
+            Path::new("unused-tmux"),
+            &record,
+            |_| Err(io::Error::other("injected FIFO open failure")),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !fifo_path.exists(),
+            "broker startup failure must roll back its ephemeral FIFO"
         );
     }
 
