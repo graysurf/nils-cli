@@ -22,7 +22,8 @@ ENVIRONMENT:
 EXIT CODES:
   0   success
   1   runtime false/failed state
-  64  command-line usage error";
+  64  command-line usage error
+  65  could not resolve session id (unknown or ambiguous)";
 
 #[derive(Parser)]
 #[command(

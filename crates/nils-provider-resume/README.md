@@ -30,11 +30,11 @@ render-path determinism gate forbids.
   `ResumeResolveError` (`NotFound` / `Ambiguous { cwd_count }` / `Truncated`).
 - Lower-level primitives reused by `agent-session` (post-launch capture and
   transcript-path resolution): `codex_sessions_root`, `claude_projects_root`,
-  `read_codex_session_meta`, `read_claude_session_cwd`,
-  `collect_codex_provider_resume_matches`,
+  `read_codex_session_meta` (returning `CodexSessionMeta`),
+  `read_claude_session_cwd`, `collect_codex_provider_resume_matches`,
   `collect_claude_provider_resume_matches`, `ProviderHistoryMatch`,
   `CodexResumeScanBudget`, `ClaudeResumeScanBudget`,
-  `CODEX_RESUME_SCAN_MAX_DEPTH`.
+  `CODEX_RESUME_SCAN_MAX_DEPTH`, `CLAUDE_SESSION_META_MAX_LINE_BYTES`.
 
 ## Scan tuning
 

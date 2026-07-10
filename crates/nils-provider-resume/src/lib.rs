@@ -52,8 +52,9 @@ pub enum ResumeProvider {
 impl ResumeProvider {
     /// Stable machine-readable label describing how a match was captured.
     /// Mirrors the `capture_method` recorded by `agent-session` provider-resume
-    /// imports so the two stay in lockstep.
-    pub fn capture_method(self) -> &'static str {
+    /// imports so the two stay in lockstep. Surfaced to callers through
+    /// [`ResolvedResume::capture_method`] rather than called directly.
+    pub(crate) fn capture_method(self) -> &'static str {
         match self {
             ResumeProvider::Codex => "codex-session-meta-import",
             ResumeProvider::Claude => "claude-project-transcript-import",
@@ -708,6 +709,55 @@ mod tests {
             resolve_resume_source_in(ResumeProvider::Claude, &projects, "claude-id"),
             Err(ResumeResolveError::NotFound)
         );
+    }
+
+    #[test]
+    fn codex_scan_truncates_by_entry_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions = tmp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for index in 0..3 {
+            fs::write(
+                sessions.join(format!("s{index}.jsonl")),
+                r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"dup","session_id":"dup","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
+            )
+            .unwrap();
+        }
+
+        let mut matches = BTreeSet::new();
+        let mut budget = CodexResumeScanBudget {
+            visited: 0,
+            max_entries: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+            truncated: false,
+        };
+        collect_codex_provider_resume_matches(&sessions, 0, "dup", &mut matches, &mut budget);
+        assert!(budget.truncated, "entry budget must truncate the scan");
+    }
+
+    #[test]
+    fn claude_scan_truncates_by_entry_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let projects = tmp.path().join("projects");
+        for index in 0..3 {
+            let project = projects.join(format!("-proj-{index}"));
+            fs::create_dir_all(&project).unwrap();
+            fs::write(
+                project.join("session.jsonl"),
+                "{\"sessionId\":\"dup\",\"cwd\":\"/repo\"}\n",
+            )
+            .unwrap();
+        }
+
+        let mut matches = BTreeSet::new();
+        let mut budget = ClaudeResumeScanBudget {
+            visited: 0,
+            max_entries: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+            truncated: false,
+        };
+        collect_claude_provider_resume_matches(&projects, "dup", &mut matches, &mut budget);
+        assert!(budget.truncated, "entry budget must truncate the scan");
     }
 
     #[test]

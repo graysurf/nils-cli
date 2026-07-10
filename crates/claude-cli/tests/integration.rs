@@ -461,8 +461,11 @@ fn agent_resume_launches_claude_in_recorded_cwd_from_unrelated_dir() {
         "expected claude to be launched in the recorded cwd"
     );
     let logged = std::fs::read_to_string(&out_log).expect("stub log");
-    assert!(logged.contains("ARG:--resume"));
-    assert!(logged.contains("ARG:cl-x"));
+    assert_eq!(
+        logged.lines().collect::<Vec<_>>(),
+        vec!["ARG:--resume", "ARG:cl-x"],
+        "claude must be launched with exactly `--resume <id>`"
+    );
 }
 
 #[test]
@@ -477,4 +480,65 @@ fn agent_resume_cd_override_to_missing_directory_is_runtime_error() {
 
     assert_exit(&output, 1);
     assert!(stderr(&output).contains("not an existing directory"));
+}
+
+#[test]
+fn agent_resume_truncated_scan_returns_runtime_error() {
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    let config = tmp.path().join("claude-config");
+    // Two matching projects plus a one-entry budget forces the bounded scan to
+    // truncate before it can decide, without ever launching claude.
+    write_claude_session(&config, "-proj-a", "trunc-id", &repo);
+    write_claude_session(&config, "-proj-b", "trunc-id", &repo);
+
+    let options = CmdOptions::default()
+        .with_cwd(tmp.path())
+        .with_env("CLAUDE_CONFIG_DIR", &path_str(&config))
+        .with_env("AGENT_SESSION_CLAUDE_RESUME_SCAN_MAX_ENTRIES", "1");
+    let output = run(&["agent", "resume", "trunc-id"], &options);
+
+    assert_exit(&output, 1);
+    assert!(stderr(&output).contains("truncated"));
+}
+
+#[test]
+fn agent_resume_cd_override_bypasses_resolution() {
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let override_dir = tmp.path().join("override target");
+    std::fs::create_dir_all(&override_dir).expect("override dir");
+    // Empty project history: automatic resolution would fail with NotFound, so a
+    // successful launch proves `--cd` bypassed resolution entirely.
+    let config = tmp.path().join("claude-config");
+    std::fs::create_dir_all(config.join("projects")).expect("projects");
+
+    let stub_dir = tmp.path().join("stub");
+    std::fs::create_dir_all(&stub_dir).expect("stub dir");
+    nils_test_support::write_exe(
+        &stub_dir,
+        "claude",
+        "#!/bin/sh\n: > launched-here\nexit 5\n",
+    );
+
+    let options = CmdOptions::default()
+        .with_cwd(tmp.path())
+        .with_env("CLAUDE_CONFIG_DIR", &path_str(&config))
+        .with_path_prepend(&stub_dir);
+    let output = run(
+        &[
+            "agent",
+            "resume",
+            "unresolved-id",
+            "--cd",
+            &path_str(&override_dir),
+        ],
+        &options,
+    );
+
+    assert_exit(&output, 5);
+    assert!(
+        override_dir.join("launched-here").exists(),
+        "expected claude to be launched in the --cd override directory"
+    );
 }
