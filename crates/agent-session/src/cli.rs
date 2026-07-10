@@ -372,7 +372,8 @@ pub struct ActivitySetupArgs {
     #[arg(long, conflicts_with_all = ["dry_run", "remove", "repair"])]
     pub apply: bool,
 
-    /// Remove only agent-session-owned provider hook entries.
+    /// Remove only agent-session-owned provider lifecycle entries, including
+    /// the exact Codex notify argv.
     #[arg(long, conflicts_with_all = ["dry_run", "apply", "repair"])]
     pub remove: bool,
 

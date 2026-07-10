@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -229,6 +229,8 @@ pub(crate) struct ProviderDoctor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) version_error: Option<String>,
     pub(crate) configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) configuration_error: Option<String>,
     pub(crate) config_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) notification_config_path: Option<String>,
@@ -439,6 +441,23 @@ fn semantic_event_is_duplicate(
             .as_ref()
             .and_then(|turn| turn.provider_turn_id.as_ref())
             == event.provider_turn_id.as_ref()
+    {
+        return true;
+    }
+    if matches!(
+        event.kind,
+        TurnEventKind::TurnCompleted | TurnEventKind::TurnFailed
+    ) && let Some(event_turn_id) = event.provider_turn_id.as_ref()
+        && document
+            .state
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_turn_id.as_ref())
+            != Some(event_turn_id)
+        && document.state.last_turn.as_ref().is_some_and(|turn| {
+            turn.provider_turn_id.as_ref() == Some(event_turn_id)
+                && matches!(turn.outcome.as_str(), "completed" | "failed")
+        })
     {
         return true;
     }
@@ -1341,7 +1360,10 @@ pub(crate) fn doctor(
         let notification_path = (agent == AgentKind::Codex)
             .then(codex_notification_config_path)
             .transpose()?;
-        let configured = provider_configured(agent, &path).unwrap_or(false);
+        let (configured, configuration_error) = match provider_configured(agent, &path) {
+            Ok(configured) => (configured, None),
+            Err(error) => (false, Some(error.code().to_string())),
+        };
         let activity_summary = activity_by_provider
             .get(agent.as_str())
             .cloned()
@@ -1397,7 +1419,11 @@ pub(crate) fn doctor(
         } else {
             base_guidance.to_string()
         };
-        if !configured {
+        if let Some(error) = configuration_error.as_deref() {
+            guidance.push_str(&format!(
+                " Provider lifecycle configuration could not be validated ({error}); fix the provider configuration before running repair."
+            ));
+        } else if !configured {
             guidance.push_str(
                 " The installed hook specification is missing or drifted; run activity setup --repair after reviewing the dry-run.",
             );
@@ -1413,6 +1439,7 @@ pub(crate) fn doctor(
             version,
             version_error: version_probe.error,
             configured,
+            configuration_error,
             config_path: display_path(&path),
             notification_config_path: notification_path.as_deref().map(display_path),
             completion: completion.to_string(),
@@ -1523,14 +1550,7 @@ pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult
     let (would_change, would_configure) = match agent {
         AgentKind::Codex => {
             let notify_path = notification_path.as_deref().expect("Codex notify path");
-            // Refuse a user-owned singular notify command before mutating the
-            // additive hooks file. Removal preserves user-owned notify argv.
-            if action != SetupAction::Remove {
-                let _ = setup_codex_notification(notify_path, SetupAction::DryRun)?;
-            }
-            let hooks = setup_json_provider(agent, &path, action)?;
-            let notify = setup_codex_notification(notify_path, action)?;
-            (hooks.0 || notify.0, hooks.1 && notify.1)
+            setup_codex_provider(&path, notify_path, action)?
         }
         AgentKind::Claude => setup_json_provider(agent, &path, action)?,
         AgentKind::Hermes => setup_hermes(&path, action)?,
@@ -1707,6 +1727,15 @@ struct ProviderSpec {
     matcher: Option<&'static str>,
 }
 
+#[derive(Debug)]
+struct ProviderConfigPlan {
+    path: PathBuf,
+    original_bytes: Option<Vec<u8>>,
+    updated_bytes: Vec<u8>,
+    changed: bool,
+    configured: bool,
+}
+
 fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
     match agent {
         AgentKind::Codex => vec![
@@ -1805,8 +1834,12 @@ fn owned_command(agent: AgentKind, event: Option<&str>) -> String {
 
 fn provider_configured(agent: AgentKind, path: &Path) -> Result<bool, CliError> {
     match agent {
-        AgentKind::Codex => Ok(json_provider_configured(agent, path)?
-            && codex_notification_configured(&codex_notification_config_path()?)?),
+        AgentKind::Codex => {
+            let hooks_configured = json_provider_configured(agent, path)?;
+            let notification_configured =
+                codex_notification_configured(&codex_notification_config_path()?)?;
+            Ok(hooks_configured && notification_configured)
+        }
         AgentKind::Claude => json_provider_configured(agent, path),
         AgentKind::Hermes => hermes_configured(path),
     }
@@ -1847,7 +1880,10 @@ fn codex_notification_is_owned(document: &TomlDocument) -> bool {
         })
 }
 
-fn setup_codex_notification(path: &Path, action: SetupAction) -> Result<(bool, bool), CliError> {
+fn plan_codex_notification(
+    path: &Path,
+    action: SetupAction,
+) -> Result<ProviderConfigPlan, CliError> {
     let original_bytes = if path.is_file() {
         Some(
             fs::read(path)
@@ -1896,10 +1932,109 @@ fn setup_codex_notification(path: &Path, action: SetupAction) -> Result<(bool, b
     let rendered = document.to_string().into_bytes();
     let original_rendered = original_bytes.as_deref().unwrap_or_default();
     let changed = rendered != original_rendered;
-    if changed && action != SetupAction::DryRun {
-        write_provider_config_if_unchanged(path, &rendered, original_bytes.as_deref())?;
+    Ok(ProviderConfigPlan {
+        path: path.to_path_buf(),
+        original_bytes,
+        updated_bytes: rendered,
+        changed,
+        configured: codex_notification_is_owned(&document),
+    })
+}
+
+fn setup_codex_provider(
+    hooks_path: &Path,
+    notification_path: &Path,
+    action: SetupAction,
+) -> Result<(bool, bool), CliError> {
+    // Parse and render both files before either can change. This makes invalid
+    // or conflicting notification configuration a preflight failure for apply,
+    // repair, and remove alike.
+    let hooks = plan_json_provider(AgentKind::Codex, hooks_path, action)?;
+    let notification = plan_codex_notification(notification_path, action)?;
+    let changed = hooks.changed || notification.changed;
+    let configured = hooks.configured && notification.configured;
+    if action == SetupAction::DryRun {
+        return Ok((changed, configured));
     }
-    Ok((changed, codex_notification_is_owned(&document)))
+
+    apply_codex_provider_plans(&hooks, &notification)?;
+    Ok((changed, configured))
+}
+
+fn apply_codex_provider_plans(
+    hooks: &ProviderConfigPlan,
+    notification: &ProviderConfigPlan,
+) -> Result<(), CliError> {
+    apply_provider_config_plan(hooks)?;
+    if let Err(apply_error) = apply_provider_config_plan(notification) {
+        if hooks.changed
+            && let Err(rollback_error) = rollback_provider_config_plan(hooks)
+        {
+            return Err(CliError::runtime(
+                "provider-config-rollback-failed",
+                "Codex lifecycle setup could not apply both configuration files and could not restore the first file; inspect both paths before retrying",
+                Some(json!({
+                    "apply_error": apply_error.code(),
+                    "rollback_error": rollback_error.code(),
+                    "config_path": display_path(&hooks.path),
+                    "notification_config_path": display_path(&notification.path)
+                })),
+            ));
+        }
+        return Err(apply_error);
+    }
+    Ok(())
+}
+
+fn apply_provider_config_plan(plan: &ProviderConfigPlan) -> Result<(), CliError> {
+    if !plan.changed {
+        return Ok(());
+    }
+    write_provider_config_if_unchanged(
+        &plan.path,
+        &plan.updated_bytes,
+        plan.original_bytes.as_deref(),
+    )
+}
+
+fn rollback_provider_config_plan(plan: &ProviderConfigPlan) -> Result<(), CliError> {
+    if !plan.changed {
+        return Ok(());
+    }
+    let current = match fs::read(&plan.path) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(activity_io_error(
+                "provider-config-rollback-read-failed",
+                &plan.path,
+                err,
+            ));
+        }
+    };
+    if current.as_deref() != Some(plan.updated_bytes.as_slice()) {
+        return Err(CliError::runtime(
+            "provider-config-rollback-concurrent-modification",
+            "provider config changed after activity setup wrote it; refusing to overwrite the newer file during rollback",
+            Some(json!({ "path": display_path(&plan.path) })),
+        ));
+    }
+    if let Some(original) = plan.original_bytes.as_deref() {
+        write_atomic(&plan.path, original, SECRET_FILE_MODE).map_err(|err| {
+            CliError::runtime(
+                "provider-config-rollback-write-failed",
+                format!(
+                    "failed to restore provider config {}: {err}",
+                    plan.path.display()
+                ),
+                Some(json!({ "path": display_path(&plan.path) })),
+            )
+        })
+    } else {
+        fs::remove_file(&plan.path).map_err(|err| {
+            activity_io_error("provider-config-rollback-remove-failed", &plan.path, err)
+        })
+    }
 }
 
 fn json_provider_configured(agent: AgentKind, path: &Path) -> Result<bool, CliError> {
@@ -1927,6 +2062,18 @@ fn setup_json_provider(
     path: &Path,
     action: SetupAction,
 ) -> Result<(bool, bool), CliError> {
+    let plan = plan_json_provider(agent, path, action)?;
+    if action != SetupAction::DryRun {
+        apply_provider_config_plan(&plan)?;
+    }
+    Ok((plan.changed, plan.configured))
+}
+
+fn plan_json_provider(
+    agent: AgentKind,
+    path: &Path,
+    action: SetupAction,
+) -> Result<ProviderConfigPlan, CliError> {
     let original_bytes = if path.is_file() {
         Some(
             fs::read(path)
@@ -1959,23 +2106,23 @@ fn setup_json_provider(
         mutate_json_spec(&mut updated, agent, spec, remove)?;
     }
     let changed = updated != original;
-    if changed && action != SetupAction::DryRun {
-        write_provider_config_if_unchanged(
-            path,
-            &serde_json::to_vec_pretty(&updated).map_err(|err| {
-                CliError::runtime(
-                    "provider-config-render-failed",
-                    format!("failed to render provider config: {err}"),
-                    None,
-                )
-            })?,
-            original_bytes.as_deref(),
-        )?;
-    }
+    let updated_bytes = serde_json::to_vec_pretty(&updated).map_err(|err| {
+        CliError::runtime(
+            "provider-config-render-failed",
+            format!("failed to render provider config: {err}"),
+            None,
+        )
+    })?;
     let configured = provider_specs(agent)
         .iter()
         .all(|spec| json_has_spec(&updated, agent, *spec));
-    Ok((changed, configured))
+    Ok(ProviderConfigPlan {
+        path: path.to_path_buf(),
+        original_bytes,
+        updated_bytes,
+        changed,
+        configured,
+    })
 }
 
 fn json_has_spec(value: &Value, agent: AgentKind, spec: ProviderSpec) -> bool {
@@ -2548,6 +2695,34 @@ mod tests {
 
         assert_eq!(document.state.phase, TurnPhase::Waiting);
         assert_eq!(document.state.last_turn, last_b);
+    }
+
+    #[test]
+    fn codex_authoritative_completion_requires_an_exact_open_turn() {
+        let mut completion = event(TurnEventKind::TurnCompleted, "completion");
+        completion.confidence = Confidence::Authoritative;
+        completion.provider_turn_id = Some("turn-a".to_string());
+
+        let mut no_open_turn = document();
+        reduce(&mut no_open_turn, &completion, "2026-07-10T00:00:01Z");
+        assert_eq!(no_open_turn.state.phase, TurnPhase::Starting);
+        assert!(no_open_turn.state.last_turn.is_none());
+
+        let mut id_less_turn = document();
+        let mut start_without_id = event(TurnEventKind::TurnStarted, "start-without-id");
+        start_without_id.provider_turn_id = None;
+        reduce(&mut id_less_turn, &start_without_id, "2026-07-10T00:00:01Z");
+        reduce(&mut id_less_turn, &completion, "2026-07-10T00:00:02Z");
+        assert_eq!(id_less_turn.state.phase, TurnPhase::Working);
+        assert!(id_less_turn.state.current_turn.is_some());
+
+        let mut exact_turn = document();
+        let mut start = event(TurnEventKind::TurnStarted, "start");
+        start.provider_turn_id = Some("turn-a".to_string());
+        reduce(&mut exact_turn, &start, "2026-07-10T00:00:01Z");
+        reduce(&mut exact_turn, &completion, "2026-07-10T00:00:02Z");
+        assert_eq!(exact_turn.state.phase, TurnPhase::Waiting);
+        assert!(exact_turn.state.current_turn.is_none());
     }
 
     #[test]
@@ -3145,11 +3320,19 @@ mod tests {
         complete.runtime_id = runtime_id;
         let first =
             ingest_event(&context, &created.record.id, complete.clone()).expect("first completion");
+        let mut stop = event(TurnEventKind::StopObserved, "hook-stop-after-completion");
+        stop.runtime_id = complete.runtime_id.clone();
+        let after_stop =
+            ingest_event(&context, &created.record.id, stop).expect("interleaved raw stop");
         complete.event_id = "hook-complete-2".to_string();
         let repeated =
             ingest_event(&context, &created.record.id, complete).expect("repeated completion");
         assert!(repeated.duplicate);
-        assert_eq!(repeated.turn_state.revision, first.turn_state.revision);
+        assert_eq!(
+            repeated.turn_state.revision, after_stop.turn_state.revision,
+            "intervening non-final observations must not reopen completion dedupe"
+        );
+        assert!(after_stop.turn_state.revision > first.turn_state.revision);
     }
 
     #[test]
@@ -3276,6 +3459,29 @@ mod tests {
             Some(tmp.path().as_os_str())
         ));
         assert!(!command_resolves_on_path("agent-session", None));
+    }
+
+    #[test]
+    fn codex_provider_plans_rollback_when_the_second_file_changes() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let hooks_path = tmp.path().join("hooks.json");
+        let notification_path = tmp.path().join("config.toml");
+        let hooks = plan_json_provider(AgentKind::Codex, &hooks_path, SetupAction::Apply)
+            .expect("hooks plan");
+        let notification = plan_codex_notification(&notification_path, SetupAction::Apply)
+            .expect("notification plan");
+
+        let concurrent = b"notify = [\"user-notifier\"]\n";
+        fs::write(&notification_path, concurrent).expect("concurrent notification config");
+        let error = apply_codex_provider_plans(&hooks, &notification)
+            .expect_err("second-file change must fail the transaction");
+
+        assert_eq!(error.code(), "provider-config-concurrent-modification");
+        assert!(!hooks_path.exists(), "first-file write must be rolled back");
+        assert_eq!(
+            fs::read(&notification_path).expect("concurrent config retained"),
+            concurrent
+        );
     }
 
     #[test]
@@ -3631,7 +3837,19 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
             // Retain it in the journal/revision, but never fabricate Waiting.
         }
         TurnEventKind::TurnCompleted | TurnEventKind::TurnFailed => {
-            let matches_current = if let Some(current) = document.state.current_turn.as_ref() {
+            let requires_exact_open_turn = event.provider == AgentKind::Codex.as_str()
+                && event.kind == TurnEventKind::TurnCompleted
+                && event.confidence == Confidence::Authoritative
+                && event.source_kind == SourceKind::ProviderHook
+                && event.provider_turn_id.is_some();
+            let matches_current = if requires_exact_open_turn {
+                document
+                    .state
+                    .current_turn
+                    .as_ref()
+                    .and_then(|turn| turn.provider_turn_id.as_ref())
+                    == event.provider_turn_id.as_ref()
+            } else if let Some(current) = document.state.current_turn.as_ref() {
                 event.provider_turn_id.is_none()
                     || current.provider_turn_id.is_none()
                     || event.provider_turn_id == current.provider_turn_id

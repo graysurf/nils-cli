@@ -148,7 +148,10 @@ Codex setup owns two distinct files. Hooks remain an additive JSON merge in
 `["agent-session", "activity", "notify", "--agent", "codex"]`, recognizes that
 exact argv idempotently, and removes only that exact argv. Any other `notify`
 value is user-owned: dry-run/apply/repair return a content-free conflict before
-mutating the hooks file. The CLI never shells or retains a downstream command.
+mutating the hooks file. Apply/repair/remove parse and plan both files before
+either mutation; a guarded second-write failure restores the first write, while
+a rollback race surfaces an explicit error naming both metadata-only paths. The
+CLI never shells or retains a downstream command.
 
 Claude setup adds exact `AskUserQuestion` matcher groups for `PreToolUse`,
 `PostToolUse`, and `PostToolUseFailure` while retaining the general PostToolUse

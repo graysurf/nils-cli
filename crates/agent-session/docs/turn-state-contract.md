@@ -130,7 +130,7 @@ remain valid.
 | correlated `attention_cleared` | remove only that request, advance monotonic `last_progress_at`, and remain `needs_input` while any remain |
 | uncorrelated `progress` | advance monotonic `last_progress_at`; may establish/retain `working`, but never clears attention |
 | `stop_observed` | increment evidence revision and journal it; never changes to Waiting |
-| matching `turn_completed` | close current turn, clear attention, enter `waiting` |
+| matching `turn_completed` | close current turn, clear attention, enter `waiting`; authoritative Codex notifications require the exact open turn id |
 | matching `turn_failed` | close current turn with failed outcome, clear attention, enter `waiting` |
 | late completion for older turn | retain the newer current phase |
 | duplicate `event_id` | no state or revision change within the 4096-event active-runtime replay horizon |
@@ -219,11 +219,14 @@ and never auto-accepts Codex trust or Hermes consent. Codex setup additionally
 owns the exact `agent-session activity notify --agent codex` argv in the
 singular top-level `notify` field of `~/.codex/config.toml`: it inserts the argv
 only when absent, recognizes it idempotently, removes only that exact value, and
-preserves/refuses every user-owned value before changing the hooks file. Doctor scans session
-records once, probes provider versions concurrently with a two-second bound per
+preserves/refuses every user-owned value before changing the hooks file. The two
+Codex files are fully planned before mutation and the first guarded write is
+rolled back if the second guarded write fails. Doctor scans session records
+once, probes provider versions concurrently with a two-second bound per
 provider, and reports installed version or a bounded probe error, audited
-classification, config status, finality and correlation limits, trust
-requirements, and repair guidance without emitting provider config content.
+classification, config status or sanitized configuration error, finality and
+correlation limits, trust requirements, and repair guidance without emitting
+provider config content.
 Configured status requires every exact owned hook command/timeout and, for
 Codex, the exact notify argv; helper health resolves the bare `agent-session`
 command on PATH. Hook/notification diagnostics are bound to the active

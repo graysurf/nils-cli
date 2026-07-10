@@ -801,6 +801,86 @@ fn codex_activity_setup_refuses_a_user_owned_notify_without_mutating_configs() {
 }
 
 #[test]
+fn codex_activity_remove_validates_both_configs_before_mutating_either() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    let applied = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+
+    let mut hooks: Value =
+        serde_json::from_slice(&fs::read(&hooks_path).expect("hooks")).expect("hooks json");
+    hooks["hooks"]
+        .as_object_mut()
+        .expect("hooks object")
+        .remove("UserPromptSubmit");
+    fs::write(
+        &hooks_path,
+        serde_json::to_vec_pretty(&hooks).expect("hooks bytes"),
+    )
+    .expect("partial hooks");
+    fs::write(&notify_path, b"notify = [\"unterminated\"").expect("malformed notify config");
+    let hooks_before = fs::read(&hooks_path).expect("hooks before");
+    let notify_before = fs::read(&notify_path).expect("notify before");
+
+    let removed = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--remove", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_ne!(removed.code, 0);
+    assert_eq!(
+        removed.stdout_json()["error"]["code"],
+        "provider-config-invalid"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
+fn codex_activity_doctor_surfaces_notification_config_errors() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    fs::write(home.join(".codex/hooks.json"), r#"{"hooks":{}}"#).expect("hooks config");
+    fs::write(
+        home.join(".codex/config.toml"),
+        b"notify = [\"unterminated\"",
+    )
+    .expect("malformed notify config");
+    let home_arg = home.to_string_lossy().to_string();
+    let doctor = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(doctor.code, 0, "stderr={}", doctor.stderr_text());
+    let doctor_json = doctor.stdout_json();
+    let provider = &data(&doctor_json)["providers"][0];
+    assert_eq!(provider["configured"], false);
+    assert_eq!(provider["configuration_error"], "provider-config-invalid");
+    assert!(
+        provider["guidance"]
+            .as_str()
+            .expect("guidance")
+            .contains("fix the provider configuration before running repair")
+    );
+}
+
+#[test]
 fn codex_adapter_uses_authoritative_notify_after_conservative_raw_stop() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

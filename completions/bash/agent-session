@@ -64,6 +64,9 @@ _agent-session() {
             agent__session__activity,hook)
                 cmd="agent__session__activity__hook"
                 ;;
+            agent__session__activity,notify)
+                cmd="agent__session__activity__notify"
+                ;;
             agent__session__activity,setup)
                 cmd="agent__session__activity__setup"
                 ;;
@@ -102,7 +105,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__activity)
-            opts="-h --state-dir --host --help event status hook doctor setup"
+            opts="-h --state-dir --host --help event status hook notify doctor setup"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -201,6 +204,35 @@ _agent-session() {
                     ;;
                 --event)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__session__activity__notify)
+            opts="-h --agent --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --agent)
+                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
                     return 0
                     ;;
                 --state-dir)

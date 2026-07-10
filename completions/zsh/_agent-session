@@ -204,6 +204,16 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(notify)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Provider whose notification payload is supplied as the final argument]:AGENT:(codex claude hermes)' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+':payload -- Provider-authored JSON notification payload:_default' \
+&& ret=0
+;;
 (doctor)
 _arguments "${_arguments_options[@]}" : \
 '--agent=[Limit diagnostics to one provider]:AGENT:(codex claude hermes)' \
@@ -224,7 +234,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
 '(--apply --remove --repair)--dry-run[Preview the exact additive change without writing it]' \
 '(--dry-run --remove --repair)--apply[Apply the additive provider integration]' \
-'(--dry-run --apply --repair)--remove[Remove only agent-session-owned provider hook entries]' \
+'(--dry-run --apply --repair)--remove[Remove only agent-session-owned provider lifecycle entries, including the exact Codex notify argv]' \
 '(--dry-run --apply --remove)--repair[Restore missing agent-session-owned entries without replacing others]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -299,8 +309,9 @@ _agent-session__subcmd__activity_commands() {
 'event:Ingest one normalized metadata-only lifecycle event from stdin' \
 'status:Inspect the durable turn-state snapshot for one session' \
 'hook:Translate one provider hook payload into a safe normalized event' \
+'notify:Translate one provider notification payload into a safe normalized event' \
 'doctor:Report provider support, version, configuration, and repair guidance' \
-'setup:Preview or apply additive provider hook configuration' \
+'setup:Preview or apply additive provider lifecycle configuration' \
     )
     _describe -t commands 'agent-session activity commands' commands "$@"
 }
@@ -318,6 +329,11 @@ _agent-session__subcmd__activity__subcmd__event_commands() {
 _agent-session__subcmd__activity__subcmd__hook_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session activity hook commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__activity__subcmd__notify_commands] )) ||
+_agent-session__subcmd__activity__subcmd__notify_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session activity notify commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__activity__subcmd__setup_commands] )) ||
 _agent-session__subcmd__activity__subcmd__setup_commands() {
