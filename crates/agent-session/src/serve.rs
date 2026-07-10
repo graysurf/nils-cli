@@ -9,7 +9,7 @@
 //! Every response carries the daemon's `machine` identity so the edge can
 //! aggregate multiple machines. Literal keystroke text is never echoed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -39,8 +39,13 @@ use nils_common::usage_time::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
 use crate::cli::{self, AgentKind, SpecialKey};
+use crate::provider_prompt::{
+    MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind, ProviderPromptEvent,
+    ProviderPromptTail,
+};
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
     glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
@@ -62,6 +67,14 @@ const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_STDIN_TOKEN_BYTES: u64 = 8 * 1024;
 const USAGE_SCHEMA_VERSION: &str = "agent-session.usage.v1";
 const DEFAULT_USAGE_TIMEOUT_MS: u64 = 45_000;
+const ATTACH_TERMINAL_QUEUE_CAPACITY: usize = 64;
+const ATTACH_CONTROL_QUEUE_CAPACITY: usize = 8;
+const ATTACH_TERMINAL_BURST: usize = 32;
+const ATTACH_HANDOFF_BUFFER_CAPACITY: usize = ATTACH_BROADCAST_CAPACITY;
+const ATTACH_HANDOFF_MAX_RECAPTURES: usize = 1;
+const PROVIDER_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
+const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
 const RESET_AT_EPOCH_KEYS: &[&str] = &[
     "reset_at_epoch",
@@ -1291,8 +1304,63 @@ enum AttachEvent {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachWriterExit {
+    Drained,
+    SendFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachPumpExit {
+    BrokerClosed,
+    Lagged,
+    WriterClosed,
+}
+
+struct AttachHandoff {
+    snapshot: Option<String>,
+    live: VecDeque<Bytes>,
+    broker_closed: bool,
+}
+
+struct AbortOnDropTask<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropTask<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        self.handle.as_mut().expect("task handle is present")
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    async fn abort_and_wait(mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 struct AttachSubscription {
-    receiver: tokio::sync::broadcast::Receiver<AttachEvent>,
+    receiver: Option<tokio::sync::broadcast::Receiver<AttachEvent>>,
     lease: Option<AttachLease>,
     resize_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -1364,6 +1432,14 @@ impl Default for AttachBrokerSlot {
 }
 
 impl AttachSubscription {
+    fn receiver_mut(&mut self) -> &mut tokio::sync::broadcast::Receiver<AttachEvent> {
+        self.receiver.as_mut().expect("attach receiver is present")
+    }
+
+    fn take_receiver(&mut self) -> tokio::sync::broadcast::Receiver<AttachEvent> {
+        self.receiver.take().expect("attach receiver is present")
+    }
+
     async fn release(mut self) {
         if let Some(lease) = self.lease.take() {
             lease.release().await;
@@ -1457,7 +1533,7 @@ impl AttachBrokerRegistry {
             if !active.broker.closed.load(Ordering::Acquire) {
                 active.subscribers += 1;
                 return Ok(AttachSubscription {
-                    receiver,
+                    receiver: Some(receiver),
                     lease: Some(AttachLease {
                         slot: slot.clone(),
                         generation: active.generation,
@@ -1481,7 +1557,7 @@ impl AttachBrokerRegistry {
             broker,
         });
         Ok(AttachSubscription {
-            receiver,
+            receiver: Some(receiver),
             lease: Some(AttachLease {
                 slot: slot.clone(),
                 generation,
@@ -1738,6 +1814,85 @@ async fn capture_attach_snapshot_with_timeout(
     .map_err(|err| io::Error::other(format!("tmux capture task failed: {err}")))?
 }
 
+async fn capture_attach_handoff(
+    tmux: &Path,
+    record: &crate::SessionRecord,
+    receiver: &mut tokio::sync::broadcast::Receiver<AttachEvent>,
+) -> io::Result<AttachHandoff> {
+    for recaptures in 0..=ATTACH_HANDOFF_MAX_RECAPTURES {
+        let capture = capture_attach_snapshot(tmux, record);
+        tokio::pin!(capture);
+        let mut live = VecDeque::with_capacity(ATTACH_HANDOFF_BUFFER_CAPACITY);
+        let mut overflowed = false;
+        let mut broker_closed = false;
+
+        let snapshot = loop {
+            tokio::select! {
+                snapshot = &mut capture => break snapshot?,
+                event = receiver.recv(), if !broker_closed => {
+                    match event {
+                        Ok(AttachEvent::Output(bytes)) => {
+                            if !overflowed && live.len() < ATTACH_HANDOFF_BUFFER_CAPACITY {
+                                live.push_back(bytes);
+                            } else {
+                                // Continue draining so output generated by the
+                                // daemon's own snapshot handoff cannot make this
+                                // client appear slow. A fresh snapshot below
+                                // becomes the new terminal-state baseline.
+                                overflowed = true;
+                                live.clear();
+                            }
+                        }
+                        Ok(AttachEvent::Closed)
+                        | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            broker_closed = true;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            overflowed = true;
+                            live.clear();
+                        }
+                    }
+                }
+            }
+        };
+
+        if !overflowed {
+            return Ok(AttachHandoff {
+                snapshot,
+                live,
+                broker_closed,
+            });
+        }
+        if recaptures == ATTACH_HANDOFF_MAX_RECAPTURES {
+            return Err(io::Error::other(
+                "attach snapshot handoff overflowed after bounded recapture",
+            ));
+        }
+    }
+    unreachable!("bounded snapshot handoff loop returns")
+}
+
+async fn pump_attach_events(
+    mut receiver: tokio::sync::broadcast::Receiver<AttachEvent>,
+    terminal_tx: mpsc::Sender<Message>,
+) -> AttachPumpExit {
+    loop {
+        match receiver.recv().await {
+            Ok(AttachEvent::Output(bytes)) => {
+                if terminal_tx.send(Message::Binary(bytes)).await.is_err() {
+                    return AttachPumpExit::WriterClosed;
+                }
+            }
+            Ok(AttachEvent::Closed) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return AttachPumpExit::BrokerClosed;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                return AttachPumpExit::Lagged;
+            }
+        }
+    }
+}
+
 async fn read_attach_fifo(
     fifo: tokio::io::unix::AsyncFd<std::fs::File>,
     sender: tokio::sync::broadcast::Sender<AttachEvent>,
@@ -1785,6 +1940,7 @@ async fn read_attach_fifo(
     let _ = sender.send(AttachEvent::Closed);
 }
 
+#[cfg(test)]
 fn attach_event_bytes(
     event: Result<AttachEvent, tokio::sync::broadcast::error::RecvError>,
 ) -> Option<Bytes> {
@@ -1806,9 +1962,21 @@ where
     )
 }
 
-async fn attach_socket(socket: WebSocket, state: Arc<ServeState>, record: crate::SessionRecord) {
+async fn attach_socket(
+    socket: WebSocket,
+    state: Arc<ServeState>,
+    mut record: crate::SessionRecord,
+) {
     let target = format!("{}:0.0", record.tmux_session);
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
+    let (terminal_tx, terminal_rx) = mpsc::channel(ATTACH_TERMINAL_QUEUE_CAPACITY);
+    let (control_tx, control_rx) = mpsc::channel(ATTACH_CONTROL_QUEUE_CAPACITY);
+    let mut writer_task = Some(AbortOnDropTask::new(tokio::spawn(outbound_writer(
+        sender,
+        terminal_rx,
+        control_rx,
+        ATTACH_WEBSOCKET_SEND_TIMEOUT,
+    ))));
 
     // Subscribe before capturing the initial screen so pane output produced
     // during capture is buffered instead of silently lost. Snapshot and live
@@ -1827,41 +1995,145 @@ async fn attach_socket(socket: WebSocket, state: Arc<ServeState>, record: crate:
             return;
         }
     };
-
-    match capture_attach_snapshot(&state.tmux_bin, &record).await {
-        Ok(Some(text)) => {
-            if !send_attach_message(
-                &mut sender,
-                Message::Binary(text.into_bytes().into()),
-                ATTACH_WEBSOCKET_SEND_TIMEOUT,
-            )
-            .await
-            {
+    let handoff =
+        match capture_attach_handoff(&state.tmux_bin, &record, subscription.receiver_mut()).await {
+            Ok(handoff) => handoff,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to establish attach snapshot handoff for {}: {err}",
+                    record.id
+                );
                 subscription.release().await;
+                if let Some(task) = writer_task.take() {
+                    task.abort_and_wait().await;
+                }
                 return;
             }
+        };
+    if let Some(text) = handoff.snapshot
+        && terminal_tx
+            .send(Message::Binary(text.into_bytes().into()))
+            .await
+            .is_err()
+    {
+        subscription.release().await;
+        if let Some(task) = writer_task.take() {
+            task.abort_and_wait().await;
         }
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!(
-                "warning: failed to capture initial attach snapshot for {}: {err}",
-                record.id
-            );
+        return;
+    }
+    for bytes in handoff.live {
+        if terminal_tx.send(Message::Binary(bytes)).await.is_err() {
             subscription.release().await;
+            if let Some(task) = writer_task.take() {
+                task.abort_and_wait().await;
+            }
             return;
         }
     }
+
+    let mut pump_task = (!handoff.broker_closed).then(|| {
+        AbortOnDropTask::new(tokio::spawn(pump_attach_events(
+            subscription.take_receiver(),
+            terminal_tx.clone(),
+        )))
+    });
 
     // Client -> pane: JSON control frames { text?, key?, keys?, resize{cols,rows} }.
     // The first resize after attach forces a full-frame repaint (see resize_pane).
     let mut initial_repaint_pending = true;
     let resize_lock = subscription.resize_lock.clone();
-    loop {
+    let mut provider_prompt_task: Option<AbortOnDropTask<()>> = None;
+    let mut provider_open_task: Option<
+        AbortOnDropTask<(crate::SessionRecord, Option<ProviderPromptTail>)>,
+    > = None;
+    let mut provider_refresh_pending = false;
+    let mut drain_writer = handoff.broker_closed;
+    while pump_task.is_some() {
         tokio::select! {
+            writer_result = async {
+                writer_task
+                    .as_mut()
+                    .expect("writer task select guard")
+                    .handle_mut()
+                    .await
+            }, if writer_task.is_some() => {
+                writer_task.take();
+                if matches!(writer_result, Ok(AttachWriterExit::SendFailed) | Err(_)) {
+                    eprintln!(
+                        "warning: outbound attach writer stopped for {}",
+                        record.id
+                    );
+                }
+                break;
+            }
+            pump_result = async {
+                pump_task
+                    .as_mut()
+                    .expect("attach pump select guard")
+                    .handle_mut()
+                    .await
+            }, if pump_task.is_some() => {
+                pump_task.take();
+                drain_writer = matches!(pump_result, Ok(AttachPumpExit::BrokerClosed));
+                break;
+            }
+            opened = async {
+                provider_open_task
+                    .as_mut()
+                    .expect("provider open task select guard")
+                    .handle_mut()
+                    .await
+            }, if provider_open_task.is_some() => {
+                provider_open_task.take();
+                let prompt_tail = match opened {
+                    Ok((updated_record, tail)) => {
+                        record = updated_record;
+                        tail
+                    }
+                    Err(_) => None,
+                };
+                let capability = ProviderPromptCapabilityState {
+                    supported: prompt_tail.is_some(),
+                    provider: prompt_tail.as_ref().map(ProviderPromptTail::provider),
+                };
+                if control_tx
+                    .send(Message::Text(
+                        provider_prompt_capability_frame(capability).into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+
+                if provider_refresh_pending {
+                    provider_refresh_pending = false;
+                    provider_open_task = Some(open_provider_prompt_task(record.clone()));
+                } else if let Some(tail) = prompt_tail {
+                    provider_prompt_task = Some(AbortOnDropTask::new(tokio::spawn(
+                        provider_prompt_loop(tail, control_tx.clone()),
+                    )));
+                }
+            }
             message = receiver.next() => {
                 let Some(Ok(message)) = message else { break; };
                 match message {
                     Message::Text(text) => {
+                        if provider_prompt_subscription_requested(text.as_str()) {
+                            if let Some(mut task) = provider_prompt_task.take() {
+                                task.abort();
+                            }
+                            if provider_open_task.is_some() {
+                                // Preserve the old serial refresh behavior without
+                                // pausing broker consumption or launching overlapping
+                                // transcript scans for repeated subscriptions.
+                                provider_refresh_pending = true;
+                            } else {
+                                provider_open_task = Some(open_provider_prompt_task(record.clone()));
+                            }
+                            continue;
+                        }
                         handle_input(
                             &state.context,
                             &state.tmux_bin,
@@ -1877,20 +2149,196 @@ async fn attach_socket(socket: WebSocket, state: Arc<ServeState>, record: crate:
                     _ => {}
                 }
             }
-            event = subscription.receiver.recv() => {
-                let Some(bytes) = attach_event_bytes(event) else { break; };
-                if !send_attach_message(
-                    &mut sender,
-                    Message::Binary(bytes),
-                    ATTACH_WEBSOCKET_SEND_TIMEOUT,
-                ).await {
-                    break;
-                }
-            }
         }
     }
 
+    if let Some(task) = pump_task {
+        task.abort_and_wait().await;
+    }
+    if let Some(task) = provider_prompt_task {
+        task.abort_and_wait().await;
+    }
+    if let Some(task) = provider_open_task {
+        task.abort_and_wait().await;
+    }
     subscription.release().await;
+    drop(terminal_tx);
+    drop(control_tx);
+    if let Some(task) = writer_task {
+        finish_outbound_writer(task, drain_writer).await;
+    }
+}
+
+fn open_provider_prompt_task(
+    record: crate::SessionRecord,
+) -> AbortOnDropTask<(crate::SessionRecord, Option<ProviderPromptTail>)> {
+    AbortOnDropTask::new(tokio::task::spawn_blocking(move || {
+        let tail = ProviderPromptTail::open(&record);
+        (record, tail)
+    }))
+}
+
+async fn finish_outbound_writer(mut writer_task: AbortOnDropTask<AttachWriterExit>, drain: bool) {
+    if drain
+        && tokio::time::timeout(ATTACH_WEBSOCKET_SEND_TIMEOUT, writer_task.handle_mut())
+            .await
+            .is_ok()
+    {
+        return;
+    }
+    writer_task.abort_and_wait().await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderPromptCapabilityState {
+    supported: bool,
+    provider: Option<ProviderKind>,
+}
+
+fn provider_prompt_subscription_requested(frame: &str) -> bool {
+    serde_json::from_str::<Value>(frame)
+        .ok()
+        .and_then(|value| value.get("subscribe").and_then(Value::as_array).cloned())
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability.as_str() == Some(PROVIDER_PROMPT_CAPABILITY))
+        })
+}
+
+fn provider_prompt_capability_frame(capability: ProviderPromptCapabilityState) -> String {
+    json!({
+        "schema_version": ATTACH_SCHEMA_VERSION,
+        "type": "capability",
+        "capability": PROVIDER_PROMPT_CAPABILITY,
+        "supported": capability.supported,
+        "provider": capability.provider.map(ProviderKind::as_str),
+        "prompt_max_bytes": MAX_PROVIDER_PROMPT_BYTES,
+    })
+    .to_string()
+}
+
+fn provider_prompt_event_frame(provider: ProviderKind, event: ProviderPromptEvent) -> String {
+    json!({
+        "schema_version": ATTACH_EVENT_SCHEMA_VERSION,
+        "type": "prompt_submitted",
+        "event_id": event.id,
+        "provider": provider.as_str(),
+        "submitted_at": event.submitted_at,
+        "text": event.prompt,
+        "truncated": event.truncated,
+    })
+    .to_string()
+}
+
+async fn provider_prompt_loop(mut tail: ProviderPromptTail, sender: mpsc::Sender<Message>) {
+    let provider = tail.provider();
+    let mut interval = tokio::time::interval(PROVIDER_PROMPT_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = sender.closed() => break,
+            _ = interval.tick() => {}
+        }
+        let polled = tokio::task::spawn_blocking(move || {
+            let result = tail.poll();
+            (tail, result)
+        })
+        .await;
+        let Ok((returned_tail, result)) = polled else {
+            break;
+        };
+        tail = returned_tail;
+        let Ok(events) = result else {
+            break;
+        };
+        for event in events {
+            let frame = Message::Text(provider_prompt_event_frame(provider, event).into());
+            match sender.try_send(frame) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Prompt events are advisory. Queue saturation must never
+                    // apply backpressure to terminal output.
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+    }
+}
+
+async fn outbound_writer<S>(
+    mut sender: S,
+    mut terminal_rx: mpsc::Receiver<Message>,
+    mut control_rx: mpsc::Receiver<Message>,
+    send_timeout: Duration,
+) -> AttachWriterExit
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let mut terminal_burst = 0;
+    while let Some(message) =
+        next_outbound_message(&mut terminal_rx, &mut control_rx, &mut terminal_burst).await
+    {
+        if !send_attach_message(&mut sender, message, send_timeout).await {
+            return AttachWriterExit::SendFailed;
+        }
+    }
+    AttachWriterExit::Drained
+}
+
+async fn next_outbound_message(
+    terminal_rx: &mut mpsc::Receiver<Message>,
+    control_rx: &mut mpsc::Receiver<Message>,
+    terminal_burst: &mut usize,
+) -> Option<Message> {
+    if *terminal_burst >= ATTACH_TERMINAL_BURST
+        && let Ok(message) = control_rx.try_recv()
+    {
+        *terminal_burst = 0;
+        return Some(message);
+    }
+    if let Ok(message) = terminal_rx.try_recv() {
+        *terminal_burst += 1;
+        return Some(message);
+    }
+    if let Ok(message) = control_rx.try_recv() {
+        *terminal_burst = 0;
+        return Some(message);
+    }
+    tokio::select! {
+        biased;
+        message = terminal_rx.recv() => {
+            match message {
+                Some(message) => {
+                    *terminal_burst += 1;
+                    Some(message)
+                }
+                None => {
+                    let message = control_rx.recv().await;
+                    if message.is_some() {
+                        *terminal_burst = 0;
+                    }
+                    message
+                },
+            }
+        }
+        message = control_rx.recv() => {
+            match message {
+                Some(message) => {
+                    *terminal_burst = 0;
+                    Some(message)
+                }
+                None => {
+                    let message = terminal_rx.recv().await;
+                    if message.is_some() {
+                        *terminal_burst += 1;
+                    }
+                    message
+                },
+            }
+        }
+    }
 }
 
 /// After a fresh (re)attach the client rebuilds its terminal emulator from
@@ -2030,11 +2478,572 @@ mod tests {
     use nils_test_support::{EnvGuard, GlobalStateLock};
     use std::io::Write;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::{Message as ClientMessage, client::IntoClientRequest};
     use tower::ServiceExt;
 
     const MACHINE: &str = "test-machine";
     const TOKEN: &str = "s3cr3t-token";
+
+    #[test]
+    fn provider_prompt_subscription_requires_the_versioned_capability() {
+        assert!(provider_prompt_subscription_requested(
+            r#"{"subscribe":["provider-prompt.v1"]}"#
+        ));
+        assert!(provider_prompt_subscription_requested(
+            r#"{"subscribe":["other.v1","provider-prompt.v1"]}"#
+        ));
+        assert!(!provider_prompt_subscription_requested(
+            r#"{"subscribe":["provider-prompt.v2"]}"#
+        ));
+        assert!(!provider_prompt_subscription_requested(
+            r#"{"text":"provider-prompt.v1"}"#
+        ));
+        assert!(!provider_prompt_subscription_requested("not json"));
+    }
+
+    #[test]
+    fn provider_prompt_frames_use_the_versioned_text_contract() {
+        let capability = provider_prompt_capability_frame(ProviderPromptCapabilityState {
+            supported: true,
+            provider: Some(ProviderKind::Codex),
+        });
+        let capability: Value = serde_json::from_str(&capability).expect("capability json");
+        assert_eq!(
+            capability,
+            json!({
+                "schema_version": ATTACH_SCHEMA_VERSION,
+                "type": "capability",
+                "capability": PROVIDER_PROMPT_CAPABILITY,
+                "supported": true,
+                "provider": "codex",
+                "prompt_max_bytes": MAX_PROVIDER_PROMPT_BYTES,
+            })
+        );
+        let unsupported: Value = serde_json::from_str(&provider_prompt_capability_frame(
+            ProviderPromptCapabilityState {
+                supported: false,
+                provider: None,
+            },
+        ))
+        .expect("unsupported capability json");
+        assert_eq!(
+            unsupported,
+            json!({
+                "schema_version": ATTACH_SCHEMA_VERSION,
+                "type": "capability",
+                "capability": PROVIDER_PROMPT_CAPABILITY,
+                "supported": false,
+                "provider": null,
+                "prompt_max_bytes": MAX_PROVIDER_PROMPT_BYTES,
+            })
+        );
+
+        let event = provider_prompt_event_frame(
+            ProviderKind::Claude,
+            ProviderPromptEvent {
+                id: "pp-opaque".to_string(),
+                prompt: "submitted prompt".to_string(),
+                submitted_at: "2099-01-01T00:00:00Z".to_string(),
+                truncated: false,
+            },
+        );
+        let event: Value = serde_json::from_str(&event).expect("event json");
+        assert_eq!(
+            event,
+            json!({
+                "schema_version": ATTACH_EVENT_SCHEMA_VERSION,
+                "type": "prompt_submitted",
+                "event_id": "pp-opaque",
+                "provider": "claude",
+                "submitted_at": "2099-01-01T00:00:00Z",
+                "text": "submitted prompt",
+                "truncated": false,
+            })
+        );
+        assert!(!event.to_string().contains("/home/"));
+    }
+
+    #[tokio::test]
+    async fn outbound_writer_prioritizes_terminal_bytes_over_control_events() {
+        let (terminal_tx, mut terminal_rx) = mpsc::channel(2);
+        let (control_tx, mut control_rx) = mpsc::channel(2);
+        control_tx
+            .send(Message::Text("control".into()))
+            .await
+            .expect("queue control");
+        terminal_tx
+            .send(Message::Binary(vec![1, 2, 3].into()))
+            .await
+            .expect("queue terminal");
+
+        let mut terminal_burst = 0;
+        let first = next_outbound_message(&mut terminal_rx, &mut control_rx, &mut terminal_burst)
+            .await
+            .expect("first frame");
+        let second = next_outbound_message(&mut terminal_rx, &mut control_rx, &mut terminal_burst)
+            .await
+            .expect("second frame");
+        assert!(matches!(first, Message::Binary(_)));
+        assert!(matches!(second, Message::Text(_)));
+    }
+
+    #[tokio::test]
+    async fn outbound_writer_delivers_control_within_a_bounded_terminal_burst() {
+        let (terminal_tx, mut terminal_rx) = mpsc::channel(ATTACH_TERMINAL_QUEUE_CAPACITY);
+        let (control_tx, mut control_rx) = mpsc::channel(2);
+        for byte in 0..ATTACH_TERMINAL_QUEUE_CAPACITY {
+            terminal_tx
+                .send(Message::Binary(vec![byte as u8].into()))
+                .await
+                .expect("queue terminal");
+        }
+        control_tx
+            .send(Message::Text("capability".into()))
+            .await
+            .expect("queue control");
+
+        let mut selected_control = false;
+        let mut terminal_burst = 0;
+        for _ in 0..=32 {
+            let message =
+                next_outbound_message(&mut terminal_rx, &mut control_rx, &mut terminal_burst)
+                    .await
+                    .expect("frame");
+            if matches!(message, Message::Text(_)) {
+                selected_control = true;
+                break;
+            }
+        }
+        assert!(
+            selected_control,
+            "control frame exceeded the terminal burst bound"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_subscription_emits_capability_and_new_provider_prompt_only() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let codex_home = tmp.path().join("codex-home");
+        let transcript = codex_home.join("sessions/2026/07/session.jsonl");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp":"2099-01-01T00:00:00Z",
+                    "type":"session_meta",
+                    "payload":{
+                        "id":"resume-session-id",
+                        "session_id":"resume-session-id",
+                        "cwd":cwd.to_string_lossy(),
+                        "source":"cli",
+                        "timestamp":"2099-01-01T00:00:00Z"
+                    }
+                }),
+                json!({
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":"pre-subscription prompt"}
+                })
+            ),
+        )
+        .expect("transcript");
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        seed_resumable_session(
+            &state_dir,
+            "ws-prompt",
+            "codex",
+            "hs-codex-ws-prompt",
+            &cwd,
+            &["resume", "resume-session-id"],
+        );
+        let tmux = minimal_tmux(tmp.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("address");
+        let server_state_dir = state_dir.clone();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(state(&server_state_dir, Some(TOKEN), tmux)),
+            )
+            .await;
+        });
+
+        let mut request = format!("ws://{addr}/sessions/ws-prompt/attach")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().expect("authorization"),
+        );
+        let (mut socket, _) = connect_async(request).await.expect("connect");
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("snapshot timeout")
+            .expect("snapshot frame")
+            .expect("snapshot message");
+        assert!(matches!(snapshot, ClientMessage::Binary(_)));
+
+        socket
+            .send(ClientMessage::Text(
+                json!({"subscribe":[PROVIDER_PROMPT_CAPABILITY]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("subscribe");
+        let capability = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("capability timeout")
+            .expect("capability frame")
+            .expect("capability message");
+        let ClientMessage::Text(capability) = capability else {
+            panic!("capability must be a text frame");
+        };
+        let capability: Value = serde_json::from_str(capability.as_str()).expect("capability json");
+        assert_eq!(capability["type"], "capability");
+        assert_eq!(capability["supported"], true);
+
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("append transcript")
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "type":"event_msg",
+                        "payload":{"type":"user_message","message":"websocket prompt"}
+                    })
+                )
+                .as_bytes(),
+            )
+            .expect("write prompt");
+        let event = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("event timeout")
+            .expect("event frame")
+            .expect("event message");
+        let ClientMessage::Text(event) = event else {
+            panic!("prompt event must be a text frame");
+        };
+        let event: Value = serde_json::from_str(event.as_str()).expect("event json");
+        assert_eq!(event["type"], "prompt_submitted");
+        assert_eq!(event["text"], "websocket prompt");
+        assert!(event["event_id"].is_string());
+        assert!(event["submitted_at"].is_string());
+        assert_eq!(event["provider"], "codex");
+        assert!(
+            !event
+                .to_string()
+                .contains(transcript.to_string_lossy().as_ref())
+        );
+
+        let rotated = transcript.with_extension("jsonl.old");
+        std::fs::rename(&transcript, &rotated).expect("rotate transcript");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp":"2099-01-01T00:00:00Z",
+                    "type":"session_meta",
+                    "payload":{
+                        "id":"different-session-id",
+                        "cwd":cwd.to_string_lossy(),
+                        "source":"cli",
+                        "timestamp":"2099-01-01T00:00:00Z"
+                    }
+                })
+            ),
+        )
+        .expect("mismatched replacement");
+        socket
+            .send(ClientMessage::Text(
+                json!({"subscribe":[PROVIDER_PROMPT_CAPABILITY]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("resubscribe");
+        let capability = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("resubscribe timeout")
+            .expect("resubscribe frame")
+            .expect("resubscribe message");
+        let ClientMessage::Text(capability) = capability else {
+            panic!("capability must be a text frame");
+        };
+        let capability: Value = serde_json::from_str(capability.as_str()).expect("capability json");
+        assert_eq!(capability["supported"], false);
+
+        let _ = socket.close(None).await;
+        let session_dir = state_dir.join("sessions/ws-prompt");
+        let mut cleaned = false;
+        for _ in 0..20 {
+            cleaned = std::fs::read_dir(&session_dir)
+                .expect("session dir")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with("attach-"));
+            if cleaned {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(cleaned, "disconnect must remove the private attach pipe");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_unsubscribed_client_gets_binary_only_and_unsupported_ack() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        seed_session(&state_dir, "ws-unsupported", "hermes", "hs-hermes-ws");
+        let tmux = minimal_tmux(tmp.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router(state(&state_dir, Some(TOKEN), tmux))).await;
+        });
+
+        let mut request = format!("ws://{addr}/sessions/ws-unsupported/attach")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().expect("authorization"),
+        );
+        let (mut socket, _) = connect_async(request).await.expect("connect");
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("snapshot timeout")
+            .expect("snapshot frame")
+            .expect("snapshot message");
+        assert!(matches!(snapshot, ClientMessage::Binary(_)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), socket.next())
+                .await
+                .is_err(),
+            "unsubscribed clients must not receive text events"
+        );
+
+        socket
+            .send(ClientMessage::Text(
+                json!({"subscribe":[PROVIDER_PROMPT_CAPABILITY]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("subscribe");
+        let capability = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("capability timeout")
+            .expect("capability frame")
+            .expect("capability message");
+        let ClientMessage::Text(capability) = capability else {
+            panic!("capability must be a text frame");
+        };
+        let capability: Value = serde_json::from_str(capability.as_str()).expect("capability json");
+        assert_eq!(capability["supported"], false);
+        let _ = socket.close(None).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_subscription_rejects_heuristic_same_cwd_codex_backfill() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let codex_home = tmp.path().join("codex-home");
+        let transcript = codex_home.join("sessions/2000/01/session.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("dirs");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp":"2000-01-01T00:00:00Z",
+                    "type":"session_meta",
+                    "payload":{
+                        "id":"backfill-resume-id",
+                        "cwd":"/tmp",
+                        "source":"cli",
+                        "timestamp":"2000-01-01T00:00:00Z"
+                    }
+                })
+            ),
+        )
+        .expect("transcript");
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        seed_session(&state_dir, "ws-backfill", "codex", "hs-codex-backfill");
+        let record_path = state_dir.join("sessions/ws-backfill/session.json");
+        let tmux = minimal_tmux(tmp.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("address");
+        let server_state_dir = state_dir.clone();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(state(&server_state_dir, Some(TOKEN), tmux)),
+            )
+            .await;
+        });
+
+        let mut request = format!("ws://{addr}/sessions/ws-backfill/attach")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().expect("authorization"),
+        );
+        let (mut socket, _) = connect_async(request).await.expect("connect");
+        let _snapshot = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("snapshot timeout")
+            .expect("snapshot frame")
+            .expect("snapshot message");
+        let before: Value = serde_json::from_slice(
+            &std::fs::read(&record_path).expect("record before subscription"),
+        )
+        .expect("record json");
+        assert!(before.get("provider_resume").is_none());
+
+        socket
+            .send(ClientMessage::Text(
+                json!({"subscribe":[PROVIDER_PROMPT_CAPABILITY]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("subscribe");
+        let capability = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("capability timeout")
+            .expect("capability frame")
+            .expect("capability message");
+        let ClientMessage::Text(capability) = capability else {
+            panic!("capability must be a text frame");
+        };
+        let capability: Value = serde_json::from_str(capability.as_str()).expect("capability json");
+        assert_eq!(capability["supported"], false);
+        let after: Value = serde_json::from_slice(
+            &std::fs::read(&record_path).expect("record after subscription"),
+        )
+        .expect("record json");
+        assert!(after.get("provider_resume").is_none());
+
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("open unrelated transcript")
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "timestamp":"2099-01-01T00:00:00Z",
+                        "type":"event_msg",
+                        "payload":{
+                            "type":"user_message",
+                            "message":"unrelated same-cwd prompt"
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .expect("append unrelated prompt");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), socket.next())
+                .await
+                .is_err(),
+            "an unrelated same-cwd transcript must not emit prompt events"
+        );
+        let _ = socket.close(None).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_prompt_loop_drops_events_when_control_queue_is_saturated() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("codex.jsonl");
+        std::fs::write(&transcript, "").expect("baseline");
+        let tail = ProviderPromptTail::open_path(
+            ProviderKind::Codex,
+            "codex-id",
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tail");
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        control_tx
+            .send(Message::Text("capability".into()))
+            .await
+            .expect("fill queue");
+        let task = tokio::spawn(provider_prompt_loop(tail, control_tx));
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("open transcript")
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "timestamp":"2099-01-01T00:00:00Z",
+                        "type":"event_msg",
+                        "payload":{"type":"user_message","message":"dropped prompt"}
+                    })
+                )
+                .as_bytes(),
+            )
+            .expect("append prompt");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            control_rx.recv().await,
+            Some(Message::Text("capability".into()))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), control_rx.recv())
+                .await
+                .is_err(),
+            "advisory event should be dropped while the queue is full"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_prompt_loop_stops_when_control_receiver_closes() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("codex.jsonl");
+        std::fs::write(&transcript, "").expect("baseline");
+        let tail = ProviderPromptTail::open_path(
+            ProviderKind::Codex,
+            "codex-id",
+            transcript,
+            Duration::ZERO,
+        )
+        .expect("tail");
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let task = tokio::spawn(provider_prompt_loop(tail, control_tx));
+        drop(control_rx);
+
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("provider watcher must stop when its writer queue closes")
+            .expect("provider watcher task");
+    }
 
     fn state(state_dir: &Path, token: Option<&str>, tmux_bin: PathBuf) -> Arc<ServeState> {
         Arc::new(ServeState {
@@ -4123,6 +5132,248 @@ exit 0
     }
 
     #[tokio::test]
+    async fn outbound_writer_reports_a_stalled_sink() {
+        struct PendingSink;
+
+        impl futures_util::Sink<Message> for PendingSink {
+            type Error = io::Error;
+
+            fn poll_ready(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+
+            fn start_send(
+                self: std::pin::Pin<&mut Self>,
+                _item: Message,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let (terminal_tx, terminal_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        terminal_tx
+            .send(Message::Binary(Bytes::from_static(b"blocked")))
+            .await
+            .unwrap();
+        drop(terminal_tx);
+        drop(control_tx);
+
+        assert_eq!(
+            outbound_writer(
+                PendingSink,
+                terminal_rx,
+                control_rx,
+                Duration::from_millis(20),
+            )
+            .await,
+            AttachWriterExit::SendFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_broker_close_drains_frames_already_accepted_by_the_writer() {
+        #[derive(Clone)]
+        struct RecordingSink(Arc<std::sync::Mutex<Vec<Message>>>);
+
+        impl futures_util::Sink<Message> for RecordingSink {
+            type Error = io::Error;
+
+            fn poll_ready(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn start_send(
+                self: std::pin::Pin<&mut Self>,
+                item: Message,
+            ) -> Result<(), Self::Error> {
+                self.0.lock().unwrap().push(item);
+                Ok(())
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (terminal_tx, terminal_rx) = mpsc::channel(2);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        terminal_tx
+            .send(Message::Binary(Bytes::from_static(b"first")))
+            .await
+            .unwrap();
+        terminal_tx
+            .send(Message::Binary(Bytes::from_static(b"second")))
+            .await
+            .unwrap();
+        drop(terminal_tx);
+        drop(control_tx);
+
+        let task = AbortOnDropTask::new(tokio::spawn(outbound_writer(
+            RecordingSink(written.clone()),
+            terminal_rx,
+            control_rx,
+            Duration::from_secs(1),
+        )));
+        finish_outbound_writer(task, true).await;
+
+        let written = written.lock().unwrap();
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0], Message::Binary(Bytes::from_static(b"first")));
+        assert_eq!(written[1], Message::Binary(Bytes::from_static(b"second")));
+    }
+
+    #[tokio::test]
+    async fn attach_pump_drains_beyond_the_broadcast_ring_capacity() {
+        let (broker_tx, broker_rx) = tokio::sync::broadcast::channel(ATTACH_BROADCAST_CAPACITY);
+        let (terminal_tx, mut terminal_rx) = mpsc::channel(ATTACH_BROADCAST_CAPACITY * 2);
+        let task = tokio::spawn(pump_attach_events(broker_rx, terminal_tx));
+
+        for index in 0..=ATTACH_BROADCAST_CAPACITY {
+            broker_tx
+                .send(AttachEvent::Output(Bytes::from(vec![index as u8])))
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+        broker_tx.send(AttachEvent::Closed).unwrap();
+
+        assert_eq!(task.await.unwrap(), AttachPumpExit::BrokerClosed);
+        let mut received = 0;
+        while terminal_rx.recv().await.is_some() {
+            received += 1;
+        }
+        assert_eq!(received, ATTACH_BROADCAST_CAPACITY + 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_attach_child_task_aborts_it() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task = AbortOnDropTask::new(tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+        drop(task);
+
+        tokio::time::timeout(Duration::from_millis(250), dropped_rx)
+            .await
+            .expect("aborted task must drop its owned state")
+            .expect("drop signal");
+    }
+
+    #[tokio::test]
+    async fn snapshot_handoff_recaptures_after_internal_buffer_overflow() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let calls = tmp.path().join("capture-calls");
+        let first_started = tmp.path().join("first-started");
+        let first_release = tmp.path().join("first-release");
+        let second_started = tmp.path().join("second-started");
+        let second_release = tmp.path().join("second-release");
+        seed_session(&state_dir, "recapture", "codex", "hs-codex-recapture");
+        let tmux = executable(
+            &tmp.path().join("tmux"),
+            &format!(
+                r#"#!/usr/bin/env sh
+if [ "$1" = "capture-pane" ]; then
+  printf 'capture\n' >> {calls}
+  count=$(wc -l < {calls})
+  if [ "$count" -eq 1 ]; then
+    : > {first_started}
+    while [ ! -f {first_release} ]; do sleep 0.01; done
+    printf 'stale\n'
+  else
+    : > {second_started}
+    while [ ! -f {second_release} ]; do sleep 0.01; done
+    printf 'fresh\n'
+  fi
+fi
+exit 0
+"#,
+                calls = shell_words::quote(&calls.to_string_lossy()),
+                first_started = shell_words::quote(&first_started.to_string_lossy()),
+                first_release = shell_words::quote(&first_release.to_string_lossy()),
+                second_started = shell_words::quote(&second_started.to_string_lossy()),
+                second_release = shell_words::quote(&second_release.to_string_lossy()),
+            ),
+        );
+        let context = CliContext {
+            state_dir,
+            host: None,
+        };
+        let record = load_session_record(&context, "recapture").unwrap();
+        let (broker_tx, mut broker_rx) = tokio::sync::broadcast::channel(ATTACH_BROADCAST_CAPACITY);
+        let task =
+            tokio::spawn(
+                async move { capture_attach_handoff(&tmux, &record, &mut broker_rx).await },
+            );
+
+        wait_for_file(&first_started).await;
+        for index in 0..=ATTACH_HANDOFF_BUFFER_CAPACITY {
+            broker_tx
+                .send(AttachEvent::Output(Bytes::from(vec![index as u8])))
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+        std::fs::write(&first_release, b"").unwrap();
+        wait_for_file(&second_started).await;
+        broker_tx
+            .send(AttachEvent::Output(Bytes::from_static(b"after-recapture")))
+            .unwrap();
+        tokio::task::yield_now().await;
+        std::fs::write(&second_release, b"").unwrap();
+
+        let handoff = task.await.unwrap().unwrap();
+        assert_eq!(handoff.snapshot.as_deref(), Some("fresh\n"));
+        assert_eq!(handoff.live.len(), 1);
+        assert_eq!(handoff.live[0], Bytes::from_static(b"after-recapture"));
+        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 2);
+    }
+
+    #[tokio::test]
     async fn attach_broker_fans_out_and_only_last_subscriber_tears_down_pipe() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state_dir = tmp.path().join("state");
@@ -4562,7 +5813,7 @@ exit 0
         drop(source_writer);
         terminate_process_from_file(&writer_pid);
 
-        let closed = tokio::time::timeout(Duration::from_secs(5), first.receiver.recv())
+        let closed = tokio::time::timeout(Duration::from_secs(5), first.receiver_mut().recv())
             .await
             .expect("timed out waiting for the old broker to close");
         assert!(attach_event_bytes(closed).is_none());
@@ -4587,9 +5838,10 @@ exit 0
     }
 
     async fn recv_attach_bytes(subscription: &mut AttachSubscription) -> Vec<u8> {
-        let event = tokio::time::timeout(Duration::from_secs(2), subscription.receiver.recv())
-            .await
-            .expect("timed out waiting for broker output");
+        let event =
+            tokio::time::timeout(Duration::from_secs(2), subscription.receiver_mut().recv())
+                .await
+                .expect("timed out waiting for broker output");
         attach_event_bytes(event)
             .expect("broker closed before delivering output")
             .to_vec()
@@ -4630,6 +5882,16 @@ exit 0
         })
         .await
         .expect("timed out waiting for subscriber cleanup");
+    }
+
+    async fn wait_for_file(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for test marker");
     }
 
     fn pipe_close_count(calls: &Path) -> usize {

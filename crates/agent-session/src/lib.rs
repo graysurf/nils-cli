@@ -1,5 +1,6 @@
 mod cli;
 pub mod completion;
+mod provider_prompt;
 mod serve;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -931,6 +932,12 @@ struct ProviderResumeSource {
     capture_method: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProviderHistoryMatch {
+    path: PathBuf,
+    cwd: String,
+}
+
 fn normalize_provider_resume_id(session_id: &str) -> Result<String, CliError> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
@@ -1013,10 +1020,14 @@ fn resolve_codex_provider_resume_source(
     if budget.truncated {
         return Err(provider_resume_scan_truncated(AgentKind::Codex, session_id));
     }
+    let cwd_matches = matches
+        .into_iter()
+        .map(|candidate: ProviderHistoryMatch| candidate.cwd)
+        .collect();
     provider_resume_source_from_matches(
         AgentKind::Codex,
         session_id,
-        matches,
+        cwd_matches,
         "codex-session-meta-import",
     )
 }
@@ -1025,7 +1036,7 @@ fn collect_codex_provider_resume_matches(
     dir: &Path,
     depth: usize,
     session_id: &str,
-    matches: &mut BTreeSet<String>,
+    matches: &mut BTreeSet<ProviderHistoryMatch>,
     budget: &mut CodexResumeScanBudget,
 ) {
     if depth > CODEX_RESUME_SCAN_MAX_DEPTH {
@@ -1049,13 +1060,18 @@ fn collect_codex_provider_resume_matches(
             }
             continue;
         }
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        if !file_type.is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        {
             continue;
         }
         if let Some(meta) = read_codex_session_meta(&path)
             && meta.session_id == session_id
         {
-            matches.insert(meta.cwd);
+            matches.insert(ProviderHistoryMatch {
+                path,
+                cwd: meta.cwd,
+            });
         }
     }
 }
@@ -1074,10 +1090,14 @@ fn resolve_claude_provider_resume_source(
             session_id,
         ));
     }
+    let cwd_matches = matches
+        .into_iter()
+        .map(|candidate: ProviderHistoryMatch| candidate.cwd)
+        .collect();
     provider_resume_source_from_matches(
         AgentKind::Claude,
         session_id,
-        matches,
+        cwd_matches,
         "claude-project-transcript-import",
     )
 }
@@ -1092,7 +1112,7 @@ fn claude_projects_root() -> Option<PathBuf> {
 fn collect_claude_provider_resume_matches(
     projects_root: &Path,
     session_id: &str,
-    matches: &mut BTreeSet<String>,
+    matches: &mut BTreeSet<ProviderHistoryMatch>,
     budget: &mut ClaudeResumeScanBudget,
 ) {
     let Ok(projects) = fs::read_dir(projects_root) else {
@@ -1125,10 +1145,47 @@ fn collect_claude_provider_resume_matches(
                 continue;
             }
             if let Some(cwd) = read_claude_session_cwd(&path, session_id) {
-                matches.insert(cwd);
+                matches.insert(ProviderHistoryMatch { path, cwd });
             }
         }
     }
+}
+
+pub(crate) fn resolve_provider_transcript_path_from_roots(
+    agent: AgentKind,
+    session_id: &str,
+    codex_root: Option<&Path>,
+    claude_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut matches = BTreeSet::new();
+    let truncated = match agent {
+        AgentKind::Codex => {
+            let mut budget = CodexResumeScanBudget::from_env();
+            collect_codex_provider_resume_matches(
+                codex_root?,
+                0,
+                session_id,
+                &mut matches,
+                &mut budget,
+            );
+            budget.truncated
+        }
+        AgentKind::Claude => {
+            let mut budget = ClaudeResumeScanBudget::from_env();
+            collect_claude_provider_resume_matches(
+                claude_root?,
+                session_id,
+                &mut matches,
+                &mut budget,
+            );
+            budget.truncated
+        }
+        AgentKind::Hermes => return None,
+    };
+    if truncated || matches.len() != 1 {
+        return None;
+    }
+    matches.into_iter().next().map(|candidate| candidate.path)
 }
 
 fn provider_resume_source_from_matches(
