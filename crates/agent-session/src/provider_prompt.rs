@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -9,15 +9,14 @@ use uuid::Uuid;
 
 use crate::{
     AgentKind, SessionRecord, claude_projects_root, codex_sessions_root, read_claude_session_cwd,
-    read_codex_session_meta,
+    read_codex_session_meta, resolve_provider_transcript_path_from_roots,
 };
 
 pub(crate) const PROVIDER_PROMPT_CAPABILITY: &str = "provider-prompt.v1";
 pub(crate) const MAX_PROVIDER_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_PROVIDER_LINE_BYTES: usize = 256 * 1024;
 const MAX_PROVIDER_READ_BYTES: usize = 64 * 1024;
-const MAX_PROVIDER_RESOLVE_ENTRIES: usize = 5_000;
-const MAX_PROVIDER_RESOLVE_DEPTH: usize = 6;
+const PROVIDER_CONTINUITY_BYTES: usize = 4 * 1024;
 const CLAUDE_FALLBACK_DELAY: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +38,7 @@ impl ProviderKind {
 pub(crate) struct ProviderPromptEvent {
     pub(crate) id: String,
     pub(crate) prompt: String,
+    pub(crate) submitted_at: String,
     pub(crate) truncated: bool,
 }
 
@@ -46,6 +46,15 @@ pub(crate) struct ProviderPromptEvent {
 struct ParsedPrompt {
     prompt: String,
     truncated: bool,
+    submitted_at: Option<String>,
+    turn_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingClaudePrompt {
+    prompt: ParsedPrompt,
+    started_at: Instant,
+    canonical: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -66,10 +75,10 @@ pub(crate) struct ProviderPromptTail {
     source: ProviderPromptSource,
     identity: FileIdentity,
     offset: u64,
+    continuity: Vec<u8>,
     partial: Vec<u8>,
     discarding_oversized_line: bool,
-    pending_claude: Option<ParsedPrompt>,
-    pending_claude_since: Option<Instant>,
+    pending_claude: VecDeque<PendingClaudePrompt>,
     claude_fallback_delay: Duration,
     disabled: bool,
 }
@@ -84,22 +93,23 @@ impl ProviderPromptTail {
         source: ProviderPromptSource,
         claude_fallback_delay: Duration,
     ) -> io::Result<Self> {
-        let metadata = fs::metadata(&source.path)?;
+        let (mut file, metadata) = open_regular_file(&source.path)?;
+        let offset = metadata.len();
         Ok(Self {
             source,
             identity: file_identity(&metadata),
-            offset: metadata.len(),
+            offset,
+            continuity: read_continuity(&mut file, offset)?,
             partial: Vec::new(),
             discarding_oversized_line: false,
-            pending_claude: None,
-            pending_claude_since: None,
+            pending_claude: VecDeque::new(),
             claude_fallback_delay,
             disabled: false,
         })
     }
 
     #[cfg(test)]
-    fn open_path(
+    pub(crate) fn open_path(
         provider: ProviderKind,
         session_id: &str,
         path: PathBuf,
@@ -124,11 +134,16 @@ impl ProviderPromptTail {
             return Ok(Vec::new());
         }
 
-        let metadata = fs::metadata(&self.source.path)?;
+        let (mut file, metadata) = open_regular_file(&self.source.path)?;
         let identity = file_identity(&metadata);
-        if identity != self.identity || metadata.len() < self.offset {
-            self.reset_to_eof(metadata, identity);
-            if !source_still_matches(&self.source) {
+        let continuous = identity == self.identity
+            && metadata.len() >= self.offset
+            && continuity_matches(&mut file, self.offset, &self.continuity)?;
+        if !continuous {
+            self.reset_to_eof(&mut file, &metadata, identity)?;
+            if !source_still_matches(&self.source)
+                || !opened_file_still_current(&self.source.path, identity)
+            {
                 self.disabled = true;
             }
             return Ok(Vec::new());
@@ -140,33 +155,33 @@ impl ProviderPromptTail {
             .min(MAX_PROVIDER_READ_BYTES);
         let mut events = Vec::new();
         if read_len > 0 {
-            let mut file = File::open(&self.source.path)?;
             file.seek(SeekFrom::Start(self.offset))?;
             let mut bytes = vec![0u8; read_len];
             let read = file.read(&mut bytes)?;
             self.offset = self.offset.saturating_add(read as u64);
+            update_continuity(&mut self.continuity, &bytes[..read]);
             self.consume(&bytes[..read], &mut events);
         }
 
-        if self.source.provider == ProviderKind::Claude
-            && self
-                .pending_claude_since
-                .is_some_and(|started| started.elapsed() >= self.claude_fallback_delay)
-            && let Some(prompt) = self.pending_claude.take()
-        {
-            self.pending_claude_since = None;
-            events.push(provider_event(prompt));
+        if self.source.provider == ProviderKind::Claude {
+            self.drain_ready_claude(&mut events);
         }
         Ok(events)
     }
 
-    fn reset_to_eof(&mut self, metadata: fs::Metadata, identity: FileIdentity) {
+    fn reset_to_eof(
+        &mut self,
+        file: &mut File,
+        metadata: &fs::Metadata,
+        identity: FileIdentity,
+    ) -> io::Result<()> {
         self.identity = identity;
         self.offset = metadata.len();
+        self.continuity = read_continuity(file, self.offset)?;
         self.partial.clear();
         self.discarding_oversized_line = false;
-        self.pending_claude = None;
-        self.pending_claude_since = None;
+        self.pending_claude.clear();
+        Ok(())
     }
 
     fn consume(&mut self, bytes: &[u8], events: &mut Vec<ProviderPromptEvent>) {
@@ -205,19 +220,48 @@ impl ProviderPromptTail {
             }
             ProviderKind::Claude => {
                 if let Some(prompt) = parse_claude_last_prompt(&line, &self.source.session_id) {
-                    if self.pending_claude.take().is_some() {
-                        events.push(provider_event(prompt));
+                    let match_index = match prompt.turn_id.as_deref() {
+                        Some(turn_id) => self.pending_claude.iter().position(|candidate| {
+                            candidate.prompt.turn_id.as_deref() == Some(turn_id)
+                        }),
+                        None if self.pending_claude.len() == 1
+                            && self.pending_claude[0].prompt.turn_id.is_none() =>
+                        {
+                            Some(0)
+                        }
+                        None => None,
+                    };
+                    if let Some(index) = match_index {
+                        let candidate = &mut self.pending_claude[index];
+                        candidate.prompt.prompt = prompt.prompt;
+                        candidate.prompt.truncated = prompt.truncated;
+                        if prompt.submitted_at.is_some() {
+                            candidate.prompt.submitted_at = prompt.submitted_at;
+                        }
+                        candidate.canonical = true;
                     }
-                    self.pending_claude_since = None;
                     return;
                 }
                 if let Some(prompt) = parse_claude_user_prompt(&line, &self.source.session_id) {
-                    if let Some(previous) = self.pending_claude.replace(prompt) {
-                        events.push(provider_event(previous));
-                    }
-                    self.pending_claude_since = Some(Instant::now());
+                    self.pending_claude.push_back(PendingClaudePrompt {
+                        prompt,
+                        started_at: Instant::now(),
+                        canonical: false,
+                    });
                 }
             }
+        }
+    }
+
+    fn drain_ready_claude(&mut self, events: &mut Vec<ProviderPromptEvent>) {
+        while self.pending_claude.front().is_some_and(|candidate| {
+            candidate.canonical || candidate.started_at.elapsed() >= self.claude_fallback_delay
+        }) {
+            let candidate = self
+                .pending_claude
+                .pop_front()
+                .expect("ready candidate exists");
+            events.push(provider_event(candidate.prompt));
         }
     }
 }
@@ -226,6 +270,9 @@ fn provider_event(prompt: ParsedPrompt) -> ProviderPromptEvent {
     ProviderPromptEvent {
         id: format!("pp-{}", Uuid::new_v4().simple()),
         prompt: prompt.prompt,
+        submitted_at: prompt
+            .submitted_at
+            .unwrap_or_else(|| jiff::Timestamp::now().to_string()),
         truncated: prompt.truncated,
     }
 }
@@ -239,7 +286,9 @@ fn parse_codex_prompt(line: &str) -> Option<ParsedPrompt> {
     if payload.get("type").and_then(Value::as_str) != Some("user_message") {
         return None;
     }
-    bounded_prompt(payload.get("message").and_then(Value::as_str)?)
+    let mut prompt = bounded_prompt(payload.get("message").and_then(Value::as_str)?)?;
+    prompt.submitted_at = provider_timestamp(&value);
+    Some(prompt)
 }
 
 fn parse_claude_last_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt> {
@@ -249,7 +298,14 @@ fn parse_claude_last_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt
     {
         return None;
     }
-    bounded_prompt(value.get("lastPrompt").and_then(Value::as_str)?)
+    let mut prompt = bounded_prompt(value.get("lastPrompt").and_then(Value::as_str)?)?;
+    prompt.submitted_at = provider_timestamp(&value);
+    prompt.turn_id = value
+        .get("leafUuid")
+        .or_else(|| value.get("leaf_uuid"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(prompt)
 }
 
 fn parse_claude_user_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt> {
@@ -258,6 +314,11 @@ fn parse_claude_user_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt
         || !claude_session_matches(&value, session_id)
         || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
         || value.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+        || value
+            .get("isVisibleInTranscriptOnly")
+            .and_then(Value::as_bool)
+            == Some(true)
         || value.get("promptSource").and_then(Value::as_str) == Some("system")
     {
         return None;
@@ -267,18 +328,36 @@ fn parse_claude_user_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt
         return None;
     }
     let content = message.get("content")?;
-    if let Some(text) = content.as_str() {
-        return bounded_prompt(text);
-    }
-    let text = content
-        .as_array()?
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
-        .filter(|text| !text.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    bounded_prompt(&text)
+    let text = if let Some(text) = content.as_str() {
+        text.to_string()
+    } else {
+        content
+            .as_array()?
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut prompt = bounded_prompt(&text)?;
+    prompt.submitted_at = provider_timestamp(&value);
+    prompt.turn_id = value
+        .get("uuid")
+        .or_else(|| value.get("messageUuid"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(prompt)
+}
+
+fn provider_timestamp(value: &Value) -> Option<String> {
+    value
+        .get("timestamp")
+        .or_else(|| value.get("submitted_at"))
+        .and_then(Value::as_str)
+        .filter(|timestamp| !timestamp.trim().is_empty())
+        .and_then(|timestamp| timestamp.parse::<jiff::Timestamp>().ok())
+        .map(|timestamp| timestamp.to_string())
 }
 
 fn claude_session_matches(value: &Value, session_id: &str) -> bool {
@@ -297,6 +376,8 @@ fn bounded_prompt(prompt: &str) -> Option<ParsedPrompt> {
         return Some(ParsedPrompt {
             prompt: prompt.to_string(),
             truncated: false,
+            submitted_at: None,
+            turn_id: None,
         });
     }
     let mut end = MAX_PROVIDER_PROMPT_BYTES;
@@ -306,6 +387,8 @@ fn bounded_prompt(prompt: &str) -> Option<ParsedPrompt> {
     Some(ParsedPrompt {
         prompt: prompt[..end].to_string(),
         truncated: true,
+        submitted_at: None,
+        turn_id: None,
     })
 }
 
@@ -330,11 +413,21 @@ fn resolve_provider_prompt_source_from_roots(
     let (provider, path) = match agent {
         AgentKind::Codex => (
             ProviderKind::Codex,
-            resolve_codex_transcript(codex_root?, &resume.session_id)?,
+            resolve_provider_transcript_path_from_roots(
+                AgentKind::Codex,
+                &resume.session_id,
+                codex_root,
+                claude_root,
+            )?,
         ),
         AgentKind::Claude => (
             ProviderKind::Claude,
-            resolve_claude_transcript(claude_root?, &resume.session_id)?,
+            resolve_provider_transcript_path_from_roots(
+                AgentKind::Claude,
+                &resume.session_id,
+                codex_root,
+                claude_root,
+            )?,
         ),
         AgentKind::Hermes => return None,
     };
@@ -345,125 +438,67 @@ fn resolve_provider_prompt_source_from_roots(
     })
 }
 
-fn resolve_codex_transcript(root: &Path, session_id: &str) -> Option<PathBuf> {
-    let mut paths = BTreeSet::new();
-    let mut budget = ResolveBudget::new();
-    collect_codex_transcripts(root, 0, session_id, &mut paths, &mut budget);
-    if budget.truncated {
-        return None;
+fn open_regular_file(path: &Path) -> io::Result<(File, fs::Metadata)> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider transcript is not a regular file",
+        ));
     }
-    single_path(paths)
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if file_identity(&path_metadata) != file_identity(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider transcript changed while opening",
+        ));
+    }
+    Ok((file, metadata))
 }
 
-fn collect_codex_transcripts(
-    dir: &Path,
-    depth: usize,
-    session_id: &str,
-    paths: &mut BTreeSet<PathBuf>,
-    budget: &mut ResolveBudget,
-) {
-    if depth > MAX_PROVIDER_RESOLVE_DEPTH {
+fn opened_file_still_current(path: &Path, identity: FileIdentity) -> bool {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .is_some_and(|metadata| file_identity(&metadata) == identity)
+}
+
+fn read_continuity(file: &mut File, offset: u64) -> io::Result<Vec<u8>> {
+    let length = offset.min(PROVIDER_CONTINUITY_BYTES as u64) as usize;
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    file.seek(SeekFrom::Start(offset - length as u64))?;
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn continuity_matches(file: &mut File, offset: u64, expected: &[u8]) -> io::Result<bool> {
+    if expected.is_empty() {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::Start(offset - expected.len() as u64))?;
+    let mut actual = vec![0; expected.len()];
+    file.read_exact(&mut actual)?;
+    Ok(actual == expected)
+}
+
+fn update_continuity(continuity: &mut Vec<u8>, appended: &[u8]) {
+    if appended.len() >= PROVIDER_CONTINUITY_BYTES {
+        continuity.clear();
+        continuity.extend_from_slice(&appended[appended.len() - PROVIDER_CONTINUITY_BYTES..]);
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if !budget.visit() {
-            return;
-        }
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            collect_codex_transcripts(&path, depth + 1, session_id, paths, budget);
-            if budget.truncated {
-                return;
-            }
-            continue;
-        }
-        if path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-            && read_codex_session_meta(&path)
-                .is_some_and(|metadata| metadata.session_id == session_id)
-        {
-            paths.insert(path);
-        }
+    let overflow = continuity
+        .len()
+        .saturating_add(appended.len())
+        .saturating_sub(PROVIDER_CONTINUITY_BYTES);
+    if overflow > 0 {
+        continuity.drain(..overflow);
     }
-}
-
-fn resolve_claude_transcript(root: &Path, session_id: &str) -> Option<PathBuf> {
-    let mut paths = BTreeSet::new();
-    let mut budget = ResolveBudget::new();
-    collect_claude_transcripts(root, 0, session_id, &mut paths, &mut budget);
-    if budget.truncated {
-        return None;
-    }
-    single_path(paths)
-}
-
-fn collect_claude_transcripts(
-    dir: &Path,
-    depth: usize,
-    session_id: &str,
-    paths: &mut BTreeSet<PathBuf>,
-    budget: &mut ResolveBudget,
-) {
-    if depth > MAX_PROVIDER_RESOLVE_DEPTH {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if !budget.visit() {
-            return;
-        }
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            collect_claude_transcripts(&path, depth + 1, session_id, paths, budget);
-            if budget.truncated {
-                return;
-            }
-            continue;
-        }
-        if path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-            && read_claude_session_cwd(&path, session_id).is_some()
-        {
-            paths.insert(path);
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ResolveBudget {
-    visited: usize,
-    truncated: bool,
-}
-
-impl ResolveBudget {
-    fn new() -> Self {
-        Self {
-            visited: 0,
-            truncated: false,
-        }
-    }
-
-    fn visit(&mut self) -> bool {
-        if self.visited >= MAX_PROVIDER_RESOLVE_ENTRIES {
-            self.truncated = true;
-            return false;
-        }
-        self.visited += 1;
-        true
-    }
-}
-
-fn single_path(paths: BTreeSet<PathBuf>) -> Option<PathBuf> {
-    (paths.len() == 1).then(|| paths.into_iter().next().expect("one transcript"))
+    continuity.extend_from_slice(appended);
 }
 
 fn source_still_matches(source: &ProviderPromptSource) -> bool {
@@ -502,6 +537,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
 
+    use nils_test_support::{EnvGuard, GlobalStateLock};
     use pretty_assertions::{assert_eq, assert_ne};
     use serde_json::json;
 
@@ -529,6 +565,8 @@ mod tests {
         let sidechain = r#"{"type":"user","sessionId":"claude-id","isSidechain":true,"message":{"role":"user","content":"sidechain prompt"}}"#;
         let meta = r#"{"type":"user","sessionId":"claude-id","isMeta":true,"message":{"role":"user","content":"meta prompt"}}"#;
         let system = r#"{"type":"user","sessionId":"claude-id","promptSource":"system","message":{"role":"user","content":"system prompt"}}"#;
+        let compact_summary = r#"{"type":"user","sessionId":"claude-id","isCompactSummary":true,"message":{"role":"user","content":"compact summary"}}"#;
+        let transcript_only = r#"{"type":"user","sessionId":"claude-id","isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"transcript-only context"}}"#;
         let tool_result = r#"{"type":"user","sessionId":"claude-id","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool","content":"tool output"}]}}"#;
 
         assert_eq!(
@@ -542,6 +580,8 @@ mod tests {
         assert_eq!(parse_claude_user_prompt(sidechain, "claude-id"), None);
         assert_eq!(parse_claude_user_prompt(meta, "claude-id"), None);
         assert_eq!(parse_claude_user_prompt(system, "claude-id"), None);
+        assert_eq!(parse_claude_user_prompt(compact_summary, "claude-id"), None);
+        assert_eq!(parse_claude_user_prompt(transcript_only, "claude-id"), None);
         assert_eq!(parse_claude_user_prompt(tool_result, "claude-id"), None);
         assert_eq!(parse_claude_last_prompt(last_prompt, "other-id"), None);
     }
@@ -635,6 +675,75 @@ mod tests {
     }
 
     #[test]
+    fn tail_rejects_same_inode_rewrite_that_regrows_past_the_offset() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("codex.jsonl");
+        let meta = codex_meta("codex-id", "/repo");
+        fs::write(&transcript, &meta).expect("baseline");
+        let mut tail = ProviderPromptTail::open_path(
+            ProviderKind::Codex,
+            "codex-id",
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tail");
+        append(&transcript, codex_line("before rewrite").as_bytes());
+        assert_eq!(tail.poll().expect("first").len(), 1);
+
+        let prefix_padding = tail.offset as usize - meta.len();
+        let replacement = format!(
+            "{}{}{}",
+            meta,
+            " ".repeat(prefix_padding),
+            codex_line("replacement replay")
+        );
+        fs::write(&transcript, replacement).expect("same-inode rewrite");
+        assert_eq!(tail.poll().expect("continuity reset"), Vec::new());
+        append(&transcript, codex_line("after continuity reset").as_bytes());
+        let events = tail.poll().expect("after continuity reset");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].prompt, "after continuity reset");
+    }
+
+    #[test]
+    fn tail_handles_matching_rotation_and_disables_mismatched_replacement() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("codex.jsonl");
+        let rotated = tmp.path().join("codex.old.jsonl");
+        fs::write(&transcript, codex_meta("codex-id", "/repo")).expect("baseline");
+        let mut tail = ProviderPromptTail::open_path(
+            ProviderKind::Codex,
+            "codex-id",
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tail");
+
+        fs::rename(&transcript, &rotated).expect("rotate");
+        fs::write(
+            &transcript,
+            format!(
+                "{}{}",
+                codex_meta("codex-id", "/repo"),
+                codex_line("replayed after rotation")
+            ),
+        )
+        .expect("matching replacement");
+        assert_eq!(tail.poll().expect("matching reset"), Vec::new());
+        append(&transcript, codex_line("after rotation").as_bytes());
+        let events = tail.poll().expect("after matching rotation");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].prompt, "after rotation");
+
+        fs::remove_file(&rotated).expect("remove old rotation");
+        fs::rename(&transcript, &rotated).expect("rotate again");
+        fs::write(&transcript, codex_meta("other-id", "/repo")).expect("mismatch");
+        assert_eq!(tail.poll().expect("mismatch reset"), Vec::new());
+        append(&transcript, codex_line("must not emit").as_bytes());
+        assert_eq!(tail.poll().expect("disabled"), Vec::new());
+    }
+
+    #[test]
     fn claude_tail_emits_last_prompt_once_and_falls_back_to_top_level_user() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let transcript = tmp.path().join("claude.jsonl");
@@ -669,6 +778,92 @@ mod tests {
         let events = tail.poll().expect("fallback");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].prompt, "fallback only");
+    }
+
+    #[test]
+    fn claude_tail_waits_for_canonical_record_then_falls_back_after_deadline() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("claude.jsonl");
+        fs::write(&transcript, "").expect("baseline");
+        let delay = Duration::from_millis(750);
+        let mut tail = ProviderPromptTail::open_path(
+            ProviderKind::Claude,
+            "claude-id",
+            transcript.clone(),
+            delay,
+        )
+        .expect("tail");
+
+        append(
+            &transcript,
+            claude_user_with_uuid("claude-id", "turn-a", "typed A").as_bytes(),
+        );
+        assert_eq!(tail.poll().expect("before deadline"), Vec::new());
+        append(
+            &transcript,
+            claude_last_prompt("claude-id", "turn-a", "canonical A").as_bytes(),
+        );
+        let events = tail.poll().expect("canonical");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].prompt, "canonical A");
+
+        append(
+            &transcript,
+            claude_user_with_uuid("claude-id", "turn-b", "fallback B").as_bytes(),
+        );
+        assert_eq!(tail.poll().expect("fallback pending"), Vec::new());
+        tail.pending_claude
+            .front_mut()
+            .expect("fallback candidate")
+            .started_at = Instant::now() - delay;
+        let events = tail.poll().expect("fallback expired");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].prompt, "fallback B");
+    }
+
+    #[test]
+    fn claude_tail_does_not_cross_pair_delayed_last_prompt_records() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("claude.jsonl");
+        fs::write(&transcript, "").expect("baseline");
+        let delay = Duration::from_millis(750);
+        let mut tail = ProviderPromptTail::open_path(
+            ProviderKind::Claude,
+            "claude-id",
+            transcript.clone(),
+            delay,
+        )
+        .expect("tail");
+        append(
+            &transcript,
+            format!(
+                "{}{}{}",
+                claude_user_with_uuid("claude-id", "turn-a", "typed A"),
+                claude_user_with_uuid("claude-id", "turn-b", "typed B"),
+                claude_last_prompt("claude-id", "turn-a", "canonical A")
+            )
+            .as_bytes(),
+        );
+        let first = tail.poll().expect("canonical A");
+        assert_eq!(
+            first
+                .iter()
+                .map(|event| event.prompt.as_str())
+                .collect::<Vec<_>>(),
+            vec!["canonical A"]
+        );
+        tail.pending_claude
+            .front_mut()
+            .expect("fallback candidate")
+            .started_at = Instant::now() - delay;
+        let second = tail.poll().expect("fallback B");
+        assert_eq!(
+            second
+                .iter()
+                .map(|event| event.prompt.as_str())
+                .collect::<Vec<_>>(),
+            vec!["typed B"]
+        );
     }
 
     #[test]
@@ -708,6 +903,42 @@ mod tests {
                 Some(&claude_root),
             )
             .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_ignores_symlinks_and_non_regular_transcripts() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codex_root = tmp.path().join("codex");
+        let outside = tmp.path().join("outside.jsonl");
+        fs::create_dir_all(&codex_root).expect("root");
+        fs::write(&outside, codex_meta("codex-id", "/repo")).expect("outside transcript");
+        symlink(&outside, codex_root.join("linked.jsonl")).expect("symlink");
+        let _socket = UnixListener::bind(codex_root.join("socket.jsonl")).expect("unix socket");
+
+        let record = record("codex", "codex-id");
+        assert!(
+            resolve_provider_prompt_source_from_roots(&record, Some(&codex_root), None).is_none()
+        );
+    }
+
+    #[test]
+    fn resolver_fails_soft_when_shared_history_budget_is_exhausted() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codex_root = tmp.path().join("codex");
+        let transcript = codex_root.join("nested/session.jsonl");
+        fs::create_dir_all(transcript.parent().expect("parent")).expect("dirs");
+        fs::write(&transcript, codex_meta("codex-id", "/repo")).expect("transcript");
+        let _entries = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RESUME_SCAN_MAX_ENTRIES", "1");
+
+        let record = record("codex", "codex-id");
+        assert!(
+            resolve_provider_prompt_source_from_roots(&record, Some(&codex_root), None).is_none()
         );
     }
 
@@ -752,6 +983,32 @@ mod tests {
                 "sessionId":session_id,
                 "cwd":"/repo",
                 "message":{"role":"user","content":prompt}
+            })
+        )
+    }
+
+    fn claude_user_with_uuid(session_id: &str, uuid: &str, prompt: &str) -> String {
+        format!(
+            "{}\n",
+            json!({
+                "type":"user",
+                "uuid":uuid,
+                "sessionId":session_id,
+                "cwd":"/repo",
+                "timestamp":"2099-01-01T00:00:00Z",
+                "message":{"role":"user","content":prompt}
+            })
+        )
+    }
+
+    fn claude_last_prompt(session_id: &str, leaf_uuid: &str, prompt: &str) -> String {
+        format!(
+            "{}\n",
+            json!({
+                "type":"last-prompt",
+                "sessionId":session_id,
+                "leafUuid":leaf_uuid,
+                "lastPrompt":prompt
             })
         )
     }
