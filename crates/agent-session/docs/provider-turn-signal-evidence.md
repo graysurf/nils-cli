@@ -4,8 +4,8 @@
 
 This report freezes the provider lifecycle evidence used by
 `agent-session.turn-event.v1` and `agent-session.turn-state.v1`. It was audited
-on 2026-07-10 against Codex CLI 0.144.1, Claude Code 2.1.206, Hermes Agent
-0.18.0, and agent-session 1.21.6. The support floors are deliberately the
+on 2026-07-11 against Codex CLI 0.144.1, Claude Code 2.1.206, Hermes Agent
+0.18.0, and agent-session 1.21.7. The support floors are deliberately the
 oldest versions directly covered by this audit, not guesses about earlier
 releases.
 
@@ -24,8 +24,9 @@ normalized event is created.
   documents the older `agent-turn-complete`-only notify surface. It is not
   installed automatically because `notify` is a singular user-owned command.
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks) documents parallel
-  matching hooks, `UserPromptSubmit`, `PermissionRequest`, `PostToolUse`,
-  `Stop`, `StopFailure`, and `Notification` types including `idle_prompt`.
+  matching hooks, exact `AskUserQuestion` matching, shared `tool_use_id` on
+  `PreToolUse`/`PostToolUse`/`PostToolUseFailure`, `PermissionRequest` without
+  that id, and notifications including `idle_prompt`.
 - [Hermes hooks](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md)
   documents `pre_llm_call`, `post_llm_call`, `pre_approval_request`,
   `post_approval_response`, shell-hook consent, and synthetic hook tests. The
@@ -37,7 +38,7 @@ normalized event is created.
 | Provider | Audited floor | Classification | Start | Completion | Attention | Failure | Setup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Codex | 0.144.1 | partial | `UserPromptSubmit`, observed | raw `Stop` is journal evidence only; no Waiting transition | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive merge into `~/.codex/hooks.json`; Codex trust review remains mandatory |
-| Claude Code | 2.1.198 | partial | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | `PermissionRequest`/notification, observed conservative latch | `StopFailure`, observed | additive merge into `~/.claude/settings.json` |
+| Claude Code | 2.1.206 | partial | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | `StopFailure`, observed; `AskUserQuestion` tool failure clears only its clarification | additive merge into `~/.claude/settings.json` |
 | Hermes | 0.18.0 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | pre/post approval hooks exist, but clearing remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
 Versions below the audited floor remain usable. `activity doctor` reports them
@@ -66,10 +67,20 @@ Raw `Stop` is therefore treated exactly like Codex raw Stop. `idle_prompt` is a
 later provider notification explicitly meaning that Claude is done and waiting
 for another prompt, so it may yield observed Waiting.
 
+`PreToolUse`, `PostToolUse`, and `PostToolUseFailure` expose the same
+`tool_use_id` for `AskUserQuestion`. The adapter projects that raw id through a
+runtime-scoped SHA-256 namespace before persistence, records clarification
+attention at PreToolUse, and clears only the matching clarification after
+success or failure. The installed-version live probe retained only event names,
+tool name, id presence, and a one-way comparison digest; its Pre/Post digests
+matched.
+
 `PermissionRequest` explicitly omits `tool_use_id`, even though later tool events
-include one. Permission notifications also omit a stable request id. Attention
-is therefore an uncorrelated conservative latch cleared only by a proven
-completion, a new turn, or a runtime boundary.
+include one. A separate installed-version permission/progress probe reproduced
+that asymmetry. Permission notifications also omit a stable request id. Those
+signals remain uncorrelated conservative latches cleared only by a proven
+completion, a new turn, or a runtime boundary; later progress may prove work is
+continuing but never proves the request was answered.
 
 ### Hermes
 
@@ -86,7 +97,10 @@ The executable fixtures cover:
 
 - two concurrent attention requests, correlated one-by-one clearing, and a
   metadata-only `pending_count`;
-- unrelated progress while attention is pending;
+- exact AskUserQuestion request/success/failure correlation and independent
+  clearing alongside unrelated generic attention;
+- unrelated progress while attention is pending, including monotonic
+  `current_turn.last_progress_at` without phase relaxation;
 - Stop followed by continuation/new-turn evidence;
 - duplicate and out-of-order normalized events;
 - rejection of a delayed prior-runtime event before host timestamping;
@@ -116,6 +130,12 @@ idempotent merge into the provider's user config. Existing hook arrays and
 unrelated config keys are preserved; removal deletes only the exact
 agent-session-owned command entries. Setup refuses an observed concurrent
 source-file change instead of replacing the newer configuration.
+
+Claude setup adds exact `AskUserQuestion` matcher groups for `PreToolUse`,
+`PostToolUse`, and `PostToolUseFailure` while retaining the general PostToolUse
+progress hook. Claude Code deduplicates identical matching command handlers, so
+an AskUserQuestion completion is ingested once even though the exact and general
+PostToolUse groups both match.
 
 Provider hooks invoke the local binary without network access. They no-op when
 `AGENT_SESSION_ID` or `AGENT_SESSION_RUNTIME_ID` is absent, accept at most 64 KiB

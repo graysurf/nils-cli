@@ -69,6 +69,7 @@ Example:
   "current_turn": {
     "provider_turn_id": "turn-id",
     "started_at": "2026-07-10T12:31:08Z",
+    "last_progress_at": "2026-07-10T12:31:41Z",
     "attention": {
       "kind": "approval",
       "requested_at": "2026-07-10T12:31:28Z",
@@ -96,6 +97,14 @@ activity storage. At most 64 attention correlations are retained in the
 snapshot; additional requests contribute only to a bounded overflow summary
 and keep `needs_input` conservatively latched until a new turn or completion.
 
+`current_turn.last_progress_at` is optional additive v1 metadata. It advances
+monotonically only when accepted provider-hook evidence proves progress for the
+active runtime and open turn. It never uses terminal output, spinner text,
+focus, browser clocks, or provider-supplied timestamps. Exact
+`AskUserQuestion` completion/failure counts as progress while clearing only its
+own runtime-scoped clarification correlation. Old snapshots omit the field and
+remain valid.
+
 ## Deterministic transition rules
 
 | Input | Rule |
@@ -103,8 +112,8 @@ and keep `needs_input` conservatively latched until a new turn or completion.
 | new runtime | interrupt an open turn, preserve it as last turn, clear attention, enter authoritative `starting` |
 | `turn_started` | interrupt an older open turn, clear old attention, enter `working` |
 | `attention_requested` | keep current start time, add one opaque pending request, enter `needs_input` |
-| correlated `attention_cleared` | remove only that request; remain `needs_input` while any remain |
-| uncorrelated `progress` | may establish/retain `working`, but never clears attention |
+| correlated `attention_cleared` | remove only that request, advance monotonic `last_progress_at`, and remain `needs_input` while any remain |
+| uncorrelated `progress` | advance monotonic `last_progress_at`; may establish/retain `working`, but never clears attention |
 | `stop_observed` | increment evidence revision and journal it; never changes to Waiting |
 | matching `turn_completed` | close current turn, clear attention, enter `waiting` |
 | matching `turn_failed` | close current turn with failed outcome, clear attention, enter `waiting` |
@@ -116,6 +125,24 @@ and keep `needs_input` conservatively latched until a new turn or completion.
 Revision is monotonic for each accepted non-duplicate event and runtime
 boundary. Phase timestamps change only when the phase changes. Durations are
 derived by clients and are never persisted separately.
+
+## Client presentation projection
+
+Durable phase remains conservative for old-client safety. A new client may
+derive simultaneous work plus attention from the additive timestamps without
+rewriting server state:
+
+| Durable evidence | Presentation |
+| --- | --- |
+| open turn, no pending attention | Working from `started_at` |
+| attention pending, no later provider progress | Needs input from `requested_at` |
+| attention pending and `last_progress_at > requested_at` | Working plus input requested, keeping both timers |
+| exact clarification clear removes the final request | Working from the original `started_at` |
+| proven completion or failure | Waiting from `completed_at` |
+
+Unavailable, stopped, resumable, and connecting health/runtime states remain
+higher priority than this activity projection. Progress never implies that an
+uncorrelated permission or notification request was answered.
 
 ## Persistence and concurrency
 
