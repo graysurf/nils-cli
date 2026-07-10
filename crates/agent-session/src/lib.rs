@@ -2359,8 +2359,7 @@ fn resume_session_by_id(
         &resume_args,
     ) {
         let record_restore = write_session_record(context, &previous_record);
-        let activity_restore =
-            activity::restore_snapshot(context, &record.id, previous_activity.as_deref());
+        let activity_restore = activity::restore_snapshot(context, &record.id, &previous_activity);
         if record_restore.is_err() || activity_restore.is_err() {
             return Err(CliError::runtime(
                 "resume-launch-rollback-failed",

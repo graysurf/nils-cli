@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use jiff::Zoned;
 use nils_common::fs::{SECRET_FILE_MODE, display_path, home_dir, write_atomic};
@@ -19,12 +22,15 @@ pub(crate) const TURN_STATE_VERSION: &str = "agent-session.turn-state.v1";
 const ACTIVITY_DOCUMENT_VERSION: &str = "agent-session.activity.v1";
 const ACTIVITY_FILE: &str = "activity.json";
 const ACTIVITY_JOURNAL_FILE: &str = "activity.journal.jsonl";
+const ACTIVITY_REPLAY_FILE: &str = "activity.replay.bin";
 const ACTIVITY_DIAGNOSTIC_FILE: &str = "activity.diagnostic.json";
 const ACTIVITY_LOCK_FILE: &str = ".activity.lock";
 const MAX_EVENT_BYTES: u64 = 64 * 1024;
 const MAX_JOURNAL_EVENTS: usize = 256;
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
 const MAX_DEDUPE_EVENTS: usize = 4096;
+const REPLAY_SLOT_COUNT: usize = MAX_DEDUPE_EVENTS * 2;
+const REPLAY_SLOT_BYTES: usize = 32;
 const MAX_PENDING_ATTENTION: usize = 64;
 const MAX_ID_CHARS: usize = 256;
 
@@ -63,6 +69,8 @@ pub(crate) struct TurnSource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) provider: Option<String>,
     pub(crate) confidence: Confidence,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -70,6 +78,8 @@ pub(crate) struct AttentionView {
     pub(crate) kind: String,
     pub(crate) requested_at: String,
     pub(crate) pending_count: usize,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -79,6 +89,8 @@ pub(crate) struct CurrentTurn {
     pub(crate) started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) attention: Option<AttentionView>,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -89,6 +101,8 @@ pub(crate) struct LastTurn {
     pub(crate) started_at: Option<String>,
     pub(crate) completed_at: String,
     pub(crate) outcome: String,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -102,6 +116,8 @@ pub(crate) struct TurnState {
     pub(crate) current_turn: Option<CurrentTurn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_turn: Option<LastTurn>,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -109,6 +125,8 @@ struct PendingAttention {
     id: String,
     kind: String,
     requested_at: String,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -116,25 +134,31 @@ struct OverflowAttention {
     kind: String,
     requested_at: String,
     count: usize,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ActivityDocument {
     schema_version: String,
     runtime_id: String,
+    #[serde(default)]
+    runtime_generation: u64,
     state: TurnState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_attention: Vec<PendingAttention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     overflow_attention: Option<OverflowAttention>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    seen_event_ids: Vec<String>,
+    #[serde(default)]
+    seen_event_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_event_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_journal: Option<JournalEntry>,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -192,6 +216,8 @@ pub(crate) struct ProviderDoctor {
     pub(crate) provider: String,
     pub(crate) classification: String,
     pub(crate) version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) version_error: Option<String>,
     pub(crate) configured: bool,
     pub(crate) config_path: String,
     pub(crate) completion: String,
@@ -229,6 +255,17 @@ struct ActivityDiagnostic {
     provider: String,
     code: String,
     observed_at: String,
+}
+
+#[derive(Clone, Debug)]
+struct VersionProbe {
+    version: Option<String>,
+    error: Option<String>,
+}
+
+pub(crate) struct ActivitySnapshot {
+    document: Option<Vec<u8>>,
+    replay: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -283,6 +320,7 @@ fn runtime_source() -> TurnSource {
         kind: SourceKind::Runtime,
         provider: None,
         confidence: Confidence::Authoritative,
+        extra: Map::new(),
     }
 }
 
@@ -291,6 +329,7 @@ fn provider_source(event: &TurnEvent) -> TurnSource {
         kind: event.source_kind.clone(),
         provider: Some(event.provider.clone()),
         confidence: event.confidence.clone(),
+        extra: Map::new(),
     }
 }
 
@@ -322,13 +361,17 @@ fn projected_provider_identifier(
     Ok(format!("local:v1:{}", hex_digest(digest.finalize())))
 }
 
-fn event_dedupe_key(runtime_id: &str, event_id: &str) -> String {
+fn event_dedupe_key(runtime_id: &str, event_id: &str) -> [u8; REPLAY_SLOT_BYTES] {
     let mut digest = Sha256::new();
     digest.update(b"agent-session.event-id.v1\0");
     digest.update(runtime_id.as_bytes());
     digest.update(b"\0");
     digest.update(event_id.as_bytes());
-    format!("sha256:{}", hex_digest(digest.finalize()))
+    let mut key: [u8; REPLAY_SLOT_BYTES] = digest.finalize().into();
+    if key.iter().all(|byte| *byte == 0) {
+        key[REPLAY_SLOT_BYTES - 1] = 1;
+    }
+    key
 }
 
 fn normalize_provider_identifier(
@@ -368,6 +411,7 @@ fn starting_state(at: String, revision: u64, last_turn: Option<LastTurn>) -> Tur
         source: runtime_source(),
         current_turn: None,
         last_turn,
+        extra: Map::new(),
     }
 }
 
@@ -375,32 +419,49 @@ pub(crate) fn activate_runtime(
     context: &CliContext,
     record: &SessionRecord,
 ) -> Result<TurnState, CliError> {
-    let runtime_id = record
-        .runtime
-        .as_ref()
-        .map(|runtime| runtime.launch_id.as_str())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            CliError::data(
-                "runtime-id-missing",
-                "session runtime is missing its launch id",
-                Some(json!({ "id": record.id })),
-            )
-        })?;
+    let runtime = record.runtime.as_ref().ok_or_else(|| {
+        CliError::data(
+            "runtime-id-missing",
+            "session runtime is missing its launch id",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    let runtime_id = runtime.launch_id.as_str();
+    if runtime_id.is_empty() {
+        return Err(CliError::data(
+            "runtime-id-missing",
+            "session runtime is missing its launch id",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    let runtime_generation = runtime.generation;
     let dir = session_dir(context, &record.id);
     let _lock = acquire_lock(&dir)?;
     let path = dir.join(ACTIVITY_FILE);
-    let existing = read_document(&path).ok();
+    let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
+    let replay_path = dir.join(ACTIVITY_REPLAY_FILE);
+    let mut existing = if path.is_file() {
+        match read_document(&path) {
+            Ok(mut document) => {
+                repair_pending_transaction(&path, &journal_path, &replay_path, &mut document)?;
+                Some(document)
+            }
+            Err(err) => {
+                quarantine_activity_snapshot(&path, err.code())?;
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Some(existing) = existing.as_ref()
         && existing.runtime_id == runtime_id
+        && existing.runtime_generation == runtime_generation
     {
         return Ok(existing.state.clone());
     }
-    let at = record
-        .runtime
-        .as_ref()
-        .map(|runtime| runtime.started_at.clone())
-        .unwrap_or_else(now);
+    reset_replay_index(&replay_path)?;
+    let at = runtime.started_at.clone();
     let mut last_turn = existing
         .as_ref()
         .and_then(|document| document.state.last_turn.clone());
@@ -413,19 +474,26 @@ pub(crate) fn activate_runtime(
             started_at: Some(current.started_at.clone()),
             completed_at: at.clone(),
             outcome: "interrupted".to_string(),
+            extra: current.extra.clone(),
         });
     }
     let revision = existing
         .as_ref()
         .map(|document| document.state.revision.saturating_add(1))
         .unwrap_or(1);
+    let mut state = starting_state(at, revision, last_turn);
+    if let Some(document) = existing.as_ref() {
+        state.extra = document.state.extra.clone();
+        state.source.extra = document.state.source.extra.clone();
+    }
     let document = ActivityDocument {
         schema_version: ACTIVITY_DOCUMENT_VERSION.to_string(),
         runtime_id: runtime_id.to_string(),
-        state: starting_state(at, revision, last_turn),
+        runtime_generation,
+        state,
         pending_attention: Vec::new(),
         overflow_attention: None,
-        seen_event_ids: Vec::new(),
+        seen_event_count: 0,
         provider_session_id: record
             .provider_resume
             .as_ref()
@@ -441,9 +509,61 @@ pub(crate) fn activate_runtime(
             .transpose()?,
         last_event_at: None,
         pending_journal: None,
+        extra: existing
+            .take()
+            .map_or_else(Map::new, |document| document.extra),
     };
     write_document(&path, &document)?;
     Ok(document.state)
+}
+
+fn quarantine_activity_snapshot(path: &Path, code: &str) -> Result<(), CliError> {
+    let parent = path.parent().ok_or_else(|| {
+        CliError::runtime(
+            "activity-quarantine-failed",
+            "activity snapshot has no parent directory",
+            Some(json!({ "path": display_path(path) })),
+        )
+    })?;
+    let destination = parent.join(format!(
+        "activity.quarantine.{}.{}.json",
+        code,
+        uuid::Uuid::new_v4()
+    ));
+    fs::rename(path, &destination).map_err(|err| {
+        CliError::runtime(
+            "activity-quarantine-failed",
+            format!("failed to quarantine {}: {err}", path.display()),
+            Some(json!({
+                "path": display_path(path),
+                "quarantine_path": display_path(&destination)
+            })),
+        )
+    })?;
+    fs::set_permissions(&destination, fs::Permissions::from_mode(SECRET_FILE_MODE)).map_err(|err| {
+        activity_io_error("activity-quarantine-permission-failed", &destination, err)
+    })
+}
+
+fn unknown_state(record: &SessionRecord) -> TurnState {
+    TurnState {
+        schema_version: TURN_STATE_VERSION.to_string(),
+        phase: TurnPhase::Unknown,
+        phase_changed_at: record.updated_at.clone(),
+        revision: 0,
+        source: runtime_source(),
+        current_turn: None,
+        last_turn: None,
+        extra: Map::new(),
+    }
+}
+
+fn activity_matches_runtime(document: &ActivityDocument, record: &SessionRecord) -> bool {
+    record.runtime.as_ref().is_some_and(|runtime| {
+        !runtime.launch_id.is_empty()
+            && document.runtime_id == runtime.launch_id
+            && document.runtime_generation == runtime.generation
+    })
 }
 
 pub(crate) fn state_for_view(context: &CliContext, record: &SessionRecord) -> Option<TurnState> {
@@ -452,39 +572,43 @@ pub(crate) fn state_for_view(context: &CliContext, record: &SessionRecord) -> Op
         return None;
     }
     match read_document(&path) {
-        Ok(document) => Some(document.state),
-        Err(_) => Some(TurnState {
-            schema_version: TURN_STATE_VERSION.to_string(),
-            phase: TurnPhase::Unknown,
-            phase_changed_at: record.updated_at.clone(),
-            revision: 0,
-            source: runtime_source(),
-            current_turn: None,
-            last_turn: None,
-        }),
+        Ok(document) if activity_matches_runtime(&document, record) => Some(document.state),
+        Ok(_) | Err(_) => Some(unknown_state(record)),
     }
 }
 
 pub(crate) fn capture_snapshot(
     context: &CliContext,
     id: &str,
-) -> Result<Option<Vec<u8>>, CliError> {
-    let path = session_dir(context, id).join(ACTIVITY_FILE);
-    match fs::read(&path) {
+) -> Result<ActivitySnapshot, CliError> {
+    let dir = session_dir(context, id);
+    let _lock = acquire_lock(&dir)?;
+    Ok(ActivitySnapshot {
+        document: read_optional_activity_file(&dir.join(ACTIVITY_FILE))?,
+        replay: read_optional_activity_file(&dir.join(ACTIVITY_REPLAY_FILE))?,
+    })
+}
+
+fn read_optional_activity_file(path: &Path) -> Result<Option<Vec<u8>>, CliError> {
+    match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(activity_io_error("activity-read-failed", &path, err)),
+        Err(err) => Err(activity_io_error("activity-read-failed", path, err)),
     }
 }
 
 pub(crate) fn restore_snapshot(
     context: &CliContext,
     id: &str,
-    snapshot: Option<&[u8]>,
+    snapshot: &ActivitySnapshot,
 ) -> Result<(), CliError> {
     let dir = session_dir(context, id);
     let _lock = acquire_lock(&dir)?;
-    let path = dir.join(ACTIVITY_FILE);
+    restore_activity_file(&dir.join(ACTIVITY_FILE), snapshot.document.as_deref())?;
+    restore_activity_file(&dir.join(ACTIVITY_REPLAY_FILE), snapshot.replay.as_deref())
+}
+
+fn restore_activity_file(path: &Path, snapshot: Option<&[u8]>) -> Result<(), CliError> {
     if let Some(bytes) = snapshot {
         write_atomic(&path, bytes, SECRET_FILE_MODE).map_err(|err| {
             CliError::runtime(
@@ -494,10 +618,10 @@ pub(crate) fn restore_snapshot(
             )
         })
     } else {
-        match fs::remove_file(&path) {
+        match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(activity_io_error("activity-remove-failed", &path, err)),
+            Err(err) => Err(activity_io_error("activity-remove-failed", path, err)),
         }
     }
 }
@@ -544,11 +668,11 @@ pub(crate) fn ingest_event(
             Some(json!({ "id": record.id, "provider": event.provider })),
         ));
     }
-    let active_runtime_id = record
-        .runtime
-        .as_ref()
+    let active_runtime = record.runtime.as_ref();
+    let active_runtime_id = active_runtime
         .map(|runtime| runtime.launch_id.as_str())
         .unwrap_or_default();
+    let active_runtime_generation = active_runtime.map_or(0, |runtime| runtime.generation);
     if active_runtime_id.is_empty() || event.runtime_id != active_runtime_id {
         return Err(CliError::data(
             "runtime-id-mismatch",
@@ -597,15 +721,19 @@ pub(crate) fn ingest_event(
     let dir = session_dir(context, &record.id);
     let _lock = acquire_lock(&dir)?;
     let path = dir.join(ACTIVITY_FILE);
+    let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
+    let replay_path = dir.join(ACTIVITY_REPLAY_FILE);
     let mut document = read_document(&path)?;
-    if document.runtime_id != event.runtime_id {
+    if document.runtime_id != event.runtime_id
+        || document.runtime_generation != active_runtime_generation
+    {
         return Err(CliError::data(
             "runtime-id-mismatch",
             "activity snapshot does not match the active runtime generation",
             Some(json!({ "id": record.id })),
         ));
     }
-    repair_pending_journal(&path, &dir.join(ACTIVITY_JOURNAL_FILE), &mut document)?;
+    repair_pending_transaction(&path, &journal_path, &replay_path, &mut document)?;
     if let (Some(bound), Some(observed)) = (
         document.provider_session_id.as_ref(),
         event.provider_session_id.as_ref(),
@@ -625,14 +753,14 @@ pub(crate) fn ingest_event(
         ));
     }
     let dedupe_key = event_dedupe_key(&event.runtime_id, &event.event_id);
-    if document.seen_event_ids.iter().any(|id| id == &dedupe_key) {
+    if replay_contains(&replay_path, &dedupe_key)? {
         return Ok(ActivityResult {
             id: record.id,
             turn_state: document.state,
             duplicate: true,
         });
     }
-    if document.seen_event_ids.len() >= MAX_DEDUPE_EVENTS {
+    if document.seen_event_count >= MAX_DEDUPE_EVENTS {
         return Err(CliError::data(
             "activity-dedupe-capacity-reached",
             "activity event replay horizon is full for this runtime; resume the session to start a new runtime generation",
@@ -646,14 +774,15 @@ pub(crate) fn ingest_event(
     if document.provider_session_id.is_none() {
         document.provider_session_id = event.provider_session_id.clone();
     }
-    document.seen_event_ids.push(dedupe_key);
+    document.seen_event_count = document.seen_event_count.saturating_add(1);
     let journal_entry = JournalEntry {
         received_at: received_at.clone(),
         event,
     };
     document.pending_journal = Some(journal_entry.clone());
     write_document(&path, &document)?;
-    append_journal_entry(&dir.join(ACTIVITY_JOURNAL_FILE), journal_entry)?;
+    replay_insert(&replay_path, &dedupe_key)?;
+    append_journal_entry(&journal_path, journal_entry)?;
     document.pending_journal = None;
     write_document(&path, &document)?;
     Ok(ActivityResult {
@@ -673,6 +802,7 @@ pub(crate) fn activity_status(context: &CliContext, id: &str) -> Result<Activity
         source: runtime_source(),
         current_turn: None,
         last_turn: None,
+        extra: Map::new(),
     });
     Ok(ActivityResult {
         id: record.id,
@@ -908,12 +1038,42 @@ pub(crate) fn doctor(
     let agents = agent
         .map(|agent| vec![agent])
         .unwrap_or_else(|| vec![AgentKind::Codex, AgentKind::Claude, AgentKind::Hermes]);
+    let activity_by_provider = latest_provider_activity(context);
+    let version_probes = thread::scope(|scope| {
+        let handles = agents
+            .iter()
+            .copied()
+            .map(|agent| (agent, scope.spawn(move || provider_version(agent))))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(agent, handle)| {
+                (
+                    agent.as_str().to_string(),
+                    handle.join().unwrap_or_else(|_| VersionProbe {
+                        version: None,
+                        error: Some("probe-panicked".to_string()),
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    });
     let mut providers = Vec::new();
     for agent in agents {
         let path = provider_config_path(agent)?;
         let configured = provider_configured(agent, &path).unwrap_or(false);
-        let (last_event_at, last_error) = latest_provider_activity(context, agent);
-        let version = provider_version(agent);
+        let (last_event_at, last_error) = activity_by_provider
+            .get(agent.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let version_probe = version_probes
+            .get(agent.as_str())
+            .cloned()
+            .unwrap_or(VersionProbe {
+                version: None,
+                error: Some("probe-unavailable".to_string()),
+            });
+        let version = version_probe.version;
         let (supported_classification, completion, attention_correlation, trust, base_guidance) =
             match agent {
                 AgentKind::Codex => (
@@ -961,6 +1121,7 @@ pub(crate) fn doctor(
             provider: agent.as_str().to_string(),
             classification: classification.to_string(),
             version,
+            version_error: version_probe.error,
             configured,
             config_path: display_path(&path),
             completion: completion.to_string(),
@@ -980,14 +1141,12 @@ pub(crate) fn doctor(
 
 fn latest_provider_activity(
     context: &CliContext,
-    agent: AgentKind,
-) -> (Option<String>, Option<String>) {
+) -> BTreeMap<String, (Option<String>, Option<String>)> {
     let root = context.state_dir.join("sessions");
     let Ok(entries) = fs::read_dir(root) else {
-        return (None, None);
+        return BTreeMap::new();
     };
-    let mut latest = None;
-    let mut error = None;
+    let mut activity = BTreeMap::<String, (Option<String>, Option<String>)>::new();
     for entry in entries.flatten() {
         let record_path = entry.path().join("session.json");
         let Ok(record_bytes) = fs::read(&record_path) else {
@@ -996,19 +1155,20 @@ fn latest_provider_activity(
         let Ok(record) = serde_json::from_slice::<SessionRecord>(&record_bytes) else {
             continue;
         };
-        if record.agent != agent.as_str() {
+        if !matches!(record.agent.as_str(), "codex" | "claude" | "hermes") {
             continue;
         }
+        let (latest, error) = activity.entry(record.agent.clone()).or_default();
         let diagnostic_path = entry.path().join(ACTIVITY_DIAGNOSTIC_FILE);
         if let Ok(bytes) = fs::read(&diagnostic_path) {
             match serde_json::from_slice::<ActivityDiagnostic>(&bytes) {
                 Ok(diagnostic)
                     if diagnostic.schema_version == "agent-session.activity-diagnostic.v1"
-                        && diagnostic.provider == agent.as_str() =>
+                        && diagnostic.provider == record.agent =>
                 {
-                    error = Some(diagnostic.code);
+                    *error = Some(diagnostic.code);
                 }
-                _ => error = Some("activity diagnostic unreadable".to_string()),
+                _ => *error = Some("activity diagnostic unreadable".to_string()),
             }
         }
         let activity_path = entry.path().join(ACTIVITY_FILE);
@@ -1020,13 +1180,13 @@ fn latest_provider_activity(
                 if let Some(observed) = document.last_event_at
                     && latest.as_ref().is_none_or(|current| &observed > current)
                 {
-                    latest = Some(observed);
+                    *latest = Some(observed);
                 }
             }
-            Err(_) => error = Some("activity snapshot unreadable".to_string()),
+            Err(_) => *error = Some("activity snapshot unreadable".to_string()),
         }
     }
-    (latest, error)
+    activity
 }
 
 pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult, CliError> {
@@ -1069,25 +1229,83 @@ pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult
     })
 }
 
-fn provider_version(agent: AgentKind) -> Option<String> {
-    let mut command = ProcessCommand::new(match agent {
-        AgentKind::Codex => "codex",
-        AgentKind::Claude => "claude",
-        AgentKind::Hermes => "hermes",
-    });
-    command.arg("--version");
-    let output = command.output().ok()?;
+fn provider_version(agent: AgentKind) -> VersionProbe {
+    probe_version_command(
+        match agent {
+            AgentKind::Codex => "codex",
+            AgentKind::Claude => "claude",
+            AgentKind::Hermes => "hermes",
+        },
+        Duration::from_secs(2),
+    )
+}
+
+fn probe_version_command(binary: &str, timeout: Duration) -> VersionProbe {
+    let mut command = ProcessCommand::new(binary);
+    command
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return VersionProbe {
+                version: None,
+                error: Some("unavailable".to_string()),
+            };
+        }
+    };
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return VersionProbe {
+                    version: None,
+                    error: Some("timeout".to_string()),
+                };
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return VersionProbe {
+                    version: None,
+                    error: Some("probe-failed".to_string()),
+                };
+            }
+        }
+    };
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(_) => {
+            return VersionProbe {
+                version: None,
+                error: Some("probe-output-failed".to_string()),
+            };
+        }
+    };
     if !output.status.success() {
-        return None;
+        return VersionProbe {
+            version: None,
+            error: Some(format!("exit-{}", status.code().unwrap_or(-1))),
+        };
     }
     let text = if output.stdout.is_empty() {
         String::from_utf8_lossy(&output.stderr)
     } else {
         String::from_utf8_lossy(&output.stdout)
     };
-    text.lines()
+    let version = text
+        .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().chars().take(160).collect())
+        .map(|line| line.trim().chars().take(160).collect());
+    VersionProbe {
+        error: version.is_none().then(|| "empty-output".to_string()),
+        version,
+    }
 }
 
 fn audited_floor(agent: AgentKind) -> (u64, u64, u64) {
@@ -1565,7 +1783,7 @@ fn write_provider_config_if_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CliContext, ProviderResume, RecordRequest, create_record};
+    use crate::{CliContext, ProviderResume, RecordRequest, create_record, write_session_record};
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
 
@@ -1590,13 +1808,15 @@ mod tests {
         ActivityDocument {
             schema_version: ACTIVITY_DOCUMENT_VERSION.to_string(),
             runtime_id: "runtime-1".to_string(),
+            runtime_generation: 1,
             state: starting_state("2026-07-10T00:00:00Z".to_string(), 1, None),
             pending_attention: Vec::new(),
             overflow_attention: None,
-            seen_event_ids: Vec::new(),
+            seen_event_count: 0,
             provider_session_id: None,
             last_event_at: None,
             pending_journal: None,
+            extra: Map::new(),
         }
     }
 
@@ -1972,6 +2192,160 @@ mod tests {
     }
 
     #[test]
+    fn runtime_generation_mismatch_never_exposes_or_accepts_stale_activity() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session(&tmp);
+        let mut progress = event(TurnEventKind::Progress, "generation-one-event");
+        progress.runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        ingest_event(&context, &created.record.id, progress.clone()).expect("generation one event");
+
+        let mut downgraded_resume = created.record.clone();
+        downgraded_resume
+            .runtime
+            .as_mut()
+            .expect("runtime")
+            .generation += 1;
+        write_session_record(&context, &downgraded_resume).expect("downgraded resume record");
+        let status = activity_status(&context, &created.record.id).expect("safe status");
+        assert_eq!(status.turn_state.phase, TurnPhase::Unknown);
+        progress.event_id = "generation-two-event".to_string();
+        assert_eq!(
+            ingest_event(&context, &created.record.id, progress)
+                .expect_err("stale activity generation")
+                .code(),
+            "runtime-id-mismatch"
+        );
+    }
+
+    #[test]
+    fn runtime_activation_repairs_pending_journal_before_transition() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session(&tmp);
+        let dir = session_dir(&context, &created.record.id);
+        let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
+        fs::create_dir(&journal_path).expect("block journal target");
+        let mut progress = event(TurnEventKind::Progress, "pre-resume-pending");
+        progress.runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        assert!(ingest_event(&context, &created.record.id, progress).is_err());
+        fs::remove_dir(&journal_path).expect("restore journal target");
+
+        let mut resumed = created.record.clone();
+        let runtime = resumed.runtime.as_mut().expect("runtime");
+        runtime.generation += 1;
+        runtime.launch_id = "runtime-2".to_string();
+        runtime.started_at = "2026-07-10T00:02:00Z".to_string();
+        write_session_record(&context, &resumed).expect("resumed record");
+        activate_runtime(&context, &resumed).expect("activate next generation");
+
+        let journal = fs::read_to_string(journal_path).expect("repaired journal");
+        assert_eq!(journal.matches("pre-resume-pending").count(), 1);
+        let document = read_document(&dir.join(ACTIVITY_FILE)).expect("new activity");
+        assert_eq!(document.runtime_generation, 2);
+        assert!(document.pending_journal.is_none());
+    }
+
+    #[test]
+    fn runtime_activation_preserves_additive_fields_and_quarantines_future_schema() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session(&tmp);
+        let dir = session_dir(&context, &created.record.id);
+        let path = dir.join(ACTIVITY_FILE);
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(&path).expect("activity")).expect("activity json");
+        value["future_top"] = json!({ "enabled": true });
+        value["state"]["future_state"] = json!("preserve-me");
+        value["state"]["source"]["future_source"] = json!("preserve-source");
+        value["state"]["current_turn"] = json!({
+            "provider_turn_id": null,
+            "started_at": "2026-07-10T00:01:00Z",
+            "future_turn": "preserve-turn"
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("activity bytes"),
+        )
+        .expect("extended activity");
+
+        let mut next = created.record.clone();
+        let runtime = next.runtime.as_mut().expect("runtime");
+        runtime.generation += 1;
+        runtime.launch_id = "runtime-2".to_string();
+        runtime.started_at = "2026-07-10T00:02:00Z".to_string();
+        write_session_record(&context, &next).expect("next record");
+        activate_runtime(&context, &next).expect("activate with additive fields");
+        let preserved: Value =
+            serde_json::from_slice(&fs::read(&path).expect("preserved activity"))
+                .expect("preserved json");
+        assert_eq!(preserved["future_top"]["enabled"], true);
+        assert_eq!(preserved["state"]["future_state"], "preserve-me");
+        assert_eq!(
+            preserved["state"]["source"]["future_source"],
+            "preserve-source"
+        );
+        assert_eq!(
+            preserved["state"]["last_turn"]["future_turn"],
+            "preserve-turn"
+        );
+
+        let mut future = preserved;
+        future["schema_version"] = json!("agent-session.activity.v99");
+        let future_bytes = serde_json::to_vec_pretty(&future).expect("future bytes");
+        fs::write(&path, &future_bytes).expect("future activity");
+        let runtime = next.runtime.as_mut().expect("runtime");
+        runtime.generation += 1;
+        runtime.launch_id = "runtime-3".to_string();
+        runtime.started_at = "2026-07-10T00:03:00Z".to_string();
+        write_session_record(&context, &next).expect("third record");
+        activate_runtime(&context, &next).expect("quarantine future activity");
+
+        let quarantine = fs::read_dir(&dir)
+            .expect("session files")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("activity.quarantine.activity-version-unsupported")
+                    })
+            })
+            .expect("future activity quarantine");
+        assert_eq!(
+            fs::read(quarantine).expect("quarantine bytes"),
+            future_bytes
+        );
+        let current = read_document(&path).expect("current activity");
+        assert_eq!(current.runtime_generation, 3);
+    }
+
+    #[test]
+    fn provider_version_probe_times_out_without_blocking_diagnostics() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let binary = tmp.path().join("slow-provider");
+        fs::write(&binary, "#!/usr/bin/env sh\nsleep 5\n").expect("slow provider");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("provider mode");
+        let started = Instant::now();
+        let probe = probe_version_command(
+            binary.to_str().expect("provider path"),
+            Duration::from_millis(50),
+        );
+        assert_eq!(probe.error.as_deref(), Some("timeout"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn journal_is_bounded_and_metadata_only() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().join(ACTIVITY_JOURNAL_FILE);
@@ -2129,7 +2503,8 @@ fn validate_event(event: &TurnEvent) -> Result<(), CliError> {
 
 fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
     let previous_phase = document.state.phase.clone();
-    let source = provider_source(event);
+    let mut source = provider_source(event);
+    source.extra = document.state.source.extra.clone();
     match event.kind {
         TurnEventKind::TurnStarted => {
             if let Some(current) = document.state.current_turn.take() {
@@ -2138,6 +2513,7 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                     started_at: Some(current.started_at),
                     completed_at: at.to_string(),
                     outcome: "interrupted".to_string(),
+                    extra: current.extra,
                 });
             }
             document.pending_attention.clear();
@@ -2146,6 +2522,7 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                 provider_turn_id: event.provider_turn_id.clone(),
                 started_at: at.to_string(),
                 attention: None,
+                extra: Map::new(),
             });
             document.state.phase = TurnPhase::Working;
         }
@@ -2155,6 +2532,7 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                     provider_turn_id: event.provider_turn_id.clone(),
                     started_at: at.to_string(),
                     attention: None,
+                    extra: Map::new(),
                 });
             }
             let attention_id = event.attention_id.as_deref().unwrap_or_default();
@@ -2172,6 +2550,7 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                         id: attention_id.to_string(),
                         kind,
                         requested_at: at.to_string(),
+                        extra: Map::new(),
                     });
                 } else if let Some(overflow) = document.overflow_attention.as_mut() {
                     overflow.count = overflow.count.saturating_add(1);
@@ -2180,6 +2559,7 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                         kind,
                         requested_at: at.to_string(),
                         count: 1,
+                        extra: Map::new(),
                     });
                 }
             }
@@ -2205,6 +2585,7 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                     provider_turn_id: event.provider_turn_id.clone(),
                     started_at: at.to_string(),
                     attention: None,
+                    extra: Map::new(),
                 });
             }
             if document.pending_attention.is_empty() && document.overflow_attention.is_none() {
@@ -2234,6 +2615,17 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
             };
             if matches_current {
                 let current = document.state.current_turn.take();
+                let extra = current
+                    .as_ref()
+                    .map(|turn| turn.extra.clone())
+                    .or_else(|| {
+                        document
+                            .state
+                            .last_turn
+                            .as_ref()
+                            .map(|turn| turn.extra.clone())
+                    })
+                    .unwrap_or_default();
                 document.state.last_turn = Some(LastTurn {
                     provider_turn_id: event.provider_turn_id.clone().or_else(|| {
                         current
@@ -2247,6 +2639,7 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                     } else {
                         "completed".to_string()
                     },
+                    extra,
                 });
                 document.pending_attention.clear();
                 document.overflow_attention = None;
@@ -2262,6 +2655,13 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
 }
 
 fn refresh_attention(document: &mut ActivityDocument) {
+    let prior_extra = document
+        .state
+        .current_turn
+        .as_ref()
+        .and_then(|current| current.attention.as_ref())
+        .map(|attention| attention.extra.clone())
+        .unwrap_or_default();
     let attention = document
         .pending_attention
         .first()
@@ -2274,6 +2674,11 @@ fn refresh_attention(document: &mut ActivityDocument) {
                     .as_ref()
                     .map_or(0, |overflow| overflow.count),
             ),
+            extra: if pending.extra.is_empty() {
+                prior_extra.clone()
+            } else {
+                pending.extra.clone()
+            },
         })
         .or_else(|| {
             document
@@ -2283,6 +2688,11 @@ fn refresh_attention(document: &mut ActivityDocument) {
                     kind: overflow.kind.clone(),
                     requested_at: overflow.requested_at.clone(),
                     pending_count: overflow.count,
+                    extra: if overflow.extra.is_empty() {
+                        prior_extra.clone()
+                    } else {
+                        overflow.extra.clone()
+                    },
                 })
         });
     if let Some(current) = document.state.current_turn.as_mut() {
@@ -2392,15 +2802,106 @@ fn append_journal_entry(path: &Path, entry: JournalEntry) -> Result<(), CliError
     }
 }
 
-fn repair_pending_journal(
+fn repair_pending_transaction(
     document_path: &Path,
     journal_path: &Path,
+    replay_path: &Path,
     document: &mut ActivityDocument,
 ) -> Result<(), CliError> {
     let Some(entry) = document.pending_journal.clone() else {
         return Ok(());
     };
+    let key = event_dedupe_key(&entry.event.runtime_id, &entry.event.event_id);
+    replay_insert(replay_path, &key)?;
     append_journal_entry(journal_path, entry)?;
     document.pending_journal = None;
     write_document(document_path, document)
+}
+
+fn reset_replay_index(path: &Path) -> Result<(), CliError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(activity_io_error("activity-replay-reset-failed", path, err)),
+    }
+}
+
+fn open_replay_index(path: &Path) -> Result<fs::File, CliError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(SECRET_FILE_MODE)
+        .open(path)
+        .map_err(|err| activity_io_error("activity-replay-open-failed", path, err))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(SECRET_FILE_MODE))
+        .map_err(|err| activity_io_error("activity-replay-permission-failed", path, err))?;
+    let expected_len = (REPLAY_SLOT_COUNT * REPLAY_SLOT_BYTES) as u64;
+    let actual_len = file
+        .metadata()
+        .map_err(|err| activity_io_error("activity-replay-metadata-failed", path, err))?
+        .len();
+    if actual_len == 0 {
+        file.set_len(expected_len)
+            .map_err(|err| activity_io_error("activity-replay-size-failed", path, err))?;
+    } else if actual_len != expected_len {
+        return Err(CliError::data(
+            "activity-replay-size-invalid",
+            "activity replay index has an unexpected size",
+            Some(json!({ "path": display_path(path), "expected_bytes": expected_len })),
+        ));
+    }
+    Ok(file)
+}
+
+fn replay_slot(key: &[u8; REPLAY_SLOT_BYTES], probe: usize) -> u64 {
+    let start = u64::from_be_bytes(key[..8].try_into().expect("eight-byte replay prefix"));
+    ((start as usize + probe) % REPLAY_SLOT_COUNT * REPLAY_SLOT_BYTES) as u64
+}
+
+fn replay_contains(path: &Path, key: &[u8; REPLAY_SLOT_BYTES]) -> Result<bool, CliError> {
+    let mut file = open_replay_index(path)?;
+    let mut slot = [0_u8; REPLAY_SLOT_BYTES];
+    for probe in 0..REPLAY_SLOT_COUNT {
+        file.seek(SeekFrom::Start(replay_slot(key, probe)))
+            .map_err(|err| activity_io_error("activity-replay-seek-failed", path, err))?;
+        file.read_exact(&mut slot)
+            .map_err(|err| activity_io_error("activity-replay-read-failed", path, err))?;
+        if slot.iter().all(|byte| *byte == 0) {
+            return Ok(false);
+        }
+        if &slot == key {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn replay_insert(path: &Path, key: &[u8; REPLAY_SLOT_BYTES]) -> Result<(), CliError> {
+    let mut file = open_replay_index(path)?;
+    let mut slot = [0_u8; REPLAY_SLOT_BYTES];
+    for probe in 0..REPLAY_SLOT_COUNT {
+        let offset = replay_slot(key, probe);
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|err| activity_io_error("activity-replay-seek-failed", path, err))?;
+        file.read_exact(&mut slot)
+            .map_err(|err| activity_io_error("activity-replay-read-failed", path, err))?;
+        if &slot == key {
+            return Ok(());
+        }
+        if slot.iter().all(|byte| *byte == 0) {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|err| activity_io_error("activity-replay-seek-failed", path, err))?;
+            file.write_all(key)
+                .map_err(|err| activity_io_error("activity-replay-write-failed", path, err))?;
+            file.sync_data()
+                .map_err(|err| activity_io_error("activity-replay-sync-failed", path, err))?;
+            return Ok(());
+        }
+    }
+    Err(CliError::data(
+        "activity-replay-index-full",
+        "activity replay index is full for this runtime generation",
+        Some(json!({ "path": display_path(path) })),
+    ))
 }

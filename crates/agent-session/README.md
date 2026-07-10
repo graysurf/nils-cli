@@ -49,7 +49,9 @@ Every new runtime receives a fresh opaque `AGENT_SESSION_RUNTIME_ID` alongside
 project lifecycle metadata into a private, atomic activity snapshot and bounded
 journal. Provider identifiers are runtime-scoped opaque projections, attention
 and replay state are explicitly bounded, and interrupted snapshot/journal
-writes repair on the next event. Session views add optional
+writes repair before the next event or runtime transition. State is bound to
+both the launch id and persisted runtime generation so a stale snapshot is
+never shown after an interrupted resume. Session views add optional
 `runtime_started_at` and `turn_state`
 fields, distinguishing `starting`, `working`, `waiting`, `needs_input`, and
 `unknown` without storing prompt, assistant, terminal, command, tool, or
@@ -70,7 +72,8 @@ agent-session-owned handlers into existing provider configuration, repeated
 apply/repair is idempotent, and removal preserves unrelated hooks. Provider
 setup also refuses an observed concurrent config change. Provider hook failure
 is fail-open and old/unsupported providers retain the activity
-fallback. See [the stable turn-state contract](docs/turn-state-contract.md) and
+fallback. Doctor scans local session evidence once and probes provider versions
+concurrently with a bounded timeout. See [the stable turn-state contract](docs/turn-state-contract.md) and
 [provider evidence matrix](docs/provider-turn-signal-evidence.md).
 
 ## Serve daemon

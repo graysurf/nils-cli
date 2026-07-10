@@ -573,6 +573,19 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
         assert!(!contents.contains("tool_input"));
         assert!(!contents.contains("transcript"));
     }
+    let replay_path = session_dir.join("activity.replay.bin");
+    assert_eq!(
+        fs::metadata(&replay_path)
+            .expect("replay metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(replay_path).expect("replay size").len(),
+        4096 * 2 * 32
+    );
 }
 
 #[test]
@@ -3252,6 +3265,10 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
     assert!(
         !session.join("activity.json").exists(),
         "a failed launch must not retain a phantom Starting runtime"
+    );
+    assert!(
+        !session.join("activity.replay.bin").exists(),
+        "a failed launch must restore the prior replay-index boundary"
     );
 }
 

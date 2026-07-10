@@ -124,17 +124,23 @@ Each session owns:
 - `activity.json`: atomic mode-0600 snapshot;
 - `activity.journal.jsonl`: atomic mode-0600 metadata journal, bounded to 256
   events and 64 KiB;
+- `activity.replay.bin`: fixed-size mode-0600 open-addressed replay index for
+  4096 runtime-scoped event-id digests;
 - `.activity.lock`: mode-0600 cross-process advisory lock.
 
 Activity files are separate from `session.json`, so title/resume writes and hook
 writes cannot overwrite each other. Every reducer transaction holds the lock,
-validates the active runtime, records one pending journal entry in the atomic
-snapshot, updates the bounded journal idempotently, and clears the pending
-marker. A later event repairs an interrupted split write before reduction.
-Event-id digests use a separate 4096-entry runtime replay horizon rather than
-the shorter journal retention; reaching the horizon rejects further events with
-resume guidance instead of forgetting old ids. Session deletion removes the
-entire session directory.
+validates both the active launch id and runtime generation, records one pending
+journal entry in the atomic snapshot, updates the fixed replay index and bounded
+journal idempotently, and clears the pending marker. A later event or runtime
+transition repairs an interrupted split write before reduction. The replay
+index is separate from the shorter journal retention, gives expected O(1)
+duplicate checks without growing the JSON snapshot, and rejects further events
+at its 4096-event capacity with resume guidance instead of forgetting old ids.
+Unknown additive JSON fields survive supported reads and writes. A corrupt or
+future-version snapshot is moved to a private quarantine file before a fresh
+runtime snapshot is written. Session deletion removes the entire session
+directory.
 
 ## Privacy and provider adapter boundary
 
@@ -159,10 +165,11 @@ agent-session activity doctor [--agent <provider>] --format json
 
 Setup is explicit, additive, idempotent, and reversible. It preserves unrelated
 provider config, detects an observed concurrent modification before replacement,
-and never auto-accepts Codex trust or Hermes consent. Doctor
-reports installed version, audited classification, config status, finality and
-correlation limits, trust requirements, and repair guidance without emitting
-provider config content.
+and never auto-accepts Codex trust or Hermes consent. Doctor scans session
+records once, probes provider versions concurrently with a two-second bound per
+provider, and reports installed version or a bounded probe error, audited
+classification, config status, finality and correlation limits, trust
+requirements, and repair guidance without emitting provider config content.
 
 Setup JSON distinguishes current and prospective state: `configured` and
 `changed` describe the file after the command, while `would_configure` and
