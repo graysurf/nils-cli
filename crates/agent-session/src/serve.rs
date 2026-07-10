@@ -29,8 +29,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use jiff::Timestamp;
 use nils_common::cli_contract::{exit, schema_version_for};
+use nils_common::usage_time::{
+    epoch_seconds_from_f64, normalize_epoch_seconds, reset_epoch_seconds_from_str,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -498,7 +500,7 @@ fn normalize_codex_usage(output: UsageHelperOutput) -> UsageProvider {
             .and_then(Value::as_bool)
             .unwrap_or_else(|| result.get("status").and_then(Value::as_str) == Some("ok"))
     }) {
-        windows.extend(windows_from_value(result));
+        windows.extend(windows_from_value(result, None));
         if windows.is_empty()
             && let Some(summary) = result.get("summary")
         {
@@ -545,7 +547,8 @@ fn normalize_claude_usage(output: UsageHelperOutput) -> UsageProvider {
     };
 
     let result = value.get("result").unwrap_or(&value);
-    let windows = windows_from_value(result);
+    let reference_epoch = i64_field(result, &["updated_at", "updatedAt"]);
+    let windows = windows_from_value(result, reference_epoch);
     if !windows.is_empty() {
         return UsageProvider {
             id: "claude".to_string(),
@@ -562,21 +565,26 @@ fn normalize_claude_usage(output: UsageHelperOutput) -> UsageProvider {
     provider_error("claude", "Claude", &code, message)
 }
 
-fn windows_from_value(value: &Value) -> Vec<UsageWindow> {
+fn windows_from_value(value: &Value, reference_epoch: Option<i64>) -> Vec<UsageWindow> {
     value
         .get("windows")
         .and_then(Value::as_array)
-        .map(|windows| windows.iter().filter_map(usage_window_from_value).collect())
+        .map(|windows| {
+            windows
+                .iter()
+                .filter_map(|window| usage_window_from_value(window, reference_epoch))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
-fn usage_window_from_value(value: &Value) -> Option<UsageWindow> {
+fn usage_window_from_value(value: &Value, reference_epoch: Option<i64>) -> Option<UsageWindow> {
     let label = value.get("label").and_then(Value::as_str)?.to_string();
     let used_percent = i64_field(value, &["used_percent"])?;
     let remaining_percent = i64_field(value, &["remaining_percent"])
         .unwrap_or_else(|| (100 - used_percent).clamp(0, 100));
     let reset_at = reset_at_text_field(value, RESET_AT_KEYS);
-    let reset_at_epoch = epoch_field(value, RESET_AT_EPOCH_KEYS);
+    let reset_at_epoch = epoch_field(value, RESET_AT_EPOCH_KEYS, reference_epoch);
     Some(UsageWindow {
         label,
         used_percent,
@@ -652,48 +660,22 @@ fn safe_reset_at_text(raw: &str) -> bool {
         || raw.contains("/Users/"))
 }
 
-fn epoch_field(value: &Value, keys: &[&str]) -> Option<i64> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(epoch_seconds_from_value))
+fn epoch_field(value: &Value, keys: &[&str], reference_epoch: Option<i64>) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|value| epoch_seconds_from_value(value, reference_epoch))
+    })
 }
 
-fn epoch_seconds_from_value(value: &Value) -> Option<i64> {
+fn epoch_seconds_from_value(value: &Value, reference_epoch: Option<i64>) -> Option<i64> {
     match value {
         Value::Number(number) => number
             .as_i64()
             .or_else(|| number.as_f64().and_then(epoch_seconds_from_f64))
             .map(normalize_epoch_seconds),
-        Value::String(raw) => epoch_seconds_from_str(raw),
+        Value::String(raw) => reset_epoch_seconds_from_str(raw, reference_epoch),
         _ => None,
-    }
-}
-
-fn epoch_seconds_from_str(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    raw.parse::<i64>()
-        .ok()
-        .map(normalize_epoch_seconds)
-        .or_else(|| raw.parse::<f64>().ok().and_then(epoch_seconds_from_f64))
-        .or_else(|| {
-            raw.parse::<Timestamp>()
-                .ok()
-                .map(|timestamp| timestamp.as_second())
-        })
-}
-
-fn epoch_seconds_from_f64(raw: f64) -> Option<i64> {
-    raw.is_finite()
-        .then(|| normalize_epoch_seconds(raw.round() as i64))
-}
-
-fn normalize_epoch_seconds(raw: i64) -> i64 {
-    if raw.unsigned_abs() >= 10_000_000_000 {
-        raw / 1_000
-    } else {
-        raw
     }
 }
 
@@ -1670,6 +1652,7 @@ mod tests {
   "command": "usage",
   "ok": true,
   "result": {
+    "updated_at": 1783666800,
     "windows": [
       { "label": "5h", "used_percent": 3, "remaining_percent": 97, "resets_at": "2030-01-01T00:00:00Z" },
       { "label": "Weekly", "used_percent": 0, "remaining_percent": 100, "resetsAtEpoch": 1805000000 },
@@ -1698,7 +1681,7 @@ mod tests {
         assert_eq!(value["windows"][2]["reset_at_epoch"], 1_893_456_000);
         assert_eq!(value["windows"][3]["reset_at_epoch"], 1_893_456_000);
         assert_eq!(value["windows"][4]["reset_at"], "Jul 12, 9pm (Asia/Taipei)");
-        assert!(value["windows"][4].get("reset_at_epoch").is_none());
+        assert_eq!(value["windows"][4]["reset_at_epoch"], 1_783_861_200);
         assert!(value["windows"][5].get("reset_at").is_none());
         assert!(value["windows"][5].get("reset_at_epoch").is_none());
     }

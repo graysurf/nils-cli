@@ -36,6 +36,7 @@ pub mod rate_limits_ansi;
 pub mod redact;
 pub mod shell;
 pub mod slug;
+pub mod usage_time;
 
 pub fn greeting(name: &str) -> String {
     format!("Hello, {name}!")

@@ -3,6 +3,7 @@ use nils_common::diag_output;
 use nils_common::env as shared_env;
 use nils_common::process;
 use nils_common::shell::{AnsiStripMode, quote_posix_single, strip_ansi};
+use nils_common::usage_time::reset_epoch_seconds_from_str;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::ffi::OsString;
@@ -63,6 +64,8 @@ struct UsageWindow {
     remaining_percent: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     resets_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resets_at_epoch: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -186,10 +189,10 @@ fn result_from_usage(
 ) -> UsageResult {
     let mut windows = Vec::new();
     if let Some(window) = &usage.five_hour {
-        windows.push(usage_window("5h", "5h", 300, window));
+        windows.push(usage_window("5h", "5h", 300, window, updated_at));
     }
     if let Some(window) = &usage.seven_day {
-        windows.push(usage_window("weekly", "Weekly", 10_080, window));
+        windows.push(usage_window("weekly", "Weekly", 10_080, window, updated_at));
     }
 
     UsageResult {
@@ -209,14 +212,20 @@ fn usage_window(
     label: &str,
     window_minutes: i64,
     window: &render::Window,
+    reference_epoch: Option<i64>,
 ) -> UsageWindow {
+    let resets_at = window.resets_at.clone();
+    let resets_at_epoch = resets_at
+        .as_deref()
+        .and_then(|raw| reset_epoch_seconds(raw, reference_epoch));
     UsageWindow {
         key: key.to_string(),
         label: label.to_string(),
         window_minutes,
         used_percent: round_percent(window.used_percent),
         remaining_percent: round_percent(f64::from(window.remaining_percent as i32)),
-        resets_at: window.resets_at.clone(),
+        resets_at,
+        resets_at_epoch,
     }
 }
 
@@ -640,6 +649,10 @@ fn remaining_percent(used_percent: f64) -> i64 {
 
 fn round_percent(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
+}
+
+fn reset_epoch_seconds(raw: &str, reference_epoch: Option<i64>) -> Option<i64> {
+    reset_epoch_seconds_from_str(raw, reference_epoch)
 }
 
 fn now_epoch_seconds() -> i64 {
