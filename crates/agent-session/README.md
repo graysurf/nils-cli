@@ -68,10 +68,14 @@ is no second state model.
 - Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
   session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
   Empty or null titles clear the custom session title so clients can fall back to the session id.
-- `GET /sessions/{id}/attach` — a WebSocket PTY attach: a `capture-pane` snapshot then a live `tmux pipe-pane` byte
-  stream (binary frames, renderable by xterm.js); the client sends JSON control frames
+- `GET /sessions/{id}/attach` — a WebSocket PTY attach: a `capture-pane` snapshot then a live byte stream from one
+  daemon-owned `tmux pipe-pane` broker per session (binary frames, renderable by xterm.js). Concurrent clients fan out
+  from the same bounded in-memory stream; disconnecting one client leaves the others live, while a lagging client is
+  disconnected so it cannot stall tmux or other clients. The broker uses a private ephemeral FIFO and retains no
+  interactive-session terminal bytes after the final client disconnects. The client sends JSON control frames
   `{ "text": "...", "key": "enter", "keys": ["c-c"], "resize": { "cols": 80, "rows": 24 } }`. Token-gated; disconnect
-  leaves the tmux session alive.
+  leaves the tmux session alive. Concurrent clients share the pane geometry; resize sequences are serialized and the
+  last completed resize wins.
 
 Every response uses the `cli.agent-session.serve.v1` envelope and carries a `machine` identity (`--machine` /
 `AGENT_SESSION_MACHINE` / `--host` / hostname) so an edge can aggregate several machines. Auth is a bearer token

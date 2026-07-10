@@ -9,25 +9,29 @@
 //! Every response carries the daemon's `machine` identity so the edge can
 //! aggregate multiple machines. Literal keystroke text is never echoed.
 
+use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
-use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use nils_common::cli_contract::{exit, schema_version_for};
 use nils_common::usage_time::{
@@ -42,13 +46,15 @@ use crate::{
     glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
     resolve_tmux_bin, resume_session_by_id, run_capture_pane, search_workdirs, send_input,
     session_clipboard_buffer, session_dir, session_status, short_hostname,
-    start_provider_resume_session, start_session, update_session_title, write_private_file,
-    write_session_attachment,
+    start_provider_resume_session, start_session, update_session_title, write_session_attachment,
 };
 
-/// Monotonic counter giving each attach connection a private pipe file, so
-/// concurrent attaches to one session never delete each other's file.
-static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
+const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
+const ATTACH_BROADCAST_CAPACITY: usize = 128;
+const ATTACH_PIPE_STARTUP_GRACE: Duration = Duration::from_secs(2);
+const ATTACH_READER_STOP_TIMEOUT: Duration = Duration::from_millis(250);
+const ATTACH_TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const ATTACH_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_STDIN_TOKEN_BYTES: u64 = 8 * 1024;
 const USAGE_SCHEMA_VERSION: &str = "agent-session.usage.v1";
@@ -71,6 +77,7 @@ struct ServeState {
     machine: String,
     token: Option<String>,
     tmux_bin: PathBuf,
+    attach_brokers: AttachBrokerRegistry,
 }
 
 pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
@@ -123,6 +130,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
         machine,
         token,
         tmux_bin,
+        attach_brokers: AttachBrokerRegistry::default(),
     });
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -148,11 +156,12 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             "agent-session serve listening on http://{bind} (machine={})",
             state.machine
         );
-        let app = router(state);
-        match axum::serve(listener, app)
+        let app = router(state.clone());
+        let result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
-            .await
-        {
+            .await;
+        state.attach_brokers.shutdown_all().await;
+        match result {
             Ok(()) => exit::SUCCESS,
             Err(err) => {
                 eprintln!("error: serve failed: {err}");
@@ -1212,8 +1221,12 @@ async fn delete_handler(
     }
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
-    match tokio::task::spawn_blocking(move || delete_session(&context, &id, tmux)).await {
-        Ok(Ok(result)) => envelope_ok(json!({ "machine": state.machine, "deleted": result })),
+    let delete_id = id.clone();
+    match tokio::task::spawn_blocking(move || delete_session(&context, &delete_id, tmux)).await {
+        Ok(Ok(result)) => {
+            state.attach_brokers.shutdown_session(&id).await;
+            envelope_ok(json!({ "machine": state.machine, "deleted": result }))
+        }
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
@@ -1249,7 +1262,7 @@ async fn attach_handler(
     if status != "running" {
         return envelope_err(attach_unavailable_error(&record, &status));
     }
-    ws.on_upgrade(move |socket| attach_socket(socket, context, tmux, record))
+    ws.on_upgrade(move |socket| attach_socket(socket, state, record))
 }
 
 fn attach_unavailable_error(record: &crate::SessionRecord, status: &str) -> CliError {
@@ -1269,125 +1282,494 @@ fn attach_unavailable_error(record: &crate::SessionRecord, status: &str) -> CliE
 
 // --- websocket attach ---------------------------------------------------------
 
-async fn attach_socket(
-    socket: WebSocket,
-    context: CliContext,
+#[derive(Clone, Debug)]
+enum AttachEvent {
+    Output(Bytes),
+    Closed,
+}
+
+struct AttachSubscription {
+    receiver: tokio::sync::broadcast::Receiver<AttachEvent>,
+    lease: Option<AttachLease>,
+    resize_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct AttachLease {
+    slot: Arc<tokio::sync::Mutex<AttachBrokerSlot>>,
+    generation: u64,
+    released: bool,
+}
+
+#[derive(Default)]
+struct AttachBrokerRegistry {
+    entries: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<AttachBrokerSlot>>>>,
+}
+
+struct AttachBrokerSlot {
+    accepting: bool,
+    next_generation: u64,
+    active: Option<AttachBrokerGeneration>,
+}
+
+struct AttachBrokerGeneration {
+    generation: u64,
+    subscribers: usize,
+    broker: AttachBroker,
+}
+
+struct AttachBroker {
+    target: String,
+    fifo_path: PathBuf,
     tmux: PathBuf,
-    record: crate::SessionRecord,
+    sender: tokio::sync::broadcast::Sender<AttachEvent>,
+    reader_task: tokio::task::JoinHandle<()>,
+    closed: Arc<AtomicBool>,
+    resize_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Default for AttachBrokerSlot {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            next_generation: 1,
+            active: None,
+        }
+    }
+}
+
+impl AttachSubscription {
+    async fn release(mut self) {
+        if let Some(lease) = self.lease.take() {
+            lease.release().await;
+        }
+    }
+}
+
+impl Drop for AttachSubscription {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        drop(lease);
+    }
+}
+
+impl AttachLease {
+    async fn release(mut self) {
+        let cleanup = self.schedule_release();
+        self.released = true;
+        if let Some(cleanup) = cleanup {
+            let _ = cleanup.await;
+        }
+    }
+
+    fn schedule_release(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let slot = self.slot.clone();
+        let generation = self.generation;
+        Some(handle.spawn(async move {
+            let mut slot = slot.lock().await;
+            let Some(active) = slot.active.as_mut() else {
+                return;
+            };
+            if active.generation != generation {
+                return;
+            }
+            if active.subscribers > 1 {
+                active.subscribers -= 1;
+                return;
+            }
+            if let Some(active) = slot.active.take() {
+                // This supervisor task owns teardown independently of the
+                // caller, so cancellation cannot strand the pipe or FIFO.
+                // Keep the per-session lock so an old generation cannot close
+                // a replacement pane pipe for the same session.
+                active.broker.stop().await;
+            }
+        }))
+    }
+}
+
+impl Drop for AttachLease {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let _ = self.schedule_release();
+    }
+}
+
+impl AttachBrokerRegistry {
+    async fn subscribe(
+        &self,
+        context: &CliContext,
+        tmux: &Path,
+        record: &crate::SessionRecord,
+    ) -> io::Result<AttachSubscription> {
+        let slot = {
+            let mut entries = self.entries.lock().await;
+            entries
+                .entry(record.id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(AttachBrokerSlot::default())))
+                .clone()
+        };
+        let mut slot_state = slot.lock().await;
+        if !slot_state.accepting {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "attach broker is shutting down",
+            ));
+        }
+
+        let target = format!("{}:0.0", record.tmux_session);
+        if let Some(active) = slot_state.active.as_mut()
+            && active.broker.target == target
+        {
+            // Subscribe before checking `closed`. If the reader exits between
+            // these operations, this receiver observes its terminal event.
+            let receiver = active.broker.sender.subscribe();
+            if !active.broker.closed.load(Ordering::Acquire) {
+                active.subscribers += 1;
+                return Ok(AttachSubscription {
+                    receiver,
+                    lease: Some(AttachLease {
+                        slot: slot.clone(),
+                        generation: active.generation,
+                        released: false,
+                    }),
+                    resize_lock: active.broker.resize_lock.clone(),
+                });
+            }
+        }
+
+        if let Some(active) = slot_state.active.take() {
+            active.broker.stop().await;
+        }
+        let generation = slot_state.next_generation;
+        slot_state.next_generation = slot_state.next_generation.wrapping_add(1).max(1);
+        let (broker, receiver) = AttachBroker::start(context, tmux, record).await?;
+        let resize_lock = broker.resize_lock.clone();
+        slot_state.active = Some(AttachBrokerGeneration {
+            generation,
+            subscribers: 1,
+            broker,
+        });
+        Ok(AttachSubscription {
+            receiver,
+            lease: Some(AttachLease {
+                slot: slot.clone(),
+                generation,
+                released: false,
+            }),
+            resize_lock,
+        })
+    }
+
+    async fn shutdown_all(&self) {
+        let mut entries = self.entries.lock().await;
+        let slots: Vec<_> = entries.drain().map(|(_, slot)| slot).collect();
+        drop(entries);
+        for slot in slots {
+            let mut slot = slot.lock().await;
+            slot.accepting = false;
+            if let Some(active) = slot.active.take() {
+                active.broker.stop().await;
+            }
+        }
+    }
+
+    async fn shutdown_session(&self, session_id: &str) {
+        let slot = self.entries.lock().await.remove(session_id);
+        if let Some(slot) = slot {
+            let mut slot = slot.lock().await;
+            slot.accepting = false;
+            if let Some(active) = slot.active.take() {
+                active.broker.stop().await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn subscriber_count(&self, session_id: &str) -> usize {
+        let slot = self.entries.lock().await.get(session_id).cloned();
+        let Some(slot) = slot else { return 0 };
+        let slot = slot.lock().await;
+        slot.active.as_ref().map_or(0, |active| active.subscribers)
+    }
+}
+
+impl AttachBroker {
+    async fn start(
+        context: &CliContext,
+        tmux: &Path,
+        record: &crate::SessionRecord,
+    ) -> io::Result<(Self, tokio::sync::broadcast::Receiver<AttachEvent>)> {
+        let target = format!("{}:0.0", record.tmux_session);
+        let fifo_path = session_dir(context, &record.id).join(ATTACH_LIVE_FIFO_NAME);
+        create_private_fifo(&fifo_path)?;
+        let fifo = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo_path)?;
+        let fifo = tokio::io::unix::AsyncFd::new(fifo)?;
+
+        let (sender, receiver) = tokio::sync::broadcast::channel(ATTACH_BROADCAST_CAPACITY);
+        if let Err(err) = enable_tmux_pipe(tmux, &target, &fifo_path).await {
+            let _ = std::fs::remove_file(&fifo_path);
+            return Err(err);
+        }
+
+        let reader_sender = sender.clone();
+        let closed = Arc::new(AtomicBool::new(false));
+        let reader_closed = closed.clone();
+        let reader_task = tokio::spawn(async move {
+            read_attach_fifo(fifo, reader_sender, reader_closed).await;
+        });
+        let resize_lock = Arc::new(tokio::sync::Mutex::new(()));
+        Ok((
+            Self {
+                target,
+                fifo_path,
+                tmux: tmux.to_path_buf(),
+                sender,
+                reader_task,
+                closed,
+                resize_lock,
+            },
+            receiver,
+        ))
+    }
+
+    async fn stop(self) {
+        let _ = close_tmux_pipe(&self.tmux, &self.target).await;
+        let mut reader_task = self.reader_task;
+        if tokio::time::timeout(ATTACH_READER_STOP_TIMEOUT, &mut reader_task)
+            .await
+            .is_err()
+        {
+            reader_task.abort();
+            let _ = reader_task.await;
+        }
+        let _ = std::fs::remove_file(&self.fifo_path);
+    }
+}
+
+fn create_private_fifo(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attach FIFO path contains a NUL byte",
+        )
+    })?;
+    // SAFETY: `path` is a valid, NUL-terminated C string and mode 0600 keeps
+    // terminal bytes private to the daemon user.
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+async fn enable_tmux_pipe(tmux: &Path, target: &str, fifo_path: &Path) -> io::Result<()> {
+    let tmux = tmux.to_path_buf();
+    let target = target.to_string();
+    let fifo_path = fifo_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut command = ProcessCommand::new(&tmux);
+        command.arg("pipe-pane").arg("-t").arg(&target).arg(format!(
+            "cat > {}",
+            shell_words::quote(&fifo_path.to_string_lossy())
+        ));
+        let status = run_process_with_timeout(&mut command, ATTACH_TMUX_COMMAND_TIMEOUT)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "tmux pipe-pane failed with status {status}"
+            )))
+        }
+    })
+    .await
+    .map_err(|err| io::Error::other(format!("tmux pipe task failed: {err}")))?
+}
+
+async fn close_tmux_pipe(tmux: &Path, target: &str) -> io::Result<()> {
+    let tmux = tmux.to_path_buf();
+    let target = target.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut command = ProcessCommand::new(&tmux);
+        command.arg("pipe-pane").arg("-t").arg(&target);
+        run_process_with_timeout(&mut command, ATTACH_TMUX_COMMAND_TIMEOUT).map(|_| ())
+    })
+    .await
+    .map_err(|err| io::Error::other(format!("tmux close task failed: {err}")))?
+}
+
+fn run_process_with_timeout(
+    command: &mut ProcessCommand,
+    timeout: Duration,
+) -> io::Result<std::process::ExitStatus> {
+    let mut child = command.spawn()?;
+    let started_at = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("process exceeded {} ms", timeout.as_millis()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+async fn read_attach_fifo(
+    fifo: tokio::io::unix::AsyncFd<std::fs::File>,
+    sender: tokio::sync::broadcast::Sender<AttachEvent>,
+    closed: Arc<AtomicBool>,
 ) {
+    let mut buf = vec![0u8; 8192];
+    let started_at = Instant::now();
+    let mut writer_seen = false;
+    loop {
+        let mut ready = match fifo.readable().await {
+            Ok(ready) => ready,
+            Err(_) => break,
+        };
+        let read = ready.try_io(|inner| {
+            let mut file = inner.get_ref();
+            file.read(&mut buf)
+        });
+        match read {
+            Ok(Ok(0)) if !writer_seen && started_at.elapsed() < ATTACH_PIPE_STARTUP_GRACE => {
+                // `pipe-pane` starts its shell asynchronously. A nonblocking
+                // FIFO reader briefly sees EOF until that writer opens.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                writer_seen = true;
+                let _ = sender.send(AttachEvent::Output(Bytes::copy_from_slice(&buf[..n])));
+            }
+            Ok(Err(_)) => break,
+            Err(_would_block) => {
+                writer_seen = true;
+            }
+        }
+    }
+    closed.store(true, Ordering::Release);
+    let _ = sender.send(AttachEvent::Closed);
+}
+
+fn attach_event_bytes(
+    event: Result<AttachEvent, tokio::sync::broadcast::error::RecvError>,
+) -> Option<Bytes> {
+    match event {
+        Ok(AttachEvent::Output(bytes)) => Some(bytes),
+        Ok(AttachEvent::Closed)
+        | Err(tokio::sync::broadcast::error::RecvError::Closed)
+        | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => None,
+    }
+}
+
+async fn send_attach_message<S>(sender: &mut S, message: Message, timeout: Duration) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    matches!(
+        tokio::time::timeout(timeout, sender.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn attach_socket(socket: WebSocket, state: Arc<ServeState>, record: crate::SessionRecord) {
     let target = format!("{}:0.0", record.tmux_session);
     let (mut sender, mut receiver) = socket.split();
 
-    // Initial screen snapshot so the client renders current pane state before
-    // the live stream begins.
+    // Subscribe before capturing the initial screen so pane output produced
+    // during capture is buffered instead of silently lost. Snapshot and live
+    // bytes may overlap; preserving every byte is preferable to a gap.
+    let mut subscription = match state
+        .attach_brokers
+        .subscribe(&state.context, &state.tmux_bin, &record)
+        .await
+    {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to start live attach broker for {}: {err}",
+                record.id
+            );
+            return;
+        }
+    };
+
     let snapshot = tokio::task::spawn_blocking({
         let record = record.clone();
-        let tmux = tmux.clone();
+        let tmux = state.tmux_bin.clone();
         move || run_capture_pane(&record, 200, &tmux)
     })
     .await;
-    if let Ok(Ok(Some(text))) = snapshot {
-        let _ = sender.send(Message::Binary(text.into_bytes().into())).await;
-    }
-
-    // Stream live pane output via `tmux pipe-pane` into a private per-connection
-    // file we tail. The file is 0600 (honoring the crate's secret-file model,
-    // since pane output can contain secrets) and uniquely named so concurrent
-    // attaches never remove each other's file. Note: tmux allows one pipe-pane
-    // per pane, so simultaneous attaches to the SAME session share the pane and
-    // the last to connect wins the live pipe (a documented tmux limitation).
-    let seq = ATTACH_SEQ.fetch_add(1, Ordering::Relaxed);
-    let pipe_file = session_dir(&context, &record.id).join(format!("attach-{seq}.pipe"));
-    let enabled = {
-        let tmux = tmux.clone();
-        let target = target.clone();
-        let pipe_file = pipe_file.clone();
-        tokio::task::spawn_blocking(move || {
-            if write_private_file(&pipe_file, b"").is_err() {
-                return false;
-            }
-            ProcessCommand::new(&tmux)
-                .arg("pipe-pane")
-                .arg("-o")
-                .arg("-t")
-                .arg(&target)
-                .arg(format!(
-                    "cat >> {}",
-                    shell_words::quote(&pipe_file.to_string_lossy())
-                ))
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-        })
+    if let Ok(Ok(Some(text))) = snapshot
+        && !send_attach_message(
+            &mut sender,
+            Message::Binary(text.into_bytes().into()),
+            ATTACH_WEBSOCKET_SEND_TIMEOUT,
+        )
         .await
-        .unwrap_or(false)
-    };
-    let tail_task = enabled.then(|| tokio::spawn(tail_pipe(pipe_file.clone(), sender)));
+    {
+        subscription.release().await;
+        return;
+    }
 
     // Client -> pane: JSON control frames { text?, key?, keys?, resize{cols,rows} }.
     // The first resize after attach forces a full-frame repaint (see resize_pane).
     let mut initial_repaint_pending = true;
-    while let Some(Ok(message)) = receiver.next().await {
-        match message {
-            Message::Text(text) => {
-                handle_input(
-                    &context,
-                    &tmux,
-                    &record,
-                    &target,
-                    text.as_str(),
-                    &mut initial_repaint_pending,
-                )
-                .await;
-            }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-
-    // Teardown: stop the tail, disable the pipe, remove this connection's private
-    // file. The tmux session itself stays alive (durability across disconnect).
-    if let Some(handle) = tail_task {
-        handle.abort();
-    }
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = ProcessCommand::new(&tmux)
-            .arg("pipe-pane")
-            .arg("-t")
-            .arg(&target)
-            .status();
-        let _ = std::fs::remove_file(&pipe_file);
-    })
-    .await;
-}
-
-/// Tail an appended-to file, forwarding new bytes as binary WebSocket frames.
-/// A regular file's offset does not stick at EOF, so a zero-length read simply
-/// means "no new data yet" — sleep briefly and read again.
-async fn tail_pipe(path: PathBuf, mut sender: SplitSink<WebSocket, Message>) {
-    use tokio::io::AsyncReadExt;
-    let mut file = loop {
-        match tokio::fs::File::open(&path).await {
-            Ok(file) => break file,
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-        }
-    };
-    let mut buf = vec![0u8; 8192];
+    let resize_lock = subscription.resize_lock.clone();
     loop {
-        match file.read(&mut buf).await {
-            Ok(0) => tokio::time::sleep(Duration::from_millis(60)).await,
-            Ok(n) => {
-                if sender
-                    .send(Message::Binary(buf[..n].to_vec().into()))
-                    .await
-                    .is_err()
-                {
+        tokio::select! {
+            message = receiver.next() => {
+                let Some(Ok(message)) = message else { break; };
+                match message {
+                    Message::Text(text) => {
+                        handle_input(
+                            &state.context,
+                            &state.tmux_bin,
+                            &record,
+                            &target,
+                            text.as_str(),
+                            &mut initial_repaint_pending,
+                            &resize_lock,
+                        )
+                        .await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            event = subscription.receiver.recv() => {
+                let Some(bytes) = attach_event_bytes(event) else { break; };
+                if !send_attach_message(
+                    &mut sender,
+                    Message::Binary(bytes),
+                    ATTACH_WEBSOCKET_SEND_TIMEOUT,
+                ).await {
                     break;
                 }
             }
-            Err(_) => break,
         }
     }
+
+    subscription.release().await;
 }
 
 /// After a fresh (re)attach the client rebuilds its terminal emulator from
@@ -1438,6 +1820,7 @@ async fn handle_input(
     target: &str,
     frame: &str,
     initial_repaint_pending: &mut bool,
+    resize_lock: &tokio::sync::Mutex<()>,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(frame) else {
         return;
@@ -1448,6 +1831,9 @@ async fn handle_input(
         let rows = resize.get("rows").and_then(Value::as_u64);
         if let (Some(cols), Some(rows)) = (cols, rows) {
             let force_repaint = std::mem::take(initial_repaint_pending);
+            // Concurrent attach clients share one tmux pane. Keep each resize
+            // sequence atomic; the last completed client resize wins.
+            let _guard = resize_lock.lock().await;
             resize_pane(tmux, target, cols, rows, force_repaint).await;
         }
         return;
@@ -1494,7 +1880,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use nils_test_support::{EnvGuard, GlobalStateLock};
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::io::Write;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tower::ServiceExt;
 
     const MACHINE: &str = "test-machine";
@@ -1509,6 +1897,7 @@ mod tests {
             machine: MACHINE.to_string(),
             token: token.map(str::to_string),
             tmux_bin,
+            attach_brokers: AttachBrokerRegistry::default(),
         })
     }
 
@@ -3263,11 +3652,30 @@ mod tests {
         };
         let record = test_record("look", "hs-codex-look");
         let target = "hs-codex-look:0.0";
+        let resize_lock = tokio::sync::Mutex::new(());
 
         // Malformed JSON and an empty object must not touch tmux.
         let mut pending = false;
-        handle_input(&ctx, &tmux, &record, target, "{ not json", &mut pending).await;
-        handle_input(&ctx, &tmux, &record, target, "{}", &mut pending).await;
+        handle_input(
+            &ctx,
+            &tmux,
+            &record,
+            target,
+            "{ not json",
+            &mut pending,
+            &resize_lock,
+        )
+        .await;
+        handle_input(
+            &ctx,
+            &tmux,
+            &record,
+            target,
+            "{}",
+            &mut pending,
+            &resize_lock,
+        )
+        .await;
         let after_noops = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
             after_noops.trim().is_empty(),
@@ -3283,6 +3691,7 @@ mod tests {
             target,
             r#"{"resize":{"cols":123,"rows":45}}"#,
             &mut pending,
+            &resize_lock,
         )
         .await;
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
@@ -3312,6 +3721,7 @@ mod tests {
         };
         let record = test_record("look", "hs-codex-look");
         let target = "hs-codex-look:0.0";
+        let resize_lock = tokio::sync::Mutex::new(());
 
         // First resize after attach: nudge to rows-1, then the real rows, so the
         // agent is guaranteed a SIGWINCH and repaints its whole frame into the
@@ -3324,6 +3734,7 @@ mod tests {
             target,
             r#"{"resize":{"cols":80,"rows":24}}"#,
             &mut pending,
+            &resize_lock,
         )
         .await;
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
@@ -3360,6 +3771,7 @@ mod tests {
             target,
             r#"{"resize":{"cols":100,"rows":40}}"#,
             &mut pending,
+            &resize_lock,
         )
         .await;
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
@@ -3372,6 +3784,54 @@ mod tests {
             resizes[0].contains("-y 40"),
             "later resize must use the requested rows: {:?}",
             resizes[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_resize_sequences_do_not_interleave() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("calls.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let ctx = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = test_record("look", "hs-codex-look");
+        let target = "hs-codex-look:0.0";
+        let resize_lock = tokio::sync::Mutex::new(());
+        let mut first_pending = true;
+        let mut second_pending = true;
+
+        tokio::join!(
+            handle_input(
+                &ctx,
+                &tmux,
+                &record,
+                target,
+                r#"{"resize":{"cols":80,"rows":24}}"#,
+                &mut first_pending,
+                &resize_lock,
+            ),
+            handle_input(
+                &ctx,
+                &tmux,
+                &record,
+                target,
+                r#"{"resize":{"cols":100,"rows":40}}"#,
+                &mut second_pending,
+                &resize_lock,
+            ),
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let rows: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.contains("resize-window"))
+            .map(|line| line.rsplit_once("-y ").unwrap().1)
+            .collect();
+        assert!(
+            rows == ["23", "24", "39", "40"] || rows == ["39", "40", "23", "24"],
+            "each client's nudge/final resize pair must stay contiguous: {calls:?}"
         );
     }
 
@@ -3389,18 +3849,518 @@ mod tests {
     }
 
     #[test]
-    fn private_files_are_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        // The attach pipe is created via write_private_file; assert the mode is
-        // 0600 so live pane output is not group/world-readable.
+    fn lagged_live_output_disconnects_the_slow_client() {
+        assert!(
+            attach_event_bytes(Err(tokio::sync::broadcast::error::RecvError::Lagged(1))).is_none(),
+            "a lagged subscriber must disconnect instead of blocking the broker"
+        );
+        assert!(
+            attach_event_bytes(Ok(AttachEvent::Closed)).is_none(),
+            "a closed broker must disconnect its subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_websocket_send_is_bounded() {
+        struct PendingSink;
+
+        impl futures_util::Sink<Message> for PendingSink {
+            type Error = io::Error;
+
+            fn poll_ready(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+
+            fn start_send(
+                self: std::pin::Pin<&mut Self>,
+                _item: Message,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        assert!(
+            !send_attach_message(
+                &mut PendingSink,
+                Message::Binary(Bytes::from_static(b"blocked")),
+                Duration::from_millis(20),
+            )
+            .await,
+            "a stalled WebSocket sink must time out"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_broker_fans_out_and_only_last_subscriber_tears_down_pipe() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("attach.pipe");
-        write_private_file(&path, b"").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let state_dir = tmp.path().join("state");
+        let calls = tmp.path().join("calls.log");
+        let source = tmp.path().join("pane-output.fifo");
+        let writer_pid = tmp.path().join("writer.pid");
+        create_private_fifo(&source).unwrap();
+        seed_session(&state_dir, "fanout", "codex", "hs-codex-fanout");
+
+        let tmux = fanout_tmux(tmp.path(), &calls, &source, &writer_pid);
+        let context = CliContext {
+            state_dir: state_dir.clone(),
+            host: None,
+        };
+        let record = load_session_record(&context, "fanout").unwrap();
+        let registry = AttachBrokerRegistry::default();
+        let live_fifo = session_dir(&context, "fanout").join(ATTACH_LIVE_FIFO_NAME);
+        crate::write_private_file(&live_fifo, b"stale daemon bytes").unwrap();
+
+        let mut first = registry.subscribe(&context, &tmux, &record).await.unwrap();
+        let mut second = registry.subscribe(&context, &tmux, &record).await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(&live_fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the live broker transport must be an ephemeral FIFO"
+        );
+
+        let mut source_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap();
+        source_writer.write_all(b"hello").unwrap();
+        source_writer.flush().unwrap();
+
+        assert_eq!(recv_attach_bytes(&mut first).await, b"hello");
+        assert_eq!(recv_attach_bytes(&mut second).await, b"hello");
+
+        let closes_before_detach = pipe_close_count(&calls);
+        first.release().await;
+        assert_eq!(
+            pipe_close_count(&calls),
+            closes_before_detach,
+            "disconnecting one subscriber must not close the shared tmux pipe"
+        );
+        assert!(live_fifo.exists());
+
+        source_writer.write_all(b"again").unwrap();
+        source_writer.flush().unwrap();
+        assert_eq!(recv_attach_bytes(&mut second).await, b"again");
+
+        second.release().await;
+        assert_eq!(
+            pipe_close_count(&calls),
+            closes_before_detach + 1,
+            "the final subscriber must close the shared tmux pipe"
+        );
+        assert!(
+            !live_fifo.exists(),
+            "broker teardown must remove the ephemeral FIFO"
+        );
+
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        let enables: Vec<_> = calls
+            .lines()
+            .filter(|line| line.contains("cat >"))
+            .collect();
+        assert_eq!(
+            enables.len(),
+            1,
+            "simultaneous subscribers must share one tmux pipe: {calls:?}"
+        );
+        assert!(
+            !enables[0].split_whitespace().any(|arg| arg == "-o"),
+            "a fresh broker must replace a stale tmux pipe instead of preserving it: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_attach_fans_out_live_output_after_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let calls = tmp.path().join("calls.log");
+        let source = tmp.path().join("pane-output.fifo");
+        let writer_pid = tmp.path().join("writer.pid");
+        create_private_fifo(&source).unwrap();
+        seed_session(&state_dir, "socket", "codex", "hs-codex-socket");
+
+        let tmux = fanout_tmux(tmp.path(), &calls, &source, &writer_pid);
+        let state = state(&state_dir, Some(TOKEN), tmux);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let connect = || async {
+            let mut request = format!("ws://{address}/sessions/socket/attach")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+            tokio_tungstenite::connect_async(request).await.unwrap().0
+        };
+        let mut first = connect().await;
+        let mut second = connect().await;
+        assert_eq!(recv_websocket_binary(&mut first).await, b"pane\n");
+        assert_eq!(recv_websocket_binary(&mut second).await, b"pane\n");
+        wait_for_subscriber_count(&state.attach_brokers, "socket", 2).await;
+
+        let mut source_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap();
+        source_writer.write_all(b"both-clients").unwrap();
+        source_writer.flush().unwrap();
+        assert_eq!(recv_websocket_binary(&mut first).await, b"both-clients");
+        assert_eq!(recv_websocket_binary(&mut second).await, b"both-clients");
+
+        first.close(None).await.unwrap();
+        wait_for_subscriber_count(&state.attach_brokers, "socket", 1).await;
+        source_writer.write_all(b"remaining-client").unwrap();
+        source_writer.flush().unwrap();
+        assert_eq!(
+            recv_websocket_binary(&mut second).await,
+            b"remaining-client"
+        );
+
+        second.close(None).await.unwrap();
+        wait_for_subscriber_count(&state.attach_brokers, "socket", 0).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn dropping_last_attach_subscription_releases_the_broker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let calls = tmp.path().join("calls.log");
+        let source = tmp.path().join("pane-output.fifo");
+        let writer_pid = tmp.path().join("writer.pid");
+        create_private_fifo(&source).unwrap();
+        seed_session(&state_dir, "cancel", "codex", "hs-codex-cancel");
+
+        let tmux = fanout_tmux(tmp.path(), &calls, &source, &writer_pid);
+        let context = CliContext {
+            state_dir: state_dir.clone(),
+            host: None,
+        };
+        let record = load_session_record(&context, "cancel").unwrap();
+        let registry = AttachBrokerRegistry::default();
+        let live_fifo = session_dir(&context, "cancel").join(ATTACH_LIVE_FIFO_NAME);
+
+        let subscription = registry.subscribe(&context, &tmux, &record).await.unwrap();
+        assert_eq!(registry.subscriber_count("cancel").await, 1);
+        drop(subscription);
+
+        wait_for_subscriber_count(&registry, "cancel", 0).await;
+        assert!(
+            !live_fifo.exists(),
+            "cancelling an attach task must remove its final broker FIFO"
+        );
+        assert_eq!(pipe_close_count(&calls), 1);
+    }
+
+    #[tokio::test]
+    async fn aborting_release_during_teardown_does_not_strand_the_broker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let calls = tmp.path().join("calls.log");
+        let close_started = tmp.path().join("close-started");
+        seed_session(&state_dir, "abort", "codex", "hs-codex-abort");
+        let tmux = executable(
+            &tmp.path().join("tmux"),
+            &format!(
+                r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {}
+if [ "$1" = "pipe-pane" ]; then
+  last=""
+  for arg in "$@"; do last="$arg"; done
+  case "$last" in
+    "cat > "*) ;;
+    *)
+      if [ ! -e {} ]; then
+        : > {}
+        sleep 1
+      fi
+      ;;
+  esac
+fi
+exit 0
+"#,
+                shell_words::quote(&calls.to_string_lossy()),
+                shell_words::quote(&close_started.to_string_lossy()),
+                shell_words::quote(&close_started.to_string_lossy()),
+            ),
+        );
+        let context = CliContext {
+            state_dir,
+            host: None,
+        };
+        let record = load_session_record(&context, "abort").unwrap();
+        let registry = AttachBrokerRegistry::default();
+        let live_fifo = session_dir(&context, "abort").join(ATTACH_LIVE_FIFO_NAME);
+        let subscription = registry.subscribe(&context, &tmux, &record).await.unwrap();
+
+        let release_task = tokio::spawn(subscription.release());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !close_started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("broker teardown never reached the blocking close command");
+        release_task.abort();
+        let _ = release_task.await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while live_fifo.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("supervised teardown did not remove the broker FIFO");
+        assert_eq!(pipe_close_count(&calls), 1);
+
+        let replacement = registry.subscribe(&context, &tmux, &record).await.unwrap();
+        replacement.release().await;
+        assert_eq!(pipe_close_count(&calls), 2);
+    }
+
+    #[tokio::test]
+    async fn slow_broker_start_does_not_block_an_unrelated_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let slow_started = tmp.path().join("slow-started");
+        seed_session(&state_dir, "slow", "codex", "hs-codex-slow");
+        seed_session(&state_dir, "fast", "codex", "hs-codex-fast");
+        let tmux = executable(
+            &tmp.path().join("tmux"),
+            &format!(
+                "#!/usr/bin/env sh\ncase \"$*\" in\n  *hs-codex-slow*\\ cat\\ \\>* ) : > {}; sleep 1 ;;\nesac\nexit 0\n",
+                shell_words::quote(&slow_started.to_string_lossy())
+            ),
+        );
+        let context = CliContext {
+            state_dir,
+            host: None,
+        };
+        let slow_record = load_session_record(&context, "slow").unwrap();
+        let fast_record = load_session_record(&context, "fast").unwrap();
+        let registry = Arc::new(AttachBrokerRegistry::default());
+
+        let slow_task = tokio::spawn({
+            let registry = registry.clone();
+            let context = context.clone();
+            let tmux = tmux.clone();
+            async move {
+                registry
+                    .subscribe(&context, &tmux, &slow_record)
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !slow_started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slow session never began broker startup");
+
+        let fast = tokio::time::timeout(
+            Duration::from_millis(250),
+            registry.subscribe(&context, &tmux, &fast_record),
+        )
+        .await
+        .expect("an unrelated session was blocked by slow broker startup")
+        .unwrap();
+        fast.release().await;
+
+        let slow = slow_task.await.unwrap();
+        slow.release().await;
+    }
+
+    #[tokio::test]
+    async fn late_subscriber_restarts_a_closed_broker_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let calls = tmp.path().join("calls.log");
+        let source = tmp.path().join("pane-output.fifo");
+        let writer_pid = tmp.path().join("writer.pid");
+        create_private_fifo(&source).unwrap();
+        seed_session(&state_dir, "restart", "codex", "hs-codex-restart");
+
+        let tmux = fanout_tmux(tmp.path(), &calls, &source, &writer_pid);
+        let context = CliContext {
+            state_dir,
+            host: None,
+        };
+        let record = load_session_record(&context, "restart").unwrap();
+        let registry = AttachBrokerRegistry::default();
+        let mut first = registry.subscribe(&context, &tmux, &record).await.unwrap();
+
+        let mut source_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap();
+        source_writer.write_all(b"before-close").unwrap();
+        source_writer.flush().unwrap();
+        assert_eq!(recv_attach_bytes(&mut first).await, b"before-close");
+        drop(source_writer);
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), first.receiver.recv())
+            .await
+            .expect("timed out waiting for the old broker to close");
+        assert!(attach_event_bytes(closed).is_none());
+
+        let mut second = registry.subscribe(&context, &tmux, &record).await.unwrap();
+        let mut source_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap();
+        source_writer.write_all(b"after-restart").unwrap();
+        source_writer.flush().unwrap();
+        assert_eq!(recv_attach_bytes(&mut second).await, b"after-restart");
+
+        first.release().await;
+        second.release().await;
+        let enables = std::fs::read_to_string(&calls)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("cat >"))
+            .count();
+        assert_eq!(enables, 2, "a closed generation must be replaced once");
+    }
+
+    async fn recv_attach_bytes(subscription: &mut AttachSubscription) -> Vec<u8> {
+        let event = tokio::time::timeout(Duration::from_secs(2), subscription.receiver.recv())
+            .await
+            .expect("timed out waiting for broker output");
+        attach_event_bytes(event)
+            .expect("broker closed before delivering output")
+            .to_vec()
+    }
+
+    async fn recv_websocket_binary<S>(socket: &mut S) -> Vec<u8>
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("timed out waiting for WebSocket output")
+            .expect("WebSocket closed before output")
+            .expect("WebSocket output failed");
+        match message {
+            tokio_tungstenite::tungstenite::Message::Binary(bytes) => bytes.to_vec(),
+            other => panic!("expected binary WebSocket output, got {other:?}"),
+        }
+    }
+
+    async fn wait_for_subscriber_count(
+        registry: &AttachBrokerRegistry,
+        session_id: &str,
+        expected: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.subscriber_count(session_id).await == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for subscriber cleanup");
+    }
+
+    fn pipe_close_count(calls: &Path) -> usize {
+        std::fs::read_to_string(calls)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("pipe-pane") && !line.contains("cat >"))
+            .count()
+    }
+
+    fn fanout_tmux(dir: &Path, calls: &Path, source: &Path, writer_pid: &Path) -> PathBuf {
+        executable(
+            &dir.join("tmux"),
+            &format!(
+                r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {}
+if [ "$1" = "capture-pane" ]; then
+  printf 'pane\n'
+  exit 0
+fi
+if [ "$1" = "pipe-pane" ]; then
+  last=""
+  for arg in "$@"; do last="$arg"; done
+  case "$last" in
+    "cat > "*)
+      dest=${{last#cat > }}
+      (exec 3>"$dest"; cat {} >&3) &
+      printf '%s\n' "$!" > {}
+      ;;
+    *)
+      if [ -s {} ]; then
+        kill "$(cat {})" 2>/dev/null || true
+        rm -f {}
+      fi
+      ;;
+  esac
+fi
+exit 0
+"#,
+                shell_words::quote(&calls.to_string_lossy()),
+                shell_words::quote(&source.to_string_lossy()),
+                shell_words::quote(&writer_pid.to_string_lossy()),
+                shell_words::quote(&writer_pid.to_string_lossy()),
+                shell_words::quote(&writer_pid.to_string_lossy()),
+                shell_words::quote(&writer_pid.to_string_lossy()),
+            ),
+        )
+    }
+
+    #[test]
+    fn private_files_and_attach_fifos_are_0600() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file_path = tmp.path().join("private.file");
+        crate::write_private_file(&file_path, b"").unwrap();
+        let mode = std::fs::metadata(&file_path).unwrap().permissions().mode();
         assert_eq!(
             mode & 0o077,
             0,
-            "pipe file must not be group/world readable"
+            "private files must not be group/world readable"
+        );
+
+        let fifo_path = tmp.path().join("attach.fifo");
+        create_private_fifo(&fifo_path).unwrap();
+        let metadata = std::fs::metadata(&fifo_path).unwrap();
+        assert!(metadata.file_type().is_fifo());
+        assert_eq!(
+            metadata.permissions().mode() & 0o077,
+            0,
+            "live terminal FIFO must not be group/world readable"
         );
     }
 
