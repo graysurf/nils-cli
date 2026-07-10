@@ -737,10 +737,12 @@ fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
         ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
     ];
     let secret = "sk-proj-content-must-not-persist";
+    let provider_session_secret = "sk-proj-provider-session-must-not-persist";
+    let provider_turn_secret = "/secret/provider/turn/path";
     let prompt = json!({
         "hook_event_name": "UserPromptSubmit",
-        "session_id": "provider-session",
-        "turn_id": "provider-turn",
+        "session_id": provider_session_secret,
+        "turn_id": provider_turn_secret,
         "prompt": secret,
         "transcript_path": "/secret/transcript.jsonl"
     })
@@ -774,8 +776,8 @@ fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
 
     let stop = json!({
         "hook_event_name": "Stop",
-        "session_id": "provider-session",
-        "turn_id": "provider-turn",
+        "session_id": provider_session_secret,
+        "turn_id": provider_turn_secret,
         "last_assistant_message": secret,
         "stop_hook_active": false
     })
@@ -811,6 +813,8 @@ fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
         assert!(!contents.contains(secret));
         assert!(!contents.contains("transcript_path"));
         assert!(!contents.contains("last_assistant_message"));
+        assert!(!contents.contains(provider_session_secret));
+        assert!(!contents.contains(provider_turn_secret));
     }
 
     let malformed = format!(r#"{{"prompt":"{secret}""#);
@@ -855,7 +859,54 @@ fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
         "provider-hook-invalid"
     );
 
-    let progress = json!({"hook_event_name": "PostToolUse"}).to_string();
+    let ignored = json!({"hook_event_name": "FutureIgnoredEvent"}).to_string();
+    let hook = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &hook_env,
+        &ignored,
+    );
+    assert_eq!(hook.code, 0);
+    assert!(
+        diagnostic_path.exists(),
+        "ignored events do not clear errors"
+    );
+
+    let stale_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", "prior-runtime"),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let hook = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &stale_env,
+        "{invalid-stale-json",
+    );
+    assert_eq!(hook.code, 0);
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("current diagnostic retained");
+    assert!(diagnostic.contains("provider-hook-invalid"));
+
+    let mismatched = json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "different-provider-session"
+    })
+    .to_string();
+    let hook = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &hook_env,
+        &mismatched,
+    );
+    assert_eq!(hook.code, 0);
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("session mismatch diagnostic");
+    assert!(diagnostic.contains("provider-session-id-mismatch"));
+
+    let progress = json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": provider_session_secret
+    })
+    .to_string();
     let hook = run_with_stdin(
         tmp.path(),
         &["activity", "hook", "--agent", "codex"],
@@ -3112,6 +3163,62 @@ fn resume_persists_runtime_generation_before_provider_launch() {
     assert_eq!(record["runtime"]["generation"], 2);
     assert!(record["runtime"]["launch_id"].is_string());
     assert_ne!(record["updated_at"], "2000-01-01T00:00:00Z");
+}
+
+#[test]
+fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let session = write_resumable_session_record_with_agent_bin(
+        &state_dir,
+        "resume-launch-fail",
+        "codex",
+        "hs-codex-resume-launch-fail",
+        &cwd,
+        &["resume", "resume-session-id", "--cd", cwd.to_str().unwrap()],
+        Some(&codex_bin),
+    );
+    let record_path = session.join("session.json");
+    let before: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("prior record"))
+            .expect("prior record json");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "resume-launch-fail",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL", "new-session"),
+        ],
+    );
+
+    assert_ne!(output.code, 0);
+    let after: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("restored record"))
+            .expect("restored record json");
+    assert_eq!(after["runtime"], before["runtime"]);
+    assert_eq!(after["updated_at"], before["updated_at"]);
+    assert!(
+        !session.join("activity.json").exists(),
+        "a failed launch must not retain a phantom Starting runtime"
+    );
 }
 
 #[test]

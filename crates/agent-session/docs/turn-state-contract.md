@@ -39,6 +39,12 @@ keys fail parsing. Identifiers are bounded, non-empty, and control-free.
 `clarification`, `authentication`, or `other`; `attention_cleared` requires the
 matching id.
 
+Provider hooks never persist their raw session or turn identifiers. They are
+projected to runtime-scoped SHA-256 opaque values before validation, storage,
+or exposure. When exact provider resume identity is known it must match; when
+it is not known, the first non-empty projected provider session id binds the
+runtime and later changes are rejected.
+
 The host receive time is canonical. Provider time is accepted only as inert
 metadata in v1 and never advances state ahead of host observation. Runtime id
 and provider mismatch are rejected before timestamping, journaling, or reducing.
@@ -81,9 +87,12 @@ Source kinds are `provider_hook`, `console_observation`,
 `terminal_heuristic`, and `runtime`. Last-turn outcomes are `completed`,
 `interrupted`, `failed`, and `unknown`.
 
-`pending_count` is the only client-visible attention correlation summary.
-Provider/session/turn identifiers may be exposed, but provider request ids and
-the active runtime id remain protected in local activity storage.
+`pending_count` is the only client-visible attention correlation summary. Only
+runtime-scoped projections of provider session/turn identifiers may be exposed.
+Provider request ids and the active runtime id remain protected in local
+activity storage. At most 64 attention correlations are retained in the
+snapshot; additional requests contribute only to a bounded overflow summary
+and keep `needs_input` conservatively latched until a new turn or completion.
 
 ## Deterministic transition rules
 
@@ -98,7 +107,7 @@ the active runtime id remain protected in local activity storage.
 | matching `turn_completed` | close current turn, clear attention, enter `waiting` |
 | matching `turn_failed` | close current turn with failed outcome, clear attention, enter `waiting` |
 | late completion for older turn | retain the newer current phase |
-| duplicate `event_id` | no state or revision change |
+| duplicate `event_id` | no state or revision change within the 4096-event active-runtime replay horizon |
 | missing/prior runtime id | reject before host timestamp or reducer |
 | corrupt snapshot | expose safe `unknown`; list/serve/delete remain available |
 
@@ -117,8 +126,13 @@ Each session owns:
 
 Activity files are separate from `session.json`, so title/resume writes and hook
 writes cannot overwrite each other. Every reducer transaction holds the lock,
-validates the active runtime, writes the snapshot atomically, and then updates
-the bounded journal. Session deletion removes the entire session directory.
+validates the active runtime, records one pending journal entry in the atomic
+snapshot, updates the bounded journal idempotently, and clears the pending
+marker. A later event repairs an interrupted split write before reduction.
+Event-id digests use a separate 4096-entry runtime replay horizon rather than
+the shorter journal retention; reaching the horizon rejects further events with
+resume guidance instead of forgetting old ids. Session deletion removes the
+entire session directory.
 
 ## Privacy and provider adapter boundary
 
@@ -142,7 +156,8 @@ agent-session activity doctor [--agent <provider>] --format json
 ```
 
 Setup is explicit, additive, idempotent, and reversible. It preserves unrelated
-provider config and never auto-accepts Codex trust or Hermes consent. Doctor
+provider config, detects an observed concurrent modification before replacement,
+and never auto-accepts Codex trust or Hermes consent. Doctor
 reports installed version, audited classification, config status, finality and
 correlation limits, trust requirements, and repair guidance without emitting
 provider config content.

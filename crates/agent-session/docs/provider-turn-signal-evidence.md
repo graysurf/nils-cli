@@ -90,9 +90,12 @@ The executable fixtures cover:
 - Stop followed by continuation/new-turn evidence;
 - duplicate and out-of-order normalized events;
 - rejection of a delayed prior-runtime event before host timestamping;
+- runtime/provider-session binding and runtime-scoped projection of raw
+  provider identifiers;
 - raw provider payloads containing content fields, proving those fields do not
   enter the snapshot or journal;
-- journal event/byte bounds and mode-0600 snapshot, journal, and lock files;
+- bounded attention overflow, independent replay/journal horizons, recoverable
+  split writes, and mode-0600 snapshot, journal, diagnostic, and lock files;
 - dry-run, additive apply, repeated apply, repair, and owned-entry-only removal
   for all three provider configs.
 
@@ -107,7 +110,8 @@ interactive sessions started by agent-session. The selected mechanism is the
 third preference: explicit `activity setup --dry-run`, followed by an additive,
 idempotent merge into the provider's user config. Existing hook arrays and
 unrelated config keys are preserved; removal deletes only the exact
-agent-session-owned command entries.
+agent-session-owned command entries. Setup refuses an observed concurrent
+source-file change instead of replacing the newer configuration.
 
 Provider hooks invoke the local binary without network access. They no-op when
 `AGENT_SESSION_ID` or `AGENT_SESSION_RUNTIME_ID` is absent, accept at most 64 KiB

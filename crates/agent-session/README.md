@@ -37,7 +37,9 @@ agent-session delete <id>
 (`--key enter|escape|c-c|up|down|left|right|tab`), so codex/claude approval prompts are answerable from a phone.
 `glance` returns the recent pane tail plus live status as a JSON contract for dashboard tiles (cheaper than a full attach).
 `resume` recreates a missing tmux runtime only when the session has exact provider resume metadata; it never resumes the
-latest provider conversation implicitly. `send` bumps `updated_at`, so `list` orders by real control-plane activity.
+latest provider conversation implicitly. Runtime metadata is persisted before launch so hooks see the new generation;
+if tmux launch fails, the prior runtime and activity snapshot are restored. `send` bumps `updated_at`, so `list` orders
+by real control-plane activity.
 `--agent hermes` launches `hermes chat` interactively (one-shot `run` mode is codex/claude only).
 
 ## Durable turn state
@@ -45,7 +47,10 @@ latest provider conversation implicitly. `send` bumps `updated_at`, so `list` or
 Every new runtime receives a fresh opaque `AGENT_SESSION_RUNTIME_ID` alongside
 `AGENT_SESSION_ID` and `AGENT_SESSION_STATE_DIR`. Supported provider hooks
 project lifecycle metadata into a private, atomic activity snapshot and bounded
-journal. Session views add optional `runtime_started_at` and `turn_state`
+journal. Provider identifiers are runtime-scoped opaque projections, attention
+and replay state are explicitly bounded, and interrupted snapshot/journal
+writes repair on the next event. Session views add optional
+`runtime_started_at` and `turn_state`
 fields, distinguishing `starting`, `working`, `waiting`, `needs_input`, and
 `unknown` without storing prompt, assistant, terminal, command, tool, or
 transcript content.
@@ -63,7 +68,8 @@ agent-session activity setup --agent codex --remove
 The same commands support `claude` and `hermes`. Setup merges exact
 agent-session-owned handlers into existing provider configuration, repeated
 apply/repair is idempotent, and removal preserves unrelated hooks. Provider
-hook failure is fail-open and old/unsupported providers retain the activity
+setup also refuses an observed concurrent config change. Provider hook failure
+is fail-open and old/unsupported providers retain the activity
 fallback. See [the stable turn-state contract](docs/turn-state-contract.md) and
 [provider evidence matrix](docs/provider-turn-signal-evidence.md).
 

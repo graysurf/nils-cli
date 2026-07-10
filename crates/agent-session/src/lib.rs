@@ -2322,6 +2322,8 @@ fn resume_session_by_id(
         _ => {}
     }
     let (provider_resume, agent) = validate_resume_metadata(&record)?;
+    let previous_record = record.clone();
+    let previous_activity = activity::capture_snapshot(context, &record.id)?;
     let resume_args = provider_resume.resume_args.clone();
     let agent_bin = record
         .agent_bin
@@ -2349,13 +2351,30 @@ fn resume_session_by_id(
     record.updated_at = now.timestamp().to_string();
     write_session_record(context, &record)?;
     activity::activate_runtime(context, &record)?;
-    start_resume_tmux(
+    if let Err(launch_err) = start_resume_tmux(
         tmux_bin,
         &agent_bin,
         &context.state_dir,
         &record,
         &resume_args,
-    )?;
+    ) {
+        let record_restore = write_session_record(context, &previous_record);
+        let activity_restore =
+            activity::restore_snapshot(context, &record.id, previous_activity.as_deref());
+        if record_restore.is_err() || activity_restore.is_err() {
+            return Err(CliError::runtime(
+                "resume-launch-rollback-failed",
+                "provider resume launch failed and the prior durable runtime could not be fully restored",
+                Some(json!({
+                    "id": record.id,
+                    "launch_error": launch_err.code(),
+                    "record_restored": record_restore.is_ok(),
+                    "activity_restored": activity_restore.is_ok()
+                })),
+            ));
+        }
+        return Err(launch_err);
+    }
     Ok(session_view(
         context,
         &record,
