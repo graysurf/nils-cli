@@ -90,6 +90,8 @@ pub(crate) struct CurrentTurn {
     pub(crate) provider_turn_id: Option<String>,
     pub(crate) started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_progress_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) attention: Option<AttentionView>,
     #[serde(default, flatten)]
     extra: Map<String, Value>,
@@ -385,6 +387,13 @@ fn event_dedupe_key(runtime_id: &str, event_id: &str) -> [u8; REPLAY_SLOT_BYTES]
 fn semantic_event_key(event: &TurnEvent) -> String {
     let mut digest = Sha256::new();
     digest.update(b"agent-session.semantic-event.v1\0");
+    let correlated_attention_id = if event.attention_kind.as_deref() == Some("clarification")
+        || event.kind == TurnEventKind::AttentionCleared
+    {
+        event.attention_id.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
     for value in [
         event.provider.as_str(),
         event.provider_session_id.as_deref().unwrap_or(""),
@@ -399,6 +408,7 @@ fn semantic_event_key(event: &TurnEvent) -> String {
             TurnEventKind::TurnFailed => "turn_failed",
         },
         event.attention_kind.as_deref().unwrap_or(""),
+        correlated_attention_id,
     ] {
         digest.update(value.as_bytes());
         digest.update(b"\0");
@@ -1069,6 +1079,13 @@ fn normalize_provider_hook(
         return Ok(None);
     };
     let notification = raw.get("notification_type").and_then(Value::as_str);
+    let tool_name = raw.get("tool_name").and_then(Value::as_str);
+    let exact_clarification = agent == AgentKind::Claude
+        && tool_name == Some("AskUserQuestion")
+        && matches!(
+            event_name,
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+        );
     let (kind, attention_kind, confidence) = match (agent, event_name, notification) {
         (AgentKind::Codex, "UserPromptSubmit", _) => {
             (TurnEventKind::TurnStarted, None, Confidence::Observed)
@@ -1084,6 +1101,17 @@ fn normalize_provider_hook(
         (AgentKind::Codex, "Stop", _) => (TurnEventKind::StopObserved, None, Confidence::Observed),
         (AgentKind::Claude, "UserPromptSubmit", _) => {
             (TurnEventKind::TurnStarted, None, Confidence::Observed)
+        }
+        (AgentKind::Claude, "PreToolUse", _) if exact_clarification => (
+            TurnEventKind::AttentionRequested,
+            Some("clarification"),
+            Confidence::Observed,
+        ),
+        (AgentKind::Claude, "PostToolUse", _) if exact_clarification => {
+            (TurnEventKind::AttentionCleared, None, Confidence::Observed)
+        }
+        (AgentKind::Claude, "PostToolUseFailure", _) if exact_clarification => {
+            (TurnEventKind::AttentionCleared, None, Confidence::Observed)
         }
         (AgentKind::Claude, "PermissionRequest", _)
         | (AgentKind::Claude, "Notification", Some("permission_prompt")) => (
@@ -1137,8 +1165,23 @@ fn normalize_provider_hook(
         .and_then(Value::as_str)
         .map(|value| projected_provider_identifier(runtime_id, agent, "turn", value))
         .transpose()?;
-    let attention_id =
-        (kind == TurnEventKind::AttentionRequested).then(|| uuid::Uuid::new_v4().to_string());
+    let exact_attention_id = if exact_clarification {
+        raw.get("tool_use_id")
+            .and_then(Value::as_str)
+            .map(|value| projected_provider_identifier(runtime_id, agent, "attention", value))
+            .transpose()?
+    } else {
+        None
+    };
+    if exact_clarification && exact_attention_id.is_none() {
+        return Ok(None);
+    }
+    let attention_id = match kind {
+        TurnEventKind::AttentionRequested if exact_clarification => exact_attention_id,
+        TurnEventKind::AttentionRequested => Some(uuid::Uuid::new_v4().to_string()),
+        TurnEventKind::AttentionCleared => exact_attention_id,
+        _ => None,
+    };
     Ok(Some(TurnEvent {
         schema_version: TURN_EVENT_VERSION.to_string(),
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -1212,7 +1255,7 @@ pub(crate) fn doctor(
                 AgentKind::Claude => (
                     "partial",
                     "idle_prompt is observed completion; raw Stop remains non-final because other hooks may continue",
-                    "PermissionRequest omits tool_use_id; attention is conservatively latched",
+                    "AskUserQuestion uses exact runtime-scoped tool_use_id correlation; PermissionRequest and notifications remain conservative latches",
                     "Claude settings hooks compose additively and execute with the user's permissions",
                     "Run activity setup --agent claude --dry-run and then --apply",
                 ),
@@ -1481,7 +1524,7 @@ fn probe_version_command(binary: &str, timeout: Duration) -> VersionProbe {
 fn audited_floor(agent: AgentKind) -> (u64, u64, u64) {
     match agent {
         AgentKind::Codex => (0, 144, 1),
-        AgentKind::Claude => (2, 1, 198),
+        AgentKind::Claude => (2, 1, 206),
         AgentKind::Hermes => (0, 18, 0),
     }
 }
@@ -1553,8 +1596,20 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
                 matcher: None,
             },
             ProviderSpec {
+                event: "PreToolUse",
+                matcher: Some("AskUserQuestion"),
+            },
+            ProviderSpec {
                 event: "PostToolUse",
                 matcher: None,
+            },
+            ProviderSpec {
+                event: "PostToolUse",
+                matcher: Some("AskUserQuestion"),
+            },
+            ProviderSpec {
+                event: "PostToolUseFailure",
+                matcher: Some("AskUserQuestion"),
             },
             ProviderSpec {
                 event: "Stop",
@@ -2058,6 +2113,11 @@ mod tests {
             &event(TurnEventKind::Progress, "unrelated-progress"),
             "2026-07-10T00:00:03Z",
         );
+        assert_eq!(
+            serde_json::to_value(&document.state).expect("state json")["current_turn"]["last_progress_at"],
+            "2026-07-10T00:00:03Z",
+            "accepted provider progress should expose a safe monotonic timestamp"
+        );
         reduce(
             &mut document,
             &event(TurnEventKind::StopObserved, "raw-stop"),
@@ -2069,6 +2129,11 @@ mod tests {
         clear.attention_id = Some("request-1".to_string());
         reduce(&mut document, &clear, "2026-07-10T00:00:05Z");
         assert_eq!(document.state.phase, TurnPhase::NeedsInput);
+        assert_eq!(
+            serde_json::to_value(&document.state).expect("state json")["current_turn"]["last_progress_at"],
+            "2026-07-10T00:00:05Z",
+            "an exact response is both a correlated clear and safe provider progress"
+        );
         assert_eq!(
             document
                 .state
@@ -2083,6 +2148,30 @@ mod tests {
         clear.attention_id = Some("request-2".to_string());
         reduce(&mut document, &clear, "2026-07-10T00:00:06Z");
         assert_eq!(document.state.phase, TurnPhase::Working);
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .map(|turn| turn.started_at.as_str()),
+            Some("2026-07-10T00:00:01Z"),
+            "clearing attention must not reset the original turn timer"
+        );
+
+        reduce(
+            &mut document,
+            &event(TurnEventKind::Progress, "late-progress"),
+            "2026-07-10T00:00:04Z",
+        );
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.last_progress_at.as_deref()),
+            Some("2026-07-10T00:00:06Z"),
+            "out-of-order evidence must not regress the monotonic progress timestamp"
+        );
     }
 
     #[test]
@@ -2198,6 +2287,97 @@ mod tests {
     }
 
     #[test]
+    fn claude_ask_user_question_uses_exact_runtime_scoped_correlation() {
+        let request = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            "runtime-1",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "claude-session",
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "tool-use-secret-1",
+                "tool_input": {"questions": [{"question": "discarded"}]}
+            }),
+        )
+        .expect("request mapping")
+        .expect("recognized request");
+        assert_eq!(request.kind, TurnEventKind::AttentionRequested);
+        assert_eq!(request.attention_kind.as_deref(), Some("clarification"));
+        let correlation = request.attention_id.as_deref().expect("correlation id");
+        assert!(correlation.starts_with("local:v1:"));
+        assert!(!correlation.contains("tool-use-secret-1"));
+
+        for event_name in ["PostToolUse", "PostToolUseFailure"] {
+            let response = normalize_provider_hook(
+                AgentKind::Claude,
+                None,
+                "runtime-1",
+                &json!({
+                    "hook_event_name": event_name,
+                    "session_id": "claude-session",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "tool-use-secret-1",
+                    "tool_response": {"answers": "discarded"},
+                    "error": "discarded"
+                }),
+            )
+            .expect("response mapping")
+            .expect("recognized response");
+            assert_eq!(response.kind, TurnEventKind::AttentionCleared);
+            assert_eq!(response.attention_id.as_deref(), Some(correlation));
+            let serialized = serde_json::to_string(&response).expect("response json");
+            assert!(!serialized.contains("tool-use-secret-1"));
+            assert!(!serialized.contains("answers"));
+            assert!(!serialized.contains("discarded"));
+        }
+
+        let permission = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            "runtime-1",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": "claude-session",
+                "tool_name": "Bash"
+            }),
+        )
+        .expect("permission mapping")
+        .expect("recognized permission");
+        assert_eq!(permission.kind, TurnEventKind::AttentionRequested);
+        assert_ne!(permission.attention_id.as_deref(), Some(correlation));
+
+        let unrelated = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            "runtime-1",
+            &json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "claude-session",
+                "tool_name": "Bash",
+                "tool_use_id": "other-tool"
+            }),
+        )
+        .expect("progress mapping")
+        .expect("recognized progress");
+        assert_eq!(unrelated.kind, TurnEventKind::Progress);
+        assert!(unrelated.attention_id.is_none());
+
+        let missing_correlation = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            "runtime-1",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "claude-session",
+                "tool_name": "AskUserQuestion"
+            }),
+        )
+        .expect("missing correlation fails open");
+        assert!(missing_correlation.is_none());
+    }
+
+    #[test]
     fn frozen_provider_fixtures_replay_through_each_adapter() {
         let cases = [
             (
@@ -2215,6 +2395,10 @@ mod tests {
                 include_str!("../tests/fixtures/activity/claude-events.jsonl"),
                 vec![
                     TurnEventKind::TurnStarted,
+                    TurnEventKind::AttentionRequested,
+                    TurnEventKind::AttentionCleared,
+                    TurnEventKind::AttentionRequested,
+                    TurnEventKind::AttentionCleared,
                     TurnEventKind::AttentionRequested,
                     TurnEventKind::Progress,
                     TurnEventKind::StopObserved,
@@ -2285,6 +2469,7 @@ mod tests {
         );
         assert_eq!(parse_version_triplet("Hermes 0.18.0"), Some((0, 18, 0)));
         assert_eq!(parse_version_triplet("development build"), None);
+        assert_eq!(audited_floor(AgentKind::Claude), (2, 1, 206));
     }
 
     #[test]
@@ -2666,6 +2851,19 @@ mod tests {
             &hermes,
             provider_specs(AgentKind::Hermes)[0]
         ));
+
+        let claude_specs = provider_specs(AgentKind::Claude);
+        assert!(
+            claude_specs.iter().any(|spec| {
+                spec.event == "PreToolUse" && spec.matcher == Some("AskUserQuestion")
+            })
+        );
+        assert!(claude_specs.iter().any(|spec| {
+            spec.event == "PostToolUse" && spec.matcher == Some("AskUserQuestion")
+        }));
+        assert!(claude_specs.iter().any(|spec| {
+            spec.event == "PostToolUseFailure" && spec.matcher == Some("AskUserQuestion")
+        }));
     }
 
     #[test]
@@ -2802,6 +3000,13 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/activity/turn-states.json"))
                 .expect("turn state fixtures");
         assert_eq!(states.len(), 3);
+        assert_eq!(
+            states[1]
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.last_progress_at.as_deref()),
+            Some("2026-07-10T00:00:03Z")
+        );
 
         for fixture in [
             include_str!("../tests/fixtures/activity/codex-events.jsonl"),
@@ -2817,6 +3022,9 @@ mod tests {
                 "tool_response",
                 "transcript_path",
                 "\"command\":",
+                "\"questions\":",
+                "\"options\":",
+                "\"answers\":",
                 "token",
             ] {
                 assert!(!fixture.contains(forbidden), "forbidden key {forbidden}");
@@ -2937,6 +3145,7 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
             document.state.current_turn = Some(CurrentTurn {
                 provider_turn_id: event.provider_turn_id.clone(),
                 started_at: at.to_string(),
+                last_progress_at: None,
                 attention: None,
                 extra: Map::new(),
             });
@@ -2947,6 +3156,7 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                 document.state.current_turn = Some(CurrentTurn {
                     provider_turn_id: event.provider_turn_id.clone(),
                     started_at: at.to_string(),
+                    last_progress_at: None,
                     attention: None,
                     extra: Map::new(),
                 });
@@ -2987,6 +3197,9 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
             document
                 .pending_attention
                 .retain(|pending| pending.id != attention_id);
+            if let Some(current) = document.state.current_turn.as_mut() {
+                advance_last_progress_at(current, at);
+            }
             refresh_attention(document);
             document.state.phase =
                 if document.pending_attention.is_empty() && document.overflow_attention.is_none() {
@@ -3000,9 +3213,13 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                 document.state.current_turn = Some(CurrentTurn {
                     provider_turn_id: event.provider_turn_id.clone(),
                     started_at: at.to_string(),
+                    last_progress_at: None,
                     attention: None,
                     extra: Map::new(),
                 });
+            }
+            if let Some(current) = document.state.current_turn.as_mut() {
+                advance_last_progress_at(current, at);
             }
             if document.pending_attention.is_empty() && document.overflow_attention.is_none() {
                 document.state.phase = TurnPhase::Working;
@@ -3067,6 +3284,20 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
     document.state.source = source;
     if document.state.phase != previous_phase {
         document.state.phase_changed_at = at.to_string();
+    }
+}
+
+fn advance_last_progress_at(current: &mut CurrentTurn, at: &str) {
+    let Ok(candidate) = at.parse::<jiff::Timestamp>() else {
+        return;
+    };
+    let should_advance = current
+        .last_progress_at
+        .as_deref()
+        .and_then(|value| value.parse::<jiff::Timestamp>().ok())
+        .is_none_or(|previous| candidate > previous);
+    if should_advance {
+        current.last_progress_at = Some(at.to_string());
     }
 }
 
