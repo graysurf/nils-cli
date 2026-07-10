@@ -610,11 +610,11 @@ pub(crate) fn restore_snapshot(
 
 fn restore_activity_file(path: &Path, snapshot: Option<&[u8]>) -> Result<(), CliError> {
     if let Some(bytes) = snapshot {
-        write_atomic(&path, bytes, SECRET_FILE_MODE).map_err(|err| {
+        write_atomic(path, bytes, SECRET_FILE_MODE).map_err(|err| {
             CliError::runtime(
                 "activity-write-failed",
                 format!("activity storage failed at {}: {err}", path.display()),
-                Some(json!({ "path": display_path(&path) })),
+                Some(json!({ "path": display_path(path) })),
             )
         })
     } else {
