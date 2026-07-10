@@ -155,6 +155,85 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':id -- Session id:_default' \
 && ret=0
 ;;
+(activity)
+_arguments "${_arguments_options[@]}" : \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_agent-session__subcmd__activity_commands" \
+"*::: :->activity" \
+&& ret=0
+
+    case $state in
+    (activity)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-session-activity-command-$line[1]:"
+        case $line[1] in
+            (event)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'--stdin[Read the JSON event from stdin]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Session id:_default' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Session id:_default' \
+&& ret=0
+;;
+(hook)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Provider whose hook payload is on stdin]:AGENT:(codex claude hermes)' \
+'--event=[Provider event name when the raw payload does not carry one]:EVENT:_default' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Limit diagnostics to one provider]:AGENT:(codex claude hermes)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(setup)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Provider to configure]:AGENT:(codex claude hermes)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'(--apply --remove --repair)--dry-run[Preview the exact additive change without writing it]' \
+'(--dry-run --remove --repair)--apply[Apply the additive provider integration]' \
+'(--dry-run --apply --repair)--remove[Remove only agent-session-owned provider hook entries]' \
+'(--dry-run --apply --remove)--repair[Restore missing agent-session-owned entries without replacing others]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (serve)
 _arguments "${_arguments_options[@]}" : \
 '--bind=[Address to bind. Defaults to loopback; a non-loopback address is refused unless --allow-non-loopback is passed (it exposes a remote shell)]:ADDR:_default' \
@@ -207,11 +286,48 @@ _agent-session_commands() {
 'send:Send input (literal text and/or special keys) to a live session' \
 'glance:Capture the recent pane tail plus live status as a dashboard glance' \
 'resume:Recreate a missing tmux runtime from exact provider resume metadata' \
+'activity:Inspect or ingest metadata-only agent turn lifecycle events' \
 'serve:Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback' \
 'delete:Delete session state and kill the tmux session if it is still alive' \
 'completion:Print shell completion script' \
     )
     _describe -t commands 'agent-session commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__activity_commands] )) ||
+_agent-session__subcmd__activity_commands() {
+    local commands; commands=(
+'event:Ingest one normalized metadata-only lifecycle event from stdin' \
+'status:Inspect the durable turn-state snapshot for one session' \
+'hook:Translate one provider hook payload into a safe normalized event' \
+'doctor:Report provider support, version, configuration, and repair guidance' \
+'setup:Preview or apply additive provider hook configuration' \
+    )
+    _describe -t commands 'agent-session activity commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__activity__subcmd__doctor_commands] )) ||
+_agent-session__subcmd__activity__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session activity doctor commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__activity__subcmd__event_commands] )) ||
+_agent-session__subcmd__activity__subcmd__event_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session activity event commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__activity__subcmd__hook_commands] )) ||
+_agent-session__subcmd__activity__subcmd__hook_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session activity hook commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__activity__subcmd__setup_commands] )) ||
+_agent-session__subcmd__activity__subcmd__setup_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session activity setup commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__activity__subcmd__status_commands] )) ||
+_agent-session__subcmd__activity__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session activity status commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__attach_commands] )) ||
 _agent-session__subcmd__attach_commands() {

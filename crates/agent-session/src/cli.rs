@@ -53,6 +53,8 @@ pub enum Command {
     Glance(GlanceArgs),
     /// Recreate a missing tmux runtime from exact provider resume metadata.
     Resume(ResumeArgs),
+    /// Inspect or ingest metadata-only agent turn lifecycle events.
+    Activity(ActivityArgs),
     /// Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback.
     Serve(ServeArgs),
     /// Delete session state and kill the tmux session if it is still alive.
@@ -263,6 +265,106 @@ pub struct ResumeArgs {
     /// tmux binary override.
     #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub tmux_bin: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ActivityArgs {
+    #[command(subcommand)]
+    pub command: ActivityCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ActivityCommand {
+    /// Ingest one normalized metadata-only lifecycle event from stdin.
+    Event(ActivityEventArgs),
+    /// Inspect the durable turn-state snapshot for one session.
+    Status(ActivityStatusArgs),
+    /// Translate one provider hook payload into a safe normalized event.
+    #[command(hide = true)]
+    Hook(ActivityHookArgs),
+    /// Report provider support, version, configuration, and repair guidance.
+    Doctor(ActivityDoctorArgs),
+    /// Preview or apply additive provider hook configuration.
+    Setup(ActivitySetupArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ActivityEventArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// Read the JSON event from stdin.
+    #[arg(long, required = true)]
+    pub stdin: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ActivityStatusArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ActivityHookArgs {
+    /// Provider whose hook payload is on stdin.
+    #[arg(long, value_enum)]
+    pub agent: AgentKind,
+
+    /// Provider event name when the raw payload does not carry one.
+    #[arg(long, hide = true)]
+    pub event: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ActivityDoctorArgs {
+    /// Limit diagnostics to one provider.
+    #[arg(long, value_enum)]
+    pub agent: Option<AgentKind>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ActivitySetupArgs {
+    /// Provider to configure.
+    #[arg(long, value_enum)]
+    pub agent: AgentKind,
+
+    /// Preview the exact additive change without writing it.
+    #[arg(
+        long,
+        required_unless_present_any = ["apply", "remove", "repair"],
+        conflicts_with_all = ["apply", "remove", "repair"]
+    )]
+    pub dry_run: bool,
+
+    /// Apply the additive provider integration.
+    #[arg(long, conflicts_with_all = ["dry_run", "remove", "repair"])]
+    pub apply: bool,
+
+    /// Remove only agent-session-owned provider hook entries.
+    #[arg(long, conflicts_with_all = ["dry_run", "apply", "repair"])]
+    pub remove: bool,
+
+    /// Restore missing agent-session-owned entries without replacing others.
+    #[arg(long, conflicts_with_all = ["dry_run", "apply", "remove"])]
+    pub repair: bool,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]

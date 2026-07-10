@@ -354,6 +354,519 @@ fn help_includes_version_flag_and_examples() {
 }
 
 #[test]
+fn activity_events_are_runtime_bound_private_and_deterministic() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let envs = [("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())];
+    let start = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    let start_json = start.stdout_json();
+    let start_data = data(&start_json);
+    let id = start_data["id"].as_str().expect("session id");
+    assert_eq!(
+        start_data["turn_state"]["schema_version"],
+        "agent-session.turn-state.v1"
+    );
+    assert_eq!(start_data["turn_state"]["phase"], "starting");
+    assert!(start_data["runtime_started_at"].is_string());
+
+    let session_dir = state_dir.join("sessions").join(id);
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(session_dir.join("session.json")).expect("session record"),
+    )
+    .expect("session json");
+    let runtime_id = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("runtime launch id");
+    let new_session = tmux_calls(&tmux_log)
+        .into_iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("new-session call");
+    assert!(
+        new_session
+            .windows(2)
+            .any(|pair| pair == ["-e", &format!("AGENT_SESSION_ID={id}")])
+    );
+    assert!(new_session.windows(2).any(|pair| {
+        pair == [
+            "-e",
+            &format!("AGENT_SESSION_STATE_DIR={}", state_dir.display()),
+        ]
+    }));
+    assert!(
+        new_session
+            .windows(2)
+            .any(|pair| { pair == ["-e", &format!("AGENT_SESSION_RUNTIME_ID={runtime_id}")] })
+    );
+
+    let event = |event_id: &str,
+                 kind: &str,
+                 turn_id: Option<&str>,
+                 attention_id: Option<&str>,
+                 runtime: &str| {
+        let mut value = json!({
+            "schema_version": "agent-session.turn-event.v1",
+            "event_id": event_id,
+            "runtime_id": runtime,
+            "provider": "codex",
+            "provider_session_id": "provider-session",
+            "kind": kind,
+            "confidence": "observed"
+        });
+        if let Some(turn_id) = turn_id {
+            value["provider_turn_id"] = json!(turn_id);
+        }
+        if let Some(attention_id) = attention_id {
+            value["attention_id"] = json!(attention_id);
+            value["attention_kind"] = json!("approval");
+        }
+        value.to_string()
+    };
+    let submit = |payload: &str| {
+        run_with_stdin(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "activity",
+                "event",
+                id,
+                "--stdin",
+                "--format",
+                "json",
+            ],
+            &[],
+            payload,
+        )
+    };
+
+    let started = submit(&event(
+        "evt-start",
+        "turn_started",
+        Some("turn-1"),
+        None,
+        runtime_id,
+    ));
+    assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
+    assert_eq!(
+        data(&started.stdout_json())["turn_state"]["phase"],
+        "working"
+    );
+
+    let attention = submit(&event(
+        "evt-attention",
+        "attention_requested",
+        Some("turn-1"),
+        Some("approval-1"),
+        runtime_id,
+    ));
+    assert_eq!(attention.code, 0, "stderr={}", attention.stderr_text());
+    let attention_json = attention.stdout_json();
+    let attention_data = data(&attention_json);
+    assert_eq!(attention_data["turn_state"]["phase"], "needs_input");
+    assert_eq!(
+        attention_data["turn_state"]["current_turn"]["attention"]["pending_count"],
+        1
+    );
+    let attention_revision = attention_data["turn_state"]["revision"]
+        .as_u64()
+        .expect("attention revision");
+
+    let unrelated = submit(&event(
+        "evt-progress",
+        "progress",
+        Some("turn-1"),
+        None,
+        runtime_id,
+    ));
+    assert_eq!(unrelated.code, 0, "stderr={}", unrelated.stderr_text());
+    assert_eq!(
+        data(&unrelated.stdout_json())["turn_state"]["phase"],
+        "needs_input",
+        "uncorrelated progress must not clear attention"
+    );
+
+    let stale = submit(&event(
+        "evt-stale",
+        "turn_completed",
+        Some("turn-1"),
+        None,
+        "prior-runtime",
+    ));
+    assert_ne!(stale.code, 0);
+    assert_eq!(stale.stdout_json()["error"]["code"], "runtime-id-mismatch");
+
+    let completed_payload = event(
+        "evt-complete",
+        "turn_completed",
+        Some("turn-1"),
+        None,
+        runtime_id,
+    );
+    let completed = submit(&completed_payload);
+    assert_eq!(completed.code, 0, "stderr={}", completed.stderr_text());
+    let completed_json = completed.stdout_json();
+    let completed_data = data(&completed_json);
+    assert_eq!(completed_data["turn_state"]["phase"], "waiting");
+    assert_eq!(
+        completed_data["turn_state"]["last_turn"]["outcome"],
+        "completed"
+    );
+    assert!(
+        completed_data["turn_state"]["revision"]
+            .as_u64()
+            .expect("completed revision")
+            > attention_revision
+    );
+    let completed_revision = completed_data["turn_state"]["revision"].clone();
+
+    let duplicate = submit(&completed_payload);
+    assert_eq!(duplicate.code, 0, "stderr={}", duplicate.stderr_text());
+    assert_eq!(
+        data(&duplicate.stdout_json())["turn_state"]["revision"],
+        completed_revision,
+        "duplicate events must be idempotent"
+    );
+
+    for file in ["activity.json", "activity.journal.jsonl"] {
+        let path = session_dir.join(file);
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("activity metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let contents = fs::read_to_string(path).expect("activity file");
+        assert!(!contents.contains("prompt"));
+        assert!(!contents.contains("tool_input"));
+        assert!(!contents.contains("transcript"));
+    }
+}
+
+#[test]
+fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    fs::create_dir_all(home.join(".claude")).expect("claude dir");
+    fs::create_dir_all(home.join(".hermes")).expect("hermes dir");
+    let codex_path = home.join(".codex/hooks.json");
+    let claude_path = home.join(".claude/settings.json");
+    let hermes_path = home.join(".hermes/config.yaml");
+    fs::write(
+        &codex_path,
+        r#"{"keep":"codex","hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep-codex-hook"}]}]}}"#,
+    )
+    .expect("codex config");
+    fs::write(
+        &claude_path,
+        r#"{"keep":"claude","hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep-claude-hook"}]}]}}"#,
+    )
+    .expect("claude config");
+    fs::write(
+        &hermes_path,
+        "keep: hermes\nhooks:\n  post_llm_call:\n    - command: keep-hermes-hook\n",
+    )
+    .expect("hermes config");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    for (agent, path, keep) in [
+        ("codex", codex_path.as_path(), "keep-codex-hook"),
+        ("claude", claude_path.as_path(), "keep-claude-hook"),
+        ("hermes", hermes_path.as_path(), "keep-hermes-hook"),
+    ] {
+        let before = fs::read(path).expect("before config");
+        let dry_run = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                agent,
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(
+            dry_run.code,
+            0,
+            "agent={agent} stderr={}",
+            dry_run.stderr_text()
+        );
+        assert_eq!(data(&dry_run.stdout_json())["changed"], true);
+        assert_eq!(fs::read(path).expect("dry-run config"), before);
+
+        let apply = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", agent, "--apply", "--format", "json",
+            ],
+            &envs,
+        );
+        assert_eq!(
+            apply.code,
+            0,
+            "agent={agent} stderr={}",
+            apply.stderr_text()
+        );
+        let apply_json = apply.stdout_json();
+        assert_eq!(data(&apply_json)["changed"], true);
+        assert_eq!(data(&apply_json)["configured"], true);
+        let applied = fs::read(path).expect("applied config");
+        assert!(String::from_utf8_lossy(&applied).contains(keep));
+
+        let second = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", agent, "--apply", "--format", "json",
+            ],
+            &envs,
+        );
+        assert_eq!(
+            second.code,
+            0,
+            "agent={agent} stderr={}",
+            second.stderr_text()
+        );
+        assert_eq!(data(&second.stdout_json())["changed"], false);
+        assert_eq!(fs::read(path).expect("second config"), applied);
+
+        let remove = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", agent, "--remove", "--format", "json",
+            ],
+            &envs,
+        );
+        assert_eq!(
+            remove.code,
+            0,
+            "agent={agent} stderr={}",
+            remove.stderr_text()
+        );
+        let removed = fs::read_to_string(path).expect("removed config");
+        assert!(removed.contains(keep));
+        assert!(!removed.contains("agent-session activity hook"));
+    }
+}
+
+#[test]
+fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let start = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    let start_json = start.stdout_json();
+    let id = data(&start_json)["id"].as_str().expect("id").to_string();
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(state_dir.join("sessions").join(&id).join("session.json"))
+            .expect("record"),
+    )
+    .expect("record json");
+    let runtime_id = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("runtime id")
+        .to_string();
+    let hook_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let secret = "sk-proj-content-must-not-persist";
+    let prompt = json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "provider-session",
+        "turn_id": "provider-turn",
+        "prompt": secret,
+        "transcript_path": "/secret/transcript.jsonl"
+    })
+    .to_string();
+    let hook = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &hook_env,
+        &prompt,
+    );
+    assert_eq!(hook.code, 0);
+    assert!(hook.stdout_text().is_empty());
+    assert!(hook.stderr_text().is_empty());
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&status.stdout_json())["turn_state"]["phase"],
+        "working"
+    );
+
+    let stop = json!({
+        "hook_event_name": "Stop",
+        "session_id": "provider-session",
+        "turn_id": "provider-turn",
+        "last_assistant_message": secret,
+        "stop_hook_active": false
+    })
+    .to_string();
+    let hook = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &hook_env,
+        &stop,
+    );
+    assert_eq!(hook.code, 0);
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&status.stdout_json())["turn_state"]["phase"],
+        "working",
+        "raw Stop must not claim Waiting"
+    );
+    for file in ["activity.json", "activity.journal.jsonl"] {
+        let contents = fs::read_to_string(state_dir.join("sessions").join(&id).join(file))
+            .expect("activity file");
+        assert!(!contents.contains(secret));
+        assert!(!contents.contains("transcript_path"));
+        assert!(!contents.contains("last_assistant_message"));
+    }
+
+    let malformed = format!(r#"{{"prompt":"{secret}""#);
+    let hook = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &hook_env,
+        &malformed,
+    );
+    assert_eq!(hook.code, 0, "provider hooks must remain fail-open");
+    let diagnostic_path = state_dir
+        .join("sessions")
+        .join(&id)
+        .join("activity.diagnostic.json");
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("safe diagnostic");
+    assert!(diagnostic.contains("provider-hook-invalid"));
+    assert!(!diagnostic.contains(secret));
+    assert_eq!(
+        fs::metadata(&diagnostic_path)
+            .expect("diagnostic metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let doctor = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "doctor",
+            "--agent",
+            "codex",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&doctor.stdout_json())["providers"][0]["last_error"],
+        "provider-hook-invalid"
+    );
+
+    let progress = json!({"hook_event_name": "PostToolUse"}).to_string();
+    let hook = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &hook_env,
+        &progress,
+    );
+    assert_eq!(hook.code, 0);
+    assert!(!diagnostic_path.exists());
+}
+
+#[test]
 fn start_creates_session_state_without_printing_prompt() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -426,6 +939,12 @@ fn start_creates_session_state_without_printing_prompt() {
         fs::read_to_string(prompt_file).expect("prompt file"),
         prompt
     );
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(state_dir.join("sessions").join(id).join("session.json"))
+            .expect("session record"),
+    )
+    .expect("session json");
+    let runtime_id = record["runtime"]["launch_id"].as_str().expect("runtime id");
 
     let calls = tmux_calls(&tmux_log);
     let new_session = calls
@@ -441,6 +960,12 @@ fn start_creates_session_state_without_printing_prompt() {
             result["tmux_session"].as_str().unwrap().to_string(),
             "-c".to_string(),
             cwd_arg.clone(),
+            "-e".to_string(),
+            format!("AGENT_SESSION_ID={id}"),
+            "-e".to_string(),
+            format!("AGENT_SESSION_STATE_DIR={}", state_dir.display()),
+            "-e".to_string(),
+            format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
             "--".to_string(),
             codex_arg.clone(),
             "--cd".to_string(),
@@ -2485,6 +3010,9 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
         .iter()
         .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
         .expect("new-session call");
+    let record_path = state_dir.join("sessions/recoverable/session.json");
+    let record: Value = serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    let runtime_id = record["runtime"]["launch_id"].as_str().expect("runtime id");
     assert_eq!(
         new_session,
         &vec![
@@ -2494,6 +3022,12 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             "hs-codex-recoverable".to_string(),
             "-c".to_string(),
             cwd.to_string_lossy().to_string(),
+            "-e".to_string(),
+            "AGENT_SESSION_ID=recoverable".to_string(),
+            "-e".to_string(),
+            format!("AGENT_SESSION_STATE_DIR={}", state_dir.display()),
+            "-e".to_string(),
+            format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
             "--".to_string(),
             codex_arg.clone(),
             "resume".to_string(),
@@ -2506,8 +3040,6 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
         ]
     );
 
-    let record_path = state_dir.join("sessions/recoverable/session.json");
-    let record: Value = serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
     assert_eq!(record["id"], "recoverable");
     assert_eq!(record["runtime"]["generation"], 2);
     assert_ne!(record["updated_at"], "2000-01-01T00:00:00Z");
@@ -2519,7 +3051,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
 }
 
 #[test]
-fn resume_reports_persisted_state_when_runtime_refresh_write_fails() {
+fn resume_persists_runtime_generation_before_provider_launch() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let cwd = tmp.path().join("repo");
@@ -2570,14 +3102,16 @@ fn resume_reports_persisted_state_when_runtime_refresh_write_fails() {
     let result = data(&value);
     assert_eq!(result["status"], "running");
     assert_eq!(result["resumable"], true);
-    assert_eq!(result["updated_at"], "2000-01-01T00:00:00Z");
+    assert_ne!(result["updated_at"], "2000-01-01T00:00:00Z");
+    assert_eq!(result["turn_state"]["phase"], "starting");
     let _ = fs::set_permissions(&session, fs::Permissions::from_mode(0o700));
     let record_path = session.join("session.json");
     let record: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
             .expect("record json");
-    assert_eq!(record["runtime"]["generation"], 1);
-    assert_eq!(record["updated_at"], "2000-01-01T00:00:00Z");
+    assert_eq!(record["runtime"]["generation"], 2);
+    assert!(record["runtime"]["launch_id"].is_string());
+    assert_ne!(record["updated_at"], "2000-01-01T00:00:00Z");
 }
 
 #[test]

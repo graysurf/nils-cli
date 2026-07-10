@@ -1,0 +1,120 @@
+# Provider turn signal evidence
+
+## Status and scope
+
+This report freezes the provider lifecycle evidence used by
+`agent-session.turn-event.v1` and `agent-session.turn-state.v1`. It was audited
+on 2026-07-10 against Codex CLI 0.144.1, Claude Code 2.1.206, Hermes Agent
+0.18.0, and agent-session 1.21.6. The support floors are deliberately the
+oldest versions directly covered by this audit, not guesses about earlier
+releases.
+
+The fixtures under `tests/fixtures/activity/` contain lifecycle identifiers and
+event names only. Prompt text, assistant output, tool input/output, commands,
+transcript paths, credentials, and terminal content are removed before the
+normalized event is created.
+
+## Evidence sources
+
+- [Codex hooks](https://learn.chatgpt.com/docs/hooks) documents concurrent
+  matching hooks, additive discovery across active config layers, trust review,
+  `turn_id`, and the `UserPromptSubmit`, `PermissionRequest`, `PostToolUse`, and
+  `Stop` payloads.
+- [Codex notifications](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)
+  documents the older `agent-turn-complete`-only notify surface. It is not
+  installed automatically because `notify` is a singular user-owned command.
+- [Claude Code hooks](https://code.claude.com/docs/en/hooks) documents parallel
+  matching hooks, `UserPromptSubmit`, `PermissionRequest`, `PostToolUse`,
+  `Stop`, `StopFailure`, and `Notification` types including `idle_prompt`.
+- [Hermes hooks](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md)
+  documents `pre_llm_call`, `post_llm_call`, `pre_approval_request`,
+  `post_approval_response`, shell-hook consent, and synthetic hook tests. The
+  installed source was also checked because Hermes is not an agent-session-owned
+  stable interface.
+
+## Support matrix
+
+| Provider | Audited floor | Classification | Start | Completion | Attention | Failure | Setup |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Codex | 0.144.1 | partial | `UserPromptSubmit`, observed | raw `Stop` is journal evidence only; no Waiting transition | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive merge into `~/.codex/hooks.json`; Codex trust review remains mandatory |
+| Claude Code | 2.1.198 | partial | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | `PermissionRequest`/notification, observed conservative latch | `StopFailure`, observed | additive merge into `~/.claude/settings.json` |
+| Hermes | 0.18.0 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | pre/post approval hooks exist, but clearing remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
+
+Versions below the audited floor remain usable. `activity doctor` reports them
+as unverified and session views retain optional-field/activity fallback rather
+than fabricating a phase.
+
+## Finality and correlation findings
+
+### Codex
+
+Matching hooks from multiple sources run concurrently. A `Stop` observer cannot
+know whether another matching hook will return a continuation decision, so raw
+`Stop` cannot produce Waiting. The event is retained as `stop_observed` with
+observed confidence. A later new turn, runtime boundary, or separately proven
+completion source may reconcile it.
+
+`PermissionRequest` has `turn_id` but no request identifier shared with
+`PostToolUse`; `PostToolUse.tool_use_id` cannot be correlated to the preceding
+approval. Multiple approval requests therefore use agent-session-owned opaque
+attention ids and remain latched. Unrelated progress never clears them.
+
+### Claude Code
+
+Matching hooks also run in parallel, and `Stop` hooks may continue the turn.
+Raw `Stop` is therefore treated exactly like Codex raw Stop. `idle_prompt` is a
+later provider notification explicitly meaning that Claude is done and waiting
+for another prompt, so it may yield observed Waiting.
+
+`PermissionRequest` explicitly omits `tool_use_id`, even though later tool events
+include one. Permission notifications also omit a stable request id. Attention
+is therefore an uncorrelated conservative latch cleared only by a proven
+completion, a new turn, or a runtime boundary.
+
+### Hermes
+
+The installed `post_llm_call` fires only after a successful final response and
+does not fire for interruption, so it is authoritative completion at the
+audited version. Approval hooks expose `session_key`, surface, and response
+choice, but no stable per-request id. `post_approval_response` is recorded as
+progress and cannot by itself clear Needs input; completion or a new turn clears
+the latch.
+
+## Concurrency, continuation, and privacy probes
+
+The executable fixtures cover:
+
+- two concurrent attention requests, correlated one-by-one clearing, and a
+  metadata-only `pending_count`;
+- unrelated progress while attention is pending;
+- Stop followed by continuation/new-turn evidence;
+- duplicate and out-of-order normalized events;
+- rejection of a delayed prior-runtime event before host timestamping;
+- raw provider payloads containing content fields, proving those fields do not
+  enter the snapshot or journal;
+- journal event/byte bounds and mode-0600 snapshot, journal, and lock files;
+- dry-run, additive apply, repeated apply, repair, and owned-entry-only removal
+  for all three provider configs.
+
+The live release probe uses a no-content marker turn for each installed provider
+after the released binary is installed. Retained evidence records only provider
+version, event names, phase/revision changes, and pass/fail status.
+
+## Setup selection and failure behavior
+
+No audited provider offers an invocation-scoped hook flag that covers all
+interactive sessions started by agent-session. The selected mechanism is the
+third preference: explicit `activity setup --dry-run`, followed by an additive,
+idempotent merge into the provider's user config. Existing hook arrays and
+unrelated config keys are preserved; removal deletes only the exact
+agent-session-owned command entries.
+
+Provider hooks invoke the local binary without network access. They no-op when
+`AGENT_SESSION_ID` or `AGENT_SESSION_RUNTIME_ID` is absent, accept at most 64 KiB
+of JSON, project only allowlisted metadata into a normalized event, and always
+exit successfully to the provider. Telemetry failure can make state unknown or
+stale, but cannot block a prompt, tool call, approval, or completion.
+
+The connection-scoped `provider-prompt.v1` title channel remains independent.
+Its prompt text, attach events, reconnect behavior, queue drops, and event ids
+are never lifecycle input and never enter activity persistence.
