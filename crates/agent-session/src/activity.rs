@@ -1988,6 +1988,24 @@ fn apply_codex_provider_plans(
 
 fn apply_provider_config_plan(plan: &ProviderConfigPlan) -> Result<(), CliError> {
     if !plan.changed {
+        let current = match fs::read(&plan.path) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(activity_io_error(
+                    "provider-config-read-failed",
+                    &plan.path,
+                    err,
+                ));
+            }
+        };
+        if current != plan.original_bytes {
+            return Err(CliError::runtime(
+                "provider-config-concurrent-modification",
+                "provider config changed while activity setup was preparing an update; retry after reviewing the newer file",
+                Some(json!({ "path": display_path(&plan.path) })),
+            ));
+        }
         return Ok(());
     }
     write_provider_config_if_unchanged(
@@ -3475,6 +3493,35 @@ mod tests {
         fs::write(&notification_path, concurrent).expect("concurrent notification config");
         let error = apply_codex_provider_plans(&hooks, &notification)
             .expect_err("second-file change must fail the transaction");
+
+        assert_eq!(error.code(), "provider-config-concurrent-modification");
+        assert!(!hooks_path.exists(), "first-file write must be rolled back");
+        assert_eq!(
+            fs::read(&notification_path).expect("concurrent config retained"),
+            concurrent
+        );
+    }
+
+    #[test]
+    fn codex_provider_plans_guard_an_unchanged_second_file() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let hooks_path = tmp.path().join("hooks.json");
+        let notification_path = tmp.path().join("config.toml");
+        fs::write(
+            &notification_path,
+            "notify = [\"agent-session\", \"activity\", \"notify\", \"--agent\", \"codex\"]\n",
+        )
+        .expect("owned notification config");
+        let hooks = plan_json_provider(AgentKind::Codex, &hooks_path, SetupAction::Apply)
+            .expect("hooks plan");
+        let notification = plan_codex_notification(&notification_path, SetupAction::Apply)
+            .expect("notification plan");
+        assert!(!notification.changed);
+
+        let concurrent = b"notify = [\"user-notifier\"]\n";
+        fs::write(&notification_path, concurrent).expect("concurrent notification config");
+        let error = apply_codex_provider_plans(&hooks, &notification)
+            .expect_err("unchanged second-file plan must still verify its snapshot");
 
         assert_eq!(error.code(), "provider-config-concurrent-modification");
         assert!(!hooks_path.exists(), "first-file write must be rolled back");
