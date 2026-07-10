@@ -1920,6 +1920,7 @@ dependencies = [
  "clap_complete",
  "futures-util",
  "jiff",
+ "libc",
  "nils-build-info",
  "nils-common",
  "nils-test-support",
@@ -1929,6 +1930,7 @@ dependencies = [
  "shell-words",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "uuid",
 ]

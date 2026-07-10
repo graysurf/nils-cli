@@ -29,10 +29,12 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { workspace = true }
 axum = { workspace = true }
 futures-util = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 nils-test-support = { version = "1.21.5", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
+tokio-tungstenite = "0.29"
 # `tower::ServiceExt::oneshot` drives the serve Router in tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }
