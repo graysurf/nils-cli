@@ -1,5 +1,6 @@
 mod cli;
 pub mod completion;
+mod provider_prompt;
 mod serve;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

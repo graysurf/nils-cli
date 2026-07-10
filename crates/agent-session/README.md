@@ -75,7 +75,44 @@ is no second state model.
   interactive-session terminal bytes after the final client disconnects. The client sends JSON control frames
   `{ "text": "...", "key": "enter", "keys": ["c-c"], "resize": { "cols": 80, "rows": 24 } }`. Token-gated; disconnect
   leaves the tmux session alive. Concurrent clients share the pane geometry; resize sequences are serialized and the
-  last completed resize wins.
+  last completed resize wins. A client may opt into authoritative Codex/Claude prompt events by sending
+  `{ "subscribe": ["provider-prompt.v1"] }`. The daemon baselines the exact provider transcript at EOF, replies with an
+  `agent-session.attach.v1` `capability` text frame, and only after that acknowledgement emits later `prompt_submitted`
+  events as bounded text frames; terminal snapshot/live output remains binary. The normative supported acknowledgement is:
+
+  ```json
+  {
+    "schema_version": "agent-session.attach.v1",
+    "type": "capability",
+    "capability": "provider-prompt.v1",
+    "supported": true,
+    "provider": "codex",
+    "prompt_max_bytes": 16384
+  }
+  ```
+
+  `provider` is `"codex"` or `"claude"` when supported and `null` otherwise; an unsupported provider, unresolved exact
+  transcript, unsafe transcript path, or exhausted discovery budget returns the same object with `supported:false`.
+  Clients that do not subscribe receive no event text frames. The normative event is:
+
+  ```json
+  {
+    "schema_version": "agent-session.attach.event.v1",
+    "type": "prompt_submitted",
+    "event_id": "pp-opaque",
+    "provider": "codex",
+    "submitted_at": "2026-07-10T03:51:49Z",
+    "text": "final provider-recorded prompt",
+    "truncated": false
+  }
+  ```
+
+  `event_id` is unique and opaque, `submitted_at` uses the provider timestamp when present (otherwise detection time), and
+  `text` is UTF-8 bounded to `prompt_max_bytes`; `truncated` reports clipping. Events never contain transcript paths and are
+  never logged or persisted by the daemon. Terminal and control queues are bounded: terminal frames receive bounded burst
+  preference, while advisory prompt events may be dropped on saturation and must not delay terminal bytes. Consumers should
+  retain their documented local fallback when capability is absent/false or an event does not arrive within its bounded
+  fallback interval.
 
 Every response uses the `cli.agent-session.serve.v1` envelope and carries a `machine` identity (`--machine` /
 `AGENT_SESSION_MACHINE` / `--host` / hostname) so an edge can aggregate several machines. Auth is a bearer token
