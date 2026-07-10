@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,6 +13,7 @@ use nils_common::fs::{SECRET_FILE_MODE, display_path, home_dir, write_atomic};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use toml_edit::{Array as TomlArray, DocumentMut as TomlDocument, value as toml_value};
 
 use crate::cli::AgentKind;
 use crate::{CliContext, CliError, SessionRecord, load_session_record, session_dir};
@@ -35,6 +36,7 @@ const REPLAY_HEADER_BYTES: usize = 64;
 const REPLAY_MAGIC: &[u8; 16] = b"agent-session-r1";
 const MAX_PENDING_ATTENTION: usize = 64;
 const MAX_ID_CHARS: usize = 256;
+const CODEX_NOTIFY_ARGV: [&str; 5] = ["agent-session", "activity", "notify", "--agent", "codex"];
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -227,7 +229,11 @@ pub(crate) struct ProviderDoctor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) version_error: Option<String>,
     pub(crate) configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) configuration_error: Option<String>,
     pub(crate) config_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) notification_config_path: Option<String>,
     pub(crate) completion: String,
     pub(crate) attention_correlation: String,
     pub(crate) trust: String,
@@ -253,6 +259,8 @@ pub(crate) struct SetupResult {
     pub(crate) configured: bool,
     pub(crate) would_configure: bool,
     pub(crate) config_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) notification_config_path: Option<String>,
     pub(crate) owned_events: Vec<String>,
     pub(crate) trust: String,
 }
@@ -433,6 +441,23 @@ fn semantic_event_is_duplicate(
             .as_ref()
             .and_then(|turn| turn.provider_turn_id.as_ref())
             == event.provider_turn_id.as_ref()
+    {
+        return true;
+    }
+    if matches!(
+        event.kind,
+        TurnEventKind::TurnCompleted | TurnEventKind::TurnFailed
+    ) && let Some(event_turn_id) = event.provider_turn_id.as_ref()
+        && document
+            .state
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_turn_id.as_ref())
+            != Some(event_turn_id)
+        && document.state.last_turn.as_ref().is_some_and(|turn| {
+            turn.provider_turn_id.as_ref() == Some(event_turn_id)
+                && matches!(turn.outcome.as_str(), "completed" | "failed")
+        })
     {
         return true;
     }
@@ -1007,6 +1032,56 @@ pub(crate) fn ingest_provider_hook_fail_open(
     }
 }
 
+pub(crate) fn ingest_provider_notification(
+    context: &CliContext,
+    agent: AgentKind,
+    payload: &str,
+) -> Result<bool, CliError> {
+    let Some(id) = std::env::var("AGENT_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    let Some(runtime_id) = std::env::var("AGENT_SESSION_RUNTIME_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    if payload.len() as u64 > MAX_EVENT_BYTES {
+        return Err(CliError::data(
+            "provider-notification-too-large",
+            "provider notification payload exceeds the local metadata parser limit",
+            None,
+        ));
+    }
+    let raw: Value = serde_json::from_str(payload).map_err(|_| {
+        CliError::data(
+            "provider-notification-invalid",
+            "provider notification payload is not valid JSON",
+            None,
+        )
+    })?;
+    let Some(event) = normalize_provider_notification(agent, &runtime_id, &raw)? else {
+        return Ok(false);
+    };
+    let _ = ingest_event(context, &id, event)?;
+    Ok(true)
+}
+
+pub(crate) fn ingest_provider_notification_fail_open(
+    context: &CliContext,
+    agent: AgentKind,
+    payload: &str,
+) {
+    match ingest_provider_notification(context, agent, payload) {
+        Ok(true) => clear_hook_diagnostic(context, agent),
+        Ok(false) => {}
+        Err(err) => record_hook_diagnostic(context, agent, err.code()),
+    }
+}
+
 fn record_hook_diagnostic(context: &CliContext, agent: AgentKind, code: &str) {
     let Some(id) = std::env::var("AGENT_SESSION_ID")
         .ok()
@@ -1202,6 +1277,54 @@ fn normalize_provider_hook(
     }))
 }
 
+fn normalize_provider_notification(
+    agent: AgentKind,
+    runtime_id: &str,
+    raw: &Value,
+) -> Result<Option<TurnEvent>, CliError> {
+    if agent != AgentKind::Codex
+        || raw.get("type").and_then(Value::as_str) != Some("agent-turn-complete")
+    {
+        return Ok(None);
+    }
+    let provider_session_id = raw
+        .get("thread-id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-notification-session-id-missing",
+                "Codex completion notification is missing thread-id",
+                None,
+            )
+        })
+        .and_then(|value| projected_provider_identifier(runtime_id, agent, "session", value))?;
+    let provider_turn_id = raw
+        .get("turn-id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-notification-turn-id-missing",
+                "Codex completion notification is missing turn-id",
+                None,
+            )
+        })
+        .and_then(|value| projected_provider_identifier(runtime_id, agent, "turn", value))?;
+    Ok(Some(TurnEvent {
+        schema_version: TURN_EVENT_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        runtime_id: runtime_id.to_string(),
+        provider: agent.as_str().to_string(),
+        provider_session_id: Some(provider_session_id),
+        provider_turn_id: Some(provider_turn_id),
+        kind: TurnEventKind::TurnCompleted,
+        attention_id: None,
+        attention_kind: None,
+        confidence: Confidence::Authoritative,
+        source_kind: SourceKind::ProviderHook,
+        provider_time: None,
+    }))
+}
+
 pub(crate) fn doctor(
     context: &CliContext,
     agent: Option<AgentKind>,
@@ -1234,7 +1357,13 @@ pub(crate) fn doctor(
     let mut providers = Vec::new();
     for agent in agents {
         let path = provider_config_path(agent)?;
-        let configured = provider_configured(agent, &path).unwrap_or(false);
+        let notification_path = (agent == AgentKind::Codex)
+            .then(codex_notification_config_path)
+            .transpose()?;
+        let (configured, configuration_error) = match provider_configured(agent, &path) {
+            Ok(configured) => (configured, None),
+            Err(error) => (false, Some(error.code().to_string())),
+        };
         let activity_summary = activity_by_provider
             .get(agent.as_str())
             .cloned()
@@ -1250,11 +1379,11 @@ pub(crate) fn doctor(
         let (supported_classification, completion, attention_correlation, trust, base_guidance) =
             match agent {
                 AgentKind::Codex => (
-                    "partial",
-                    "raw Stop is observed only because concurrent matching hooks may continue the turn",
+                    "supported",
+                    "agent-turn-complete is authoritative; raw Stop remains non-final observation because matching hooks may continue the turn",
                     "PermissionRequest has no request id shared with PostToolUse; attention is conservatively latched",
-                    "Codex requires review/trust for each non-managed hook definition",
-                    "Run activity setup --agent codex --dry-run, apply it, then approve the hook definitions in Codex",
+                    "Codex requires review/trust for each non-managed hook definition; the singular notify argv must be absent or agent-session-owned",
+                    "Run activity setup --agent codex --dry-run, apply it, then approve the hook definitions in Codex; a user-owned notify command is preserved and reported as a conflict",
                 ),
                 AgentKind::Claude => (
                     "partial",
@@ -1290,7 +1419,11 @@ pub(crate) fn doctor(
         } else {
             base_guidance.to_string()
         };
-        if !configured {
+        if let Some(error) = configuration_error.as_deref() {
+            guidance.push_str(&format!(
+                " Provider lifecycle configuration could not be validated ({error}); fix the provider configuration before running repair."
+            ));
+        } else if !configured {
             guidance.push_str(
                 " The installed hook specification is missing or drifted; run activity setup --repair after reviewing the dry-run.",
             );
@@ -1306,7 +1439,9 @@ pub(crate) fn doctor(
             version,
             version_error: version_probe.error,
             configured,
+            configuration_error,
             config_path: display_path(&path),
+            notification_config_path: notification_path.as_deref().map(display_path),
             completion: completion.to_string(),
             attention_correlation: attention_correlation.to_string(),
             trust: trust.to_string(),
@@ -1408,9 +1543,16 @@ fn latest_provider_activity(context: &CliContext) -> BTreeMap<String, ProviderAc
 
 pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult, CliError> {
     let path = provider_config_path(agent)?;
+    let notification_path = (agent == AgentKind::Codex)
+        .then(codex_notification_config_path)
+        .transpose()?;
     let configured_before = provider_configured(agent, &path)?;
     let (would_change, would_configure) = match agent {
-        AgentKind::Codex | AgentKind::Claude => setup_json_provider(agent, &path, action)?,
+        AgentKind::Codex => {
+            let notify_path = notification_path.as_deref().expect("Codex notify path");
+            setup_codex_provider(&path, notify_path, action)?
+        }
+        AgentKind::Claude => setup_json_provider(agent, &path, action)?,
         AgentKind::Hermes => setup_hermes(&path, action)?,
     };
     let action_name = match action {
@@ -1431,12 +1573,16 @@ pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult
         },
         would_configure,
         config_path: display_path(&path),
+        notification_config_path: notification_path.as_deref().map(display_path),
         owned_events: provider_specs(agent)
             .into_iter()
             .map(|spec| spec.event.to_string())
+            .chain((agent == AgentKind::Codex).then(|| "agent-turn-complete".to_string()))
             .collect(),
         trust: match agent {
-            AgentKind::Codex => "approve the exact new Codex hook definitions before they run",
+            AgentKind::Codex => {
+                "approve the exact new Codex hook definitions; the singular notify argv is changed only when absent or agent-session-owned"
+            }
             AgentKind::Claude => "review the additive settings entries before apply",
             AgentKind::Hermes => {
                 "approve each new (event, command) pair or use Hermes' explicit hook-consent flow"
@@ -1564,10 +1710,30 @@ fn provider_config_path(agent: AgentKind) -> Result<std::path::PathBuf, CliError
     })
 }
 
+fn codex_notification_config_path() -> Result<std::path::PathBuf, CliError> {
+    let home = home_dir().ok_or_else(|| {
+        CliError::runtime(
+            "home-unavailable",
+            "HOME is required for provider activity setup",
+            None,
+        )
+    })?;
+    Ok(home.join(".codex/config.toml"))
+}
+
 #[derive(Clone, Copy)]
 struct ProviderSpec {
     event: &'static str,
     matcher: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct ProviderConfigPlan {
+    path: PathBuf,
+    original_bytes: Option<Vec<u8>>,
+    updated_bytes: Vec<u8>,
+    changed: bool,
+    configured: bool,
 }
 
 fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
@@ -1668,8 +1834,224 @@ fn owned_command(agent: AgentKind, event: Option<&str>) -> String {
 
 fn provider_configured(agent: AgentKind, path: &Path) -> Result<bool, CliError> {
     match agent {
-        AgentKind::Codex | AgentKind::Claude => json_provider_configured(agent, path),
+        AgentKind::Codex => {
+            let hooks_configured = json_provider_configured(agent, path)?;
+            let notification_configured =
+                codex_notification_configured(&codex_notification_config_path()?)?;
+            Ok(hooks_configured && notification_configured)
+        }
+        AgentKind::Claude => json_provider_configured(agent, path),
         AgentKind::Hermes => hermes_configured(path),
+    }
+}
+
+fn codex_notification_configured(path: &Path) -> Result<bool, CliError> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let document = parse_codex_notification_config(
+        path,
+        &fs::read_to_string(path)
+            .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
+    )?;
+    Ok(codex_notification_is_owned(&document))
+}
+
+fn parse_codex_notification_config(path: &Path, raw: &str) -> Result<TomlDocument, CliError> {
+    raw.parse::<TomlDocument>().map_err(|err| {
+        CliError::data(
+            "provider-config-invalid",
+            format!("failed to parse {}: {err}", path.display()),
+            None,
+        )
+    })
+}
+
+fn codex_notification_is_owned(document: &TomlDocument) -> bool {
+    document
+        .get("notify")
+        .and_then(|item| item.as_array())
+        .is_some_and(|array| {
+            array.len() == CODEX_NOTIFY_ARGV.len()
+                && array
+                    .iter()
+                    .zip(CODEX_NOTIFY_ARGV)
+                    .all(|(value, expected)| value.as_str() == Some(expected))
+        })
+}
+
+fn plan_codex_notification(
+    path: &Path,
+    action: SetupAction,
+) -> Result<ProviderConfigPlan, CliError> {
+    let original_bytes = if path.is_file() {
+        Some(
+            fs::read(path)
+                .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
+        )
+    } else {
+        None
+    };
+    let raw = original_bytes
+        .as_ref()
+        .map(|bytes| {
+            String::from_utf8(bytes.clone()).map_err(|_| {
+                CliError::data(
+                    "provider-config-invalid",
+                    format!("{} is not valid UTF-8 TOML", path.display()),
+                    None,
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut document = if raw.is_empty() {
+        TomlDocument::new()
+    } else {
+        parse_codex_notification_config(path, &raw)?
+    };
+    let has_notify = document.get("notify").is_some();
+    let owned = codex_notification_is_owned(&document);
+    let remove = action == SetupAction::Remove;
+    if has_notify && !owned && !remove {
+        return Err(CliError::data(
+            "provider-notification-config-conflict",
+            "Codex config already has a user-owned notify command; it was preserved and activity setup made no changes",
+            Some(json!({ "path": display_path(path) })),
+        ));
+    }
+    if remove {
+        if owned {
+            document.remove("notify");
+        }
+    } else if !owned {
+        let mut argv = TomlArray::new();
+        argv.extend(CODEX_NOTIFY_ARGV);
+        document["notify"] = toml_value(argv);
+    }
+    let rendered = document.to_string().into_bytes();
+    let original_rendered = original_bytes.as_deref().unwrap_or_default();
+    let changed = rendered != original_rendered;
+    Ok(ProviderConfigPlan {
+        path: path.to_path_buf(),
+        original_bytes,
+        updated_bytes: rendered,
+        changed,
+        configured: codex_notification_is_owned(&document),
+    })
+}
+
+fn setup_codex_provider(
+    hooks_path: &Path,
+    notification_path: &Path,
+    action: SetupAction,
+) -> Result<(bool, bool), CliError> {
+    // Parse and render both files before either can change. This makes invalid
+    // or conflicting notification configuration a preflight failure for apply,
+    // repair, and remove alike.
+    let hooks = plan_json_provider(AgentKind::Codex, hooks_path, action)?;
+    let notification = plan_codex_notification(notification_path, action)?;
+    let changed = hooks.changed || notification.changed;
+    let configured = hooks.configured && notification.configured;
+    if action == SetupAction::DryRun {
+        return Ok((changed, configured));
+    }
+
+    apply_codex_provider_plans(&hooks, &notification)?;
+    Ok((changed, configured))
+}
+
+fn apply_codex_provider_plans(
+    hooks: &ProviderConfigPlan,
+    notification: &ProviderConfigPlan,
+) -> Result<(), CliError> {
+    apply_provider_config_plan(hooks)?;
+    if let Err(apply_error) = apply_provider_config_plan(notification) {
+        if hooks.changed
+            && let Err(rollback_error) = rollback_provider_config_plan(hooks)
+        {
+            return Err(CliError::runtime(
+                "provider-config-rollback-failed",
+                "Codex lifecycle setup could not apply both configuration files and could not restore the first file; inspect both paths before retrying",
+                Some(json!({
+                    "apply_error": apply_error.code(),
+                    "rollback_error": rollback_error.code(),
+                    "config_path": display_path(&hooks.path),
+                    "notification_config_path": display_path(&notification.path)
+                })),
+            ));
+        }
+        return Err(apply_error);
+    }
+    Ok(())
+}
+
+fn apply_provider_config_plan(plan: &ProviderConfigPlan) -> Result<(), CliError> {
+    if !plan.changed {
+        let current = match fs::read(&plan.path) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(activity_io_error(
+                    "provider-config-read-failed",
+                    &plan.path,
+                    err,
+                ));
+            }
+        };
+        if current != plan.original_bytes {
+            return Err(CliError::runtime(
+                "provider-config-concurrent-modification",
+                "provider config changed while activity setup was preparing an update; retry after reviewing the newer file",
+                Some(json!({ "path": display_path(&plan.path) })),
+            ));
+        }
+        return Ok(());
+    }
+    write_provider_config_if_unchanged(
+        &plan.path,
+        &plan.updated_bytes,
+        plan.original_bytes.as_deref(),
+    )
+}
+
+fn rollback_provider_config_plan(plan: &ProviderConfigPlan) -> Result<(), CliError> {
+    if !plan.changed {
+        return Ok(());
+    }
+    let current = match fs::read(&plan.path) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(activity_io_error(
+                "provider-config-rollback-read-failed",
+                &plan.path,
+                err,
+            ));
+        }
+    };
+    if current.as_deref() != Some(plan.updated_bytes.as_slice()) {
+        return Err(CliError::runtime(
+            "provider-config-rollback-concurrent-modification",
+            "provider config changed after activity setup wrote it; refusing to overwrite the newer file during rollback",
+            Some(json!({ "path": display_path(&plan.path) })),
+        ));
+    }
+    if let Some(original) = plan.original_bytes.as_deref() {
+        write_atomic(&plan.path, original, SECRET_FILE_MODE).map_err(|err| {
+            CliError::runtime(
+                "provider-config-rollback-write-failed",
+                format!(
+                    "failed to restore provider config {}: {err}",
+                    plan.path.display()
+                ),
+                Some(json!({ "path": display_path(&plan.path) })),
+            )
+        })
+    } else {
+        fs::remove_file(&plan.path).map_err(|err| {
+            activity_io_error("provider-config-rollback-remove-failed", &plan.path, err)
+        })
     }
 }
 
@@ -1698,6 +2080,18 @@ fn setup_json_provider(
     path: &Path,
     action: SetupAction,
 ) -> Result<(bool, bool), CliError> {
+    let plan = plan_json_provider(agent, path, action)?;
+    if action != SetupAction::DryRun {
+        apply_provider_config_plan(&plan)?;
+    }
+    Ok((plan.changed, plan.configured))
+}
+
+fn plan_json_provider(
+    agent: AgentKind,
+    path: &Path,
+    action: SetupAction,
+) -> Result<ProviderConfigPlan, CliError> {
     let original_bytes = if path.is_file() {
         Some(
             fs::read(path)
@@ -1730,23 +2124,23 @@ fn setup_json_provider(
         mutate_json_spec(&mut updated, agent, spec, remove)?;
     }
     let changed = updated != original;
-    if changed && action != SetupAction::DryRun {
-        write_provider_config_if_unchanged(
-            path,
-            &serde_json::to_vec_pretty(&updated).map_err(|err| {
-                CliError::runtime(
-                    "provider-config-render-failed",
-                    format!("failed to render provider config: {err}"),
-                    None,
-                )
-            })?,
-            original_bytes.as_deref(),
-        )?;
-    }
+    let updated_bytes = serde_json::to_vec_pretty(&updated).map_err(|err| {
+        CliError::runtime(
+            "provider-config-render-failed",
+            format!("failed to render provider config: {err}"),
+            None,
+        )
+    })?;
     let configured = provider_specs(agent)
         .iter()
         .all(|spec| json_has_spec(&updated, agent, *spec));
-    Ok((changed, configured))
+    Ok(ProviderConfigPlan {
+        path: path.to_path_buf(),
+        original_bytes,
+        updated_bytes,
+        changed,
+        configured,
+    })
 }
 
 fn json_has_spec(value: &Value, agent: AgentKind, spec: ProviderSpec) -> bool {
@@ -2322,6 +2716,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_authoritative_completion_requires_an_exact_open_turn() {
+        let mut completion = event(TurnEventKind::TurnCompleted, "completion");
+        completion.confidence = Confidence::Authoritative;
+        completion.provider_turn_id = Some("turn-a".to_string());
+
+        let mut no_open_turn = document();
+        reduce(&mut no_open_turn, &completion, "2026-07-10T00:00:01Z");
+        assert_eq!(no_open_turn.state.phase, TurnPhase::Starting);
+        assert!(no_open_turn.state.last_turn.is_none());
+
+        let mut id_less_turn = document();
+        let mut start_without_id = event(TurnEventKind::TurnStarted, "start-without-id");
+        start_without_id.provider_turn_id = None;
+        reduce(&mut id_less_turn, &start_without_id, "2026-07-10T00:00:01Z");
+        reduce(&mut id_less_turn, &completion, "2026-07-10T00:00:02Z");
+        assert_eq!(id_less_turn.state.phase, TurnPhase::Working);
+        assert!(id_less_turn.state.current_turn.is_some());
+
+        let mut exact_turn = document();
+        let mut start = event(TurnEventKind::TurnStarted, "start");
+        start.provider_turn_id = Some("turn-a".to_string());
+        reduce(&mut exact_turn, &start, "2026-07-10T00:00:01Z");
+        reduce(&mut exact_turn, &completion, "2026-07-10T00:00:02Z");
+        assert_eq!(exact_turn.state.phase, TurnPhase::Waiting);
+        assert!(exact_turn.state.current_turn.is_none());
+    }
+
+    #[test]
     fn provider_mapping_uses_only_metadata_and_conservative_finality() {
         let codex = normalize_provider_hook(
             AgentKind::Codex,
@@ -2343,6 +2765,54 @@ mod tests {
         assert!(!serialized.contains("transcript"));
         assert!(!serialized.contains("provider-session"));
         assert!(!serialized.contains("provider-turn"));
+
+        let codex_completion = normalize_provider_notification(
+            AgentKind::Codex,
+            "runtime-1",
+            &json!({
+                "type": "agent-turn-complete",
+                "thread-id": "provider-session",
+                "turn-id": "provider-turn",
+                "cwd": "/secret/cwd",
+                "input-messages": ["secret prompt"],
+                "last-assistant-message": "secret output"
+            }),
+        )
+        .expect("Codex notification mapping")
+        .expect("recognized completion");
+        assert_eq!(codex_completion.kind, TurnEventKind::TurnCompleted);
+        assert_eq!(codex_completion.confidence, Confidence::Authoritative);
+        let serialized = serde_json::to_string(&codex_completion).expect("completion event json");
+        for forbidden in [
+            "provider-session",
+            "provider-turn",
+            "/secret/cwd",
+            "secret prompt",
+            "secret output",
+            "input-messages",
+            "last-assistant-message",
+        ] {
+            assert!(!serialized.contains(forbidden), "forbidden {forbidden}");
+        }
+        assert!(
+            normalize_provider_notification(
+                AgentKind::Codex,
+                "runtime-1",
+                &json!({"type": "future-notification"}),
+            )
+            .expect("future notification")
+            .is_none()
+        );
+        let missing_turn = normalize_provider_notification(
+            AgentKind::Codex,
+            "runtime-1",
+            &json!({
+                "type": "agent-turn-complete",
+                "thread-id": "provider-session"
+            }),
+        )
+        .expect_err("completion requires turn-id correlation");
+        assert_eq!(missing_turn.code(), "provider-notification-turn-id-missing");
 
         let claude = normalize_provider_hook(
             AgentKind::Claude,
@@ -2534,6 +3004,32 @@ mod tests {
                 assert!(!serialized.contains("tool-1"));
                 assert!(!serialized.contains("rate_limit"));
             }
+        }
+    }
+
+    #[test]
+    fn frozen_codex_notification_fixture_projects_only_matching_completion_metadata() {
+        let normalized = include_str!("../tests/fixtures/activity/codex-notifications.jsonl")
+            .lines()
+            .map(|line| {
+                let raw: Value = serde_json::from_str(line).expect("Codex notification fixture");
+                normalize_provider_notification(AgentKind::Codex, "runtime-1", &raw)
+                    .expect("Codex notification mapping")
+            })
+            .collect::<Vec<_>>();
+        let completion = normalized[0].as_ref().expect("recognized completion");
+        assert_eq!(completion.kind, TurnEventKind::TurnCompleted);
+        assert_eq!(completion.confidence, Confidence::Authoritative);
+        assert!(normalized[1].is_none());
+        let serialized = serde_json::to_string(completion).expect("normalized completion");
+        for forbidden in [
+            "codex-session",
+            "codex-turn",
+            "<redacted>",
+            "input-messages",
+            "last-assistant-message",
+        ] {
+            assert!(!serialized.contains(forbidden), "forbidden {forbidden}");
         }
     }
 
@@ -2842,11 +3338,19 @@ mod tests {
         complete.runtime_id = runtime_id;
         let first =
             ingest_event(&context, &created.record.id, complete.clone()).expect("first completion");
+        let mut stop = event(TurnEventKind::StopObserved, "hook-stop-after-completion");
+        stop.runtime_id = complete.runtime_id.clone();
+        let after_stop =
+            ingest_event(&context, &created.record.id, stop).expect("interleaved raw stop");
         complete.event_id = "hook-complete-2".to_string();
         let repeated =
             ingest_event(&context, &created.record.id, complete).expect("repeated completion");
         assert!(repeated.duplicate);
-        assert_eq!(repeated.turn_state.revision, first.turn_state.revision);
+        assert_eq!(
+            repeated.turn_state.revision, after_stop.turn_state.revision,
+            "intervening non-final observations must not reopen completion dedupe"
+        );
+        assert!(after_stop.turn_state.revision > first.turn_state.revision);
     }
 
     #[test]
@@ -2973,6 +3477,58 @@ mod tests {
             Some(tmp.path().as_os_str())
         ));
         assert!(!command_resolves_on_path("agent-session", None));
+    }
+
+    #[test]
+    fn codex_provider_plans_rollback_when_the_second_file_changes() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let hooks_path = tmp.path().join("hooks.json");
+        let notification_path = tmp.path().join("config.toml");
+        let hooks = plan_json_provider(AgentKind::Codex, &hooks_path, SetupAction::Apply)
+            .expect("hooks plan");
+        let notification = plan_codex_notification(&notification_path, SetupAction::Apply)
+            .expect("notification plan");
+
+        let concurrent = b"notify = [\"user-notifier\"]\n";
+        fs::write(&notification_path, concurrent).expect("concurrent notification config");
+        let error = apply_codex_provider_plans(&hooks, &notification)
+            .expect_err("second-file change must fail the transaction");
+
+        assert_eq!(error.code(), "provider-config-concurrent-modification");
+        assert!(!hooks_path.exists(), "first-file write must be rolled back");
+        assert_eq!(
+            fs::read(&notification_path).expect("concurrent config retained"),
+            concurrent
+        );
+    }
+
+    #[test]
+    fn codex_provider_plans_guard_an_unchanged_second_file() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let hooks_path = tmp.path().join("hooks.json");
+        let notification_path = tmp.path().join("config.toml");
+        fs::write(
+            &notification_path,
+            "notify = [\"agent-session\", \"activity\", \"notify\", \"--agent\", \"codex\"]\n",
+        )
+        .expect("owned notification config");
+        let hooks = plan_json_provider(AgentKind::Codex, &hooks_path, SetupAction::Apply)
+            .expect("hooks plan");
+        let notification = plan_codex_notification(&notification_path, SetupAction::Apply)
+            .expect("notification plan");
+        assert!(!notification.changed);
+
+        let concurrent = b"notify = [\"user-notifier\"]\n";
+        fs::write(&notification_path, concurrent).expect("concurrent notification config");
+        let error = apply_codex_provider_plans(&hooks, &notification)
+            .expect_err("unchanged second-file plan must still verify its snapshot");
+
+        assert_eq!(error.code(), "provider-config-concurrent-modification");
+        assert!(!hooks_path.exists(), "first-file write must be rolled back");
+        assert_eq!(
+            fs::read(&notification_path).expect("concurrent config retained"),
+            concurrent
+        );
     }
 
     #[test]
@@ -3328,7 +3884,19 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
             // Retain it in the journal/revision, but never fabricate Waiting.
         }
         TurnEventKind::TurnCompleted | TurnEventKind::TurnFailed => {
-            let matches_current = if let Some(current) = document.state.current_turn.as_ref() {
+            let requires_exact_open_turn = event.provider == AgentKind::Codex.as_str()
+                && event.kind == TurnEventKind::TurnCompleted
+                && event.confidence == Confidence::Authoritative
+                && event.source_kind == SourceKind::ProviderHook
+                && event.provider_turn_id.is_some();
+            let matches_current = if requires_exact_open_turn {
+                document
+                    .state
+                    .current_turn
+                    .as_ref()
+                    .and_then(|turn| turn.provider_turn_id.as_ref())
+                    == event.provider_turn_id.as_ref()
+            } else if let Some(current) = document.state.current_turn.as_ref() {
                 event.provider_turn_id.is_none()
                     || current.provider_turn_id.is_none()
                     || event.provider_turn_id == current.provider_turn_id

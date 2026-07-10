@@ -72,11 +72,29 @@ agent-session activity setup --agent codex --remove
 The same commands support `claude` and `hermes`. Setup merges exact
 agent-session-owned handlers into existing provider configuration, repeated
 apply/repair is idempotent, and removal preserves unrelated hooks. Provider
-setup also refuses an observed concurrent config change. Provider hook failure
-is fail-open and old/unsupported providers retain the activity
-fallback. Doctor scans local session evidence once and probes provider versions
-concurrently with a bounded timeout, verifies the exact owned hook timeout, and
-checks that the configured helper resolves to an executable on the hook PATH.
+setup also refuses an observed concurrent config change. For Codex, setup adds
+the official `agent-turn-complete` notify argv to `~/.codex/config.toml` only
+when `notify` is absent or already agent-session-owned. A user-owned singular
+notify command is preserved and reported as a conflict; removal deletes only
+the exact owned argv. Both Codex files are parsed and planned before either is
+written; if the guarded second write fails, the first write is restored or a
+loud rollback error identifies the partial state. That provider-authored
+notification must match the exact open runtime/thread/turn and is the
+authoritative completion input. Raw Codex
+`Stop` remains non-final observation. Hook/notification failure is fail-open and
+old/unsupported providers retain the activity fallback. Doctor scans local
+session evidence once and probes provider versions concurrently with a bounded
+timeout, verifies the exact owned hook timeout and Codex notify argv, surfaces
+sanitized configuration errors, and checks that the configured helper resolves
+to an executable on the provider PATH.
+
+Codex itself appends the full notification JSON to the configured command argv.
+Agent-session discards content after parsing and never prints or persists it,
+but prompt, assistant, and cwd fields are transiently visible to same-host
+process inspection while the helper runs. Use this integration only where
+process visibility is restricted to the same trusted user. A provider-supported
+stdin or metadata-only notification transport, or an App Server migration,
+would be required to remove this upstream argv boundary.
 See [the stable turn-state contract](docs/turn-state-contract.md) and
 [provider evidence matrix](docs/provider-turn-signal-evidence.md).
 

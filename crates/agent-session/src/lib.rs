@@ -144,7 +144,7 @@ fn command_format(command: &Command) -> OutputFormat {
         Command::Activity(args) => match &args.command {
             cli::ActivityCommand::Event(args) => args.format,
             cli::ActivityCommand::Status(args) => args.format,
-            cli::ActivityCommand::Hook(_) => OutputFormat::Text,
+            cli::ActivityCommand::Hook(_) | cli::ActivityCommand::Notify(_) => OutputFormat::Text,
             cli::ActivityCommand::Doctor(args) => args.format,
             cli::ActivityCommand::Setup(args) => args.format,
         },
@@ -324,6 +324,12 @@ fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
             // Provider telemetry is deliberately fail-open: malformed or stale
             // hook input must never block a prompt, permission, or turn.
             activity::ingest_provider_hook_fail_open(context, args.agent, args.event.as_deref());
+            exit::SUCCESS
+        }
+        cli::ActivityCommand::Notify(args) => {
+            // Provider notifications are auxiliary telemetry. Invalid, stale,
+            // or mismatched input must never change Codex's own exit behavior.
+            activity::ingest_provider_notification_fail_open(context, args.agent, &args.payload);
             exit::SUCCESS
         }
         cli::ActivityCommand::Doctor(args) => match activity::doctor(context, args.agent) {

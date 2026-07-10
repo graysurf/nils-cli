@@ -286,9 +286,12 @@ pub enum ActivityCommand {
     /// Translate one provider hook payload into a safe normalized event.
     #[command(hide = true)]
     Hook(ActivityHookArgs),
+    /// Translate one provider notification payload into a safe normalized event.
+    #[command(hide = true)]
+    Notify(ActivityNotifyArgs),
     /// Report provider support, version, configuration, and repair guidance.
     Doctor(ActivityDoctorArgs),
-    /// Preview or apply additive provider hook configuration.
+    /// Preview or apply additive provider lifecycle configuration.
     Setup(ActivitySetupArgs),
 }
 
@@ -330,6 +333,18 @@ pub struct ActivityHookArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ActivityNotifyArgs {
+    /// Provider whose notification payload is supplied as the final argument.
+    #[arg(long, value_enum)]
+    pub agent: AgentKind,
+
+    /// Provider-authored JSON passed by Codex in argv; content is discarded
+    /// after parsing but is transiently visible to same-host process inspection.
+    #[arg(value_name = "PAYLOAD")]
+    pub payload: String,
+}
+
+#[derive(Debug, Args)]
 pub struct ActivityDoctorArgs {
     /// Limit diagnostics to one provider.
     #[arg(long, value_enum)]
@@ -358,7 +373,8 @@ pub struct ActivitySetupArgs {
     #[arg(long, conflicts_with_all = ["dry_run", "remove", "repair"])]
     pub apply: bool,
 
-    /// Remove only agent-session-owned provider hook entries.
+    /// Remove only agent-session-owned provider lifecycle entries, including
+    /// the exact Codex notify argv.
     #[arg(long, conflicts_with_all = ["dry_run", "apply", "repair"])]
     pub remove: bool,
 
