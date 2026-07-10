@@ -1,6 +1,7 @@
 pub mod applescript;
 pub mod cliclick;
 pub mod hammerspoon;
+pub mod hammerspoon_input;
 pub mod input_source;
 pub mod process;
 

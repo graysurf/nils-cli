@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use crate::backend::applescript;
 use crate::backend::cliclick;
 use crate::backend::process::ProcessRunner;
 use crate::cli::{InputClickArgs, OutputFormat};
@@ -21,6 +22,11 @@ pub fn run(
     if args.count == 0 {
         return Err(CliError::usage("--count must be at least 1"));
     }
+    let modifiers = if args.mods.trim().is_empty() {
+        Vec::new()
+    } else {
+        applescript::parse_modifiers(&args.mods)?
+    };
 
     let action_id = next_action_id("input.click");
     let started = Instant::now();
@@ -36,6 +42,7 @@ pub fn run(
                 args.y,
                 args.button,
                 args.count,
+                &modifiers,
                 policy.timeout_ms,
             )
         })?;
@@ -48,6 +55,10 @@ pub fn run(
         y: args.y,
         button: cliclick::button_name(args.button),
         count: args.count,
+        mods: modifiers
+            .iter()
+            .map(|modifier| modifier.canonical().to_string())
+            .collect(),
         policy: action_policy_result(policy),
         meta: build_action_meta_with_attempts(action_id, started, policy, attempts_used),
     };
@@ -58,12 +69,13 @@ pub fn run(
         }
         OutputFormat::Text => {
             println!(
-                "input.click\taction_id={}\tx={}\ty={}\tbutton={}\tcount={}\telapsed_ms={}",
+                "input.click\taction_id={}\tx={}\ty={}\tbutton={}\tcount={}\tmods={}\telapsed_ms={}",
                 result.meta.action_id,
                 result.x,
                 result.y,
                 result.button,
                 result.count,
+                result.mods.join(","),
                 result.meta.elapsed_ms,
             );
         }

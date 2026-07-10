@@ -275,6 +275,38 @@ pub struct InputClickResult {
     pub y: i32,
     pub button: &'static str,
     pub count: u8,
+    pub mods: Vec<String>,
+    pub policy: ActionPolicyResult,
+    pub meta: ActionMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InputMoveResult {
+    pub x: i32,
+    pub y: i32,
+    pub policy: ActionPolicyResult,
+    pub meta: ActionMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InputDragResult {
+    pub from_x: i32,
+    pub from_y: i32,
+    pub to_x: i32,
+    pub to_y: i32,
+    pub duration_ms: u64,
+    pub steps: u16,
+    pub mods: Vec<String>,
+    pub policy: ActionPolicyResult,
+    pub meta: ActionMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InputScrollResult {
+    pub delta_x: i32,
+    pub delta_y: i32,
+    pub unit: &'static str,
+    pub mods: Vec<String>,
     pub policy: ActionPolicyResult,
     pub meta: ActionMeta,
 }
@@ -284,6 +316,14 @@ pub struct InputTypeResult {
     pub text_length: usize,
     pub enter: bool,
     pub delay_ms: Option<u64>,
+    pub policy: ActionPolicyResult,
+    pub meta: ActionMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InputKeyResult {
+    pub key: String,
+    pub count: u8,
     pub policy: ActionPolicyResult,
     pub meta: ActionMeta,
 }

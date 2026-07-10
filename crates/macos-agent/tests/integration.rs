@@ -23,6 +23,8 @@ mod help_snapshot;
 mod input_click;
 #[path = "integration/input_keyboard.rs"]
 mod input_keyboard;
+#[path = "integration/input_pointer.rs"]
+mod input_pointer;
 #[path = "integration/list_commands.rs"]
 mod list_commands;
 #[path = "integration/observe_screenshot.rs"]

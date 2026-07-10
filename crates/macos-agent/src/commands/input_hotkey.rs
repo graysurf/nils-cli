@@ -21,7 +21,8 @@ pub fn run(
     policy: ActionPolicy,
     runner: &dyn ProcessRunner,
 ) -> Result<(), CliError> {
-    validate_key(&args.key)?;
+    let key = args.key.trim();
+    validate_key(key)?;
     let modifiers = applescript::parse_modifiers(&args.mods)?;
 
     let action_id = next_action_id("input.hotkey");
@@ -31,7 +32,7 @@ pub fn run(
     if !policy.dry_run {
         let retry = policy.retry_policy();
         let (_, attempts) = run_with_retry(retry, || {
-            applescript::send_hotkey(runner, &modifiers, &args.key, policy.timeout_ms)
+            applescript::send_hotkey(runner, &modifiers, key, policy.timeout_ms)
         })?;
         attempts_used = attempts;
     }
@@ -43,7 +44,7 @@ pub fn run(
 
     let result = InputHotkeyResult {
         mods,
-        key: args.key.clone(),
+        key: key.to_string(),
         policy: action_policy_result(policy),
         meta: build_action_meta_with_attempts(action_id, started, policy, attempts_used),
     };
@@ -69,7 +70,7 @@ pub fn run(
     Ok(())
 }
 
-fn validate_key(key: &str) -> Result<(), CliError> {
+pub(crate) fn validate_key(key: &str) -> Result<(), CliError> {
     let token = key.trim();
     if token.is_empty() {
         return Err(CliError::usage("--key cannot be empty"));
