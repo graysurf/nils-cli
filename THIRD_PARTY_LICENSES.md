@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `ec5d4a738dbeab1aa57584d9f0e0db8aa4cf02d97ce8b82f7576fbdcc0b8744d`
+- Cargo.lock SHA256: `7e2152d29215f691e30a366a8b8ca04a41af8dfdee229fb08351e24a73dc68df`
 - Third-party crates (`source != null`): 458
 - Workspace crates (`source == null`, excluded below): 44
 
@@ -208,8 +208,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | jaq-core | 3.1.0 | MIT | crates.io |
 | jaq-json | 2.0.1 | MIT | crates.io |
 | jaq-std | 3.0.1 | MIT | crates.io |
-| jiff | 0.2.31 | Unlicense OR MIT | crates.io |
-| jiff-static | 0.2.31 | Unlicense OR MIT | crates.io |
+| jiff | 0.2.32 | Unlicense OR MIT | crates.io |
+| jiff-static | 0.2.32 | Unlicense OR MIT | crates.io |
 | jiff-tzdb | 0.1.6 | Unlicense OR MIT | crates.io |
 | jiff-tzdb-platform | 0.1.3 | Unlicense OR MIT | crates.io |
 | jni | 0.22.4 | MIT OR Apache-2.0 | crates.io |
@@ -306,7 +306,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 | crates.io |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 | crates.io |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 | crates.io |
-| regex | 1.12.4 | MIT OR Apache-2.0 | crates.io |
+| regex | 1.13.0 | MIT OR Apache-2.0 | crates.io |
 | regex-automata | 0.4.14 | MIT OR Apache-2.0 | crates.io |
 | regex-bites | 0.1.6 | MIT OR Apache-2.0 | crates.io |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 | crates.io |
@@ -492,9 +492,9 @@ This file documents third-party Rust crate licenses used by this workspace.
 | yansi | 1.0.1 | MIT OR Apache-2.0 | crates.io |
 | yoke | 0.8.3 | Unicode-3.0 | crates.io |
 | yoke-derive | 0.8.2 | Unicode-3.0 | crates.io |
-| zbus | 5.16.0 | MIT | crates.io |
-| zbus_macros | 5.16.0 | MIT | crates.io |
-| zbus_names | 4.3.2 | MIT | crates.io |
+| zbus | 5.17.0 | MIT | crates.io |
+| zbus_macros | 5.17.0 | MIT | crates.io |
+| zbus_names | 4.3.3 | MIT | crates.io |
 | zerocopy | 0.8.52 | BSD-2-Clause OR Apache-2.0 OR MIT | crates.io |
 | zerocopy-derive | 0.8.52 | BSD-2-Clause OR Apache-2.0 OR MIT | crates.io |
 | zerofrom | 0.1.8 | Unicode-3.0 | crates.io |
@@ -507,6 +507,6 @@ This file documents third-party Rust crate licenses used by this workspace.
 | zmij | 1.0.21 | MIT | crates.io |
 | zune-core | 0.5.1 | MIT OR Apache-2.0 OR Zlib | crates.io |
 | zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | crates.io |
-| zvariant | 5.12.0 | MIT | crates.io |
-| zvariant_derive | 5.12.0 | MIT | crates.io |
-| zvariant_utils | 3.4.0 | MIT | crates.io |
+| zvariant | 5.13.0 | MIT | crates.io |
+| zvariant_derive | 5.13.0 | MIT | crates.io |
+| zvariant_utils | 3.5.0 | MIT | crates.io |
