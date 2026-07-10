@@ -338,7 +338,8 @@ pub struct ActivityNotifyArgs {
     #[arg(long, value_enum)]
     pub agent: AgentKind,
 
-    /// Provider-authored JSON notification payload.
+    /// Provider-authored JSON passed by Codex in argv; content is discarded
+    /// after parsing but is transiently visible to same-host process inspection.
     #[arg(value_name = "PAYLOAD")]
     pub payload: String,
 }

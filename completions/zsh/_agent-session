@@ -211,7 +211,7 @@ _arguments "${_arguments_options[@]}" : \
 '--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
-':payload -- Provider-authored JSON notification payload:_default' \
+':payload -- Provider-authored JSON passed by Codex in argv; content is discarded after parsing but is transiently visible to same-host process inspection:_default' \
 && ret=0
 ;;
 (doctor)

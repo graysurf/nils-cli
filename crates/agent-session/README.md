@@ -87,6 +87,14 @@ session evidence once and probes provider versions concurrently with a bounded
 timeout, verifies the exact owned hook timeout and Codex notify argv, surfaces
 sanitized configuration errors, and checks that the configured helper resolves
 to an executable on the provider PATH.
+
+Codex itself appends the full notification JSON to the configured command argv.
+Agent-session discards content after parsing and never prints or persists it,
+but prompt, assistant, and cwd fields are transiently visible to same-host
+process inspection while the helper runs. Use this integration only where
+process visibility is restricted to the same trusted user. A provider-supported
+stdin or metadata-only notification transport, or an App Server migration,
+would be required to remove this upstream argv boundary.
 See [the stable turn-state contract](docs/turn-state-contract.md) and
 [provider evidence matrix](docs/provider-turn-signal-evidence.md).
 

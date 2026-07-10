@@ -197,7 +197,12 @@ The schemas forbid prompt/assistant/terminal/transcript text, commands, tool
 arguments/results, paths from provider transcripts, credentials, tokens, and
 free-form provider errors. Raw hook payloads are parsed in memory and projected
 onto the allowlist; the Codex notification adapter applies the same boundary to
-the provider's single JSON argv. Content fields are never serialized.
+the provider's single JSON argv. Content fields are never printed or serialized
+by agent-session. Codex supplies that JSON as a process argument, so prompt,
+assistant, and cwd content remains transiently observable through same-host
+process inspection until the helper exits. Restricted process visibility is a
+deployment requirement; eliminating this upstream argv exposure requires a
+future provider-supported stdin/metadata-only transport or App Server boundary.
 
 `provider-prompt.v1` is a separate, advisory attach/title protocol. It is not a
 turn event source, it is not persisted into activity files, and a prompt-event

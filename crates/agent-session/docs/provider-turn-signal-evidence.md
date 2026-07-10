@@ -24,7 +24,9 @@ normalized event is created.
   documents the `agent-turn-complete` notify surface and its `thread-id` and
   `turn-id`. Setup installs the exact agent-session argv when `notify` is absent
   or already owned; a different singular user command is preserved and blocks
-  automatic setup.
+  automatic setup. Codex appends its full notification JSON to that argv;
+  agent-session discards content after parsing and never persists it, but the
+  provider-supplied argv is transiently visible to same-host process inspection.
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks) documents parallel
   matching hooks, exact `AskUserQuestion` matching, shared `tool_use_id` on
   `PreToolUse`/`PostToolUse`/`PostToolUseFailure`, `PermissionRequest` without
