@@ -28,7 +28,57 @@ _claude-cli() {
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:claude-cli-command-$line[1]:"
         case $line[1] in
-            (prompt-segment)
+            (agent)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_claude-cli__subcmd__agent_commands" \
+"*::: :->agent" \
+&& ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:claude-cli-agent-command-$line[1]:"
+        case $line[1] in
+            (resume)
+_arguments "${_arguments_options[@]}" : \
+'--cd=[Override the recorded working directory (for a moved repository)]:dir:_files -/' \
+'-h[Print help]' \
+'--help[Print help]' \
+':session_id -- Claude session id to resume:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_claude-cli__subcmd__agent__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:claude-cli-agent-help-command-$line[1]:"
+        case $line[1] in
+            (resume)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(prompt-segment)
 _arguments "${_arguments_options[@]}" : \
 '--ttl=[Cache TTL]:TTL:_default' \
 '--time-format=[Reset time format (local time)]:TIME_FORMAT:_default' \
@@ -120,7 +170,27 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:claude-cli-help-command-$line[1]:"
         case $line[1] in
-            (prompt-segment)
+            (agent)
+_arguments "${_arguments_options[@]}" : \
+":: :_claude-cli__subcmd__help__subcmd__agent_commands" \
+"*::: :->agent" \
+&& ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:claude-cli-help-agent-command-$line[1]:"
+        case $line[1] in
+            (resume)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(prompt-segment)
 _arguments "${_arguments_options[@]}" : \
 ":: :_claude-cli__subcmd__help__subcmd__prompt-segment_commands" \
 "*::: :->prompt-segment" \
@@ -168,12 +238,44 @@ esac
 (( $+functions[_claude-cli_commands] )) ||
 _claude-cli_commands() {
     local commands; commands=(
+'agent:Agent command group' \
 'prompt-segment:Prompt-segment command group' \
 'usage:Read Claude usage from OAuth, Claude CLI, or cache' \
 'completion:Export shell completion script' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'claude-cli commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent_commands] )) ||
+_claude-cli__subcmd__agent_commands() {
+    local commands; commands=(
+'resume:Resume a Claude session in its recorded working directory' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'claude-cli agent commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__help_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__help_commands() {
+    local commands; commands=(
+'resume:Resume a Claude session in its recorded working directory' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'claude-cli agent help commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__help__subcmd__help_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent help help commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__help__subcmd__resume_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__help__subcmd__resume_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent help resume commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__resume_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__resume_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent resume commands' commands "$@"
 }
 (( $+functions[_claude-cli__subcmd__completion_commands] )) ||
 _claude-cli__subcmd__completion_commands() {
@@ -183,12 +285,25 @@ _claude-cli__subcmd__completion_commands() {
 (( $+functions[_claude-cli__subcmd__help_commands] )) ||
 _claude-cli__subcmd__help_commands() {
     local commands; commands=(
+'agent:Agent command group' \
 'prompt-segment:Prompt-segment command group' \
 'usage:Read Claude usage from OAuth, Claude CLI, or cache' \
 'completion:Export shell completion script' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'claude-cli help commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__agent_commands] )) ||
+_claude-cli__subcmd__help__subcmd__agent_commands() {
+    local commands; commands=(
+'resume:Resume a Claude session in its recorded working directory' \
+    )
+    _describe -t commands 'claude-cli help agent commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__agent__subcmd__resume_commands] )) ||
+_claude-cli__subcmd__help__subcmd__agent__subcmd__resume_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help agent resume commands' commands "$@"
 }
 (( $+functions[_claude-cli__subcmd__help__subcmd__completion_commands] )) ||
 _claude-cli__subcmd__help__subcmd__completion_commands() {

@@ -33,12 +33,34 @@ fn run() -> i32 {
     };
 
     match cli.command {
+        Some(cli::Command::Agent(args)) => handle_agent(&args),
         Some(cli::Command::PromptSegment(args)) => handle_prompt_segment(&args),
         Some(cli::Command::Usage(args)) => handle_usage(&args),
         Some(cli::Command::Completion(args)) => completion::run(args.shell),
         None => {
             let mut cmd = cli::Cli::command();
             if cmd.print_help().is_ok() {
+                println!();
+                return exit::SUCCESS;
+            }
+            exit::RUNTIME
+        }
+    }
+}
+
+fn handle_agent(args: &cli::AgentArgs) -> i32 {
+    match &args.command {
+        Some(cli::AgentCommand::Resume { session_id, cd }) => {
+            claude_cli::agent::resume::run(&claude_cli::agent::resume::ResumeOptions {
+                session_id: session_id.clone(),
+                cwd: cd.clone(),
+            })
+        }
+        None => {
+            let mut cmd = cli::Cli::command();
+            if let Some(subcommand) = cmd.find_subcommand_mut("agent")
+                && subcommand.print_help().is_ok()
+            {
                 println!();
                 return exit::SUCCESS;
             }

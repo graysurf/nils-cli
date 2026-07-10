@@ -9,6 +9,7 @@ Claude Code prompt-segment rendering, usage source selection, Keychain credentia
 
 ```text
 Usage:
+  claude-cli agent resume <SESSION_ID> [--cd <dir>]
   claude-cli prompt-segment [options]
   claude-cli prompt-segment check
   claude-cli prompt-segment status [--format text|json]
@@ -17,6 +18,7 @@ Usage:
 
 Help:
   claude-cli help
+  claude-cli agent --help
   claude-cli prompt-segment --help
 ```
 
@@ -30,6 +32,14 @@ Help:
 `claude-cli` owns provider-specific Claude behavior. zsh-kit should keep only the small compatibility wrapper and shell integration.
 
 ## Commands
+
+### agent
+
+- `agent resume <SESSION_ID> [--cd <dir>]`: Resolve the session's recorded working directory from local Claude Code project history and
+  launch `claude --resume <SESSION_ID>` in that directory, propagating Claude's exit status. Claude Code has no `--cd` flag and stores
+  sessions per project, so the recorded directory is applied as the child process working directory. Run it from any directory. Fails
+  without launching Claude (`65`) when the id is unknown or matches more than one recorded directory; pass `--cd` to override the resolved
+  directory for a repository that moved.
 
 ### prompt-segment
 
@@ -94,12 +104,16 @@ normalized back into the same cache shape used by `prompt-segment`.
 
 - macOS `security` is used for Keychain credential lookup unless an automation credential override is supplied.
 - No `curl`, `jq`, or Python runtime is required for prompt-segment rendering.
+- `claude` is required for `agent resume`.
+- `agent resume` reads local Claude Code project history under `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`); the shared
+  resolver lives in `nils-provider-resume`.
 
 ## Exit codes
 
 - `0`: success, help output, or no prompt output needed.
 - `1`: operational false/failed state such as `prompt-segment check` without credentials.
 - `64`: usage or argument errors.
+- `65`: `agent resume` could not resolve the session id (unknown or ambiguous).
 
 ## Docs
 

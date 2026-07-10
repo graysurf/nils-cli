@@ -16,6 +16,9 @@ _claude-cli() {
             ",$1")
                 cmd="claude__cli"
                 ;;
+            claude__cli,agent)
+                cmd="claude__cli__agent"
+                ;;
             claude__cli,completion)
                 cmd="claude__cli__completion"
                 ;;
@@ -28,6 +31,21 @@ _claude-cli() {
             claude__cli,usage)
                 cmd="claude__cli__usage"
                 ;;
+            claude__cli__agent,help)
+                cmd="claude__cli__agent__help"
+                ;;
+            claude__cli__agent,resume)
+                cmd="claude__cli__agent__resume"
+                ;;
+            claude__cli__agent__help,help)
+                cmd="claude__cli__agent__help__help"
+                ;;
+            claude__cli__agent__help,resume)
+                cmd="claude__cli__agent__help__resume"
+                ;;
+            claude__cli__help,agent)
+                cmd="claude__cli__help__agent"
+                ;;
             claude__cli__help,completion)
                 cmd="claude__cli__help__completion"
                 ;;
@@ -39,6 +57,9 @@ _claude-cli() {
                 ;;
             claude__cli__help,usage)
                 cmd="claude__cli__help__usage"
+                ;;
+            claude__cli__help__agent,resume)
+                cmd="claude__cli__help__agent__resume"
                 ;;
             claude__cli__help__prompt__segment,check)
                 cmd="claude__cli__help__prompt__segment__check"
@@ -71,12 +92,89 @@ _claude-cli() {
 
     case "${cmd}" in
         claude__cli)
-            opts="-h -V --help --version prompt-segment usage completion help"
+            opts="-h -V --help --version agent prompt-segment usage completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        claude__cli__agent)
+            opts="-h --help resume help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        claude__cli__agent__help)
+            opts="resume help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        claude__cli__agent__help__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        claude__cli__agent__help__resume)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        claude__cli__agent__resume)
+            opts="-h --cd --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --cd)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -99,8 +197,36 @@ _claude-cli() {
             return 0
             ;;
         claude__cli__help)
-            opts="prompt-segment usage completion help"
+            opts="agent prompt-segment usage completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        claude__cli__help__agent)
+            opts="resume"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        claude__cli__help__agent__resume)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
