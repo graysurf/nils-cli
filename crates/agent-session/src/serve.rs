@@ -3848,7 +3848,7 @@ mod tests {
         std::fs::create_dir_all(bad_transcript.parent().expect("parent")).unwrap();
         std::fs::write(
             &bad_transcript,
-            "x".repeat(crate::CLAUDE_SESSION_META_MAX_LINE_BYTES + 1),
+            "x".repeat(nils_provider_resume::CLAUDE_SESSION_META_MAX_LINE_BYTES + 1),
         )
         .unwrap();
         write_claude_session_transcript(
