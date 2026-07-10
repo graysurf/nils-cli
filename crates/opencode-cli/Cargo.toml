@@ -1,6 +1,6 @@
 [package]
 name = "nils-opencode-cli"
-version = "1.21.9"
+version = "1.21.10"
 edition.workspace = true
 license.workspace = true
 
@@ -18,10 +18,10 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.21.9", path = "../nils-build-info" }
-nils-common = { version = "1.21.9", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.21.10", path = "../nils-build-info" }
+nils-common = { version = "1.21.10", path = "../nils-common", package = "nils-common" }
 
 [dev-dependencies]
-nils-test-support = { version = "1.21.9", path = "../nils-test-support" }
+nils-test-support = { version = "1.21.10", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"

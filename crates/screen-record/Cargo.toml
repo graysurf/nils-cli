@@ -1,6 +1,6 @@
 [package]
 name = "nils-screen-record"
-version = "1.21.9"
+version = "1.21.10"
 edition.workspace = true
 license.workspace = true
 build = "build.rs"
@@ -18,10 +18,10 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.21.9", path = "../nils-build-info" }
+nils-build-info = { version = "1.21.10", path = "../nils-build-info" }
 ctrlc = "3.5.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-nils-common = { version = "1.21.9", path = "../nils-common", package = "nils-common" }
+nils-common = { version = "1.21.10", path = "../nils-common", package = "nils-common" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["randr"] }
@@ -42,7 +42,7 @@ block2 = "0.6.2"
 dispatch2 = "0.3.1"
 
 [dev-dependencies]
-nils-test-support = { version = "1.21.9", path = "../nils-test-support" }
+nils-test-support = { version = "1.21.10", path = "../nils-test-support" }
 tempfile = "3"
 
 [lints.rust]
