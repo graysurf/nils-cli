@@ -299,8 +299,22 @@ fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
     match args.command {
         cli::ActivityCommand::Event(args) => {
             let format = args.format;
-            let result = activity::read_event_from_stdin()
-                .and_then(|event| activity::ingest_event(context, &args.id, event));
+            let retry_agent = std::env::var(activity::ACTIVITY_RETRY_PROVIDER_ENV)
+                .ok()
+                .and_then(|provider| AgentKind::from_name(&provider));
+            let result = activity::read_event_from_stdin().and_then(|event| {
+                if retry_agent.is_some() {
+                    activity::ingest_event_retry(context, &args.id, event)
+                } else {
+                    activity::ingest_event(context, &args.id, event)
+                }
+            });
+            if let Some(agent) = retry_agent {
+                match &result {
+                    Ok(_) => activity::clear_hook_diagnostic(context, agent),
+                    Err(error) => activity::record_hook_diagnostic(context, agent, error.code()),
+                }
+            }
             match result {
                 Ok(result) => render_single_success(
                     ACTIVITY_EVENT_COMMAND,
@@ -330,6 +344,11 @@ fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
             // Provider notifications are auxiliary telemetry. Invalid, stale,
             // or mismatched input must never change Codex's own exit behavior.
             activity::ingest_provider_notification_fail_open(context, args.agent, &args.payload);
+            activity::forward_provider_notification_fail_open(
+                args.agent,
+                args.forward_notify_argv_json.as_deref(),
+                &args.payload,
+            );
             exit::SUCCESS
         }
         cli::ActivityCommand::Doctor(args) => match activity::doctor(context, args.agent) {
@@ -3644,6 +3663,9 @@ fn render_doctor_text(result: &activity::DoctorResult) -> String {
             if provider.configured { "yes" } else { "no" }
         ));
         text.push_str(&format!("  completion: {}\n", provider.completion));
+        if let Some(mode) = provider.notification_mode.as_deref() {
+            text.push_str(&format!("  notification: {mode}\n"));
+        }
         text.push_str(&format!(
             "  attention: {}\n",
             provider.attention_correlation

@@ -207,6 +207,7 @@ _arguments "${_arguments_options[@]}" : \
 (notify)
 _arguments "${_arguments_options[@]}" : \
 '--agent=[Provider whose notification payload is supplied as the final argument]:AGENT:(codex claude hermes)' \
+'--forward-notify-argv-json=[JSON argv for an existing singular notifier composed by activity setup]:JSON:_default' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
 '--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
 '-h[Print help]' \

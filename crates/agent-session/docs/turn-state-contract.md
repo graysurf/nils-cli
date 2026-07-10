@@ -231,17 +231,31 @@ provider config, detects an observed concurrent modification before replacement,
 and never auto-accepts Codex trust or Hermes consent. Codex setup additionally
 owns the exact `agent-session activity notify --agent codex` argv in the
 singular top-level `notify` field of `~/.codex/config.toml`: it inserts the argv
-only when absent, recognizes it idempotently, removes only that exact value, and
-preserves/refuses every user-owned value before changing the hooks file. The two
+when absent, recognizes it idempotently, and composes a bounded safe user-owned
+argv through the hidden `--forward-notify-argv-json` transport. Composition
+executes the original argv directly without a shell, passes the provider JSON
+as its final argument, suppresses child output, and kills it after two seconds.
+The helper marks fan-out depth, rejects nested forwarding metadata, and uses a
+non-blocking activity lock so local state contention cannot delay the preserved
+notifier. On contention, the normalized metadata-only completion is piped to a
+detached `activity event` retry that waits for the same transaction lock, so the
+single-shot authoritative signal survives transient contention without holding
+up Codex. The retry has a five-second lock deadline, clears diagnostics after
+durable success, and records a sanitized timeout or ingest failure instead of
+accumulating an unbounded worker. Remove deletes an exact owned value or restores
+the original full
+config bytes; setup accepts composition only when that byte-exact reversal is
+proven in memory. Unsafe, oversized, non-string, recursive, and non-reversible
+values fail closed before hooks mutation. The two
 Codex files are fully planned before mutation and the first guarded write is
 rolled back if the second guarded write fails. Doctor scans session records
 once, probes provider versions concurrently with a two-second bound per
 provider, and reports installed version or a bounded probe error, audited
-classification, config status or sanitized configuration error, finality and
-correlation limits, trust requirements, and repair guidance without emitting
-provider config content.
+classification, config status or sanitized configuration error, Codex
+`notification_mode`, finality and correlation limits, trust requirements, and
+repair guidance without emitting provider config content.
 Configured status requires every exact owned hook command/timeout and, for
-Codex, the exact notify argv; helper health resolves the bare `agent-session`
+Codex, an exact owned or valid composed notify argv; helper health resolves the bare `agent-session`
 command on PATH. Hook/notification diagnostics are bound to the active
 launch id/generation and the newest current-runtime diagnostic is selected
 deterministically across sessions.

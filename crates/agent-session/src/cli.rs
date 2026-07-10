@@ -338,6 +338,10 @@ pub struct ActivityNotifyArgs {
     #[arg(long, value_enum)]
     pub agent: AgentKind,
 
+    /// JSON argv for an existing singular notifier composed by activity setup.
+    #[arg(long, hide = true, value_name = "JSON")]
+    pub forward_notify_argv_json: Option<String>,
+
     /// Provider-authored JSON passed by Codex in argv; content is discarded
     /// after parsing but is transiently visible to same-host process inspection.
     #[arg(value_name = "PAYLOAD")]
