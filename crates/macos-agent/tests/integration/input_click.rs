@@ -36,6 +36,82 @@ fn input_click_double_click_succeeds() {
 }
 
 #[test]
+fn input_click_uses_absolute_negative_coordinates_for_secondary_displays() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let log = cwd.path().join("cliclick.log");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("AGENTS_MACOS_AGENT_STUB_LOG", &log.to_string_lossy());
+
+    let out = harness.run_with_options(
+        cwd.path(),
+        &["input", "click", "--x", "-120", "--y", "40"],
+        options,
+    );
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let recorded = std::fs::read_to_string(log).expect("read cliclick log");
+    assert!(recorded.contains("cliclick c:=-120,40"));
+}
+
+#[test]
+fn input_click_holds_and_releases_modifiers_in_one_backend_action() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let log = cwd.path().join("cliclick.log");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("AGENTS_MACOS_AGENT_STUB_LOG", &log.to_string_lossy());
+
+    let out = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--format",
+            "json",
+            "input",
+            "click",
+            "--x",
+            "120",
+            "--y",
+            "40",
+            "--mods",
+            "cmd,shift",
+        ],
+        options,
+    );
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload: serde_json::Value =
+        serde_json::from_str(&out.stdout_text()).expect("stdout should be json");
+    assert_eq!(
+        payload["result"]["mods"],
+        serde_json::json!(["cmd", "shift"])
+    );
+    let recorded = std::fs::read_to_string(log).expect("read cliclick log");
+    assert!(
+        recorded.contains("cliclick kd:cmd,shift c:120,40 ku:cmd,shift"),
+        "{recorded}"
+    );
+}
+
+#[test]
+fn input_click_rejects_invalid_modifier() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+
+    let out = harness.run(
+        cwd.path(),
+        &[
+            "input", "click", "--x", "1", "--y", "2", "--mods", "cmd,nope",
+        ],
+    );
+
+    assert_eq!(out.code, 2);
+    assert!(out.stderr_text().contains("invalid modifier"));
+}
+
+#[test]
 fn input_click_invalid_count_is_usage_error() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("tempdir");

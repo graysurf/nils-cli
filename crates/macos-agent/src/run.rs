@@ -48,7 +48,11 @@ pub fn command_group_label(command: &CommandGroup) -> &'static str {
         },
         CommandGroup::Input { command } => match command {
             InputCommand::Click(_) => "input.click",
+            InputCommand::Move(_) => "input.move",
+            InputCommand::Drag(_) => "input.drag",
+            InputCommand::Scroll(_) => "input.scroll",
             InputCommand::Type(_) => "input.type",
+            InputCommand::Key(_) => "input.key",
             InputCommand::Hotkey(_) => "input.hotkey",
         },
         CommandGroup::InputSource { command } => match command {
@@ -159,8 +163,20 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
             command: InputCommand::Click(args),
         } => commands::input_click::run(cli.format, &args, policy, &runner),
         CommandGroup::Input {
+            command: InputCommand::Move(args),
+        } => commands::input_pointer::run_move(cli.format, &args, policy, &runner),
+        CommandGroup::Input {
+            command: InputCommand::Drag(args),
+        } => commands::input_pointer::run_drag(cli.format, &args, policy, &runner),
+        CommandGroup::Input {
+            command: InputCommand::Scroll(args),
+        } => commands::input_pointer::run_scroll(cli.format, &args, policy, &runner),
+        CommandGroup::Input {
             command: InputCommand::Type(args),
         } => commands::input_type::run(cli.format, &args, policy, &runner),
+        CommandGroup::Input {
+            command: InputCommand::Key(args),
+        } => commands::input_key::run(cli.format, &args, policy, &runner),
         CommandGroup::Input {
             command: InputCommand::Hotkey(args),
         } => commands::input_hotkey::run(cli.format, &args, policy, &runner),

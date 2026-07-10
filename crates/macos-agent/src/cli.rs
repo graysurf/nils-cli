@@ -32,6 +32,12 @@ pub enum ImageFormat {
     Webp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScrollUnit {
+    Pixel,
+    Line,
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "macos-agent",
@@ -257,8 +263,20 @@ pub enum InputCommand {
     /// Click at x/y coordinates.
     Click(InputClickArgs),
 
+    /// Move the pointer to x/y coordinates.
+    Move(InputMoveArgs),
+
+    /// Drag from one coordinate to another.
+    Drag(InputDragArgs),
+
+    /// Scroll horizontally and/or vertically.
+    Scroll(InputScrollArgs),
+
     /// Type text.
     Type(InputTypeArgs),
+
+    /// Press one key without modifiers.
+    Key(InputKeyArgs),
 
     /// Send hotkey chord.
     Hotkey(InputHotkeyArgs),
@@ -851,11 +869,11 @@ pub struct AxWatchStopArgs {
 #[derive(Debug, Clone, Args)]
 pub struct InputClickArgs {
     /// X coordinate in pixels.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub x: i32,
 
     /// Y coordinate in pixels.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub y: i32,
 
     /// Mouse button.
@@ -866,6 +884,10 @@ pub struct InputClickArgs {
     #[arg(long, default_value_t = 1)]
     pub count: u8,
 
+    /// Modifier keys held during the click (cmd,ctrl,alt,shift,fn).
+    #[arg(long, default_value = "")]
+    pub mods: String,
+
     /// Wait before clicking.
     #[arg(long, default_value_t = 0)]
     pub pre_wait_ms: u64,
@@ -873,6 +895,67 @@ pub struct InputClickArgs {
     /// Wait after clicking.
     #[arg(long, default_value_t = 0)]
     pub post_wait_ms: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct InputMoveArgs {
+    /// Absolute X coordinate in pixels.
+    #[arg(long, allow_hyphen_values = true)]
+    pub x: i32,
+
+    /// Absolute Y coordinate in pixels.
+    #[arg(long, allow_hyphen_values = true)]
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct InputDragArgs {
+    /// Absolute starting X coordinate in pixels.
+    #[arg(long, allow_hyphen_values = true)]
+    pub from_x: i32,
+
+    /// Absolute starting Y coordinate in pixels.
+    #[arg(long, allow_hyphen_values = true)]
+    pub from_y: i32,
+
+    /// Absolute ending X coordinate in pixels.
+    #[arg(long, allow_hyphen_values = true)]
+    pub to_x: i32,
+
+    /// Absolute ending Y coordinate in pixels.
+    #[arg(long, allow_hyphen_values = true)]
+    pub to_y: i32,
+
+    /// Approximate drag duration in milliseconds.
+    #[arg(long, default_value_t = 500)]
+    pub duration_ms: u64,
+
+    /// Number of intermediate drag movements (1-100).
+    #[arg(long, default_value_t = 10)]
+    pub steps: u16,
+
+    /// Modifier keys held during the drag (cmd,ctrl,alt,shift,fn).
+    #[arg(long, default_value = "")]
+    pub mods: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct InputScrollArgs {
+    /// Horizontal scroll delta; positive moves right.
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+    pub delta_x: i32,
+
+    /// Vertical scroll delta; negative moves down.
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+    pub delta_y: i32,
+
+    /// Scroll delta unit.
+    #[arg(long, value_enum, default_value_t = ScrollUnit::Pixel)]
+    pub unit: ScrollUnit,
+
+    /// Modifier flags attached to the scroll event (cmd,ctrl,alt,shift,fn).
+    #[arg(long, default_value = "")]
+    pub mods: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -888,6 +971,17 @@ pub struct InputTypeArgs {
     /// Press Enter after typing.
     #[arg(long = "submit")]
     pub enter: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct InputKeyArgs {
+    /// Key name or one literal character.
+    #[arg(long)]
+    pub key: String,
+
+    /// Number of key presses.
+    #[arg(long, default_value_t = 1)]
+    pub count: u8,
 }
 
 #[derive(Debug, Clone, Args)]

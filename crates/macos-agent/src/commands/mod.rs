@@ -13,6 +13,8 @@ pub mod ax_type;
 pub mod ax_watch;
 pub mod input_click;
 pub mod input_hotkey;
+pub mod input_key;
+pub mod input_pointer;
 pub mod input_source;
 pub mod input_type;
 pub mod list;

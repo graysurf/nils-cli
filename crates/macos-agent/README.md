@@ -1,8 +1,8 @@
 # macos-agent
 
 `macos-agent` is a macOS-oriented CLI for agent desktop automation. It provides parseable primitives for discovery, observation, and input
-actions: window/app listing, window activation, click, type, hotkey, AX (Accessibility) actions, input-source switching, screenshot, and
-wait helpers.
+actions: window/app listing, window activation, click, pointer move/drag, scroll, keypress, type, hotkey, AX (Accessibility) actions,
+input-source switching, screenshot, and wait helpers.
 
 ## Quick Start
 
@@ -17,7 +17,11 @@ macos-agent apps list --format json
 # activate + input
 macos-agent window activate --app Terminal --wait-ms 1500
 macos-agent input click --x 200 --y 160
+macos-agent input move --x 200 --y 160
+macos-agent input drag --from-x 200 --from-y 160 --to-x 500 --to-y 400
+macos-agent input scroll --delta-y -480 --unit pixel
 macos-agent input type --text "hello world"
+macos-agent input key --key return
 macos-agent input hotkey --mods cmd,shift --key 4
 macos-agent input-source switch --id abc
 
@@ -69,8 +73,15 @@ macos-agent debug bundle --active-window --format json
   - `macos-agent window activate (--window-id <id> | --active-window | --app <name>`
     `[--window-title-contains <name>] | --bundle-id <bundle_id>) [--wait-ms <ms>] [--reopen-on-fail]`
 - `input`
-  - `macos-agent input click --x <px> --y <px> [--button <left|right|middle>] [--count <n>] [--pre-wait-ms <ms>] [--post-wait-ms <ms>]`
+  - `macos-agent input click --x <px> --y <px> [--button <left|right|middle>] [--count <n>]`
+    `[--mods <cmd,ctrl,alt,shift,fn>] [--pre-wait-ms <ms>] [--post-wait-ms <ms>]`
+  - `macos-agent input move --x <px> --y <px>`
+  - `macos-agent input drag --from-x <px> --from-y <px> --to-x <px> --to-y <px>`
+    `[--duration-ms <ms>] [--steps <1-100>] [--mods <cmd,ctrl,alt,shift,fn>]`
+    (the duration plus bounded backend headroom must fit global `--timeout-ms`)
+  - `macos-agent input scroll [--delta-x <n>] [--delta-y <n>] [--unit <pixel|line>] [--mods <cmd,ctrl,alt,shift,fn>]`
   - `macos-agent input type --text <text> [--delay-ms <ms>] [--submit]`
+  - `macos-agent input key --key <key> [--count <n>]`
   - `macos-agent input hotkey --mods <cmd,ctrl,alt,shift,fn> --key <key>`
 - `input-source`
   - `macos-agent input-source current`
@@ -191,9 +202,12 @@ Preflight permission contract (`macos-agent --format json preflight`):
 }
 ```
 
-Mutating action commands (`window activate`, `input click`, `input type`, `input hotkey`, `ax click`, `ax type`) always include
+Mutating action commands (`window activate`, `input click`, `input move`, `input drag`, `input scroll`, `input type`, `input key`,
+`input hotkey`, `ax click`, `ax type`) always include
 `result.policy` in JSON output so agent-side retry and timeout policy can be parsed without guessing defaults. These action results also
 include `result.meta.attempts_used` so flaky steps can be detected quickly.
+Retries default to zero. After any mutating timeout, treat the outcome as unknown and observe current UI state before deciding whether to retry;
+do not blindly replay a non-idempotent action. `input drag` also attempts a best-effort mouse-up cleanup when its backend fails.
 
 Exit codes:
 
@@ -222,15 +236,15 @@ Error envelope (`--error-format json`):
 
 ## Permission Matrix
 
-| Capability                | Required setup                                                                       | Typical failure symptom                                           | Mitigation                                                                                   |
-| ------------------------- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Accessibility             | Terminal host allowed in **System Settings > Privacy & Security > Accessibility**    | click/type/hotkey fail                                            | Enable the shell host app (Terminal/iTerm/etc.) and retry                                    |
-| Automation (Apple Events) | Terminal host allowed in **System Settings > Privacy & Security > Automation**       | activation / System Events probe fails                            | Allow the terminal app to control System Events                                              |
-| Screen Recording          | Terminal host allowed in **System Settings > Privacy & Security > Screen Recording** | observe screenshot fails                                          | Enable Screen Recording for terminal host                                                    |
-| `osascript` binary        | Preinstalled on macOS; required for AppleScript backend + preflight probes           | preflight reports missing `osascript`                             | Reinstall macOS command-line tools if missing (`xcode-select --install`)                     |
-| `cliclick` binary         | Installed and on `PATH`                                                              | preflight reports missing `cliclick`                              | `brew install cliclick`                                                                      |
-| `hs` (Hammerspoon CLI)    | Required for Hammerspoon AX backend; install Hammerspoon and enable `hs.ipc`         | `ax attr/action/session/watch` fail with backend-unavailable hint | `brew install --cask hammerspoon`, then add `require('hs.ipc')` to `~/.hammerspoon/init.lua` |
-| `im-select` binary        | Required by `input-source current` and `input-source switch`                         | `input-source` commands fail with `missing dependency im-select`  | `brew install im-select`                                                                     |
+| Capability                | Required setup                                                                                  | Typical failure symptom                                          | Mitigation                                                                                   |
+| ------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Accessibility             | Terminal host allowed in **System Settings > Privacy & Security > Accessibility**               | click/type/hotkey fail                                           | Enable the shell host app (Terminal/iTerm/etc.) and retry                                    |
+| Automation (Apple Events) | Terminal host allowed in **System Settings > Privacy & Security > Automation**                  | activation / System Events probe fails                           | Allow the terminal app to control System Events                                              |
+| Screen Recording          | Terminal host allowed in **System Settings > Privacy & Security > Screen Recording**            | observe screenshot fails                                         | Enable Screen Recording for terminal host                                                    |
+| `osascript` binary        | Preinstalled on macOS; required for AppleScript backend + preflight probes                      | preflight reports missing `osascript`                            | Reinstall macOS command-line tools if missing (`xcode-select --install`)                     |
+| `cliclick` binary         | Installed and on `PATH`                                                                         | preflight reports missing `cliclick`                             | `brew install cliclick`                                                                      |
+| `hs` (Hammerspoon CLI)    | Required for Hammerspoon AX backend and `input scroll`; install Hammerspoon and enable `hs.ipc` | AX extensions or scroll fail with backend-unavailable hint       | `brew install --cask hammerspoon`, then add `require('hs.ipc')` to `~/.hammerspoon/init.lua` |
+| `im-select` binary        | Required by `input-source current` and `input-source switch`                                    | `input-source` commands fail with `missing dependency im-select` | `brew install im-select`                                                                     |
 
 See the workspace [`BINARY_DEPENDENCIES.md`](../../BINARY_DEPENDENCIES.md) for the canonical install matrix (rows for `hs`, `cliclick`, `im-select`, and `osascript`).
 
@@ -321,6 +335,8 @@ CI-safe integration tests.
 
 - TCC signal quality in `preflight` (Accessibility/Automation statuses + hints)
 - focus drift detection path for activation + `wait app-active`
+- Calculator-backed move, key, scroll, and drag primitives under the explicit
+  mutating gate
 
 `crates/macos-agent/tests/e2e_real_apps.rs` contains app workflow checks for:
 
@@ -345,7 +361,7 @@ MACOS_AGENT_REAL_E2E=1 MACOS_AGENT_REAL_E2E_MUTATING=1 MACOS_AGENT_REAL_E2E_APPS
 Real-app E2E environment variables:
 
 - `MACOS_AGENT_REAL_E2E=1`: enable real desktop tests.
-- `MACOS_AGENT_REAL_E2E_MUTATING=1`: allow mutating desktop actions (click/type/hotkey).
+- `MACOS_AGENT_REAL_E2E_MUTATING=1`: allow mutating desktop actions (click/move/drag/scroll/type/key/hotkey).
 - `MACOS_AGENT_REAL_E2E_APPS=arc,spotify,finder`: select app subset in deterministic order.
   - Unsupported app names are treated as configuration errors (fail fast).
 - `MACOS_AGENT_REAL_E2E_PROFILE=default-1440p`: choose coordinate profile fixture.
@@ -402,7 +418,7 @@ Use the `Decision ID` from `Command Decision Matrix` to choose the row quickly.
 | ID   | Symptom                                                          | Next command                                                                             | What to inspect                                                                                           | Decision row     |
 | ---- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ---------------- |
 | `T1` | `not authorized` or Apple Events failures                        | `macos-agent --format json preflight --include-probes`                                   | `error.hints`, Automation/Accessibility rows                                                              | `D3`             |
-| `T2` | Flaky click/input behavior                                       | `macos-agent --trace --error-format json input click ...`                                | latest trace JSON (`attempts_used`, timeout/retry policy)                                                 | `D3`             |
+| `T2` | Flaky pointer/keyboard behavior                                  | `macos-agent --trace --error-format json input <click|move|drag|scroll|key> ...`         | latest trace JSON (`attempts_used`, timeout/retry policy)                                                 | `D3`             |
 | `T3` | AX selector no match / ambiguous match                           | `macos-agent --format json ax list --app <name> --role <AXRole> --title-contains <text>` | node candidates (`node_id`, `role`, `title`, `identifier`) and refine selector / `--nth`                  | `D1`             |
 | `T4` | AX press/type fails but coordinate/keyboard path should continue | rerun with `ax click --allow-coordinate-fallback` or `ax type --allow-keyboard-fallback` | whether `used_coordinate_fallback` / `used_keyboard_fallback` is true in JSON result                      | `D2`             |
 | `T5` | Hammerspoon AX backend unavailable                               | `hs -t 1 -q -c 'return \"ok\"'`                                                          | ensure Hammerspoon is running and `require('hs.ipc')` is enabled, or keep backend `auto` for JXA fallback | `D1`, `D2`, `D4` |

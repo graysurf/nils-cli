@@ -572,8 +572,31 @@ pub fn send_hotkey(
     key: &str,
     timeout_ms: u64,
 ) -> Result<(), CliError> {
+    send_key_event(runner, mods, key, 1, timeout_ms, "input.hotkey")
+}
+
+pub fn send_key(
+    runner: &dyn ProcessRunner,
+    key: &str,
+    count: u8,
+    timeout_ms: u64,
+) -> Result<(), CliError> {
+    send_key_event(runner, &[], key, count, timeout_ms, "input.key")
+}
+
+fn send_key_event(
+    runner: &dyn ProcessRunner,
+    mods: &[Modifier],
+    key: &str,
+    count: u8,
+    timeout_ms: u64,
+    operation: &'static str,
+) -> Result<(), CliError> {
     if key.trim().is_empty() {
         return Err(CliError::usage("--key cannot be empty"));
+    }
+    if count == 0 {
+        return Err(CliError::usage("--count must be at least 1"));
     }
 
     let modifiers = if mods.is_empty() {
@@ -587,13 +610,34 @@ pub fn send_hotkey(
         format!(" using {{{joined}}}")
     };
 
-    let script = format!(
-        "tell application \"System Events\"\n  keystroke \"{}\"{}\nend tell",
-        escape_applescript(key),
-        modifiers
-    );
+    let action = if let Some(code) = named_key_code(key) {
+        format!("key code {code}{modifiers}")
+    } else {
+        format!("keystroke \"{}\"{modifiers}", escape_applescript(key))
+    };
+    let body = if count == 1 {
+        format!("  {action}")
+    } else {
+        format!("  repeat {count} times\n    {action}\n  end repeat")
+    };
+    let script = format!("tell application \"System Events\"\n{body}\nend tell");
 
-    run_osascript(runner, "input.hotkey", script, timeout_ms).map(|_| ())
+    run_osascript(runner, operation, script, timeout_ms).map(|_| ())
+}
+
+fn named_key_code(key: &str) -> Option<u16> {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "tab" => Some(48),
+        "return" | "enter" => Some(36),
+        "escape" => Some(53),
+        "space" => Some(49),
+        "left" => Some(123),
+        "right" => Some(124),
+        "down" => Some(125),
+        "up" => Some(126),
+        "delete" => Some(51),
+        _ => None,
+    }
 }
 
 pub fn frontmost_app_name(runner: &dyn ProcessRunner, timeout_ms: u64) -> Result<String, CliError> {

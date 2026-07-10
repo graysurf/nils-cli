@@ -1,6 +1,153 @@
 use tempfile::TempDir;
 
 use crate::common;
+
+#[test]
+fn input_key_sends_named_key_without_modifiers() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let log = cwd.path().join("osascript.log");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("AGENTS_MACOS_AGENT_STUB_LOG", &log.to_string_lossy());
+
+    let out = harness.run_with_options(
+        cwd.path(),
+        &["--format", "json", "input", "key", "--key", "return"],
+        options,
+    );
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let payload: serde_json::Value =
+        serde_json::from_str(&out.stdout_text()).expect("stdout should be json");
+    assert_eq!(payload["command"], serde_json::json!("input.key"));
+    assert_eq!(payload["result"]["key"], serde_json::json!("return"));
+    let recorded = std::fs::read_to_string(log).expect("read osascript log");
+    assert!(recorded.contains("key code 36"));
+    assert!(!recorded.contains("using {"));
+}
+
+#[test]
+fn input_key_count_uses_one_bounded_applescript_action() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let log = cwd.path().join("osascript.log");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("AGENTS_MACOS_AGENT_STUB_LOG", &log.to_string_lossy());
+
+    let out = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--format", "json", "input", "key", "--key", "left", "--count", "3",
+        ],
+        options,
+    );
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let recorded = std::fs::read_to_string(log).expect("read osascript log");
+    assert_eq!(recorded.matches("osascript ").count(), 1, "{recorded}");
+    assert!(recorded.contains("repeat 3 times"), "{recorded}");
+    assert_eq!(recorded.matches("key code 123").count(), 1, "{recorded}");
+}
+
+#[test]
+fn input_key_and_hotkey_normalize_surrounding_whitespace() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let log = cwd.path().join("osascript.log");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("AGENTS_MACOS_AGENT_STUB_LOG", &log.to_string_lossy());
+
+    let key_out = harness.run_with_options(
+        cwd.path(),
+        &["--format", "json", "input", "key", "--key", " x "],
+        options.clone(),
+    );
+    assert_eq!(key_out.code, 0, "stderr: {}", key_out.stderr_text());
+    let key_payload: serde_json::Value =
+        serde_json::from_str(&key_out.stdout_text()).expect("key stdout should be json");
+    assert_eq!(key_payload["result"]["key"], serde_json::json!("x"));
+
+    let hotkey_out = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--format", "json", "input", "hotkey", "--mods", "cmd", "--key", " left ",
+        ],
+        options,
+    );
+    assert_eq!(hotkey_out.code, 0, "stderr: {}", hotkey_out.stderr_text());
+    let hotkey_payload: serde_json::Value =
+        serde_json::from_str(&hotkey_out.stdout_text()).expect("hotkey stdout should be json");
+    assert_eq!(hotkey_payload["result"]["key"], serde_json::json!("left"));
+
+    let recorded = std::fs::read_to_string(log).expect("read osascript log");
+    assert!(recorded.contains("keystroke \"x\""), "{recorded}");
+    assert!(
+        recorded.contains("key code 123 using {command down}"),
+        "{recorded}"
+    );
+    assert!(!recorded.contains("keystroke \" x \""), "{recorded}");
+}
+
+#[test]
+fn input_hotkey_named_key_uses_key_code_with_modifiers() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let log = cwd.path().join("osascript.log");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("AGENTS_MACOS_AGENT_STUB_LOG", &log.to_string_lossy());
+
+    let out = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--format", "json", "input", "hotkey", "--mods", "cmd", "--key", "left",
+        ],
+        options,
+    );
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let recorded = std::fs::read_to_string(log).expect("read osascript log");
+    assert!(recorded.contains("key code 123 using {command down}"));
+}
+
+#[test]
+fn input_key_rejects_unknown_named_key() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+
+    let out = harness.run(cwd.path(), &["input", "key", "--key", "unknown-key"]);
+
+    assert_eq!(out.code, 2);
+    assert_eq!(out.stdout_text(), "");
+    assert!(out.stderr_text().contains("unsupported --key"));
+}
+
+#[test]
+fn input_key_backend_error_keeps_input_key_operation() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("AGENTS_MACOS_AGENT_STUB_OSASCRIPT_MODE", "fail");
+
+    let out = harness.run_with_options(
+        cwd.path(),
+        &["--error-format", "json", "input", "key", "--key", "return"],
+        options,
+    );
+
+    assert_eq!(out.code, 1);
+    let payload: serde_json::Value =
+        serde_json::from_str(&out.stderr_text()).expect("stderr should be json");
+    assert_eq!(
+        payload["error"]["operation"],
+        serde_json::json!("input.key")
+    );
+}
+
 #[test]
 fn input_type_accepts_whitespace_and_punctuation() {
     let harness = common::MacosAgentHarness::new();
@@ -163,6 +310,25 @@ fn input_keyboard_rejects_tsv_output_mode() {
     assert_eq!(hotkey_out.code, 2);
     assert!(
         hotkey_out
+            .stderr_text()
+            .contains("only supported for `windows list` and `apps list`")
+    );
+
+    let key_out = harness.run(
+        cwd.path(),
+        &[
+            "--format",
+            "tsv",
+            "input",
+            "key",
+            "--key",
+            "return",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(key_out.code, 2);
+    assert!(
+        key_out
             .stderr_text()
             .contains("only supported for `windows list` and `apps list`")
     );

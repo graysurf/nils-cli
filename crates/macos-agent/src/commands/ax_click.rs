@@ -106,7 +106,7 @@ pub fn run(
                     "backend requested coordinate fallback but y coordinate is missing",
                 )
             })?;
-            cliclick::click(runner, x, y, MouseButton::Left, 1, policy.timeout_ms)?;
+            cliclick::click(runner, x, y, MouseButton::Left, 1, &[], policy.timeout_ms)?;
             backend_result.action = "coordinate-fallback".to_string();
         }
 
