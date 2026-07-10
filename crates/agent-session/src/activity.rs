@@ -560,6 +560,13 @@ pub(crate) fn ingest_event(
             Some(json!({ "id": record.id })),
         ));
     }
+    if expected_provider_session_id.is_some() && event.provider_session_id.is_none() {
+        return Err(CliError::data(
+            "provider-session-id-missing",
+            "activity event omitted the provider session identity required by this runtime",
+            Some(json!({ "id": record.id })),
+        ));
+    }
 
     let dir = session_dir(context, &record.id);
     let _lock = acquire_lock(&dir)?;
@@ -581,6 +588,13 @@ pub(crate) fn ingest_event(
         return Err(CliError::data(
             "provider-session-id-mismatch",
             "activity event changed provider session identity within one runtime",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    if document.provider_session_id.is_some() && event.provider_session_id.is_none() {
+        return Err(CliError::data(
+            "provider-session-id-missing",
+            "activity event omitted the provider session identity already bound to this runtime",
             Some(json!({ "id": record.id })),
         ));
     }
@@ -1913,6 +1927,21 @@ mod tests {
     }
 
     #[test]
+    fn journal_idempotency_is_scoped_to_the_runtime_generation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join(ACTIVITY_JOURNAL_FILE);
+        let first = event(TurnEventKind::Progress, "reused-event-id");
+        append_journal(&path, &first, "2026-07-10T00:00:00Z").expect("first runtime");
+        let mut second = first;
+        second.runtime_id = "runtime-2".to_string();
+        append_journal(&path, &second, "2026-07-10T00:01:00Z").expect("second runtime");
+        let entries = fs::read_to_string(path).expect("journal");
+        assert_eq!(entries.matches("reused-event-id").count(), 2);
+        assert!(entries.contains("runtime-1"));
+        assert!(entries.contains("runtime-2"));
+    }
+
+    #[test]
     fn frozen_normalized_fixtures_parse_and_contain_no_content_keys() {
         let events = include_str!("../tests/fixtures/activity/turn-events.jsonl");
         for line in events.lines() {
@@ -2267,10 +2296,10 @@ fn append_journal_entry(path: &Path, entry: JournalEntry) -> Result<(), CliError
     } else {
         Vec::new()
     };
-    if entries
-        .iter()
-        .any(|existing| existing.event.event_id == entry.event.event_id)
-    {
+    if entries.iter().any(|existing| {
+        existing.event.runtime_id == entry.event.runtime_id
+            && existing.event.event_id == entry.event.event_id
+    }) {
         return Ok(());
     }
     entries.push(entry);

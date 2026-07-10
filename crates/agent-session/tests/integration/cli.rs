@@ -902,6 +902,17 @@ fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
     let diagnostic = fs::read_to_string(&diagnostic_path).expect("session mismatch diagnostic");
     assert!(diagnostic.contains("provider-session-id-mismatch"));
 
+    let missing_identity = json!({"hook_event_name": "PostToolUse"}).to_string();
+    let hook = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &hook_env,
+        &missing_identity,
+    );
+    assert_eq!(hook.code, 0);
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("missing identity diagnostic");
+    assert!(diagnostic.contains("provider-session-id-missing"));
+
     let progress = json!({
         "hook_event_name": "PostToolUse",
         "session_id": provider_session_secret

@@ -43,7 +43,7 @@ Provider hooks never persist their raw session or turn identifiers. They are
 projected to runtime-scoped SHA-256 opaque values before validation, storage,
 or exposure. When exact provider resume identity is known it must match; when
 it is not known, the first non-empty projected provider session id binds the
-runtime and later changes are rejected.
+runtime; later changes or identity-less events are rejected.
 
 The host receive time is canonical. Provider time is accepted only as inert
 metadata in v1 and never advances state ahead of host observation. Runtime id
