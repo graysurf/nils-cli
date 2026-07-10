@@ -1,6 +1,6 @@
 [package]
 name = "nils-agent-workflow-primitives"
-version = "1.21.11"
+version = "1.21.12"
 edition.workspace = true
 license.workspace = true
 
@@ -64,17 +64,17 @@ path = "src/bin/test-first-evidence.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.21.11", path = "../nils-build-info" }
-nils-agent-out = { version = "1.21.11", path = "../agent-out" }
-nils-common = { version = "1.21.11", path = "../nils-common", package = "nils-common" }
-nils-markdown = { version = "1.21.11", path = "../nils-markdown", package = "nils-markdown" }
-nils-term = { version = "1.21.11", path = "../nils-term", package = "nils-term" }
+nils-build-info = { version = "1.21.12", path = "../nils-build-info" }
+nils-agent-out = { version = "1.21.12", path = "../agent-out" }
+nils-common = { version = "1.21.12", path = "../nils-common", package = "nils-common" }
+nils-markdown = { version = "1.21.12", path = "../nils-markdown", package = "nils-markdown" }
+nils-term = { version = "1.21.12", path = "../nils-term", package = "nils-term" }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 
 [dev-dependencies]
-nils-test-support = { version = "1.21.11", path = "../nils-test-support" }
+nils-test-support = { version = "1.21.12", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
