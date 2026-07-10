@@ -52,6 +52,9 @@ _codex-cli() {
             codex__cli__agent,prompt)
                 cmd="codex__cli__agent__prompt"
                 ;;
+            codex__cli__agent,resume)
+                cmd="codex__cli__agent__resume"
+                ;;
             codex__cli__agent__help,advice)
                 cmd="codex__cli__agent__help__advice"
                 ;;
@@ -66,6 +69,9 @@ _codex-cli() {
                 ;;
             codex__cli__agent__help,prompt)
                 cmd="codex__cli__agent__help__prompt"
+                ;;
+            codex__cli__agent__help,resume)
+                cmd="codex__cli__agent__help__resume"
                 ;;
             codex__cli__auth,auto-refresh)
                 cmd="codex__cli__auth__auto__refresh"
@@ -211,6 +217,9 @@ _codex-cli() {
             codex__cli__help__agent,prompt)
                 cmd="codex__cli__help__agent__prompt"
                 ;;
+            codex__cli__help__agent,resume)
+                cmd="codex__cli__help__agent__resume"
+                ;;
             codex__cli__help__auth,auto-refresh)
                 cmd="codex__cli__help__auth__auto__refresh"
                 ;;
@@ -298,7 +307,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__agent)
-            opts="-h --help prompt advice knowledge commit help"
+            opts="-h --help prompt advice knowledge commit resume help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -340,7 +349,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__agent__help)
-            opts="prompt advice knowledge commit help"
+            opts="prompt advice knowledge commit resume help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -423,6 +432,20 @@ _codex-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        codex__cli__agent__help__resume)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         codex__cli__agent__knowledge)
             opts="-h --ephemeral --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -444,6 +467,27 @@ _codex-cli() {
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        codex__cli__agent__resume)
+            opts="-h --cd --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --cd)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -1096,7 +1140,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__help__agent)
-            opts="prompt advice knowledge commit"
+            opts="prompt advice knowledge commit resume"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1152,6 +1196,20 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__help__agent__prompt)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        codex__cli__help__agent__resume)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

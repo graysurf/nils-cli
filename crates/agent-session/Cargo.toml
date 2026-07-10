@@ -21,6 +21,7 @@ clap_complete = { workspace = true }
 jiff = { workspace = true }
 nils-build-info = { version = "1.21.8", path = "../nils-build-info" }
 nils-common = { version = "1.21.8", path = "../nils-common", package = "nils-common" }
+nils-provider-resume = { version = "1.21.8", path = "../nils-provider-resume", package = "nils-provider-resume" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }

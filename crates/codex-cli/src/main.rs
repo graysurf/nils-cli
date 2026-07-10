@@ -90,6 +90,12 @@ fn handle_agent(args: &cli::AgentArgs) -> i32 {
             };
             agent::commit::run(&options).unwrap_or(1)
         }
+        Some(cli::AgentCommand::Resume { session_id, cd }) => {
+            agent::resume::run(&agent::resume::ResumeOptions {
+                session_id: session_id.clone(),
+                cwd: cd.clone(),
+            })
+        }
         None => print_subcommand_help("agent"),
     }
 }

@@ -9,6 +9,8 @@ mod agent_commit;
 mod agent_exec;
 #[path = "integration/agent_prompt.rs"]
 mod agent_prompt;
+#[path = "integration/agent_resume.rs"]
+mod agent_resume;
 #[path = "integration/agent_templates.rs"]
 mod agent_templates;
 #[path = "integration/auth_auto_refresh.rs"]

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::thread;
@@ -24,6 +24,18 @@ use nils_common::fs::{
     SECRET_FILE_MODE, display_path, expand_home, home_dir, normalize_path, write_atomic,
 };
 use nils_common::git::parse_git_remote_url;
+// The provider session-resume resolver, session-history scanning primitives, and
+// bounded-scan budgets live in `nils-provider-resume` so `codex-cli`,
+// `claude-cli`, and this crate share one implementation. Items reused by the
+// `provider_prompt` module via `crate::` are re-exported at crate scope.
+use nils_provider_resume::{
+    CODEX_RESUME_SCAN_MAX_DEPTH, ClaudeResumeScanBudget, CodexResumeScanBudget, ResumeIdError,
+    ResumeProvider, ResumeResolveError, collect_claude_provider_resume_matches,
+    collect_codex_provider_resume_matches, normalize_resume_id, resolve_resume_source,
+};
+pub(crate) use nils_provider_resume::{
+    claude_projects_root, codex_sessions_root, read_claude_session_cwd, read_codex_session_meta,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -51,14 +63,6 @@ const CODEX_RESUME_CAPTURE_TIMEOUT_MS: u64 = 1500;
 const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
 const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
 const CODEX_RESUME_BACKFILL_MAX_AGE_SECS: u64 = 10 * 60;
-const CODEX_RESUME_SCAN_MAX_DEPTH: usize = 6;
-const CODEX_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
-const CODEX_RESUME_SCAN_SLICE_MS: u64 = 250;
-const CODEX_SESSION_META_MAX_LINE_BYTES: u64 = 64 * 1024;
-const CLAUDE_RESUME_SCAN_MAX_ENTRIES: usize = 5000;
-const CLAUDE_RESUME_SCAN_SLICE_MS: u64 = 250;
-const CLAUDE_SESSION_SCAN_MAX_LINES: usize = 64;
-const CLAUDE_SESSION_META_MAX_LINE_BYTES: usize = 1024 * 1024;
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -1029,43 +1033,45 @@ struct ProviderResumeSource {
     capture_method: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ProviderHistoryMatch {
-    path: PathBuf,
-    cwd: String,
-}
-
 fn normalize_provider_resume_id(session_id: &str) -> Result<String, CliError> {
-    let session_id = session_id.trim();
-    if session_id.is_empty() {
-        return Err(CliError::usage(
-            "invalid-provider-resume-id",
-            "provider resume id must not be empty",
-            None,
-        ));
-    }
-    if session_id.chars().any(char::is_control) {
-        return Err(CliError::usage(
-            "invalid-provider-resume-id",
-            "provider resume id must not contain control characters",
-            None,
-        ));
-    }
-    Ok(session_id.to_string())
+    normalize_resume_id(session_id).map_err(|err| {
+        let message = match err {
+            ResumeIdError::Empty => "provider resume id must not be empty",
+            ResumeIdError::ControlChar => "provider resume id must not contain control characters",
+        };
+        CliError::usage("invalid-provider-resume-id", message, None)
+    })
 }
 
 fn resolve_provider_resume_source(
     agent: AgentKind,
     session_id: &str,
 ) -> Result<ProviderResumeSource, CliError> {
-    match agent {
-        AgentKind::Codex => resolve_codex_provider_resume_source(session_id),
-        AgentKind::Claude => resolve_claude_provider_resume_source(session_id),
-        AgentKind::Hermes => Err(CliError::usage(
-            "unsupported-provider-resume-agent",
-            "hermes sessions cannot be imported by provider resume id",
-            Some(json!({ "agent": agent.as_str() })),
-        )),
+    let provider = match agent {
+        AgentKind::Codex => ResumeProvider::Codex,
+        AgentKind::Claude => ResumeProvider::Claude,
+        AgentKind::Hermes => {
+            return Err(CliError::usage(
+                "unsupported-provider-resume-agent",
+                "hermes sessions cannot be imported by provider resume id",
+                Some(json!({ "agent": agent.as_str() })),
+            ));
+        }
+    };
+    // The shared resolver owns the bounded history scan and returns a structured
+    // outcome; the user-facing error text and exit-code mapping stay here.
+    match resolve_resume_source(provider, session_id) {
+        Ok(resolved) => Ok(ProviderResumeSource {
+            cwd: resolved.cwd,
+            capture_method: resolved.capture_method.to_string(),
+        }),
+        Err(ResumeResolveError::NotFound) => Err(provider_resume_not_found(agent, session_id)),
+        Err(ResumeResolveError::Ambiguous { cwd_count }) => {
+            Err(provider_resume_ambiguous(agent, session_id, cwd_count))
+        }
+        Err(ResumeResolveError::Truncated) => {
+            Err(provider_resume_scan_truncated(agent, session_id))
+        }
     }
 }
 
@@ -1106,148 +1112,6 @@ fn provider_resume_scan_truncated(agent: AgentKind, session_id: &str) -> CliErro
     )
 }
 
-fn resolve_codex_provider_resume_source(
-    session_id: &str,
-) -> Result<ProviderResumeSource, CliError> {
-    let root = codex_sessions_root()
-        .ok_or_else(|| provider_resume_not_found(AgentKind::Codex, session_id))?;
-    let mut matches = BTreeSet::new();
-    let mut budget = CodexResumeScanBudget::from_env();
-    collect_codex_provider_resume_matches(&root, 0, session_id, &mut matches, &mut budget);
-    if budget.truncated {
-        return Err(provider_resume_scan_truncated(AgentKind::Codex, session_id));
-    }
-    let cwd_matches = matches
-        .into_iter()
-        .map(|candidate: ProviderHistoryMatch| candidate.cwd)
-        .collect();
-    provider_resume_source_from_matches(
-        AgentKind::Codex,
-        session_id,
-        cwd_matches,
-        "codex-session-meta-import",
-    )
-}
-
-fn collect_codex_provider_resume_matches(
-    dir: &Path,
-    depth: usize,
-    session_id: &str,
-    matches: &mut BTreeSet<ProviderHistoryMatch>,
-    budget: &mut CodexResumeScanBudget,
-) {
-    if depth > CODEX_RESUME_SCAN_MAX_DEPTH {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if !budget.visit_entry() {
-            return;
-        }
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            collect_codex_provider_resume_matches(&path, depth + 1, session_id, matches, budget);
-            if budget.truncated {
-                return;
-            }
-            continue;
-        }
-        if !file_type.is_file()
-            || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-        {
-            continue;
-        }
-        if let Some(meta) = read_codex_session_meta(&path)
-            && meta.session_id == session_id
-        {
-            matches.insert(ProviderHistoryMatch {
-                path,
-                cwd: meta.cwd,
-            });
-        }
-    }
-}
-
-fn resolve_claude_provider_resume_source(
-    session_id: &str,
-) -> Result<ProviderResumeSource, CliError> {
-    let root = claude_projects_root()
-        .ok_or_else(|| provider_resume_not_found(AgentKind::Claude, session_id))?;
-    let mut matches = BTreeSet::new();
-    let mut budget = ClaudeResumeScanBudget::from_env();
-    collect_claude_provider_resume_matches(&root, session_id, &mut matches, &mut budget);
-    if budget.truncated {
-        return Err(provider_resume_scan_truncated(
-            AgentKind::Claude,
-            session_id,
-        ));
-    }
-    let cwd_matches = matches
-        .into_iter()
-        .map(|candidate: ProviderHistoryMatch| candidate.cwd)
-        .collect();
-    provider_resume_source_from_matches(
-        AgentKind::Claude,
-        session_id,
-        cwd_matches,
-        "claude-project-transcript-import",
-    )
-}
-
-fn claude_projects_root() -> Option<PathBuf> {
-    if let Some(claude_config_dir) = non_empty_env("CLAUDE_CONFIG_DIR") {
-        return Some(PathBuf::from(claude_config_dir).join("projects"));
-    }
-    home_dir().map(|home| home.join(".claude/projects"))
-}
-
-fn collect_claude_provider_resume_matches(
-    projects_root: &Path,
-    session_id: &str,
-    matches: &mut BTreeSet<ProviderHistoryMatch>,
-    budget: &mut ClaudeResumeScanBudget,
-) {
-    let Ok(projects) = fs::read_dir(projects_root) else {
-        return;
-    };
-    for project in projects.flatten() {
-        if !budget.visit_entry() {
-            return;
-        }
-        let Ok(project_type) = project.file_type() else {
-            continue;
-        };
-        if !project_type.is_dir() {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(project.path()) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if !budget.visit_entry() {
-                return;
-            }
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-            {
-                continue;
-            }
-            if let Some(cwd) = read_claude_session_cwd(&path, session_id) {
-                matches.insert(ProviderHistoryMatch { path, cwd });
-            }
-        }
-    }
-}
-
 pub(crate) fn resolve_provider_transcript_path_from_roots(
     agent: AgentKind,
     session_id: &str,
@@ -1283,130 +1147,6 @@ pub(crate) fn resolve_provider_transcript_path_from_roots(
         return None;
     }
     matches.into_iter().next().map(|candidate| candidate.path)
-}
-
-fn provider_resume_source_from_matches(
-    agent: AgentKind,
-    session_id: &str,
-    matches: BTreeSet<String>,
-    capture_method: &str,
-) -> Result<ProviderResumeSource, CliError> {
-    match matches.len() {
-        0 => Err(provider_resume_not_found(agent, session_id)),
-        1 => Ok(ProviderResumeSource {
-            cwd: PathBuf::from(matches.iter().next().expect("single match")),
-            capture_method: capture_method.to_string(),
-        }),
-        len => Err(provider_resume_ambiguous(agent, session_id, len)),
-    }
-}
-
-#[derive(Debug)]
-struct ClaudeResumeScanBudget {
-    visited: usize,
-    max_entries: usize,
-    deadline: Instant,
-    truncated: bool,
-}
-
-impl ClaudeResumeScanBudget {
-    fn from_env() -> Self {
-        let max_entries = env_usize(
-            "AGENT_SESSION_CLAUDE_RESUME_SCAN_MAX_ENTRIES",
-            CLAUDE_RESUME_SCAN_MAX_ENTRIES,
-        )
-        .max(1);
-        let slice = Duration::from_millis(env_u64(
-            "AGENT_SESSION_CLAUDE_RESUME_SCAN_SLICE_MS",
-            CLAUDE_RESUME_SCAN_SLICE_MS,
-        ));
-        Self {
-            visited: 0,
-            max_entries,
-            deadline: Instant::now() + slice,
-            truncated: false,
-        }
-    }
-
-    fn visit_entry(&mut self) -> bool {
-        if self.visited >= self.max_entries || Instant::now() >= self.deadline {
-            self.truncated = true;
-            return false;
-        }
-        self.visited += 1;
-        true
-    }
-}
-
-fn read_claude_session_cwd(path: &Path, session_id: &str) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let mut reader = io::BufReader::new(file);
-    let mut line = Vec::new();
-    for _ in 0..CLAUDE_SESSION_SCAN_MAX_LINES {
-        let within_limit =
-            read_bounded_line(&mut reader, &mut line, CLAUDE_SESSION_META_MAX_LINE_BYTES).ok()?;
-        let within_limit = within_limit?;
-        if !within_limit {
-            return None;
-        }
-        let Ok(line) = std::str::from_utf8(trim_line_ending(&line)) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let id_matches = value
-            .get("sessionId")
-            .or_else(|| value.get("session_id"))
-            .and_then(Value::as_str)
-            == Some(session_id);
-        if !id_matches || value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
-        }
-        if let Some(cwd) = value
-            .get("cwd")
-            .and_then(Value::as_str)
-            .filter(|cwd| !cwd.trim().is_empty())
-        {
-            return Some(cwd.to_string());
-        }
-    }
-    None
-}
-
-fn read_bounded_line<R: BufRead>(
-    reader: &mut R,
-    buffer: &mut Vec<u8>,
-    max_bytes: usize,
-) -> io::Result<Option<bool>> {
-    buffer.clear();
-    let mut total = 0usize;
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok((total > 0).then_some(true));
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let take_len = newline.map_or(available.len(), |index| index + 1);
-        let remaining = max_bytes.saturating_sub(total);
-        if take_len > remaining {
-            buffer.extend_from_slice(&available[..remaining]);
-            let consume_len = remaining.saturating_add(1).min(take_len);
-            reader.consume(consume_len);
-            return Ok(Some(false));
-        }
-        buffer.extend_from_slice(&available[..take_len]);
-        total = total.saturating_add(take_len);
-        reader.consume(take_len);
-        if newline.is_some() {
-            return Ok(Some(true));
-        }
-    }
-}
-
-fn trim_line_ending(bytes: &[u8]) -> &[u8] {
-    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
 /// Resolve the `systemd-run` binary used to launch the tmux server inside a
@@ -1589,13 +1329,6 @@ struct CodexResumeCandidate {
     created_at: SystemTime,
 }
 
-#[derive(Debug, PartialEq)]
-struct CodexSessionMeta {
-    session_id: String,
-    cwd: String,
-    created_at: SystemTime,
-}
-
 fn capture_codex_resume(
     record: &SessionRecord,
     launch_started_at: SystemTime,
@@ -1727,54 +1460,6 @@ fn codex_provider_resume(record: &SessionRecord, session_id: &str) -> ProviderRe
     }
 }
 
-fn codex_sessions_root() -> Option<PathBuf> {
-    if let Some(codex_home) = non_empty_env("CODEX_HOME") {
-        return Some(PathBuf::from(codex_home).join("sessions"));
-    }
-    home_dir().map(|home| home.join(".codex/sessions"))
-}
-
-#[derive(Debug)]
-struct CodexResumeScanBudget {
-    visited: usize,
-    max_entries: usize,
-    deadline: Instant,
-    truncated: bool,
-}
-
-impl CodexResumeScanBudget {
-    fn from_env() -> Self {
-        let max_entries = non_empty_env("AGENT_SESSION_CODEX_RESUME_SCAN_MAX_ENTRIES")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or_else(|| {
-                env_usize(
-                    "AGENT_SESSION_CODEX_CAPTURE_MAX_ENTRIES",
-                    CODEX_RESUME_SCAN_MAX_ENTRIES,
-                )
-            })
-            .max(1);
-        let slice = Duration::from_millis(env_u64(
-            "AGENT_SESSION_CODEX_SCAN_SLICE_MS",
-            CODEX_RESUME_SCAN_SLICE_MS,
-        ));
-        Self {
-            visited: 0,
-            max_entries,
-            deadline: Instant::now() + slice,
-            truncated: false,
-        }
-    }
-
-    fn visit_entry(&mut self) -> bool {
-        if self.visited >= self.max_entries || Instant::now() >= self.deadline {
-            self.truncated = true;
-            return false;
-        }
-        self.visited += 1;
-        true
-    }
-}
-
 fn collect_codex_resume_candidates(
     dir: &Path,
     depth: usize,
@@ -1827,48 +1512,6 @@ fn collect_codex_resume_candidates(
             });
         }
     }
-}
-
-fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
-    let file = fs::File::open(path).ok()?;
-    let mut reader = io::BufReader::new(file).take(CODEX_SESSION_META_MAX_LINE_BYTES + 1);
-    let mut first_line = Vec::new();
-    let read = reader.read_until(b'\n', &mut first_line).ok()?;
-    if read == 0 || first_line.len() as u64 > CODEX_SESSION_META_MAX_LINE_BYTES {
-        return None;
-    }
-    if first_line.last() == Some(&b'\n') {
-        first_line.pop();
-        if first_line.last() == Some(&b'\r') {
-            first_line.pop();
-        }
-    }
-    let first_line = std::str::from_utf8(&first_line).ok()?;
-    let value: Value = serde_json::from_str(first_line).ok()?;
-    if value.get("type").and_then(Value::as_str)? != "session_meta" {
-        return None;
-    }
-    let payload = value.get("payload")?;
-    let cwd = payload.get("cwd").and_then(Value::as_str)?.to_string();
-    if payload.get("source").and_then(Value::as_str)? != "cli" {
-        return None;
-    }
-    let session_id = payload
-        .get("id")
-        .or_else(|| payload.get("session_id"))
-        .and_then(Value::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .map(str::to_string)?;
-    let timestamp = payload
-        .get("timestamp")
-        .or_else(|| value.get("timestamp"))
-        .and_then(Value::as_str)?;
-    let created_at: SystemTime = timestamp.parse::<Timestamp>().ok()?.into();
-    Some(CodexSessionMeta {
-        session_id,
-        cwd,
-        created_at,
-    })
 }
 
 fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError> {
@@ -2143,60 +1786,6 @@ fn strip_trailing_blank_lines(text: &str) -> String {
 #[cfg(test)]
 mod codex_resume_tests {
     use super::*;
-
-    #[test]
-    fn codex_session_meta_reader_matches_only_cli_source_and_cwd() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("rollout.jsonl");
-        fs::write(
-            &path,
-            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
-        )
-        .unwrap();
-        let meta = read_codex_session_meta(&path).expect("session meta");
-        assert_eq!(meta.session_id, "codex-id");
-        assert_eq!(meta.cwd, "/repo");
-
-        fs::write(
-            &path,
-            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}},"timestamp":"2099-01-01T00:00:00Z"}}"#,
-        )
-        .unwrap();
-        assert_eq!(read_codex_session_meta(&path), None);
-    }
-
-    #[test]
-    fn codex_session_meta_reader_rejects_oversized_first_line() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("rollout.jsonl");
-        fs::write(
-            &path,
-            format!(
-                r#"{{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{{"id":"oversized-codex-id","session_id":"oversized-codex-id","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z","pad":"{}"}}}}"#,
-                "x".repeat(2 * 1024 * 1024)
-            ),
-        )
-        .unwrap();
-
-        assert_eq!(read_codex_session_meta(&path), None);
-    }
-
-    #[test]
-    fn bounded_line_reader_discards_oversized_lines_without_growing_buffer() {
-        let mut reader = io::Cursor::new(format!("{}\nvalid\n", "x".repeat(32)).into_bytes());
-        let mut line = Vec::new();
-
-        assert_eq!(
-            read_bounded_line(&mut reader, &mut line, 8).unwrap(),
-            Some(false)
-        );
-        assert_eq!(line.len(), 8);
-        assert_eq!(
-            reader.position(),
-            9,
-            "oversized lines must not be drained to newline"
-        );
-    }
 
     #[test]
     fn codex_resume_scan_truncates_large_stale_tree_by_entry_budget() {
@@ -4155,12 +3744,6 @@ fn binary_on_path(name: &str) -> Option<PathBuf> {
 fn env_u64(key: &str, default: u64) -> u64 {
     non_empty_env(key)
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    non_empty_env(key)
-        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
 }
 

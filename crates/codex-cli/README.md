@@ -15,7 +15,7 @@ Usage:
   codex-cli completion <shell>
 
 Groups:
-  agent           prompt | advice | knowledge | commit
+  agent           prompt | advice | knowledge | commit | resume
   auth            login | use | save | remove | refresh | auto-refresh | status | current | sync | remote pull
   diag            rate-limits
   config          show | set
@@ -47,10 +47,15 @@ Help:
 - `advice [--ephemeral] [QUESTION...]`: Request actionable engineering advice.
 - `knowledge [--ephemeral] [CONCEPT...]`: Request a concept explanation.
 - `commit [--ephemeral] [-p|--push] [-a|--auto-stage] [EXTRA...]`: Run the semantic-commit workflow.
+- `resume <SESSION_ID> [--cd <dir>]`: Resolve the session's recorded working directory from local Codex history and launch
+  `codex resume <SESSION_ID> --cd <cwd> --no-alt-screen` there, propagating Codex's exit status. Run it from any directory. Fails without
+  launching Codex (`65`) when the id is unknown or matches more than one recorded directory; pass `--cd` to override the resolved directory
+  for a repository that moved.
 
 Agent flag notes:
 
 - `--ephemeral`: Forward `codex exec --ephemeral` so Codex does not persist session files for that run.
+- `resume --cd <dir>`: Bypass automatic cwd resolution and resume in `<dir>` (must be an existing directory).
 
 ### auth
 
@@ -155,11 +160,14 @@ Auth examples:
 - `git` is required for `agent commit`.
 - `semantic-commit` and `git-scope` are optional for `agent commit` (fallbacks apply).
 - `ssh` is required for `auth remote pull`.
+- `agent resume` reads local Codex session history under `$CODEX_HOME/sessions` (default `~/.codex/sessions`); the shared resolver lives in
+  `nils-provider-resume`.
 
 ## Exit codes
 
 - `0`: success and help output.
 - `64`: usage or argument errors.
+- `65`: `agent resume` could not resolve the session id (unknown or ambiguous).
 - `1`: operational errors.
 
 ## Contract sign-off checklist

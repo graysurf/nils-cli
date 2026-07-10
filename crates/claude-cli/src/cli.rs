@@ -1,4 +1,6 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 
 const ROOT_AFTER_HELP: &str = "\
 EXAMPLES:
@@ -6,6 +8,7 @@ EXAMPLES:
   claude-cli prompt-segment --refresh
   claude-cli prompt-segment status --format json
   claude-cli usage --format json --source auto
+  claude-cli agent resume <session-id>
   claude-cli completion zsh
 
 ENVIRONMENT:
@@ -19,7 +22,8 @@ ENVIRONMENT:
 EXIT CODES:
   0   success
   1   runtime false/failed state
-  64  command-line usage error";
+  64  command-line usage error
+  65  could not resolve session id (unknown or ambiguous)";
 
 #[derive(Parser)]
 #[command(
@@ -37,12 +41,33 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Agent command group
+    Agent(AgentArgs),
     /// Prompt-segment command group
     PromptSegment(PromptSegmentArgs),
     /// Read Claude usage from OAuth, Claude CLI, or cache
     Usage(UsageArgs),
     /// Export shell completion script
     Completion(CompletionArgs),
+}
+
+#[derive(Args)]
+pub struct AgentArgs {
+    #[command(subcommand)]
+    pub command: Option<AgentCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum AgentCommand {
+    /// Resume a Claude session in its recorded working directory
+    Resume {
+        /// Claude session id to resume
+        #[arg(value_name = "session_id")]
+        session_id: String,
+        /// Override the recorded working directory (for a moved repository)
+        #[arg(long = "cd", value_name = "dir", value_hint = ValueHint::DirPath)]
+        cd: Option<PathBuf>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
