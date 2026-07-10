@@ -628,8 +628,21 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
             "agent={agent} stderr={}",
             dry_run.stderr_text()
         );
-        assert_eq!(data(&dry_run.stdout_json())["changed"], true);
+        let dry_run_json = dry_run.stdout_json();
+        assert_eq!(data(&dry_run_json)["changed"], false);
+        assert_eq!(data(&dry_run_json)["would_change"], true);
+        assert_eq!(data(&dry_run_json)["configured"], false);
+        assert_eq!(data(&dry_run_json)["would_configure"], true);
         assert_eq!(fs::read(path).expect("dry-run config"), before);
+
+        let dry_run_text = run(
+            tmp.path(),
+            &["activity", "setup", "--agent", agent, "--dry-run"],
+            &envs,
+        );
+        assert_eq!(dry_run_text.code, 0);
+        assert!(dry_run_text.stdout_text().contains("configured now: no"));
+        assert!(dry_run_text.stdout_text().contains("would configure: yes"));
 
         let apply = run(
             tmp.path(),
@@ -646,7 +659,9 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
         );
         let apply_json = apply.stdout_json();
         assert_eq!(data(&apply_json)["changed"], true);
+        assert_eq!(data(&apply_json)["would_change"], true);
         assert_eq!(data(&apply_json)["configured"], true);
+        assert_eq!(data(&apply_json)["would_configure"], true);
         let applied = fs::read(path).expect("applied config");
         assert!(String::from_utf8_lossy(&applied).contains(keep));
 
@@ -664,6 +679,9 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
             second.stderr_text()
         );
         assert_eq!(data(&second.stdout_json())["changed"], false);
+        assert_eq!(data(&second.stdout_json())["would_change"], false);
+        assert_eq!(data(&second.stdout_json())["configured"], true);
+        assert_eq!(data(&second.stdout_json())["would_configure"], true);
         assert_eq!(fs::read(path).expect("second config"), applied);
 
         let remove = run(
@@ -679,6 +697,11 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
             "agent={agent} stderr={}",
             remove.stderr_text()
         );
+        let remove_json = remove.stdout_json();
+        assert_eq!(data(&remove_json)["changed"], true);
+        assert_eq!(data(&remove_json)["would_change"], true);
+        assert_eq!(data(&remove_json)["configured"], false);
+        assert_eq!(data(&remove_json)["would_configure"], false);
         let removed = fs::read_to_string(path).expect("removed config");
         assert!(removed.contains(keep));
         assert!(!removed.contains("agent-session activity hook"));

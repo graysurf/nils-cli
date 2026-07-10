@@ -39,11 +39,13 @@ keys fail parsing. Identifiers are bounded, non-empty, and control-free.
 `clarification`, `authentication`, or `other`; `attention_cleared` requires the
 matching id.
 
-Provider hooks never persist their raw session or turn identifiers. They are
-projected to runtime-scoped SHA-256 opaque values before validation, storage,
-or exposure. When exact provider resume identity is known it must match; when
-it is not known, the first non-empty projected provider session id binds the
-runtime; later changes or identity-less events are rejected.
+Provider hooks and direct `activity event` callers may supply bounded raw opaque
+session or turn identifiers. Ingestion projects them to runtime-scoped SHA-256
+opaque values before storage or exposure; an already projected `local:v1:` value
+must carry exactly 64 hexadecimal digest characters. When exact provider resume
+identity is known it must match; when it is not known, the first non-empty
+projected provider session id binds the runtime; later changes or identity-less
+events are rejected.
 
 The host receive time is canonical. Provider time is accepted only as inert
 metadata in v1 and never advances state ahead of host observation. Runtime id
@@ -161,3 +163,8 @@ and never auto-accepts Codex trust or Hermes consent. Doctor
 reports installed version, audited classification, config status, finality and
 correlation limits, trust requirements, and repair guidance without emitting
 provider config content.
+
+Setup JSON distinguishes current and prospective state: `configured` and
+`changed` describe the file after the command, while `would_configure` and
+`would_change` describe the requested transformation. Dry-run never reports a
+file change and leaves `configured` at the current value.

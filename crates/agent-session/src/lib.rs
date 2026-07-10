@@ -4060,12 +4060,25 @@ fn render_doctor_text(result: &activity::DoctorResult) -> String {
 }
 
 fn render_setup_text(result: &activity::SetupResult) -> String {
+    if result.action == "dry-run" {
+        return format!(
+            "{} activity setup preview: {} (configured now: {}; would configure: {})\n",
+            result.provider,
+            if result.would_change {
+                "changes required"
+            } else {
+                "no change"
+            },
+            if result.configured { "yes" } else { "no" },
+            if result.would_configure { "yes" } else { "no" }
+        );
+    }
     format!(
         "{} activity setup {}: {} (configured: {})\n",
         result.provider,
         result.action,
         if result.changed {
-            "changes required"
+            "updated"
         } else {
             "no change"
         },

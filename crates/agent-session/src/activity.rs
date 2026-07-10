@@ -165,7 +165,6 @@ pub(crate) struct TurnEvent {
     pub(crate) attention_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) attention_kind: Option<String>,
-    #[serde(default)]
     pub(crate) confidence: Confidence,
     #[serde(default)]
     pub(crate) source_kind: SourceKind,
@@ -216,7 +215,9 @@ pub(crate) struct SetupResult {
     pub(crate) provider: String,
     pub(crate) action: String,
     pub(crate) changed: bool,
+    pub(crate) would_change: bool,
     pub(crate) configured: bool,
+    pub(crate) would_configure: bool,
     pub(crate) config_path: String,
     pub(crate) owned_events: Vec<String>,
     pub(crate) trust: String,
@@ -328,6 +329,25 @@ fn event_dedupe_key(runtime_id: &str, event_id: &str) -> String {
     digest.update(b"\0");
     digest.update(event_id.as_bytes());
     format!("sha256:{}", hex_digest(digest.finalize()))
+}
+
+fn normalize_provider_identifier(
+    runtime_id: &str,
+    agent: AgentKind,
+    field: &str,
+    value: &str,
+) -> Result<String, CliError> {
+    if let Some(digest) = value.strip_prefix("local:v1:") {
+        if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(value.to_string());
+        }
+        return Err(CliError::data(
+            "provider-hook-identifier-invalid",
+            "projected provider identifier must use local:v1 followed by 64 hexadecimal characters",
+            Some(json!({ "field": field })),
+        ));
+    }
+    projected_provider_identifier(runtime_id, agent, field, value)
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
@@ -513,7 +533,7 @@ pub(crate) fn read_event_from_stdin() -> Result<TurnEvent, CliError> {
 pub(crate) fn ingest_event(
     context: &CliContext,
     id: &str,
-    event: TurnEvent,
+    mut event: TurnEvent,
 ) -> Result<ActivityResult, CliError> {
     validate_event(&event)?;
     let record = load_session_record(context, id)?;
@@ -536,17 +556,23 @@ pub(crate) fn ingest_event(
             Some(json!({ "id": record.id })),
         ));
     }
+    let agent = AgentKind::from_name(&record.agent).expect("validated session agent");
+    event.provider_session_id = event
+        .provider_session_id
+        .as_deref()
+        .map(|value| normalize_provider_identifier(active_runtime_id, agent, "session", value))
+        .transpose()?;
+    event.provider_turn_id = event
+        .provider_turn_id
+        .as_deref()
+        .map(|value| normalize_provider_identifier(active_runtime_id, agent, "turn", value))
+        .transpose()?;
     let expected_provider_session_id = record
         .provider_resume
         .as_ref()
         .filter(|resume| resume.provider == record.agent)
         .map(|resume| {
-            projected_provider_identifier(
-                active_runtime_id,
-                AgentKind::from_name(&record.agent).expect("validated session agent"),
-                "session",
-                &resume.session_id,
-            )
+            projected_provider_identifier(active_runtime_id, agent, "session", &resume.session_id)
         })
         .transpose()?;
     if let (Some(expected), Some(observed)) = (
@@ -1005,7 +1031,8 @@ fn latest_provider_activity(
 
 pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult, CliError> {
     let path = provider_config_path(agent)?;
-    let (changed, configured) = match agent {
+    let configured_before = provider_configured(agent, &path)?;
+    let (would_change, would_configure) = match agent {
         AgentKind::Codex | AgentKind::Claude => setup_json_provider(agent, &path, action)?,
         AgentKind::Hermes => setup_hermes(&path, action)?,
     };
@@ -1018,8 +1045,14 @@ pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult
     Ok(SetupResult {
         provider: agent.as_str().to_string(),
         action: action_name.to_string(),
-        changed,
-        configured,
+        changed: action != SetupAction::DryRun && would_change,
+        would_change,
+        configured: if action == SetupAction::DryRun {
+            configured_before
+        } else {
+            would_configure
+        },
+        would_configure,
         config_path: display_path(&path),
         owned_events: provider_specs(agent)
             .into_iter()
@@ -1532,8 +1565,9 @@ fn write_provider_config_if_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CliContext, RecordRequest, create_record};
+    use crate::{CliContext, ProviderResume, RecordRequest, create_record};
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
 
     fn event(kind: TurnEventKind, event_id: &str) -> TurnEvent {
         TurnEvent {
@@ -1582,7 +1616,14 @@ mod tests {
             cwd: &cwd,
             prompt: None,
             log_file_name: None,
-            provider_resume: None,
+            provider_resume: Some(ProviderResume {
+                provider: "codex".to_string(),
+                session_id: "session-1".to_string(),
+                captured_at: "2026-07-10T00:00:00Z".to_string(),
+                capture_method: "test".to_string(),
+                resume_args: vec!["resume".to_string(), "session-1".to_string()],
+                extra: BTreeMap::new(),
+            }),
             agent_args: Vec::new(),
             agent_bin: None,
         })
@@ -1850,6 +1891,18 @@ mod tests {
     }
 
     #[test]
+    fn event_confidence_is_required_by_the_v1_wire_contract() {
+        let missing = json!({
+            "schema_version": TURN_EVENT_VERSION,
+            "event_id": "event-1",
+            "runtime_id": "runtime-1",
+            "provider": "codex",
+            "kind": "progress"
+        });
+        assert!(serde_json::from_value::<TurnEvent>(missing).is_err());
+    }
+
+    #[test]
     fn dedupe_horizon_is_independent_from_the_bounded_journal() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (context, created) = test_session(&tmp);
@@ -1879,6 +1932,13 @@ mod tests {
         let result = ingest_event(&context, &created.record.id, replay).expect("duplicate replay");
         assert!(result.duplicate);
         assert_eq!(result.turn_state.revision, before);
+        let dir = session_dir(&context, &created.record.id);
+        let snapshot = fs::read_to_string(dir.join(ACTIVITY_FILE)).expect("snapshot");
+        let journal = fs::read_to_string(dir.join(ACTIVITY_JOURNAL_FILE)).expect("journal");
+        assert!(!snapshot.contains("session-1"));
+        assert!(!snapshot.contains("turn-1"));
+        assert!(!journal.contains("session-1"));
+        assert!(!journal.contains("turn-1"));
     }
 
     #[test]
