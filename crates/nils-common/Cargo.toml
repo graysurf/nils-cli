@@ -10,6 +10,7 @@ repository = "https://github.com/sympoies/nils-cli"
 anyhow = { workspace = true }
 base64 = "0.22"
 clap = { workspace = true }
+jiff = { workspace = true }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }

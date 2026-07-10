@@ -7,7 +7,7 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn claude_cli_bin() -> PathBuf {
     bin::resolve("claude-cli")
@@ -51,17 +51,34 @@ fn write_cache(cache_dir: &Path, body: &str) -> PathBuf {
 }
 
 fn make_old(path: &Path) {
+    set_modified(path, SystemTime::now() - Duration::from_secs(120));
+}
+
+fn set_modified(path: &Path, time: SystemTime) {
     let file = OpenOptions::new().write(true).open(path).expect("open");
-    file.set_modified(SystemTime::now() - Duration::from_secs(120))
-        .expect("set modified");
+    file.set_modified(time).expect("set modified");
 }
 
 fn usage_json(five_utilization: f64, weekly_utilization: f64) -> String {
+    usage_json_with_resets(
+        five_utilization,
+        weekly_utilization,
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-03T12:30:00+00:00",
+    )
+}
+
+fn usage_json_with_resets(
+    five_utilization: f64,
+    weekly_utilization: f64,
+    five_resets_at: &str,
+    weekly_resets_at: &str,
+) -> String {
     format!(
         r#"{{
           "usage": {{
-            "five_hour": {{"utilization": {five_utilization}, "resets_at": "2026-01-01T00:00:00+00:00"}},
-            "seven_day": {{"utilization": {weekly_utilization}, "resets_at": "2026-01-03T12:30:00+00:00"}}
+            "five_hour": {{"utilization": {five_utilization}, "resets_at": {five_resets_at:?}}},
+            "seven_day": {{"utilization": {weekly_utilization}, "resets_at": {weekly_resets_at:?}}}
           }}
         }}"#
     )
@@ -176,6 +193,49 @@ OUT
     assert!(!cached.contains("secret-token-usage"));
     assert!(cached.contains("\"five_hour\""));
     assert!(cached.contains("\"seven_day\""));
+}
+
+#[test]
+fn usage_cache_source_outputs_epoch_for_human_reset_times() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(
+        tmp.path(),
+        &usage_json_with_resets(
+            21.0,
+            10.0,
+            "3:20pm(Asia/Taipei)",
+            "Jul 12, 9pm (Asia/Taipei)",
+        ),
+    );
+    set_modified(&cache_file, UNIX_EPOCH + Duration::from_secs(1_783_666_800));
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "cache"],
+        &base_options(tmp.path()),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["schema_version"], "claude-cli.usage.v1");
+    assert_eq!(payload["command"], "usage");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["result"]["updated_at"], 1_783_666_800);
+    assert_eq!(
+        payload["result"]["windows"][0]["resets_at"],
+        "3:20pm(Asia/Taipei)"
+    );
+    assert_eq!(
+        payload["result"]["windows"][0]["resets_at_epoch"],
+        1_783_668_000
+    );
+    assert_eq!(
+        payload["result"]["windows"][1]["resets_at"],
+        "Jul 12, 9pm (Asia/Taipei)"
+    );
+    assert_eq!(
+        payload["result"]["windows"][1]["resets_at_epoch"],
+        1_783_861_200
+    );
 }
 
 #[test]
