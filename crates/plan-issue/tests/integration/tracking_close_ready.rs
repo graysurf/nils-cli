@@ -225,3 +225,248 @@ fn tracking_close_ready_help_lists_required_args() {
     assert!(out.stdout_text().contains("--approval"));
     assert!(out.stdout_text().contains("--expect-visible"));
 }
+
+/// Build a closeout-complete tracking fixture (source, plan, complete state,
+/// session, validation) plus a caller-supplied `review` payload — or no
+/// `review` role when `review` is `None`. Writes both `body.md` (read by
+/// `tracking close-ready`) and `issue-body.md` (read by `record close`) plus a
+/// shared `comments.json`, so one directory drives both commands over
+/// identical evidence (plan-tracking-testbed#79).
+fn closeout_fixture(review: Option<(Value, &str)>) -> TempDir {
+    let tmp = TempDir::new().expect("tmp");
+    let body = "## Final Dashboard\n";
+    fs::write(tmp.path().join("body.md"), body).expect("body");
+    fs::write(tmp.path().join("issue-body.md"), body).expect("issue-body");
+
+    let mut roles: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "source",
+            json!({"path": "p", "commit": "c"}),
+            "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:00Z",
+        ),
+        (
+            "plan",
+            json!({"path": "p", "commit": "c"}),
+            "## Plan Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:01Z",
+        ),
+        (
+            "state",
+            json!({
+                "status": "complete",
+                "target_scope": "x",
+                "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+                "prs": [{"ref": "owner/repo#1", "url": "https://example.com/pr/1", "status": "merged"}]
+            }),
+            "## Execution State\n\n- Profile: tracking\n- Status: complete\n\n## Task Ledger\n\n| ID | Status |\n| --- | --- |\n| 1.1 | done |",
+            "2026-05-26T00:00:02Z",
+        ),
+        (
+            "session",
+            json!({"summary": "completed"}),
+            "## Execution Session\n\n- Profile: tracking\n- Summary: completed",
+            "2026-05-26T00:00:03Z",
+        ),
+        (
+            "validation",
+            json!({"overall": "pass", "commands": [{"command": "cargo test", "status": "pass"}], "waivers": []}),
+            "## Validation Evidence\n\n- Profile: tracking\n- Overall: pass\n\n| Command | Status | Evidence |\n|---|---|---|\n| cargo test | pass | log |",
+            "2026-05-26T00:00:04Z",
+        ),
+    ];
+    if let Some((data, visible)) = review {
+        roles.push(("review", data, visible, "2026-05-26T00:00:05Z"));
+    }
+
+    let comments: Vec<Value> = roles
+        .iter()
+        .enumerate()
+        .map(|(idx, (role, data, visible, at))| {
+            json!({
+                "url": format!("https://example.com/c{idx}"),
+                "created_at": at,
+                "body": v2_comment(role, "tracking", data.clone(), visible),
+            })
+        })
+        .collect();
+    fs::write(
+        tmp.path().join("comments.json"),
+        json!({"comments": comments}).to_string(),
+    )
+    .expect("comments");
+    tmp
+}
+
+/// An approved review body carrying a single residual finding at `severity`.
+fn approved_review_with_residual(severity: &str) -> (Value, &'static str) {
+    let data = json!({
+        "decision": "approve",
+        "findings": [
+            {"id": "F1", "severity": severity, "disposition": "residual", "summary": "residual finding"}
+        ],
+        "lenses": ["testing"]
+    });
+    (
+        data,
+        "## Review Evidence\n\n- Profile: tracking\n- Decision: approve\n- Lenses: testing\n\n| ID | Severity | Disposition | Summary |\n|---|---|---|---|\n| F1 | s | residual | residual finding |",
+    )
+}
+
+fn blocker_codes(result: &Value) -> Vec<String> {
+    result["blockers"]
+        .as_array()
+        .expect("blockers array")
+        .iter()
+        .map(|b| b["code"].as_str().expect("code").to_string())
+        .collect()
+}
+
+/// plan-tracking-testbed#79: the non-mutating `tracking close-ready` probe and
+/// the mutating `record close` gate must reach the SAME verdict on an approved
+/// review that still carries a residual blocker/major finding. Before the fix,
+/// close-ready reported `ready: true` / `RECORD_READY_FOR_CLOSE` while
+/// `record close` rejected the identical evidence with
+/// `review-unresolved-findings`, stranding the closeout skill mid-flight. Both
+/// commands must now block with the same stable code.
+/// Run `tracking close-ready` over `fixture` and return the `result` payload.
+fn run_close_ready(fixture: &TempDir) -> Value {
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "close-ready",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+        "--approval",
+        "https://example.com/approval",
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    out.stdout_json()["payload"]["result"].clone()
+}
+
+/// Run `record close` over `fixture` and return the parsed JSON envelope plus
+/// exit code.
+fn run_record_close(fixture: &TempDir) -> (i32, Value) {
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "79",
+        "--profile",
+        "tracking",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+        "--approval",
+        "https://example.com/approval",
+    ]);
+    (out.code, out.stdout_json())
+}
+
+/// plan-tracking-testbed#79: the non-mutating `tracking close-ready` probe and
+/// the mutating `record close` gate must reach the SAME verdict on an approved
+/// review that still carries a residual blocker/major finding. Before the fix,
+/// close-ready reported `ready: true` / `RECORD_READY_FOR_CLOSE` while
+/// `record close` rejected the identical evidence with
+/// `review-unresolved-findings`, stranding the closeout skill mid-flight. Both
+/// commands must now block with the same stable code.
+#[test]
+fn close_ready_and_record_close_agree_on_residual_major_review() {
+    let fixture = closeout_fixture(Some(approved_review_with_residual("major")));
+
+    // Non-mutating probe: must NOT authorize the close.
+    let result = run_close_ready(&fixture);
+    let codes = blocker_codes(&result);
+    assert_eq!(
+        result["ready"], false,
+        "close-ready must not authorize close; result={result}"
+    );
+    assert!(
+        codes.iter().any(|c| c == "review-unresolved-findings"),
+        "close-ready blockers must include review-unresolved-findings: {codes:?}"
+    );
+
+    // Mutating gate: must fail with the same stable code.
+    let (code, err) = run_record_close(&fixture);
+    assert_eq!(
+        code, 1,
+        "record close must reject residual major findings; envelope: {err}"
+    );
+    assert_eq!(err["status"], "error");
+    assert_eq!(err["error"]["code"], "record-close-gate-failed");
+    let message = err["error"]["message"].as_str().expect("error message");
+    assert!(
+        message.contains("review-unresolved-findings"),
+        "record close must cite the same review-unresolved-findings code: {message}"
+    );
+}
+
+/// The severity predicate must discriminate in both directions: a residual
+/// `minor` finding is not a close blocker, so close-ready must stay ready and
+/// emit no `review-*` blocker. Guards against the predicate regressing to
+/// over-broad (blocking any residual severity).
+#[test]
+fn close_ready_allows_approved_review_with_residual_minor() {
+    let fixture = closeout_fixture(Some(approved_review_with_residual("minor")));
+    let result = run_close_ready(&fixture);
+    let codes = blocker_codes(&result);
+    assert!(
+        !codes.iter().any(|c| c.starts_with("review-")),
+        "residual minor must not raise a review blocker: {codes:?}"
+    );
+    assert_eq!(
+        result["ready"], true,
+        "close-ready must stay ready for a residual minor finding; result={result}"
+    );
+}
+
+/// The `contains_key("review")` guard exists so the shared review gate does
+/// not duplicate the `review-missing` blocker the reconcile step already
+/// emits for a fully-absent review role. Assert exactly one `review-missing`.
+#[test]
+fn close_ready_emits_review_missing_once_when_review_absent() {
+    let fixture = closeout_fixture(None);
+    let result = run_close_ready(&fixture);
+    let codes = blocker_codes(&result);
+    assert_eq!(
+        result["ready"], false,
+        "close-ready must block without review evidence; result={result}"
+    );
+    assert_eq!(
+        codes.iter().filter(|c| *c == "review-missing").count(),
+        1,
+        "review-missing must appear exactly once (no reconcile/gate double-emit): {codes:?}"
+    );
+}
+
+/// Parity also holds for a `request-changes` decision: both surfaces block with
+/// the shared `review-rejected` code, not just for residual findings.
+#[test]
+fn close_ready_and_record_close_agree_on_request_changes_review() {
+    let fixture = closeout_fixture(Some((
+        json!({"decision": "request-changes", "findings": [], "lenses": ["testing"]}),
+        "## Review Evidence\n\n- Profile: tracking\n- Decision: request-changes\n- Lenses: testing",
+    )));
+
+    let result = run_close_ready(&fixture);
+    let codes = blocker_codes(&result);
+    assert_eq!(result["ready"], false, "result={result}");
+    assert!(
+        codes.iter().any(|c| c == "review-rejected"),
+        "close-ready must block request-changes with review-rejected: {codes:?}"
+    );
+
+    let (code, err) = run_record_close(&fixture);
+    assert_eq!(
+        code, 1,
+        "record close must reject request-changes; envelope: {err}"
+    );
+    assert_eq!(err["error"]["code"], "record-close-gate-failed");
+    let message = err["error"]["message"].as_str().expect("error message");
+    assert!(
+        message.contains("review-rejected"),
+        "record close must cite the same review-rejected code: {message}"
+    );
+}
