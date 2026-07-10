@@ -3745,14 +3745,27 @@ fn run_tracking_close_ready(
     // reconcile step's `review-missing` blocker above, so only evaluate when
     // the evidence is present to avoid emitting the code twice.
     if let Some(audit) = audit.as_ref()
-        && audit.evidence.contains_key("review")
+        && let Some(review) = audit.evidence.get("review")
         && let lifecycle_record::ReviewCloseoutOutcome::Blocked { code, detail } =
-            lifecycle_record::evaluate_review_closeout(audit.evidence.get("review"))
+            lifecycle_record::evaluate_review_closeout(Some(review))
     {
+        // Guidance depends on which strict rule fired, so the operator reads a
+        // hint that matches the actual blocker rather than a generic one.
+        let suggested_unblock = match code {
+            "review-rejected" => {
+                "resolve the review decision (request-changes) or malformed payload and record an approving review before close"
+            }
+            "review-missing" => {
+                "record review evidence with a machine-readable payload before close"
+            }
+            _ => {
+                "resolve the blocking review findings (record a review with no residual blocker/major findings) before close"
+            }
+        };
         blockers.push(json!({
             "code": code,
             "message": detail,
-            "suggested_unblock": "resolve the blocking review findings (record a review with no residual blocker/major findings) before close",
+            "suggested_unblock": suggested_unblock,
         }));
     }
 
