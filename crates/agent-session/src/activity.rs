@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
@@ -37,6 +38,10 @@ const REPLAY_MAGIC: &[u8; 16] = b"agent-session-r1";
 const MAX_PENDING_ATTENTION: usize = 64;
 const MAX_ID_CHARS: usize = 256;
 const CODEX_NOTIFY_ARGV: [&str; 5] = ["agent-session", "activity", "notify", "--agent", "codex"];
+const CODEX_NOTIFY_FORWARD_FLAG: &str = "--forward-notify-argv-json";
+const MAX_CODEX_FORWARD_ARGS: usize = 64;
+const MAX_CODEX_FORWARD_ARGV_BYTES: usize = 16 * 1024;
+const CODEX_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -234,6 +239,8 @@ pub(crate) struct ProviderDoctor {
     pub(crate) config_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) notification_config_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) notification_mode: Option<String>,
     pub(crate) completion: String,
     pub(crate) attention_correlation: String,
     pub(crate) trust: String,
@@ -1082,6 +1089,56 @@ pub(crate) fn ingest_provider_notification_fail_open(
     }
 }
 
+pub(crate) fn forward_provider_notification_fail_open(
+    agent: AgentKind,
+    encoded_argv: Option<&str>,
+    payload: &str,
+) {
+    if agent != AgentKind::Codex {
+        return;
+    }
+    let Some(encoded_argv) = encoded_argv else {
+        return;
+    };
+    if encoded_argv.len() > MAX_CODEX_FORWARD_ARGV_BYTES {
+        return;
+    }
+    let Ok(argv) = serde_json::from_str::<Vec<String>>(encoded_argv) else {
+        return;
+    };
+    if !codex_forward_argv_is_safe(&argv) {
+        return;
+    }
+
+    let mut command = ProcessCommand::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .arg(payload)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    let deadline = Instant::now() + CODEX_FORWARD_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                unsafe {
+                    let pgid = -(child.id() as libc::pid_t);
+                    let _ = libc::kill(pgid, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+}
+
 fn record_hook_diagnostic(context: &CliContext, agent: AgentKind, code: &str) {
     let Some(id) = std::env::var("AGENT_SESSION_ID")
         .ok()
@@ -1372,6 +1429,9 @@ pub(crate) fn doctor(
         let notification_path = (agent == AgentKind::Codex)
             .then(codex_notification_config_path)
             .transpose()?;
+        let notification_mode = notification_path
+            .as_deref()
+            .and_then(|path| codex_notify_mode_label(path).ok());
         let (configured, configuration_error) = match provider_configured(agent, &path) {
             Ok(configured) => (configured, None),
             Err(error) => (false, Some(error.code().to_string())),
@@ -1394,8 +1454,8 @@ pub(crate) fn doctor(
                     "supported",
                     "agent-turn-complete is authoritative; raw Stop remains non-final observation because matching hooks may continue the turn",
                     "PermissionRequest has no request id shared with PostToolUse; attention is conservatively latched",
-                    "Codex requires review/trust for each non-managed hook definition; the singular notify argv must be absent or agent-session-owned",
-                    "Run activity setup --agent codex --dry-run, apply it, then approve the hook definitions in Codex; a user-owned notify command is preserved and reported as a conflict",
+                    "Codex requires review/trust for each non-managed hook definition; a safe singular user notify argv is composed through bounded direct execution without a shell",
+                    "Run activity setup --agent codex --dry-run, apply it, then approve the hook definitions in Codex; unsafe or recursive user-owned notify commands are preserved and reported as conflicts",
                 ),
                 AgentKind::Claude => (
                     "partial",
@@ -1454,6 +1514,7 @@ pub(crate) fn doctor(
             configuration_error,
             config_path: display_path(&path),
             notification_config_path: notification_path.as_deref().map(display_path),
+            notification_mode,
             completion: completion.to_string(),
             attention_correlation: attention_correlation.to_string(),
             trust: trust.to_string(),
@@ -1593,7 +1654,7 @@ pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult
             .collect(),
         trust: match agent {
             AgentKind::Codex => {
-                "approve the exact new Codex hook definitions; the singular notify argv is changed only when absent or agent-session-owned"
+                "approve the exact new Codex hook definitions; a safe singular user notify argv is preserved through bounded direct-argv fan-out without a shell"
             }
             AgentKind::Claude => "review the additive settings entries before apply",
             AgentKind::Hermes => {
@@ -1866,7 +1927,10 @@ fn codex_notification_configured(path: &Path) -> Result<bool, CliError> {
         &fs::read_to_string(path)
             .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
     )?;
-    Ok(codex_notification_is_owned(&document))
+    Ok(matches!(
+        codex_notify_mode(&document),
+        CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
+    ))
 }
 
 fn parse_codex_notification_config(path: &Path, raw: &str) -> Result<TomlDocument, CliError> {
@@ -1879,17 +1943,76 @@ fn parse_codex_notification_config(path: &Path, raw: &str) -> Result<TomlDocumen
     })
 }
 
-fn codex_notification_is_owned(document: &TomlDocument) -> bool {
-    document
-        .get("notify")
-        .and_then(|item| item.as_array())
-        .is_some_and(|array| {
-            array.len() == CODEX_NOTIFY_ARGV.len()
-                && array
-                    .iter()
-                    .zip(CODEX_NOTIFY_ARGV)
-                    .all(|(value, expected)| value.as_str() == Some(expected))
-        })
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CodexNotifyMode {
+    Absent,
+    Owned,
+    Composed(Vec<String>),
+    Foreign(Vec<String>),
+    Invalid,
+}
+
+fn codex_notify_mode(document: &TomlDocument) -> CodexNotifyMode {
+    let Some(item) = document.get("notify") else {
+        return CodexNotifyMode::Absent;
+    };
+    let Some(array) = item.as_array() else {
+        return CodexNotifyMode::Invalid;
+    };
+    let Some(argv) = array
+        .iter()
+        .map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return CodexNotifyMode::Invalid;
+    };
+    if argv_matches(&argv, &CODEX_NOTIFY_ARGV) {
+        return CodexNotifyMode::Owned;
+    }
+    if argv.len() == CODEX_NOTIFY_ARGV.len() + 2
+        && argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV)
+        && argv[CODEX_NOTIFY_ARGV.len()] == CODEX_NOTIFY_FORWARD_FLAG
+        && let Ok(forwarded) =
+            serde_json::from_str::<Vec<String>>(&argv[CODEX_NOTIFY_ARGV.len() + 1])
+        && codex_forward_argv_is_safe(&forwarded)
+    {
+        return CodexNotifyMode::Composed(forwarded);
+    }
+    CodexNotifyMode::Foreign(argv)
+}
+
+fn argv_matches(argv: &[String], expected: &[&str]) -> bool {
+    argv.len() == expected.len()
+        && argv
+            .iter()
+            .zip(expected)
+            .all(|(value, expected)| value == expected)
+}
+
+fn codex_forward_argv_is_safe(argv: &[String]) -> bool {
+    !argv.is_empty()
+        && argv.len() <= MAX_CODEX_FORWARD_ARGS
+        && !argv[0].trim().is_empty()
+        && argv.iter().map(String::len).sum::<usize>() <= MAX_CODEX_FORWARD_ARGV_BYTES
+        && !(argv.len() >= CODEX_NOTIFY_ARGV.len()
+            && argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV))
+}
+
+fn codex_notify_mode_label(path: &Path) -> Result<String, CliError> {
+    if !path.is_file() {
+        return Ok("absent".to_string());
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?;
+    let document = parse_codex_notification_config(path, &raw)?;
+    Ok(match codex_notify_mode(&document) {
+        CodexNotifyMode::Absent => "absent",
+        CodexNotifyMode::Owned => "owned",
+        CodexNotifyMode::Composed(_) => "composed",
+        CodexNotifyMode::Foreign(_) => "conflict",
+        CodexNotifyMode::Invalid => "invalid",
+    }
+    .to_string())
 }
 
 fn plan_codex_notification(
@@ -1922,24 +2045,57 @@ fn plan_codex_notification(
     } else {
         parse_codex_notification_config(path, &raw)?
     };
-    let has_notify = document.get("notify").is_some();
-    let owned = codex_notification_is_owned(&document);
+    let mode = codex_notify_mode(&document);
     let remove = action == SetupAction::Remove;
-    if has_notify && !owned && !remove {
-        return Err(CliError::data(
-            "provider-notification-config-conflict",
-            "Codex config already has a user-owned notify command; it was preserved and activity setup made no changes",
-            Some(json!({ "path": display_path(path) })),
-        ));
-    }
     if remove {
-        if owned {
-            document.remove("notify");
+        match mode {
+            CodexNotifyMode::Owned => {
+                document.remove("notify");
+            }
+            CodexNotifyMode::Composed(forwarded) => {
+                let mut argv = TomlArray::new();
+                argv.extend(forwarded);
+                document["notify"] = toml_value(argv);
+            }
+            CodexNotifyMode::Absent | CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {}
         }
-    } else if !owned {
-        let mut argv = TomlArray::new();
-        argv.extend(CODEX_NOTIFY_ARGV);
-        document["notify"] = toml_value(argv);
+    } else {
+        match mode {
+            CodexNotifyMode::Absent => {
+                let mut argv = TomlArray::new();
+                argv.extend(CODEX_NOTIFY_ARGV);
+                document["notify"] = toml_value(argv);
+            }
+            CodexNotifyMode::Owned | CodexNotifyMode::Composed(_) => {}
+            CodexNotifyMode::Foreign(forwarded) if codex_forward_argv_is_safe(&forwarded) => {
+                let encoded = serde_json::to_string(&forwarded).map_err(|_| {
+                    CliError::data(
+                        "provider-notification-config-invalid",
+                        "Codex user-owned notify argv could not be encoded for safe composition",
+                        Some(json!({ "path": display_path(path) })),
+                    )
+                })?;
+                if encoded.len() > MAX_CODEX_FORWARD_ARGV_BYTES {
+                    return Err(CliError::data(
+                        "provider-notification-config-conflict",
+                        "Codex user-owned notify argv expands beyond the safe composition limit; it was preserved and activity setup made no changes",
+                        Some(json!({ "path": display_path(path) })),
+                    ));
+                }
+                let mut argv = TomlArray::new();
+                argv.extend(CODEX_NOTIFY_ARGV);
+                argv.push(CODEX_NOTIFY_FORWARD_FLAG);
+                argv.push(encoded);
+                document["notify"] = toml_value(argv);
+            }
+            CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {
+                return Err(CliError::data(
+                    "provider-notification-config-conflict",
+                    "Codex config has a notify command that cannot be composed safely; it was preserved and activity setup made no changes",
+                    Some(json!({ "path": display_path(path) })),
+                ));
+            }
+        }
     }
     let rendered = document.to_string().into_bytes();
     let original_rendered = original_bytes.as_deref().unwrap_or_default();
@@ -1949,7 +2105,10 @@ fn plan_codex_notification(
         original_bytes,
         updated_bytes: rendered,
         changed,
-        configured: codex_notification_is_owned(&document),
+        configured: matches!(
+            codex_notify_mode(&document),
+            CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
+        ),
     })
 }
 

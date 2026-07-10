@@ -41,7 +41,7 @@ normalized event is created.
 
 | Provider | Audited floor | Classification | Start | Completion | Attention | Failure | Setup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Codex | 0.144.1 | supported | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive hooks in `~/.codex/hooks.json` plus exact owned notify argv in `~/.codex/config.toml`; user-owned notify conflicts fail closed |
+| Codex | 0.144.1 | supported | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive hooks in `~/.codex/hooks.json` plus owned or bounded direct-argv-composed notify in `~/.codex/config.toml`; unsafe/recursive values fail closed |
 | Claude Code | 2.1.206 | partial | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | `StopFailure`, observed; `AskUserQuestion` tool failure clears only its clarification | additive merge into `~/.claude/settings.json` |
 | Hermes | 0.18.0 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | pre/post approval hooks exist, but clearing remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
@@ -134,8 +134,9 @@ The executable fixtures cover:
   quarantine, deterministic current-runtime diagnostics, and mode-0600
   snapshot, replay, journal, diagnostic, and lock files;
 - dry-run, additive apply, repeated apply, repair, and owned-entry-only removal
-  for all three provider configs, including Codex notify absence/ownership and
-  user-owned notify conflict preservation.
+  for all three provider configs, including Codex notify absence/ownership,
+  reversible user-owned argv composition, literal no-shell forwarding, bounded
+  downstream hangs/failures, and unsafe/recursive conflict preservation.
 
 The live release probe uses a no-content marker turn for each installed provider
 after the released binary is installed. Retained evidence records only provider

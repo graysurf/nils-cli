@@ -769,7 +769,7 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
 }
 
 #[test]
-fn codex_activity_setup_refuses_a_user_owned_notify_without_mutating_configs() {
+fn codex_activity_setup_composes_and_restores_a_user_owned_notify() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");
     fs::create_dir_all(home.join(".codex")).expect("codex dir");
@@ -791,6 +791,71 @@ fn codex_activity_setup_refuses_a_user_owned_notify_without_mutating_configs() {
         ],
         &[("HOME", home_arg.as_str())],
     );
+    assert_eq!(result.code, 0, "stderr={}", result.stderr_text());
+    assert_ne!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    let composed = fs::read_to_string(&notify_path).expect("composed notify");
+    assert!(composed.contains("agent-session"));
+    assert!(composed.contains("--forward-notify-argv-json"));
+    assert!(composed.contains("user-notifier"));
+    assert!(composed.contains("--keep"));
+
+    let second = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(second.code, 0, "stderr={}", second.stderr_text());
+    assert_eq!(data(&second.stdout_json())["changed"], false);
+    let doctor = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(doctor.code, 0, "stderr={}", doctor.stderr_text());
+    let doctor_json = doctor.stdout_json();
+    let provider = &data(&doctor_json)["providers"][0];
+    assert_eq!(provider["configured"], true);
+    assert_eq!(provider["notification_mode"], "composed");
+
+    let removed = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--remove", "--format", "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    assert_eq!(
+        fs::read(&notify_path).expect("restored notify"),
+        notify_before
+    );
+}
+
+#[test]
+fn codex_activity_setup_refuses_a_recursive_notify_without_mutating_configs() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(&hooks_path, r#"{"keep":"hooks"}"#).expect("hooks config");
+    fs::write(
+        &notify_path,
+        "notify = [\"agent-session\", \"activity\", \"notify\", \"--agent\", \"codex\", \"--unexpected\"]\n",
+    )
+    .expect("notify config");
+    let hooks_before = fs::read(&hooks_path).expect("hooks before");
+    let notify_before = fs::read(&notify_path).expect("notify before");
+    let home_arg = home.to_string_lossy().to_string();
+    let result = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
     assert_ne!(result.code, 0);
     assert_eq!(
         result.stdout_json()["error"]["code"],
@@ -798,6 +863,158 @@ fn codex_activity_setup_refuses_a_user_owned_notify_without_mutating_configs() {
     );
     assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
     assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
+fn codex_activity_setup_refuses_argv_that_expands_past_the_composition_bound() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(&hooks_path, r#"{"keep":"hooks"}"#).expect("hooks config");
+    let expanding_arg = "\\".repeat(9_000);
+    fs::write(
+        &notify_path,
+        format!(
+            "notify = [\"user-notifier\", {}]\n",
+            serde_json::to_string(&expanding_arg).expect("encoded expanding arg")
+        ),
+    )
+    .expect("notify config");
+    let hooks_before = fs::read(&hooks_path).expect("hooks before");
+    let notify_before = fs::read(&notify_path).expect("notify before");
+    let home_arg = home.to_string_lossy().to_string();
+    let result = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(result.code, 0);
+    assert_eq!(
+        result.stdout_json()["error"]["code"],
+        "provider-notification-config-conflict"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
+fn codex_composed_notify_executes_user_argv_directly_and_fail_open() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let notifier = tmp.path().join("user notifier");
+    let log = tmp.path().join("forward.log");
+    let injected = tmp.path().join("must-not-exist");
+    write_executable(
+        &notifier,
+        r#"#!/usr/bin/env sh
+: "${FORWARD_LOG:?}"
+for arg in "$@"; do
+  printf '%s\000' "$arg" >> "$FORWARD_LOG"
+done
+exit 23
+"#,
+    );
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(
+        &notify_path,
+        format!(
+            "notify = [{}]\n",
+            [
+                serde_json::to_string(&notifier.to_string_lossy()).expect("notifier string"),
+                serde_json::to_string(&format!("$(touch {})", injected.display()))
+                    .expect("literal string"),
+            ]
+            .join(", ")
+        ),
+    )
+    .expect("notify config");
+    let home_arg = home.to_string_lossy().to_string();
+    let setup = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(setup.code, 0, "stderr={}", setup.stderr_text());
+
+    let document = fs::read_to_string(&notify_path)
+        .expect("composed config")
+        .parse::<toml_edit::DocumentMut>()
+        .expect("composed TOML");
+    let argv = document["notify"]
+        .as_array()
+        .expect("notify array")
+        .iter()
+        .map(|value| value.as_str().expect("string argv").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(argv[0], "agent-session");
+    let payload = r#"{"type":"agent-turn-complete","thread-id":"thread","turn-id":"turn"}"#;
+    let mut args = argv.iter().skip(1).map(String::as_str).collect::<Vec<_>>();
+    args.push(payload);
+    let log_arg = log.to_string_lossy().to_string();
+    let notify = run(
+        tmp.path(),
+        &args,
+        &[
+            ("HOME", home_arg.as_str()),
+            ("FORWARD_LOG", log_arg.as_str()),
+        ],
+    );
+    assert_eq!(notify.code, 0, "stderr={}", notify.stderr_text());
+    assert_eq!(
+        fs::read(&log).expect("forward log"),
+        format!("$(touch {})\0{payload}\0", injected.display()).as_bytes()
+    );
+    assert!(
+        !injected.exists(),
+        "forwarded argv must never run through a shell"
+    );
+}
+
+#[test]
+fn codex_composed_notify_bounds_a_hung_user_notifier() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let notifier = tmp.path().join("hung-notifier");
+    let orphan_marker = tmp.path().join("orphan-marker");
+    write_executable(
+        &notifier,
+        &format!(
+            "#!/usr/bin/env sh\n(sleep 3; touch '{}') &\nwait\n",
+            orphan_marker.display()
+        ),
+    );
+    let forwarded = serde_json::to_string(&vec![notifier.to_string_lossy().to_string()])
+        .expect("forwarded argv");
+    let started = Instant::now();
+    let notify = run(
+        tmp.path(),
+        &[
+            "activity",
+            "notify",
+            "--agent",
+            "codex",
+            "--forward-notify-argv-json",
+            &forwarded,
+            r#"{"type":"agent-turn-complete"}"#,
+        ],
+        &[],
+    );
+    assert_eq!(notify.code, 0, "stderr={}", notify.stderr_text());
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "hung notifier must be killed at the bounded fail-open deadline"
+    );
+    thread::sleep(Duration::from_millis(1_250));
+    assert!(
+        !orphan_marker.exists(),
+        "the timeout must kill the notifier process group, not only its parent"
+    );
 }
 
 #[test]

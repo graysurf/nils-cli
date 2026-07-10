@@ -330,6 +330,11 @@ fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
             // Provider notifications are auxiliary telemetry. Invalid, stale,
             // or mismatched input must never change Codex's own exit behavior.
             activity::ingest_provider_notification_fail_open(context, args.agent, &args.payload);
+            activity::forward_provider_notification_fail_open(
+                args.agent,
+                args.forward_notify_argv_json.as_deref(),
+                &args.payload,
+            );
             exit::SUCCESS
         }
         cli::ActivityCommand::Doctor(args) => match activity::doctor(context, args.agent) {
@@ -3644,6 +3649,9 @@ fn render_doctor_text(result: &activity::DoctorResult) -> String {
             if provider.configured { "yes" } else { "no" }
         ));
         text.push_str(&format!("  completion: {}\n", provider.completion));
+        if let Some(mode) = provider.notification_mode.as_deref() {
+            text.push_str(&format!("  notification: {mode}\n"));
+        }
         text.push_str(&format!(
             "  attention: {}\n",
             provider.attention_correlation
