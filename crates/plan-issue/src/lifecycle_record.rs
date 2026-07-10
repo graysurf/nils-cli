@@ -2462,6 +2462,79 @@ pub struct StrictCloseoutGateInput<'a> {
     pub allow_non_required_check_failure: bool,
 }
 
+/// Outcome of the shared strict review-finding evaluation.
+///
+/// Both the mutating `record close` gate ([`evaluate_strict_closeout_gate`])
+/// and the non-mutating `tracking close-ready` probe route the `review`
+/// lifecycle evidence through [`evaluate_review_closeout`], so the two can
+/// never disagree about whether the review authorizes a close
+/// (plan-tracking-testbed#79).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewCloseoutOutcome {
+    /// Review evidence clears the strict close gate. `detail` is the passing
+    /// human-facing reason (e.g. `decision = approve`).
+    Pass { detail: String },
+    /// Review evidence blocks the close. `code` is the stable blocked code
+    /// shared by both surfaces; `detail` is the human-facing reason.
+    Blocked { code: &'static str, detail: String },
+}
+
+/// Evaluate the `review` lifecycle evidence against the strict close-out
+/// review rule. This is the single source of truth behind both close gates:
+/// a `request-changes` decision, a malformed payload, or a missing payload
+/// blocks with `review-rejected` / `review-missing`, and any residual
+/// blocker/major finding blocks with `review-unresolved-findings`. An
+/// approved/comments-only review with no residual blocker/major findings
+/// passes.
+pub fn evaluate_review_closeout(review: Option<&LifecycleEvidence>) -> ReviewCloseoutOutcome {
+    let Some(hit) = review else {
+        return ReviewCloseoutOutcome::Blocked {
+            code: "review-missing",
+            detail: "missing".to_string(),
+        };
+    };
+    match hit.payload.as_ref().map(|payload| payload.parse_review()) {
+        Some(Ok(data)) => match data.decision {
+            ReviewDecision::RequestChanges => ReviewCloseoutOutcome::Blocked {
+                code: "review-rejected",
+                detail: "decision = request-changes".to_string(),
+            },
+            decision => {
+                let unresolved = data.findings.iter().any(|finding| {
+                    matches!(finding.disposition, FindingDisposition::Residual)
+                        && matches!(
+                            finding.severity,
+                            FindingSeverity::Blocker | FindingSeverity::Major
+                        )
+                });
+                if unresolved {
+                    ReviewCloseoutOutcome::Blocked {
+                        code: "review-unresolved-findings",
+                        detail: "unresolved blocker/major findings".to_string(),
+                    }
+                } else {
+                    let label = match decision {
+                        ReviewDecision::Approve => "approve",
+                        ReviewDecision::CommentsOnly => "comments-only",
+                        ReviewDecision::RequestChanges => unreachable!(),
+                    };
+                    ReviewCloseoutOutcome::Pass {
+                        detail: format!("decision = {label}"),
+                    }
+                }
+            }
+        },
+        Some(Err(err)) => ReviewCloseoutOutcome::Blocked {
+            code: "review-rejected",
+            detail: format!("malformed review payload: {}", err.message),
+        },
+        None => ReviewCloseoutOutcome::Blocked {
+            code: "review-missing",
+            detail: "missing payload".to_string(),
+        },
+    }
+}
+
 pub fn evaluate_strict_closeout_gate(
     audit: &RecordAudit,
     input: StrictCloseoutGateInput<'_>,
@@ -2602,67 +2675,14 @@ pub fn evaluate_strict_closeout_gate(
         ),
     }
 
-    match audit.evidence.get("review") {
-        Some(hit) => {
-            let parsed = hit.payload.as_ref().map(|payload| payload.parse_review());
-            match parsed {
-                Some(Ok(data)) => match data.decision {
-                    ReviewDecision::RequestChanges => push_fail(
-                        &mut checks,
-                        &mut blocked_codes,
-                        "review",
-                        "decision = request-changes".to_string(),
-                        "review-rejected",
-                    ),
-                    decision => {
-                        let unresolved = data.findings.iter().any(|finding| {
-                            matches!(finding.disposition, FindingDisposition::Residual)
-                                && matches!(
-                                    finding.severity,
-                                    FindingSeverity::Blocker | FindingSeverity::Major
-                                )
-                        });
-                        if unresolved {
-                            push_fail(
-                                &mut checks,
-                                &mut blocked_codes,
-                                "review",
-                                "unresolved blocker/major findings".to_string(),
-                                "review-unresolved-findings",
-                            );
-                        } else {
-                            let label = match decision {
-                                ReviewDecision::Approve => "approve",
-                                ReviewDecision::CommentsOnly => "comments-only",
-                                ReviewDecision::RequestChanges => unreachable!(),
-                            };
-                            push_pass(&mut checks, "review", format!("decision = {label}"));
-                        }
-                    }
-                },
-                Some(Err(err)) => push_fail(
-                    &mut checks,
-                    &mut blocked_codes,
-                    "review",
-                    format!("malformed review payload: {}", err.message),
-                    "review-rejected",
-                ),
-                None => push_fail(
-                    &mut checks,
-                    &mut blocked_codes,
-                    "review",
-                    "missing payload".to_string(),
-                    "review-missing",
-                ),
-            }
+    // Shared strict review rule (plan-tracking-testbed#79): the identical
+    // evaluation runs in the non-mutating `tracking close-ready` probe so the
+    // two gates never disagree.
+    match evaluate_review_closeout(audit.evidence.get("review")) {
+        ReviewCloseoutOutcome::Pass { detail } => push_pass(&mut checks, "review", detail),
+        ReviewCloseoutOutcome::Blocked { code, detail } => {
+            push_fail(&mut checks, &mut blocked_codes, "review", detail, code)
         }
-        None => push_fail(
-            &mut checks,
-            &mut blocked_codes,
-            "review",
-            "missing".to_string(),
-            "review-missing",
-        ),
     }
 
     let approval_text = input.approval.unwrap_or("").trim();

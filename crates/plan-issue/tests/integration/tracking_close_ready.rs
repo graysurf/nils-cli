@@ -225,3 +225,157 @@ fn tracking_close_ready_help_lists_required_args() {
     assert!(out.stdout_text().contains("--approval"));
     assert!(out.stdout_text().contains("--expect-visible"));
 }
+
+/// Fixture for the close-ready / record-close review-parity regression
+/// (plan-tracking-testbed#79): a closeout-complete tracking record whose
+/// approved review payload carries a residual `major` finding. Writes both
+/// `body.md` (read by `tracking close-ready`) and `issue-body.md` (read by
+/// `record close`) plus a shared `comments.json`, so one directory drives
+/// both commands and the two gates see identical evidence.
+fn residual_major_review_fixture() -> TempDir {
+    let tmp = TempDir::new().expect("tmp");
+    let body = "## Final Dashboard\n";
+    fs::write(tmp.path().join("body.md"), body).expect("body");
+    fs::write(tmp.path().join("issue-body.md"), body).expect("issue-body");
+
+    let roles: [(&str, Value, &str, &str); 6] = [
+        (
+            "source",
+            json!({"path": "p", "commit": "c"}),
+            "## Source Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:00Z",
+        ),
+        (
+            "plan",
+            json!({"path": "p", "commit": "c"}),
+            "## Plan Snapshot\n\n- Profile: tracking\n- Path: `p`",
+            "2026-05-26T00:00:01Z",
+        ),
+        (
+            "state",
+            json!({
+                "status": "complete",
+                "target_scope": "x",
+                "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+                "prs": [{"ref": "owner/repo#1", "url": "https://example.com/pr/1", "status": "merged"}]
+            }),
+            "## Execution State\n\n- Profile: tracking\n- Status: complete\n\n## Task Ledger\n\n| ID | Status |\n| --- | --- |\n| 1.1 | done |",
+            "2026-05-26T00:00:02Z",
+        ),
+        (
+            "session",
+            json!({"summary": "completed"}),
+            "## Execution Session\n\n- Profile: tracking\n- Summary: completed",
+            "2026-05-26T00:00:03Z",
+        ),
+        (
+            "validation",
+            json!({"overall": "pass", "commands": [{"command": "cargo test", "status": "pass"}], "waivers": []}),
+            "## Validation Evidence\n\n- Profile: tracking\n- Overall: pass\n\n| Command | Status | Evidence |\n|---|---|---|\n| cargo test | pass | log |",
+            "2026-05-26T00:00:04Z",
+        ),
+        (
+            "review",
+            json!({
+                "decision": "approve",
+                "findings": [
+                    {"id": "F1", "severity": "major", "disposition": "residual", "summary": "unresolved major"}
+                ],
+                "lenses": ["testing"]
+            }),
+            "## Review Evidence\n\n- Profile: tracking\n- Decision: approve\n- Lenses: testing\n\n| ID | Severity | Disposition | Summary |\n|---|---|---|---|\n| F1 | major | residual | unresolved major |",
+            "2026-05-26T00:00:05Z",
+        ),
+    ];
+
+    let comments: Vec<Value> = roles
+        .iter()
+        .enumerate()
+        .map(|(idx, (role, data, visible, at))| {
+            json!({
+                "url": format!("https://example.com/c{idx}"),
+                "created_at": at,
+                "body": v2_comment(role, "tracking", data.clone(), visible),
+            })
+        })
+        .collect();
+    fs::write(
+        tmp.path().join("comments.json"),
+        json!({"comments": comments}).to_string(),
+    )
+    .expect("comments");
+    tmp
+}
+
+/// plan-tracking-testbed#79: the non-mutating `tracking close-ready` probe and
+/// the mutating `record close` gate must reach the SAME verdict on an approved
+/// review that still carries a residual blocker/major finding. Before the fix,
+/// close-ready reported `ready: true` / `RECORD_READY_FOR_CLOSE` while
+/// `record close` rejected the identical evidence with
+/// `review-unresolved-findings`, stranding the closeout skill mid-flight. Both
+/// commands must now block with the same stable code.
+#[test]
+fn close_ready_and_record_close_agree_on_residual_major_review() {
+    let fixture = residual_major_review_fixture();
+    let path = fixture.path().to_str().expect("fixture");
+
+    // Non-mutating probe: must NOT authorize the close.
+    let close_ready = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "close-ready",
+        "--fixture",
+        path,
+        "--approval",
+        "https://example.com/approval",
+    ]);
+    assert_eq!(close_ready.code, 0, "stderr: {}", close_ready.stderr_text());
+    let result = close_ready.stdout_json()["payload"]["result"].clone();
+    let close_ready_codes: Vec<String> = result["blockers"]
+        .as_array()
+        .expect("blockers array")
+        .iter()
+        .map(|b| b["code"].as_str().expect("code").to_string())
+        .collect();
+    assert_eq!(
+        result["ready"], false,
+        "close-ready must not authorize close; result={result}"
+    );
+    assert!(
+        close_ready_codes
+            .iter()
+            .any(|c| c == "review-unresolved-findings"),
+        "close-ready blockers must include review-unresolved-findings: {close_ready_codes:?}"
+    );
+
+    // Mutating gate: must fail with the same stable code.
+    let record_close = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "79",
+        "--profile",
+        "tracking",
+        "--fixture",
+        path,
+        "--approval",
+        "https://example.com/approval",
+    ]);
+    assert_eq!(
+        record_close.code,
+        1,
+        "record close must reject residual major findings; stdout: {}",
+        record_close.stdout_text()
+    );
+    let err = record_close.stdout_json();
+    assert_eq!(err["status"], "error");
+    assert_eq!(err["error"]["code"], "record-close-gate-failed");
+    let message = err["error"]["message"].as_str().expect("error message");
+    assert!(
+        message.contains("review-unresolved-findings"),
+        "record close must cite the same review-unresolved-findings code: {message}"
+    );
+}

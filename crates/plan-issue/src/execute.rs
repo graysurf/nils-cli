@@ -3736,6 +3736,26 @@ fn run_tracking_close_ready(
         }
     }
 
+    // Strict review-finding gate (plan-tracking-testbed#79): the non-mutating
+    // probe must evaluate the SAME review rule as `record close`, otherwise a
+    // residual blocker/major finding (or a `request-changes` decision) passes
+    // close-ready and is then rejected by the mutating gate with
+    // `review-unresolved-findings`, stranding the closeout skill in its close
+    // window. A fully missing `review` role is already reported via the
+    // reconcile step's `review-missing` blocker above, so only evaluate when
+    // the evidence is present to avoid emitting the code twice.
+    if let Some(audit) = audit.as_ref()
+        && audit.evidence.contains_key("review")
+        && let lifecycle_record::ReviewCloseoutOutcome::Blocked { code, detail } =
+            lifecycle_record::evaluate_review_closeout(audit.evidence.get("review"))
+    {
+        blockers.push(json!({
+            "code": code,
+            "message": detail,
+            "suggested_unblock": "resolve the blocking review findings (record a review with no residual blocker/major findings) before close",
+        }));
+    }
+
     let ready = blockers.is_empty()
         && matches!(
             reconciled.state,
