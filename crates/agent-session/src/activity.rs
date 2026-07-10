@@ -1174,7 +1174,11 @@ fn normalize_provider_hook(
         None
     };
     if exact_clarification && exact_attention_id.is_none() {
-        return Ok(None);
+        return Err(CliError::data(
+            "provider-hook-correlation-missing",
+            "recognized AskUserQuestion hook event is missing tool_use_id",
+            None,
+        ));
     }
     let attention_id = match kind {
         TurnEventKind::AttentionRequested if exact_clarification => exact_attention_id,
@@ -2175,6 +2179,90 @@ mod tests {
     }
 
     #[test]
+    fn reducer_progress_metadata_requires_provider_evidence_and_matching_clear() {
+        let mut document = document();
+        reduce(
+            &mut document,
+            &event(TurnEventKind::TurnStarted, "start"),
+            "2026-07-10T00:00:01Z",
+        );
+
+        for (index, source_kind) in [
+            SourceKind::ConsoleObservation,
+            SourceKind::TerminalHeuristic,
+            SourceKind::Runtime,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut progress = event(TurnEventKind::Progress, &format!("progress-{index}"));
+            progress.source_kind = source_kind;
+            reduce(
+                &mut document,
+                &progress,
+                &format!("2026-07-10T00:00:0{}Z", index + 2),
+            );
+        }
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.last_progress_at.as_deref()),
+            None,
+            "non-provider observations must not create safe progress metadata"
+        );
+
+        let mut request = event(TurnEventKind::AttentionRequested, "ask-1");
+        request.attention_id = Some("request-1".to_string());
+        request.attention_kind = Some("clarification".to_string());
+        reduce(&mut document, &request, "2026-07-10T00:00:05Z");
+
+        let mut non_provider_clear = event(TurnEventKind::AttentionCleared, "clear-local");
+        non_provider_clear.attention_id = Some("request-1".to_string());
+        non_provider_clear.source_kind = SourceKind::TerminalHeuristic;
+        reduce(&mut document, &non_provider_clear, "2026-07-10T00:00:06Z");
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.last_progress_at.as_deref()),
+            None,
+            "a non-provider clear must not count as safe provider progress"
+        );
+
+        request.event_id = "ask-2".to_string();
+        request.attention_id = Some("request-2".to_string());
+        reduce(&mut document, &request, "2026-07-10T00:00:07Z");
+
+        let mut unmatched_clear = event(TurnEventKind::AttentionCleared, "clear-unmatched");
+        unmatched_clear.attention_id = Some("different-request".to_string());
+        reduce(&mut document, &unmatched_clear, "2026-07-10T00:00:08Z");
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.last_progress_at.as_deref()),
+            None,
+            "an unmatched clear must not count as correlated provider progress"
+        );
+
+        unmatched_clear.event_id = "clear-matched".to_string();
+        unmatched_clear.attention_id = Some("request-2".to_string());
+        reduce(&mut document, &unmatched_clear, "2026-07-10T00:00:09Z");
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.last_progress_at.as_deref()),
+            Some("2026-07-10T00:00:09Z")
+        );
+    }
+
+    #[test]
     fn reducer_bounds_attention_and_keeps_overflow_conservatively_latched() {
         let mut document = document();
         reduce(
@@ -2373,8 +2461,11 @@ mod tests {
                 "tool_name": "AskUserQuestion"
             }),
         )
-        .expect("missing correlation fails open");
-        assert!(missing_correlation.is_none());
+        .expect_err("missing correlation should surface safe drift diagnostics");
+        assert_eq!(
+            missing_correlation.code(),
+            "provider-hook-correlation-missing"
+        );
     }
 
     #[test]
@@ -3194,10 +3285,15 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
         }
         TurnEventKind::AttentionCleared => {
             let attention_id = event.attention_id.as_deref().unwrap_or_default();
+            let pending_before = document.pending_attention.len();
             document
                 .pending_attention
                 .retain(|pending| pending.id != attention_id);
-            if let Some(current) = document.state.current_turn.as_mut() {
+            let matched = document.pending_attention.len() < pending_before;
+            if matched
+                && is_provider_progress_evidence(event)
+                && let Some(current) = document.state.current_turn.as_mut()
+            {
                 advance_last_progress_at(current, at);
             }
             refresh_attention(document);
@@ -3218,7 +3314,9 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                     extra: Map::new(),
                 });
             }
-            if let Some(current) = document.state.current_turn.as_mut() {
+            if is_provider_progress_evidence(event)
+                && let Some(current) = document.state.current_turn.as_mut()
+            {
                 advance_last_progress_at(current, at);
             }
             if document.pending_attention.is_empty() && document.overflow_attention.is_none() {
@@ -3285,6 +3383,10 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
     if document.state.phase != previous_phase {
         document.state.phase_changed_at = at.to_string();
     }
+}
+
+fn is_provider_progress_evidence(event: &TurnEvent) -> bool {
+    event.source_kind == SourceKind::ProviderHook
 }
 
 fn advance_last_progress_at(current: &mut CurrentTurn, at: &str) {

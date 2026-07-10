@@ -1069,6 +1069,24 @@ fn claude_ask_user_question_clears_exactly_and_keeps_generic_attention() {
         .expect("started at")
         .to_string();
 
+    let drift_secret = "missing-correlation-content-must-not-persist";
+    let missing_correlation = hook(json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": provider_session_id,
+        "tool_name": "AskUserQuestion",
+        "tool_input": {"questions": [{"question": drift_secret}]}
+    }));
+    assert_eq!(
+        missing_correlation.code, 0,
+        "provider hooks must remain fail-open"
+    );
+    assert!(missing_correlation.stdout_text().is_empty());
+    assert!(missing_correlation.stderr_text().is_empty());
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("schema drift diagnostic");
+    assert!(diagnostic.contains("provider-hook-correlation-missing"));
+    assert!(!diagnostic.contains(drift_secret));
+    assert!(!diagnostic.contains("questions"));
+
     let raw_tool_id = "tool-use-must-not-persist";
     assert_eq!(
         hook(json!({
@@ -1080,6 +1098,10 @@ fn claude_ask_user_question_clears_exactly_and_keeps_generic_attention() {
         }))
         .code,
         0
+    );
+    assert!(
+        !diagnostic_path.exists(),
+        "a later valid event should clear the drift diagnostic"
     );
     assert_eq!(
         hook(json!({
