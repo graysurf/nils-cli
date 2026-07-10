@@ -15,6 +15,7 @@
     "current_turn": {
       "provider_turn_id": "turn-1",
       "started_at": "2026-07-10T00:00:01Z",
+      "last_progress_at": "2026-07-10T00:00:03Z",
       "attention": { "kind": "approval", "requested_at": "2026-07-10T00:00:02Z", "pending_count": 2 }
     }
   },

@@ -965,6 +965,208 @@ fn codex_hook_adapter_discards_content_and_keeps_raw_stop_conservative() {
 }
 
 #[test]
+fn claude_ask_user_question_clears_exactly_and_keeps_generic_attention() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let claude_bin = fake_agent(tmp.path(), "claude");
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let claude_arg = claude_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let start = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "claude",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &claude_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    let start_json = start.stdout_json();
+    let id = data(&start_json)["id"].as_str().expect("id").to_string();
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(state_dir.join("sessions").join(&id).join("session.json"))
+            .expect("record"),
+    )
+    .expect("record json");
+    let runtime_id = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("runtime id")
+        .to_string();
+    let provider_session_id = record["provider_resume"]["session_id"]
+        .as_str()
+        .unwrap_or("claude-session")
+        .to_string();
+    let hook_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let hook = |payload: Value| {
+        run_with_stdin(
+            tmp.path(),
+            &["activity", "hook", "--agent", "claude"],
+            &hook_env,
+            &payload.to_string(),
+        )
+    };
+    let status = || {
+        run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "activity",
+                "status",
+                &id,
+                "--format",
+                "json",
+            ],
+            &[],
+        )
+        .stdout_json()
+    };
+
+    let prompt_hook = hook(json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": provider_session_id
+    }));
+    assert_eq!(prompt_hook.code, 0);
+    let diagnostic_path = state_dir
+        .join("sessions")
+        .join(&id)
+        .join("activity.diagnostic.json");
+    assert!(
+        !diagnostic_path.exists(),
+        "diagnostic={}",
+        fs::read_to_string(&diagnostic_path).unwrap_or_default()
+    );
+    let working = status();
+    assert_eq!(
+        data(&working)["turn_state"]["phase"],
+        "working",
+        "status={working}"
+    );
+    let started_at = data(&working)["turn_state"]["current_turn"]["started_at"]
+        .as_str()
+        .expect("started at")
+        .to_string();
+
+    let drift_secret = "missing-correlation-content-must-not-persist";
+    let missing_correlation = hook(json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": provider_session_id,
+        "tool_name": "AskUserQuestion",
+        "tool_input": {"questions": [{"question": drift_secret}]}
+    }));
+    assert_eq!(
+        missing_correlation.code, 0,
+        "provider hooks must remain fail-open"
+    );
+    assert!(missing_correlation.stdout_text().is_empty());
+    assert!(missing_correlation.stderr_text().is_empty());
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("schema drift diagnostic");
+    assert!(diagnostic.contains("provider-hook-correlation-missing"));
+    assert!(!diagnostic.contains(drift_secret));
+    assert!(!diagnostic.contains("questions"));
+
+    let raw_tool_id = "tool-use-must-not-persist";
+    assert_eq!(
+        hook(json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": provider_session_id,
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": raw_tool_id,
+            "tool_input": {"questions": [{"question": "discarded"}]}
+        }))
+        .code,
+        0
+    );
+    assert!(
+        !diagnostic_path.exists(),
+        "a later valid event should clear the drift diagnostic"
+    );
+    assert_eq!(
+        hook(json!({
+            "hook_event_name": "PermissionRequest",
+            "session_id": provider_session_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "discarded"}
+        }))
+        .code,
+        0
+    );
+    let pending = status();
+    assert_eq!(data(&pending)["turn_state"]["phase"], "needs_input");
+    assert_eq!(
+        data(&pending)["turn_state"]["current_turn"]["attention"]["pending_count"],
+        2
+    );
+
+    assert_eq!(
+        hook(json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": provider_session_id,
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": raw_tool_id,
+            "tool_response": {"answers": "discarded"}
+        }))
+        .code,
+        0
+    );
+    let cleared = status();
+    let turn = &data(&cleared)["turn_state"]["current_turn"];
+    assert_eq!(data(&cleared)["turn_state"]["phase"], "needs_input");
+    assert_eq!(turn["attention"]["pending_count"], 1);
+    assert_eq!(turn["started_at"], started_at);
+    assert!(turn["last_progress_at"].is_string());
+
+    assert_eq!(
+        hook(json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": provider_session_id,
+            "tool_name": "Bash",
+            "tool_use_id": "unrelated-tool"
+        }))
+        .code,
+        0
+    );
+    assert_eq!(data(&status())["turn_state"]["phase"], "needs_input");
+
+    for file in ["activity.json", "activity.journal.jsonl"] {
+        let contents = fs::read_to_string(state_dir.join("sessions").join(&id).join(file))
+            .expect("activity file");
+        for forbidden in [
+            raw_tool_id,
+            provider_session_id.as_str(),
+            "questions",
+            "answers",
+            "discarded",
+            "command",
+        ] {
+            assert!(!contents.contains(forbidden), "forbidden {forbidden}");
+        }
+    }
+}
+
+#[test]
 fn start_creates_session_state_without_printing_prompt() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
