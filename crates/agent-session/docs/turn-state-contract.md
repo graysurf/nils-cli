@@ -122,6 +122,14 @@ remain valid.
 | missing/prior runtime id | reject before host timestamp or reducer |
 | corrupt snapshot | expose safe `unknown`; list/serve/delete remain available |
 
+Claude `bypassPermissions` is an adapter-level exception: in that mode no
+approval blocks the turn, and approvals carry no correlated clear event, so a
+raised approval would latch `needs_input` until the turn ends. The Claude
+adapter therefore does not emit `attention_requested` for a `PermissionRequest`
+/ `permission_prompt` hook whose payload `permission_mode` is
+`bypassPermissions`. Genuine approvals in `default`, `acceptEdits`, and `plan`
+keep the conservative latch above.
+
 Revision is monotonic for each accepted non-duplicate event and runtime
 boundary. Phase timestamps change only when the phase changes. Durations are
 derived by clients and are never persisted separately.

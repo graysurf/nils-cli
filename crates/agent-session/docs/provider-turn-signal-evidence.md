@@ -82,6 +82,13 @@ signals remain uncorrelated conservative latches cleared only by a proven
 completion, a new turn, or a runtime boundary; later progress may prove work is
 continuing but never proves the request was answered.
 
+The one exception is `permission_mode: "bypassPermissions"`: in that mode Claude
+never blocks on an approval, so a permission hook is not a genuine attention
+request. Because it would otherwise become a latch that no clear event can ever
+release, the adapter drops the approval `attention_requested` for a
+`PermissionRequest` / `permission_prompt` payload carrying that mode. Other
+modes (`default`, `acceptEdits`, `plan`) still latch conservatively.
+
 ### Hermes
 
 The installed `post_llm_call` fires only after a successful final response and
