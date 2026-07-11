@@ -365,11 +365,12 @@ pub struct ActivitySetupArgs {
     #[arg(long, value_enum)]
     pub agent: AgentKind,
 
-    /// Preview the exact additive change without writing it.
+    /// Preview a Codex-only repair plan when combined with --repair; otherwise
+    /// preview the exact additive change without writing it.
     #[arg(
         long,
         required_unless_present_any = ["apply", "remove", "repair"],
-        conflicts_with_all = ["apply", "remove", "repair"]
+        conflicts_with_all = ["apply", "remove"]
     )]
     pub dry_run: bool,
 
@@ -383,8 +384,18 @@ pub struct ActivitySetupArgs {
     pub remove: bool,
 
     /// Restore missing agent-session-owned entries without replacing others.
-    #[arg(long, conflicts_with_all = ["dry_run", "apply", "remove"])]
+    #[arg(long, conflicts_with_all = ["apply", "remove"])]
     pub repair: bool,
+
+    /// Digest returned by the reviewed Codex repair preview. Required when
+    /// applying Codex repair and rejected if either planned file changed.
+    #[arg(
+        long,
+        value_name = "SHA256",
+        requires = "repair",
+        conflicts_with = "dry_run"
+    )]
+    pub expected_preview_digest: Option<String>,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]

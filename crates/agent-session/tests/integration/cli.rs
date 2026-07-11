@@ -386,6 +386,71 @@ fn serve_help_describes_activity_stream_authentication() {
 }
 
 #[test]
+fn activity_setup_repair_preview_is_codex_only_in_matrix_help_and_completion() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("home dir");
+    let home_arg = home.to_string_lossy().to_string();
+
+    for provider in ["claude", "hermes"] {
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                provider,
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &[("HOME", home_arg.as_str())],
+        );
+        assert_ne!(preview.code, 0, "provider={provider}");
+        assert_eq!(
+            preview.stdout_json()["error"]["code"],
+            "provider-repair-preview-unsupported",
+            "provider={provider}"
+        );
+        assert!(
+            !preview.stdout_text().contains("digest unavailable"),
+            "provider={provider}"
+        );
+    }
+
+    let help = run(tmp.path(), &["activity", "setup", "--help"], &[]);
+    assert_eq!(help.code, 0, "stderr={}", help.stderr_text());
+    assert!(
+        help.stdout_text()
+            .contains("Preview a Codex-only repair plan"),
+        "help={}",
+        help.stdout_text()
+    );
+
+    for shell in ["bash", "zsh"] {
+        let completion = run(tmp.path(), &["completion", shell], &[]);
+        assert_eq!(
+            completion.code,
+            0,
+            "shell={shell} stderr={}",
+            completion.stderr_text()
+        );
+        let script = completion.stdout_text();
+        assert!(
+            script.contains("--expected-preview-digest"),
+            "shell={shell}"
+        );
+        if shell == "zsh" {
+            assert!(
+                script.contains("Preview a Codex-only repair plan"),
+                "shell={shell}"
+            );
+        }
+    }
+}
+
+#[test]
 fn activity_events_are_runtime_bound_private_and_deterministic() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -618,6 +683,551 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
         fs::metadata(replay_path).expect("replay size").len(),
         64 + 4096 * 2 * 32
     );
+}
+
+#[test]
+fn hermes_identical_approval_hooks_preserve_persisted_multiplicity_until_completion() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let hermes_bin = fake_agent(tmp.path(), "hermes");
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let hermes_arg = hermes_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let start = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "hermes",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &hermes_arg,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    let id = data(&start.stdout_json())["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let session_dir = state_dir.join("sessions").join(&id);
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(session_dir.join("session.json")).expect("session record"),
+    )
+    .expect("session json");
+    let runtime_id = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("runtime id")
+        .to_string();
+    let hook_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let hook = |payload: &Value| {
+        run_with_stdin(
+            tmp.path(),
+            &["activity", "hook", "--agent", "hermes"],
+            &hook_env,
+            &payload.to_string(),
+        )
+    };
+    let status = || {
+        run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "activity",
+                "status",
+                &id,
+                "--format",
+                "json",
+            ],
+            &[],
+        )
+    };
+
+    let malformed = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "hermes"],
+        &hook_env,
+        "{invalid-hook",
+    );
+    assert_eq!(malformed.code, 0, "hook telemetry is fail-open");
+    let diagnostic_path = session_dir.join("activity.diagnostic.json");
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("hook diagnostic");
+    assert!(diagnostic.contains("provider-hook-invalid"));
+
+    let raw_values = [
+        "raw-command-never-persist",
+        "raw-description-never-persist",
+        "raw-pattern-never-persist",
+        "raw-secondary-pattern-never-persist",
+        "raw-session-never-persist",
+        "raw-surface-never-persist",
+    ];
+    let request = json!({
+        "event": "pre_approval_request",
+        "command": raw_values[0],
+        "description": raw_values[1],
+        "pattern_key": raw_values[2],
+        "pattern_keys": [raw_values[3], raw_values[2]],
+        "session_key": raw_values[4],
+        "surface": raw_values[5]
+    });
+    let first = hook(&request);
+    assert_eq!(first.code, 0, "stderr={}", first.stderr_text());
+    assert!(first.stdout_text().is_empty());
+    assert!(first.stderr_text().is_empty());
+    assert!(
+        !diagnostic_path.exists(),
+        "successful ingestion clears diagnostic"
+    );
+    let first_status = status();
+    assert_eq!(
+        first_status.code,
+        0,
+        "stderr={}",
+        first_status.stderr_text()
+    );
+    let first_status_json = first_status.stdout_json();
+    let first_state = &data(&first_status_json)["turn_state"];
+    assert_eq!(first_state["phase"], "needs_input");
+    assert_eq!(first_state["current_turn"]["attention"]["pending_count"], 1);
+    let first_revision = first_state["revision"].as_u64().expect("first revision");
+
+    let second = hook(&request);
+    assert_eq!(second.code, 0, "stderr={}", second.stderr_text());
+    let second_status = status();
+    let second_status_json = second_status.stdout_json();
+    let second_state = &data(&second_status_json)["turn_state"];
+    assert_eq!(second_state["phase"], "needs_input");
+    assert_eq!(
+        second_state["current_turn"]["attention"]["pending_count"],
+        2
+    );
+    let second_revision = second_state["revision"].as_u64().expect("second revision");
+    assert!(second_revision > first_revision);
+
+    let mut response = request.clone();
+    response["event"] = json!("post_approval_response");
+    response["choice"] = json!("once");
+    let post = hook(&response);
+    assert_eq!(post.code, 0, "stderr={}", post.stderr_text());
+    let post_status = status();
+    let post_status_json = post_status.stdout_json();
+    let post_state = &data(&post_status_json)["turn_state"];
+    assert_eq!(post_state["phase"], "needs_input");
+    assert_eq!(post_state["current_turn"]["attention"]["pending_count"], 1);
+    let post_revision = post_state["revision"].as_u64().expect("post revision");
+    assert!(post_revision > second_revision);
+
+    let completion = hook(&json!({
+        "event": "post_llm_call",
+        "session_id": raw_values[4],
+        "platform": raw_values[5]
+    }));
+    assert_eq!(completion.code, 0, "stderr={}", completion.stderr_text());
+    let completed_status = status();
+    let completed_status_json = completed_status.stdout_json();
+    let completed_state = &data(&completed_status_json)["turn_state"];
+    assert_eq!(completed_state["phase"], "waiting");
+    assert!(completed_state["current_turn"].is_null());
+    assert_eq!(completed_state["last_turn"]["outcome"], "completed");
+    assert!(
+        completed_state["revision"]
+            .as_u64()
+            .expect("completion revision")
+            > post_revision
+    );
+
+    let journal =
+        fs::read_to_string(session_dir.join("activity.journal.jsonl")).expect("activity journal");
+    assert_eq!(journal.matches("attention_requested").count(), 2);
+    assert_eq!(journal.matches("attention_cleared").count(), 1);
+    assert_eq!(journal.matches("turn_completed").count(), 1);
+    let snapshot =
+        fs::read_to_string(session_dir.join("activity.json")).expect("activity snapshot");
+    for persisted in [snapshot.as_str(), journal.as_str()] {
+        for field in [
+            "\"command\"",
+            "\"description\"",
+            "\"pattern_key\"",
+            "\"pattern_keys\"",
+            "\"session_key\"",
+            "\"surface\"",
+        ] {
+            assert!(
+                !persisted.contains(field),
+                "raw tuple field persisted: {field}"
+            );
+        }
+        for raw in raw_values {
+            assert!(!persisted.contains(raw), "raw tuple value persisted: {raw}");
+        }
+    }
+    assert!(!diagnostic_path.exists());
+    assert!(session_dir.join("activity.replay.bin").is_file());
+}
+
+#[test]
+fn hermes_shell_wire_approvals_use_exact_ids_and_compatibility_fallback() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let hermes_bin = fake_agent(tmp.path(), "hermes");
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let hermes_arg = hermes_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let start = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "hermes",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &hermes_arg,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    let id = data(&start.stdout_json())["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let session_dir = state_dir.join("sessions").join(&id);
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(session_dir.join("session.json")).expect("session record"),
+    )
+    .expect("session json");
+    let runtime_id = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("runtime id")
+        .to_string();
+    let hook_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let hook = |payload: &Value| {
+        run_with_stdin(
+            tmp.path(),
+            &["activity", "hook", "--agent", "hermes"],
+            &hook_env,
+            &payload.to_string(),
+        )
+    };
+    let state = || {
+        let status = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "activity",
+                "status",
+                &id,
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+        assert_eq!(status.code, 0, "stderr={}", status.stderr_text());
+        data(&status.stdout_json())["turn_state"].clone()
+    };
+    let fixture = include_str!("../fixtures/activity/hermes-shell-approval-events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("Hermes shell-wire fixture"))
+        .collect::<Vec<_>>();
+    assert_eq!(fixture.len(), 7);
+
+    let malformed = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "hermes"],
+        &hook_env,
+        "{invalid-hook",
+    );
+    assert_eq!(malformed.code, 0, "hook telemetry is fail-open");
+    let diagnostic_path = session_dir.join("activity.diagnostic.json");
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("hook diagnostic");
+    assert!(diagnostic.contains("provider-hook-invalid"));
+
+    let first = hook(&fixture[0]);
+    assert_eq!(first.code, 0, "stderr={}", first.stderr_text());
+    assert!(first.stdout_text().is_empty());
+    assert!(first.stderr_text().is_empty());
+    assert!(!diagnostic_path.exists());
+    let first_state = state();
+    assert_eq!(first_state["phase"], "needs_input");
+    assert_eq!(first_state["current_turn"]["attention"]["pending_count"], 1);
+    let first_revision = first_state["revision"].as_u64().expect("first revision");
+
+    let first_replay = hook(&fixture[0]);
+    assert_eq!(first_replay.code, 0);
+    let replay_state = state();
+    assert_eq!(replay_state["revision"], first_revision);
+    assert_eq!(
+        replay_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+
+    let second = hook(&fixture[1]);
+    assert_eq!(second.code, 0, "stderr={}", second.stderr_text());
+    let second_state = state();
+    assert_eq!(second_state["phase"], "needs_input");
+    assert_eq!(
+        second_state["current_turn"]["attention"]["pending_count"],
+        2
+    );
+    let second_revision = second_state["revision"].as_u64().expect("second revision");
+    assert!(second_revision > first_revision);
+
+    let journal_path = session_dir.join("activity.journal.jsonl");
+    let before_interleaved_replay =
+        fs::read_to_string(&journal_path).expect("journal before interleaved replay");
+    let interleaved_replay = hook(&fixture[0]);
+    assert_eq!(interleaved_replay.code, 0);
+    let interleaved_replay_state = state();
+    assert_eq!(interleaved_replay_state["revision"], second_revision);
+    assert_eq!(
+        interleaved_replay_state["current_turn"]["attention"]["pending_count"],
+        2
+    );
+    assert_eq!(
+        fs::read_to_string(&journal_path).expect("journal after interleaved replay"),
+        before_interleaved_replay
+    );
+
+    thread::sleep(Duration::from_millis(1_100));
+    let delayed_replay = hook(&fixture[0]);
+    assert_eq!(delayed_replay.code, 0);
+    let delayed_replay_state = state();
+    assert_eq!(delayed_replay_state["revision"], second_revision);
+    assert_eq!(
+        delayed_replay_state["current_turn"]["attention"]["pending_count"],
+        2
+    );
+    assert_eq!(
+        fs::read_to_string(&journal_path).expect("journal after delayed replay"),
+        before_interleaved_replay
+    );
+
+    let post_b = hook(&fixture[2]);
+    assert_eq!(post_b.code, 0, "stderr={}", post_b.stderr_text());
+    let post_b_state = state();
+    assert_eq!(post_b_state["phase"], "needs_input");
+    assert_eq!(
+        post_b_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+    let post_b_revision = post_b_state["revision"].as_u64().expect("post B revision");
+    assert!(post_b_revision > second_revision);
+
+    let post_b_replay = hook(&fixture[2]);
+    assert_eq!(post_b_replay.code, 0);
+    let post_b_replay_state = state();
+    assert_eq!(post_b_replay_state["revision"], post_b_revision);
+    assert_eq!(
+        post_b_replay_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+
+    let fallback_pre = hook(&fixture[4]);
+    assert_eq!(
+        fallback_pre.code,
+        0,
+        "stderr={}",
+        fallback_pre.stderr_text()
+    );
+    let fallback_pre_state = state();
+    assert_eq!(fallback_pre_state["phase"], "needs_input");
+    assert_eq!(
+        fallback_pre_state["current_turn"]["attention"]["pending_count"],
+        2
+    );
+
+    let fallback_post = hook(&fixture[5]);
+    assert_eq!(
+        fallback_post.code,
+        0,
+        "stderr={}",
+        fallback_post.stderr_text()
+    );
+    let fallback_post_state = state();
+    assert_eq!(fallback_post_state["phase"], "needs_input");
+    assert_eq!(
+        fallback_post_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+
+    let post_a = hook(&fixture[3]);
+    assert_eq!(post_a.code, 0, "stderr={}", post_a.stderr_text());
+    let post_a_state = state();
+    assert_eq!(post_a_state["phase"], "working");
+    assert!(post_a_state["current_turn"]["attention"].is_null());
+    let cleared_revision = post_a_state["revision"].as_u64().expect("cleared revision");
+
+    let before_cleared_pre_replay =
+        fs::read_to_string(&journal_path).expect("journal before cleared pre replay");
+    let cleared_pre_replay = hook(&fixture[0]);
+    assert_eq!(cleared_pre_replay.code, 0);
+    let cleared_pre_replay_state = state();
+    assert_eq!(cleared_pre_replay_state["phase"], "working");
+    assert!(cleared_pre_replay_state["current_turn"]["attention"].is_null());
+    assert_eq!(cleared_pre_replay_state["revision"], cleared_revision);
+    assert_eq!(
+        fs::read_to_string(&journal_path).expect("journal after cleared pre replay"),
+        before_cleared_pre_replay
+    );
+
+    let fallback_pending = hook(&fixture[4]);
+    assert_eq!(fallback_pending.code, 0);
+    let pending_state = state();
+    assert_eq!(pending_state["phase"], "needs_input");
+    assert_eq!(
+        pending_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+    let pending_revision = pending_state["revision"]
+        .as_u64()
+        .expect("pending revision");
+    assert!(pending_revision > cleared_revision);
+
+    let stale_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", "prior-runtime"),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let stale = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "hermes"],
+        &stale_env,
+        &fixture[1].to_string(),
+    );
+    assert_eq!(stale.code, 0, "stale hook telemetry is fail-open");
+    let after_stale_state = state();
+    assert_eq!(after_stale_state["revision"], pending_revision);
+    assert_eq!(
+        after_stale_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+
+    let mut invalid_tool_call = fixture[0].clone();
+    invalid_tool_call["extra"]["tool_call_id"] = json!({"raw": "must-not-persist"});
+    let invalid = hook(&invalid_tool_call);
+    assert_eq!(invalid.code, 0, "invalid hook telemetry is fail-open");
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("invalid-id diagnostic");
+    assert!(diagnostic.contains("provider-hook-correlation-invalid"));
+    for forbidden in [
+        "must-not-persist",
+        "tool_call_id",
+        "raw-command-never-persist",
+    ] {
+        assert!(!diagnostic.contains(forbidden));
+    }
+    assert_eq!(state()["revision"], pending_revision);
+
+    let completion = hook(&fixture[6]);
+    assert_eq!(completion.code, 0, "stderr={}", completion.stderr_text());
+    assert!(!diagnostic_path.exists());
+    let completed_state = state();
+    assert_eq!(completed_state["phase"], "waiting");
+    assert!(completed_state["current_turn"].is_null());
+    assert_eq!(completed_state["last_turn"]["outcome"], "completed");
+    assert!(
+        completed_state["revision"]
+            .as_u64()
+            .expect("completion revision")
+            > pending_revision
+    );
+
+    let journal =
+        fs::read_to_string(session_dir.join("activity.journal.jsonl")).expect("activity journal");
+    assert_eq!(journal.matches("attention_requested").count(), 4);
+    assert_eq!(journal.matches("attention_cleared").count(), 3);
+    assert_eq!(journal.matches("turn_completed").count(), 1);
+    let journal_entries = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("journal entry"))
+        .collect::<Vec<_>>();
+    let requested_ids = journal_entries
+        .iter()
+        .filter(|entry| entry["event"]["kind"] == "attention_requested")
+        .map(|entry| {
+            entry["event"]["attention_id"]
+                .as_str()
+                .expect("attention id")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requested_ids.len(), 4);
+    assert_ne!(requested_ids[0], requested_ids[1]);
+    assert_ne!(requested_ids[0], requested_ids[2]);
+    assert_eq!(requested_ids[2], requested_ids[3]);
+
+    let snapshot =
+        fs::read_to_string(session_dir.join("activity.json")).expect("activity snapshot");
+    let raw_values = [
+        "raw-command-never-persist",
+        "raw-description-never-persist",
+        "raw-pattern-never-persist",
+        "raw-secondary-pattern-never-persist",
+        "raw-session-never-persist",
+        "raw-surface-never-persist",
+        "raw-turn-never-persist",
+        "raw-tool-call-a-never-persist",
+        "raw-tool-call-b-never-persist",
+        "raw-fallback-command-never-persist",
+        "raw-fallback-description-never-persist",
+        "raw-fallback-pattern-never-persist",
+        "raw-fallback-secondary-never-persist",
+        "/raw/cwd-never-persist",
+    ];
+    for persisted in [snapshot.as_str(), journal.as_str()] {
+        for field in [
+            "\"extra\"",
+            "\"command\"",
+            "\"description\"",
+            "\"pattern_key\"",
+            "\"pattern_keys\"",
+            "\"session_key\"",
+            "\"surface\"",
+            "\"tool_call_id\"",
+            "\"cwd\"",
+        ] {
+            assert!(
+                !persisted.contains(field),
+                "raw shell field persisted: {field}"
+            );
+        }
+        for raw in raw_values {
+            assert!(!persisted.contains(raw), "raw shell value persisted: {raw}");
+        }
+    }
+    assert!(session_dir.join("activity.replay.bin").is_file());
 }
 
 #[test]
@@ -895,6 +1505,288 @@ fn codex_activity_setup_refuses_composition_that_cannot_restore_exact_bytes() {
     );
     assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
     assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
+fn codex_activity_repair_preview_reports_safe_nonreversible_notifier_by_hash() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(&hooks_path, r#"{"keep":"hooks"}"#).expect("hooks config");
+    fs::write(
+        &notify_path,
+        "# desktop rewrite\nnotify = [\n  \"user-notifier\",\n  \"--title\",\n  \"sensitive-title-must-not-persist\",\n  \"--message\",\n]\n",
+    )
+    .expect("notify config");
+    let hooks_before = fs::read(&hooks_path).expect("hooks before");
+    let notify_before = fs::read(&notify_path).expect("notify before");
+    let home_arg = home.to_string_lossy().to_string();
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview = preview.stdout_json();
+    let result = data(&preview);
+    assert_eq!(result["action"], "repair-preview");
+    assert_eq!(result["changed"], false);
+    assert_eq!(result["configured"], false);
+    assert_eq!(result["apply_allowed"], false);
+    assert_eq!(result["notification_preview"]["current_mode"], "conflict");
+    assert_eq!(result["notification_preview"]["candidate_mode"], "composed");
+    assert_eq!(result["notification_preview"]["forwarded_argc"], 4);
+    assert_eq!(result["notification_preview"]["reversible"], false);
+    assert_eq!(
+        result["notification_preview"]["blocker_code"],
+        "provider-notification-config-nonreversible"
+    );
+    assert_eq!(
+        result["notification_preview"]["forwarded_argv_sha256"],
+        "sha256:1396340af9627c539dea8d0fff93faa8e06f84c38cadeebad406d4100ef6ad55",
+        "preview hash must match compact JSON argv plus one LF"
+    );
+    let serialized = serde_json::to_string(&preview).expect("preview json");
+    for forbidden in [
+        "user-notifier",
+        "--title",
+        "sensitive-title-must-not-persist",
+        "--message",
+    ] {
+        assert!(!serialized.contains(forbidden), "forbidden {forbidden}");
+    }
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+    let preview_digest = result["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+
+    let repair = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &preview_digest,
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(repair.code, 0);
+    assert_eq!(
+        repair.stdout_json()["error"]["code"],
+        "provider-notification-config-conflict"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
+fn codex_activity_repair_requires_a_preview_digest() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(&hooks_path, r#"{"keep":"reviewed-marker-A"}"#).expect("hooks config");
+    fs::write(&notify_path, "notify = [\"user-notifier\", \"--keep\"]\n").expect("notify config");
+    let hooks_before = fs::read(&hooks_path).expect("hooks before");
+    let notify_before = fs::read(&notify_path).expect("notify before");
+    let home_arg = home.to_string_lossy().to_string();
+
+    let repair = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--repair", "--format", "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(repair.code, 0);
+    assert_eq!(
+        repair.stdout_json()["error"]["code"],
+        "provider-config-preview-digest-required"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
+fn codex_activity_repair_rejects_stale_preview_digest_without_writes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(&hooks_path, r#"{"keep":"reviewed-marker-A"}"#).expect("hooks config");
+    fs::write(&notify_path, "notify = [\"user-notifier\", \"--keep\"]\n").expect("notify config");
+    let home_arg = home.to_string_lossy().to_string();
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let reviewed_digest = data(&preview.stdout_json())["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+
+    fs::write(&hooks_path, r#"{"keep":"unreviewed-marker-B"}"#).expect("changed hooks");
+    let hooks_changed = fs::read(&hooks_path).expect("changed hooks bytes");
+    let notify_unchanged = fs::read(&notify_path).expect("unchanged notify bytes");
+    let repair = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &reviewed_digest,
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(repair.code, 0);
+    assert_eq!(
+        repair.stdout_json()["error"]["code"],
+        "provider-config-preview-digest-mismatch"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_changed);
+    assert_eq!(
+        fs::read(&notify_path).expect("notify after"),
+        notify_unchanged
+    );
+    for forbidden in ["reviewed-marker-A", "unreviewed-marker-B", "user-notifier"] {
+        assert!(!repair.stdout_text().contains(forbidden));
+        assert!(!repair.stderr_text().contains(forbidden));
+    }
+
+    let hooks_reviewed_preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    let hooks_reviewed_digest = data(&hooks_reviewed_preview.stdout_json())["preview_digest"]
+        .as_str()
+        .expect("hooks-reviewed preview digest")
+        .to_string();
+    assert_ne!(hooks_reviewed_digest, reviewed_digest);
+
+    fs::write(
+        &notify_path,
+        "notify = [\"replacement-notifier\", \"--other\"]\n",
+    )
+    .expect("changed notification config");
+    let hooks_unchanged = fs::read(&hooks_path).expect("unchanged hooks bytes");
+    let notify_changed = fs::read(&notify_path).expect("changed notification bytes");
+    let stale_notification_repair = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &hooks_reviewed_digest,
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(stale_notification_repair.code, 0);
+    assert_eq!(
+        stale_notification_repair.stdout_json()["error"]["code"],
+        "provider-config-preview-digest-mismatch"
+    );
+    assert_eq!(
+        fs::read(&hooks_path).expect("hooks after notification race"),
+        hooks_unchanged
+    );
+    assert_eq!(
+        fs::read(&notify_path).expect("notification after race"),
+        notify_changed
+    );
+    for forbidden in ["unreviewed-marker-B", "replacement-notifier", "--other"] {
+        assert!(!stale_notification_repair.stdout_text().contains(forbidden));
+        assert!(!stale_notification_repair.stderr_text().contains(forbidden));
+    }
+
+    let current_preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    let current_digest = data(&current_preview.stdout_json())["preview_digest"]
+        .as_str()
+        .expect("current preview digest")
+        .to_string();
+    assert_ne!(current_digest, hooks_reviewed_digest);
+    let applied = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &current_digest,
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    assert_eq!(data(&applied.stdout_json())["configured"], true);
 }
 
 #[test]
