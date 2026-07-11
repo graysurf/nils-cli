@@ -275,6 +275,11 @@ command on PATH. Hook/notification diagnostics are bound to the active
 launch id/generation and the newest current-runtime diagnostic is selected
 deterministically across sessions.
 
+The combined `--repair --dry-run` reviewed-plan action is Codex-only because its
+digest binds Codex's two-file repair transaction. Claude and Hermes reject that
+combination with `provider-repair-preview-unsupported`; their ordinary
+`--dry-run` and `--repair` actions remain supported independently.
+
 Codex repair preview (`--repair --dry-run`) is non-destructive even when a safe
 foreign notifier cannot pass byte-exact reversal. It reports only the
 current/candidate mode, argument count, reversibility, a blocker code, and

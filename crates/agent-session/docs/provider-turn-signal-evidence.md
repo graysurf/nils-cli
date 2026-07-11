@@ -200,6 +200,9 @@ perform normalization. The preview's separate plan digest binds the exact
 current and candidate bytes for both files. Applying repair requires it via
 `--expected-preview-digest`; any missing, malformed, or stale digest fails
 before mutation.
+Claude and Hermes do not have this two-file reviewed-plan contract, so the same
+combined flags reject with `provider-repair-preview-unsupported`; ordinary
+dry-run and repair remain separate supported actions for those providers.
 Apply/repair/remove parse and plan both files before either mutation; a guarded
 second-write failure restores the first write, while a rollback race surfaces an
 explicit error naming both metadata-only paths.

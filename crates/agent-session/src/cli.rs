@@ -365,7 +365,8 @@ pub struct ActivitySetupArgs {
     #[arg(long, value_enum)]
     pub agent: AgentKind,
 
-    /// Preview the exact additive change without writing it.
+    /// Preview a Codex-only repair plan when combined with --repair; otherwise
+    /// preview the exact additive change without writing it.
     #[arg(
         long,
         required_unless_present_any = ["apply", "remove", "repair"],

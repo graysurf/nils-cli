@@ -2000,6 +2000,13 @@ pub(crate) fn setup(
     action: SetupAction,
     expected_preview_digest: Option<&str>,
 ) -> Result<SetupResult, CliError> {
+    if action == SetupAction::RepairPreview && agent != AgentKind::Codex {
+        return Err(CliError::usage(
+            "provider-repair-preview-unsupported",
+            "--repair --dry-run is a Codex-only reviewed-plan workflow; use --dry-run or --repair separately for this provider",
+            Some(json!({ "agent": agent.as_str() })),
+        ));
+    }
     if agent == AgentKind::Codex && action == SetupAction::Repair {
         let Some(expected) = expected_preview_digest else {
             return Err(CliError::data(

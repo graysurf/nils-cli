@@ -3798,7 +3798,7 @@ fn render_setup_text(result: &activity::SetupResult) -> String {
         let preview_digest = result
             .preview_digest
             .as_deref()
-            .unwrap_or("digest unavailable");
+            .expect("Codex repair preview always has a plan digest");
         if !result.apply_allowed {
             let notification = result
                 .notification_preview

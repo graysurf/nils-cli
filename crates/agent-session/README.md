@@ -73,10 +73,12 @@ agent-session activity doctor --agent codex --format json
 agent-session activity setup --agent codex --remove
 ```
 
-The same commands support `claude` and `hermes`. Setup merges exact
-agent-session-owned handlers into existing provider configuration, repeated
-apply/repair is idempotent, and removal preserves unrelated hooks. Provider
-setup also refuses an observed concurrent config change. For Codex, setup adds
+Ordinary `--dry-run`, `--apply`, `--repair`, and `--remove` also support
+`claude` and `hermes`; the combined `--repair --dry-run` reviewed-plan workflow
+is Codex-only and rejects other providers. Setup merges exact agent-session-owned
+handlers into existing provider configuration, repeated apply/repair is
+idempotent, and removal preserves unrelated hooks. Provider setup also refuses
+an observed concurrent config change. For Codex, setup adds
 the official `agent-turn-complete` notify argv to `~/.codex/config.toml` when
 `notify` is absent, recognizes exact ownership idempotently, or wraps a safe
 user-owned singular argv in an agent-session-owned fan-out. The fan-out invokes
