@@ -86,15 +86,21 @@ pub(crate) struct ProviderPromptTail {
 impl ProviderPromptTail {
     pub(crate) fn open(record: &SessionRecord) -> Option<Self> {
         let source = resolve_provider_prompt_source(record)?;
-        Self::open_source(source, CLAUDE_FALLBACK_DELAY).ok()
+        Self::open_source(source, CLAUDE_FALLBACK_DELAY, true).ok()
+    }
+
+    pub(crate) fn open_new_runtime(record: &SessionRecord) -> Option<Self> {
+        let source = resolve_provider_prompt_source(record)?;
+        Self::open_source(source, CLAUDE_FALLBACK_DELAY, false).ok()
     }
 
     fn open_source(
         source: ProviderPromptSource,
         claude_fallback_delay: Duration,
+        baseline_at_eof: bool,
     ) -> io::Result<Self> {
         let (mut file, metadata) = open_regular_file(&source.path)?;
-        let offset = metadata.len();
+        let offset = if baseline_at_eof { metadata.len() } else { 0 };
         Ok(Self {
             source,
             identity: file_identity(&metadata),
@@ -122,6 +128,7 @@ impl ProviderPromptTail {
                 path,
             },
             claude_fallback_delay,
+            true,
         )
     }
 

@@ -49,7 +49,8 @@ use crate::provider_prompt::{
 };
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
-    glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
+    glance_session, list_sessions, load_session_record,
+    load_session_record_with_provider_resume_backfill, non_empty_env, repo_remote_url_from_cwd,
     resolve_tmux_bin, resume_session_by_id, search_workdirs, send_input, session_clipboard_buffer,
     session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
     update_session_title, write_session_attachment,
@@ -75,6 +76,7 @@ const ATTACH_TERMINAL_BURST: usize = 32;
 const ATTACH_HANDOFF_BUFFER_CAPACITY: usize = ATTACH_BROADCAST_CAPACITY;
 const ATTACH_HANDOFF_MAX_RECAPTURES: usize = 1;
 const PROVIDER_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
@@ -2137,10 +2139,14 @@ async fn attach_socket(
                     break;
                 }
 
-                if provider_refresh_pending {
+                if provider_refresh_pending && prompt_tail.is_none() {
                     provider_refresh_pending = false;
-                    provider_open_task = Some(open_provider_prompt_task(record.clone()));
+                    provider_open_task = Some(open_provider_prompt_task(
+                        state.context.clone(),
+                        record.clone(),
+                    ));
                 } else if let Some(tail) = prompt_tail {
+                    provider_refresh_pending = false;
                     provider_prompt_task = Some(AbortOnDropTask::new(tokio::spawn(
                         provider_prompt_loop(tail, control_tx.clone()),
                     )));
@@ -2160,7 +2166,10 @@ async fn attach_socket(
                                 // transcript scans for repeated subscriptions.
                                 provider_refresh_pending = true;
                             } else {
-                                provider_open_task = Some(open_provider_prompt_task(record.clone()));
+                                provider_open_task = Some(open_provider_prompt_task(
+                                    state.context.clone(),
+                                    record.clone(),
+                                ));
                             }
                             continue;
                         }
@@ -2200,12 +2209,87 @@ async fn attach_socket(
 }
 
 fn open_provider_prompt_task(
+    context: CliContext,
     record: crate::SessionRecord,
 ) -> AbortOnDropTask<(crate::SessionRecord, Option<ProviderPromptTail>)> {
-    AbortOnDropTask::new(tokio::task::spawn_blocking(move || {
-        let tail = ProviderPromptTail::open(&record);
-        (record, tail)
-    }))
+    AbortOnDropTask::new(tokio::spawn(resolve_provider_prompt_tail(context, record)))
+}
+
+async fn resolve_provider_prompt_tail(
+    context: CliContext,
+    record: crate::SessionRecord,
+) -> (crate::SessionRecord, Option<ProviderPromptTail>) {
+    let pending_fresh_runtime = provider_prompt_pending_fresh_runtime(&record);
+    let initial = record.clone();
+    let opened = tokio::task::spawn_blocking(move || ProviderPromptTail::open(&initial))
+        .await
+        .ok()
+        .flatten();
+    if opened.is_some() || !pending_fresh_runtime {
+        return (record, opened);
+    }
+
+    let started = Instant::now();
+    let mut current = record;
+    while started.elapsed() < PROVIDER_PROMPT_PENDING_TIMEOUT {
+        tokio::time::sleep(PROVIDER_PROMPT_POLL_INTERVAL).await;
+        let load_context = context.clone();
+        let id = current.id.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            load_session_record_with_provider_resume_backfill(&load_context, &id)
+        })
+        .await;
+        let Ok(Ok(updated)) = loaded else {
+            continue;
+        };
+        if !same_provider_prompt_runtime(&current, &updated) {
+            return (updated, None);
+        }
+        current = updated;
+        let candidate = current.clone();
+        let tail =
+            tokio::task::spawn_blocking(move || ProviderPromptTail::open_new_runtime(&candidate))
+                .await
+                .ok()
+                .flatten();
+        if tail.is_some() {
+            return (current, tail);
+        }
+    }
+    (current, None)
+}
+
+fn provider_prompt_pending_fresh_runtime(record: &crate::SessionRecord) -> bool {
+    if record
+        .runtime
+        .as_ref()
+        .is_none_or(|runtime| runtime.generation != 1)
+    {
+        return false;
+    }
+    match AgentKind::from_name(&record.agent) {
+        Some(AgentKind::Codex) => record.provider_resume.is_none(),
+        Some(AgentKind::Claude) => record.provider_resume.as_ref().is_some_and(|resume| {
+            resume.provider == "claude"
+                && resume.capture_method == "claude-explicit-session-id"
+                && !resume.session_id.trim().is_empty()
+        }),
+        Some(AgentKind::Hermes) | None => false,
+    }
+}
+
+fn same_provider_prompt_runtime(
+    expected: &crate::SessionRecord,
+    current: &crate::SessionRecord,
+) -> bool {
+    match (&expected.runtime, &current.runtime) {
+        (Some(expected), Some(current)) => {
+            expected.generation == current.generation
+                && expected.launch_id == current.launch_id
+                && expected.tmux_session == current.tmux_session
+        }
+        _ => false,
+    }
 }
 
 async fn finish_outbound_writer(mut writer_task: AbortOnDropTask<AttachWriterExit>, drain: bool) {
@@ -2834,6 +2918,203 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_subscription_recovers_fresh_codex_identity_and_first_prompt() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let codex_home = tmp.path().join("codex-home");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let created_at = seed_fresh_provider_session(
+            &state_dir,
+            "ws-codex-pending",
+            "codex",
+            "hs-codex-pending",
+            &cwd,
+            None,
+        );
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let tmux = minimal_tmux(tmp.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("address");
+        let server_state_dir = state_dir.clone();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(state(&server_state_dir, Some(TOKEN), tmux)),
+            )
+            .await;
+        });
+
+        let mut request = format!("ws://{addr}/sessions/ws-codex-pending/attach")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().expect("authorization"),
+        );
+        let (mut socket, _) = connect_async(request).await.expect("connect");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("snapshot timeout")
+                .expect("snapshot frame")
+                .expect("snapshot message"),
+            ClientMessage::Binary(_)
+        ));
+        socket
+            .send(ClientMessage::Text(
+                json!({"subscribe":[PROVIDER_PROMPT_CAPABILITY]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("subscribe before identity");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let transcript = codex_home.join("sessions/2026/07/pending.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp":created_at,
+                    "type":"session_meta",
+                    "payload":{
+                        "id":"fresh-codex-id",
+                        "session_id":"fresh-codex-id",
+                        "cwd":cwd.to_string_lossy(),
+                        "source":"cli",
+                        "timestamp":created_at
+                    }
+                }),
+                json!({
+                    "timestamp":created_at,
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":"fresh codex first prompt"}
+                })
+            ),
+        )
+        .expect("fresh transcript");
+
+        assert_supported_provider_prompt(&mut socket, "codex").await;
+        assert_provider_prompt(&mut socket, "codex", "fresh codex first prompt").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), socket.next())
+                .await
+                .is_err(),
+            "fresh first prompt must be emitted exactly once"
+        );
+        let _ = socket.close(None).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_subscription_recovers_fresh_claude_transcript_and_first_prompt() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let claude_config = tmp.path().join("claude-config");
+        let cwd = tmp.path().join("repo");
+        let provider_session_id = "fresh-claude-id";
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let created_at = seed_fresh_provider_session(
+            &state_dir,
+            "ws-claude-pending",
+            "claude",
+            "hs-claude-pending",
+            &cwd,
+            Some((provider_session_id, "claude-explicit-session-id")),
+        );
+        let _claude_config =
+            EnvGuard::set(&lock, "CLAUDE_CONFIG_DIR", claude_config.to_str().unwrap());
+        let tmux = minimal_tmux(tmp.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("address");
+        let server_state_dir = state_dir.clone();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(state(&server_state_dir, Some(TOKEN), tmux)),
+            )
+            .await;
+        });
+
+        let mut request = format!("ws://{addr}/sessions/ws-claude-pending/attach")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().expect("authorization"),
+        );
+        let (mut socket, _) = connect_async(request).await.expect("connect");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("snapshot timeout")
+                .expect("snapshot frame")
+                .expect("snapshot message"),
+            ClientMessage::Binary(_)
+        ));
+        socket
+            .send(ClientMessage::Text(
+                json!({"subscribe":[PROVIDER_PROMPT_CAPABILITY]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("subscribe before transcript");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let transcript = claude_config
+            .join("projects/-pending")
+            .join(format!("{provider_session_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type":"user",
+                    "uuid":"claude-turn-1",
+                    "sessionId":provider_session_id,
+                    "cwd":cwd.to_string_lossy(),
+                    "timestamp":created_at,
+                    "message":{"role":"user","content":"fresh claude first prompt"}
+                }),
+                json!({
+                    "type":"last-prompt",
+                    "sessionId":provider_session_id,
+                    "leafUuid":"claude-turn-1",
+                    "timestamp":created_at,
+                    "lastPrompt":"fresh claude first prompt"
+                })
+            ),
+        )
+        .expect("fresh transcript");
+
+        assert_supported_provider_prompt(&mut socket, "claude").await;
+        assert_provider_prompt(&mut socket, "claude", "fresh claude first prompt").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), socket.next())
+                .await
+                .is_err(),
+            "fresh first prompt must be emitted exactly once"
+        );
+        let _ = socket.close(None).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_unsubscribed_client_gets_binary_only_and_unsupported_ack() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let state_dir = tmp.path().join("state");
@@ -3159,6 +3440,98 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    fn seed_fresh_provider_session(
+        state_dir: &Path,
+        id: &str,
+        agent: &str,
+        tmux_session: &str,
+        cwd: &Path,
+        provider_resume: Option<(&str, &str)>,
+    ) -> String {
+        let created_at = jiff::Timestamp::now().to_string();
+        let dir = state_dir.join("sessions").join(id);
+        std::fs::create_dir_all(&dir).expect("session dir");
+        let mut record = json!({
+            "schema_version":"agent-session.session.v1",
+            "id":id,
+            "agent":agent,
+            "mode":"interactive",
+            "title":null,
+            "cwd":cwd.to_string_lossy(),
+            "tmux_session":tmux_session,
+            "prompt_file":null,
+            "log_file":null,
+            "created_at":created_at,
+            "updated_at":created_at,
+            "runtime":{
+                "kind":"tmux",
+                "tmux_session":tmux_session,
+                "generation":1,
+                "started_at":created_at,
+                "launch_id":format!("launch-{id}")
+            },
+            "agent_args":[]
+        });
+        if let Some((session_id, capture_method)) = provider_resume {
+            record["provider_resume"] = json!({
+                "provider":agent,
+                "session_id":session_id,
+                "captured_at":created_at,
+                "capture_method":capture_method,
+                "resume_args":[]
+            });
+        }
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_vec_pretty(&record).expect("session json"),
+        )
+        .expect("session record");
+        created_at
+    }
+
+    async fn assert_supported_provider_prompt(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        provider: &str,
+    ) {
+        let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
+            .await
+            .expect("capability timeout")
+            .expect("capability frame")
+            .expect("capability message");
+        let ClientMessage::Text(frame) = frame else {
+            panic!("capability must be a text frame");
+        };
+        let frame: Value = serde_json::from_str(frame.as_str()).expect("capability json");
+        assert_eq!(frame["type"], "capability");
+        assert_eq!(frame["capability"], PROVIDER_PROMPT_CAPABILITY);
+        assert_eq!(frame["supported"], true);
+        assert_eq!(frame["provider"], provider);
+    }
+
+    async fn assert_provider_prompt(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        provider: &str,
+        prompt: &str,
+    ) {
+        let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
+            .await
+            .expect("prompt timeout")
+            .expect("prompt frame")
+            .expect("prompt message");
+        let ClientMessage::Text(frame) = frame else {
+            panic!("prompt must be a text frame");
+        };
+        let frame: Value = serde_json::from_str(frame.as_str()).expect("prompt json");
+        assert_eq!(frame["type"], "prompt_submitted");
+        assert_eq!(frame["provider"], provider);
+        assert_eq!(frame["text"], prompt);
+        assert!(frame["event_id"].is_string());
     }
 
     fn add_provider_resume_extra(state_dir: &Path, id: &str) {
