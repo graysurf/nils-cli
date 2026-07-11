@@ -2,12 +2,14 @@ use nils_common::cli_contract::exit;
 use nils_common::diag_output;
 use nils_common::env as shared_env;
 use nils_common::process;
+use nils_common::provider_usage::{ProviderUsageReason, classify_message, prefer_reason};
 use nils_common::shell::{AnsiStripMode, quote_posix_single, strip_ansi};
 use nils_common::usage_time::reset_epoch_seconds_from_str;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::ffi::OsString;
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -24,6 +26,15 @@ const DEFAULT_PTY_USAGE_DELAY_MS: u64 = 3_000;
 const CLI_USAGE_STDIN: &[u8] = b"/usage\n/exit\n";
 const CLI_USAGE_PTY_USAGE_STDIN: &[u8] = b"/usage\r";
 const CLI_USAGE_PTY_EXIT_STDIN: &[u8] = b"/exit\r";
+// Provider access/billing failures are usually persistent operator actions, not
+// momentary transport errors. Keep them discoverable for a work session while a
+// newer successful assistant event in the same transcript still clears that
+// diagnosis immediately.
+const API_ERROR_TRANSCRIPT_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+const API_ERROR_TRANSCRIPT_MAX_FILES: usize = 32;
+const API_ERROR_TRANSCRIPT_MAX_ENTRIES: usize = 4_096;
+const API_ERROR_TRANSCRIPT_MAX_DEPTH: usize = 4;
+const API_ERROR_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct UsageOptions {
@@ -53,6 +64,8 @@ struct UsageResult {
     plan: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<ProviderUsageReason>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,33 +111,43 @@ fn resolve_usage(source: UsageSource) -> UsageResult {
     let cache_file = cache::cache_file();
     match source {
         UsageSource::Auto => {
-            if let Some(result) = try_oauth(cache_file.as_ref()) {
-                return result;
-            }
-            if let Some(result) = try_claude_cli(cache_file.as_ref()) {
-                return result;
-            }
+            let oauth_reason = match try_oauth(cache_file.as_ref()) {
+                Ok(result) => return result,
+                Err(reason) => reason,
+            };
+            let cli_reason = match try_claude_cli(cache_file.as_ref()) {
+                Ok(result) => return result,
+                Err(reason) => reason,
+            };
+            let reason = recent_api_error_reason()
+                .map(|transcript_reason| {
+                    prefer_reason(prefer_reason(oauth_reason, cli_reason), transcript_reason)
+                })
+                .unwrap_or_else(|| prefer_reason(oauth_reason, cli_reason));
             read_cache(cache_file.as_ref())
-                .unwrap_or_else(|| empty_result(cache_file, "usage unavailable"))
+                .map(|result| result_with_reason(result, reason))
+                .unwrap_or_else(|| empty_result(cache_file, "usage unavailable", reason))
         }
         UsageSource::Oauth => try_oauth(cache_file.as_ref())
-            .unwrap_or_else(|| empty_result(cache_file, "oauth usage unavailable")),
-        UsageSource::Cli => try_claude_cli(cache_file.as_ref())
-            .unwrap_or_else(|| empty_result(cache_file, "claude cli usage unavailable")),
-        UsageSource::Cache => read_cache(cache_file.as_ref())
-            .unwrap_or_else(|| empty_result(cache_file, "cache missing")),
+            .unwrap_or_else(|reason| empty_result(cache_file, "oauth usage unavailable", reason)),
+        UsageSource::Cli => try_claude_cli(cache_file.as_ref()).unwrap_or_else(|reason| {
+            empty_result(cache_file, "claude cli usage unavailable", reason)
+        }),
+        UsageSource::Cache => read_cache(cache_file.as_ref()).unwrap_or_else(|| {
+            empty_result(cache_file, "cache missing", ProviderUsageReason::Unknown)
+        }),
     }
 }
 
-fn try_oauth(cache_file: Option<&PathBuf>) -> Option<UsageResult> {
-    let token = auth::resolve_access_token()?;
-    let body = client::fetch_usage(&token.value).ok()?;
-    let value: Value = serde_json::from_str(&body).ok()?;
-    let usage = render::parse_usage_value(&value)?;
+fn try_oauth(cache_file: Option<&PathBuf>) -> Result<UsageResult, ProviderUsageReason> {
+    let token = auth::resolve_access_token().ok_or(ProviderUsageReason::AuthRequired)?;
+    let body = client::fetch_usage(&token.value).map_err(|error| error.reason())?;
+    let value: Value = serde_json::from_str(&body).map_err(|_| ProviderUsageReason::Unknown)?;
+    let usage = render::parse_usage_value(&value).ok_or(ProviderUsageReason::Unknown)?;
     if let Some(cache_file) = cache_file {
         let _ = cache::write_cache_file(cache_file, &body);
     }
-    Some(result_from_usage(
+    Ok(result_from_usage(
         "oauth",
         false,
         cache_file,
@@ -134,14 +157,14 @@ fn try_oauth(cache_file: Option<&PathBuf>) -> Option<UsageResult> {
     ))
 }
 
-fn try_claude_cli(cache_file: Option<&PathBuf>) -> Option<UsageResult> {
-    let body = probe_claude_cli_usage().ok()?;
-    let usage = parse_cli_usage_output(&body)?;
-    let cache_body = usage_cache_body(&usage).ok()?;
+fn try_claude_cli(cache_file: Option<&PathBuf>) -> Result<UsageResult, ProviderUsageReason> {
+    let body = probe_claude_cli_usage().map_err(|error| classify_message(&error.to_string()))?;
+    let usage = parse_cli_usage_output(&body).ok_or_else(|| classify_message(&body))?;
+    let cache_body = usage_cache_body(&usage).map_err(|_| ProviderUsageReason::Unknown)?;
     if let Some(cache_file) = cache_file {
         let _ = cache::write_cache_file(cache_file, &cache_body);
     }
-    Some(result_from_usage(
+    Ok(result_from_usage(
         "cli",
         false,
         cache_file,
@@ -166,7 +189,11 @@ fn read_cache(cache_file: Option<&PathBuf>) -> Option<UsageResult> {
     ))
 }
 
-fn empty_result(cache_file: Option<PathBuf>, note: &str) -> UsageResult {
+fn empty_result(
+    cache_file: Option<PathBuf>,
+    note: &str,
+    reason: ProviderUsageReason,
+) -> UsageResult {
     UsageResult {
         provider: "claude".to_string(),
         source: "none".to_string(),
@@ -176,7 +203,126 @@ fn empty_result(cache_file: Option<PathBuf>, note: &str) -> UsageResult {
         windows: Vec::new(),
         plan: None,
         note: Some(note.to_string()),
+        reason_code: Some(reason),
     }
+}
+
+fn result_with_reason(mut result: UsageResult, reason: ProviderUsageReason) -> UsageResult {
+    result.reason_code = Some(reason);
+    result
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecentAssistantEvent {
+    Error(ProviderUsageReason),
+    Success,
+}
+
+fn recent_api_error_reason() -> Option<ProviderUsageReason> {
+    let config_dir = shared_env::env_non_empty("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".claude"))
+        })?;
+    let projects = config_dir.join("projects");
+    for path in recent_transcript_files(&projects) {
+        match last_assistant_event(&path) {
+            Some(RecentAssistantEvent::Error(reason)) => return Some(reason),
+            Some(RecentAssistantEvent::Success) | None => {}
+        }
+    }
+    None
+}
+
+fn recent_transcript_files(projects: &Path) -> Vec<PathBuf> {
+    let mut pending = vec![(projects.to_path_buf(), 0usize)];
+    let mut files = Vec::new();
+    let mut entries_seen = 0usize;
+    let now = SystemTime::now();
+
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            entries_seen += 1;
+            if entries_seen > API_ERROR_TRANSCRIPT_MAX_ENTRIES {
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() && depth < API_ERROR_TRANSCRIPT_MAX_DEPTH {
+                pending.push((entry.path(), depth + 1));
+                continue;
+            }
+            if !file_type.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if now.duration_since(modified).unwrap_or_default() > API_ERROR_TRANSCRIPT_MAX_AGE {
+                continue;
+            }
+            files.push((modified, entry.path()));
+        }
+        if entries_seen > API_ERROR_TRANSCRIPT_MAX_ENTRIES {
+            break;
+        }
+    }
+
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    files
+        .into_iter()
+        .take(API_ERROR_TRANSCRIPT_MAX_FILES)
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn last_assistant_event(path: &Path) -> Option<RecentAssistantEvent> {
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(API_ERROR_TRANSCRIPT_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw).ok()?;
+    let raw = if start == 0 {
+        raw.as_str()
+    } else {
+        raw.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
+    };
+
+    for line in raw.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if value.get("isApiErrorMessage").and_then(Value::as_bool) != Some(true) {
+            return Some(RecentAssistantEvent::Success);
+        }
+        let reason = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|content| content.get("text").and_then(Value::as_str))
+            .map(classify_message)
+            .find(|reason| *reason != ProviderUsageReason::Unknown)
+            .unwrap_or(ProviderUsageReason::Unknown);
+        return Some(RecentAssistantEvent::Error(reason));
+    }
+    None
 }
 
 fn result_from_usage(
@@ -204,6 +350,7 @@ fn result_from_usage(
         windows,
         plan: None,
         note,
+        reason_code: None,
     }
 }
 

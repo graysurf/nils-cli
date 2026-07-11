@@ -135,6 +135,11 @@ is no second state model.
   partial success, preserve reset timestamps as `reset_at_epoch` epoch seconds
   plus textual `reset_at` when supplied by the helper, and redact tokens, local
   auth paths, and private account identifiers from scoped error messages.
+  Failed providers may include the additive provider-neutral `reason_code`
+  contract (`auth_required`, `auth_expired`, `billing_past_due`,
+  `subscription_inactive`, `organization_disabled`, `permission_denied`,
+  `rate_limited`, `service_unavailable`, `timeout`, or `unknown`) copied only
+  from the helpers' allowlisted structured field.
 - `GET /workdirs?q=...&limit=N` — authenticated read; searches only the default operator roots (`$HOME/Project` and
   `$HOME/.config`) with bounded depth, count, and elapsed-time limits. Add `git_only=true&exclude_worktrees=true` for
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage

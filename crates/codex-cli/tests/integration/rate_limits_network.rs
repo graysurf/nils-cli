@@ -408,8 +408,9 @@ fn rate_limits_single_401_does_not_refresh_auth_by_default() {
 
     let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
     assert_eq!(payload["error"]["code"], "request-failed");
+    assert_eq!(payload["error"]["details"]["reason_code"], "auth_expired");
     assert!(
-        payload["error"]["message"]
+        !payload["error"]["message"]
             .as_str()
             .unwrap_or("")
             .contains("HTTP 401")
@@ -720,7 +721,7 @@ fn rate_limits_async_falls_back_to_cache_in_debug_mode() {
     assert!(stdout(&output).contains("🚦 Codex rate limits for all accounts"));
     assert!(stdout(&output).contains("+00:00"));
     assert!(stderr(&output).contains("falling back to cache"));
-    assert!(stderr(&output).contains("missing access_token"));
+    assert!(stderr(&output).contains("auth_required"));
 }
 
 #[test]

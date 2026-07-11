@@ -73,6 +73,12 @@ tokens or credential material. The result includes `provider: "claude"` and a
 `windows` array containing 5h and weekly windows when available, each with
 used/remaining percentages and optional reset timestamps. CLI-derived usage is
 normalized back into the same cache shape used by `prompt-segment`.
+When live usage is unavailable, the result may include additive `reason_code`
+with one of the shared provider-neutral values: `auth_required`, `auth_expired`,
+`billing_past_due`, `subscription_inactive`, `organization_disabled`,
+`permission_denied`, `rate_limited`, `service_unavailable`, `timeout`, or
+`unknown`. Provider response bodies and terminal error text are classified
+locally and are never copied into the JSON envelope.
 
 ### completion
 

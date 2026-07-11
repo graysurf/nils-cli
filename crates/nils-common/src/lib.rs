@@ -32,6 +32,7 @@ pub mod markdown;
 pub mod process;
 pub mod provider_payload;
 pub mod provider_runtime;
+pub mod provider_usage;
 pub mod rate_limits_ansi;
 pub mod redact;
 pub mod shell;

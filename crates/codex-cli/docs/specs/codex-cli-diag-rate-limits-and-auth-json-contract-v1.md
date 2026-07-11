@@ -117,6 +117,15 @@ Informational (do not hard-depend for schema validation):
 - Optional additive metadata (`source`, timestamps, debugging hints)
 - Human-display-oriented strings inside `error.details`
 
+Provider usage failures may carry additive `reason_code` on a per-account
+`result`. Command-level errors carry the same value under
+`error.details.reason_code`. The stable vocabulary shared with Claude usage is:
+`auth_required`, `auth_expired`, `billing_past_due`,
+`subscription_inactive`, `organization_disabled`, `permission_denied`,
+`rate_limited`, `service_unavailable`, `timeout`, and `unknown`. The helper
+classifies provider responses locally and does not include raw failure bodies in
+the error message.
+
 ## Compatibility Rules (v1)
 
 - Additive fields are allowed within `codex-cli.diag.rate-limits.v1`, `codex-cli.auth.v1`,
@@ -212,11 +221,13 @@ Informational (do not hard-depend for schema validation):
       "name": "beta",
       "target_file": "beta.json",
       "status": "error",
+      "reason_code": "auth_required",
       "error": {
         "code": "missing-access-token",
         "message": "missing access_token in beta.json",
         "details": {
-          "target_file": "beta.json"
+          "target_file": "beta.json",
+          "reason_code": "auth_required"
         }
       }
     }
