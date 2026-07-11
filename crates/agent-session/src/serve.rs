@@ -78,6 +78,7 @@ const PROVIDER_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PROVIDER_PROMPT_PENDING_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES: usize = 64;
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
@@ -1551,6 +1552,12 @@ impl ProviderPromptDiscoveryRegistry {
         let slot = {
             let mut entries = self.entries.lock().await;
             entries.retain(|existing, _| existing.session_id != key.session_id || existing == &key);
+            if !entries.contains_key(&key)
+                && entries.len() >= PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES
+                && let Some(evicted) = entries.keys().find(|existing| *existing != &key).cloned()
+            {
+                entries.remove(&evicted);
+            }
             entries
                 .entry(key.clone())
                 .or_insert_with(|| {
@@ -3120,6 +3127,21 @@ mod tests {
 
         registry.evict_session("discovery-lifecycle").await;
         assert_eq!(registry.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_prompt_discovery_bounds_distinct_session_churn() {
+        let registry = ProviderPromptDiscoveryRegistry::with_resolver(|_| None);
+        for index in 0..(PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES + 10) {
+            let id = format!("discovery-churn-{index}");
+            let record =
+                provider_discovery_record(&id, &format!("hs-{id}"), &format!("launch-{index}"), 1);
+            assert!(registry.resolve_source(&record).await.is_none());
+        }
+        assert_eq!(
+            registry.entry_count().await,
+            PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
