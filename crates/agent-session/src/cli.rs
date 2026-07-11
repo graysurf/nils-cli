@@ -386,6 +386,16 @@ pub struct ActivitySetupArgs {
     #[arg(long, conflicts_with_all = ["apply", "remove"])]
     pub repair: bool,
 
+    /// Digest returned by the reviewed Codex repair preview. Required when
+    /// applying Codex repair and rejected if either planned file changed.
+    #[arg(
+        long,
+        value_name = "SHA256",
+        requires = "repair",
+        conflicts_with = "dry_run"
+    )]
+    pub expected_preview_digest: Option<String>,
+
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,

@@ -942,6 +942,47 @@ fn codex_activity_repair_preview_reports_safe_nonreversible_notifier_by_hash() {
     }
     assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
     assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+    let preview_digest = result["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+
+    let repair = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &preview_digest,
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(repair.code, 0);
+    assert_eq!(
+        repair.stdout_json()["error"]["code"],
+        "provider-notification-config-conflict"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
+fn codex_activity_repair_requires_a_preview_digest() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(&hooks_path, r#"{"keep":"reviewed-marker-A"}"#).expect("hooks config");
+    fs::write(&notify_path, "notify = [\"user-notifier\", \"--keep\"]\n").expect("notify config");
+    let hooks_before = fs::read(&hooks_path).expect("hooks before");
+    let notify_before = fs::read(&notify_path).expect("notify before");
+    let home_arg = home.to_string_lossy().to_string();
 
     let repair = run(
         tmp.path(),
@@ -953,10 +994,172 @@ fn codex_activity_repair_preview_reports_safe_nonreversible_notifier_by_hash() {
     assert_ne!(repair.code, 0);
     assert_eq!(
         repair.stdout_json()["error"]["code"],
-        "provider-notification-config-conflict"
+        "provider-config-preview-digest-required"
     );
     assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
     assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
+fn codex_activity_repair_rejects_stale_preview_digest_without_writes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(&hooks_path, r#"{"keep":"reviewed-marker-A"}"#).expect("hooks config");
+    fs::write(&notify_path, "notify = [\"user-notifier\", \"--keep\"]\n").expect("notify config");
+    let home_arg = home.to_string_lossy().to_string();
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let reviewed_digest = data(&preview.stdout_json())["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+
+    fs::write(&hooks_path, r#"{"keep":"unreviewed-marker-B"}"#).expect("changed hooks");
+    let hooks_changed = fs::read(&hooks_path).expect("changed hooks bytes");
+    let notify_unchanged = fs::read(&notify_path).expect("unchanged notify bytes");
+    let repair = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &reviewed_digest,
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(repair.code, 0);
+    assert_eq!(
+        repair.stdout_json()["error"]["code"],
+        "provider-config-preview-digest-mismatch"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_changed);
+    assert_eq!(
+        fs::read(&notify_path).expect("notify after"),
+        notify_unchanged
+    );
+    for forbidden in ["reviewed-marker-A", "unreviewed-marker-B", "user-notifier"] {
+        assert!(!repair.stdout_text().contains(forbidden));
+        assert!(!repair.stderr_text().contains(forbidden));
+    }
+
+    let hooks_reviewed_preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    let hooks_reviewed_digest = data(&hooks_reviewed_preview.stdout_json())["preview_digest"]
+        .as_str()
+        .expect("hooks-reviewed preview digest")
+        .to_string();
+    assert_ne!(hooks_reviewed_digest, reviewed_digest);
+
+    fs::write(
+        &notify_path,
+        "notify = [\"replacement-notifier\", \"--other\"]\n",
+    )
+    .expect("changed notification config");
+    let hooks_unchanged = fs::read(&hooks_path).expect("unchanged hooks bytes");
+    let notify_changed = fs::read(&notify_path).expect("changed notification bytes");
+    let stale_notification_repair = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &hooks_reviewed_digest,
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(stale_notification_repair.code, 0);
+    assert_eq!(
+        stale_notification_repair.stdout_json()["error"]["code"],
+        "provider-config-preview-digest-mismatch"
+    );
+    assert_eq!(
+        fs::read(&hooks_path).expect("hooks after notification race"),
+        hooks_unchanged
+    );
+    assert_eq!(
+        fs::read(&notify_path).expect("notification after race"),
+        notify_changed
+    );
+    for forbidden in ["unreviewed-marker-B", "replacement-notifier", "--other"] {
+        assert!(!stale_notification_repair.stdout_text().contains(forbidden));
+        assert!(!stale_notification_repair.stderr_text().contains(forbidden));
+    }
+
+    let current_preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    let current_digest = data(&current_preview.stdout_json())["preview_digest"]
+        .as_str()
+        .expect("current preview digest")
+        .to_string();
+    assert_ne!(current_digest, hooks_reviewed_digest);
+    let applied = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &current_digest,
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    assert_eq!(data(&applied.stdout_json())["configured"], true);
 }
 
 #[test]

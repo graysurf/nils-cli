@@ -27,6 +27,7 @@ agent-session activity status <id> --format json
 agent-session activity doctor --format json
 agent-session activity setup --agent codex --dry-run
 agent-session activity setup --agent codex --repair --dry-run
+agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
 printf '%s' "$AGENT_SESSION_TOKEN" | agent-session serve --bind 127.0.0.1:8781 --token-stdin
 agent-session command <id>
 agent-session attach <id>
@@ -66,6 +67,7 @@ after reviewing the provider trust/consent boundary:
 ```bash
 agent-session activity setup --agent codex --dry-run
 agent-session activity setup --agent codex --repair --dry-run
+agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
 agent-session activity setup --agent codex --apply
 agent-session activity doctor --agent codex --format json
 agent-session activity setup --agent codex --remove
@@ -91,7 +93,10 @@ restored. Unsafe, oversized,
 non-string, recursive, or non-reversible values are preserved and reported as
 conflicts. Both Codex files are parsed and planned before either is
 written; if the guarded second write fails, the first write is restored or a
-loud rollback error identifies the partial state. That provider-authored
+loud rollback error identifies the partial state. The repair preview returns a
+content-free plan digest over the current and proposed
+bytes of both Codex files. Applying repair requires that exact digest and fails
+before either write if either file changed after review. That provider-authored
 notification must match the exact open runtime/thread/turn and is the
 authoritative completion input. Raw Codex
 `Stop` remains non-final observation. Hook/notification failure is fail-open and

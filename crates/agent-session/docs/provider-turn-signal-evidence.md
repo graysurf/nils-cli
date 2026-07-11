@@ -116,8 +116,10 @@ are never persisted. A matching post response therefore clears the distinct
 pending approval with observed confidence only when `choice` is one of the
 documented response values; missing or unknown choices fail open without
 clearing. Hermes still exposes no provider request id: two concurrent approvals
-with identical matching metadata are
-indistinguishable and intentionally share one conservative correlation.
+with identical matching metadata are indistinguishable. Each observed pre
+callback therefore increments conservative multiplicity; one matching post
+clears the addressable correlation but leaves the ambiguous remainder latched
+until authoritative completion, a new turn, or a runtime boundary.
 
 ## Concurrency, continuation, and privacy probes
 
@@ -152,7 +154,10 @@ The executable fixtures cover:
 - `--repair --dry-run` emits a content-free Codex notification preview. Safe
   foreign argv that cannot satisfy byte-exact removal is identified only by
   argument count and SHA-256 of compact JSON plus one LF; apply remains blocked
-  and both config files remain byte-identical.
+  and both config files remain byte-identical. The preview also emits a plan
+  digest over the exact current and proposed bytes of both Codex files; repair
+  requires the same digest and rejects missing or stale review evidence before
+  either write.
 
 The live release probe uses a no-content marker turn for each installed provider
 after the released binary is installed. Retained evidence records only provider
@@ -191,7 +196,10 @@ For repair review, `activity setup --agent codex --repair --dry-run` keeps both
 files untouched and reports current/candidate mode, exact-reversal status,
 argument count, and a compact-JSON-plus-LF SHA-256 without exposing argv. A
 non-reversible serialization remains blocked; the preview does not authorize or
-perform normalization.
+perform normalization. The preview's separate plan digest binds the exact
+current and candidate bytes for both files. Applying repair requires it via
+`--expected-preview-digest`; any missing, malformed, or stale digest fails
+before mutation.
 Apply/repair/remove parse and plan both files before either mutation; a guarded
 second-write failure restores the first write, while a rollback race surfaces an
 explicit error naming both metadata-only paths.

@@ -153,7 +153,10 @@ the runtime-scoped opaque identifier boundary. A matching response emits
 observed `attention_cleared` only for a documented response choice; raw
 command/description never enters activity storage. Distinct tuples clear
 independently. Concurrent requests with identical tuples are indistinguishable
-and share one conservative pending correlation.
+so each observed pre callback increases conservative pending multiplicity. A
+matching response clears the addressable correlation but cannot prove that the
+ambiguous remainder was answered; completion, a new turn, or a runtime boundary
+clears that remainder.
 
 Revision is monotonic for each accepted non-duplicate event and runtime
 boundary. Phase timestamps change only when the phase changes. Durations are
@@ -233,6 +236,7 @@ agent-session activity setup --agent <provider> --dry-run
 agent-session activity setup --agent <provider> --apply
 agent-session activity setup --agent <provider> --repair
 agent-session activity setup --agent codex --repair --dry-run
+agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
 agent-session activity setup --agent <provider> --remove
 agent-session activity doctor [--agent <provider>] --format json
 ```
@@ -274,9 +278,12 @@ deterministically across sessions.
 Codex repair preview (`--repair --dry-run`) is non-destructive even when a safe
 foreign notifier cannot pass byte-exact reversal. It reports only the
 current/candidate mode, argument count, reversibility, a blocker code, and
-SHA-256 of compact JSON argv plus one LF. It never emits argv values. A blocked
-preview does not weaken repair: `--repair` still fails closed and preserves both
-files exactly.
+SHA-256 of compact JSON argv plus one LF. It also returns a separate content-free
+plan digest that binds the presence and exact current/proposed bytes of both
+`hooks.json` and `config.toml`. It never emits argv or configuration values.
+Codex `--repair` requires that digest through `--expected-preview-digest` and
+recomputes it before either write. Missing, malformed, or stale digests fail
+closed; a blocked preview does not weaken repair, and both files remain exact.
 
 Setup JSON distinguishes current and prospective state: `configured` and
 `changed` describe the file after the command, while `would_configure` and
