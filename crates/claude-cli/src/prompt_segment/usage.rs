@@ -230,7 +230,8 @@ fn recent_api_error_reason() -> Option<ProviderUsageReason> {
     for path in recent_transcript_files(&projects) {
         match last_assistant_event(&path) {
             Some(RecentAssistantEvent::Error(reason)) => return Some(reason),
-            Some(RecentAssistantEvent::Success) | None => {}
+            Some(RecentAssistantEvent::Success) => return None,
+            None => {}
         }
     }
     None
@@ -292,13 +293,17 @@ fn last_assistant_event(path: &Path) -> Option<RecentAssistantEvent> {
     let length = file.metadata().ok()?.len();
     let start = length.saturating_sub(API_ERROR_TRANSCRIPT_TAIL_BYTES);
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut raw = String::new();
-    file.read_to_string(&mut raw).ok()?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw).ok()?;
     let raw = if start == 0 {
-        raw.as_str()
+        raw.as_slice()
     } else {
-        raw.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
+        raw.iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| &raw[index + 1..])
+            .unwrap_or_default()
     };
+    let raw = String::from_utf8_lossy(raw);
 
     for line in raw.lines().rev() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -976,6 +981,32 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_tail_handles_utf8_split_before_complete_error_line() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let transcript = dir.path().join("session.jsonl");
+        let error_line = concat!(
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"text":"Your organization has disabled Claude access."}]}}"#,
+            "\n"
+        );
+        let target_len = usize::try_from(API_ERROR_TRANSCRIPT_TAIL_BYTES).unwrap() + 1;
+        let mut bytes = "€\n".as_bytes().to_vec();
+        bytes.extend(std::iter::repeat_n(
+            b'x',
+            target_len - bytes.len() - 1 - error_line.len(),
+        ));
+        bytes.push(b'\n');
+        bytes.extend_from_slice(error_line.as_bytes());
+        std::fs::write(&transcript, bytes).expect("transcript");
+
+        assert_eq!(
+            last_assistant_event(&transcript),
+            Some(RecentAssistantEvent::Error(
+                ProviderUsageReason::OrganizationDisabled
+            ))
+        );
+    }
 
     #[test]
     fn cli_usage_parser_reads_used_and_remaining_lines() {

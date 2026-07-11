@@ -346,6 +346,63 @@ fn usage_auto_ignores_structured_api_error_after_newer_assistant_success() {
     assert!(!stdout(&output).contains("Contact your admin"));
 }
 
+#[cfg(unix)]
+#[test]
+fn usage_auto_ignores_older_error_after_newer_success_in_another_transcript() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().join("claude-config");
+    let projects = config_dir.join("projects/repo");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let error_transcript = projects.join("older-error.jsonl");
+    std::fs::write(
+        &error_transcript,
+        concat!(
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"text":"Your organization has disabled Claude access."}]}}"#,
+            "\n"
+        ),
+    )
+    .expect("error transcript");
+    let success_transcript = projects.join("newer-success.jsonl");
+    std::fs::write(
+        &success_transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"content":[{"text":"Access restored."}]}}"#,
+            "\n"
+        ),
+    )
+    .expect("success transcript");
+    let now = SystemTime::now();
+    set_modified(&error_transcript, now - Duration::from_secs(60));
+    set_modified(&success_transcript, now);
+    let bin_dir = write_fake_claude(
+        tmp.path(),
+        "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\\n' 'usage unavailable'\n",
+    );
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(429, "rate limited"));
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "auto"],
+        &base_options(tmp.path())
+            .with_path_prepend(&bin_dir)
+            .with_env("CLAUDE_CONFIG_DIR", &path_str(&config_dir))
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+                "secret-token-api-error",
+            )
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+                &format!("{}/usage", server.url()),
+            )
+            .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED", "1"),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["reason_code"], "rate_limited");
+    assert!(!stdout(&output).contains("organization_disabled"));
+}
+
 #[test]
 fn usage_cache_source_outputs_epoch_for_human_reset_times() {
     let tmp = tempfile::tempdir().expect("tempdir");
