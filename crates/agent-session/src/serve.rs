@@ -45,7 +45,7 @@ use tokio::sync::mpsc;
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::provider_prompt::{
     MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind, ProviderPromptEvent,
-    ProviderPromptTail,
+    ProviderPromptSource, ProviderPromptTail,
 };
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
@@ -77,6 +77,7 @@ const ATTACH_HANDOFF_MAX_RECAPTURES: usize = 1;
 const PROVIDER_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PROVIDER_PROMPT_PENDING_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
@@ -98,6 +99,7 @@ struct ServeState {
     token: Option<String>,
     tmux_bin: PathBuf,
     attach_brokers: AttachBrokerRegistry,
+    provider_prompt_discovery: Arc<ProviderPromptDiscoveryRegistry>,
 }
 
 pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
@@ -151,6 +153,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
         token,
         tmux_bin,
         attach_brokers: AttachBrokerRegistry::default(),
+        provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
     });
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -1408,6 +1411,30 @@ struct AttachBrokerRegistry {
     entries: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<AttachBrokerSlot>>>>,
 }
 
+#[derive(Default)]
+struct ProviderPromptDiscoveryRegistry {
+    entries: tokio::sync::Mutex<
+        HashMap<ProviderPromptDiscoveryKey, Arc<tokio::sync::Mutex<ProviderPromptDiscoverySlot>>>,
+    >,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderPromptDiscoveryKey {
+    session_id: String,
+    provider: String,
+    provider_session_id: String,
+    generation: u64,
+    launch_id: String,
+    tmux_session: String,
+}
+
+struct ProviderPromptDiscoverySlot {
+    source: Option<ProviderPromptSource>,
+    next_scan_at: Option<Instant>,
+    backoff: Duration,
+    scan_attempts: usize,
+}
+
 struct AttachBrokerSlot {
     accepting: bool,
     next_generation: u64,
@@ -1460,6 +1487,86 @@ impl Default for AttachBrokerSlot {
             next_generation: 1,
             active: None,
         }
+    }
+}
+
+impl Default for ProviderPromptDiscoverySlot {
+    fn default() -> Self {
+        Self {
+            source: None,
+            next_scan_at: None,
+            backoff: PROVIDER_PROMPT_PENDING_POLL_INTERVAL,
+            scan_attempts: 0,
+        }
+    }
+}
+
+impl ProviderPromptDiscoveryKey {
+    fn from_record(record: &crate::SessionRecord) -> Option<Self> {
+        let runtime = record.runtime.as_ref()?;
+        let resume = record.provider_resume.as_ref()?;
+        Some(Self {
+            session_id: record.id.clone(),
+            provider: resume.provider.clone(),
+            provider_session_id: resume.session_id.clone(),
+            generation: runtime.generation,
+            launch_id: runtime.launch_id.clone(),
+            tmux_session: runtime.tmux_session.clone(),
+        })
+    }
+}
+
+impl ProviderPromptDiscoveryRegistry {
+    async fn resolve_source(&self, record: &crate::SessionRecord) -> Option<ProviderPromptSource> {
+        let key = ProviderPromptDiscoveryKey::from_record(record)?;
+        let slot = {
+            let mut entries = self.entries.lock().await;
+            entries
+                .entry(key)
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Mutex::new(
+                        ProviderPromptDiscoverySlot::default(),
+                    ))
+                })
+                .clone()
+        };
+        let mut slot = slot.lock().await;
+        let source = if let Some(source) = slot.source.clone() {
+            source
+        } else {
+            let now = Instant::now();
+            if slot.next_scan_at.is_some_and(|next| now < next) {
+                return None;
+            }
+            slot.scan_attempts = slot.scan_attempts.saturating_add(1);
+            let candidate = record.clone();
+            let source =
+                tokio::task::spawn_blocking(move || ProviderPromptTail::resolve_source(&candidate))
+                    .await
+                    .ok()
+                    .flatten();
+            let Some(source) = source else {
+                slot.next_scan_at = Some(now + slot.backoff);
+                slot.backoff = slot
+                    .backoff
+                    .saturating_mul(2)
+                    .min(PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF);
+                return None;
+            };
+            slot.source = Some(source.clone());
+            source
+        };
+        Some(source)
+    }
+
+    #[cfg(test)]
+    async fn scan_attempts(&self, record: &crate::SessionRecord) -> usize {
+        let Some(key) = ProviderPromptDiscoveryKey::from_record(record) else {
+            return 0;
+        };
+        let slot = self.entries.lock().await.get(&key).cloned();
+        let Some(slot) = slot else { return 0 };
+        slot.lock().await.scan_attempts
     }
 }
 
@@ -2144,6 +2251,7 @@ async fn attach_socket(
                     provider_refresh_pending = false;
                     provider_open_task = Some(open_provider_prompt_task(
                         state.context.clone(),
+                        state.provider_prompt_discovery.clone(),
                         record.clone(),
                         *provider_pending_deadline
                             .get_or_insert_with(|| Instant::now() + PROVIDER_PROMPT_PENDING_TIMEOUT),
@@ -2171,6 +2279,7 @@ async fn attach_socket(
                             } else {
                                 provider_open_task = Some(open_provider_prompt_task(
                                     state.context.clone(),
+                                    state.provider_prompt_discovery.clone(),
                                     record.clone(),
                                     *provider_pending_deadline.get_or_insert_with(|| {
                                         Instant::now() + PROVIDER_PROMPT_PENDING_TIMEOUT
@@ -2216,11 +2325,13 @@ async fn attach_socket(
 
 fn open_provider_prompt_task(
     context: CliContext,
+    discovery: Arc<ProviderPromptDiscoveryRegistry>,
     record: crate::SessionRecord,
     pending_deadline: Instant,
 ) -> AbortOnDropTask<(crate::SessionRecord, Option<ProviderPromptTail>)> {
     AbortOnDropTask::new(tokio::spawn(resolve_provider_prompt_tail(
         context,
+        discovery,
         record,
         pending_deadline,
     )))
@@ -2228,15 +2339,20 @@ fn open_provider_prompt_task(
 
 async fn resolve_provider_prompt_tail(
     context: CliContext,
+    discovery: Arc<ProviderPromptDiscoveryRegistry>,
     record: crate::SessionRecord,
     pending_deadline: Instant,
 ) -> (crate::SessionRecord, Option<ProviderPromptTail>) {
     let pending_fresh_runtime = provider_prompt_pending_fresh_runtime(&record);
-    let initial = record.clone();
-    let opened = tokio::task::spawn_blocking(move || ProviderPromptTail::open(&initial))
-        .await
-        .ok()
-        .flatten();
+    let initial_source = discovery.resolve_source(&record).await;
+    let opened = if let Some(source) = initial_source {
+        tokio::task::spawn_blocking(move || ProviderPromptTail::open_source_at_eof(source))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     if opened.is_some() || !pending_fresh_runtime {
         return (record, opened);
     }
@@ -2255,12 +2371,15 @@ async fn resolve_provider_prompt_tail(
             return (updated, None);
         }
         current = updated;
-        let candidate = current.clone();
-        let tail =
-            tokio::task::spawn_blocking(move || ProviderPromptTail::open_new_runtime(&candidate))
+        let source = discovery.resolve_source(&current).await;
+        let tail = if let Some(source) = source {
+            tokio::task::spawn_blocking(move || ProviderPromptTail::open_new_runtime_source(source))
                 .await
                 .ok()
-                .flatten();
+                .flatten()
+        } else {
+            None
+        };
         if tail.is_some() {
             return (current, tail);
         }
@@ -2710,6 +2829,52 @@ mod tests {
         current = expected.clone();
         current.runtime.as_mut().expect("runtime").tmux_session = "hs-replaced".to_string();
         assert!(!same_provider_prompt_runtime(&expected, &current));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_provider_prompt_discovery_coalesces_concurrent_scans() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let claude_config = tmp.path().join("claude-config");
+        std::fs::create_dir_all(claude_config.join("projects/-pending"))
+            .expect("claude projects root");
+        let _claude_config =
+            EnvGuard::set(&lock, "CLAUDE_CONFIG_DIR", claude_config.to_str().unwrap());
+        let mut record = test_record("pending-shared-scan", "hs-pending-shared-scan");
+        record.agent = "claude".to_string();
+        record.provider_resume = Some(crate::ProviderResume {
+            provider: "claude".to_string(),
+            session_id: "pending-shared-provider-id".to_string(),
+            captured_at: "2026-07-11T00:00:00Z".to_string(),
+            capture_method: "claude-explicit-session-id".to_string(),
+            resume_args: vec![
+                "--resume".to_string(),
+                "pending-shared-provider-id".to_string(),
+            ],
+            extra: std::collections::BTreeMap::new(),
+        });
+        record.runtime = Some(crate::RuntimeInfo {
+            kind: "tmux".to_string(),
+            tmux_session: "hs-pending-shared-scan".to_string(),
+            generation: 1,
+            started_at: "2026-07-11T00:00:00Z".to_string(),
+            launch_id: "launch-shared-scan".to_string(),
+            extra: std::collections::BTreeMap::new(),
+        });
+        let registry = Arc::new(ProviderPromptDiscoveryRegistry::default());
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let registry = registry.clone();
+            let record = record.clone();
+            tasks.spawn(async move { registry.resolve_source(&record).await });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(
+            registry.scan_attempts(&record).await,
+            1,
+            "concurrent clients must share one provider-history scan"
+        );
     }
 
     #[tokio::test]
@@ -3186,6 +3351,7 @@ mod tests {
             "pending provider discovery must not persist same-cwd history"
         );
         let _ = socket.close(None).await;
+
         server.abort();
         let _ = server.await;
     }
@@ -3286,6 +3452,39 @@ mod tests {
             "fresh first prompt must be emitted exactly once"
         );
         let _ = socket.close(None).await;
+
+        let mut request = format!("ws://{addr}/sessions/ws-claude-pending/attach")
+            .into_client_request()
+            .expect("reconnect request");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().expect("authorization"),
+        );
+        let (mut reconnect, _) = connect_async(request).await.expect("reconnect");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), reconnect.next())
+                .await
+                .expect("reconnect snapshot timeout")
+                .expect("reconnect snapshot frame")
+                .expect("reconnect snapshot message"),
+            ClientMessage::Binary(_)
+        ));
+        reconnect
+            .send(ClientMessage::Text(
+                json!({"subscribe":[PROVIDER_PROMPT_CAPABILITY]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("reconnect subscribe");
+        assert_supported_provider_prompt(&mut reconnect, "claude").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), reconnect.next())
+                .await
+                .is_err(),
+            "Claude reconnect must baseline the cached source at EOF"
+        );
+        let _ = reconnect.close(None).await;
         server.abort();
         let _ = server.await;
     }
@@ -3543,6 +3742,7 @@ mod tests {
             token: token.map(str::to_string),
             tmux_bin,
             attach_brokers: AttachBrokerRegistry::default(),
+            provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
         })
     }
 

@@ -58,7 +58,7 @@ struct PendingClaudePrompt {
 }
 
 #[derive(Debug, Clone)]
-struct ProviderPromptSource {
+pub(crate) struct ProviderPromptSource {
     provider: ProviderKind,
     session_id: String,
     path: PathBuf,
@@ -84,26 +84,45 @@ pub(crate) struct ProviderPromptTail {
 }
 
 impl ProviderPromptTail {
-    pub(crate) fn open(record: &SessionRecord) -> Option<Self> {
-        let source = resolve_provider_prompt_source(record)?;
-        Self::open_source(source, CLAUDE_FALLBACK_DELAY, true).ok()
+    pub(crate) fn resolve_source(record: &SessionRecord) -> Option<ProviderPromptSource> {
+        resolve_provider_prompt_source(record)
     }
 
-    pub(crate) fn open_new_runtime(record: &SessionRecord) -> Option<Self> {
-        let source = resolve_provider_prompt_source(record)?;
-        Self::open_source(source, CLAUDE_FALLBACK_DELAY, false).ok()
+    pub(crate) fn open_source_at_eof(source: ProviderPromptSource) -> Option<Self> {
+        Self::open_source(source, CLAUDE_FALLBACK_DELAY, true, true).ok()
+    }
+
+    pub(crate) fn open_new_runtime_source(source: ProviderPromptSource) -> Option<Self> {
+        Self::open_source(source, CLAUDE_FALLBACK_DELAY, false, true).ok()
     }
 
     fn open_source(
         source: ProviderPromptSource,
         claude_fallback_delay: Duration,
         baseline_at_eof: bool,
+        validate_source_identity: bool,
     ) -> io::Result<Self> {
+        if validate_source_identity && !source_still_matches(&source) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider transcript no longer matches the cached session identity",
+            ));
+        }
         let (mut file, metadata) = open_regular_file(&source.path)?;
+        let identity = file_identity(&metadata);
+        if validate_source_identity
+            && (!source_still_matches(&source)
+                || !opened_file_still_current(&source.path, identity))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider transcript changed while validating cached session identity",
+            ));
+        }
         let offset = if baseline_at_eof { metadata.len() } else { 0 };
         Ok(Self {
             source,
-            identity: file_identity(&metadata),
+            identity,
             offset,
             continuity: read_continuity(&mut file, offset)?,
             partial: Vec::new(),
@@ -129,6 +148,7 @@ impl ProviderPromptTail {
             },
             claude_fallback_delay,
             true,
+            false,
         )
     }
 

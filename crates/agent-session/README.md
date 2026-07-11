@@ -167,7 +167,8 @@ is no second state model.
   exact provider identity or transcript, the connection instead keeps a bounded, cancellable resolver alive, reloads the
   same launch's session metadata, and opens that fresh transcript from its beginning so the first prompt is not lost.
   Codex `UserPromptSubmit` hook metadata supplies the exact runtime-bound session identity; the pending attach path never
-  promotes cwd/time history scans into beginning-of-transcript authority. It
+  promotes cwd/time history scans into beginning-of-transcript authority. Transcript discovery is shared by runtime across
+  attach clients and uses bounded exponential backoff, while reconnects baseline the cached exact source at EOF. It
   replies with an `agent-session.attach.v1` `capability` text frame once resolution finishes, and only after that
   acknowledgement emits `prompt_submitted` events as bounded text frames; terminal snapshot/live output remains binary.
   The normative supported acknowledgement is:
