@@ -205,7 +205,7 @@ JSON
     write_executable(
         &fake_bin.join("claude-cli"),
         r#"#!/usr/bin/env sh
-if [ "${CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS:-}" != "45" ]; then
+if [ "${CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS:-}" != "40" ]; then
   cat <<'JSON'
 {"schema_version":"claude-cli.usage.v1","command":"usage","ok":false,"error":{"code":"timeout-not-propagated","message":"missing inner timeout"}}
 JSON
@@ -307,7 +307,7 @@ JSON
         .arg("--bind")
         .arg(addr.to_string())
         .env("AGENT_SESSION_TMUX_BIN", tmux)
-        .env("AGENT_SESSION_USAGE_TIMEOUT_MS", "1000")
+        .env("AGENT_SESSION_USAGE_TIMEOUT_MS", "45000")
         .env("CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS", "9")
         .env("PATH", path)
         .stdout(Stdio::null())

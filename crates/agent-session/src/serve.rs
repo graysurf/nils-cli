@@ -17,6 +17,7 @@ use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
@@ -67,6 +68,7 @@ const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_STDIN_TOKEN_BYTES: u64 = 8 * 1024;
 const USAGE_SCHEMA_VERSION: &str = "agent-session.usage.v1";
 const DEFAULT_USAGE_TIMEOUT_MS: u64 = 45_000;
+const CLAUDE_USAGE_CLEANUP_SLACK_SECONDS: u64 = 5;
 const ATTACH_TERMINAL_QUEUE_CAPACITY: usize = 64;
 const ATTACH_CONTROL_QUEUE_CAPACITY: usize = 8;
 const ATTACH_TERMINAL_BURST: usize = 32;
@@ -429,28 +431,34 @@ fn collect_codex_usage(timeout: Duration) -> UsageProvider {
 }
 
 fn collect_claude_usage(timeout: Duration) -> UsageProvider {
-    let timeout_seconds = timeout
-        .as_secs()
-        .saturating_add(u64::from(timeout.subsec_nanos() > 0))
-        .max(1)
-        .to_string();
-    let timeout_envs = if non_empty_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS").is_some() {
-        Vec::new()
-    } else {
-        vec![(
-            "CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS",
-            timeout_seconds.as_str(),
-        )]
-    };
+    let explicit_timeout = non_empty_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS");
+    let timeout_seconds =
+        claude_inner_timeout_seconds(timeout, explicit_timeout.as_deref()).to_string();
     match run_usage_helper(
         "claude-cli",
         &["usage", "--format", "json", "--source", "auto"],
-        &timeout_envs,
+        &[(
+            "CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS",
+            timeout_seconds.as_str(),
+        )],
         timeout,
     ) {
         Ok(output) => normalize_claude_usage(output),
         Err(message) => provider_error("claude", "Claude", "helper-spawn-failed", message),
     }
+}
+
+fn claude_inner_timeout_seconds(timeout: Duration, explicit: Option<&str>) -> u64 {
+    let max_inner_seconds = timeout
+        .checked_sub(Duration::from_secs(CLAUDE_USAGE_CLEANUP_SLACK_SECONDS))
+        .map(|remaining| remaining.as_secs())
+        .unwrap_or(0)
+        .max(1);
+    explicit
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(max_inner_seconds)
+        .min(max_inner_seconds)
 }
 
 fn run_usage_helper(
@@ -465,6 +473,7 @@ fn run_usage_helper(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|err| format!("failed to start {program}: {err}"))?;
 
@@ -476,6 +485,10 @@ fn run_usage_helper(
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     timed_out = true;
+                    unsafe {
+                        let pgid = -(child.id() as libc::pid_t);
+                        let _ = libc::kill(pgid, libc::SIGKILL);
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
@@ -2493,6 +2506,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use nils_test_support::{EnvGuard, GlobalStateLock};
+    use std::fs;
     use std::io::Write;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
     use tokio_tungstenite::connect_async;
@@ -3255,6 +3269,60 @@ mod tests {
             Duration::from_millis(DEFAULT_USAGE_TIMEOUT_MS) >= Duration::from_secs(30),
             "m4 claude-cli usage can take more than 20s before returning reset-bearing windows"
         );
+    }
+
+    #[test]
+    fn claude_inner_timeout_leaves_cleanup_slack_and_clamps_overrides() {
+        let outer = Duration::from_secs(45);
+        assert_eq!(claude_inner_timeout_seconds(outer, None), 40);
+        assert_eq!(
+            claude_inner_timeout_seconds(Duration::from_millis(45_001), None),
+            40
+        );
+        assert_eq!(
+            claude_inner_timeout_seconds(Duration::from_millis(1_001), None),
+            1
+        );
+        assert_eq!(claude_inner_timeout_seconds(outer, Some("9")), 9);
+        assert_eq!(claude_inner_timeout_seconds(outer, Some("90")), 40);
+        assert_eq!(claude_inner_timeout_seconds(outer, Some("invalid")), 40);
+    }
+
+    #[test]
+    fn usage_helper_timeout_kills_descendant_process_group() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let helper = tmp.path().join("hanging-helper");
+        let pid_file = tmp.path().join("descendant.pid");
+        fs::write(
+            &helper,
+            "#!/usr/bin/env sh\nsleep 60 &\nprintf '%s' \"$!\" > \"$PID_FILE\"\nwait\n",
+        )
+        .expect("write helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).expect("chmod helper");
+
+        let output = run_usage_helper(
+            helper.to_str().expect("helper path"),
+            &[],
+            &[("PID_FILE", pid_file.to_str().expect("pid path"))],
+            Duration::from_millis(250),
+        )
+        .expect("run helper");
+        assert!(output.timed_out);
+
+        let pid = fs::read_to_string(&pid_file)
+            .expect("descendant pid")
+            .parse::<libc::pid_t>()
+            .expect("numeric pid");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "timed-out helper descendant must not survive"
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
     fn write_codex_session_meta(codex_home: &Path, session_id: &str, cwd: &Path) {

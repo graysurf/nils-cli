@@ -260,9 +260,25 @@ fn probe_claude_cli_usage() -> anyhow::Result<String> {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_CLAUDE_TIMEOUT_SECONDS);
 
+    probe_claude_cli_usage_with_modes(
+        &program,
+        &select_probe_modes(&program),
+        Instant::now() + Duration::from_secs(timeout_seconds),
+    )
+}
+
+fn probe_claude_cli_usage_with_modes(
+    program: &Path,
+    modes: &[ProbeMode],
+    deadline: Instant,
+) -> anyhow::Result<String> {
     let mut last_error: Option<anyhow::Error> = None;
-    for mode in select_probe_modes(&program) {
-        match probe_claude_cli_usage_with_mode(&program, timeout_seconds, &mode) {
+    for mode in modes {
+        if Instant::now() >= deadline {
+            last_error = Some(anyhow::anyhow!("claude usage probe timed out"));
+            break;
+        }
+        match probe_claude_cli_usage_with_mode(program, deadline, mode) {
             Ok(text)
                 if parse_cli_usage_output(&text).is_some() || matches!(mode, ProbeMode::Pipe) =>
             {
@@ -284,7 +300,7 @@ fn probe_claude_cli_usage() -> anyhow::Result<String> {
 
 fn probe_claude_cli_usage_with_mode(
     program: &Path,
-    timeout_seconds: u64,
+    deadline: Instant,
     mode: &ProbeMode,
 ) -> anyhow::Result<String> {
     let mut command = mode.command(program);
@@ -293,11 +309,14 @@ fn probe_claude_cli_usage_with_mode(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        mode.write_usage_input(&mut stdin)?;
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(error) = mode.write_usage_input(&mut stdin, deadline)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
     }
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     loop {
         if child.try_wait()?.is_some() {
             let output = child.wait_with_output()?;
@@ -348,28 +367,49 @@ impl ProbeMode {
         }
     }
 
-    fn write_usage_input(&self, stdin: &mut dyn Write) -> anyhow::Result<()> {
+    fn write_usage_input(&self, stdin: &mut dyn Write, deadline: Instant) -> anyhow::Result<()> {
         match self {
             Self::Pty(_) => {
-                thread::sleep(Duration::from_millis(env_u64(
-                    "CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_STARTUP_DELAY_MS",
-                    DEFAULT_PTY_STARTUP_DELAY_MS,
-                )));
+                sleep_before_probe_deadline(
+                    Duration::from_millis(env_u64(
+                        "CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_STARTUP_DELAY_MS",
+                        DEFAULT_PTY_STARTUP_DELAY_MS,
+                    )),
+                    deadline,
+                )?;
                 stdin.write_all(CLI_USAGE_PTY_USAGE_STDIN)?;
                 stdin.flush()?;
-                thread::sleep(Duration::from_millis(env_u64(
-                    "CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_USAGE_DELAY_MS",
-                    DEFAULT_PTY_USAGE_DELAY_MS,
-                )));
+                sleep_before_probe_deadline(
+                    Duration::from_millis(env_u64(
+                        "CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_USAGE_DELAY_MS",
+                        DEFAULT_PTY_USAGE_DELAY_MS,
+                    )),
+                    deadline,
+                )?;
                 stdin.write_all(CLI_USAGE_PTY_EXIT_STDIN)?;
                 stdin.flush()?;
             }
             Self::Pipe => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("claude usage probe timed out");
+                }
                 stdin.write_all(CLI_USAGE_STDIN)?;
             }
         }
         Ok(())
     }
+}
+
+fn sleep_before_probe_deadline(delay: Duration, deadline: Instant) -> anyhow::Result<()> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        anyhow::bail!("claude usage probe timed out");
+    };
+    if delay >= remaining {
+        thread::sleep(remaining);
+        anyhow::bail!("claude usage probe timed out");
+    }
+    thread::sleep(delay);
+    Ok(())
 }
 
 fn select_probe_modes(program: &Path) -> Vec<ProbeMode> {
@@ -775,6 +815,37 @@ mod tests {
                 ProbeMode::Pipe,
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_modes_share_one_absolute_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let program = tmp.path().join("hanging-claude");
+        let calls = tmp.path().join("calls");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/usr/bin/env sh\nprintf x >> '{}'\nexec sleep 60\n",
+                calls.display()
+            ),
+        )
+        .expect("write program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod program");
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let error = probe_claude_cli_usage_with_modes(
+            &program,
+            &[ProbeMode::Pipe, ProbeMode::Pipe],
+            deadline,
+        )
+        .expect_err("probe deadline");
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(std::fs::read_to_string(calls).expect("call count"), "x");
     }
 
     #[cfg(any(
