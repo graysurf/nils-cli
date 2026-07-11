@@ -25,10 +25,15 @@ daemon without a configured token returns 503. Tokens never appear in URLs or
 event data. Responses use `Cache-Control: no-cache, no-transform` and
 `X-Accel-Buffering: no`.
 
-If the platform filesystem watcher cannot be initialized, the daemon preserves
-all existing endpoints and returns 503 `activity-stream-unavailable` from this
-route so clients explicitly fall back to session polling rather than treating
-heartbeats from a degraded stream as healthy.
+The broker lifecycle is explicit: `starting` advances to `ready` only after the
+filesystem watcher and initial session snapshot both succeed; a watcher callback
+error or later snapshot-collection failure moves it permanently to `degraded`.
+On degradation, an existing stream receives one full `reset` and then closes,
+heartbeats stop, and new requests return 503 `activity-stream-unavailable`.
+The daemon preserves all existing endpoints, so clients fall back to session
+polling rather than treating a degraded stream as healthy. `GET /sessions` and
+the broker use the same injected session snapshot source, keeping polling and
+stream projection aligned.
 
 Every SSE frame uses:
 
