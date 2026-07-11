@@ -1,0 +1,2 @@
+{"event":"pre_approval_request","command":"discarded-command","description":"discarded-description","pattern_key":"sudo","pattern_keys":["sudo","shell_escalation"],"session_key":"hermes-session","surface":"cli"}
+{"event":"post_approval_response","command":"discarded-command","description":"discarded-description","pattern_key":"sudo","pattern_keys":["shell_escalation","sudo"],"session_key":"hermes-session","surface":"cli","choice":"once"}

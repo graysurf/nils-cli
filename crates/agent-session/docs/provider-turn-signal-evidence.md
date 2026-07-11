@@ -5,14 +5,18 @@
 This report freezes the provider lifecycle evidence used by
 `agent-session.turn-event.v1` and `agent-session.turn-state.v1`. It was audited
 on 2026-07-11 against Codex CLI 0.144.1, Claude Code 2.1.206, Hermes Agent
-0.18.0, and the agent-session 1.21.8 implementation baseline. The support floors are deliberately the
+0.18.2, and the agent-session 1.21.17 implementation baseline. The support floors are deliberately the
 oldest versions directly covered by this audit, not guesses about earlier
 releases.
 
 The fixtures under `tests/fixtures/activity/` contain lifecycle identifiers and
-event names only. Prompt text, assistant output, tool input/output, commands,
-transcript paths, credentials, and terminal content are removed before the
-normalized event is created.
+event names. The dedicated Hermes approval fixtures additionally freeze the
+0.18.2 shell `_serialize_payload` envelope and carry explicit discarded
+sentinel values for the matching metadata fields required by the provider
+contract; tests prove those values do not survive normalization.
+Prompt text, assistant output, tool input/output, commands, transcript paths,
+credentials, and terminal content are removed before the normalized event is
+created.
 
 ## Evidence sources
 
@@ -45,7 +49,7 @@ normalized event is created.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Codex | 0.144.1 | supported | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive hooks in `~/.codex/hooks.json` plus owned or bounded direct-argv-composed notify in `~/.codex/config.toml`; unsafe/recursive values fail closed |
 | Claude Code | 2.1.206 | partial | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | `StopFailure`, observed; `AskUserQuestion` tool failure clears only its clarification | additive merge into `~/.claude/settings.json` |
-| Hermes | 0.18.0 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | pre/post approval hooks exist, but clearing remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
+| Hermes | 0.18.2 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | non-empty shell `extra.tool_call_id` projects to exact pre/post correlation; missing/empty-id tuple fallback remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
 Versions below the audited floor remain usable. `activity doctor` reports them
 as unverified and session views retain optional-field/activity fallback rather
@@ -104,10 +108,22 @@ same conservative latch as every other permission mode.
 
 The installed `post_llm_call` fires only after a successful final response and
 does not fire for interruption, so it is authoritative completion at the
-audited version. Approval hooks expose `session_key`, surface, and response
-choice, but no stable per-request id. `post_approval_response` is recorded as
-progress and cannot by itself clear Needs input; completion or a new turn clears
-the latch.
+audited version. The 0.18.2 shell serializer places approval kwargs under
+`extra`, emits an empty top-level `session_id` for this callback, and carries
+the same non-empty `tool_call_id` on pre/post. The adapter reads only allowlisted
+extra fields, falls back to non-empty `extra.session_key`, and projects the
+tool-call id as an exact runtime-scoped correlation. Identical commands with
+different tool-call ids therefore clear independently and out of order;
+the event kind and projected tool-call id also derive a stable event id in the
+runtime replay index, so exact callbacks stay idempotent across interleaving,
+elapsed time, clearing, restart, and bounded journal eviction. Missing, null,
+or empty tool-call ids
+retain the older tuple fallback over `command`, `description`, `pattern_key`,
+`pattern_keys`, `session_key`, and `surface`. That tuple is canonicalized only
+in memory and projected by SHA-256; duplicate-identical fallback concurrency
+remains conservatively latched until authoritative completion, a new turn, or a
+runtime boundary. Raw kwargs never persist. Missing, malformed, or undocumented
+response choices fail open with sanitized diagnostics and do not clear.
 
 ## Concurrency, continuation, and privacy probes
 
@@ -115,6 +131,10 @@ The executable fixtures cover:
 
 - two concurrent attention requests, correlated one-by-one clearing, and a
   metadata-only `pending_count`;
+- the frozen Hermes 0.18.2 shell envelope with nested `extra`, empty top-level
+  session id, exact tool-call replay/ordering, missing/empty-id fallback, stale
+  runtime rejection, sanitized diagnostics, raw-field non-persistence, restart,
+  and bounded journal eviction;
 - exact AskUserQuestion request/success/failure correlation and independent
   clearing alongside unrelated generic attention;
 - unrelated progress while attention is pending, including monotonic
@@ -139,6 +159,13 @@ The executable fixtures cover:
   for all three provider configs, including Codex notify absence/ownership,
   reversible user-owned argv composition, literal no-shell forwarding, bounded
   downstream hangs/failures, and unsafe/recursive conflict preservation.
+- `--repair --dry-run` emits a content-free Codex notification preview. Safe
+  foreign argv that cannot satisfy byte-exact removal is identified only by
+  argument count and SHA-256 of compact JSON plus one LF; apply remains blocked
+  and both config files remain byte-identical. The preview also emits a plan
+  digest over the exact current and proposed bytes of both Codex files; repair
+  requires the same digest and rejects missing or stale review evidence before
+  either write.
 
 The live release probe uses a no-content marker turn for each installed provider
 after the released binary is installed. Retained evidence records only provider
@@ -173,6 +200,17 @@ authoritative completion across transient contention. Removal decodes and
 restores the original argv. Unsafe, oversized, non-string, nested-forward, or
 non-reversible
 values return a content-free conflict before mutating the hooks file.
+For repair review, `activity setup --agent codex --repair --dry-run` keeps both
+files untouched and reports current/candidate mode, exact-reversal status,
+argument count, and a compact-JSON-plus-LF SHA-256 without exposing argv. A
+non-reversible serialization remains blocked; the preview does not authorize or
+perform normalization. The preview's separate plan digest binds the exact
+current and candidate bytes for both files. Applying repair requires it via
+`--expected-preview-digest`; any missing, malformed, or stale digest fails
+before mutation.
+Claude and Hermes do not have this two-file reviewed-plan contract, so the same
+combined flags reject with `provider-repair-preview-unsupported`; ordinary
+dry-run and repair remain separate supported actions for those providers.
 Apply/repair/remove parse and plan both files before either mutation; a guarded
 second-write failure restores the first write, while a rollback race surfaces an
 explicit error naming both metadata-only paths.

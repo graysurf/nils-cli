@@ -364,7 +364,9 @@ fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
             Err(err) => render_error(ACTIVITY_DOCTOR_COMMAND, args.format, err),
         },
         cli::ActivityCommand::Setup(args) => {
-            let action = if args.dry_run {
+            let action = if args.dry_run && args.repair {
+                activity::SetupAction::RepairPreview
+            } else if args.dry_run {
                 activity::SetupAction::DryRun
             } else if args.apply {
                 activity::SetupAction::Apply
@@ -373,7 +375,7 @@ fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
             } else {
                 activity::SetupAction::Repair
             };
-            match activity::setup(args.agent, action) {
+            match activity::setup(args.agent, action, args.expected_preview_digest.as_deref()) {
                 Ok(result) => render_single_success(
                     ACTIVITY_SETUP_COMMAND,
                     args.format,
@@ -3792,6 +3794,44 @@ fn render_doctor_text(result: &activity::DoctorResult) -> String {
 }
 
 fn render_setup_text(result: &activity::SetupResult) -> String {
+    if result.action == "repair-preview" {
+        let preview_digest = result
+            .preview_digest
+            .as_deref()
+            .expect("Codex repair preview always has a plan digest");
+        if !result.apply_allowed {
+            let notification = result
+                .notification_preview
+                .as_ref()
+                .expect("a blocked setup preview has notification metadata");
+            return format!(
+                "{} activity setup repair preview: blocked by {} (plan: {}; notifier argv: {} args, {}; config unchanged)\n",
+                result.provider,
+                notification
+                    .blocker_code
+                    .as_deref()
+                    .unwrap_or("provider-config-preview-blocked"),
+                preview_digest,
+                notification.forwarded_argc.unwrap_or_default(),
+                notification
+                    .forwarded_argv_sha256
+                    .as_deref()
+                    .unwrap_or("hash unavailable")
+            );
+        }
+        return format!(
+            "{} activity setup repair preview: {} (configured now: {}; would configure: {}; plan: {})\n",
+            result.provider,
+            if result.would_change {
+                "changes required"
+            } else {
+                "no change"
+            },
+            if result.configured { "yes" } else { "no" },
+            if result.would_configure { "yes" } else { "no" },
+            preview_digest
+        );
+    }
     if result.action == "dry-run" {
         return format!(
             "{} activity setup preview: {} (configured now: {}; would configure: {})\n",

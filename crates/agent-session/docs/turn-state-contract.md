@@ -145,6 +145,24 @@ circuit breaker. Because these approvals have no correlated clear event, they
 keep the conservative latch above until completion, a new turn, or a runtime
 boundary.
 
+Hermes 0.18.2 shell hooks put approval kwargs under the allowlisted `extra`
+object and may leave top-level `session_id` empty. Agent-session falls back to
+`extra.session_key`, projects non-empty `extra.tool_call_id` as the exact
+runtime-scoped pre/post correlation, and treats replayed exact callbacks
+idempotently. The event kind and projected tool-call id derive a stable
+runtime-scoped event id retained by the bounded replay index, so interleaving,
+elapsed wall time, response clearing, process restart, and bounded journal
+eviction cannot reopen a delivered callback. This lets identical command tuples
+with different tool-call ids clear independently and out of order. Missing,
+null, or empty tool-call ids use
+the compatibility tuple fallback: `command`, `description`, `pattern_key`,
+sorted/deduplicated `pattern_keys`, `session_key`, and `surface` are
+canonicalized only in memory and their SHA-256 is projected. Identical fallback
+tuples remain indistinguishable, so each observed pre callback increases
+conservative pending multiplicity and an ambiguous remainder clears only at
+completion, a new turn, or a runtime boundary. Raw approval kwargs never enter
+activity storage; only documented response choices emit observed clear events.
+
 Revision is monotonic for each accepted non-duplicate event and runtime
 boundary. Phase timestamps change only when the phase changes. Durations are
 derived by clients and are never persisted separately.
@@ -222,6 +240,8 @@ drop/reconnect/title timeout cannot change durable turn state.
 agent-session activity setup --agent <provider> --dry-run
 agent-session activity setup --agent <provider> --apply
 agent-session activity setup --agent <provider> --repair
+agent-session activity setup --agent codex --repair --dry-run
+agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
 agent-session activity setup --agent <provider> --remove
 agent-session activity doctor [--agent <provider>] --format json
 ```
@@ -259,6 +279,21 @@ Codex, an exact owned or valid composed notify argv; helper health resolves the 
 command on PATH. Hook/notification diagnostics are bound to the active
 launch id/generation and the newest current-runtime diagnostic is selected
 deterministically across sessions.
+
+The combined `--repair --dry-run` reviewed-plan action is Codex-only because its
+digest binds Codex's two-file repair transaction. Claude and Hermes reject that
+combination with `provider-repair-preview-unsupported`; their ordinary
+`--dry-run` and `--repair` actions remain supported independently.
+
+Codex repair preview (`--repair --dry-run`) is non-destructive even when a safe
+foreign notifier cannot pass byte-exact reversal. It reports only the
+current/candidate mode, argument count, reversibility, a blocker code, and
+SHA-256 of compact JSON argv plus one LF. It also returns a separate content-free
+plan digest that binds the presence and exact current/proposed bytes of both
+`hooks.json` and `config.toml`. It never emits argv or configuration values.
+Codex `--repair` requires that digest through `--expected-preview-digest` and
+recomputes it before either write. Missing, malformed, or stale digests fail
+closed; a blocked preview does not weaken repair, and both files remain exact.
 
 Setup JSON distinguishes current and prospective state: `configured` and
 `changed` describe the file after the command, while `would_configure` and

@@ -26,6 +26,8 @@ agent-session resume <id>
 agent-session activity status <id> --format json
 agent-session activity doctor --format json
 agent-session activity setup --agent codex --dry-run
+agent-session activity setup --agent codex --repair --dry-run
+agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
 printf '%s' "$AGENT_SESSION_TOKEN" | agent-session serve --bind 127.0.0.1:8781 --token-stdin
 agent-session command <id>
 agent-session attach <id>
@@ -64,15 +66,19 @@ after reviewing the provider trust/consent boundary:
 
 ```bash
 agent-session activity setup --agent codex --dry-run
+agent-session activity setup --agent codex --repair --dry-run
+agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
 agent-session activity setup --agent codex --apply
 agent-session activity doctor --agent codex --format json
 agent-session activity setup --agent codex --remove
 ```
 
-The same commands support `claude` and `hermes`. Setup merges exact
-agent-session-owned handlers into existing provider configuration, repeated
-apply/repair is idempotent, and removal preserves unrelated hooks. Provider
-setup also refuses an observed concurrent config change. For Codex, setup adds
+Ordinary `--dry-run`, `--apply`, `--repair`, and `--remove` also support
+`claude` and `hermes`; the combined `--repair --dry-run` reviewed-plan workflow
+is Codex-only and rejects other providers. Setup merges exact agent-session-owned
+handlers into existing provider configuration, repeated apply/repair is
+idempotent, and removal preserves unrelated hooks. Provider setup also refuses
+an observed concurrent config change. For Codex, setup adds
 the official `agent-turn-complete` notify argv to `~/.codex/config.toml` when
 `notify` is absent, recognizes exact ownership idempotently, or wraps a safe
 user-owned singular argv in an agent-session-owned fan-out. The fan-out invokes
@@ -89,7 +95,10 @@ restored. Unsafe, oversized,
 non-string, recursive, or non-reversible values are preserved and reported as
 conflicts. Both Codex files are parsed and planned before either is
 written; if the guarded second write fails, the first write is restored or a
-loud rollback error identifies the partial state. That provider-authored
+loud rollback error identifies the partial state. The repair preview returns a
+content-free plan digest over the current and proposed
+bytes of both Codex files. Applying repair requires that exact digest and fails
+before either write if either file changed after review. That provider-authored
 notification must match the exact open runtime/thread/turn and is the
 authoritative completion input. Raw Codex
 `Stop` remains non-final observation. Hook/notification failure is fail-open and
@@ -99,6 +108,15 @@ timeout, verifies the exact owned hook timeout and owned/composed Codex notify
 argv, reports `notification_mode` as `absent`, `owned`, `composed`, `conflict`,
 or `invalid`, surfaces sanitized configuration errors, and checks that the
 configured helper resolves to an executable on the provider PATH.
+
+Hermes 0.18.2 approval shell hooks are normalized from their nested `extra`
+envelope. A non-empty tool-call id is projected into an exact runtime-scoped
+pre/post correlation; missing or empty ids retain the conservative compatibility tuple
+fallback. Empty top-level session ids fall back to the nested session key. Raw
+approval kwargs are discarded before persistence, and malformed metadata stays
+fail-open with a sanitized diagnostic code. Exact callbacks also derive a
+kind-specific stable event id from the projected tool-call id, so replay remains
+idempotent across interleaving, process restarts, and bounded journal eviction.
 
 Codex itself appends the full notification JSON to the configured command argv.
 Agent-session discards content after parsing and never prints or persists it,
