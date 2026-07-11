@@ -137,6 +137,55 @@ pub(crate) struct TurnState {
     extra: Map<String, Value>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamTurnSource {
+    pub(crate) kind: SourceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
+    pub(crate) confidence: Confidence,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamAttentionView {
+    pub(crate) kind: String,
+    pub(crate) requested_at: String,
+    pub(crate) pending_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamCurrentTurn {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_turn_id: Option<String>,
+    pub(crate) started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_progress_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attention: Option<StreamAttentionView>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamLastTurn {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at: Option<String>,
+    pub(crate) completed_at: String,
+    pub(crate) outcome: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamTurnState {
+    pub(crate) schema_version: String,
+    pub(crate) phase: TurnPhase,
+    pub(crate) phase_changed_at: String,
+    pub(crate) revision: u64,
+    pub(crate) source: StreamTurnSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) current_turn: Option<StreamCurrentTurn>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_turn: Option<StreamLastTurn>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct PendingAttention {
     id: String,
@@ -224,6 +273,43 @@ pub(crate) struct ActivityResult {
     pub(crate) id: String,
     pub(crate) turn_state: TurnState,
     pub(crate) duplicate: bool,
+}
+
+/// Project durable activity state onto the explicitly allowlisted stream
+/// contract. Durable snapshots preserve additive fields for forward
+/// compatibility; those unknown fields must not cross the daemon stream's
+/// metadata-only privacy boundary.
+pub(crate) fn stream_projection(state: &TurnState) -> StreamTurnState {
+    StreamTurnState {
+        schema_version: state.schema_version.clone(),
+        phase: state.phase.clone(),
+        phase_changed_at: state.phase_changed_at.clone(),
+        revision: state.revision,
+        source: StreamTurnSource {
+            kind: state.source.kind.clone(),
+            provider: state.source.provider.clone(),
+            confidence: state.source.confidence.clone(),
+        },
+        current_turn: state.current_turn.as_ref().map(|turn| StreamCurrentTurn {
+            provider_turn_id: turn.provider_turn_id.clone(),
+            started_at: turn.started_at.clone(),
+            last_progress_at: turn.last_progress_at.clone(),
+            attention: turn
+                .attention
+                .as_ref()
+                .map(|attention| StreamAttentionView {
+                    kind: attention.kind.clone(),
+                    requested_at: attention.requested_at.clone(),
+                    pending_count: attention.pending_count,
+                }),
+        }),
+        last_turn: state.last_turn.as_ref().map(|turn| StreamLastTurn {
+            provider_turn_id: turn.provider_turn_id.clone(),
+            started_at: turn.started_at.clone(),
+            completed_at: turn.completed_at.clone(),
+            outcome: turn.outcome.clone(),
+        }),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

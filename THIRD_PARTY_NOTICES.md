@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `8bd2148e47cd9c53a397d8095ea5d39fb4c9bef88765129e7266eef429fa479e`
-- Third-party crates (`source != null`): 458
+- Cargo.lock SHA256: `782b3ee98dff2eab9fed605cc7e528c973397b99bea7ef2ecc886f7d25df959a`
+- Third-party crates (`source != null`): 465
 
 ## Notice Extraction Policy
 
@@ -900,6 +900,14 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
+### fsevent-sys 4.1.0
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
 ### futures-channel 0.3.32
 
 - License: `MIT OR Apache-2.0`
@@ -1317,6 +1325,22 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
+### inotify 0.11.4
+
+- License: `ISC`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
+### inotify-sys 0.1.8
+
+- License: `ISC`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
 ### ipnet 2.12.0
 
 - License: `MIT OR Apache-2.0`
@@ -1463,6 +1487,22 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
 
 ### jsonwebtoken 10.4.0
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
+### kqueue 1.2.0
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
+### kqueue-sys 1.1.2
 
 - License: `MIT`
 - Source: `crates.io`
@@ -1671,6 +1711,23 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file references:
   - `LICENSE`
+
+### notify 8.2.0
+
+- License: `CC0-1.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-CC0`
+
+### notify-types 2.1.0
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
 
 ### nu-ansi-term 0.50.3
 

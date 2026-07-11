@@ -369,6 +369,23 @@ fn help_includes_version_flag_and_examples() {
 }
 
 #[test]
+fn serve_help_describes_activity_stream_authentication() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let output = run(tmp.path(), &["serve", "--help"], &[]);
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let stdout = output.stdout_text();
+    assert!(
+        stdout.contains("activity streaming, write, and attach endpoints"),
+        "serve help omitted the authenticated activity stream: {stdout}"
+    );
+    assert!(
+        stdout.contains("activity streaming, writes, and attach are disabled"),
+        "serve help omitted token-unset degradation: {stdout}"
+    );
+}
+
+#[test]
 fn activity_setup_repair_preview_is_codex_only_in_matrix_help_and_completion() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");

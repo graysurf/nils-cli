@@ -136,7 +136,8 @@ See [the stable turn-state contract](docs/turn-state-contract.md) and
 web console). It builds its own tokio runtime and reuses the synchronous lifecycle functions via `spawn_blocking`, so there
 is no second state model.
 
-- `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. Sessions report
+- `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. `GET /sessions`
+  additively reports `data.observed_at`, sampled from daemon time after the returned session state is assembled. Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
   the recorded `cwd`. New records also expose optional `runtime_started_at` and
   `turn_state`; old records omit them.
@@ -162,6 +163,20 @@ is no second state model.
   `$HOME/.config`) with bounded depth, count, and elapsed-time limits. Add `git_only=true&exclude_worktrees=true` for
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage
   (`last_used`) and then name/path.
+- `GET /activity/events` — authenticated metadata-only SSE for activity snapshots and heartbeats. Events carry a daemon-boot
+  `stream_id` and increasing `sequence`; `Last-Event-ID` enables count-and-byte-bounded replay, while stale/foreign cursors
+  and lagged consumers receive a reset. Concurrent subscribers are daemon-capped and saturation returns a stable
+  polling-fallback error. Provider hooks only update durable local activity files; a daemon filesystem watcher publishes changes
+  through bounded nonblocking queues. Payloads and SSE frames are serialized once and shared; an oversized snapshot emits a
+  transition-only content-free `oversized_snapshot` reset that requires immediate polling rather than entering replay or
+  broadcast retention. Notification storms converge through a trailing quiet debounce and refresh starts spaced by an explicit
+  minimum cadence. Backend rescan flags force a full refresh; sessions-root loss re-arms a replacement recursive watcher or
+  degrades the stream. Watcher or snapshot-source failures send existing streams one reset before closing, stop
+  heartbeats, and make new stream requests return the polling-fallback error. The stream and `/sessions` share one snapshot
+  source; degraded resets use unique sequences while retaining the last successful snapshot observation anchor, and typed
+  projection omits absent nested leaves while preserving session-level `turn_state: null`. The existing `/sessions` read remains
+  the old-peer and gap-reconciliation path. The exact
+  wire/privacy contract is [activity-stream-v1](docs/specs/activity-stream-v1.md).
 - `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
   `POST /sessions/{id}/resume`,
   `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
@@ -244,7 +259,7 @@ is no second state model.
 
 Every response uses the `cli.agent-session.serve.v1` envelope and carries a `machine` identity (`--machine` /
 `AGENT_SESSION_MACHINE` / `--host` / hostname) so an edge can aggregate several machines. Auth is a bearer token
-(`--token-stdin`, `--token`, or `AGENT_SESSION_TOKEN`) on all write and attach endpoints, compared without an early-exit
+(`--token-stdin`, `--token`, or `AGENT_SESSION_TOKEN`) on the activity stream plus all write and attach endpoints, compared without an early-exit
 on the token bytes; when no token is configured (or it is empty) those endpoints fail closed (503). Prefer
 `--token-stdin` for launcher integrations so token material does not appear in process arguments. It reads one trimmed
 token from stdin, rejects empty input, rejects multiple newline-separated tokens, and rejects input over 8192 bytes.
@@ -253,7 +268,7 @@ high-entropy token.
 
 Trust model: the daemon binds loopback and *refuses* a non-loopback bind unless `--allow-non-loopback` is passed, because
 it drives a remote shell. Session reads (`list` / `glance`) are intentionally open on the bind address, while path-bearing
-reads (`workdirs`), writes, and attach require the bearer token. Front the daemon with the agent-console edge (which
+reads (`workdirs`), activity streaming, writes, and attach require the bearer token. Front the daemon with the agent-console edge (which
 applies its own auth) and do **not** `tailscale serve` the raw serve port; expose only the edge, tailnet-only, no funnel.
 Browser WebSocket clients cannot set an `Authorization` header, so the edge must proxy the attach and inject the bearer
 server-side — never put the token in the `ws://` URL/query.
