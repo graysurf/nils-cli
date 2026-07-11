@@ -227,6 +227,7 @@ pub(crate) struct ActivityResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SetupAction {
     DryRun,
+    RepairPreview,
     Apply,
     Remove,
     Repair,
@@ -271,11 +272,27 @@ pub(crate) struct SetupResult {
     pub(crate) would_change: bool,
     pub(crate) configured: bool,
     pub(crate) would_configure: bool,
+    pub(crate) apply_allowed: bool,
     pub(crate) config_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) notification_config_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) notification_preview: Option<CodexNotificationPreview>,
     pub(crate) owned_events: Vec<String>,
     pub(crate) trust: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CodexNotificationPreview {
+    current_mode: String,
+    candidate_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) forwarded_argc: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) forwarded_argv_sha256: Option<String>,
+    reversible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) blocker_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -436,6 +453,67 @@ fn projected_provider_identifier(
     Ok(format!("local:v1:{}", hex_digest(digest.finalize())))
 }
 
+fn hermes_approval_correlation_id(runtime_id: &str, raw: &Value) -> Result<String, CliError> {
+    fn required_string<'a>(raw: &'a Value, field: &str) -> Result<&'a str, CliError> {
+        raw.get(field).and_then(Value::as_str).ok_or_else(|| {
+            CliError::data(
+                "provider-hook-correlation-missing",
+                "recognized Hermes approval hook is missing matching correlation metadata",
+                Some(json!({ "field": field })),
+            )
+        })
+    }
+
+    let mut pattern_keys = raw
+        .get("pattern_keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-hook-correlation-missing",
+                "recognized Hermes approval hook is missing matching correlation metadata",
+                Some(json!({ "field": "pattern_keys" })),
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                CliError::data(
+                    "provider-hook-correlation-missing",
+                    "recognized Hermes approval hook has invalid matching correlation metadata",
+                    Some(json!({ "field": "pattern_keys" })),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    pattern_keys.sort();
+    pattern_keys.dedup();
+
+    let canonical = serde_json::to_vec(&json!([
+        required_string(raw, "command")?,
+        required_string(raw, "description")?,
+        required_string(raw, "pattern_key")?,
+        pattern_keys,
+        required_string(raw, "session_key")?,
+        required_string(raw, "surface")?,
+    ]))
+    .map_err(|_| {
+        CliError::data(
+            "provider-hook-correlation-invalid",
+            "Hermes approval correlation metadata could not be canonicalized",
+            None,
+        )
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(b"agent-session.hermes-approval-correlation.v1\0");
+    digest.update(canonical);
+    projected_provider_identifier(
+        runtime_id,
+        AgentKind::Hermes,
+        "attention",
+        &format!("sha256:{}", hex_digest(digest.finalize())),
+    )
+}
+
 fn event_dedupe_key(runtime_id: &str, event_id: &str) -> [u8; REPLAY_SLOT_BYTES] {
     let mut digest = Sha256::new();
     digest.update(b"agent-session.event-id.v1\0");
@@ -453,6 +531,8 @@ fn semantic_event_key(event: &TurnEvent) -> String {
     let mut digest = Sha256::new();
     digest.update(b"agent-session.semantic-event.v1\0");
     let correlated_attention_id = if event.attention_kind.as_deref() == Some("clarification")
+        || (event.provider == AgentKind::Hermes.as_str()
+            && event.attention_kind.as_deref() == Some("approval"))
         || event.kind == TurnEventKind::AttentionCleared
     {
         event.attention_id.as_deref().unwrap_or("")
@@ -1473,6 +1553,24 @@ fn normalize_provider_hook(
             event_name,
             "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
         );
+    let exact_hermes_approval = agent == AgentKind::Hermes
+        && matches!(
+            event_name,
+            "pre_approval_request" | "post_approval_response"
+        );
+    if agent == AgentKind::Hermes
+        && event_name == "post_approval_response"
+        && !matches!(
+            raw.get("choice").and_then(Value::as_str),
+            Some("once" | "session" | "always" | "deny" | "timeout")
+        )
+    {
+        return Err(CliError::data(
+            "provider-hook-response-invalid",
+            "recognized Hermes approval response has an invalid or missing choice",
+            None,
+        ));
+    }
     let (kind, attention_kind, confidence) = match (agent, event_name, notification) {
         (AgentKind::Codex, "UserPromptSubmit", _) => {
             (TurnEventKind::TurnStarted, None, Confidence::Observed)
@@ -1535,9 +1633,7 @@ fn normalize_provider_hook(
             Confidence::Observed,
         ),
         (AgentKind::Hermes, "post_approval_response", _) => {
-            // Hermes does not expose a stable approval request id. Preserve the
-            // conservative latch until completion or a new turn.
-            (TurnEventKind::Progress, None, Confidence::Observed)
+            (TurnEventKind::AttentionCleared, None, Confidence::Observed)
         }
         _ => return Ok(None),
     };
@@ -1557,6 +1653,8 @@ fn normalize_provider_hook(
             .and_then(Value::as_str)
             .map(|value| projected_provider_identifier(runtime_id, agent, "attention", value))
             .transpose()?
+    } else if exact_hermes_approval {
+        Some(hermes_approval_correlation_id(runtime_id, raw)?)
     } else {
         None
     };
@@ -1568,7 +1666,9 @@ fn normalize_provider_hook(
         ));
     }
     let attention_id = match kind {
-        TurnEventKind::AttentionRequested if exact_clarification => exact_attention_id,
+        TurnEventKind::AttentionRequested if exact_clarification || exact_hermes_approval => {
+            exact_attention_id
+        }
         TurnEventKind::AttentionRequested => Some(uuid::Uuid::new_v4().to_string()),
         TurnEventKind::AttentionCleared => exact_attention_id,
         _ => None,
@@ -1718,7 +1818,7 @@ pub(crate) fn doctor(
                     "agent-turn-complete is authoritative; raw Stop remains non-final observation because matching hooks may continue the turn",
                     "PermissionRequest has no request id shared with PostToolUse; attention is conservatively latched",
                     "Codex requires review/trust for each non-managed hook definition; a safe singular user notify argv is composed through bounded direct execution without a shell",
-                    "Run activity setup --agent codex --dry-run, apply it, then approve the hook definitions in Codex; unsafe or recursive user-owned notify commands are preserved and reported as conflicts",
+                    "Run activity setup --agent codex --dry-run before initial apply; for drift, review activity setup --agent codex --repair --dry-run before repair. Unsafe, recursive, or non-reversible user-owned notify commands are preserved and reported without argv content",
                 ),
                 AgentKind::Claude => (
                     "partial",
@@ -1730,7 +1830,7 @@ pub(crate) fn doctor(
                 AgentKind::Hermes => (
                     "supported",
                     "post_llm_call is authoritative for successful non-interrupted turns on the supported version",
-                    "approval hooks expose no stable request id; attention clears on completion or a new turn",
+                    "approval hooks use observed runtime-scoped correlation derived from matching metadata; distinct tuples clear exactly, while duplicate-identical concurrent approvals remain indistinguishable",
                     "Hermes shell hooks require first-use consent unless explicitly accepted",
                     "Run activity setup --agent hermes --dry-run, apply it, then approve and verify with hermes hooks doctor",
                 ),
@@ -1759,9 +1859,15 @@ pub(crate) fn doctor(
                 " Provider lifecycle configuration could not be validated ({error}); fix the provider configuration before running repair."
             ));
         } else if !configured {
-            guidance.push_str(
-                " The installed hook specification is missing or drifted; run activity setup --repair after reviewing the dry-run.",
-            );
+            if agent == AgentKind::Codex {
+                guidance.push_str(
+                    " The installed lifecycle specification is missing or drifted; run activity setup --agent codex --repair --dry-run and proceed with repair only when apply_allowed is true.",
+                );
+            } else {
+                guidance.push_str(
+                    " The installed hook specification is missing or drifted; run activity setup --repair after reviewing the dry-run.",
+                );
+            }
         }
         if !helper_executable {
             guidance.push_str(
@@ -1883,16 +1989,23 @@ pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult
         .then(codex_notification_config_path)
         .transpose()?;
     let configured_before = provider_configured(agent, &path)?;
-    let (would_change, would_configure) = match agent {
+    let (would_change, would_configure, apply_allowed, notification_preview) = match agent {
         AgentKind::Codex => {
             let notify_path = notification_path.as_deref().expect("Codex notify path");
             setup_codex_provider(&path, notify_path, action)?
         }
-        AgentKind::Claude => setup_json_provider(agent, &path, action)?,
-        AgentKind::Hermes => setup_hermes(&path, action)?,
+        AgentKind::Claude => {
+            let (changed, configured) = setup_json_provider(agent, &path, action)?;
+            (changed, configured, true, None)
+        }
+        AgentKind::Hermes => {
+            let (changed, configured) = setup_hermes(&path, action)?;
+            (changed, configured, true, None)
+        }
     };
     let action_name = match action {
         SetupAction::DryRun => "dry-run",
+        SetupAction::RepairPreview => "repair-preview",
         SetupAction::Apply => "apply",
         SetupAction::Remove => "remove",
         SetupAction::Repair => "repair",
@@ -1900,16 +2013,19 @@ pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult
     Ok(SetupResult {
         provider: agent.as_str().to_string(),
         action: action_name.to_string(),
-        changed: action != SetupAction::DryRun && would_change,
+        changed: !matches!(action, SetupAction::DryRun | SetupAction::RepairPreview)
+            && would_change,
         would_change,
-        configured: if action == SetupAction::DryRun {
+        configured: if matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
             configured_before
         } else {
             would_configure
         },
         would_configure,
+        apply_allowed,
         config_path: display_path(&path),
         notification_config_path: notification_path.as_deref().map(display_path),
+        notification_preview,
         owned_events: provider_specs(agent)
             .into_iter()
             .map(|spec| spec.event.to_string())
@@ -2070,6 +2186,13 @@ struct ProviderConfigPlan {
     updated_bytes: Vec<u8>,
     changed: bool,
     configured: bool,
+}
+
+#[derive(Debug)]
+struct CodexNotificationPlan {
+    config: ProviderConfigPlan,
+    preview: CodexNotificationPreview,
+    apply_allowed: bool,
 }
 
 fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
@@ -2281,10 +2404,27 @@ fn codex_notify_mode_name(mode: &CodexNotifyMode) -> &'static str {
     }
 }
 
+fn codex_forward_argv_sha256(argv: &[String]) -> Result<String, CliError> {
+    let mut encoded = serde_json::to_vec(argv).map_err(|_| {
+        CliError::data(
+            "provider-notification-config-invalid",
+            "Codex user-owned notify argv could not be encoded for safe preview",
+            None,
+        )
+    })?;
+    // Match the operational comparison contract: compact JSON argv followed by
+    // one LF, so an operator can compare this content-free digest with a
+    // separately decoded composed notifier without exposing argv values.
+    encoded.push(b'\n');
+    let mut digest = Sha256::new();
+    digest.update(encoded);
+    Ok(format!("sha256:{}", hex_digest(digest.finalize())))
+}
+
 fn plan_codex_notification(
     path: &Path,
     action: SetupAction,
-) -> Result<ProviderConfigPlan, CliError> {
+) -> Result<CodexNotificationPlan, CliError> {
     let original_bytes = if path.is_file() {
         Some(
             fs::read(path)
@@ -2312,6 +2452,18 @@ fn plan_codex_notification(
         parse_codex_notification_config(path, &raw)?
     };
     let mode = codex_notify_mode(&document);
+    let current_mode = codex_notify_mode_name(&mode).to_string();
+    let forwarded_preview = match &mode {
+        CodexNotifyMode::Composed(forwarded) | CodexNotifyMode::Foreign(forwarded)
+            if codex_forward_argv_is_safe(forwarded) =>
+        {
+            Some((forwarded.len(), codex_forward_argv_sha256(forwarded)?))
+        }
+        _ => None,
+    };
+    let mut reversible = true;
+    let mut blocker_code = None;
+    let mut apply_allowed = true;
     let remove = action == SetupAction::Remove;
     if remove {
         match mode {
@@ -2359,11 +2511,18 @@ fn plan_codex_notification(
                 restored_argv.extend(forwarded);
                 restored["notify"] = toml_value(restored_argv);
                 if Some(restored.to_string().as_bytes()) != original_bytes.as_deref() {
-                    return Err(CliError::data(
-                        "provider-notification-config-conflict",
-                        "Codex user-owned notify argv cannot be composed with byte-exact removal; it was preserved and activity setup made no changes",
-                        Some(json!({ "path": display_path(path) })),
-                    ));
+                    if action == SetupAction::RepairPreview {
+                        reversible = false;
+                        apply_allowed = false;
+                        blocker_code =
+                            Some("provider-notification-config-nonreversible".to_string());
+                    } else {
+                        return Err(CliError::data(
+                            "provider-notification-config-conflict",
+                            "Codex user-owned notify argv cannot be composed with byte-exact removal; it was preserved and activity setup made no changes",
+                            Some(json!({ "path": display_path(path) })),
+                        ));
+                    }
                 }
             }
             CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {
@@ -2378,15 +2537,31 @@ fn plan_codex_notification(
     let rendered = document.to_string().into_bytes();
     let original_rendered = original_bytes.as_deref().unwrap_or_default();
     let changed = rendered != original_rendered;
-    Ok(ProviderConfigPlan {
-        path: path.to_path_buf(),
-        original_bytes,
-        updated_bytes: rendered,
-        changed,
-        configured: matches!(
-            codex_notify_mode(&document),
-            CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
-        ),
+    let candidate_mode = codex_notify_mode(&document);
+    let candidate_configured = matches!(
+        candidate_mode,
+        CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
+    );
+    let (forwarded_argc, forwarded_argv_sha256) = forwarded_preview
+        .map(|(argc, hash)| (Some(argc), Some(hash)))
+        .unwrap_or((None, None));
+    Ok(CodexNotificationPlan {
+        config: ProviderConfigPlan {
+            path: path.to_path_buf(),
+            original_bytes,
+            updated_bytes: rendered,
+            changed,
+            configured: candidate_configured,
+        },
+        preview: CodexNotificationPreview {
+            current_mode,
+            candidate_mode: codex_notify_mode_name(&candidate_mode).to_string(),
+            forwarded_argc,
+            forwarded_argv_sha256,
+            reversible,
+            blocker_code,
+        },
+        apply_allowed,
     })
 }
 
@@ -2394,20 +2569,22 @@ fn setup_codex_provider(
     hooks_path: &Path,
     notification_path: &Path,
     action: SetupAction,
-) -> Result<(bool, bool), CliError> {
+) -> Result<(bool, bool, bool, Option<CodexNotificationPreview>), CliError> {
     // Parse and render both files before either can change. This makes invalid
     // or conflicting notification configuration a preflight failure for apply,
     // repair, and remove alike.
     let hooks = plan_json_provider(AgentKind::Codex, hooks_path, action)?;
     let notification = plan_codex_notification(notification_path, action)?;
-    let changed = hooks.changed || notification.changed;
-    let configured = hooks.configured && notification.configured;
-    if action == SetupAction::DryRun {
-        return Ok((changed, configured));
+    let changed = hooks.changed || notification.config.changed;
+    let configured =
+        hooks.configured && notification.config.configured && notification.apply_allowed;
+    let preview = (action == SetupAction::RepairPreview).then(|| notification.preview.clone());
+    if matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
+        return Ok((changed, configured, notification.apply_allowed, preview));
     }
 
-    apply_codex_provider_plans(&hooks, &notification)?;
-    Ok((changed, configured))
+    apply_codex_provider_plans(&hooks, &notification.config)?;
+    Ok((changed, configured, true, None))
 }
 
 fn apply_codex_provider_plans(
@@ -2530,7 +2707,7 @@ fn setup_json_provider(
     action: SetupAction,
 ) -> Result<(bool, bool), CliError> {
     let plan = plan_json_provider(agent, path, action)?;
-    if action != SetupAction::DryRun {
+    if !matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
         apply_provider_config_plan(&plan)?;
     }
     Ok((plan.changed, plan.configured))
@@ -2808,7 +2985,7 @@ fn setup_hermes(path: &Path, action: SetupAction) -> Result<(bool, bool), CliErr
         root.remove(&hooks_key);
     }
     let changed = updated != original;
-    if changed && action != SetupAction::DryRun {
+    if changed && !matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
         let rendered = serde_yaml_ng::to_string(&updated).map_err(|err| {
             CliError::runtime(
                 "provider-config-render-failed",
@@ -3665,6 +3842,147 @@ mod tests {
     }
 
     #[test]
+    fn hermes_approval_hooks_use_runtime_scoped_metadata_correlation() {
+        let fixture = include_str!("../tests/fixtures/activity/hermes-approval-events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("Hermes approval fixture"))
+            .collect::<Vec<_>>();
+        let approval = fixture[0].clone();
+        let request = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("pre_approval_request"),
+            "runtime-1",
+            &approval,
+        )
+        .expect("request mapping")
+        .expect("recognized request");
+        assert_eq!(request.kind, TurnEventKind::AttentionRequested);
+        assert_eq!(request.attention_kind.as_deref(), Some("approval"));
+        assert_eq!(request.confidence, Confidence::Observed);
+        let correlation = request.attention_id.as_deref().expect("correlation id");
+        assert!(correlation.starts_with("local:v1:"));
+
+        let response_payload = fixture[1].clone();
+        let response = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("post_approval_response"),
+            "runtime-1",
+            &response_payload,
+        )
+        .expect("response mapping")
+        .expect("recognized response");
+        assert_eq!(response.kind, TurnEventKind::AttentionCleared);
+        assert_eq!(response.attention_id.as_deref(), Some(correlation));
+        assert_eq!(response.confidence, Confidence::Observed);
+
+        let mut reordered = response_payload.clone();
+        reordered["pattern_keys"] = json!(["shell_escalation", "sudo", "sudo"]);
+        let reordered = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("post_approval_response"),
+            "runtime-1",
+            &reordered,
+        )
+        .expect("reordered mapping")
+        .expect("recognized response");
+        assert_eq!(reordered.attention_id.as_deref(), Some(correlation));
+
+        let same_other_runtime = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("pre_approval_request"),
+            "runtime-2",
+            &approval,
+        )
+        .expect("other runtime mapping")
+        .expect("recognized request");
+        assert_ne!(same_other_runtime.attention_id, request.attention_id);
+
+        let mut different = approval.clone();
+        different["pattern_keys"] = json!(["sudo"]);
+        let different = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("pre_approval_request"),
+            "runtime-1",
+            &different,
+        )
+        .expect("different mapping")
+        .expect("recognized request");
+        assert_ne!(different.attention_id, request.attention_id);
+        assert_ne!(semantic_event_key(&different), semantic_event_key(&request));
+        assert_eq!(
+            semantic_event_key(&reordered),
+            semantic_event_key(&response)
+        );
+
+        let missing = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("pre_approval_request"),
+            "runtime-1",
+            &json!({
+                "session_key": "hermes-session",
+                "surface": "cli",
+                "command": "must-not-appear-in-diagnostic"
+            }),
+        )
+        .expect_err("the complete matching tuple is required");
+        assert_eq!(missing.code(), "provider-hook-correlation-missing");
+        assert!(!format!("{missing:?}").contains("must-not-appear-in-diagnostic"));
+
+        let mut invalid_response = response_payload.clone();
+        invalid_response["choice"] = json!("future-choice");
+        let invalid_response = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("post_approval_response"),
+            "runtime-1",
+            &invalid_response,
+        )
+        .expect_err("unknown response choices must not clear attention");
+        assert_eq!(invalid_response.code(), "provider-hook-response-invalid");
+
+        let mut document = document();
+        reduce(
+            &mut document,
+            &event(TurnEventKind::TurnStarted, "start"),
+            "2026-07-10T00:00:01Z",
+        );
+        reduce(&mut document, &request, "2026-07-10T00:00:02Z");
+        reduce(&mut document, &different, "2026-07-10T00:00:03Z");
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(2)
+        );
+        reduce(&mut document, &response, "2026-07-10T00:00:04Z");
+        assert_eq!(document.state.phase, TurnPhase::NeedsInput);
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(1)
+        );
+
+        for event in [&request, &response] {
+            let serialized = serde_json::to_string(event).expect("event json");
+            for forbidden in [
+                "discarded-command",
+                "discarded-description",
+                "shell_escalation",
+                "hermes-session",
+                "choice",
+            ] {
+                assert!(!serialized.contains(forbidden), "forbidden {forbidden}");
+            }
+        }
+    }
+
+    #[test]
     fn frozen_provider_fixtures_replay_through_each_adapter() {
         let cases = [
             (
@@ -3696,12 +4014,7 @@ mod tests {
             (
                 AgentKind::Hermes,
                 include_str!("../tests/fixtures/activity/hermes-events.jsonl"),
-                vec![
-                    TurnEventKind::TurnStarted,
-                    TurnEventKind::AttentionRequested,
-                    TurnEventKind::Progress,
-                    TurnEventKind::TurnCompleted,
-                ],
+                vec![TurnEventKind::TurnStarted, TurnEventKind::TurnCompleted],
             ),
         ];
         for (agent, fixture, expected) in cases {
@@ -4217,7 +4530,7 @@ mod tests {
 
         let concurrent = b"notify = [\"user-notifier\"]\n";
         fs::write(&notification_path, concurrent).expect("concurrent notification config");
-        let error = apply_codex_provider_plans(&hooks, &notification)
+        let error = apply_codex_provider_plans(&hooks, &notification.config)
             .expect_err("second-file change must fail the transaction");
 
         assert_eq!(error.code(), "provider-config-concurrent-modification");
@@ -4242,11 +4555,11 @@ mod tests {
             .expect("hooks plan");
         let notification = plan_codex_notification(&notification_path, SetupAction::Apply)
             .expect("notification plan");
-        assert!(!notification.changed);
+        assert!(!notification.config.changed);
 
         let concurrent = b"notify = [\"user-notifier\"]\n";
         fs::write(&notification_path, concurrent).expect("concurrent notification config");
-        let error = apply_codex_provider_plans(&hooks, &notification)
+        let error = apply_codex_provider_plans(&hooks, &notification.config)
             .expect_err("unchanged second-file plan must still verify its snapshot");
 
         assert_eq!(error.code(), "provider-config-concurrent-modification");

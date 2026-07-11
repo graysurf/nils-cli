@@ -145,6 +145,16 @@ circuit breaker. Because these approvals have no correlated clear event, they
 keep the conservative latch above until completion, a new turn, or a runtime
 boundary.
 
+Hermes approval callbacks expose the same matching metadata tuple before and
+after the response but no provider request id. Agent-session canonicalizes
+`command`, `description`, `pattern_key`, sorted/deduplicated `pattern_keys`,
+`session_key`, and `surface` only in memory, then projects its SHA-256 through
+the runtime-scoped opaque identifier boundary. A matching response emits
+observed `attention_cleared` only for a documented response choice; raw
+command/description never enters activity storage. Distinct tuples clear
+independently. Concurrent requests with identical tuples are indistinguishable
+and share one conservative pending correlation.
+
 Revision is monotonic for each accepted non-duplicate event and runtime
 boundary. Phase timestamps change only when the phase changes. Durations are
 derived by clients and are never persisted separately.
@@ -222,6 +232,7 @@ drop/reconnect/title timeout cannot change durable turn state.
 agent-session activity setup --agent <provider> --dry-run
 agent-session activity setup --agent <provider> --apply
 agent-session activity setup --agent <provider> --repair
+agent-session activity setup --agent codex --repair --dry-run
 agent-session activity setup --agent <provider> --remove
 agent-session activity doctor [--agent <provider>] --format json
 ```
@@ -259,6 +270,13 @@ Codex, an exact owned or valid composed notify argv; helper health resolves the 
 command on PATH. Hook/notification diagnostics are bound to the active
 launch id/generation and the newest current-runtime diagnostic is selected
 deterministically across sessions.
+
+Codex repair preview (`--repair --dry-run`) is non-destructive even when a safe
+foreign notifier cannot pass byte-exact reversal. It reports only the
+current/candidate mode, argument count, reversibility, a blocker code, and
+SHA-256 of compact JSON argv plus one LF. It never emits argv values. A blocked
+preview does not weaken repair: `--repair` still fails closed and preserves both
+files exactly.
 
 Setup JSON distinguishes current and prospective state: `configured` and
 `changed` describe the file after the command, while `would_configure` and

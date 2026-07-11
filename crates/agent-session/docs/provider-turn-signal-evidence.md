@@ -5,14 +5,17 @@
 This report freezes the provider lifecycle evidence used by
 `agent-session.turn-event.v1` and `agent-session.turn-state.v1`. It was audited
 on 2026-07-11 against Codex CLI 0.144.1, Claude Code 2.1.206, Hermes Agent
-0.18.0, and the agent-session 1.21.8 implementation baseline. The support floors are deliberately the
+0.18.2, and the agent-session 1.21.17 implementation baseline. The support floors are deliberately the
 oldest versions directly covered by this audit, not guesses about earlier
 releases.
 
 The fixtures under `tests/fixtures/activity/` contain lifecycle identifiers and
-event names only. Prompt text, assistant output, tool input/output, commands,
-transcript paths, credentials, and terminal content are removed before the
-normalized event is created.
+event names. The dedicated Hermes approval fixture additionally carries
+explicit discarded sentinel values for the matching metadata fields required by
+the provider contract; tests prove those values do not survive normalization.
+Prompt text, assistant output, tool input/output, commands, transcript paths,
+credentials, and terminal content are removed before the normalized event is
+created.
 
 ## Evidence sources
 
@@ -45,7 +48,7 @@ normalized event is created.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Codex | 0.144.1 | supported | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive hooks in `~/.codex/hooks.json` plus owned or bounded direct-argv-composed notify in `~/.codex/config.toml`; unsafe/recursive values fail closed |
 | Claude Code | 2.1.206 | partial | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | `StopFailure`, observed; `AskUserQuestion` tool failure clears only its clarification | additive merge into `~/.claude/settings.json` |
-| Hermes | 0.18.0 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | pre/post approval hooks exist, but clearing remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
+| Hermes | 0.18.0 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | pre/post approval metadata derives an observed runtime-scoped correlation; distinct tuples clear exactly, duplicate-identical concurrency remains indistinguishable | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
 Versions below the audited floor remain usable. `activity doctor` reports them
 as unverified and session views retain optional-field/activity fallback rather
@@ -104,10 +107,17 @@ same conservative latch as every other permission mode.
 
 The installed `post_llm_call` fires only after a successful final response and
 does not fire for interruption, so it is authoritative completion at the
-audited version. Approval hooks expose `session_key`, surface, and response
-choice, but no stable per-request id. `post_approval_response` is recorded as
-progress and cannot by itself clear Needs input; completion or a new turn clears
-the latch.
+audited version. The official pre/post approval callbacks carry the same
+`command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, and
+`surface` tuple; post additionally carries the response choice. The adapter
+canonicalizes that matching tuple in memory and projects its SHA-256 through the
+existing runtime-scoped identifier boundary. Raw command and description text
+are never persisted. A matching post response therefore clears the distinct
+pending approval with observed confidence only when `choice` is one of the
+documented response values; missing or unknown choices fail open without
+clearing. Hermes still exposes no provider request id: two concurrent approvals
+with identical matching metadata are
+indistinguishable and intentionally share one conservative correlation.
 
 ## Concurrency, continuation, and privacy probes
 
@@ -139,6 +149,10 @@ The executable fixtures cover:
   for all three provider configs, including Codex notify absence/ownership,
   reversible user-owned argv composition, literal no-shell forwarding, bounded
   downstream hangs/failures, and unsafe/recursive conflict preservation.
+- `--repair --dry-run` emits a content-free Codex notification preview. Safe
+  foreign argv that cannot satisfy byte-exact removal is identified only by
+  argument count and SHA-256 of compact JSON plus one LF; apply remains blocked
+  and both config files remain byte-identical.
 
 The live release probe uses a no-content marker turn for each installed provider
 after the released binary is installed. Retained evidence records only provider
@@ -173,6 +187,11 @@ authoritative completion across transient contention. Removal decodes and
 restores the original argv. Unsafe, oversized, non-string, nested-forward, or
 non-reversible
 values return a content-free conflict before mutating the hooks file.
+For repair review, `activity setup --agent codex --repair --dry-run` keeps both
+files untouched and reports current/candidate mode, exact-reversal status,
+argument count, and a compact-JSON-plus-LF SHA-256 without exposing argv. A
+non-reversible serialization remains blocked; the preview does not authorize or
+perform normalization.
 Apply/repair/remove parse and plan both files before either mutation; a guarded
 second-write failure restores the first write, while a rollback race surfaces an
 explicit error naming both metadata-only paths.

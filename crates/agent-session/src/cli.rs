@@ -369,7 +369,7 @@ pub struct ActivitySetupArgs {
     #[arg(
         long,
         required_unless_present_any = ["apply", "remove", "repair"],
-        conflicts_with_all = ["apply", "remove", "repair"]
+        conflicts_with_all = ["apply", "remove"]
     )]
     pub dry_run: bool,
 
@@ -383,7 +383,7 @@ pub struct ActivitySetupArgs {
     pub remove: bool,
 
     /// Restore missing agent-session-owned entries without replacing others.
-    #[arg(long, conflicts_with_all = ["dry_run", "apply", "remove"])]
+    #[arg(long, conflicts_with_all = ["apply", "remove"])]
     pub repair: bool,
 
     /// Output format.

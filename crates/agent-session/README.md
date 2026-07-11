@@ -26,6 +26,7 @@ agent-session resume <id>
 agent-session activity status <id> --format json
 agent-session activity doctor --format json
 agent-session activity setup --agent codex --dry-run
+agent-session activity setup --agent codex --repair --dry-run
 printf '%s' "$AGENT_SESSION_TOKEN" | agent-session serve --bind 127.0.0.1:8781 --token-stdin
 agent-session command <id>
 agent-session attach <id>
@@ -64,6 +65,7 @@ after reviewing the provider trust/consent boundary:
 
 ```bash
 agent-session activity setup --agent codex --dry-run
+agent-session activity setup --agent codex --repair --dry-run
 agent-session activity setup --agent codex --apply
 agent-session activity doctor --agent codex --format json
 agent-session activity setup --agent codex --remove

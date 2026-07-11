@@ -881,6 +881,85 @@ fn codex_activity_setup_refuses_composition_that_cannot_restore_exact_bytes() {
 }
 
 #[test]
+fn codex_activity_repair_preview_reports_safe_nonreversible_notifier_by_hash() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let notify_path = home.join(".codex/config.toml");
+    fs::write(&hooks_path, r#"{"keep":"hooks"}"#).expect("hooks config");
+    fs::write(
+        &notify_path,
+        "# desktop rewrite\nnotify = [\n  \"user-notifier\",\n  \"--title\",\n  \"sensitive-title-must-not-persist\",\n  \"--message\",\n]\n",
+    )
+    .expect("notify config");
+    let hooks_before = fs::read(&hooks_path).expect("hooks before");
+    let notify_before = fs::read(&notify_path).expect("notify before");
+    let home_arg = home.to_string_lossy().to_string();
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview = preview.stdout_json();
+    let result = data(&preview);
+    assert_eq!(result["action"], "repair-preview");
+    assert_eq!(result["changed"], false);
+    assert_eq!(result["configured"], false);
+    assert_eq!(result["apply_allowed"], false);
+    assert_eq!(result["notification_preview"]["current_mode"], "conflict");
+    assert_eq!(result["notification_preview"]["candidate_mode"], "composed");
+    assert_eq!(result["notification_preview"]["forwarded_argc"], 4);
+    assert_eq!(result["notification_preview"]["reversible"], false);
+    assert_eq!(
+        result["notification_preview"]["blocker_code"],
+        "provider-notification-config-nonreversible"
+    );
+    assert_eq!(
+        result["notification_preview"]["forwarded_argv_sha256"],
+        "sha256:1396340af9627c539dea8d0fff93faa8e06f84c38cadeebad406d4100ef6ad55",
+        "preview hash must match compact JSON argv plus one LF"
+    );
+    let serialized = serde_json::to_string(&preview).expect("preview json");
+    for forbidden in [
+        "user-notifier",
+        "--title",
+        "sensitive-title-must-not-persist",
+        "--message",
+    ] {
+        assert!(!serialized.contains(forbidden), "forbidden {forbidden}");
+    }
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+
+    let repair = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--repair", "--format", "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_ne!(repair.code, 0);
+    assert_eq!(
+        repair.stdout_json()["error"]["code"],
+        "provider-notification-config-conflict"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&notify_path).expect("notify after"), notify_before);
+}
+
+#[test]
 fn codex_activity_setup_refuses_a_recursive_notify_without_mutating_configs() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");
