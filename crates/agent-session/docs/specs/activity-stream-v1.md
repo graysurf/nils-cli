@@ -128,8 +128,12 @@ Without `Last-Event-ID`, a subscriber first receives the latest full snapshot.
 A retained cursor for the current stream replays events whose sequence is
 greater than the cursor. A malformed cursor, another daemon boot id, a cursor
 beyond the current sequence, or an evicted cursor receives the latest full
-state as `reset`. The replay window retains at most 128 frames and at most
-512 KiB of pre-framed SSE wire bytes. Oldest frames are evicted until both
+state as `reset`. An exact cached full frame retains its existing identity;
+otherwise a subscription recovery snapshot or reset receives a new global
+sequence, enters replay history, and is broadcast to existing subscribers.
+That gives every distinct emitted payload one stable event identity without
+creating a sequence gap. The replay window retains at most 128 frames and at
+most 512 KiB of pre-framed SSE wire bytes. Oldest frames are evicted until both
 limits hold; if any sequence needed by a cursor was evicted, the subscriber
 receives a reset. An oversized latest snapshot receives the content-free reset
 described above.

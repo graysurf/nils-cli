@@ -582,9 +582,11 @@ impl ActivityEventLog {
         let mut state = self.state.lock().expect("activity event state lock");
         let current_sequence = self.sequence.load(Ordering::SeqCst);
         let pending = match last_event_id.and_then(parse_activity_event_id) {
-            None if last_event_id.is_none() => {
-                VecDeque::from([self.full_event_locked(&mut state, current_sequence, "snapshot")])
-            }
+            None if last_event_id.is_none() => VecDeque::from([state
+                .cached_snapshot
+                .clone()
+                .filter(|frame| frame.sequence == current_sequence)
+                .unwrap_or_else(|| self.publish_full_event_locked(&mut state, "snapshot"))]),
             Some((stream_id, sequence))
                 if stream_id == self.stream_id && sequence <= current_sequence =>
             {
@@ -611,10 +613,10 @@ impl ActivityEventLog {
                 if contiguous {
                     replay
                 } else {
-                    VecDeque::from([self.reset_event_locked(&mut state, current_sequence)])
+                    VecDeque::from([self.publish_full_event_locked(&mut state, "reset")])
                 }
             }
-            _ => VecDeque::from([self.reset_event_locked(&mut state, current_sequence)]),
+            _ => VecDeque::from([self.publish_full_event_locked(&mut state, "reset")]),
         };
         ActivitySubscription {
             log: self.clone(),
@@ -634,8 +636,12 @@ impl ActivityEventLog {
 
     fn reset_event(&self) -> Arc<ActivityStreamFrame> {
         let mut state = self.state.lock().expect("activity event state lock");
-        let sequence = self.sequence.load(Ordering::SeqCst);
-        self.reset_event_locked(&mut state, sequence)
+        let current_sequence = self.sequence.load(Ordering::SeqCst);
+        state
+            .cached_reset
+            .clone()
+            .filter(|frame| frame.sequence == current_sequence)
+            .unwrap_or_else(|| self.publish_full_event_locked(&mut state, "reset"))
     }
 
     fn degraded_reset_event(&self) -> Arc<ActivityStreamFrame> {
@@ -644,36 +650,25 @@ impl ActivityEventLog {
         self.uncached_full_event_locked(&state, sequence, "reset")
     }
 
-    fn reset_event_locked(
+    fn publish_full_event_locked(
         &self,
         state: &mut ActivityEventState,
-        sequence: u64,
-    ) -> Arc<ActivityStreamFrame> {
-        self.full_event_locked(state, sequence, "reset")
-    }
-
-    fn full_event_locked(
-        &self,
-        state: &mut ActivityEventState,
-        sequence: u64,
         kind: &'static str,
     ) -> Arc<ActivityStreamFrame> {
-        let cached = if kind == "snapshot" {
-            &state.cached_snapshot
-        } else {
-            &state.cached_reset
-        };
-        if let Some(frame) = cached
-            && frame.sequence == sequence
-        {
-            return frame.clone();
-        }
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        state.cached_snapshot = None;
+        state.cached_reset = None;
         let frame = self.uncached_full_event_locked(state, sequence, kind);
         if kind == "snapshot" {
             state.cached_snapshot = Some(frame.clone());
         } else {
             state.cached_reset = Some(frame.clone());
         }
+        if state.latest_snapshot_oversized {
+            state.cached_snapshot = Some(frame.clone());
+            state.cached_reset = Some(frame.clone());
+        }
+        self.retain_and_broadcast_locked(state, frame.clone());
         frame
     }
 
@@ -6262,18 +6257,22 @@ mod tests {
         assert_eq!(data["type"], "snapshot");
         assert_eq!(data["sessions"][0]["id"], "cursor-session");
 
-        for cursor in [
+        for (offset, cursor) in [
             "malformed".to_string(),
             format!("{stream_id}:999"),
             "foreign-stream:1".to_string(),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (id, event, data) = parse_activity_sse_frame(
                 &first_activity_sse_frame(st.clone(), Some(&cursor)).await,
             );
-            assert_eq!(id, format!("{stream_id}:3"));
+            let expected_sequence = 4 + offset as u64;
+            assert_eq!(id, format!("{stream_id}:{expected_sequence}"));
             assert_eq!(event, "reset");
             assert_eq!(data["type"], "reset");
-            assert_eq!(data["sequence"], 3);
+            assert_eq!(data["sequence"], expected_sequence);
             assert_eq!(data["sessions"][0]["id"], "cursor-session");
         }
 
@@ -6438,10 +6437,11 @@ mod tests {
         assert_eq!(changed.sequence, 3);
         assert_eq!(changed.kind, "snapshot");
 
+        let mut live = log.subscribe(Some(&format!("{}:3", log.stream_id)));
         let mut foreign = log.subscribe(Some("other-stream:3"));
         let reset = foreign.next_event().await.unwrap();
         assert_eq!(reset.kind, "reset");
-        assert_eq!(reset.sequence, 3);
+        assert_eq!(reset.sequence, 4);
         assert_eq!(
             reset.sessions.as_ref().unwrap()[0]
                 .turn_state
@@ -6450,6 +6450,12 @@ mod tests {
                 .revision,
             2
         );
+        let broadcast_reset = tokio::time::timeout(Duration::from_millis(100), live.next_event())
+            .await
+            .expect("reconciliation reset must reach existing subscribers")
+            .expect("activity stream remains open");
+        assert_eq!(broadcast_reset.kind, "reset");
+        assert_eq!(broadcast_reset.sequence, reset.sequence);
 
         for _ in 0..ACTIVITY_STREAM_REPLAY_CAPACITY {
             log.publish_heartbeat();
