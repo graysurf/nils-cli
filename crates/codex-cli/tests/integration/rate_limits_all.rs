@@ -79,6 +79,49 @@ fn rate_limits_all_json_missing_secret_dir_is_structured() {
 }
 
 #[test]
+fn rate_limits_all_json_classifies_past_due_billing_without_forwarding_provider_body() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    fs::write(
+        secrets.join("alpha.json"),
+        r#"{"tokens":{"access_token":"tok","account_id":"acct_001"}}"#,
+    )
+    .expect("alpha");
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(
+            402,
+            r#"{"error":{"message":"Your subscription payment is past due. Please pay your overdue invoice."}}"#,
+        ),
+    );
+
+    let output = run(
+        &[
+            "diag",
+            "rate-limits",
+            "--all",
+            "--format",
+            "json",
+            "--no-refresh-auth",
+        ],
+        &[("CODEX_SECRET_DIR", &secrets)],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+        ],
+    );
+
+    assert_exit(&output, 1);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["results"][0]["reason_code"], "billing_past_due");
+    assert!(!stdout(&output).contains("overdue invoice"));
+    assert!(!stdout(&output).contains("acct_001"));
+}
+
+#[test]
 fn rate_limits_all_json_empty_secret_dir_is_structured() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let secrets = dir.path().join("secrets");

@@ -196,6 +196,214 @@ OUT
 }
 
 #[test]
+fn usage_oauth_classifies_past_due_billing_without_forwarding_provider_body() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let server = LoopbackServer::new().expect("server");
+    let provider_body = r#"{"error":{"message":"Your subscription payment is past due. Please pay your overdue invoice to restore access."}}"#;
+    server.add_route("GET", "/usage", HttpResponse::new(402, provider_body));
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "oauth"],
+        &base_options(tmp.path())
+            .with_env("CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN", "secret-token-billing")
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+                &format!("{}/usage", server.url()),
+            ),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["reason_code"], "billing_past_due");
+    assert!(!stdout(&output).contains("overdue invoice"));
+    assert!(!stdout(&output).contains("secret-token-billing"));
+}
+
+#[test]
+fn usage_oauth_classifies_missing_auth() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        &["usage", "--format", "json", "--source", "oauth"],
+        &base_options(tmp.path()),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["reason_code"], "auth_required");
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_cli_classifies_organization_disabled_without_forwarding_terminal_text() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = write_fake_claude(
+        tmp.path(),
+        r#"#!/usr/bin/env sh
+cat >/dev/null
+printf '%s\n' 'Your organization has disabled Claude subscription access for Claude Code. Contact your admin.'
+"#,
+    );
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "cli"],
+        &base_options(tmp.path())
+            .with_path_prepend(&bin_dir)
+            .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED", "1"),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["reason_code"], "organization_disabled");
+    assert!(!stdout(&output).contains("Contact your admin"));
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_auto_prefers_recent_structured_api_error_over_generic_usage_failure() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().join("claude-config");
+    let transcript = config_dir.join("projects/repo/session.jsonl");
+    std::fs::create_dir_all(transcript.parent().expect("parent")).expect("projects");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"assistant","isApiErrorMessage":true,"message":{"type":"message","content":[{"type":"text","text":"Your organization has disabled Claude subscription access for Claude Code. Contact your admin."}]}}
+"#,
+    )
+    .expect("transcript");
+    let bin_dir = write_fake_claude(
+        tmp.path(),
+        "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\\n' 'usage unavailable'\n",
+    );
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(429, "rate limited"));
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "auto"],
+        &base_options(tmp.path())
+            .with_path_prepend(&bin_dir)
+            .with_env("CLAUDE_CONFIG_DIR", &path_str(&config_dir))
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+                "secret-token-api-error",
+            )
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+                &format!("{}/usage", server.url()),
+            )
+            .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED", "1"),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["reason_code"], "organization_disabled");
+    assert!(!stdout(&output).contains("Contact your admin"));
+    assert!(!stdout(&output).contains("session.jsonl"));
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_auto_ignores_structured_api_error_after_newer_assistant_success() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().join("claude-config");
+    let transcript = config_dir.join("projects/repo/session.jsonl");
+    std::fs::create_dir_all(transcript.parent().expect("parent")).expect("projects");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"type":"message","content":[{"type":"text","text":"Your organization has disabled Claude subscription access for Claude Code. Contact your admin."}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"type":"message","content":[{"type":"text","text":"Access restored."}]}}"#,
+            "\n"
+        ),
+    )
+    .expect("transcript");
+    let bin_dir = write_fake_claude(
+        tmp.path(),
+        "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\\n' 'usage unavailable'\n",
+    );
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(429, "rate limited"));
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "auto"],
+        &base_options(tmp.path())
+            .with_path_prepend(&bin_dir)
+            .with_env("CLAUDE_CONFIG_DIR", &path_str(&config_dir))
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+                "secret-token-api-error",
+            )
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+                &format!("{}/usage", server.url()),
+            )
+            .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED", "1"),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["reason_code"], "rate_limited");
+    assert!(!stdout(&output).contains("Contact your admin"));
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_auto_ignores_older_error_after_newer_success_in_another_transcript() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().join("claude-config");
+    let projects = config_dir.join("projects/repo");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let error_transcript = projects.join("older-error.jsonl");
+    std::fs::write(
+        &error_transcript,
+        concat!(
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"text":"Your organization has disabled Claude access."}]}}"#,
+            "\n"
+        ),
+    )
+    .expect("error transcript");
+    let success_transcript = projects.join("newer-success.jsonl");
+    std::fs::write(
+        &success_transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"content":[{"text":"Access restored."}]}}"#,
+            "\n"
+        ),
+    )
+    .expect("success transcript");
+    let now = SystemTime::now();
+    set_modified(&error_transcript, now - Duration::from_secs(60));
+    set_modified(&success_transcript, now);
+    let bin_dir = write_fake_claude(
+        tmp.path(),
+        "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\\n' 'usage unavailable'\n",
+    );
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(429, "rate limited"));
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "auto"],
+        &base_options(tmp.path())
+            .with_path_prepend(&bin_dir)
+            .with_env("CLAUDE_CONFIG_DIR", &path_str(&config_dir))
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+                "secret-token-api-error",
+            )
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+                &format!("{}/usage", server.url()),
+            )
+            .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED", "1"),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["reason_code"], "rate_limited");
+    assert!(!stdout(&output).contains("organization_disabled"));
+}
+
+#[test]
 fn usage_cache_source_outputs_epoch_for_human_reset_times() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache_file = write_cache(

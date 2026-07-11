@@ -1,4 +1,5 @@
 use codex_cli::rate_limits::client::{UsageRequest, fetch_usage, read_tokens};
+use nils_common::provider_usage::ProviderUsageReason;
 use nils_test_support::http::{HttpResponse, LoopbackServer};
 use nils_test_support::{EnvGuard, GlobalStateLock};
 use pretty_assertions::assert_eq;
@@ -23,7 +24,7 @@ fn rate_limits_client_read_tokens_supports_root_account_id() {
 }
 
 #[test]
-fn rate_limits_client_fetch_usage_errors_include_body_preview() {
+fn rate_limits_client_fetch_usage_errors_are_classified_without_body_preview() {
     let server = LoopbackServer::new().expect("server");
     server.add_route(
         "GET",
@@ -48,11 +49,10 @@ fn rate_limits_client_fetch_usage_errors_include_body_preview() {
 
     let err = match fetch_usage(&request) {
         Ok(_) => panic!("expected fetch_usage to error"),
-        Err(err) => err.to_string(),
+        Err(err) => err,
     };
-    assert!(err.contains("HTTP 500"));
-    assert!(err.contains("body:"));
-    assert!(err.contains("hello world"));
+    assert_eq!(err.reason(), ProviderUsageReason::ServiceUnavailable);
+    assert!(!err.to_string().contains("hello world"));
 }
 
 #[test]
@@ -74,10 +74,9 @@ fn rate_limits_client_fetch_usage_errors_without_body_when_empty() {
 
     let err = match fetch_usage(&request) {
         Ok(_) => panic!("expected fetch_usage to error"),
-        Err(err) => err.to_string(),
+        Err(err) => err,
     };
-    assert!(err.contains("HTTP 500"));
-    assert!(!err.contains("body:"));
+    assert_eq!(err.reason(), ProviderUsageReason::ServiceUnavailable);
 }
 
 #[test]
@@ -99,9 +98,9 @@ fn rate_limits_client_fetch_usage_invalid_json_is_error() {
 
     let err = match fetch_usage(&request) {
         Ok(_) => panic!("expected fetch_usage to error"),
-        Err(err) => err.to_string(),
+        Err(err) => err,
     };
-    assert!(err.contains("invalid JSON"));
+    assert_eq!(err.reason(), ProviderUsageReason::Unknown);
 }
 
 #[test]
@@ -127,9 +126,9 @@ fn rate_limits_client_fetch_usage_refreshes_on_401_when_enabled() {
 
     let err = match fetch_usage(&request) {
         Ok(_) => panic!("expected fetch_usage to error"),
-        Err(err) => err.to_string(),
+        Err(err) => err,
     };
-    assert!(err.contains("HTTP 401"));
+    assert_eq!(err.reason(), ProviderUsageReason::AuthExpired);
 
     let requests = server.take_requests();
     assert_eq!(

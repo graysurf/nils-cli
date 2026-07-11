@@ -35,6 +35,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use futures_util::{SinkExt, StreamExt};
 use nils_common::cli_contract::{exit, schema_version_for};
+use nils_common::provider_usage::{ProviderUsageReason, prefer_reason};
 use nils_common::usage_time::{
     epoch_seconds_from_f64, normalize_epoch_seconds, reset_epoch_seconds_from_str,
 };
@@ -352,6 +353,8 @@ struct UsageProvider {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<ProviderUsageReason>,
     windows: Vec<UsageWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<UsageProviderError>,
@@ -541,6 +544,7 @@ fn normalize_codex_usage(output: UsageHelperOutput) -> UsageProvider {
         }
     };
 
+    let reason_code = reason_from_helper_json(&value);
     let results = value
         .get("results")
         .and_then(Value::as_array)
@@ -569,6 +573,7 @@ fn normalize_codex_usage(output: UsageHelperOutput) -> UsageProvider {
             label: "Codex".to_string(),
             ok: true,
             source: Some("codex-cli".to_string()),
+            reason_code,
             windows,
             error: None,
         };
@@ -576,7 +581,7 @@ fn normalize_codex_usage(output: UsageHelperOutput) -> UsageProvider {
 
     let (code, message) =
         error_from_helper_json(&value, output.status_code, "codex usage unavailable");
-    provider_error("codex", "Codex", &code, message)
+    provider_error_with_reason("codex", "Codex", &code, message, reason_code)
 }
 
 fn normalize_claude_usage(output: UsageHelperOutput) -> UsageProvider {
@@ -602,6 +607,7 @@ fn normalize_claude_usage(output: UsageHelperOutput) -> UsageProvider {
     };
 
     let result = value.get("result").unwrap_or(&value);
+    let reason_code = reason_from_helper_json(&value);
     let reference_epoch = i64_field(result, &["updated_at", "updatedAt"]);
     let windows = windows_from_value(result, reference_epoch);
     if !windows.is_empty() {
@@ -610,6 +616,7 @@ fn normalize_claude_usage(output: UsageHelperOutput) -> UsageProvider {
             label: "Claude".to_string(),
             ok: true,
             source: Some("claude-cli".to_string()),
+            reason_code,
             windows,
             error: None,
         };
@@ -617,7 +624,7 @@ fn normalize_claude_usage(output: UsageHelperOutput) -> UsageProvider {
 
     let (code, message) =
         error_from_helper_json(&value, output.status_code, "claude usage unavailable");
-    provider_error("claude", "Claude", &code, message)
+    provider_error_with_reason("claude", "Claude", &code, message, reason_code)
 }
 
 fn windows_from_value(value: &Value, reference_epoch: Option<i64>) -> Vec<UsageWindow> {
@@ -769,6 +776,44 @@ fn error_from_helper_json(
     (code, sanitize_helper_message(message))
 }
 
+fn reason_from_helper_json(value: &Value) -> Option<ProviderUsageReason> {
+    fn direct(value: &Value) -> Option<ProviderUsageReason> {
+        let direct = value
+            .get("reason_code")
+            .and_then(Value::as_str)
+            .and_then(ProviderUsageReason::from_code);
+        let details = value
+            .get("error")
+            .and_then(|error| error.get("details"))
+            .and_then(|details| details.get("reason_code"))
+            .and_then(Value::as_str)
+            .and_then(ProviderUsageReason::from_code);
+        match (direct, details) {
+            (Some(first), Some(second)) => Some(prefer_reason(first, second)),
+            (Some(reason), None) | (None, Some(reason)) => Some(reason),
+            (None, None) => None,
+        }
+    }
+
+    let mut reason = direct(value);
+    let mut merge = |candidate: Option<ProviderUsageReason>| {
+        if let Some(candidate) = candidate {
+            reason = Some(
+                reason
+                    .map(|current| prefer_reason(current, candidate))
+                    .unwrap_or(candidate),
+            );
+        }
+    };
+    merge(value.get("result").and_then(direct));
+    if let Some(results) = value.get("results").and_then(Value::as_array) {
+        for result in results {
+            merge(direct(result));
+        }
+    }
+    reason
+}
+
 fn helper_failure_message(prefix: &str, output: &UsageHelperOutput) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let message = stderr
@@ -788,11 +833,29 @@ fn provider_internal_error(id: &str, label: &str) -> UsageProvider {
 }
 
 fn provider_error(id: &str, label: &str, code: &str, message: String) -> UsageProvider {
+    let reason_code = match code {
+        "helper-timeout" => Some(ProviderUsageReason::Timeout),
+        "helper-spawn-failed" | "helper-invalid-json" | "serve-task-failed" => {
+            Some(ProviderUsageReason::ServiceUnavailable)
+        }
+        _ => None,
+    };
+    provider_error_with_reason(id, label, code, message, reason_code)
+}
+
+fn provider_error_with_reason(
+    id: &str,
+    label: &str,
+    code: &str,
+    message: String,
+    reason_code: Option<ProviderUsageReason>,
+) -> UsageProvider {
     UsageProvider {
         id: id.to_string(),
         label: label.to_string(),
         ok: false,
         source: None,
+        reason_code,
         windows: Vec::new(),
         error: Some(UsageProviderError {
             code: code.to_string(),
@@ -3261,6 +3324,154 @@ mod tests {
         assert_eq!(value["windows"][4]["reset_at_epoch"], 1_783_861_200);
         assert!(value["windows"][5].get("reset_at").is_none());
         assert!(value["windows"][5].get("reset_at_epoch").is_none());
+    }
+
+    #[test]
+    fn normalize_claude_usage_preserves_provider_reason_code() {
+        let provider = normalize_claude_usage(UsageHelperOutput {
+            status_code: Some(0),
+            stdout: br#"{
+  "schema_version": "claude-cli.usage.v1",
+  "command": "usage",
+  "ok": true,
+  "result": {
+    "source": "none",
+    "stale": true,
+    "windows": [],
+    "reason_code": "organization_disabled"
+  }
+}"#
+            .to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+
+        let value = serde_json::to_value(provider).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["reason_code"], "organization_disabled");
+    }
+
+    #[test]
+    fn normalize_claude_usage_preserves_reason_with_cached_windows() {
+        let provider = normalize_claude_usage(UsageHelperOutput {
+            status_code: Some(0),
+            stdout: br#"{
+  "schema_version": "claude-cli.usage.v1",
+  "command": "usage",
+  "ok": true,
+  "result": {
+    "source": "cache",
+    "stale": true,
+    "reason_code": "organization_disabled",
+    "windows": [{"label": "5h", "used_percent": 20, "remaining_percent": 80}]
+  }
+}"#
+            .to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+
+        let value = serde_json::to_value(provider).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["windows"][0]["used_percent"], 20);
+        assert_eq!(value["reason_code"], "organization_disabled");
+    }
+
+    #[test]
+    fn normalize_codex_usage_preserves_failure_reason_with_healthy_windows() {
+        let provider = normalize_codex_usage(UsageHelperOutput {
+            status_code: Some(1),
+            stdout: br#"{
+  "schema_version": "codex-cli.diag.rate-limits.v1",
+  "command": "diag rate-limits",
+  "ok": false,
+  "results": [
+    {
+      "provider": "codex",
+      "name": "healthy",
+      "status": "ok",
+      "ok": true,
+      "summary": {"non_weekly_remaining": 75}
+    },
+    {
+      "provider": "codex",
+      "name": "billing",
+      "status": "error",
+      "ok": false,
+      "reason_code": "billing_past_due"
+    }
+  ]
+}"#
+            .to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+
+        let value = serde_json::to_value(provider).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["windows"][0]["remaining_percent"], 75);
+        assert_eq!(value["reason_code"], "billing_past_due");
+    }
+
+    #[test]
+    fn normalize_codex_usage_preserves_provider_reason_code() {
+        let provider = normalize_codex_usage(UsageHelperOutput {
+            status_code: Some(1),
+            stdout: br#"{
+  "schema_version": "codex-cli.diag.rate-limits.v1",
+  "command": "diag rate-limits",
+  "ok": false,
+  "results": [{
+    "provider": "codex",
+    "name": "alpha",
+    "status": "error",
+    "ok": false,
+    "reason_code": "auth_expired",
+    "error": {"code": "request-failed", "message": "request failed"}
+  }]
+}"#
+            .to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+
+        let value = serde_json::to_value(provider).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["reason_code"], "auth_expired");
+    }
+
+    #[test]
+    fn normalize_codex_usage_prefers_actionable_reason_after_unknown_result() {
+        let provider = normalize_codex_usage(UsageHelperOutput {
+            status_code: Some(1),
+            stdout: br#"{
+  "schema_version": "codex-cli.diag.rate-limits.v1",
+  "command": "diag rate-limits",
+  "ok": false,
+  "results": [
+    {
+      "provider": "codex",
+      "name": "alpha",
+      "status": "error",
+      "ok": false,
+      "reason_code": "unknown"
+    },
+    {
+      "provider": "codex",
+      "name": "beta",
+      "status": "error",
+      "ok": false,
+      "reason_code": "billing_past_due"
+    }
+  ]
+}"#
+            .to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+
+        let value = serde_json::to_value(provider).unwrap();
+        assert_eq!(value["reason_code"], "billing_past_due");
     }
 
     #[test]

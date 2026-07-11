@@ -42,6 +42,7 @@ Workspace-level keep/delete ownership decisions are tracked in
   rendering, and stable JSON pretty-format helpers used by orchestration/reporting CLIs.
 - `provider_runtime`: provider-runtime substrate (paths, profiles, auth persistence, exec invocation, JSON/JWT helpers, structured errors)
   shared by Codex/Gemini-style CLIs without provider-specific UX copy.
+- `provider_usage`: stable provider-neutral usage failure reasons plus HTTP/message classification; callers retain provider-specific UX copy.
 - `rate_limits_ansi`: shared rate-limit table cell formatting (current-profile coloring and percent-band coloring) honoring `NO_COLOR`.
 
 The crate also exposes a tiny top-level `greeting(name: &str) -> String` helper used by `cli-template` for the new-crate smoke test.

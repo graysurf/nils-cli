@@ -17,6 +17,7 @@ use nils_common::fs;
 use nils_common::provider_runtime::persistence::{
     SyncSecretsError, TimestampPolicy, sync_auth_to_matching_secrets,
 };
+use nils_common::provider_usage::ProviderUsageReason;
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
 
 pub use nils_common::rate_limits_ansi as ansi;
@@ -78,6 +79,8 @@ struct RateLimitJsonResult {
     status: String,
     ok: bool,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<ProviderUsageReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<RateLimitSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -539,6 +542,7 @@ fn collect_json_result_for_secret(
                         status: "ok".to_string(),
                         ok: true,
                         source: "network".to_string(),
+                        reason_code: None,
                         summary: Some(summary),
                         windows: Some(windows),
                         raw_usage: Some(redact_sensitive_json(&usage.json)),
@@ -576,13 +580,20 @@ fn collect_json_result_for_secret(
                     return fallback;
                 }
             }
-            let msg = err.to_string();
-            let code = if msg.contains("missing access_token") {
+            let reason = err.reason();
+            let code = if reason == ProviderUsageReason::AuthRequired {
                 "missing-access-token"
             } else {
                 "request-failed"
             };
-            json_result_error(target_file, "network", code, msg, None)
+            json_result_error_with_reason(
+                target_file,
+                "network",
+                code,
+                err.to_string(),
+                None,
+                Some(reason),
+            )
         }
     }
 }
@@ -606,6 +617,7 @@ fn collect_json_from_cache(
             status: "ok".to_string(),
             ok: true,
             source: source.to_string(),
+            reason_code: None,
             summary: Some(summary_from_cache(&entry)),
             windows: Some(windows_from_cache(&entry)),
             raw_usage: None,
@@ -628,6 +640,17 @@ fn json_result_error(
     message: String,
     details: Option<Value>,
 ) -> RateLimitJsonResult {
+    json_result_error_with_reason(target_file, source, code, message, details, None)
+}
+
+fn json_result_error_with_reason(
+    target_file: &Path,
+    source: &str,
+    code: &str,
+    message: String,
+    details: Option<Value>,
+    reason_code: Option<ProviderUsageReason>,
+) -> RateLimitJsonResult {
     RateLimitJsonResult {
         provider: "codex".to_string(),
         name: secret_display_name(target_file),
@@ -635,6 +658,7 @@ fn json_result_error(
         status: "error".to_string(),
         ok: false,
         source: source.to_string(),
+        reason_code,
         summary: None,
         windows: None,
         raw_usage: None,
@@ -656,6 +680,7 @@ fn json_result_no_window(target_file: &Path) -> RateLimitJsonResult {
         status: "no-rate-limit-window".to_string(),
         ok: true,
         source: "network".to_string(),
+        reason_code: None,
         summary: None,
         windows: Some(Vec::new()),
         raw_usage: None,
@@ -1938,8 +1963,9 @@ fn run_single_mode(
     let usage = match fetch_usage(&usage_request) {
         Ok(value) => value,
         Err(err) => {
+            let reason = err.reason();
             let msg = err.to_string();
-            if msg.contains("missing access_token") {
+            if reason == ProviderUsageReason::AuthRequired {
                 if output_json {
                     diag_output::emit_error(
                         DIAG_SCHEMA_VERSION,
@@ -1951,6 +1977,7 @@ fn run_single_mode(
                         ),
                         Some(serde_json::json!({
                             "target_file": target_file.display().to_string(),
+                            "reason_code": reason.as_str(),
                         })),
                     )?;
                 } else {
@@ -1969,6 +1996,7 @@ fn run_single_mode(
                     msg,
                     Some(serde_json::json!({
                         "target_file": target_file.display().to_string(),
+                        "reason_code": reason.as_str(),
                     })),
                 )?;
             } else {
@@ -2064,6 +2092,7 @@ fn run_single_mode(
             status: "ok".to_string(),
             ok: true,
             source: "network".to_string(),
+            reason_code: None,
             summary: Some(RateLimitSummary {
                 non_weekly_label: weekly.non_weekly_label,
                 non_weekly_remaining: weekly.non_weekly_remaining,
