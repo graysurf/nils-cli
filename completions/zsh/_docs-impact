@@ -41,7 +41,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (record)
 _arguments "${_arguments_options[@]}" : \
-'--out=[]:DIR:_files -/' \
+'--out=[Directory containing the durable docs-impact record]:DIR:_files -/' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--repo=[]:DIR:_files -/' \
@@ -54,7 +54,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (show)
 _arguments "${_arguments_options[@]}" : \
-'--out=[]:DIR:_files -/' \
+'--out=[Directory containing the durable docs-impact record]:DIR:_files -/' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -63,7 +63,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (verify)
 _arguments "${_arguments_options[@]}" : \
-'--out=[]:DIR:_files -/' \
+'--out=[Directory containing the durable docs-impact record]:DIR:_files -/' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--repo=[]:DIR:_files -/' \

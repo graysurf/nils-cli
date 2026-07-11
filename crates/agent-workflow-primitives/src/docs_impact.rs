@@ -502,6 +502,7 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct OutArgs {
+    /// Directory containing the durable docs-impact record.
     #[arg(long = "out", value_name = "DIR", value_hint = ValueHint::DirPath)]
     out_dir: PathBuf,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
