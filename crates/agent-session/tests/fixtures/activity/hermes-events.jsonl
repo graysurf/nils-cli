@@ -1,4 +1,2 @@
 {"event":"pre_llm_call","session_id":"hermes-session","is_first_turn":true,"platform":"cli"}
-{"event":"pre_approval_request","session_key":"hermes-session","surface":"cli"}
-{"event":"post_approval_response","session_key":"hermes-session","surface":"cli","choice":"once"}
 {"event":"post_llm_call","session_id":"hermes-session","platform":"cli"}

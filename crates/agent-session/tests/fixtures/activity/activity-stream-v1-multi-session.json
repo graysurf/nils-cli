@@ -1,0 +1,48 @@
+{
+  "schema_version": "agent-session.activity-stream.event.v1",
+  "type": "snapshot",
+  "stream_id": "fixture-stream",
+  "sequence": 42,
+  "machine": "fixture-machine",
+  "observed_at": "2026-07-11T17:01:01Z",
+  "sessions": [
+    {
+      "id": "working-minimal",
+      "turn_state": {
+        "schema_version": "agent-session.turn-state.v1",
+        "phase": "working",
+        "phase_changed_at": "2026-07-11T17:00:00Z",
+        "revision": 11,
+        "source": {
+          "kind": "provider_hook",
+          "confidence": "authoritative"
+        },
+        "current_turn": {
+          "started_at": "2026-07-11T16:59:00Z"
+        }
+      }
+    },
+    {
+      "id": "completed-minimal",
+      "turn_state": {
+        "schema_version": "agent-session.turn-state.v1",
+        "phase": "waiting",
+        "phase_changed_at": "2026-07-11T17:01:00Z",
+        "revision": 12,
+        "source": {
+          "kind": "provider_hook",
+          "provider": "codex",
+          "confidence": "authoritative"
+        },
+        "last_turn": {
+          "completed_at": "2026-07-11T17:01:00Z",
+          "outcome": "completed"
+        }
+      }
+    },
+    {
+      "id": "no-activity",
+      "turn_state": null
+    }
+  ]
+}

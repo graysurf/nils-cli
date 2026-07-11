@@ -137,6 +137,55 @@ pub(crate) struct TurnState {
     extra: Map<String, Value>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamTurnSource {
+    pub(crate) kind: SourceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
+    pub(crate) confidence: Confidence,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamAttentionView {
+    pub(crate) kind: String,
+    pub(crate) requested_at: String,
+    pub(crate) pending_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamCurrentTurn {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_turn_id: Option<String>,
+    pub(crate) started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_progress_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attention: Option<StreamAttentionView>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamLastTurn {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at: Option<String>,
+    pub(crate) completed_at: String,
+    pub(crate) outcome: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamTurnState {
+    pub(crate) schema_version: String,
+    pub(crate) phase: TurnPhase,
+    pub(crate) phase_changed_at: String,
+    pub(crate) revision: u64,
+    pub(crate) source: StreamTurnSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) current_turn: Option<StreamCurrentTurn>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_turn: Option<StreamLastTurn>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct PendingAttention {
     id: String,
@@ -210,6 +259,8 @@ pub(crate) struct TurnEvent {
     pub(crate) attention_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) attention_kind: Option<String>,
+    #[serde(skip)]
+    attention_correlation_ambiguous: bool,
     pub(crate) confidence: Confidence,
     #[serde(default)]
     pub(crate) source_kind: SourceKind,
@@ -224,9 +275,47 @@ pub(crate) struct ActivityResult {
     pub(crate) duplicate: bool,
 }
 
+/// Project durable activity state onto the explicitly allowlisted stream
+/// contract. Durable snapshots preserve additive fields for forward
+/// compatibility; those unknown fields must not cross the daemon stream's
+/// metadata-only privacy boundary.
+pub(crate) fn stream_projection(state: &TurnState) -> StreamTurnState {
+    StreamTurnState {
+        schema_version: state.schema_version.clone(),
+        phase: state.phase.clone(),
+        phase_changed_at: state.phase_changed_at.clone(),
+        revision: state.revision,
+        source: StreamTurnSource {
+            kind: state.source.kind.clone(),
+            provider: state.source.provider.clone(),
+            confidence: state.source.confidence.clone(),
+        },
+        current_turn: state.current_turn.as_ref().map(|turn| StreamCurrentTurn {
+            provider_turn_id: turn.provider_turn_id.clone(),
+            started_at: turn.started_at.clone(),
+            last_progress_at: turn.last_progress_at.clone(),
+            attention: turn
+                .attention
+                .as_ref()
+                .map(|attention| StreamAttentionView {
+                    kind: attention.kind.clone(),
+                    requested_at: attention.requested_at.clone(),
+                    pending_count: attention.pending_count,
+                }),
+        }),
+        last_turn: state.last_turn.as_ref().map(|turn| StreamLastTurn {
+            provider_turn_id: turn.provider_turn_id.clone(),
+            started_at: turn.started_at.clone(),
+            completed_at: turn.completed_at.clone(),
+            outcome: turn.outcome.clone(),
+        }),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SetupAction {
     DryRun,
+    RepairPreview,
     Apply,
     Remove,
     Repair,
@@ -271,11 +360,29 @@ pub(crate) struct SetupResult {
     pub(crate) would_change: bool,
     pub(crate) configured: bool,
     pub(crate) would_configure: bool,
+    pub(crate) apply_allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) preview_digest: Option<String>,
     pub(crate) config_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) notification_config_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) notification_preview: Option<CodexNotificationPreview>,
     pub(crate) owned_events: Vec<String>,
     pub(crate) trust: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CodexNotificationPreview {
+    current_mode: String,
+    candidate_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) forwarded_argc: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) forwarded_argv_sha256: Option<String>,
+    reversible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) blocker_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -436,6 +543,112 @@ fn projected_provider_identifier(
     Ok(format!("local:v1:{}", hex_digest(digest.finalize())))
 }
 
+fn hermes_approval_correlation_id(runtime_id: &str, raw: &Value) -> Result<String, CliError> {
+    fn required_string<'a>(raw: &'a Value, field: &str) -> Result<&'a str, CliError> {
+        raw.get(field).and_then(Value::as_str).ok_or_else(|| {
+            CliError::data(
+                "provider-hook-correlation-missing",
+                "recognized Hermes approval hook is missing matching correlation metadata",
+                Some(json!({ "field": field })),
+            )
+        })
+    }
+
+    let mut pattern_keys = raw
+        .get("pattern_keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-hook-correlation-missing",
+                "recognized Hermes approval hook is missing matching correlation metadata",
+                Some(json!({ "field": "pattern_keys" })),
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                CliError::data(
+                    "provider-hook-correlation-missing",
+                    "recognized Hermes approval hook has invalid matching correlation metadata",
+                    Some(json!({ "field": "pattern_keys" })),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    pattern_keys.sort();
+    pattern_keys.dedup();
+
+    let canonical = serde_json::to_vec(&json!([
+        required_string(raw, "command")?,
+        required_string(raw, "description")?,
+        required_string(raw, "pattern_key")?,
+        pattern_keys,
+        required_string(raw, "session_key")?,
+        required_string(raw, "surface")?,
+    ]))
+    .map_err(|_| {
+        CliError::data(
+            "provider-hook-correlation-invalid",
+            "Hermes approval correlation metadata could not be canonicalized",
+            None,
+        )
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(b"agent-session.hermes-approval-correlation.v1\0");
+    digest.update(canonical);
+    projected_provider_identifier(
+        runtime_id,
+        AgentKind::Hermes,
+        "attention",
+        &format!("sha256:{}", hex_digest(digest.finalize())),
+    )
+}
+
+fn hermes_approval_metadata(raw: &Value) -> Result<&Value, CliError> {
+    match raw.get("extra") {
+        Some(extra) if extra.is_object() => Ok(extra),
+        Some(Value::Null) | None => Ok(raw),
+        Some(_) => Err(CliError::data(
+            "provider-hook-correlation-invalid",
+            "recognized Hermes approval hook has invalid matching correlation metadata",
+            Some(json!({ "field": "extra" })),
+        )),
+    }
+}
+
+fn optional_hook_string<'a>(raw: &'a Value, field: &str) -> Result<Option<&'a str>, CliError> {
+    match raw.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.is_empty() => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(CliError::data(
+            "provider-hook-identifier-invalid",
+            "provider hook identifier is invalid",
+            Some(json!({ "field": field })),
+        )),
+    }
+}
+
+fn hermes_approval_correlation(
+    runtime_id: &str,
+    metadata: &Value,
+) -> Result<(String, bool), CliError> {
+    match metadata.get("tool_call_id") {
+        Some(Value::String(value)) if !value.is_empty() => {
+            projected_provider_identifier(runtime_id, AgentKind::Hermes, "attention", value)
+                .map(|id| (id, false))
+        }
+        None | Some(Value::Null) | Some(Value::String(_)) => {
+            hermes_approval_correlation_id(runtime_id, metadata).map(|id| (id, true))
+        }
+        Some(_) => Err(CliError::data(
+            "provider-hook-correlation-invalid",
+            "recognized Hermes approval hook has invalid matching correlation metadata",
+            Some(json!({ "field": "tool_call_id" })),
+        )),
+    }
+}
+
 fn event_dedupe_key(runtime_id: &str, event_id: &str) -> [u8; REPLAY_SLOT_BYTES] {
     let mut digest = Sha256::new();
     digest.update(b"agent-session.event-id.v1\0");
@@ -449,10 +662,31 @@ fn event_dedupe_key(runtime_id: &str, event_id: &str) -> [u8; REPLAY_SLOT_BYTES]
     key
 }
 
+fn stable_hermes_approval_event_id(
+    runtime_id: &str,
+    kind: &TurnEventKind,
+    projected_tool_call_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"agent-session.provider-replay.v1\0");
+    digest.update(runtime_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(match kind {
+        TurnEventKind::AttentionRequested => b"attention_requested".as_slice(),
+        TurnEventKind::AttentionCleared => b"attention_cleared".as_slice(),
+        _ => unreachable!("Hermes approval event kind"),
+    });
+    digest.update(b"\0");
+    digest.update(projected_tool_call_id.as_bytes());
+    format!("local:v1:{}", hex_digest(digest.finalize()))
+}
+
 fn semantic_event_key(event: &TurnEvent) -> String {
     let mut digest = Sha256::new();
     digest.update(b"agent-session.semantic-event.v1\0");
     let correlated_attention_id = if event.attention_kind.as_deref() == Some("clarification")
+        || (event.provider == AgentKind::Hermes.as_str()
+            && event.attention_kind.as_deref() == Some("approval"))
         || event.kind == TurnEventKind::AttentionCleared
     {
         event.attention_id.as_deref().unwrap_or("")
@@ -488,6 +722,17 @@ fn semantic_event_is_duplicate(
     received_at: &str,
 ) -> bool {
     if event.source_kind != SourceKind::ProviderHook {
+        return false;
+    }
+    if event.provider == AgentKind::Hermes.as_str()
+        && event.kind == TurnEventKind::AttentionRequested
+        && event.attention_kind.as_deref() == Some("approval")
+        && event.attention_correlation_ambiguous
+    {
+        // Hermes provides no delivery id distinct from the derived request
+        // tuple. Preserve every observed pre-request as conservative
+        // multiplicity; the runtime-scoped event-id replay index still rejects
+        // exact normalized event replays.
         return false;
     }
     if event.kind == TurnEventKind::TurnStarted
@@ -1473,6 +1718,29 @@ fn normalize_provider_hook(
             event_name,
             "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
         );
+    let exact_hermes_approval = agent == AgentKind::Hermes
+        && matches!(
+            event_name,
+            "pre_approval_request" | "post_approval_response"
+        );
+    let hermes_approval_metadata = exact_hermes_approval
+        .then(|| hermes_approval_metadata(raw))
+        .transpose()?;
+    if agent == AgentKind::Hermes
+        && event_name == "post_approval_response"
+        && !matches!(
+            hermes_approval_metadata
+                .and_then(|metadata| metadata.get("choice"))
+                .and_then(Value::as_str),
+            Some("once" | "session" | "always" | "deny" | "timeout")
+        )
+    {
+        return Err(CliError::data(
+            "provider-hook-response-invalid",
+            "recognized Hermes approval response has an invalid or missing choice",
+            None,
+        ));
+    }
     let (kind, attention_kind, confidence) = match (agent, event_name, notification) {
         (AgentKind::Codex, "UserPromptSubmit", _) => {
             (TurnEventKind::TurnStarted, None, Confidence::Observed)
@@ -1535,30 +1803,44 @@ fn normalize_provider_hook(
             Confidence::Observed,
         ),
         (AgentKind::Hermes, "post_approval_response", _) => {
-            // Hermes does not expose a stable approval request id. Preserve the
-            // conservative latch until completion or a new turn.
-            (TurnEventKind::Progress, None, Confidence::Observed)
+            (TurnEventKind::AttentionCleared, None, Confidence::Observed)
         }
         _ => return Ok(None),
     };
-    let provider_session_id = raw
-        .get("session_id")
-        .or_else(|| raw.get("session_key"))
-        .and_then(Value::as_str)
+    let mut provider_session = optional_hook_string(raw, "session_id")?;
+    if provider_session.is_none() {
+        provider_session = optional_hook_string(raw, "session_key")?;
+    }
+    if provider_session.is_none()
+        && let Some(metadata) = hermes_approval_metadata
+    {
+        provider_session = optional_hook_string(metadata, "session_key")?;
+    }
+    let provider_session_id = provider_session
         .map(|value| projected_provider_identifier(runtime_id, agent, "session", value))
         .transpose()?;
-    let provider_turn_id = raw
-        .get("turn_id")
-        .and_then(Value::as_str)
+    let mut provider_turn = optional_hook_string(raw, "turn_id")?;
+    if provider_turn.is_none()
+        && let Some(metadata) = hermes_approval_metadata
+    {
+        provider_turn = optional_hook_string(metadata, "turn_id")?;
+    }
+    let provider_turn_id = provider_turn
         .map(|value| projected_provider_identifier(runtime_id, agent, "turn", value))
         .transpose()?;
-    let exact_attention_id = if exact_clarification {
-        raw.get("tool_use_id")
-            .and_then(Value::as_str)
-            .map(|value| projected_provider_identifier(runtime_id, agent, "attention", value))
-            .transpose()?
+    let (exact_attention_id, attention_correlation_ambiguous) = if exact_clarification {
+        (
+            raw.get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(|value| projected_provider_identifier(runtime_id, agent, "attention", value))
+                .transpose()?,
+            false,
+        )
+    } else if let Some(metadata) = hermes_approval_metadata {
+        let (id, ambiguous) = hermes_approval_correlation(runtime_id, metadata)?;
+        (Some(id), ambiguous)
     } else {
-        None
+        (None, false)
     };
     if exact_clarification && exact_attention_id.is_none() {
         return Err(CliError::data(
@@ -1568,14 +1850,27 @@ fn normalize_provider_hook(
         ));
     }
     let attention_id = match kind {
-        TurnEventKind::AttentionRequested if exact_clarification => exact_attention_id,
+        TurnEventKind::AttentionRequested if exact_clarification || exact_hermes_approval => {
+            exact_attention_id
+        }
         TurnEventKind::AttentionRequested => Some(uuid::Uuid::new_v4().to_string()),
         TurnEventKind::AttentionCleared => exact_attention_id,
         _ => None,
     };
+    let event_id = if exact_hermes_approval && !attention_correlation_ambiguous {
+        stable_hermes_approval_event_id(
+            runtime_id,
+            &kind,
+            attention_id
+                .as_deref()
+                .expect("exact Hermes approval correlation"),
+        )
+    } else {
+        uuid::Uuid::new_v4().to_string()
+    };
     Ok(Some(TurnEvent {
         schema_version: TURN_EVENT_VERSION.to_string(),
-        event_id: uuid::Uuid::new_v4().to_string(),
+        event_id,
         runtime_id: runtime_id.to_string(),
         provider: agent.as_str().to_string(),
         provider_session_id,
@@ -1583,6 +1878,7 @@ fn normalize_provider_hook(
         kind,
         attention_id,
         attention_kind: attention_kind.map(str::to_string),
+        attention_correlation_ambiguous,
         confidence,
         source_kind: SourceKind::ProviderHook,
         provider_time: None,
@@ -1631,6 +1927,7 @@ fn normalize_provider_notification(
         kind: TurnEventKind::TurnCompleted,
         attention_id: None,
         attention_kind: None,
+        attention_correlation_ambiguous: false,
         confidence: Confidence::Authoritative,
         source_kind: SourceKind::ProviderHook,
         provider_time: None,
@@ -1718,7 +2015,7 @@ pub(crate) fn doctor(
                     "agent-turn-complete is authoritative; raw Stop remains non-final observation because matching hooks may continue the turn",
                     "PermissionRequest has no request id shared with PostToolUse; attention is conservatively latched",
                     "Codex requires review/trust for each non-managed hook definition; a safe singular user notify argv is composed through bounded direct execution without a shell",
-                    "Run activity setup --agent codex --dry-run, apply it, then approve the hook definitions in Codex; unsafe or recursive user-owned notify commands are preserved and reported as conflicts",
+                    "Run activity setup --agent codex --dry-run before initial apply; for drift, review activity setup --agent codex --repair --dry-run before repair. Unsafe, recursive, or non-reversible user-owned notify commands are preserved and reported without argv content",
                 ),
                 AgentKind::Claude => (
                     "partial",
@@ -1730,7 +2027,7 @@ pub(crate) fn doctor(
                 AgentKind::Hermes => (
                     "supported",
                     "post_llm_call is authoritative for successful non-interrupted turns on the supported version",
-                    "approval hooks expose no stable request id; attention clears on completion or a new turn",
+                    "Hermes 0.18.2 shell approval hooks use projected non-empty tool_call_id for exact correlation; missing/empty-id tuple fallback retains conservative multiplicity until completion, a new turn, or a runtime boundary",
                     "Hermes shell hooks require first-use consent unless explicitly accepted",
                     "Run activity setup --agent hermes --dry-run, apply it, then approve and verify with hermes hooks doctor",
                 ),
@@ -1759,9 +2056,15 @@ pub(crate) fn doctor(
                 " Provider lifecycle configuration could not be validated ({error}); fix the provider configuration before running repair."
             ));
         } else if !configured {
-            guidance.push_str(
-                " The installed hook specification is missing or drifted; run activity setup --repair after reviewing the dry-run.",
-            );
+            if agent == AgentKind::Codex {
+                guidance.push_str(
+                    " The installed lifecycle specification is missing or drifted; run activity setup --agent codex --repair --dry-run and proceed with repair only when apply_allowed is true.",
+                );
+            } else {
+                guidance.push_str(
+                    " The installed hook specification is missing or drifted; run activity setup --repair after reviewing the dry-run.",
+                );
+            }
         }
         if !helper_executable {
             guidance.push_str(
@@ -1877,22 +2180,68 @@ fn latest_provider_activity(context: &CliContext) -> BTreeMap<String, ProviderAc
     activity
 }
 
-pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult, CliError> {
+pub(crate) fn setup(
+    agent: AgentKind,
+    action: SetupAction,
+    expected_preview_digest: Option<&str>,
+) -> Result<SetupResult, CliError> {
+    if action == SetupAction::RepairPreview && agent != AgentKind::Codex {
+        return Err(CliError::usage(
+            "provider-repair-preview-unsupported",
+            "--repair --dry-run is a Codex-only reviewed-plan workflow; use --dry-run or --repair separately for this provider",
+            Some(json!({ "agent": agent.as_str() })),
+        ));
+    }
+    if agent == AgentKind::Codex && action == SetupAction::Repair {
+        let Some(expected) = expected_preview_digest else {
+            return Err(CliError::data(
+                "provider-config-preview-digest-required",
+                "Codex repair requires the digest from a reviewed --repair --dry-run preview",
+                None,
+            ));
+        };
+        validate_preview_digest(expected)?;
+    } else if expected_preview_digest.is_some() {
+        return Err(CliError::data(
+            "provider-config-preview-digest-unsupported",
+            "an expected preview digest is accepted only when applying Codex repair",
+            None,
+        ));
+    }
     let path = provider_config_path(agent)?;
     let notification_path = (agent == AgentKind::Codex)
         .then(codex_notification_config_path)
         .transpose()?;
     let configured_before = provider_configured(agent, &path)?;
-    let (would_change, would_configure) = match agent {
+    let outcome = match agent {
         AgentKind::Codex => {
             let notify_path = notification_path.as_deref().expect("Codex notify path");
-            setup_codex_provider(&path, notify_path, action)?
+            setup_codex_provider(&path, notify_path, action, expected_preview_digest)?
         }
-        AgentKind::Claude => setup_json_provider(agent, &path, action)?,
-        AgentKind::Hermes => setup_hermes(&path, action)?,
+        AgentKind::Claude => {
+            let (would_change, would_configure) = setup_json_provider(agent, &path, action)?;
+            ProviderSetupOutcome {
+                would_change,
+                would_configure,
+                apply_allowed: true,
+                notification_preview: None,
+                preview_digest: None,
+            }
+        }
+        AgentKind::Hermes => {
+            let (would_change, would_configure) = setup_hermes(&path, action)?;
+            ProviderSetupOutcome {
+                would_change,
+                would_configure,
+                apply_allowed: true,
+                notification_preview: None,
+                preview_digest: None,
+            }
+        }
     };
     let action_name = match action {
         SetupAction::DryRun => "dry-run",
+        SetupAction::RepairPreview => "repair-preview",
         SetupAction::Apply => "apply",
         SetupAction::Remove => "remove",
         SetupAction::Repair => "repair",
@@ -1900,16 +2249,20 @@ pub(crate) fn setup(agent: AgentKind, action: SetupAction) -> Result<SetupResult
     Ok(SetupResult {
         provider: agent.as_str().to_string(),
         action: action_name.to_string(),
-        changed: action != SetupAction::DryRun && would_change,
-        would_change,
-        configured: if action == SetupAction::DryRun {
+        changed: !matches!(action, SetupAction::DryRun | SetupAction::RepairPreview)
+            && outcome.would_change,
+        would_change: outcome.would_change,
+        configured: if matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
             configured_before
         } else {
-            would_configure
+            outcome.would_configure
         },
-        would_configure,
+        would_configure: outcome.would_configure,
+        apply_allowed: outcome.apply_allowed,
+        preview_digest: outcome.preview_digest,
         config_path: display_path(&path),
         notification_config_path: notification_path.as_deref().map(display_path),
+        notification_preview: outcome.notification_preview,
         owned_events: provider_specs(agent)
             .into_iter()
             .map(|spec| spec.event.to_string())
@@ -2011,7 +2364,7 @@ fn audited_floor(agent: AgentKind) -> (u64, u64, u64) {
     match agent {
         AgentKind::Codex => (0, 144, 1),
         AgentKind::Claude => (2, 1, 206),
-        AgentKind::Hermes => (0, 18, 0),
+        AgentKind::Hermes => (0, 18, 2),
     }
 }
 
@@ -2070,6 +2423,22 @@ struct ProviderConfigPlan {
     updated_bytes: Vec<u8>,
     changed: bool,
     configured: bool,
+}
+
+#[derive(Debug)]
+struct CodexNotificationPlan {
+    config: ProviderConfigPlan,
+    preview: CodexNotificationPreview,
+    apply_allowed: bool,
+}
+
+#[derive(Debug)]
+struct ProviderSetupOutcome {
+    would_change: bool,
+    would_configure: bool,
+    apply_allowed: bool,
+    notification_preview: Option<CodexNotificationPreview>,
+    preview_digest: Option<String>,
 }
 
 fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
@@ -2281,10 +2650,71 @@ fn codex_notify_mode_name(mode: &CodexNotifyMode) -> &'static str {
     }
 }
 
+fn codex_forward_argv_sha256(argv: &[String]) -> Result<String, CliError> {
+    let mut encoded = serde_json::to_vec(argv).map_err(|_| {
+        CliError::data(
+            "provider-notification-config-invalid",
+            "Codex user-owned notify argv could not be encoded for safe preview",
+            None,
+        )
+    })?;
+    // Match the operational comparison contract: compact JSON argv followed by
+    // one LF, so an operator can compare this content-free digest with a
+    // separately decoded composed notifier without exposing argv values.
+    encoded.push(b'\n');
+    let mut digest = Sha256::new();
+    digest.update(encoded);
+    Ok(format!("sha256:{}", hex_digest(digest.finalize())))
+}
+
+fn validate_preview_digest(value: &str) -> Result<(), CliError> {
+    let valid = value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(CliError::data(
+            "provider-config-preview-digest-invalid",
+            "expected preview digest must use sha256 followed by 64 lowercase hexadecimal characters",
+            None,
+        ))
+    }
+}
+
+fn update_plan_digest(digest: &mut Sha256, role: &[u8], plan: &ProviderConfigPlan) {
+    digest.update(role);
+    digest.update(b"\0");
+    match plan.original_bytes.as_deref() {
+        Some(bytes) => {
+            digest.update([1]);
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        None => digest.update([0]),
+    }
+    digest.update((plan.updated_bytes.len() as u64).to_be_bytes());
+    digest.update(&plan.updated_bytes);
+}
+
+fn codex_provider_preview_digest(
+    hooks: &ProviderConfigPlan,
+    notification: &ProviderConfigPlan,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"agent-session.codex-provider-repair-plan.v1\0");
+    update_plan_digest(&mut digest, b"hooks", hooks);
+    update_plan_digest(&mut digest, b"notification", notification);
+    format!("sha256:{}", hex_digest(digest.finalize()))
+}
+
 fn plan_codex_notification(
     path: &Path,
     action: SetupAction,
-) -> Result<ProviderConfigPlan, CliError> {
+) -> Result<CodexNotificationPlan, CliError> {
     let original_bytes = if path.is_file() {
         Some(
             fs::read(path)
@@ -2312,6 +2742,18 @@ fn plan_codex_notification(
         parse_codex_notification_config(path, &raw)?
     };
     let mode = codex_notify_mode(&document);
+    let current_mode = codex_notify_mode_name(&mode).to_string();
+    let forwarded_preview = match &mode {
+        CodexNotifyMode::Composed(forwarded) | CodexNotifyMode::Foreign(forwarded)
+            if codex_forward_argv_is_safe(forwarded) =>
+        {
+            Some((forwarded.len(), codex_forward_argv_sha256(forwarded)?))
+        }
+        _ => None,
+    };
+    let mut reversible = true;
+    let mut blocker_code = None;
+    let mut apply_allowed = true;
     let remove = action == SetupAction::Remove;
     if remove {
         match mode {
@@ -2359,11 +2801,18 @@ fn plan_codex_notification(
                 restored_argv.extend(forwarded);
                 restored["notify"] = toml_value(restored_argv);
                 if Some(restored.to_string().as_bytes()) != original_bytes.as_deref() {
-                    return Err(CliError::data(
-                        "provider-notification-config-conflict",
-                        "Codex user-owned notify argv cannot be composed with byte-exact removal; it was preserved and activity setup made no changes",
-                        Some(json!({ "path": display_path(path) })),
-                    ));
+                    if action == SetupAction::RepairPreview {
+                        reversible = false;
+                        apply_allowed = false;
+                        blocker_code =
+                            Some("provider-notification-config-nonreversible".to_string());
+                    } else {
+                        return Err(CliError::data(
+                            "provider-notification-config-conflict",
+                            "Codex user-owned notify argv cannot be composed with byte-exact removal; it was preserved and activity setup made no changes",
+                            Some(json!({ "path": display_path(path) })),
+                        ));
+                    }
                 }
             }
             CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {
@@ -2378,15 +2827,31 @@ fn plan_codex_notification(
     let rendered = document.to_string().into_bytes();
     let original_rendered = original_bytes.as_deref().unwrap_or_default();
     let changed = rendered != original_rendered;
-    Ok(ProviderConfigPlan {
-        path: path.to_path_buf(),
-        original_bytes,
-        updated_bytes: rendered,
-        changed,
-        configured: matches!(
-            codex_notify_mode(&document),
-            CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
-        ),
+    let candidate_mode = codex_notify_mode(&document);
+    let candidate_configured = matches!(
+        candidate_mode,
+        CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
+    );
+    let (forwarded_argc, forwarded_argv_sha256) = forwarded_preview
+        .map(|(argc, hash)| (Some(argc), Some(hash)))
+        .unwrap_or((None, None));
+    Ok(CodexNotificationPlan {
+        config: ProviderConfigPlan {
+            path: path.to_path_buf(),
+            original_bytes,
+            updated_bytes: rendered,
+            changed,
+            configured: candidate_configured,
+        },
+        preview: CodexNotificationPreview {
+            current_mode,
+            candidate_mode: codex_notify_mode_name(&candidate_mode).to_string(),
+            forwarded_argc,
+            forwarded_argv_sha256,
+            reversible,
+            blocker_code,
+        },
+        apply_allowed,
     })
 }
 
@@ -2394,20 +2859,43 @@ fn setup_codex_provider(
     hooks_path: &Path,
     notification_path: &Path,
     action: SetupAction,
-) -> Result<(bool, bool), CliError> {
+    expected_preview_digest: Option<&str>,
+) -> Result<ProviderSetupOutcome, CliError> {
     // Parse and render both files before either can change. This makes invalid
     // or conflicting notification configuration a preflight failure for apply,
     // repair, and remove alike.
     let hooks = plan_json_provider(AgentKind::Codex, hooks_path, action)?;
     let notification = plan_codex_notification(notification_path, action)?;
-    let changed = hooks.changed || notification.changed;
-    let configured = hooks.configured && notification.configured;
-    if action == SetupAction::DryRun {
-        return Ok((changed, configured));
+    let plan_digest = codex_provider_preview_digest(&hooks, &notification.config);
+    let changed = hooks.changed || notification.config.changed;
+    let configured =
+        hooks.configured && notification.config.configured && notification.apply_allowed;
+    let preview = (action == SetupAction::RepairPreview).then(|| notification.preview.clone());
+    if matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
+        return Ok(ProviderSetupOutcome {
+            would_change: changed,
+            would_configure: configured,
+            apply_allowed: notification.apply_allowed,
+            notification_preview: preview,
+            preview_digest: (action == SetupAction::RepairPreview).then_some(plan_digest),
+        });
+    }
+    if action == SetupAction::Repair && expected_preview_digest != Some(plan_digest.as_str()) {
+        return Err(CliError::data(
+            "provider-config-preview-digest-mismatch",
+            "provider configuration changed after preview; review a fresh repair preview before retrying",
+            None,
+        ));
     }
 
-    apply_codex_provider_plans(&hooks, &notification)?;
-    Ok((changed, configured))
+    apply_codex_provider_plans(&hooks, &notification.config)?;
+    Ok(ProviderSetupOutcome {
+        would_change: changed,
+        would_configure: configured,
+        apply_allowed: true,
+        notification_preview: None,
+        preview_digest: None,
+    })
 }
 
 fn apply_codex_provider_plans(
@@ -2530,7 +3018,7 @@ fn setup_json_provider(
     action: SetupAction,
 ) -> Result<(bool, bool), CliError> {
     let plan = plan_json_provider(agent, path, action)?;
-    if action != SetupAction::DryRun {
+    if !matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
         apply_provider_config_plan(&plan)?;
     }
     Ok((plan.changed, plan.configured))
@@ -2808,7 +3296,7 @@ fn setup_hermes(path: &Path, action: SetupAction) -> Result<(bool, bool), CliErr
         root.remove(&hooks_key);
     }
     let changed = updated != original;
-    if changed && action != SetupAction::DryRun {
+    if changed && !matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
         let rendered = serde_yaml_ng::to_string(&updated).map_err(|err| {
             CliError::runtime(
                 "provider-config-render-failed",
@@ -2876,6 +3364,7 @@ mod tests {
             kind,
             attention_id: None,
             attention_kind: None,
+            attention_correlation_ambiguous: false,
             confidence: Confidence::Observed,
             source_kind: SourceKind::ProviderHook,
             provider_time: None,
@@ -3665,6 +4154,218 @@ mod tests {
     }
 
     #[test]
+    fn hermes_approval_hooks_use_runtime_scoped_metadata_correlation() {
+        let fixture = include_str!("../tests/fixtures/activity/hermes-approval-events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("Hermes approval fixture"))
+            .collect::<Vec<_>>();
+        let approval = fixture[0].clone();
+        let request = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("pre_approval_request"),
+            "runtime-1",
+            &approval,
+        )
+        .expect("request mapping")
+        .expect("recognized request");
+        assert_eq!(request.kind, TurnEventKind::AttentionRequested);
+        assert_eq!(request.attention_kind.as_deref(), Some("approval"));
+        assert_eq!(request.confidence, Confidence::Observed);
+        let correlation = request.attention_id.as_deref().expect("correlation id");
+        assert!(correlation.starts_with("local:v1:"));
+
+        let response_payload = fixture[1].clone();
+        let response = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("post_approval_response"),
+            "runtime-1",
+            &response_payload,
+        )
+        .expect("response mapping")
+        .expect("recognized response");
+        assert_eq!(response.kind, TurnEventKind::AttentionCleared);
+        assert_eq!(response.attention_id.as_deref(), Some(correlation));
+        assert_eq!(response.confidence, Confidence::Observed);
+
+        let mut reordered = response_payload.clone();
+        reordered["pattern_keys"] = json!(["shell_escalation", "sudo", "sudo"]);
+        let reordered = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("post_approval_response"),
+            "runtime-1",
+            &reordered,
+        )
+        .expect("reordered mapping")
+        .expect("recognized response");
+        assert_eq!(reordered.attention_id.as_deref(), Some(correlation));
+
+        let same_other_runtime = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("pre_approval_request"),
+            "runtime-2",
+            &approval,
+        )
+        .expect("other runtime mapping")
+        .expect("recognized request");
+        assert_ne!(same_other_runtime.attention_id, request.attention_id);
+
+        let mut different = approval.clone();
+        different["pattern_keys"] = json!(["sudo"]);
+        let different = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("pre_approval_request"),
+            "runtime-1",
+            &different,
+        )
+        .expect("different mapping")
+        .expect("recognized request");
+        assert_ne!(different.attention_id, request.attention_id);
+        assert_ne!(semantic_event_key(&different), semantic_event_key(&request));
+        assert_eq!(
+            semantic_event_key(&reordered),
+            semantic_event_key(&response)
+        );
+
+        let missing = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("pre_approval_request"),
+            "runtime-1",
+            &json!({
+                "session_key": "hermes-session",
+                "surface": "cli",
+                "command": "must-not-appear-in-diagnostic"
+            }),
+        )
+        .expect_err("the complete matching tuple is required");
+        assert_eq!(missing.code(), "provider-hook-correlation-missing");
+        assert!(!format!("{missing:?}").contains("must-not-appear-in-diagnostic"));
+
+        let mut invalid_response = response_payload.clone();
+        invalid_response["choice"] = json!("future-choice");
+        let invalid_response = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("post_approval_response"),
+            "runtime-1",
+            &invalid_response,
+        )
+        .expect_err("unknown response choices must not clear attention");
+        assert_eq!(invalid_response.code(), "provider-hook-response-invalid");
+
+        let mut document = document();
+        reduce(
+            &mut document,
+            &event(TurnEventKind::TurnStarted, "start"),
+            "2026-07-10T00:00:01Z",
+        );
+        reduce(&mut document, &request, "2026-07-10T00:00:02Z");
+        reduce(&mut document, &different, "2026-07-10T00:00:03Z");
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(2)
+        );
+        reduce(&mut document, &response, "2026-07-10T00:00:04Z");
+        assert_eq!(document.state.phase, TurnPhase::NeedsInput);
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(1)
+        );
+
+        for event in [&request, &response] {
+            let serialized = serde_json::to_string(event).expect("event json");
+            for forbidden in [
+                "discarded-command",
+                "discarded-description",
+                "shell_escalation",
+                "hermes-session",
+                "choice",
+            ] {
+                assert!(!serialized.contains(forbidden), "forbidden {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn identical_concurrent_hermes_approvals_remain_latched_after_one_response() {
+        let fixture = include_str!("../tests/fixtures/activity/hermes-approval-events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("Hermes approval fixture"))
+            .collect::<Vec<_>>();
+        let first = normalize_provider_hook(AgentKind::Hermes, None, "runtime-1", &fixture[0])
+            .expect("first mapping")
+            .expect("first request");
+        let second = normalize_provider_hook(AgentKind::Hermes, None, "runtime-1", &fixture[0])
+            .expect("second mapping")
+            .expect("second request");
+        assert_ne!(first.event_id, second.event_id);
+        assert_eq!(first.attention_id, second.attention_id);
+
+        let mut document = document();
+        reduce(&mut document, &first, "2026-07-10T00:00:01Z");
+        let first_key = semantic_event_key(&first);
+        document.last_semantic_event = Some(first_key);
+        document.last_semantic_event_at = Some("2026-07-10T00:00:01Z".to_string());
+        let second_key = semantic_event_key(&second);
+        assert!(
+            !semantic_event_is_duplicate(&document, &second, &second_key, "2026-07-10T00:00:01Z"),
+            "distinct hook deliveries must retain ambiguous request multiplicity"
+        );
+        reduce(&mut document, &second, "2026-07-10T00:00:01Z");
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(2)
+        );
+
+        let response = normalize_provider_hook(AgentKind::Hermes, None, "runtime-1", &fixture[1])
+            .expect("response mapping")
+            .expect("response");
+        reduce(&mut document, &response, "2026-07-10T00:00:02Z");
+        assert_eq!(document.state.phase, TurnPhase::NeedsInput);
+        assert_eq!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(1)
+        );
+
+        let completion = normalize_provider_hook(
+            AgentKind::Hermes,
+            Some("post_llm_call"),
+            "runtime-1",
+            &json!({"session_id": "hermes-session"}),
+        )
+        .expect("completion mapping")
+        .expect("completion");
+        reduce(&mut document, &completion, "2026-07-10T00:00:03Z");
+        assert_eq!(document.state.phase, TurnPhase::Waiting);
+        assert!(
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn frozen_provider_fixtures_replay_through_each_adapter() {
         let cases = [
             (
@@ -3696,12 +4397,7 @@ mod tests {
             (
                 AgentKind::Hermes,
                 include_str!("../tests/fixtures/activity/hermes-events.jsonl"),
-                vec![
-                    TurnEventKind::TurnStarted,
-                    TurnEventKind::AttentionRequested,
-                    TurnEventKind::Progress,
-                    TurnEventKind::TurnCompleted,
-                ],
+                vec![TurnEventKind::TurnStarted, TurnEventKind::TurnCompleted],
             ),
         ];
         for (agent, fixture, expected) in cases {
@@ -3780,9 +4476,10 @@ mod tests {
             parse_version_triplet("2.1.206 (Claude Code)"),
             Some((2, 1, 206))
         );
-        assert_eq!(parse_version_triplet("Hermes 0.18.0"), Some((0, 18, 0)));
+        assert_eq!(parse_version_triplet("Hermes 0.18.2"), Some((0, 18, 2)));
         assert_eq!(parse_version_triplet("development build"), None);
         assert_eq!(audited_floor(AgentKind::Claude), (2, 1, 206));
+        assert_eq!(audited_floor(AgentKind::Hermes), (0, 18, 2));
     }
 
     #[test]
@@ -3834,6 +4531,89 @@ mod tests {
         assert!(!snapshot.contains("turn-1"));
         assert!(!journal.contains("session-1"));
         assert!(!journal.contains("turn-1"));
+    }
+
+    #[test]
+    fn exact_hermes_replay_survives_restart_and_bounded_journal_eviction() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let cwd = tmp.path().join("repo");
+        fs::create_dir_all(&cwd).expect("repo dir");
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Hermes,
+            mode: "interactive",
+            title: None,
+            explicit_id: Some("hermes-replay-horizon"),
+            cwd: &cwd,
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .expect("Hermes session");
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        let raw = json!({
+            "hook_event_name": "pre_approval_request",
+            "session_id": "",
+            "extra": {
+                "command": "discarded-command",
+                "description": "discarded-description",
+                "pattern_key": "discarded-pattern",
+                "pattern_keys": ["discarded-pattern"],
+                "session_key": "provider-session",
+                "surface": "shell",
+                "turn_id": "provider-turn",
+                "tool_call_id": "exact-tool-call"
+            }
+        });
+        let exact = normalize_provider_hook(AgentKind::Hermes, None, &runtime_id, &raw)
+            .expect("normalize exact approval")
+            .expect("exact approval event");
+        let first = ingest_event(&context, &created.record.id, exact.clone())
+            .expect("first exact approval");
+        assert_eq!(first.turn_state.phase, TurnPhase::NeedsInput);
+
+        for index in 0..=(MAX_JOURNAL_EVENTS + 20) {
+            let mut progress = exact.clone();
+            progress.event_id = format!("eviction-progress-{index}");
+            progress.kind = TurnEventKind::Progress;
+            progress.attention_id = None;
+            progress.attention_kind = None;
+            progress.provider_turn_id = Some(format!("eviction-turn-{index}"));
+            ingest_event(&context, &created.record.id, progress).expect("accepted progress");
+        }
+
+        let dir = session_dir(&context, &created.record.id);
+        let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
+        let journal_before = fs::read_to_string(&journal_path).expect("bounded journal");
+        assert!(!journal_before.contains("attention_requested"));
+        let before = activity_status(&context, &created.record.id)
+            .expect("status before replay")
+            .turn_state;
+        let restarted_replay = normalize_provider_hook(AgentKind::Hermes, None, &runtime_id, &raw)
+            .expect("normalize replay after restart")
+            .expect("replayed exact approval event");
+        assert_eq!(restarted_replay.event_id, exact.event_id);
+        let replay = ingest_event(&context, &created.record.id, restarted_replay)
+            .expect("replay after bounded eviction");
+        assert!(replay.duplicate);
+        assert_eq!(replay.turn_state.revision, before.revision);
+        assert_eq!(replay.turn_state.phase, before.phase);
+        assert_eq!(
+            fs::read_to_string(journal_path).expect("journal after replay"),
+            journal_before
+        );
     }
 
     #[test]
@@ -4217,7 +4997,7 @@ mod tests {
 
         let concurrent = b"notify = [\"user-notifier\"]\n";
         fs::write(&notification_path, concurrent).expect("concurrent notification config");
-        let error = apply_codex_provider_plans(&hooks, &notification)
+        let error = apply_codex_provider_plans(&hooks, &notification.config)
             .expect_err("second-file change must fail the transaction");
 
         assert_eq!(error.code(), "provider-config-concurrent-modification");
@@ -4242,11 +5022,11 @@ mod tests {
             .expect("hooks plan");
         let notification = plan_codex_notification(&notification_path, SetupAction::Apply)
             .expect("notification plan");
-        assert!(!notification.changed);
+        assert!(!notification.config.changed);
 
         let concurrent = b"notify = [\"user-notifier\"]\n";
         fs::write(&notification_path, concurrent).expect("concurrent notification config");
-        let error = apply_codex_provider_plans(&hooks, &notification)
+        let error = apply_codex_provider_plans(&hooks, &notification.config)
             .expect_err("unchanged second-file plan must still verify its snapshot");
 
         assert_eq!(error.code(), "provider-config-concurrent-modification");
@@ -4535,7 +5315,29 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                 });
             }
             let attention_id = event.attention_id.as_deref().unwrap_or_default();
-            if !document
+            let duplicate_hermes_approval = event.attention_correlation_ambiguous
+                && event.provider == AgentKind::Hermes.as_str()
+                && event.attention_kind.as_deref() == Some("approval")
+                && document
+                    .pending_attention
+                    .iter()
+                    .any(|pending| pending.id == attention_id);
+            if duplicate_hermes_approval {
+                let kind = event
+                    .attention_kind
+                    .clone()
+                    .unwrap_or_else(|| "other".to_string());
+                if let Some(overflow) = document.overflow_attention.as_mut() {
+                    overflow.count = overflow.count.saturating_add(1);
+                } else {
+                    document.overflow_attention = Some(OverflowAttention {
+                        kind,
+                        requested_at: at.to_string(),
+                        count: 1,
+                        extra: Map::new(),
+                    });
+                }
+            } else if !document
                 .pending_attention
                 .iter()
                 .any(|pending| pending.id == attention_id)
