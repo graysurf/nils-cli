@@ -145,18 +145,19 @@ circuit breaker. Because these approvals have no correlated clear event, they
 keep the conservative latch above until completion, a new turn, or a runtime
 boundary.
 
-Hermes approval callbacks expose the same matching metadata tuple before and
-after the response but no provider request id. Agent-session canonicalizes
-`command`, `description`, `pattern_key`, sorted/deduplicated `pattern_keys`,
-`session_key`, and `surface` only in memory, then projects its SHA-256 through
-the runtime-scoped opaque identifier boundary. A matching response emits
-observed `attention_cleared` only for a documented response choice; raw
-command/description never enters activity storage. Distinct tuples clear
-independently. Concurrent requests with identical tuples are indistinguishable
-so each observed pre callback increases conservative pending multiplicity. A
-matching response clears the addressable correlation but cannot prove that the
-ambiguous remainder was answered; completion, a new turn, or a runtime boundary
-clears that remainder.
+Hermes 0.18.2 shell hooks put approval kwargs under the allowlisted `extra`
+object and may leave top-level `session_id` empty. Agent-session falls back to
+`extra.session_key`, projects non-empty `extra.tool_call_id` as the exact
+runtime-scoped pre/post correlation, and treats replayed exact callbacks
+idempotently. This lets identical command tuples with different tool-call ids
+clear independently and out of order. Missing, null, or empty tool-call ids use
+the compatibility tuple fallback: `command`, `description`, `pattern_key`,
+sorted/deduplicated `pattern_keys`, `session_key`, and `surface` are
+canonicalized only in memory and their SHA-256 is projected. Identical fallback
+tuples remain indistinguishable, so each observed pre callback increases
+conservative pending multiplicity and an ambiguous remainder clears only at
+completion, a new turn, or a runtime boundary. Raw approval kwargs never enter
+activity storage; only documented response choices emit observed clear events.
 
 Revision is monotonic for each accepted non-duplicate event and runtime
 boundary. Phase timestamps change only when the phase changes. Durations are

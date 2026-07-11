@@ -10,9 +10,10 @@ oldest versions directly covered by this audit, not guesses about earlier
 releases.
 
 The fixtures under `tests/fixtures/activity/` contain lifecycle identifiers and
-event names. The dedicated Hermes approval fixture additionally carries
-explicit discarded sentinel values for the matching metadata fields required by
-the provider contract; tests prove those values do not survive normalization.
+event names. The dedicated Hermes approval fixtures additionally freeze the
+0.18.2 shell `_serialize_payload` envelope and carry explicit discarded
+sentinel values for the matching metadata fields required by the provider
+contract; tests prove those values do not survive normalization.
 Prompt text, assistant output, tool input/output, commands, transcript paths,
 credentials, and terminal content are removed before the normalized event is
 created.
@@ -48,7 +49,7 @@ created.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Codex | 0.144.1 | supported | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive hooks in `~/.codex/hooks.json` plus owned or bounded direct-argv-composed notify in `~/.codex/config.toml`; unsafe/recursive values fail closed |
 | Claude Code | 2.1.206 | partial | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | `StopFailure`, observed; `AskUserQuestion` tool failure clears only its clarification | additive merge into `~/.claude/settings.json` |
-| Hermes | 0.18.0 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | pre/post approval metadata derives an observed runtime-scoped correlation; distinct tuples clear exactly, duplicate-identical concurrency remains indistinguishable | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
+| Hermes | 0.18.2 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | non-empty shell `extra.tool_call_id` projects to exact pre/post correlation; missing/empty-id tuple fallback remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
 Versions below the audited floor remain usable. `activity doctor` reports them
 as unverified and session views retain optional-field/activity fallback rather
@@ -107,19 +108,19 @@ same conservative latch as every other permission mode.
 
 The installed `post_llm_call` fires only after a successful final response and
 does not fire for interruption, so it is authoritative completion at the
-audited version. The official pre/post approval callbacks carry the same
-`command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, and
-`surface` tuple; post additionally carries the response choice. The adapter
-canonicalizes that matching tuple in memory and projects its SHA-256 through the
-existing runtime-scoped identifier boundary. Raw command and description text
-are never persisted. A matching post response therefore clears the distinct
-pending approval with observed confidence only when `choice` is one of the
-documented response values; missing or unknown choices fail open without
-clearing. Hermes still exposes no provider request id: two concurrent approvals
-with identical matching metadata are indistinguishable. Each observed pre
-callback therefore increments conservative multiplicity; one matching post
-clears the addressable correlation but leaves the ambiguous remainder latched
-until authoritative completion, a new turn, or a runtime boundary.
+audited version. The 0.18.2 shell serializer places approval kwargs under
+`extra`, emits an empty top-level `session_id` for this callback, and carries
+the same non-empty `tool_call_id` on pre/post. The adapter reads only allowlisted
+extra fields, falls back to non-empty `extra.session_key`, and projects the
+tool-call id as an exact runtime-scoped correlation. Identical commands with
+different tool-call ids therefore clear independently and out of order;
+replayed exact callbacks are idempotent. Missing, null, or empty tool-call ids
+retain the older tuple fallback over `command`, `description`, `pattern_key`,
+`pattern_keys`, `session_key`, and `surface`. That tuple is canonicalized only
+in memory and projected by SHA-256; duplicate-identical fallback concurrency
+remains conservatively latched until authoritative completion, a new turn, or a
+runtime boundary. Raw kwargs never persist. Missing, malformed, or undocumented
+response choices fail open with sanitized diagnostics and do not clear.
 
 ## Concurrency, continuation, and privacy probes
 
@@ -127,6 +128,9 @@ The executable fixtures cover:
 
 - two concurrent attention requests, correlated one-by-one clearing, and a
   metadata-only `pending_count`;
+- the frozen Hermes 0.18.2 shell envelope with nested `extra`, empty top-level
+  session id, exact tool-call replay/ordering, missing/empty-id fallback, stale
+  runtime rejection, sanitized diagnostics, and raw-field non-persistence;
 - exact AskUserQuestion request/success/failure correlation and independent
   clearing alongside unrelated generic attention;
 - unrelated progress while attention is pending, including monotonic

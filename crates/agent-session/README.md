@@ -109,6 +109,13 @@ argv, reports `notification_mode` as `absent`, `owned`, `composed`, `conflict`,
 or `invalid`, surfaces sanitized configuration errors, and checks that the
 configured helper resolves to an executable on the provider PATH.
 
+Hermes 0.18.2 approval shell hooks are normalized from their nested `extra`
+envelope. A non-empty tool-call id is projected into an exact runtime-scoped
+pre/post correlation; missing or empty ids retain the conservative compatibility tuple
+fallback. Empty top-level session ids fall back to the nested session key. Raw
+approval kwargs are discarded before persistence, and malformed metadata stays
+fail-open with a sanitized diagnostic code.
+
 Codex itself appends the full notification JSON to the configured command argv.
 Agent-session discards content after parsing and never prints or persists it,
 but prompt, assistant, and cwd fields are transiently visible to same-host

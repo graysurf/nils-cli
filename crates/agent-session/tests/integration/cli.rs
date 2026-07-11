@@ -867,6 +867,310 @@ fn hermes_identical_approval_hooks_preserve_persisted_multiplicity_until_complet
 }
 
 #[test]
+fn hermes_shell_wire_approvals_use_exact_ids_and_compatibility_fallback() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let hermes_bin = fake_agent(tmp.path(), "hermes");
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let hermes_arg = hermes_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let start = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "hermes",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &hermes_arg,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    let id = data(&start.stdout_json())["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let session_dir = state_dir.join("sessions").join(&id);
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(session_dir.join("session.json")).expect("session record"),
+    )
+    .expect("session json");
+    let runtime_id = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("runtime id")
+        .to_string();
+    let hook_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let hook = |payload: &Value| {
+        run_with_stdin(
+            tmp.path(),
+            &["activity", "hook", "--agent", "hermes"],
+            &hook_env,
+            &payload.to_string(),
+        )
+    };
+    let state = || {
+        let status = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "activity",
+                "status",
+                &id,
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+        assert_eq!(status.code, 0, "stderr={}", status.stderr_text());
+        data(&status.stdout_json())["turn_state"].clone()
+    };
+    let fixture = include_str!("../fixtures/activity/hermes-shell-approval-events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("Hermes shell-wire fixture"))
+        .collect::<Vec<_>>();
+    assert_eq!(fixture.len(), 7);
+
+    let malformed = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "hermes"],
+        &hook_env,
+        "{invalid-hook",
+    );
+    assert_eq!(malformed.code, 0, "hook telemetry is fail-open");
+    let diagnostic_path = session_dir.join("activity.diagnostic.json");
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("hook diagnostic");
+    assert!(diagnostic.contains("provider-hook-invalid"));
+
+    let first = hook(&fixture[0]);
+    assert_eq!(first.code, 0, "stderr={}", first.stderr_text());
+    assert!(first.stdout_text().is_empty());
+    assert!(first.stderr_text().is_empty());
+    assert!(!diagnostic_path.exists());
+    let first_state = state();
+    assert_eq!(first_state["phase"], "needs_input");
+    assert_eq!(first_state["current_turn"]["attention"]["pending_count"], 1);
+    let first_revision = first_state["revision"].as_u64().expect("first revision");
+
+    let first_replay = hook(&fixture[0]);
+    assert_eq!(first_replay.code, 0);
+    let replay_state = state();
+    assert_eq!(replay_state["revision"], first_revision);
+    assert_eq!(
+        replay_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+
+    let second = hook(&fixture[1]);
+    assert_eq!(second.code, 0, "stderr={}", second.stderr_text());
+    let second_state = state();
+    assert_eq!(second_state["phase"], "needs_input");
+    assert_eq!(
+        second_state["current_turn"]["attention"]["pending_count"],
+        2
+    );
+    let second_revision = second_state["revision"].as_u64().expect("second revision");
+    assert!(second_revision > first_revision);
+
+    let post_b = hook(&fixture[2]);
+    assert_eq!(post_b.code, 0, "stderr={}", post_b.stderr_text());
+    let post_b_state = state();
+    assert_eq!(post_b_state["phase"], "needs_input");
+    assert_eq!(
+        post_b_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+    let post_b_revision = post_b_state["revision"].as_u64().expect("post B revision");
+    assert!(post_b_revision > second_revision);
+
+    let post_b_replay = hook(&fixture[2]);
+    assert_eq!(post_b_replay.code, 0);
+    let post_b_replay_state = state();
+    assert_eq!(post_b_replay_state["revision"], post_b_revision);
+    assert_eq!(
+        post_b_replay_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+
+    let fallback_pre = hook(&fixture[4]);
+    assert_eq!(
+        fallback_pre.code,
+        0,
+        "stderr={}",
+        fallback_pre.stderr_text()
+    );
+    let fallback_pre_state = state();
+    assert_eq!(fallback_pre_state["phase"], "needs_input");
+    assert_eq!(
+        fallback_pre_state["current_turn"]["attention"]["pending_count"],
+        2
+    );
+
+    let fallback_post = hook(&fixture[5]);
+    assert_eq!(
+        fallback_post.code,
+        0,
+        "stderr={}",
+        fallback_post.stderr_text()
+    );
+    let fallback_post_state = state();
+    assert_eq!(fallback_post_state["phase"], "needs_input");
+    assert_eq!(
+        fallback_post_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+
+    let post_a = hook(&fixture[3]);
+    assert_eq!(post_a.code, 0, "stderr={}", post_a.stderr_text());
+    let post_a_state = state();
+    assert_eq!(post_a_state["phase"], "working");
+    assert!(post_a_state["current_turn"]["attention"].is_null());
+    let cleared_revision = post_a_state["revision"].as_u64().expect("cleared revision");
+
+    let fallback_pending = hook(&fixture[4]);
+    assert_eq!(fallback_pending.code, 0);
+    let pending_state = state();
+    assert_eq!(pending_state["phase"], "needs_input");
+    assert_eq!(
+        pending_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+    let pending_revision = pending_state["revision"]
+        .as_u64()
+        .expect("pending revision");
+    assert!(pending_revision > cleared_revision);
+
+    let stale_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", "prior-runtime"),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let stale = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "hermes"],
+        &stale_env,
+        &fixture[1].to_string(),
+    );
+    assert_eq!(stale.code, 0, "stale hook telemetry is fail-open");
+    let after_stale_state = state();
+    assert_eq!(after_stale_state["revision"], pending_revision);
+    assert_eq!(
+        after_stale_state["current_turn"]["attention"]["pending_count"],
+        1
+    );
+
+    let mut invalid_tool_call = fixture[0].clone();
+    invalid_tool_call["extra"]["tool_call_id"] = json!({"raw": "must-not-persist"});
+    let invalid = hook(&invalid_tool_call);
+    assert_eq!(invalid.code, 0, "invalid hook telemetry is fail-open");
+    let diagnostic = fs::read_to_string(&diagnostic_path).expect("invalid-id diagnostic");
+    assert!(diagnostic.contains("provider-hook-correlation-invalid"));
+    for forbidden in [
+        "must-not-persist",
+        "tool_call_id",
+        "raw-command-never-persist",
+    ] {
+        assert!(!diagnostic.contains(forbidden));
+    }
+    assert_eq!(state()["revision"], pending_revision);
+
+    let completion = hook(&fixture[6]);
+    assert_eq!(completion.code, 0, "stderr={}", completion.stderr_text());
+    assert!(!diagnostic_path.exists());
+    let completed_state = state();
+    assert_eq!(completed_state["phase"], "waiting");
+    assert!(completed_state["current_turn"].is_null());
+    assert_eq!(completed_state["last_turn"]["outcome"], "completed");
+    assert!(
+        completed_state["revision"]
+            .as_u64()
+            .expect("completion revision")
+            > pending_revision
+    );
+
+    let journal =
+        fs::read_to_string(session_dir.join("activity.journal.jsonl")).expect("activity journal");
+    assert_eq!(journal.matches("attention_requested").count(), 4);
+    assert_eq!(journal.matches("attention_cleared").count(), 3);
+    assert_eq!(journal.matches("turn_completed").count(), 1);
+    let journal_entries = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("journal entry"))
+        .collect::<Vec<_>>();
+    let requested_ids = journal_entries
+        .iter()
+        .filter(|entry| entry["event"]["kind"] == "attention_requested")
+        .map(|entry| {
+            entry["event"]["attention_id"]
+                .as_str()
+                .expect("attention id")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requested_ids.len(), 4);
+    assert_ne!(requested_ids[0], requested_ids[1]);
+    assert_ne!(requested_ids[0], requested_ids[2]);
+    assert_eq!(requested_ids[2], requested_ids[3]);
+
+    let snapshot =
+        fs::read_to_string(session_dir.join("activity.json")).expect("activity snapshot");
+    let raw_values = [
+        "raw-command-never-persist",
+        "raw-description-never-persist",
+        "raw-pattern-never-persist",
+        "raw-secondary-pattern-never-persist",
+        "raw-session-never-persist",
+        "raw-surface-never-persist",
+        "raw-turn-never-persist",
+        "raw-tool-call-a-never-persist",
+        "raw-tool-call-b-never-persist",
+        "raw-fallback-command-never-persist",
+        "raw-fallback-description-never-persist",
+        "raw-fallback-pattern-never-persist",
+        "raw-fallback-secondary-never-persist",
+        "/raw/cwd-never-persist",
+    ];
+    for persisted in [snapshot.as_str(), journal.as_str()] {
+        for field in [
+            "\"extra\"",
+            "\"command\"",
+            "\"description\"",
+            "\"pattern_key\"",
+            "\"pattern_keys\"",
+            "\"session_key\"",
+            "\"surface\"",
+            "\"tool_call_id\"",
+            "\"cwd\"",
+        ] {
+            assert!(
+                !persisted.contains(field),
+                "raw shell field persisted: {field}"
+            );
+        }
+        for raw in raw_values {
+            assert!(!persisted.contains(raw), "raw shell value persisted: {raw}");
+        }
+    }
+    assert!(session_dir.join("activity.replay.bin").is_file());
+}
+
+#[test]
 fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");

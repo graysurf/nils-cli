@@ -210,6 +210,8 @@ pub(crate) struct TurnEvent {
     pub(crate) attention_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) attention_kind: Option<String>,
+    #[serde(skip)]
+    attention_correlation_ambiguous: bool,
     pub(crate) confidence: Confidence,
     #[serde(default)]
     pub(crate) source_kind: SourceKind,
@@ -516,6 +518,51 @@ fn hermes_approval_correlation_id(runtime_id: &str, raw: &Value) -> Result<Strin
     )
 }
 
+fn hermes_approval_metadata(raw: &Value) -> Result<&Value, CliError> {
+    match raw.get("extra") {
+        Some(extra) if extra.is_object() => Ok(extra),
+        Some(Value::Null) | None => Ok(raw),
+        Some(_) => Err(CliError::data(
+            "provider-hook-correlation-invalid",
+            "recognized Hermes approval hook has invalid matching correlation metadata",
+            Some(json!({ "field": "extra" })),
+        )),
+    }
+}
+
+fn optional_hook_string<'a>(raw: &'a Value, field: &str) -> Result<Option<&'a str>, CliError> {
+    match raw.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.is_empty() => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(CliError::data(
+            "provider-hook-identifier-invalid",
+            "provider hook identifier is invalid",
+            Some(json!({ "field": field })),
+        )),
+    }
+}
+
+fn hermes_approval_correlation(
+    runtime_id: &str,
+    metadata: &Value,
+) -> Result<(String, bool), CliError> {
+    match metadata.get("tool_call_id") {
+        Some(Value::String(value)) if !value.is_empty() => {
+            projected_provider_identifier(runtime_id, AgentKind::Hermes, "attention", value)
+                .map(|id| (id, false))
+        }
+        None | Some(Value::Null) | Some(Value::String(_)) => {
+            hermes_approval_correlation_id(runtime_id, metadata).map(|id| (id, true))
+        }
+        Some(_) => Err(CliError::data(
+            "provider-hook-correlation-invalid",
+            "recognized Hermes approval hook has invalid matching correlation metadata",
+            Some(json!({ "field": "tool_call_id" })),
+        )),
+    }
+}
+
 fn event_dedupe_key(runtime_id: &str, event_id: &str) -> [u8; REPLAY_SLOT_BYTES] {
     let mut digest = Sha256::new();
     digest.update(b"agent-session.event-id.v1\0");
@@ -575,6 +622,7 @@ fn semantic_event_is_duplicate(
     if event.provider == AgentKind::Hermes.as_str()
         && event.kind == TurnEventKind::AttentionRequested
         && event.attention_kind.as_deref() == Some("approval")
+        && event.attention_correlation_ambiguous
     {
         // Hermes provides no delivery id distinct from the derived request
         // tuple. Preserve every observed pre-request as conservative
@@ -1570,10 +1618,15 @@ fn normalize_provider_hook(
             event_name,
             "pre_approval_request" | "post_approval_response"
         );
+    let hermes_approval_metadata = exact_hermes_approval
+        .then(|| hermes_approval_metadata(raw))
+        .transpose()?;
     if agent == AgentKind::Hermes
         && event_name == "post_approval_response"
         && !matches!(
-            raw.get("choice").and_then(Value::as_str),
+            hermes_approval_metadata
+                .and_then(|metadata| metadata.get("choice"))
+                .and_then(Value::as_str),
             Some("once" | "session" | "always" | "deny" | "timeout")
         )
     {
@@ -1649,26 +1702,40 @@ fn normalize_provider_hook(
         }
         _ => return Ok(None),
     };
-    let provider_session_id = raw
-        .get("session_id")
-        .or_else(|| raw.get("session_key"))
-        .and_then(Value::as_str)
+    let mut provider_session = optional_hook_string(raw, "session_id")?;
+    if provider_session.is_none() {
+        provider_session = optional_hook_string(raw, "session_key")?;
+    }
+    if provider_session.is_none()
+        && let Some(metadata) = hermes_approval_metadata
+    {
+        provider_session = optional_hook_string(metadata, "session_key")?;
+    }
+    let provider_session_id = provider_session
         .map(|value| projected_provider_identifier(runtime_id, agent, "session", value))
         .transpose()?;
-    let provider_turn_id = raw
-        .get("turn_id")
-        .and_then(Value::as_str)
+    let mut provider_turn = optional_hook_string(raw, "turn_id")?;
+    if provider_turn.is_none()
+        && let Some(metadata) = hermes_approval_metadata
+    {
+        provider_turn = optional_hook_string(metadata, "turn_id")?;
+    }
+    let provider_turn_id = provider_turn
         .map(|value| projected_provider_identifier(runtime_id, agent, "turn", value))
         .transpose()?;
-    let exact_attention_id = if exact_clarification {
-        raw.get("tool_use_id")
-            .and_then(Value::as_str)
-            .map(|value| projected_provider_identifier(runtime_id, agent, "attention", value))
-            .transpose()?
-    } else if exact_hermes_approval {
-        Some(hermes_approval_correlation_id(runtime_id, raw)?)
+    let (exact_attention_id, attention_correlation_ambiguous) = if exact_clarification {
+        (
+            raw.get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(|value| projected_provider_identifier(runtime_id, agent, "attention", value))
+                .transpose()?,
+            false,
+        )
+    } else if let Some(metadata) = hermes_approval_metadata {
+        let (id, ambiguous) = hermes_approval_correlation(runtime_id, metadata)?;
+        (Some(id), ambiguous)
     } else {
-        None
+        (None, false)
     };
     if exact_clarification && exact_attention_id.is_none() {
         return Err(CliError::data(
@@ -1695,6 +1762,7 @@ fn normalize_provider_hook(
         kind,
         attention_id,
         attention_kind: attention_kind.map(str::to_string),
+        attention_correlation_ambiguous,
         confidence,
         source_kind: SourceKind::ProviderHook,
         provider_time: None,
@@ -1743,6 +1811,7 @@ fn normalize_provider_notification(
         kind: TurnEventKind::TurnCompleted,
         attention_id: None,
         attention_kind: None,
+        attention_correlation_ambiguous: false,
         confidence: Confidence::Authoritative,
         source_kind: SourceKind::ProviderHook,
         provider_time: None,
@@ -1842,7 +1911,7 @@ pub(crate) fn doctor(
                 AgentKind::Hermes => (
                     "supported",
                     "post_llm_call is authoritative for successful non-interrupted turns on the supported version",
-                    "approval hooks use observed runtime-scoped correlation derived from matching metadata; distinct tuples clear exactly, while duplicate-identical concurrent approvals retain conservative multiplicity until completion, a new turn, or a runtime boundary",
+                    "Hermes 0.18.2 shell approval hooks use projected non-empty tool_call_id for exact correlation; missing/empty-id tuple fallback retains conservative multiplicity until completion, a new turn, or a runtime boundary",
                     "Hermes shell hooks require first-use consent unless explicitly accepted",
                     "Run activity setup --agent hermes --dry-run, apply it, then approve and verify with hermes hooks doctor",
                 ),
@@ -2179,7 +2248,7 @@ fn audited_floor(agent: AgentKind) -> (u64, u64, u64) {
     match agent {
         AgentKind::Codex => (0, 144, 1),
         AgentKind::Claude => (2, 1, 206),
-        AgentKind::Hermes => (0, 18, 0),
+        AgentKind::Hermes => (0, 18, 2),
     }
 }
 
@@ -3179,6 +3248,7 @@ mod tests {
             kind,
             attention_id: None,
             attention_kind: None,
+            attention_correlation_ambiguous: false,
             confidence: Confidence::Observed,
             source_kind: SourceKind::ProviderHook,
             provider_time: None,
@@ -4290,9 +4360,10 @@ mod tests {
             parse_version_triplet("2.1.206 (Claude Code)"),
             Some((2, 1, 206))
         );
-        assert_eq!(parse_version_triplet("Hermes 0.18.0"), Some((0, 18, 0)));
+        assert_eq!(parse_version_triplet("Hermes 0.18.2"), Some((0, 18, 2)));
         assert_eq!(parse_version_triplet("development build"), None);
         assert_eq!(audited_floor(AgentKind::Claude), (2, 1, 206));
+        assert_eq!(audited_floor(AgentKind::Hermes), (0, 18, 2));
     }
 
     #[test]
@@ -5045,7 +5116,8 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                 });
             }
             let attention_id = event.attention_id.as_deref().unwrap_or_default();
-            let duplicate_hermes_approval = event.provider == AgentKind::Hermes.as_str()
+            let duplicate_hermes_approval = event.attention_correlation_ambiguous
+                && event.provider == AgentKind::Hermes.as_str()
                 && event.attention_kind.as_deref() == Some("approval")
                 && document
                     .pending_attention
