@@ -34,6 +34,7 @@ tokio = { workspace = true }
 axum = { workspace = true }
 futures-util = { workspace = true }
 libc = "0.2"
+notify = "8"
 
 [dev-dependencies]
 nils-test-support = { version = "1.21.17", path = "../nils-test-support" }

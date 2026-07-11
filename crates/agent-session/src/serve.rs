@@ -10,6 +10,7 @@
 //! aggregate multiple machines. Literal keystroke text is never echoed.
 
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::ffi::CString;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -20,8 +21,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -31,6 +32,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use futures_util::{SinkExt, StreamExt};
@@ -39,9 +41,10 @@ use nils_common::provider_usage::{ProviderUsageReason, prefer_reason};
 use nils_common::usage_time::{
     epoch_seconds_from_f64, normalize_epoch_seconds, reset_epoch_seconds_from_str,
 };
+use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::provider_prompt::{
@@ -83,6 +86,11 @@ const PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES: usize = 64;
 const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
+const ACTIVITY_STREAM_EVENT_SCHEMA_VERSION: &str = "agent-session.activity-stream.event.v1";
+const ACTIVITY_STREAM_BROADCAST_CAPACITY: usize = 32;
+const ACTIVITY_STREAM_REPLAY_CAPACITY: usize = 128;
+const ACTIVITY_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const ACTIVITY_STREAM_DEBOUNCE: Duration = Duration::from_millis(25);
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
 const RESET_AT_EPOCH_KEYS: &[&str] = &[
     "reset_at_epoch",
@@ -103,6 +111,7 @@ struct ServeState {
     tmux_bin: PathBuf,
     attach_brokers: AttachBrokerRegistry,
     provider_prompt_discovery: Arc<ProviderPromptDiscoveryRegistry>,
+    activity_broker: Arc<ActivityBroker>,
 }
 
 pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
@@ -137,7 +146,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
     };
     if token.is_none() {
         eprintln!(
-            "warning: no --token / --token-stdin / AGENT_SESSION_TOKEN set; write and attach endpoints are disabled"
+            "warning: no --token / --token-stdin / AGENT_SESSION_TOKEN set; authenticated endpoints are disabled"
         );
     }
 
@@ -150,15 +159,6 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
         .unwrap_or_else(|| "unknown".to_string());
 
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
-    let state = Arc::new(ServeState {
-        context: context.clone(),
-        machine,
-        token,
-        tmux_bin,
-        attach_brokers: AttachBrokerRegistry::default(),
-        provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
-    });
-
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -171,6 +171,17 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
     };
 
     runtime.block_on(async move {
+        let activity_broker =
+            ActivityBroker::start(context.clone(), machine.clone(), tmux_bin.clone()).await;
+        let state = Arc::new(ServeState {
+            context: context.clone(),
+            machine,
+            token,
+            tmux_bin,
+            attach_brokers: AttachBrokerRegistry::default(),
+            provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
+            activity_broker,
+        });
         let listener = match tokio::net::TcpListener::bind(bind).await {
             Ok(listener) => listener,
             Err(err) => {
@@ -201,6 +212,7 @@ fn router(state: Arc<ServeState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/sessions", get(list_handler).post(create_handler))
+        .route("/activity/events", get(activity_events_handler))
         .route("/usage", get(usage_handler))
         .route("/workdirs", get(workdirs_handler))
         .route("/repos/remote-url", get(repo_remote_url_handler))
@@ -274,6 +286,383 @@ fn read_token_from_stdin<R: Read>(reader: R) -> Result<String, ServeTokenError> 
 /// matching the env-var sanitization in `non_empty_env`.
 fn sanitize_token(token: Option<String>) -> Option<String> {
     token.filter(|value| !value.trim().is_empty())
+}
+
+// --- activity stream ---------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct ActivityStreamSession {
+    id: String,
+    turn_state: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ActivityStreamEvent {
+    schema_version: &'static str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    stream_id: String,
+    sequence: u64,
+    machine: String,
+    observed_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions: Option<Vec<ActivityStreamSession>>,
+}
+
+impl ActivityStreamEvent {
+    fn sse_id(&self) -> String {
+        format!("{}:{}", self.stream_id, self.sequence)
+    }
+
+    fn as_sse(&self) -> SseEvent {
+        SseEvent::default()
+            .id(self.sse_id())
+            .event(self.kind)
+            .data(serde_json::to_string(self).expect("activity stream event serializes"))
+    }
+}
+
+struct ActivityEventState {
+    history: VecDeque<Arc<ActivityStreamEvent>>,
+    latest_sessions: Vec<ActivityStreamSession>,
+}
+
+struct ActivityEventLog {
+    stream_id: String,
+    machine: String,
+    sequence: AtomicU64,
+    state: StdMutex<ActivityEventState>,
+    sender: broadcast::Sender<Arc<ActivityStreamEvent>>,
+}
+
+impl ActivityEventLog {
+    fn new(machine: String, sessions: Vec<ActivityStreamSession>) -> Arc<Self> {
+        let stream_id = uuid::Uuid::new_v4().to_string();
+        let initial = Arc::new(ActivityStreamEvent {
+            schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
+            kind: "snapshot",
+            stream_id: stream_id.clone(),
+            sequence: 1,
+            machine: machine.clone(),
+            observed_at: activity_observed_at(),
+            sessions: Some(sessions.clone()),
+        });
+        let mut history = VecDeque::with_capacity(ACTIVITY_STREAM_REPLAY_CAPACITY);
+        history.push_back(initial.clone());
+        let (sender, _) = broadcast::channel(ACTIVITY_STREAM_BROADCAST_CAPACITY);
+        Arc::new(Self {
+            stream_id,
+            machine,
+            sequence: AtomicU64::new(1),
+            state: StdMutex::new(ActivityEventState {
+                history,
+                latest_sessions: sessions,
+            }),
+            sender,
+        })
+    }
+
+    fn publish_snapshot(&self, sessions: Vec<ActivityStreamSession>) {
+        let unchanged = self
+            .state
+            .lock()
+            .expect("activity event state lock")
+            .latest_sessions
+            == sessions;
+        if unchanged {
+            return;
+        }
+        self.publish("snapshot", Some(sessions));
+    }
+
+    fn publish_heartbeat(&self) {
+        self.publish("heartbeat", None);
+    }
+
+    fn publish(&self, kind: &'static str, sessions: Option<Vec<ActivityStreamSession>>) {
+        let mut state = self.state.lock().expect("activity event state lock");
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let event = Arc::new(ActivityStreamEvent {
+            schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
+            kind,
+            stream_id: self.stream_id.clone(),
+            sequence,
+            machine: self.machine.clone(),
+            observed_at: activity_observed_at(),
+            sessions: sessions.clone(),
+        });
+        if let Some(sessions) = sessions {
+            state.latest_sessions = sessions;
+        }
+        state.history.push_back(event.clone());
+        while state.history.len() > ACTIVITY_STREAM_REPLAY_CAPACITY {
+            state.history.pop_front();
+        }
+        // A bounded broadcast is deliberately lossy. A lagged subscriber gets
+        // a full reset and polling remains the convergence path.
+        let _ = self.sender.send(event);
+    }
+
+    fn subscribe(self: &Arc<Self>, last_event_id: Option<&str>) -> ActivitySubscription {
+        // Subscribe before taking the replay snapshot. Events racing with the
+        // snapshot may be present in both sources; the sequence filter removes
+        // those duplicates without losing an event.
+        let receiver = self.sender.subscribe();
+        let state = self.state.lock().expect("activity event state lock");
+        let current_sequence = self.sequence.load(Ordering::SeqCst);
+        let pending = match last_event_id.and_then(parse_activity_event_id) {
+            None if last_event_id.is_none() => {
+                VecDeque::from([self.full_event_locked(&state, current_sequence, "snapshot")])
+            }
+            Some((stream_id, sequence))
+                if stream_id == self.stream_id && sequence <= current_sequence =>
+            {
+                let oldest = state
+                    .history
+                    .front()
+                    .map_or(current_sequence, |event| event.sequence);
+                if sequence.saturating_add(1) < oldest {
+                    VecDeque::from([self.reset_event_locked(&state, current_sequence)])
+                } else {
+                    state
+                        .history
+                        .iter()
+                        .filter(|event| event.sequence > sequence)
+                        .cloned()
+                        .collect()
+                }
+            }
+            _ => VecDeque::from([self.reset_event_locked(&state, current_sequence)]),
+        };
+        ActivitySubscription {
+            log: self.clone(),
+            pending,
+            receiver,
+            last_sequence: last_event_id
+                .and_then(parse_activity_event_id)
+                .filter(|(stream_id, sequence)| {
+                    stream_id == &self.stream_id && *sequence <= current_sequence
+                })
+                .map_or(0, |(_, sequence)| sequence),
+        }
+    }
+
+    fn reset_event(&self) -> Arc<ActivityStreamEvent> {
+        let state = self.state.lock().expect("activity event state lock");
+        let sequence = self.sequence.load(Ordering::SeqCst);
+        self.reset_event_locked(&state, sequence)
+    }
+
+    fn reset_event_locked(
+        &self,
+        state: &ActivityEventState,
+        sequence: u64,
+    ) -> Arc<ActivityStreamEvent> {
+        self.full_event_locked(state, sequence, "reset")
+    }
+
+    fn full_event_locked(
+        &self,
+        state: &ActivityEventState,
+        sequence: u64,
+        kind: &'static str,
+    ) -> Arc<ActivityStreamEvent> {
+        Arc::new(ActivityStreamEvent {
+            schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
+            kind,
+            stream_id: self.stream_id.clone(),
+            sequence,
+            machine: self.machine.clone(),
+            observed_at: activity_observed_at(),
+            sessions: Some(state.latest_sessions.clone()),
+        })
+    }
+}
+
+struct ActivitySubscription {
+    log: Arc<ActivityEventLog>,
+    pending: VecDeque<Arc<ActivityStreamEvent>>,
+    receiver: broadcast::Receiver<Arc<ActivityStreamEvent>>,
+    last_sequence: u64,
+}
+
+impl ActivitySubscription {
+    async fn next_event(&mut self) -> Arc<ActivityStreamEvent> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                if event.sequence > self.last_sequence || event.kind == "reset" {
+                    self.last_sequence = event.sequence;
+                    return event;
+                }
+                continue;
+            }
+            match self.receiver.recv().await {
+                Ok(event) if event.sequence > self.last_sequence => {
+                    self.last_sequence = event.sequence;
+                    return event;
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let event = self.log.reset_event();
+                    self.last_sequence = event.sequence;
+                    return event;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return self.log.reset_event();
+                }
+            }
+        }
+    }
+}
+
+struct ActivityBroker {
+    log: Arc<ActivityEventLog>,
+    available: bool,
+    _watcher: StdMutex<Option<RecommendedWatcher>>,
+}
+
+impl ActivityBroker {
+    async fn start(context: CliContext, machine: String, tmux_bin: PathBuf) -> Arc<Self> {
+        let (change_tx, change_rx) = mpsc::channel(1);
+        let callback_tx = change_tx.clone();
+        let mut watcher =
+            notify::recommended_watcher(move |result: notify::Result<NotifyEvent>| {
+                if result.as_ref().is_ok_and(activity_notify_event_relevant) {
+                    let _ = callback_tx.try_send(());
+                }
+            })
+            .ok();
+        let sessions_root = context.state_dir.join("sessions");
+        if std::fs::create_dir_all(&sessions_root).is_err()
+            || watcher.as_mut().is_some_and(|watcher| {
+                watcher
+                    .watch(&sessions_root, RecursiveMode::Recursive)
+                    .is_err()
+            })
+        {
+            watcher = None;
+        }
+        if watcher.is_none() {
+            eprintln!(
+                "warning: activity filesystem notifications unavailable; session polling will reconcile"
+            );
+        }
+        let initial_context = context.clone();
+        let initial_tmux = tmux_bin.clone();
+        let initial = tokio::task::spawn_blocking(move || {
+            collect_activity_stream_sessions(&initial_context, &initial_tmux)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "warning: initial activity stream snapshot unavailable; session polling will reconcile"
+            );
+            Vec::new()
+        });
+        let log = ActivityEventLog::new(machine, initial);
+        let available = watcher.is_some();
+        let broker = Arc::new(Self {
+            log,
+            available,
+            _watcher: StdMutex::new(watcher),
+        });
+        if available {
+            tokio::spawn(activity_change_loop(
+                broker.log.clone(),
+                context,
+                tmux_bin,
+                change_rx,
+            ));
+            tokio::spawn(activity_heartbeat_loop(broker.log.clone()));
+        }
+        broker
+    }
+
+    #[cfg(test)]
+    fn for_test(machine: &str) -> Arc<Self> {
+        let watcher = notify::recommended_watcher(|_: notify::Result<NotifyEvent>| {})
+            .expect("test filesystem watcher");
+        Arc::new(Self {
+            log: ActivityEventLog::new(machine.to_string(), Vec::new()),
+            available: true,
+            _watcher: StdMutex::new(Some(watcher)),
+        })
+    }
+}
+
+fn activity_observed_at() -> String {
+    jiff::Timestamp::now().to_string()
+}
+
+fn parse_activity_event_id(raw: &str) -> Option<(String, u64)> {
+    let (stream_id, sequence) = raw.rsplit_once(':')?;
+    if stream_id.is_empty() {
+        return None;
+    }
+    Some((stream_id.to_string(), sequence.parse().ok()?))
+}
+
+fn activity_notify_event_relevant(event: &NotifyEvent) -> bool {
+    event.paths.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "activity.json" | "session.json"))
+    })
+}
+
+fn collect_activity_stream_sessions(
+    context: &CliContext,
+    tmux_bin: &Path,
+) -> Result<Vec<ActivityStreamSession>, CliError> {
+    list_sessions(context, Some(tmux_bin)).map(|sessions| {
+        sessions
+            .into_iter()
+            .map(|session| ActivityStreamSession {
+                id: session.id,
+                turn_state: session
+                    .turn_state
+                    .as_ref()
+                    .map(crate::activity::stream_projection),
+            })
+            .collect()
+    })
+}
+
+async fn activity_change_loop(
+    log: Arc<ActivityEventLog>,
+    context: CliContext,
+    tmux_bin: PathBuf,
+    mut changes: mpsc::Receiver<()>,
+) {
+    while changes.recv().await.is_some() {
+        tokio::time::sleep(ACTIVITY_STREAM_DEBOUNCE).await;
+        while changes.try_recv().is_ok() {}
+        let context = context.clone();
+        let tmux_bin = tmux_bin.clone();
+        match tokio::task::spawn_blocking(move || {
+            collect_activity_stream_sessions(&context, &tmux_bin)
+        })
+        .await
+        {
+            Ok(Ok(sessions)) => log.publish_snapshot(sessions),
+            Ok(Err(_)) | Err(_) => {
+                eprintln!(
+                    "warning: activity stream snapshot refresh failed; polling will reconcile"
+                )
+            }
+        }
+    }
+}
+
+async fn activity_heartbeat_loop(log: Arc<ActivityEventLog>) {
+    let mut interval = tokio::time::interval(ACTIVITY_STREAM_HEARTBEAT_INTERVAL);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        log.publish_heartbeat();
+    }
 }
 
 // --- response helpers ---------------------------------------------------------
@@ -928,7 +1317,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Enforce the bearer token on write / attach endpoints. Returns `Some(denial)`
+/// Enforce the bearer token on authenticated endpoints. Returns `Some(denial)`
 /// to reject (401), or `Some(503)` when the daemon has no token configured
 /// (fail closed); returns `None` when the request is authorized.
 fn deny_unauthorized(state: &ServeState, headers: &HeaderMap) -> Option<Response> {
@@ -936,7 +1325,7 @@ fn deny_unauthorized(state: &ServeState, headers: &HeaderMap) -> Option<Response
         return Some(status_json(
             StatusCode::SERVICE_UNAVAILABLE,
             "token-not-configured",
-            "server has no token configured; write and attach endpoints are disabled",
+            "server has no token configured; authenticated endpoints are disabled",
         ));
     };
     let provided = headers
@@ -1010,10 +1399,47 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
     match tokio::task::spawn_blocking(move || list_sessions(&context, Some(&tmux))).await {
-        Ok(Ok(sessions)) => envelope_ok(json!({ "machine": state.machine, "sessions": sessions })),
+        Ok(Ok(sessions)) => envelope_ok(json!({
+            "machine": state.machine,
+            "observed_at": activity_observed_at(),
+            "sessions": sessions,
+        })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
+}
+
+async fn activity_events_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    if !state.activity_broker.available {
+        return status_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "activity-stream-unavailable",
+            "activity filesystem notifications are unavailable; use session polling",
+        );
+    }
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok());
+    let subscription = state.activity_broker.log.subscribe(last_event_id);
+    let stream = futures_util::stream::unfold(subscription, |mut subscription| async move {
+        let event = subscription.next_event().await;
+        Some((Ok::<_, Infallible>(event.as_sse()), subscription))
+    });
+    let mut response = Sse::new(stream).into_response();
+    response.headers_mut().insert(
+        "cache-control",
+        "no-cache, no-transform".parse().expect("static header"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", "no".parse().expect("static header"));
+    response
 }
 
 async fn glance_handler(
@@ -4291,6 +4717,7 @@ mod tests {
             tmux_bin,
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
+            activity_broker: ActivityBroker::for_test(MACHINE),
         })
     }
 
@@ -4935,7 +5362,217 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
         assert_eq!(body["data"]["machine"], MACHINE);
+        let observed_at = body["data"]["observed_at"]
+            .as_str()
+            .expect("daemon observation anchor");
+        observed_at
+            .parse::<jiff::Timestamp>()
+            .expect("RFC3339 daemon observation anchor");
         assert_eq!(body["data"]["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn activity_stream_requires_auth_and_sets_sse_headers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+
+        let (status, body) = call(router(st.clone()), get_auth("/activity/events", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let response = router(st)
+            .oneshot(get_auth("/activity/events", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            response.headers()["cache-control"],
+            "no-cache, no-transform"
+        );
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+    }
+
+    #[test]
+    fn activity_stream_projection_is_metadata_only_and_drops_additive_content() {
+        let state: crate::activity::TurnState = serde_json::from_value(json!({
+            "schema_version":"agent-session.turn-state.v1",
+            "phase":"needs_input",
+            "phase_changed_at":"2026-07-11T00:00:00Z",
+            "revision":7,
+            "source":{
+                "kind":"provider_hook",
+                "provider":"codex",
+                "confidence":"authoritative",
+                "config":"must-not-stream"
+            },
+            "current_turn":{
+                "provider_turn_id":"opaque-turn",
+                "started_at":"2026-07-11T00:00:00Z",
+                "last_progress_at":"2026-07-11T00:00:01Z",
+                "attention":{
+                    "kind":"permission",
+                    "requested_at":"2026-07-11T00:00:02Z",
+                    "pending_count":1,
+                    "tool":"must-not-stream"
+                },
+                "prompt":"must-not-stream"
+            },
+            "last_turn":{
+                "provider_turn_id":"opaque-prior-turn",
+                "started_at":"2026-07-10T23:59:00Z",
+                "completed_at":"2026-07-10T23:59:30Z",
+                "outcome":"completed",
+                "response":"must-not-stream"
+            },
+            "terminal":"must-not-stream",
+            "credential":"must-not-stream"
+        }))
+        .expect("forward-compatible state");
+
+        let projection = crate::activity::stream_projection(&state);
+        assert_eq!(projection["revision"], 7);
+        assert_eq!(
+            projection["current_turn"]["attention"]["kind"],
+            "permission"
+        );
+        let encoded = projection.to_string();
+        for forbidden in [
+            "prompt",
+            "response",
+            "command",
+            "tool",
+            "terminal",
+            "transcript",
+            "config",
+            "credential",
+            "must-not-stream",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "leaked forbidden field: {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_stream_replays_in_order_and_resets_invalid_or_evicted_cursors() {
+        let initial = vec![ActivityStreamSession {
+            id: "session-1".to_string(),
+            turn_state: Some(json!({"revision":1})),
+        }];
+        let log = ActivityEventLog::new(MACHINE.to_string(), initial.clone());
+        let mut first = log.subscribe(None);
+        let snapshot = first.next_event().await;
+        assert_eq!(snapshot.kind, "snapshot");
+        assert_eq!(snapshot.sequence, 1);
+        assert_eq!(snapshot.sessions.as_ref(), Some(&initial));
+
+        log.publish_heartbeat();
+        log.publish_snapshot(vec![ActivityStreamSession {
+            id: "session-1".to_string(),
+            turn_state: Some(json!({"revision":2})),
+        }]);
+        let mut replay = log.subscribe(Some(&format!("{}:1", log.stream_id)));
+        assert_eq!(replay.next_event().await.sequence, 2);
+        let changed = replay.next_event().await;
+        assert_eq!(changed.sequence, 3);
+        assert_eq!(changed.kind, "snapshot");
+
+        let mut foreign = log.subscribe(Some("other-stream:3"));
+        let reset = foreign.next_event().await;
+        assert_eq!(reset.kind, "reset");
+        assert_eq!(reset.sequence, 3);
+        assert_eq!(
+            reset.sessions.as_ref().unwrap()[0]
+                .turn_state
+                .as_ref()
+                .unwrap()["revision"],
+            2
+        );
+
+        for _ in 0..ACTIVITY_STREAM_REPLAY_CAPACITY {
+            log.publish_heartbeat();
+        }
+        let mut fresh = log.subscribe(None);
+        let current = fresh.next_event().await;
+        assert_eq!(current.kind, "snapshot");
+        assert_eq!(current.sequence, log.sequence.load(Ordering::SeqCst));
+        let mut evicted = log.subscribe(Some(&format!("{}:1", log.stream_id)));
+        assert_eq!(evicted.next_event().await.kind, "reset");
+    }
+
+    #[tokio::test]
+    async fn activity_stream_backpressure_never_blocks_producers_and_lag_resets() {
+        let log = ActivityEventLog::new(MACHINE.to_string(), Vec::new());
+        let cursor = format!("{}:1", log.stream_id);
+        let mut slow = log.subscribe(Some(&cursor));
+        for _ in 0..(ACTIVITY_STREAM_BROADCAST_CAPACITY + 4) {
+            log.publish_heartbeat();
+        }
+        let reset = tokio::time::timeout(Duration::from_millis(100), slow.next_event())
+            .await
+            .expect("lagged subscriber reset");
+        assert_eq!(reset.kind, "reset");
+        assert_eq!(reset.sequence, log.sequence.load(Ordering::SeqCst));
+        assert!(reset.sessions.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activity_file_notification_publishes_transition_without_http_polling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let broker = ActivityBroker::start(context.clone(), MACHINE.to_string(), tmux).await;
+        let mut subscription = broker.log.subscribe(None);
+        assert_eq!(subscription.next_event().await.kind, "snapshot");
+
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        seed_fresh_provider_session(
+            tmp.path(),
+            "streamed-session",
+            "codex",
+            "hs-streamed-session",
+            &cwd,
+            None,
+        );
+        let record = load_session_record(&context, "streamed-session").expect("session record");
+        crate::activity::activate_runtime(&context, &record).expect("activity snapshot");
+
+        let event = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = subscription.next_event().await;
+                let has_activity = event.sessions.as_ref().is_some_and(|sessions| {
+                    sessions.iter().any(|session| {
+                        session.id == "streamed-session" && session.turn_state.is_some()
+                    })
+                });
+                if has_activity {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("filesystem-driven transition");
+        assert_eq!(event.kind, "snapshot");
+        let session = event
+            .sessions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|session| session.id == "streamed-session")
+            .unwrap();
+        assert_eq!(session.turn_state.as_ref().unwrap()["revision"], 1);
     }
 
     #[tokio::test]

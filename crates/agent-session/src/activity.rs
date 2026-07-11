@@ -224,6 +224,50 @@ pub(crate) struct ActivityResult {
     pub(crate) duplicate: bool,
 }
 
+/// Project durable activity state onto the explicitly allowlisted stream
+/// contract. Durable snapshots preserve additive fields for forward
+/// compatibility; those unknown fields must not cross the daemon stream's
+/// metadata-only privacy boundary.
+pub(crate) fn stream_projection(state: &TurnState) -> Value {
+    let source = json!({
+        "kind": state.source.kind,
+        "provider": state.source.provider,
+        "confidence": state.source.confidence,
+    });
+    let current_turn = state.current_turn.as_ref().map(|turn| {
+        let attention = turn.attention.as_ref().map(|attention| {
+            json!({
+                "kind": attention.kind,
+                "requested_at": attention.requested_at,
+                "pending_count": attention.pending_count,
+            })
+        });
+        json!({
+            "provider_turn_id": turn.provider_turn_id,
+            "started_at": turn.started_at,
+            "last_progress_at": turn.last_progress_at,
+            "attention": attention,
+        })
+    });
+    let last_turn = state.last_turn.as_ref().map(|turn| {
+        json!({
+            "provider_turn_id": turn.provider_turn_id,
+            "started_at": turn.started_at,
+            "completed_at": turn.completed_at,
+            "outcome": turn.outcome,
+        })
+    });
+    json!({
+        "schema_version": state.schema_version,
+        "phase": state.phase,
+        "phase_changed_at": state.phase_changed_at,
+        "revision": state.revision,
+        "source": source,
+        "current_turn": current_turn,
+        "last_turn": last_turn,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SetupAction {
     DryRun,
