@@ -10,7 +10,7 @@
 use crate::doctor::skill_surface;
 use crate::install::link_map::LinkMap;
 use crate::install::plan::{InstallPlan, PlanAction, SymlinkLinkMode};
-use crate::render::manifest::SourceRoot;
+use crate::render::manifest::{SkillExposure, SkillInvocation, SourceRoot, load_optional_skills};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -67,7 +67,17 @@ pub struct SkillRecord {
     /// `None` for other products.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discoverable: Option<bool>,
+    pub invocation: Option<SkillInvocation>,
+    pub exposure: Option<SkillExposure>,
+    pub pending_disposition: bool,
     pub warnings: Vec<SkillWarning>,
+}
+
+#[derive(Debug, Clone)]
+struct SkillMetadata {
+    invocation: Option<SkillInvocation>,
+    exposure: Option<SkillExposure>,
+    pending_disposition: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -111,6 +121,26 @@ pub fn run(args: ListSkillsArgs) -> anyhow::Result<u8> {
     }
 
     let root = SourceRoot::from_arg_or_cwd(args.source_root.as_deref())?;
+    let skills_manifest = load_optional_skills(&root)?;
+    let metadata_by_id = skills_manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .skills
+                .iter()
+                .map(|skill| {
+                    (
+                        skill.id.clone(),
+                        SkillMetadata {
+                            invocation: skill.invocation.clone(),
+                            exposure: skill.exposure.clone(),
+                            pending_disposition: manifest.is_pending_disposition(&skill.id),
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let link_map = LinkMap::load(root.path(), &args.product)?;
 
     // The install plan expansion is filesystem-aware but does not mutate
@@ -186,7 +216,9 @@ pub fn run(args: ListSkillsArgs) -> anyhow::Result<u8> {
         let dest_str = dest_rel.to_string_lossy().to_string();
         let discoverable = match args.product.as_str() {
             "codex" => Some(
-                matches!(link_mode, SymlinkLinkMode::Directory) && is_skills_prefixed(dest_rel),
+                (matches!(link_mode, SymlinkLinkMode::Directory) && is_skills_prefixed(dest_rel))
+                    || (matches!(link_mode, SymlinkLinkMode::RecursiveFile)
+                        && is_plugin_skill_leaf(dest_rel)),
             ),
             _ => None,
         };
@@ -194,6 +226,7 @@ pub fn run(args: ListSkillsArgs) -> anyhow::Result<u8> {
             .get(entry_id)
             .cloned()
             .unwrap_or_default();
+        let metadata = metadata_by_id.get(&id);
         by_id.insert(
             id.clone(),
             SkillRecord {
@@ -202,6 +235,9 @@ pub fn run(args: ListSkillsArgs) -> anyhow::Result<u8> {
                 destination: dest_str,
                 link_mode: (*link_mode).into(),
                 discoverable,
+                invocation: metadata.and_then(|item| item.invocation.clone()),
+                exposure: metadata.and_then(|item| item.exposure.clone()),
+                pending_disposition: metadata.is_some_and(|item| item.pending_disposition),
                 warnings,
             },
         );
@@ -231,12 +267,9 @@ fn identify_skill(product: &str, dest_rel: &Path) -> Option<String> {
         })
         .collect();
     match product {
-        // Hermes installs skills under `~/.hermes/skills/<domain>/<skill>/`
-        // via a recursive copy, so its destination layout matches codex's
-        // `skills/<domain>/<skill>` surface exactly.
-        "codex" | "hermes" => {
+        "codex" => {
             // `skills/<domain>/<skill>` is the active discoverable skill
-            // surface; the rehearsal pins these.
+            // surface retained for backward-compatible source roots.
             if components.len() == 3 && components[0] == "skills" {
                 return Some(format!("{}.{}", components[1], components[2]));
             }
@@ -244,22 +277,55 @@ fn identify_skill(product: &str, dest_rel: &Path) -> Option<String> {
             if components.len() == 4 && components[0] == "skills" && components[3] == "SKILL.md" {
                 return Some(format!("{}.{}", components[1], components[2]));
             }
-            None
+            plugin_skill_id(&components)
         }
-        "claude" => {
-            // `plugins/<domain>/skills/<skill>/SKILL.md` is the canonical
-            // per-skill leaf produced by the claude recursive expansion.
-            if components.len() == 5
-                && components[0] == "plugins"
-                && components[2] == "skills"
-                && components[4] == "SKILL.md"
-            {
-                return Some(format!("{}.{}", components[1], components[3]));
+        // Hermes installs skills under `~/.hermes/skills/<domain>/<skill>/`
+        // via a recursive copy.
+        "hermes" => {
+            if components.len() == 3 && components[0] == "skills" {
+                return Some(format!("{}.{}", components[1], components[2]));
             }
-            None
+            if components.len() == 4 && components[0] == "skills" && components[3] == "SKILL.md" {
+                return Some(format!("{}.{}", components[1], components[2]));
+            }
+            hermes_external_skill_id(&components)
         }
+        "claude" => plugin_skill_id(&components),
         _ => None,
     }
+}
+
+fn plugin_skill_id(components: &[&str]) -> Option<String> {
+    if components.len() == 5
+        && components[0] == "plugins"
+        && components[2] == "skills"
+        && components[4] == "SKILL.md"
+    {
+        return Some(format!("{}.{}", components[1], components[3]));
+    }
+    None
+}
+
+fn hermes_external_skill_id(components: &[&str]) -> Option<String> {
+    if components.len() == 5
+        && components[0] == "external-skills"
+        && components[1] == "agent-runtime-kit"
+        && components[4] == "SKILL.md"
+    {
+        return Some(format!("{}.{}", components[2], components[3]));
+    }
+    None
+}
+
+fn is_plugin_skill_leaf(path: &Path) -> bool {
+    let components: Vec<&str> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect();
+    plugin_skill_id(&components).is_some()
 }
 
 fn is_skills_prefixed(path: &Path) -> bool {
@@ -445,6 +511,9 @@ entries:
                         destination: dest_rel.to_string_lossy().to_string(),
                         link_mode: SkillLinkMode::Directory,
                         discoverable: Some(true),
+                        invocation: None,
+                        exposure: None,
+                        pending_disposition: false,
                         warnings: Vec::new(),
                     },
                 );
@@ -474,10 +543,30 @@ entries:
     }
 
     #[test]
+    fn identifies_codex_plugin_skill_md_leaf() {
+        let id = identify_skill(
+            "codex",
+            Path::new("plugins/reporting/skills/daily-brief/SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(id, "reporting.daily-brief");
+    }
+
+    #[test]
     fn identifies_claude_skill_md_leaf() {
         let id = identify_skill(
             "claude",
             Path::new("plugins/reporting/skills/daily-brief/SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(id, "reporting.daily-brief");
+    }
+
+    #[test]
+    fn identifies_hermes_external_skill_md_leaf() {
+        let id = identify_skill(
+            "hermes",
+            Path::new("external-skills/agent-runtime-kit/reporting/daily-brief/SKILL.md"),
         )
         .unwrap();
         assert_eq!(id, "reporting.daily-brief");

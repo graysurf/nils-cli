@@ -105,6 +105,8 @@ fn failing_manifest_path(err: &manifest::ManifestError, root: &SourceRoot) -> st
     let file = match err {
         ManifestError::Missing { path, .. } => Some(path.clone()),
         ManifestError::SchemaVersion { file, .. } => Some(file.clone()),
+        ManifestError::SchemaVersions { file, .. } => Some(file.clone()),
+        ManifestError::InvalidSkillContract { file, .. } => Some(file.clone()),
         ManifestError::Parse { file, .. } => Some(file.clone()),
         ManifestError::Io { file, .. } => Some(file.clone()),
         ManifestError::SourceRoot { path, .. } => Some(path.clone()),

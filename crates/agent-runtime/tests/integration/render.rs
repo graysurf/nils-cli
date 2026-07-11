@@ -957,7 +957,7 @@ fn write_common_manifests(root: &Path) {
 /// expected (its recursive link-map entry expands over the stale tree),
 /// silently keeping it in the live home.
 #[test]
-fn render_retiring_a_skill_reconciles_build_outputs_and_cache_entry() {
+fn render_retiring_a_v2_skill_reconciles_build_outputs_and_cache_entry() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();
     let root_str = root.to_str().unwrap();
@@ -968,11 +968,18 @@ fn render_retiring_a_skill_reconciles_build_outputs_and_cache_entry() {
     write(
         &root.join("manifests/skills.yaml"),
         r#"
-schema_version: 1
+schema_version: 2
 skills:
   - id: market.keep
     domain: market
     source: core/skills/market/keep
+    invocation:
+      role: workflow
+      intents: [market]
+      example_request: "Keep this market workflow"
+      admission_rationale: "Exercises one retained user workflow."
+    exposure:
+      profile: default
     products:
       codex:
         name: /market-keep
@@ -981,6 +988,13 @@ skills:
   - id: market.retire
     domain: market
     source: core/skills/market/retire
+    invocation:
+      role: workflow
+      intents: [market]
+      example_request: "Retire this market workflow"
+      admission_rationale: "Exercises one removable user workflow."
+    exposure:
+      profile: default
     products:
       codex:
         name: /market-retire
@@ -1023,11 +1037,18 @@ skills:
     write(
         &root.join("manifests/skills.yaml"),
         r#"
-schema_version: 1
+schema_version: 2
 skills:
   - id: market.keep
     domain: market
     source: core/skills/market/keep
+    invocation:
+      role: workflow
+      intents: [market]
+      example_request: "Keep this market workflow"
+      admission_rationale: "Exercises one retained user workflow."
+    exposure:
+      profile: default
     products:
       codex:
         name: /market-keep

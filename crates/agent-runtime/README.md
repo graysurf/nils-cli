@@ -68,6 +68,18 @@ JSON v1 schema (`cli.agent-runtime.list-skills.v1`):
       "destination": "skills/reporting/daily-brief",
       "link_mode": "directory",
       "discoverable": true,
+      "invocation": {
+        "role": "workflow",
+        "intents": ["daily-brief"],
+        "example_request": "Prepare my daily brief",
+        "admission_rationale": "Produces a direct user-requested information brief."
+      },
+      "exposure": {
+        "profile": "default",
+        "replacement": null,
+        "retire_after": null
+      },
+      "pending_disposition": false,
       "warnings": []
     }
   ]
@@ -77,6 +89,12 @@ JSON v1 schema (`cli.agent-runtime.list-skills.v1`):
 - `skills` is sorted by `id` for deterministic diffs.
 - `discoverable` is `true`/`false` for `--product codex`; omitted for other
   products.
+- `invocation` and `exposure` are populated from a skills manifest v2 entry.
+  They are `null` for v1 entries and for v2 entries explicitly listed under
+  `migration.pending_disposition`.
+- `pending_disposition` is always present. `true` means the skill remains
+  honestly installed and discoverable while the manifest owner completes its
+  migration review; it is not a hidden/internal exposure class.
 - `warnings` mirrors `doctor::skill_surface` warning codes (currently
   `codex.active-skill.file-symlink`) and is always present in JSON output.
   Pass `--include-warnings` to surface them inline in text output too.
@@ -84,6 +102,16 @@ JSON v1 schema (`cli.agent-runtime.list-skills.v1`):
 Pipe the JSON to `jq -r '.skills[].id' | sort` to recover the canonical
 `<domain>.<skill>` list used by sandbox install rehearsal pins under
 `agent-runtime-kit/tests/sandbox/<product>/expected-skills.txt`.
+
+### Skills manifest compatibility
+
+`agent-runtime` accepts `manifests/skills.yaml` schema versions 1 and 2 while
+other runtime manifest families remain on version 1. Version 2 adds typed
+invocation, exposure, and pending-disposition metadata. Active retained entries
+support only honest `default` exposure in this release; unsupported `opt-in`,
+permanent `internal`, and `advanced` plus default combinations fail closed.
+Compatibility entries must declare both a canonical replacement and a
+time-bounded `retire_after` value.
 
 ## PR body rendering
 

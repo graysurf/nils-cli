@@ -155,6 +155,8 @@ mod test_support {
             id: "market.favorites".to_string(),
             domain: "market".to_string(),
             source: "core/skills/market/favorites".to_string(),
+            invocation: None,
+            exposure: None,
             products,
             required_clis,
             state_out_mode: StateOutMode::Runtime,
@@ -176,6 +178,7 @@ mod test_support {
         ManifestSet {
             skills: SkillsManifest {
                 schema_version: 1,
+                migration: None,
                 skills: vec![skill],
             },
             plugins: PluginsManifest {
