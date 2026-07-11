@@ -2623,7 +2623,10 @@ fn validate_record_id(
     Ok(())
 }
 
-fn write_session_record(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
+pub(crate) fn write_session_record(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
     let bytes = serde_json::to_vec_pretty(record).map_err(|err| {
         CliError::runtime(
             "session-render-failed",
@@ -3085,7 +3088,7 @@ fn validate_resume_metadata(
     Ok((provider_resume, agent))
 }
 
-fn canonical_provider_resume_args(
+pub(crate) fn canonical_provider_resume_args(
     agent: AgentKind,
     cwd: &str,
     session_id: &str,

@@ -49,8 +49,7 @@ use crate::provider_prompt::{
 };
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
-    glance_session, list_sessions, load_session_record,
-    load_session_record_with_provider_resume_backfill, non_empty_env, repo_remote_url_from_cwd,
+    glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
     resolve_tmux_bin, resume_session_by_id, search_workdirs, send_input, session_clipboard_buffer,
     session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
     update_session_title, write_session_attachment,
@@ -76,7 +75,8 @@ const ATTACH_TERMINAL_BURST: usize = 32;
 const ATTACH_HANDOFF_BUFFER_CAPACITY: usize = ATTACH_BROADCAST_CAPACITY;
 const ATTACH_HANDOFF_MAX_RECAPTURES: usize = 1;
 const PROVIDER_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const PROVIDER_PROMPT_PENDING_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
@@ -2080,6 +2080,7 @@ async fn attach_socket(
         AbortOnDropTask<(crate::SessionRecord, Option<ProviderPromptTail>)>,
     > = None;
     let mut provider_refresh_pending = false;
+    let mut provider_pending_deadline: Option<Instant> = None;
     let mut drain_writer = handoff.broker_closed;
     while pump_task.is_some() {
         tokio::select! {
@@ -2144,6 +2145,8 @@ async fn attach_socket(
                     provider_open_task = Some(open_provider_prompt_task(
                         state.context.clone(),
                         record.clone(),
+                        *provider_pending_deadline
+                            .get_or_insert_with(|| Instant::now() + PROVIDER_PROMPT_PENDING_TIMEOUT),
                     ));
                 } else if let Some(tail) = prompt_tail {
                     provider_refresh_pending = false;
@@ -2169,6 +2172,9 @@ async fn attach_socket(
                                 provider_open_task = Some(open_provider_prompt_task(
                                     state.context.clone(),
                                     record.clone(),
+                                    *provider_pending_deadline.get_or_insert_with(|| {
+                                        Instant::now() + PROVIDER_PROMPT_PENDING_TIMEOUT
+                                    }),
                                 ));
                             }
                             continue;
@@ -2211,13 +2217,19 @@ async fn attach_socket(
 fn open_provider_prompt_task(
     context: CliContext,
     record: crate::SessionRecord,
+    pending_deadline: Instant,
 ) -> AbortOnDropTask<(crate::SessionRecord, Option<ProviderPromptTail>)> {
-    AbortOnDropTask::new(tokio::spawn(resolve_provider_prompt_tail(context, record)))
+    AbortOnDropTask::new(tokio::spawn(resolve_provider_prompt_tail(
+        context,
+        record,
+        pending_deadline,
+    )))
 }
 
 async fn resolve_provider_prompt_tail(
     context: CliContext,
     record: crate::SessionRecord,
+    pending_deadline: Instant,
 ) -> (crate::SessionRecord, Option<ProviderPromptTail>) {
     let pending_fresh_runtime = provider_prompt_pending_fresh_runtime(&record);
     let initial = record.clone();
@@ -2229,16 +2241,13 @@ async fn resolve_provider_prompt_tail(
         return (record, opened);
     }
 
-    let started = Instant::now();
     let mut current = record;
-    while started.elapsed() < PROVIDER_PROMPT_PENDING_TIMEOUT {
-        tokio::time::sleep(PROVIDER_PROMPT_POLL_INTERVAL).await;
+    while Instant::now() < pending_deadline {
+        tokio::time::sleep(PROVIDER_PROMPT_PENDING_POLL_INTERVAL).await;
         let load_context = context.clone();
         let id = current.id.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            load_session_record_with_provider_resume_backfill(&load_context, &id)
-        })
-        .await;
+        let loaded =
+            tokio::task::spawn_blocking(move || load_session_record(&load_context, &id)).await;
         let Ok(Ok(updated)) = loaded else {
             continue;
         };
@@ -2679,6 +2688,30 @@ mod tests {
         assert!(!event.to_string().contains("/home/"));
     }
 
+    #[test]
+    fn pending_provider_prompt_runtime_guard_rejects_replacement_identity() {
+        let mut expected = test_record("pending-runtime", "hs-pending-runtime");
+        expected.runtime = Some(crate::RuntimeInfo {
+            kind: "tmux".to_string(),
+            tmux_session: "hs-pending-runtime".to_string(),
+            generation: 1,
+            started_at: "2026-07-11T00:00:00Z".to_string(),
+            launch_id: "launch-1".to_string(),
+            extra: std::collections::BTreeMap::new(),
+        });
+        let mut current = expected.clone();
+        assert!(same_provider_prompt_runtime(&expected, &current));
+
+        current.runtime.as_mut().expect("runtime").launch_id = "launch-2".to_string();
+        assert!(!same_provider_prompt_runtime(&expected, &current));
+        current = expected.clone();
+        current.runtime.as_mut().expect("runtime").generation = 2;
+        assert!(!same_provider_prompt_runtime(&expected, &current));
+        current = expected.clone();
+        current.runtime.as_mut().expect("runtime").tmux_session = "hs-replaced".to_string();
+        assert!(!same_provider_prompt_runtime(&expected, &current));
+    }
+
     #[tokio::test]
     async fn outbound_writer_prioritizes_terminal_bytes_over_control_events() {
         let (terminal_tx, mut terminal_rx) = mpsc::channel(2);
@@ -3000,6 +3033,13 @@ mod tests {
             ),
         )
         .expect("fresh transcript");
+        persist_provider_resume_identity(
+            &state_dir,
+            "ws-codex-pending",
+            "codex",
+            "fresh-codex-id",
+            "codex-user-prompt-submit-hook",
+        );
 
         assert_supported_provider_prompt(&mut socket, "codex").await;
         assert_provider_prompt(&mut socket, "codex", "fresh codex first prompt").await;
@@ -3008,6 +3048,142 @@ mod tests {
                 .await
                 .is_err(),
             "fresh first prompt must be emitted exactly once"
+        );
+        let _ = socket.close(None).await;
+
+        let mut request = format!("ws://{addr}/sessions/ws-codex-pending/attach")
+            .into_client_request()
+            .expect("reconnect request");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().expect("authorization"),
+        );
+        let (mut reconnect, _) = connect_async(request).await.expect("reconnect");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), reconnect.next())
+                .await
+                .expect("reconnect snapshot timeout")
+                .expect("reconnect snapshot frame")
+                .expect("reconnect snapshot message"),
+            ClientMessage::Binary(_)
+        ));
+        reconnect
+            .send(ClientMessage::Text(
+                json!({"subscribe":[PROVIDER_PROMPT_CAPABILITY]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("reconnect subscribe");
+        assert_supported_provider_prompt(&mut reconnect, "codex").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), reconnect.next())
+                .await
+                .is_err(),
+            "reconnect must baseline at EOF instead of replaying the recovered prompt"
+        );
+        let _ = reconnect.close(None).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_pending_codex_rejects_unrelated_same_cwd_transcript() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let codex_home = tmp.path().join("codex-home");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let created_at = seed_fresh_provider_session(
+            &state_dir,
+            "ws-codex-unrelated",
+            "codex",
+            "hs-codex-unrelated",
+            &cwd,
+            None,
+        );
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let tmux = minimal_tmux(tmp.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("address");
+        let server_state_dir = state_dir.clone();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(state(&server_state_dir, Some(TOKEN), tmux)),
+            )
+            .await;
+        });
+
+        let mut request = format!("ws://{addr}/sessions/ws-codex-unrelated/attach")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().expect("authorization"),
+        );
+        let (mut socket, _) = connect_async(request).await.expect("connect");
+        let _snapshot = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("snapshot timeout")
+            .expect("snapshot frame")
+            .expect("snapshot message");
+        socket
+            .send(ClientMessage::Text(
+                json!({"subscribe":[PROVIDER_PROMPT_CAPABILITY]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("subscribe");
+
+        let transcript = codex_home.join("sessions/2026/07/unrelated.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp":created_at,
+                    "type":"session_meta",
+                    "payload":{
+                        "id":"unrelated-codex-id",
+                        "session_id":"unrelated-codex-id",
+                        "cwd":cwd.to_string_lossy(),
+                        "source":"cli",
+                        "timestamp":created_at
+                    }
+                }),
+                json!({
+                    "timestamp":created_at,
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":"unrelated private prompt"}
+                })
+            ),
+        )
+        .expect("unrelated transcript");
+
+        if let Ok(Some(Ok(ClientMessage::Text(frame)))) =
+            tokio::time::timeout(Duration::from_millis(500), socket.next()).await
+        {
+            let frame: Value = serde_json::from_str(frame.as_str()).expect("control json");
+            assert_eq!(
+                frame["supported"], false,
+                "unrelated transcript must not resolve capability"
+            );
+        }
+        let record: Value = serde_json::from_slice(
+            &std::fs::read(state_dir.join("sessions/ws-codex-unrelated/session.json"))
+                .expect("session record"),
+        )
+        .expect("session json");
+        assert!(
+            record.get("provider_resume").is_none(),
+            "pending provider discovery must not persist same-cwd history"
         );
         let _ = socket.close(None).await;
         server.abort();
@@ -3489,6 +3665,31 @@ mod tests {
         )
         .expect("session record");
         created_at
+    }
+
+    fn persist_provider_resume_identity(
+        state_dir: &Path,
+        id: &str,
+        provider: &str,
+        session_id: &str,
+        capture_method: &str,
+    ) {
+        let path = state_dir.join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("session record"))
+                .expect("session json");
+        record["provider_resume"] = json!({
+            "provider":provider,
+            "session_id":session_id,
+            "captured_at":jiff::Timestamp::now().to_string(),
+            "capture_method":capture_method,
+            "resume_args":[]
+        });
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&record).expect("session json"),
+        )
+        .expect("persist provider identity");
     }
 
     async fn assert_supported_provider_prompt(
