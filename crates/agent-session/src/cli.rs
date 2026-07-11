@@ -398,9 +398,9 @@ pub struct ServeArgs {
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8781")]
     pub bind: String,
 
-    /// Bearer token required on write and attach endpoints. Falls back to
-    /// AGENT_SESSION_TOKEN. When unset, writes and attach are disabled (reads
-    /// still work on loopback).
+    /// Bearer token required on activity streaming, write, and attach endpoints.
+    /// Falls back to AGENT_SESSION_TOKEN. When unset, activity streaming,
+    /// writes, and attach are disabled (session reads still work on loopback).
     #[arg(long, value_name = "TOKEN")]
     pub token: Option<String>,
 

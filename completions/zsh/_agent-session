@@ -248,7 +248,7 @@ esac
 (serve)
 _arguments "${_arguments_options[@]}" : \
 '--bind=[Address to bind. Defaults to loopback; a non-loopback address is refused unless --allow-non-loopback is passed (it exposes a remote shell)]:ADDR:_default' \
-'--token=[Bearer token required on write and attach endpoints. Falls back to AGENT_SESSION_TOKEN. When unset, writes and attach are disabled (reads still work on loopback)]:TOKEN:_default' \
+'--token=[Bearer token required on activity streaming, write, and attach endpoints. Falls back to AGENT_SESSION_TOKEN. When unset, activity streaming, writes, and attach are disabled (session reads still work on loopback)]:TOKEN:_default' \
 '--machine=[Machine identity reported in responses. Falls back to AGENT_SESSION_MACHINE, then --host, then the short hostname]:NAME:_default' \
 '--tmux-bin=[tmux binary override]:PATH:_files' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \

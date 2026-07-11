@@ -83,7 +83,10 @@ Without `Last-Event-ID`, a subscriber first receives the latest full snapshot.
 A retained cursor for the current stream replays events whose sequence is
 greater than the cursor. A malformed cursor, another daemon boot id, a cursor
 beyond the current sequence, or an evicted cursor receives the latest full
-state as `reset`. The replay window retains 128 frames.
+state as `reset`. The replay window retains at most 128 frames and at most
+512 KiB of serialized event data. Oldest frames are evicted until both limits
+hold; if any sequence needed by a cursor was evicted (including an individual
+snapshot larger than the byte budget), the subscriber receives a full reset.
 
 Consumers deduplicate by `(machine, stream_id, sequence)`. A sequence gap or a
 `reset` triggers immediate `GET /sessions` reconciliation. The regular session
@@ -91,6 +94,9 @@ poll remains active for convergence, daemon health, and old-peer fallback.
 
 The daemon uses a bounded 32-frame broadcast queue. Producers never await a
 subscriber. A lagged subscriber receives a full reset from the latest state.
+At most 64 concurrent SSE subscribers are admitted. Further authenticated
+requests receive 429 `activity-stream-capacity`; disconnecting a subscriber
+releases its permit and polling remains available throughout saturation.
 Filesystem notifications for `activity.json` and session lifecycle changes are
 coalesced before snapshot projection; HTTP polling is not the transition source.
 

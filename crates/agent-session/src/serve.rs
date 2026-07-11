@@ -4,8 +4,9 @@
 //! The rest of the crate is synchronous; this module builds its own tokio
 //! runtime inside the `serve` subcommand and calls the existing synchronous
 //! lifecycle functions from `tokio::task::spawn_blocking`, so there is no
-//! duplicate state model. Reads are open on loopback; writes and the WebSocket
-//! attach require a bearer token (fail closed when no token is configured).
+//! duplicate state model. Session reads are open on loopback; activity
+//! streaming, writes, and the WebSocket attach require a bearer token (fail
+//! closed when no token is configured).
 //! Every response carries the daemon's `machine` identity so the edge can
 //! aggregate multiple machines. Literal keystroke text is never echoed.
 
@@ -44,7 +45,7 @@ use nils_common::usage_time::{
 use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::provider_prompt::{
@@ -89,6 +90,8 @@ const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const ACTIVITY_STREAM_EVENT_SCHEMA_VERSION: &str = "agent-session.activity-stream.event.v1";
 const ACTIVITY_STREAM_BROADCAST_CAPACITY: usize = 32;
 const ACTIVITY_STREAM_REPLAY_CAPACITY: usize = 128;
+const ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY: usize = 512 * 1024;
+const ACTIVITY_STREAM_SUBSCRIBER_CAPACITY: usize = 64;
 const ACTIVITY_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const ACTIVITY_STREAM_DEBOUNCE: Duration = Duration::from_millis(25);
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
@@ -320,10 +323,17 @@ impl ActivityStreamEvent {
             .event(self.kind)
             .data(serde_json::to_string(self).expect("activity stream event serializes"))
     }
+
+    fn replay_bytes(&self) -> usize {
+        serde_json::to_vec(self)
+            .expect("activity stream event serializes")
+            .len()
+    }
 }
 
 struct ActivityEventState {
     history: VecDeque<Arc<ActivityStreamEvent>>,
+    history_bytes: usize,
     latest_sessions: Vec<ActivityStreamSession>,
 }
 
@@ -348,7 +358,13 @@ impl ActivityEventLog {
             sessions: Some(sessions.clone()),
         });
         let mut history = VecDeque::with_capacity(ACTIVITY_STREAM_REPLAY_CAPACITY);
-        history.push_back(initial.clone());
+        let initial_bytes = initial.replay_bytes();
+        let history_bytes = if initial_bytes <= ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY {
+            history.push_back(initial.clone());
+            initial_bytes
+        } else {
+            0
+        };
         let (sender, _) = broadcast::channel(ACTIVITY_STREAM_BROADCAST_CAPACITY);
         Arc::new(Self {
             stream_id,
@@ -356,6 +372,7 @@ impl ActivityEventLog {
             sequence: AtomicU64::new(1),
             state: StdMutex::new(ActivityEventState {
                 history,
+                history_bytes,
                 latest_sessions: sessions,
             }),
             sender,
@@ -394,9 +411,14 @@ impl ActivityEventLog {
         if let Some(sessions) = sessions {
             state.latest_sessions = sessions;
         }
+        state.history_bytes = state.history_bytes.saturating_add(event.replay_bytes());
         state.history.push_back(event.clone());
-        while state.history.len() > ACTIVITY_STREAM_REPLAY_CAPACITY {
-            state.history.pop_front();
+        while state.history.len() > ACTIVITY_STREAM_REPLAY_CAPACITY
+            || state.history_bytes > ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY
+        {
+            if let Some(evicted) = state.history.pop_front() {
+                state.history_bytes = state.history_bytes.saturating_sub(evicted.replay_bytes());
+            }
         }
         // A bounded broadcast is deliberately lossy. A lagged subscriber gets
         // a full reset and polling remains the convergence path.
@@ -417,19 +439,30 @@ impl ActivityEventLog {
             Some((stream_id, sequence))
                 if stream_id == self.stream_id && sequence <= current_sequence =>
             {
-                let oldest = state
+                let replay: VecDeque<_> = state
                     .history
-                    .front()
-                    .map_or(current_sequence, |event| event.sequence);
-                if sequence.saturating_add(1) < oldest {
-                    VecDeque::from([self.reset_event_locked(&state, current_sequence)])
+                    .iter()
+                    .filter(|event| event.sequence > sequence)
+                    .cloned()
+                    .collect();
+                let contiguous = if sequence == current_sequence {
+                    replay.is_empty()
                 } else {
-                    state
-                        .history
-                        .iter()
-                        .filter(|event| event.sequence > sequence)
-                        .cloned()
-                        .collect()
+                    replay
+                        .front()
+                        .is_some_and(|event| event.sequence == sequence.saturating_add(1))
+                        && replay
+                            .back()
+                            .is_some_and(|event| event.sequence == current_sequence)
+                        && replay
+                            .iter()
+                            .zip(replay.iter().skip(1))
+                            .all(|(left, right)| right.sequence == left.sequence.saturating_add(1))
+                };
+                if contiguous {
+                    replay
+                } else {
+                    VecDeque::from([self.reset_event_locked(&state, current_sequence)])
                 }
             }
             _ => VecDeque::from([self.reset_event_locked(&state, current_sequence)]),
@@ -444,6 +477,7 @@ impl ActivityEventLog {
                     stream_id == &self.stream_id && *sequence <= current_sequence
                 })
                 .map_or(0, |(_, sequence)| sequence),
+            _subscriber_permit: None,
         }
     }
 
@@ -484,6 +518,7 @@ struct ActivitySubscription {
     pending: VecDeque<Arc<ActivityStreamEvent>>,
     receiver: broadcast::Receiver<Arc<ActivityStreamEvent>>,
     last_sequence: u64,
+    _subscriber_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ActivitySubscription {
@@ -518,6 +553,7 @@ impl ActivitySubscription {
 struct ActivityBroker {
     log: Arc<ActivityEventLog>,
     available: bool,
+    subscribers: Arc<Semaphore>,
     _watcher: StdMutex<Option<RecommendedWatcher>>,
 }
 
@@ -566,6 +602,7 @@ impl ActivityBroker {
         let broker = Arc::new(Self {
             log,
             available,
+            subscribers: Arc::new(Semaphore::new(ACTIVITY_STREAM_SUBSCRIBER_CAPACITY)),
             _watcher: StdMutex::new(watcher),
         });
         if available {
@@ -582,13 +619,29 @@ impl ActivityBroker {
 
     #[cfg(test)]
     fn for_test(machine: &str) -> Arc<Self> {
+        Self::for_test_with_subscriber_limit(machine, ACTIVITY_STREAM_SUBSCRIBER_CAPACITY)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_subscriber_limit(machine: &str, subscriber_limit: usize) -> Arc<Self> {
         let watcher = notify::recommended_watcher(|_: notify::Result<NotifyEvent>| {})
             .expect("test filesystem watcher");
         Arc::new(Self {
             log: ActivityEventLog::new(machine.to_string(), Vec::new()),
             available: true,
+            subscribers: Arc::new(Semaphore::new(subscriber_limit)),
             _watcher: StdMutex::new(Some(watcher)),
         })
+    }
+
+    fn subscribe(
+        &self,
+        last_event_id: Option<&str>,
+    ) -> Result<ActivitySubscription, tokio::sync::TryAcquireError> {
+        let permit = self.subscribers.clone().try_acquire_owned()?;
+        let mut subscription = self.log.subscribe(last_event_id);
+        subscription._subscriber_permit = Some(permit);
+        Ok(subscription)
     }
 }
 
@@ -1426,7 +1479,16 @@ async fn activity_events_handler(
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok());
-    let subscription = state.activity_broker.log.subscribe(last_event_id);
+    let subscription = match state.activity_broker.subscribe(last_event_id) {
+        Ok(subscription) => subscription,
+        Err(_) => {
+            return status_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "activity-stream-capacity",
+                "activity stream subscriber capacity reached; retry with polling fallback",
+            );
+        }
+    };
     let stream = futures_util::stream::unfold(subscription, |mut subscription| async move {
         let event = subscription.next_event().await;
         Some((Ok::<_, Infallible>(event.as_sse()), subscription))
@@ -4707,6 +4769,20 @@ mod tests {
     }
 
     fn state(state_dir: &Path, token: Option<&str>, tmux_bin: PathBuf) -> Arc<ServeState> {
+        state_with_activity_broker(
+            state_dir,
+            token,
+            tmux_bin,
+            ActivityBroker::for_test(MACHINE),
+        )
+    }
+
+    fn state_with_activity_broker(
+        state_dir: &Path,
+        token: Option<&str>,
+        tmux_bin: PathBuf,
+        activity_broker: Arc<ActivityBroker>,
+    ) -> Arc<ServeState> {
         Arc::new(ServeState {
             context: CliContext {
                 state_dir: state_dir.to_path_buf(),
@@ -4717,7 +4793,7 @@ mod tests {
             tmux_bin,
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
-            activity_broker: ActivityBroker::for_test(MACHINE),
+            activity_broker,
         })
     }
 
@@ -5509,6 +5585,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_stream_replay_bytes_are_bounded_and_high_cardinality_eviction_resets() {
+        let log = ActivityEventLog::new(MACHINE.to_string(), Vec::new());
+        let previous_sequence = log.sequence.load(Ordering::SeqCst);
+        let sessions = (0..128)
+            .map(|index| ActivityStreamSession {
+                id: format!("session-{index:03}-{}", "x".repeat(128)),
+                turn_state: Some(json!({
+                    "schema_version":"agent-session.turn-state.v1",
+                    "phase":"working",
+                    "phase_changed_at":"x".repeat(8192),
+                    "revision":index,
+                })),
+            })
+            .collect();
+        log.publish_snapshot(sessions);
+
+        {
+            let state = log.state.lock().expect("activity event state lock");
+            assert!(
+                state.history_bytes <= ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY,
+                "replay bytes exceeded cap: {} > {}",
+                state.history_bytes,
+                ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY
+            );
+        }
+
+        let mut replay = log.subscribe(Some(&format!("{}:{previous_sequence}", log.stream_id)));
+        let reset = replay.next_event().await;
+        assert_eq!(reset.kind, "reset");
+        assert_eq!(reset.sequence, log.sequence.load(Ordering::SeqCst));
+        assert_eq!(reset.sessions.as_ref().unwrap().len(), 128);
+    }
+
+    #[tokio::test]
     async fn activity_stream_backpressure_never_blocks_producers_and_lag_resets() {
         let log = ActivityEventLog::new(MACHINE.to_string(), Vec::new());
         let cursor = format!("{}:1", log.stream_id);
@@ -5522,6 +5632,34 @@ mod tests {
         assert_eq!(reset.kind, "reset");
         assert_eq!(reset.sequence, log.sequence.load(Ordering::SeqCst));
         assert!(reset.sessions.is_some());
+    }
+
+    #[tokio::test]
+    async fn activity_stream_rejects_subscriber_saturation_and_reclaims_permits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broker = ActivityBroker::for_test_with_subscriber_limit(MACHINE, 1);
+        let st = state_with_activity_broker(tmp.path(), Some(TOKEN), PathBuf::from("tmux"), broker);
+
+        let first = router(st.clone())
+            .oneshot(get_auth("/activity/events", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth("/activity/events", Some(TOKEN)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["code"], "activity-stream-capacity");
+
+        drop(first);
+        let reclaimed = router(st)
+            .oneshot(get_auth("/activity/events", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.status(), StatusCode::OK);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

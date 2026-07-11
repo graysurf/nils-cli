@@ -146,8 +146,9 @@ is no second state model.
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage
   (`last_used`) and then name/path.
 - `GET /activity/events` — authenticated metadata-only SSE for activity snapshots and heartbeats. Events carry a daemon-boot
-  `stream_id` and increasing `sequence`; `Last-Event-ID` enables bounded replay, while stale/foreign cursors and lagged consumers
-  receive a full reset. Provider hooks only update durable local activity files; a daemon filesystem watcher publishes changes
+  `stream_id` and increasing `sequence`; `Last-Event-ID` enables count-and-byte-bounded replay, while stale/foreign cursors
+  and lagged consumers receive a full reset. Concurrent subscribers are daemon-capped and saturation returns a stable
+  polling-fallback error. Provider hooks only update durable local activity files; a daemon filesystem watcher publishes changes
   through bounded nonblocking queues. The existing `/sessions` read remains the old-peer and gap-reconciliation path. The exact
   wire/privacy contract is [activity-stream-v1](docs/specs/activity-stream-v1.md).
 - `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
