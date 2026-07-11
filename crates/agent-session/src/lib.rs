@@ -487,6 +487,18 @@ struct RuntimeInfo {
     extra: BTreeMap<String, Value>,
 }
 
+fn same_runtime_identity(left: Option<&RuntimeInfo>, right: Option<&RuntimeInfo>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.generation == right.generation
+                && left.launch_id == right.launch_id
+                && left.tmux_session == right.tmux_session
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct DurableResumeRecord {
     schema_version: String,
@@ -721,8 +733,19 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         && let Some(provider_resume) =
             capture_provider_resume_after_launch(args.agent, &created.record, launch_started_at)
     {
-        created.record.provider_resume = Some(provider_resume);
-        created.record = persist_or_reload_session_record(context, &created.record);
+        created.record = mutate_session_record(context, &created.record.id, |record| {
+            if record.provider_resume.is_none()
+                && same_runtime_identity(record.runtime.as_ref(), created.record.runtime.as_ref())
+                && record.agent == created.record.agent
+            {
+                record.provider_resume = Some(provider_resume);
+            }
+            Ok(record.clone())
+        })
+        .unwrap_or_else(|_| {
+            load_session_record(context, &created.record.id)
+                .unwrap_or_else(|_| created.record.clone())
+        });
     }
 
     let result = session_view(
@@ -1689,9 +1712,12 @@ fn read_send_text(text: &Option<String>, text_stdin: bool) -> Result<Option<Stri
 }
 
 fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceResult, CliError> {
-    let record = load_session_record_with_provider_resume_backfill(context, &args.id)?;
+    let mut record = load_session_record(context, &args.id)?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let status = session_status(&tmux_bin, &record);
+    if status != "running" {
+        record = backfill_provider_resume(context, record);
+    }
     let tail = if status == "running" {
         capture_pane_tail(&record, args.tail, &tmux_bin)?
     } else {
@@ -1924,7 +1950,12 @@ fn resume_session_by_id(
     id: &str,
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
-    let mut record = load_session_record_with_provider_resume_backfill(context, id)?;
+    // Preserve not-found semantics before creating the private lock file, then
+    // serialize the entire resume transition (including launch and rollback)
+    // against title, hook, timestamp, and backfill writers.
+    let _ = load_session_record(context, id)?;
+    let _record_lock = acquire_session_record_lock(context, id)?;
+    let mut record = load_session_record(context, id)?;
     match session_status(tmux_bin, &record).as_str() {
         "running" => {
             return Ok(session_view(
@@ -1942,6 +1973,13 @@ fn resume_session_by_id(
             ));
         }
         _ => {}
+    }
+    if record.provider_resume.is_none()
+        && AgentKind::from_name(&record.agent) == Some(AgentKind::Codex)
+        && let Some(provider_resume) = capture_codex_resume_from_history(&record)
+    {
+        record.provider_resume = Some(provider_resume);
+        write_session_record(context, &record)?;
     }
     let (provider_resume, agent) = validate_resume_metadata(&record)?;
     let previous_record = record.clone();
@@ -2396,9 +2434,13 @@ fn list_sessions(
                 )?;
                 let record = read_session_record(&resolved.record_path)?;
                 validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
-                let record = backfill_provider_resume(context, record);
                 let (status, last_terminal_activity_at) =
                     session_list_runtime_snapshot(&tmux_bin, tmux_snapshots.as_ref(), &record);
+                let record = if status == "running" {
+                    record
+                } else {
+                    backfill_provider_resume(context, record)
+                };
                 records.push(session_view_from_parts(
                     context,
                     &record,
@@ -2422,11 +2464,14 @@ fn load_session_view(
     id: &str,
     tmux_bin: Option<&Path>,
 ) -> Result<SessionView, CliError> {
-    let record = load_session_record_with_provider_resume_backfill(context, id)?;
+    let mut record = load_session_record(context, id)?;
     let tmux_bin = tmux_bin
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_tmux_bin(None));
     let status = session_status(&tmux_bin, &record);
+    if status != "running" {
+        record = backfill_provider_resume(context, record);
+    }
     Ok(session_view(
         context,
         &record,
@@ -2442,25 +2487,30 @@ fn load_session_record(context: &CliContext, id: &str) -> Result<SessionRecord, 
     Ok(record)
 }
 
-fn load_session_record_with_provider_resume_backfill(
-    context: &CliContext,
-    id: &str,
-) -> Result<SessionRecord, CliError> {
-    load_session_record(context, id).map(|record| backfill_provider_resume(context, record))
-}
-
 fn backfill_provider_resume(context: &CliContext, record: SessionRecord) -> SessionRecord {
     if record.provider_resume.is_some()
         || AgentKind::from_name(&record.agent) != Some(AgentKind::Codex)
+        || record
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.generation == 1)
     {
         return record;
     }
     let Some(provider_resume) = capture_codex_resume_from_history(&record) else {
         return record;
     };
-    let mut record = record;
-    record.provider_resume = Some(provider_resume);
-    persist_or_reload_session_record(context, &record)
+    mutate_session_record(context, &record.id, |current| {
+        if current.provider_resume.is_none()
+            && current.agent == record.agent
+            && current.cwd == record.cwd
+            && same_runtime_identity(current.runtime.as_ref(), record.runtime.as_ref())
+        {
+            current.provider_resume = Some(provider_resume);
+        }
+        Ok(current.clone())
+    })
+    .unwrap_or_else(|_| load_session_record(context, &record.id).unwrap_or(record))
 }
 
 #[derive(Debug)]
@@ -2707,13 +2757,6 @@ pub(crate) fn write_session_record(
     let path = session_dir(context, &record.id).join("session.json");
     write_resume_sidecar(context, record)?;
     write_private_file(&path, &bytes)
-}
-
-fn persist_or_reload_session_record(context: &CliContext, record: &SessionRecord) -> SessionRecord {
-    match write_session_record(context, record) {
-        Ok(()) => record.clone(),
-        Err(_) => load_session_record(context, &record.id).unwrap_or_else(|_| record.clone()),
-    }
 }
 
 fn merge_resume_sidecar(path: &Path, record: &mut SessionRecord) -> Result<(), CliError> {

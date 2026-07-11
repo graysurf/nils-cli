@@ -171,7 +171,10 @@ is no second state model.
   attach clients, is owned by the daemon across waiter cancellation, uses bounded exponential backoff, and admits at most
   four concurrent history scans. Active slots are never capacity-evicted; obsolete runtime keys and deleted sessions are
   evicted, and a fixed daemon-local entry cap bounds unrelated session churn. Reconnects
-  baseline the revalidated cached exact source at EOF. It
+  baseline the revalidated cached exact source at EOF. Passive list/glance reads never persist heuristic Codex history
+  into a live generation-1 runtime, and fresh Codex byte-zero recovery admits only `codex-user-prompt-submit-hook`
+  identity. Explicit stopped-session resume may recover older provider history while holding the same per-session record lock for
+  its complete resume/rollback transition. It
   replies with an `agent-session.attach.v1` `capability` text frame once resolution finishes, and only after that
   acknowledgement emits `prompt_submitted` events as bounded text frames; terminal snapshot/live output remains binary.
   The normative supported acknowledgement is:

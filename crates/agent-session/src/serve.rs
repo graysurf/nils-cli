@@ -2492,6 +2492,9 @@ async fn resolve_provider_prompt_tail(
             return (updated, None);
         }
         current = updated;
+        if !provider_prompt_new_runtime_source_authorized(&current) {
+            continue;
+        }
         let source = discovery.resolve_source(&current).await;
         let had_source = source.is_some();
         let tail = if let Some(source) = source {
@@ -2510,6 +2513,21 @@ async fn resolve_provider_prompt_tail(
         }
     }
     (current, None)
+}
+
+fn provider_prompt_new_runtime_source_authorized(record: &crate::SessionRecord) -> bool {
+    let Some(resume) = record.provider_resume.as_ref() else {
+        return false;
+    };
+    match AgentKind::from_name(&record.agent) {
+        Some(AgentKind::Codex) => {
+            resume.provider == "codex" && resume.capture_method == "codex-user-prompt-submit-hook"
+        }
+        Some(AgentKind::Claude) => {
+            resume.provider == "claude" && resume.capture_method == "claude-explicit-session-id"
+        }
+        Some(AgentKind::Hermes) | None => false,
+    }
 }
 
 fn provider_prompt_pending_fresh_runtime(record: &crate::SessionRecord) -> bool {
@@ -2954,6 +2972,29 @@ mod tests {
         current = expected.clone();
         current.runtime.as_mut().expect("runtime").tmux_session = "hs-replaced".to_string();
         assert!(!same_provider_prompt_runtime(&expected, &current));
+    }
+
+    #[test]
+    fn fresh_provider_prompt_byte_zero_requires_authoritative_provenance() {
+        let mut record = provider_discovery_record(
+            "prompt-provenance",
+            "hs-prompt-provenance",
+            "launch-prompt-provenance",
+            1,
+        );
+        assert!(provider_prompt_new_runtime_source_authorized(&record));
+
+        record.agent = "codex".to_string();
+        let resume = record.provider_resume.as_mut().expect("provider resume");
+        resume.provider = "codex".to_string();
+        resume.capture_method = "codex-session-meta".to_string();
+        assert!(!provider_prompt_new_runtime_source_authorized(&record));
+        record
+            .provider_resume
+            .as_mut()
+            .expect("provider resume")
+            .capture_method = "codex-user-prompt-submit-hook".to_string();
+        assert!(provider_prompt_new_runtime_source_authorized(&record));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3431,12 +3472,9 @@ mod tests {
             .expect("listener");
         let addr = listener.local_addr().expect("address");
         let server_state_dir = state_dir.clone();
+        let server_state = state(&server_state_dir, Some(TOKEN), tmux);
         let server = tokio::spawn(async move {
-            let _ = axum::serve(
-                listener,
-                router(state(&server_state_dir, Some(TOKEN), tmux)),
-            )
-            .await;
+            let _ = axum::serve(listener, router(server_state)).await;
         });
 
         let mut request = format!("ws://{addr}/sessions/ws-prompt/attach")
@@ -3587,12 +3625,9 @@ mod tests {
             .expect("listener");
         let addr = listener.local_addr().expect("address");
         let server_state_dir = state_dir.clone();
+        let server_state = state(&server_state_dir, Some(TOKEN), tmux);
         let server = tokio::spawn(async move {
-            let _ = axum::serve(
-                listener,
-                router(state(&server_state_dir, Some(TOKEN), tmux)),
-            )
-            .await;
+            let _ = axum::serve(listener, router(server_state)).await;
         });
 
         let mut request = format!("ws://{addr}/sessions/ws-codex-pending/attach")
@@ -3724,12 +3759,10 @@ mod tests {
             .expect("listener");
         let addr = listener.local_addr().expect("address");
         let server_state_dir = state_dir.clone();
+        let server_state = state(&server_state_dir, Some(TOKEN), tmux);
+        let list_state = server_state.clone();
         let server = tokio::spawn(async move {
-            let _ = axum::serve(
-                listener,
-                router(state(&server_state_dir, Some(TOKEN), tmux)),
-            )
-            .await;
+            let _ = axum::serve(listener, router(server_state)).await;
         });
 
         let mut request = format!("ws://{addr}/sessions/ws-codex-unrelated/attach")
@@ -3780,6 +3813,9 @@ mod tests {
             ),
         )
         .expect("unrelated transcript");
+
+        let (status, _) = call(router(list_state), get("/sessions")).await;
+        assert_eq!(status, StatusCode::OK, "list must remain a read-only probe");
 
         if let Ok(Some(Ok(ClientMessage::Text(frame)))) =
             tokio::time::timeout(Duration::from_millis(500), socket.next()).await
@@ -5410,6 +5446,128 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "session-not-found");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_transition_serializes_concurrent_title_mutation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let cwd_arg = cwd.to_string_lossy().to_string();
+        seed_resumable_session(
+            &state_dir,
+            "resume-title-race",
+            "codex",
+            "hs-resume-title-race",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                &cwd_arg,
+                "--no-alt-screen",
+            ],
+        );
+        let started = tmp.path().join("resume-started");
+        let release = tmp.path().join("resume-release");
+        let running = tmp.path().join("resume-running");
+        let tmux = executable(
+            &tmp.path().join("tmux-resume-lock"),
+            &format!(
+                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                started = shell_words::quote(&started.to_string_lossy()),
+                release = shell_words::quote(&release.to_string_lossy()),
+                running = shell_words::quote(&running.to_string_lossy()),
+            ),
+        );
+        let context = CliContext {
+            state_dir: state_dir.clone(),
+            host: None,
+        };
+        let resume_task = {
+            let context = context.clone();
+            let tmux = tmux.clone();
+            tokio::task::spawn_blocking(move || {
+                resume_session_by_id(&context, "resume-title-race", &tmux)
+            })
+        };
+        for _ in 0..200 {
+            if started.is_file() {
+                break;
+            }
+            if resume_task.is_finished() {
+                let result = resume_task.await;
+                panic!("resume exited before entering the tmux launch: {result:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.is_file(), "resume did not enter the tmux launch");
+        let mut title_task = {
+            let context = context.clone();
+            let tmux = tmux.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::update_session_title(
+                    &context,
+                    "resume-title-race",
+                    Some("Title after resume".to_string()),
+                    &tmux,
+                )
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut title_task)
+                .await
+                .is_err(),
+            "title mutation must wait for the complete resume transaction"
+        );
+        let mut second_resume_task = {
+            let context = context.clone();
+            let tmux = tmux.clone();
+            tokio::task::spawn_blocking(move || {
+                resume_session_by_id(&context, "resume-title-race", &tmux)
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second_resume_task)
+                .await
+                .is_err(),
+            "a second resume must wait for the first resume transaction"
+        );
+        std::fs::write(&release, b"").expect("release resume");
+        resume_task
+            .await
+            .expect("resume task")
+            .expect("resume transition");
+        title_task
+            .await
+            .expect("title task")
+            .expect("title mutation");
+        second_resume_task
+            .await
+            .expect("second resume task")
+            .expect("second resume result");
+
+        let record = load_session_record(&context, "resume-title-race").expect("session record");
+        assert_eq!(record.title.as_deref(), Some("Title after resume"));
+        assert_eq!(
+            record.runtime.as_ref().expect("runtime").generation,
+            2,
+            "title update must preserve the installed runtime generation"
+        );
+        assert_eq!(
+            record
+                .provider_resume
+                .as_ref()
+                .expect("provider resume")
+                .session_id,
+            "resume-session-id"
+        );
+        assert!(
+            state_dir
+                .join("sessions/resume-title-race/resume.json")
+                .is_file()
+        );
     }
 
     #[tokio::test]
