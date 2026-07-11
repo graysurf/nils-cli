@@ -1836,6 +1836,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "jiff",
+ "libc",
  "nils-build-info",
  "nils-common",
  "nils-test-support",

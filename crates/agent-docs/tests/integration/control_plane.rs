@@ -177,29 +177,44 @@ fn session_records_are_product_isolated_and_context_bound() {
         .as_str()
         .unwrap()
         .to_string();
-    let mut record: serde_json::Value =
+    let record: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(state_home.join(&record_file)).unwrap()).unwrap();
-    record["product"] = serde_json::Value::String("claude".to_string());
-    fs::write(
-        state_home.join(&record_file),
-        serde_json::to_vec_pretty(&record).unwrap(),
-    )
-    .unwrap();
+    for (field, replacement) in [
+        ("product", "claude"),
+        ("session_hash", "sha256:wrong-session"),
+        ("project_hash", "sha256:wrong-project"),
+    ] {
+        let mut corrupted_record = record.clone();
+        corrupted_record[field] = serde_json::Value::String(replacement.to_string());
+        fs::write(
+            state_home.join(&record_file),
+            serde_json::to_vec_pretty(&corrupted_record).unwrap(),
+        )
+        .unwrap();
 
-    let corrupted = env.run(&[
-        "session",
-        "status",
-        "--session-id",
-        "session-bound",
-        "--product",
-        "codex",
-        "--state-home",
-        state,
-        "--format",
-        "json",
-    ]);
-    assert_eq!(corrupted.code, 65, "stdout: {}", corrupted.stdout);
-    assert_eq!(corrupted.json()["error"]["code"], "context-mismatch");
+        let corrupted = env.run(&[
+            "session",
+            "status",
+            "--session-id",
+            "session-bound",
+            "--product",
+            "codex",
+            "--state-home",
+            state,
+            "--format",
+            "json",
+        ]);
+        assert_eq!(
+            corrupted.code, 65,
+            "field={field} stdout: {}",
+            corrupted.stdout
+        );
+        assert_eq!(
+            corrupted.json()["error"]["code"],
+            "context-mismatch",
+            "field={field}"
+        );
+    }
 }
 
 #[test]

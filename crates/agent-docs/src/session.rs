@@ -405,14 +405,39 @@ fn lock_is_stale(lock: &Path) -> bool {
     if let Ok(raw) = fs::read(lock.join(LOCK_OWNER_FILE))
         && let Ok(owner) = serde_json::from_slice::<LockOwner>(&raw)
     {
-        return unix_seconds(SystemTime::now()).saturating_sub(owner.created_at_unix_seconds)
+        let expired = unix_seconds(SystemTime::now()).saturating_sub(owner.created_at_unix_seconds)
             >= LOCK_STALE_AFTER.as_secs();
+        return expired && owner_is_definitely_dead(owner.pid);
     }
     fs::metadata(lock)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .is_some_and(|age| age >= LOCK_STALE_AFTER)
+}
+
+fn owner_is_definitely_dead(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: signal 0 does not deliver a signal; it only checks whether
+        // the positive PID exists and whether this process may signal it.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return false;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn reclaim_stale_lock(lock: &Path) -> Result<bool, SessionFailure> {
@@ -446,5 +471,62 @@ fn unix_seconds(time: SystemTime) -> u64 {
 impl Drop for RecordLock {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::*;
+
+    fn write_expired_lock(record: &Path, pid: u32) -> PathBuf {
+        let lock = record.with_extension("json.lock");
+        fs::create_dir(&lock).expect("create lock directory");
+        let owner = LockOwner {
+            pid,
+            created_at_unix_seconds: 0,
+        };
+        fs::write(
+            lock.join(LOCK_OWNER_FILE),
+            serde_json::to_vec(&owner).expect("serialize owner"),
+        )
+        .expect("write owner");
+        lock
+    }
+
+    #[test]
+    fn expired_lock_for_live_process_is_not_stale() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let record = temp.path().join("session.json");
+        let lock = write_expired_lock(&record, std::process::id());
+
+        assert!(!lock_is_stale(&lock));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_lock_for_dead_process_is_reclaimed() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived owner");
+        let dead_pid = child.id();
+        assert!(child.wait().expect("reap owner").success());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let record = temp.path().join("session.json");
+        let lock = write_expired_lock(&record, dead_pid);
+
+        let acquired = RecordLock::acquire(&record)
+            .unwrap_or_else(|failure| panic!("recover dead owner's lock: {}", failure.message));
+        let owner: LockOwner = serde_json::from_slice(
+            &fs::read(lock.join(LOCK_OWNER_FILE)).expect("read replacement owner"),
+        )
+        .expect("parse replacement owner");
+        assert_eq!(owner.pid, std::process::id());
+
+        drop(acquired);
+        assert!(!lock.exists());
     }
 }
