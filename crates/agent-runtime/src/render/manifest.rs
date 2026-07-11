@@ -18,8 +18,14 @@ pub const SKILLS_SCHEMA_VERSIONS: &[u32] = &[1, 2];
 pub enum ManifestError {
     #[error("missing manifest: {path} (source root: {root})")]
     Missing { path: PathBuf, root: PathBuf },
-    #[error("schema_version mismatch in {file}: expected one of {expected:?}, got {found}")]
+    #[error("schema_version mismatch in {file}: expected {expected}, got {found}")]
     SchemaVersion {
+        file: PathBuf,
+        expected: u32,
+        found: u32,
+    },
+    #[error("schema_version mismatch in {file}: expected one of {expected:?}, got {found}")]
+    SchemaVersions {
         file: PathBuf,
         expected: Vec<u32>,
         found: u32,
@@ -156,10 +162,18 @@ where
     })?;
     let expected = T::supported_schema_versions();
     if !expected.contains(&parsed.schema_version()) {
-        return Err(ManifestError::SchemaVersion {
-            file: file.to_path_buf(),
-            expected: expected.to_vec(),
-            found: parsed.schema_version(),
+        return Err(if let [expected] = expected {
+            ManifestError::SchemaVersion {
+                file: file.to_path_buf(),
+                expected: *expected,
+                found: parsed.schema_version(),
+            }
+        } else {
+            ManifestError::SchemaVersions {
+                file: file.to_path_buf(),
+                expected: expected.to_vec(),
+                found: parsed.schema_version(),
+            }
         });
     }
     parsed.validate_contract(file)?;
@@ -967,7 +981,7 @@ formulas:
                 found,
             } => {
                 assert!(file.ends_with("plugins.yaml"));
-                assert_eq!(expected, vec![SCHEMA_VERSION]);
+                assert_eq!(expected, SCHEMA_VERSION);
                 assert_eq!(found, 2);
             }
             other => panic!("expected ManifestError::SchemaVersion, got {other:?}"),
@@ -982,7 +996,7 @@ formulas:
         let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
         let err = load_all(&root).unwrap_err();
         match err {
-            ManifestError::SchemaVersion {
+            ManifestError::SchemaVersions {
                 file,
                 expected,
                 found,

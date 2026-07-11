@@ -14,8 +14,14 @@ use thiserror::Error;
 pub enum CoverageError {
     #[error("missing manifest: {path}")]
     Missing { path: PathBuf },
-    #[error("schema_version mismatch in {file}: expected one of {expected:?}, got {found}")]
+    #[error("schema_version mismatch in {file}: expected {expected}, got {found}")]
     SchemaVersion {
+        file: PathBuf,
+        expected: u32,
+        found: u32,
+    },
+    #[error("schema_version mismatch in {file}: expected one of {expected:?}, got {found}")]
+    SchemaVersions {
         file: PathBuf,
         expected: Vec<u32>,
         found: u32,
@@ -187,10 +193,18 @@ where
     })?;
     let expected = T::supported_schema_versions();
     if !expected.contains(&parsed.schema_version()) {
-        return Err(CoverageError::SchemaVersion {
-            file: file.to_path_buf(),
-            expected: expected.to_vec(),
-            found: parsed.schema_version(),
+        return Err(if let [expected] = expected {
+            CoverageError::SchemaVersion {
+                file: file.to_path_buf(),
+                expected: *expected,
+                found: parsed.schema_version(),
+            }
+        } else {
+            CoverageError::SchemaVersions {
+                file: file.to_path_buf(),
+                expected: expected.to_vec(),
+                found: parsed.schema_version(),
+            }
         });
     }
     Ok(parsed)
