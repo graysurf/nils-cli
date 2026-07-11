@@ -469,7 +469,7 @@ fn run_installed_runtime_only(
         &roots.state_home,
         &link_map,
     )?;
-    let installed_runtime = installed_runtime::check(product, &plan, true)?;
+    let mut installed_runtime = installed_runtime::check(product, &plan, true)?;
     let mut probe_report = probes::ProbeReport::default();
     probe_report.extend(probes::install_plan(product, &plan));
     let mut findings = installed_runtime.findings.clone();
@@ -483,6 +483,7 @@ fn run_installed_runtime_only(
         .filter(|finding| finding.severity == DoctorSeverity::Block)
         .count();
     let live_ok = block == 0;
+    installed_runtime.verified = live_ok;
     let acceptance_boundary = Some(
         "Receipt provenance and managed-target checks are portable filesystem acceptance; product execution remains a separate live probe."
             .to_string(),

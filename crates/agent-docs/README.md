@@ -252,6 +252,9 @@ atomic state record keyed by hashes of the session id and canonical repository
 root. Stored records contain no raw session id or machine path. Verification
 re-resolves documents and catalog data, so changed content or configuration
 invalidates stale activation.
+JSON responses expose `record_file` relative to `--state-home`; consumers that
+need the local file join the two paths without persisting a machine-specific
+state-home value.
 
 ```bash
 agent-docs session activate --session-id "$SESSION_ID" --product codex \

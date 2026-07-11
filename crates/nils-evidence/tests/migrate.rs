@@ -1911,3 +1911,42 @@ fn mixed_v1_v2_records_normalize_with_owner_provenance() {
     assert_eq!(workflow.rollup.owner.id, "code-review");
     assert!(report.blocked.is_empty());
 }
+
+#[test]
+fn mixed_usage_batch_blocks_malformed_v2_without_losing_valid_owners() {
+    let s = build_empty_scenario();
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-150000",
+        &record_json_with_links("deliver-pr", "2026-06-14T15:00:00Z", "[]"),
+    );
+    let intent = record_json_with_links("project-dev", "2026-06-14T16:00:00Z", "[]")
+        .replace("skill-usage.record.v1", "skill-usage.record.v2")
+        .replace(
+            r#""skill": "project-dev","#,
+            r#""owner": { "kind": "intent", "id": "project-dev" },"#,
+        );
+    write_record(&s.source_out, "graysurf__kit", "20260614-160000", &intent);
+    let malformed = intent.replace(
+        r#""owner": { "kind": "intent", "id": "project-dev" }"#,
+        r#""owner": { "kind": "intent", "id": "" }"#,
+    );
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-170000",
+        &malformed,
+    );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("mixed batch remains reportable");
+    assert_eq!(report.eligible, 2);
+    assert_eq!(report.blocked.len(), 1);
+    assert!(report.blocked[0].reason.contains("owner"));
+    let normalized = report
+        .records
+        .iter()
+        .find(|record| record.rollup.owner.kind == "intent")
+        .expect("valid intent-owned record");
+    assert_eq!(normalized.rollup.owner.id, "project-dev");
+}

@@ -13,6 +13,7 @@ use super::plan::{InstallPlan, PlanAction};
 pub const RECEIPT_SCHEMA: &str = "agent-runtime.install-receipt.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InstallReceipt {
     pub schema: String,
     pub product: String,
@@ -25,6 +26,7 @@ pub struct InstallReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedEntryReceipt {
     pub id: String,
     pub digest: String,

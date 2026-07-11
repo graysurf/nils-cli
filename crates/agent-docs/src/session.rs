@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -21,6 +21,9 @@ const EXIT_OK: i32 = 0;
 const EXIT_RUNTIME: i32 = 1;
 const EXIT_DATA: i32 = 65;
 const SECRET_MODE: u32 = 0o600;
+const LOCK_OWNER_FILE: &str = "owner.json";
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRecord {
@@ -61,7 +64,9 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
         let path = record_path(common, &roots.project_path)?;
         let _lock = RecordLock::acquire(&path)?;
         let mut record = if path.exists() {
-            read_record(&path)?
+            let record = read_record(&path)?;
+            validate_record_context(common, &roots.project_path, &record)?;
+            record
         } else {
             SessionRecord {
                 schema: RECORD_SCHEMA.to_string(),
@@ -103,7 +108,7 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
         }
         record.activated_at = jiff::Timestamp::now().to_string();
         write_record(&path, &record)?;
-        Ok(data(&path, &record, true))
+        data(&path, &common.state_home, &record, true)
     })();
     render(common.format, "activate", result)
 }
@@ -115,7 +120,8 @@ fn status(common: SessionCommonArgs, overrides: PathOverrides) -> i32 {
             .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
         let path = record_path(&common, &roots.project_path)?;
         let record = read_record(&path)?;
-        Ok(data(&path, &record, false))
+        validate_record_context(&common, &roots.project_path, &record)?;
+        data(&path, &common.state_home, &record, false)
     })();
     render(common.format, "status", result)
 }
@@ -130,6 +136,7 @@ fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackM
             .map_err(|err| SessionFailure::runtime("catalog-load-failed", err.to_string()))?;
         let path = record_path(common, &roots.project_path)?;
         let record = read_record(&path)?;
+        validate_record_context(common, &roots.project_path, &record)?;
         for raw in &args.require_intent {
             let intent =
                 Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
@@ -155,7 +162,7 @@ fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackM
                 ));
             }
         }
-        Ok(data(&path, &record, true))
+        data(&path, &common.state_home, &record, true)
     })();
     render(common.format, "verify", result)
 }
@@ -171,6 +178,23 @@ fn validate_common(common: &SessionCommonArgs) -> Result<(), SessionFailure> {
         return Err(SessionFailure::data(
             "invalid-state-home",
             "--state-home must be absolute",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_record_context(
+    common: &SessionCommonArgs,
+    project: &Path,
+    record: &SessionRecord,
+) -> Result<(), SessionFailure> {
+    let context_matches = record.session_hash == digest(common.session_id.trim().as_bytes())
+        && record.project_hash == project_hash(project)
+        && record.product == common.product.as_str();
+    if !context_matches {
+        return Err(SessionFailure::data(
+            "context-mismatch",
+            "session activation does not match the requested session, project, and product",
         ));
     }
     Ok(())
@@ -238,13 +262,24 @@ fn write_record(path: &Path, record: &SessionRecord) -> Result<(), SessionFailur
         .map_err(|err| SessionFailure::runtime("record-write-failed", err.to_string()))
 }
 
-fn data(path: &Path, record: &SessionRecord, verified: bool) -> SessionData {
-    SessionData {
+fn data(
+    path: &Path,
+    state_home: &Path,
+    record: &SessionRecord,
+    verified: bool,
+) -> Result<SessionData, SessionFailure> {
+    let record_file = path.strip_prefix(state_home).map_err(|_| {
+        SessionFailure::runtime(
+            "record-path-not-portable",
+            "session record path is outside the configured state home",
+        )
+    })?;
+    Ok(SessionData {
         product: record.product.clone(),
         active_intents: record.active_intents.keys().cloned().collect(),
-        record_file: path.to_string_lossy().into_owned(),
+        record_file: record_file.to_string_lossy().replace('\\', "/"),
         verified,
-    }
+    })
 }
 
 fn render(format: OutputFormat, command: &str, result: Result<SessionData, SessionFailure>) -> i32 {
@@ -312,6 +347,12 @@ impl SessionFailure {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct LockOwner {
+    pid: u32,
+    created_at_unix_seconds: u64,
+}
+
 struct RecordLock(PathBuf);
 
 impl RecordLock {
@@ -324,12 +365,24 @@ impl RecordLock {
         let started = Instant::now();
         loop {
             match fs::create_dir(&lock) {
-                Ok(()) => return Ok(Self(lock)),
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::AlreadyExists
-                        && started.elapsed() < Duration::from_secs(30) =>
-                {
-                    thread::sleep(Duration::from_millis(10))
+                Ok(()) => {
+                    if let Err(err) = write_lock_owner(&lock) {
+                        let _ = fs::remove_dir_all(&lock);
+                        return Err(err);
+                    }
+                    return Ok(Self(lock));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&lock) && reclaim_stale_lock(&lock)? {
+                        continue;
+                    }
+                    if started.elapsed() >= LOCK_WAIT_TIMEOUT {
+                        return Err(SessionFailure::runtime(
+                            "lock-timeout",
+                            "timed out waiting for the session activation lock",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => return Err(SessionFailure::runtime("lock-failed", err.to_string())),
             }
@@ -337,8 +390,61 @@ impl RecordLock {
     }
 }
 
+fn write_lock_owner(lock: &Path) -> Result<(), SessionFailure> {
+    let owner = LockOwner {
+        pid: std::process::id(),
+        created_at_unix_seconds: unix_seconds(SystemTime::now()),
+    };
+    let bytes = serde_json::to_vec(&owner)
+        .map_err(|err| SessionFailure::runtime("lock-owner-render-failed", err.to_string()))?;
+    fs::write(lock.join(LOCK_OWNER_FILE), bytes)
+        .map_err(|err| SessionFailure::runtime("lock-owner-write-failed", err.to_string()))
+}
+
+fn lock_is_stale(lock: &Path) -> bool {
+    if let Ok(raw) = fs::read(lock.join(LOCK_OWNER_FILE))
+        && let Ok(owner) = serde_json::from_slice::<LockOwner>(&raw)
+    {
+        return unix_seconds(SystemTime::now()).saturating_sub(owner.created_at_unix_seconds)
+            >= LOCK_STALE_AFTER.as_secs();
+    }
+    fs::metadata(lock)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= LOCK_STALE_AFTER)
+}
+
+fn reclaim_stale_lock(lock: &Path) -> Result<bool, SessionFailure> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let reclaimed =
+        lock.with_extension(format!("json.lock.reclaim-{}-{nonce}", std::process::id()));
+    match fs::rename(lock, &reclaimed) {
+        Ok(()) => {
+            fs::remove_dir_all(&reclaimed).map_err(|err| {
+                SessionFailure::runtime("stale-lock-remove-failed", err.to_string())
+            })?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(SessionFailure::runtime(
+            "stale-lock-reclaim-failed",
+            err.to_string(),
+        )),
+    }
+}
+
+fn unix_seconds(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl Drop for RecordLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.0);
+        let _ = fs::remove_dir_all(&self.0);
     }
 }

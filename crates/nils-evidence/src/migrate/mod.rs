@@ -44,9 +44,8 @@ const BINARY: &str = "evidence";
 /// Rollup record schema id written into every `skill-usage.rollup.json`.
 pub const ROLLUP_SCHEMA: &str = "skill-usage.rollup.v1";
 /// Source `skill-usage.record.json` schema this migrator knows how to roll up.
-/// A record carrying any other schema (e.g. a future `skill-usage.record.v2`
-/// with changed semantics) is skipped with a warning rather than silently
-/// normalized to a `skill-usage.rollup.v1`.
+/// A record carrying any schema outside this compatibility set is skipped with
+/// a warning rather than silently normalized to a `skill-usage.rollup.v1`.
 pub const SUPPORTED_RECORD_SCHEMAS: &[&str] = &["skill-usage.record.v1", "skill-usage.record.v2"];
 /// Provenance sidecar schema version written into every `metadata.yaml`.
 pub const METADATA_VERSION: u32 = 1;
@@ -405,9 +404,8 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
             }
         };
         // Schema gate FIRST: peek the `schema` discriminator and reject an
-        // unsupported source schema before attempting the v1 deserialization,
-        // so a future `skill-usage.record.v2` cannot silently corrupt the
-        // archive and is reported as unsupported (not as a v1 parse failure).
+        // unsupported source schema before full deserialization, so future
+        // formats cannot silently corrupt the archive.
         match SkillUsageRecord::peek_schema(&raw) {
             Ok(schema) if SUPPORTED_RECORD_SCHEMAS.contains(&schema.as_str()) => {}
             Ok(schema) => {

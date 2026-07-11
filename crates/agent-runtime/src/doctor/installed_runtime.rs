@@ -1,6 +1,5 @@
 //! `agent-runtime doctor --class installed-runtime` receipt verification.
 
-use std::path::Path;
 use std::time::SystemTime;
 
 use serde::Serialize;
@@ -36,6 +35,24 @@ pub fn check(
     let stored = match receipt::read(&plan.state_home, product) {
         Ok(receipt) => Some(receipt),
         Err(receipt::ReceiptError::Read(_)) => None,
+        Err(receipt::ReceiptError::Render(_)) => {
+            let findings = vec![DoctorFinding::block(
+                product,
+                "installed-runtime-receipt",
+                None,
+                Some(receipt::path(&plan.state_home, product)),
+                "portable install receipt is malformed or contains unsupported fields",
+            )];
+            return Ok(InstalledRuntimeReport {
+                receipt_present: true,
+                verified: false,
+                source_clean: false,
+                source_match: false,
+                plan_match: false,
+                receipt: None,
+                findings,
+            });
+        }
         Err(err) => return Err(err.into()),
     };
     let mut findings = Vec::new();
@@ -118,6 +135,3 @@ pub fn check(
         findings,
     })
 }
-
-#[allow(dead_code)]
-fn _path_is_private(_: &Path) {}

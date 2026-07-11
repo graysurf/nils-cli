@@ -161,6 +161,140 @@ fn test_first_check_is_phase_and_path_class_aware() {
         ambiguous.stdout_json()["error"]["details"]["path_class"],
         "ambiguous"
     );
+
+    for (path, expected_code) in [
+        ("unclassified/value.txt", "unknown-path-class"),
+        ("../outside.rs", "invalid-pre-edit-path"),
+        (
+            repo.join("src/lib.rs").to_str().unwrap(),
+            "invalid-pre-edit-path",
+        ),
+    ] {
+        let rejected = run(
+            "test-first-evidence",
+            tmp.path(),
+            &[
+                "check",
+                "--out",
+                out_arg,
+                "--phase",
+                "pre-edit",
+                "--project-path",
+                repo_arg,
+                "--path",
+                path,
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(
+            rejected.code,
+            65,
+            "path={path} stderr={}",
+            rejected.stderr_text()
+        );
+        let payload = rejected.stdout_json();
+        let actual = if expected_code == "unknown-path-class" {
+            payload["error"]["details"]["reason_code"].as_str()
+        } else {
+            payload["error"]["code"].as_str()
+        };
+        assert_eq!(actual, Some(expected_code), "path={path} payload={payload}");
+    }
+
+    let classified = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "check",
+            "--out",
+            out_arg,
+            "--phase",
+            "classified",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(classified.code, 0, "stderr: {}", classified.stderr_text());
+    let delivery = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "check", "--out", out_arg, "--phase", "delivery", "--format", "json",
+        ],
+    );
+    assert_eq!(delivery.code, 65);
+    assert_eq!(
+        delivery.stdout_json()["error"]["details"]["reason_code"],
+        "delivery-incomplete"
+    );
+
+    let before_fix = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "record-failing",
+            "--out",
+            out_arg,
+            "--command",
+            "cargo test regression",
+            "--exit-code",
+            "101",
+            "--summary",
+            "regression reproduced",
+        ],
+    );
+    assert_eq!(before_fix.code, 0, "stderr: {}", before_fix.stderr_text());
+    let production_ready = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "check",
+            "--out",
+            out_arg,
+            "--phase",
+            "pre-edit",
+            "--project-path",
+            repo_arg,
+            "--path",
+            "src/lib.rs",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        production_ready.code,
+        0,
+        "stderr: {}",
+        production_ready.stderr_text()
+    );
+    let final_validation = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "record-final",
+            "--out",
+            out_arg,
+            "--command",
+            "cargo test regression",
+            "--status",
+            "pass",
+        ],
+    );
+    assert_eq!(final_validation.code, 0);
+    let delivery_ready = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "check", "--out", out_arg, "--phase", "delivery", "--format", "json",
+        ],
+    );
+    assert_eq!(
+        delivery_ready.code,
+        0,
+        "stderr: {}",
+        delivery_ready.stderr_text()
+    );
 }
 
 #[test]
@@ -274,4 +408,89 @@ fn docs_impact_record_detects_stale_changes() {
     );
     assert_eq!(stale.code, 65);
     assert_eq!(stale.stdout_json()["error"]["code"], "stale-scan");
+}
+
+#[test]
+fn docs_impact_disposition_matrix_fails_closed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+    fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 2 }\n").unwrap();
+    let repo_arg = repo.to_str().unwrap();
+
+    for (disposition, expected) in [
+        ("docs-updated", "docs-update-missing"),
+        ("no-docs-needed", "rationale-required"),
+    ] {
+        let out = tmp.path().join(disposition);
+        let rejected = run(
+            "docs-impact",
+            tmp.path(),
+            &[
+                "record",
+                "--out",
+                out.to_str().unwrap(),
+                "--repo",
+                repo_arg,
+                "--disposition",
+                disposition,
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(rejected.code, 65, "stderr: {}", rejected.stderr_text());
+        assert_eq!(rejected.stdout_json()["error"]["code"], expected);
+    }
+
+    let pending = tmp.path().join("pending");
+    let record = run(
+        "docs-impact",
+        tmp.path(),
+        &[
+            "record",
+            "--out",
+            pending.to_str().unwrap(),
+            "--repo",
+            repo_arg,
+            "--disposition",
+            "pending",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(record.code, 0, "stderr: {}", record.stderr_text());
+    let verify = run(
+        "docs-impact",
+        tmp.path(),
+        &[
+            "verify",
+            "--out",
+            pending.to_str().unwrap(),
+            "--repo",
+            repo_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(verify.code, 65);
+    assert_eq!(verify.stdout_json()["error"]["code"], "pending-disposition");
+
+    fs::write(repo.join("docs/guide.md"), "# Guide\n\nUpdated.\n").unwrap();
+    let docs_updated = tmp.path().join("docs-updated-valid");
+    let accepted = run(
+        "docs-impact",
+        tmp.path(),
+        &[
+            "record",
+            "--out",
+            docs_updated.to_str().unwrap(),
+            "--repo",
+            repo_arg,
+            "--disposition",
+            "docs-updated",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(accepted.code, 0, "stderr: {}", accepted.stderr_text());
 }

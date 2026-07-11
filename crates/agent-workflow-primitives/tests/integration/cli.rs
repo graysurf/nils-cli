@@ -2151,6 +2151,64 @@ All gates green.\n",
     }
 
     #[test]
+    fn new_from_v2_skill_usage_normalizes_all_owner_kinds() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        for kind in ["skill", "workflow", "intent"] {
+            let record_dir = tmp.path().join("out").join(format!("usage-{kind}"));
+            let init = run(
+                "skill-usage",
+                tmp.path(),
+                &[
+                    "init",
+                    "--out",
+                    record_dir.to_str().unwrap(),
+                    "--owner-kind",
+                    kind,
+                    "--owner-id",
+                    &format!("{kind}-owner"),
+                    "--intent",
+                    "repair review finding",
+                    "--user-request-summary",
+                    "repair the control plane",
+                ],
+            );
+            assert_eq!(init.code, 0, "kind={kind} stderr={}", init.stderr_text());
+            let created = run(
+                "heuristic-inbox",
+                tmp.path(),
+                &[
+                    "new",
+                    "--from-skill-usage",
+                    record_dir.to_str().unwrap(),
+                    "--slug",
+                    &format!("{kind}-owner-gap"),
+                    "--out-dir",
+                    inbox.to_str().unwrap(),
+                    "--format",
+                    "json",
+                ],
+            );
+            assert_eq!(
+                created.code,
+                0,
+                "kind={kind} stderr={}",
+                created.stderr_text()
+            );
+            let entry = PathBuf::from(created.stdout_json()["data"]["path"].as_str().unwrap());
+            let text = fs::read_to_string(entry).unwrap();
+            assert!(
+                text.contains(&format!("`{kind}-owner`")),
+                "kind={kind}: {text}"
+            );
+            assert!(
+                text.contains("skill-usage.record.v2"),
+                "kind={kind}: {text}"
+            );
+        }
+    }
+
+    #[test]
     fn new_from_evidence_redacts_and_passes_verify() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let inbox = inbox_root(tmp.path());

@@ -60,7 +60,8 @@ const INGEST_COMMAND: &str = "heuristic-inbox ingest-evidence";
 const DELIVER_COMMAND: &str = "heuristic-inbox deliver";
 
 const RAW_RECORD_FILENAME: &str = "skill-usage.record.json";
-const RAW_RECORD_SCHEMA: &str = "skill-usage.record.v1";
+const RAW_RECORD_SCHEMA_V1: &str = "skill-usage.record.v1";
+const RAW_RECORD_SCHEMA_V2: &str = "skill-usage.record.v2";
 const DEFAULT_EVIDENCE_MAX_BYTES: u64 = 64 * 1024;
 
 const REQUIRED_INBOX_SECTIONS: &[&str] = &[
@@ -707,7 +708,7 @@ fn is_raw_skill_usage_record(src: &Path, sniff: bool) -> bool {
     };
     let limit = bytes.len().min(512);
     let head = String::from_utf8_lossy(&bytes[..limit]);
-    head.contains(RAW_RECORD_SCHEMA)
+    head.contains(RAW_RECORD_SCHEMA_V1) || head.contains(RAW_RECORD_SCHEMA_V2)
 }
 
 fn redact_ingest_source(src: &Path, max_bytes: u64) -> Result<(String, Vec<Violation>), CliError> {
@@ -1467,10 +1468,13 @@ fn load_skill_usage_record(input: &Path) -> Result<(PathBuf, Value), CliError> {
             Some(json!({ "path": display_path(&record_file) })),
         )
     })?;
-    if value.get("schema").and_then(Value::as_str) != Some(RAW_RECORD_SCHEMA) {
+    if !matches!(
+        value.get("schema").and_then(Value::as_str),
+        Some(RAW_RECORD_SCHEMA_V1 | RAW_RECORD_SCHEMA_V2)
+    ) {
         return Err(CliError::runtime(
             "invalid-record-schema",
-            "record schema is not skill-usage.record.v1",
+            "record schema is not a supported skill-usage.record.v1/v2 envelope",
             Some(json!({ "path": display_path(&record_file) })),
         ));
     }
@@ -1608,11 +1612,7 @@ struct ResolvedSource {
 
 fn resolve_skill_usage_source(path: &Path) -> Result<ResolvedSource, CliError> {
     let (record_file, record) = load_skill_usage_record(path)?;
-    let skill = record
-        .get("skill")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown skill")
-        .to_string();
+    let (schema, owner_kind, owner_id) = normalize_skill_usage_owner(&record, &record_file)?;
     let outcome = record.get("outcome").and_then(Value::as_object);
     let outcome_status = outcome
         .and_then(|o| o.get("status"))
@@ -1624,16 +1624,60 @@ fn resolve_skill_usage_source(path: &Path) -> Result<ResolvedSource, CliError> {
         .unwrap_or("See linked skill usage record.");
     let outcome_summary = redact_summary(outcome_summary_raw);
     let raw_record_pointer = normalize_home_paths(&display_path(&record_file));
+    let owner_label = match owner_kind.as_str() {
+        "skill" => "Skill",
+        "workflow" => "Workflow",
+        "intent" => "Intent",
+        _ => unreachable!("owner kind was normalized"),
+    };
     Ok(ResolvedSource {
-        area_default: skill.clone(),
+        area_default: owner_id.clone(),
         first_observed: today_from_record(&record),
-        signal: format!("Skill `{skill}` ended with `{outcome_status}`. Summary: {outcome_summary}"),
+        signal: format!(
+            "{owner_label} `{owner_id}` ended with `{outcome_status}`. Summary: {outcome_summary}"
+        ),
         raw_record_display: format!("`{raw_record_pointer}`"),
-        evidence_summary:
-            "linked `skill-usage.record.v1` envelope; raw runtime details remain in the evidence location."
-                .to_string(),
+        evidence_summary: format!(
+            "linked `{schema}` envelope; raw runtime details remain in the evidence location."
+        ),
         evidence_files: Vec::new(),
     })
+}
+
+fn normalize_skill_usage_owner(
+    record: &Value,
+    record_file: &Path,
+) -> Result<(String, String, String), CliError> {
+    let schema = record
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let normalized = match schema {
+        RAW_RECORD_SCHEMA_V1 => record
+            .get("skill")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|id| ("skill".to_string(), id.to_string())),
+        RAW_RECORD_SCHEMA_V2 => record
+            .get("owner")
+            .and_then(Value::as_object)
+            .and_then(|owner| {
+                let kind = owner.get("kind")?.as_str()?;
+                let id = owner.get("id")?.as_str()?;
+                (matches!(kind, "skill" | "workflow" | "intent") && !id.trim().is_empty())
+                    .then(|| (kind.to_string(), id.to_string()))
+            }),
+        _ => None,
+    };
+    normalized
+        .map(|(kind, id)| (schema.to_string(), kind, id))
+        .ok_or_else(|| {
+            CliError::runtime(
+                "invalid-record-owner",
+                "skill usage record has invalid or missing owner fields",
+                Some(json!({ "path": display_path(record_file), "schema": schema })),
+            )
+        })
 }
 
 fn resolve_evidence_source(path: &Path) -> Result<ResolvedSource, CliError> {
@@ -3781,7 +3825,7 @@ struct VerifyArgs {
         .args(["from_skill_usage", "from_evidence", "manual"]),
 ))]
 struct NewArgs {
-    /// Scaffold from a `skill-usage.record.v1` envelope (file or its directory).
+    /// Scaffold from a v1 or v2 skill-usage envelope (file or its directory).
     #[arg(long = "from-skill-usage", value_name = "PATH", value_hint = ValueHint::AnyPath)]
     from_skill_usage: Option<PathBuf>,
 

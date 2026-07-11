@@ -186,6 +186,70 @@ fn installed_runtime_class_requires_and_verifies_portable_receipt() {
     assert!(report.verified);
     assert!(report.source_clean);
     assert!(report.plan_match);
+
+    let receipt_path = state_home.join("receipts/claude.json");
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    let keys: std::collections::BTreeSet<_> =
+        receipt.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(
+        keys,
+        [
+            "install_plan_digest",
+            "managed_entries",
+            "producer_version",
+            "product",
+            "recorded_at_unix_seconds",
+            "schema",
+            "source_dirty",
+            "source_revision",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    for entry in receipt["managed_entries"].as_array().unwrap() {
+        let entry_keys: std::collections::BTreeSet<_> = entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(entry_keys, ["digest", "id"].into_iter().collect());
+    }
+    receipt["private_state_home"] =
+        serde_json::Value::String("/PRIVATE/HOST/ACCOUNT/STATE_HOME_SENTINEL".to_string());
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let tampered = doctor::run(
+        "claude",
+        &source_root,
+        Some(&home),
+        Some(&state_home),
+        &options,
+    )
+    .unwrap();
+    assert_eq!(tampered.exit_code(), 2);
+    let rendered = format!("{:?}", tampered.findings);
+    assert!(!rendered.contains("STATE_HOME_SENTINEL"));
+
+    install_clean("claude", &source_root, &home, &state_home);
+
+    let live_target = home.join("plugins/reporting/skills/daily-brief/SKILL.md");
+    fs::remove_file(&live_target).unwrap();
+    fs::write(&live_target, "# drifted\n").unwrap();
+    let drifted = doctor::run(
+        "claude",
+        &source_root,
+        Some(&home),
+        Some(&state_home),
+        &options,
+    )
+    .unwrap();
+    assert_eq!(drifted.exit_code(), 2);
+    assert!(
+        !drifted.installed_runtime.unwrap().verified,
+        "nested receipt verdict must include live managed-target acceptance"
+    );
 }
 
 fn run_doctor(

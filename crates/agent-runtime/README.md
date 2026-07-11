@@ -43,7 +43,9 @@ Successful `install --apply` writes
 product, source revision/dirty status, normalized install-plan and managed-entry
 digests, producer version, and timestamp; it excludes source/home paths,
 remotes, accounts, and host details. Reinstalling unchanged content preserves
-the plan and entry digests.
+the plan and entry digests. Receipt parsing rejects fields outside this
+allowlist so accidental path or account metadata cannot silently become part of
+the accepted contract.
 
 `doctor --class installed-runtime` is the focused acceptance gate for that
 receipt. It blocks on a missing receipt from an older install, dirty or mismatched source,

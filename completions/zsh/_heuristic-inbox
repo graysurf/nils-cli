@@ -52,7 +52,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (new)
 _arguments "${_arguments_options[@]}" : \
-'--from-skill-usage=[Scaffold from a \`skill-usage.record.v1\` envelope (file or its directory)]:PATH:_files' \
+'--from-skill-usage=[Scaffold from a v1 or v2 skill-usage envelope (file or its directory)]:PATH:_files' \
 '--from-evidence=[Scaffold from an already-redacted evidence file (reuses ingest-evidence redaction)]:PATH:_files' \
 '--slug=[Slug for the new inbox case]:SLUG:_default' \
 '--out-dir=[Output inbox directory (defaults to heuristic-system/error-inbox)]:DIR:_files -/' \

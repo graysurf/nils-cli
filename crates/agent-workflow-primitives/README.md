@@ -125,7 +125,7 @@ review-specialists bundle --input findings.jsonl --out-dir target/review-special
 
 1. token-like patterns (Bearer / `sk-` / `api_key=` / `-----BEGIN ...`)
 2. body / file byte size against the `--max-bytes` (default 64 KiB) limit
-3. raw `skill-usage.record.v1` JSON shape (matches `"schema":"skill-usage.record.v1"`)
+3. raw `skill-usage.record.v1` or `.v2` JSON shape
 4. absolute `$HOME` paths (`/Users/...` or `/home/...`)
 
 Findings on the body are surfaced under the `body_violations` array and a
@@ -193,7 +193,9 @@ The compatible `--skill` form creates `skill-usage.record.v1`. Mutually exclusiv
 `--owner-kind <skill|workflow|intent> --owner-id <id>` creates v2 with an
 explicit owner object. Mutation, verification, archive migration, query,
 search, and pruning accept mixed v1/v2 datasets; v1 skills normalize to a
-`{kind:"skill", id:...}` owner internally.
+`{kind:"skill", id:...}` owner internally. `heuristic-inbox new
+--from-skill-usage` uses the same normalization and accepts v2 `skill`,
+`workflow`, and `intent` owners.
 
 ```bash
 skill-usage init --out <dir> --skill <skill-path> \
