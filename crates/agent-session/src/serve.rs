@@ -1276,6 +1276,7 @@ async fn delete_handler(
     match tokio::task::spawn_blocking(move || delete_session(&context, &delete_id, tmux)).await {
         Ok(Ok(result)) => {
             state.attach_brokers.shutdown_session(&id).await;
+            state.provider_prompt_discovery.evict_session(&id).await;
             envelope_ok(json!({ "machine": state.machine, "deleted": result }))
         }
         Ok(Err(err)) => envelope_err(err),
@@ -1411,12 +1412,15 @@ struct AttachBrokerRegistry {
     entries: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<AttachBrokerSlot>>>>,
 }
 
-#[derive(Default)]
 struct ProviderPromptDiscoveryRegistry {
     entries: tokio::sync::Mutex<
         HashMap<ProviderPromptDiscoveryKey, Arc<tokio::sync::Mutex<ProviderPromptDiscoverySlot>>>,
     >,
+    resolver: Arc<ProviderPromptSourceResolver>,
 }
+
+type ProviderPromptSourceResolver =
+    dyn Fn(&crate::SessionRecord) -> Option<ProviderPromptSource> + Send + Sync;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProviderPromptDiscoveryKey {
@@ -1430,6 +1434,8 @@ struct ProviderPromptDiscoveryKey {
 
 struct ProviderPromptDiscoverySlot {
     source: Option<ProviderPromptSource>,
+    in_flight: bool,
+    progress: tokio::sync::watch::Sender<u64>,
     next_scan_at: Option<Instant>,
     backoff: Duration,
     scan_attempts: usize,
@@ -1492,11 +1498,23 @@ impl Default for AttachBrokerSlot {
 
 impl Default for ProviderPromptDiscoverySlot {
     fn default() -> Self {
+        let (progress, _) = tokio::sync::watch::channel(0);
         Self {
             source: None,
+            in_flight: false,
+            progress,
             next_scan_at: None,
             backoff: PROVIDER_PROMPT_PENDING_POLL_INTERVAL,
             scan_attempts: 0,
+        }
+    }
+}
+
+impl Default for ProviderPromptDiscoveryRegistry {
+    fn default() -> Self {
+        Self {
+            entries: tokio::sync::Mutex::new(HashMap::new()),
+            resolver: Arc::new(ProviderPromptTail::resolve_source),
         }
     }
 }
@@ -1517,12 +1535,24 @@ impl ProviderPromptDiscoveryKey {
 }
 
 impl ProviderPromptDiscoveryRegistry {
+    #[cfg(test)]
+    fn with_resolver<F>(resolver: F) -> Self
+    where
+        F: Fn(&crate::SessionRecord) -> Option<ProviderPromptSource> + Send + Sync + 'static,
+    {
+        Self {
+            entries: tokio::sync::Mutex::new(HashMap::new()),
+            resolver: Arc::new(resolver),
+        }
+    }
+
     async fn resolve_source(&self, record: &crate::SessionRecord) -> Option<ProviderPromptSource> {
         let key = ProviderPromptDiscoveryKey::from_record(record)?;
         let slot = {
             let mut entries = self.entries.lock().await;
+            entries.retain(|existing, _| existing.session_id != key.session_id || existing == &key);
             entries
-                .entry(key)
+                .entry(key.clone())
                 .or_insert_with(|| {
                     Arc::new(tokio::sync::Mutex::new(
                         ProviderPromptDiscoverySlot::default(),
@@ -1530,33 +1560,68 @@ impl ProviderPromptDiscoveryRegistry {
                 })
                 .clone()
         };
-        let mut slot = slot.lock().await;
-        let source = if let Some(source) = slot.source.clone() {
-            source
-        } else {
+        loop {
+            let mut state = slot.lock().await;
+            if let Some(source) = state.source.clone() {
+                return Some(source);
+            }
             let now = Instant::now();
-            if slot.next_scan_at.is_some_and(|next| now < next) {
+            if state.next_scan_at.is_some_and(|next| now < next) {
                 return None;
             }
-            slot.scan_attempts = slot.scan_attempts.saturating_add(1);
+            let mut progress = state.progress.subscribe();
+            if state.in_flight {
+                drop(state);
+                let _ = progress.changed().await;
+                continue;
+            }
+            state.in_flight = true;
+            state.scan_attempts = state.scan_attempts.saturating_add(1);
+            drop(state);
+
+            let resolver = self.resolver.clone();
             let candidate = record.clone();
-            let source =
-                tokio::task::spawn_blocking(move || ProviderPromptTail::resolve_source(&candidate))
+            let task_slot = slot.clone();
+            tokio::spawn(async move {
+                let source = tokio::task::spawn_blocking(move || resolver(&candidate))
                     .await
                     .ok()
                     .flatten();
-            let Some(source) = source else {
-                slot.next_scan_at = Some(now + slot.backoff);
-                slot.backoff = slot
-                    .backoff
-                    .saturating_mul(2)
-                    .min(PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF);
-                return None;
-            };
-            slot.source = Some(source.clone());
-            source
+                let mut state = task_slot.lock().await;
+                state.in_flight = false;
+                if let Some(source) = source {
+                    state.source = Some(source);
+                    state.next_scan_at = None;
+                } else {
+                    state.next_scan_at = Some(Instant::now() + state.backoff);
+                    state.backoff = next_provider_prompt_discovery_backoff(state.backoff);
+                }
+                state.progress.send_modify(|version| {
+                    *version = version.wrapping_add(1);
+                });
+            });
+            let _ = progress.changed().await;
+        }
+    }
+
+    async fn invalidate_source(&self, record: &crate::SessionRecord) {
+        let Some(key) = ProviderPromptDiscoveryKey::from_record(record) else {
+            return;
         };
-        Some(source)
+        let slot = self.entries.lock().await.get(&key).cloned();
+        if let Some(slot) = slot {
+            let mut state = slot.lock().await;
+            state.source = None;
+            state.next_scan_at = None;
+            state.backoff = PROVIDER_PROMPT_PENDING_POLL_INTERVAL;
+        }
+    }
+
+    async fn evict_session(&self, session_id: &str) {
+        self.entries
+            .lock()
+            .await
+            .retain(|key, _| key.session_id != session_id);
     }
 
     #[cfg(test)]
@@ -1568,6 +1633,17 @@ impl ProviderPromptDiscoveryRegistry {
         let Some(slot) = slot else { return 0 };
         slot.lock().await.scan_attempts
     }
+
+    #[cfg(test)]
+    async fn entry_count(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+}
+
+fn next_provider_prompt_discovery_backoff(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .min(PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF)
 }
 
 impl AttachSubscription {
@@ -2345,7 +2421,8 @@ async fn resolve_provider_prompt_tail(
 ) -> (crate::SessionRecord, Option<ProviderPromptTail>) {
     let pending_fresh_runtime = provider_prompt_pending_fresh_runtime(&record);
     let initial_source = discovery.resolve_source(&record).await;
-    let opened = if let Some(source) = initial_source {
+    let had_initial_source = initial_source.is_some();
+    let mut opened = if let Some(source) = initial_source {
         tokio::task::spawn_blocking(move || ProviderPromptTail::open_source_at_eof(source))
             .await
             .ok()
@@ -2353,6 +2430,16 @@ async fn resolve_provider_prompt_tail(
     } else {
         None
     };
+    if had_initial_source && opened.is_none() {
+        discovery.invalidate_source(&record).await;
+        if let Some(source) = discovery.resolve_source(&record).await {
+            opened =
+                tokio::task::spawn_blocking(move || ProviderPromptTail::open_source_at_eof(source))
+                    .await
+                    .ok()
+                    .flatten();
+        }
+    }
     if opened.is_some() || !pending_fresh_runtime {
         return (record, opened);
     }
@@ -2372,6 +2459,7 @@ async fn resolve_provider_prompt_tail(
         }
         current = updated;
         let source = discovery.resolve_source(&current).await;
+        let had_source = source.is_some();
         let tail = if let Some(source) = source {
             tokio::task::spawn_blocking(move || ProviderPromptTail::open_new_runtime_source(source))
                 .await
@@ -2382,6 +2470,9 @@ async fn resolve_provider_prompt_tail(
         };
         if tail.is_some() {
             return (current, tail);
+        }
+        if had_source {
+            discovery.invalidate_source(&current).await;
         }
     }
     (current, None)
@@ -2832,6 +2923,66 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_provider_prompt_resolver_rejects_runtime_replacement_without_replay() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        seed_fresh_provider_session(
+            &state_dir,
+            "resolver-runtime-replaced",
+            "codex",
+            "hs-resolver-runtime-replaced",
+            &cwd,
+            None,
+        );
+        let context = CliContext {
+            state_dir: state_dir.clone(),
+            host: None,
+        };
+        let record = load_session_record(&context, "resolver-runtime-replaced")
+            .expect("initial session record");
+        let discovery = Arc::new(ProviderPromptDiscoveryRegistry::default());
+        let task = tokio::spawn(resolve_provider_prompt_tail(
+            context.clone(),
+            discovery,
+            record,
+            Instant::now() + Duration::from_secs(2),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut replacement = load_session_record(&context, "resolver-runtime-replaced")
+            .expect("replacement session record");
+        let runtime = replacement.runtime.as_mut().expect("runtime");
+        runtime.generation = 2;
+        runtime.launch_id = "replacement-launch".to_string();
+        runtime.tmux_session = "hs-resolver-runtime-replacement".to_string();
+        replacement.provider_resume = Some(crate::ProviderResume {
+            provider: "codex".to_string(),
+            session_id: "replacement-provider-id".to_string(),
+            captured_at: "2026-07-11T00:00:00Z".to_string(),
+            capture_method: "codex-user-prompt-submit-hook".to_string(),
+            resume_args: vec!["resume".to_string(), "replacement-provider-id".to_string()],
+            extra: std::collections::BTreeMap::new(),
+        });
+        crate::write_session_record(&context, &replacement).expect("persist replacement runtime");
+
+        let (resolved_record, tail) = task.await.expect("resolver task");
+        assert_eq!(
+            resolved_record
+                .runtime
+                .as_ref()
+                .expect("resolved runtime")
+                .generation,
+            2
+        );
+        assert!(
+            tail.is_none(),
+            "runtime replacement must not open either runtime transcript"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_provider_prompt_discovery_coalesces_concurrent_scans() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -2875,6 +3026,181 @@ mod tests {
             1,
             "concurrent clients must share one provider-history scan"
         );
+    }
+
+    #[test]
+    fn provider_prompt_discovery_backoff_doubles_and_caps() {
+        let mut backoff = PROVIDER_PROMPT_PENDING_POLL_INTERVAL;
+        let mut observed = Vec::new();
+        for _ in 0..8 {
+            backoff = next_provider_prompt_discovery_backoff(backoff);
+            observed.push(backoff);
+        }
+        assert_eq!(observed[0], Duration::from_secs(1));
+        assert_eq!(observed[1], Duration::from_secs(2));
+        assert_eq!(observed[2], Duration::from_secs(4));
+        assert_eq!(observed[5], PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF);
+        assert_eq!(observed[7], PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_provider_prompt_scan_survives_lead_waiter_cancellation() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let registry = Arc::new(ProviderPromptDiscoveryRegistry::with_resolver({
+            let started = started.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let release = release.clone();
+            move |_| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                None
+            }
+        }));
+        let record = provider_discovery_record(
+            "cancelled-lead-scan",
+            "hs-cancelled-lead-scan",
+            "launch-cancelled-lead-scan",
+            1,
+        );
+        let lead = {
+            let registry = registry.clone();
+            let record = record.clone();
+            tokio::spawn(async move { registry.resolve_source(&record).await })
+        };
+        while started.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        lead.abort();
+
+        let mut replacements = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let registry = registry.clone();
+            let record = record.clone();
+            replacements.spawn(async move { registry.resolve_source(&record).await });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        release.store(true, Ordering::SeqCst);
+        while replacements.join_next().await.is_some() {}
+        assert_eq!(registry.scan_attempts(&record).await, 1);
+        assert!(registry.resolve_source(&record).await.is_none());
+        assert_eq!(registry.scan_attempts(&record).await, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_prompt_discovery_prunes_old_runtimes_and_deleted_sessions() {
+        let registry = ProviderPromptDiscoveryRegistry::with_resolver(|_| None);
+        let first = provider_discovery_record(
+            "discovery-lifecycle",
+            "hs-discovery-lifecycle",
+            "launch-1",
+            1,
+        );
+        assert!(registry.resolve_source(&first).await.is_none());
+        assert_eq!(registry.entry_count().await, 1);
+
+        let second = provider_discovery_record(
+            "discovery-lifecycle",
+            "hs-discovery-lifecycle",
+            "launch-2",
+            2,
+        );
+        assert!(registry.resolve_source(&second).await.is_none());
+        assert_eq!(registry.entry_count().await, 1);
+
+        registry.evict_session("discovery-lifecycle").await;
+        assert_eq!(registry.entry_count().await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_prompt_resolver_evicts_stale_cache_and_rediscovers_exact_source() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let claude_config = tmp.path().join("claude-config");
+        let _claude_config =
+            EnvGuard::set(&lock, "CLAUDE_CONFIG_DIR", claude_config.to_str().unwrap());
+        let record =
+            provider_discovery_record("stale-cache", "hs-stale-cache", "launch-stale-cache", 2);
+        let provider_id = record
+            .provider_resume
+            .as_ref()
+            .expect("provider resume")
+            .session_id
+            .clone();
+        let first = claude_config
+            .join("projects/-first")
+            .join(format!("{provider_id}.jsonl"));
+        std::fs::create_dir_all(first.parent().expect("first parent")).expect("first dir");
+        std::fs::write(
+            &first,
+            format!(
+                "{}\n",
+                json!({
+                    "type":"user",
+                    "sessionId":provider_id,
+                    "cwd":record.cwd.clone(),
+                    "message":{"role":"user","content":"first"}
+                })
+            ),
+        )
+        .expect("first transcript");
+        let registry = Arc::new(ProviderPromptDiscoveryRegistry::default());
+        assert!(registry.resolve_source(&record).await.is_some());
+
+        std::fs::write(
+            &first,
+            format!(
+                "{}\n",
+                json!({
+                    "type":"user",
+                    "sessionId":"different-provider-id",
+                    "cwd":record.cwd.clone(),
+                    "message":{"role":"user","content":"mismatch"}
+                })
+            ),
+        )
+        .expect("replace cached transcript");
+        let second = claude_config
+            .join("projects/-second")
+            .join(format!("{provider_id}.jsonl"));
+        std::fs::create_dir_all(second.parent().expect("second parent")).expect("second dir");
+        std::fs::write(
+            &second,
+            format!(
+                "{}\n",
+                json!({
+                    "type":"user",
+                    "sessionId":provider_id,
+                    "cwd":record.cwd.clone(),
+                    "message":{"role":"user","content":"replacement"}
+                })
+            ),
+        )
+        .expect("replacement transcript");
+
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let (_, tail) = resolve_provider_prompt_tail(
+            context,
+            registry.clone(),
+            record.clone(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(tail.is_some(), "stale cache must be rediscovered exactly");
+        assert_eq!(registry.scan_attempts(&record).await, 2);
     }
 
     #[tokio::test]
@@ -6973,5 +7299,32 @@ exit 0
             extra: std::collections::BTreeMap::new(),
             resume_sidecar_extra: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn provider_discovery_record(
+        id: &str,
+        tmux_session: &str,
+        launch_id: &str,
+        generation: u64,
+    ) -> crate::SessionRecord {
+        let mut record = test_record(id, tmux_session);
+        record.agent = "claude".to_string();
+        record.provider_resume = Some(crate::ProviderResume {
+            provider: "claude".to_string(),
+            session_id: format!("{id}-provider"),
+            captured_at: "2026-07-11T00:00:00Z".to_string(),
+            capture_method: "claude-explicit-session-id".to_string(),
+            resume_args: vec!["--resume".to_string(), format!("{id}-provider")],
+            extra: std::collections::BTreeMap::new(),
+        });
+        record.runtime = Some(crate::RuntimeInfo {
+            kind: "tmux".to_string(),
+            tmux_session: tmux_session.to_string(),
+            generation,
+            started_at: "2026-07-11T00:00:00Z".to_string(),
+            launch_id: launch_id.to_string(),
+            extra: std::collections::BTreeMap::new(),
+        });
+        record
     }
 }
