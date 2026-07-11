@@ -73,7 +73,6 @@ The JSON shape is:
           "provider": "codex",
           "confidence": "authoritative"
         },
-        "current_turn": null,
         "last_turn": {
           "provider_turn_id": "opaque-id",
           "started_at": "2026-07-11T16:58:00Z",
@@ -86,10 +85,30 @@ The JSON shape is:
 }
 ```
 
-`snapshot` and `reset` contain a full list of daemon session ids. `turn_state`
-is `null` when no valid activity snapshot exists. `heartbeat` omits `sessions`
-and is emitted every 15 seconds. `stream_id` is stable for one daemon process;
-`sequence` strictly increases across snapshots and heartbeats.
+`snapshot` and ordinary `reset` frames contain a full list of daemon session
+ids. `turn_state` is `null` when no valid activity snapshot exists. `heartbeat`
+omits `sessions` and is emitted every 15 seconds. `stream_id` is stable for one
+daemon process; `sequence` strictly increases across emitted frames.
+
+A projected snapshot whose complete SSE wire frame would exceed 512 KiB is not
+retained or broadcast. The producer emits this bounded content-free reset
+instead:
+
+```json
+{
+  "schema_version": "agent-session.activity-stream.event.v1",
+  "type": "reset",
+  "stream_id": "opaque-daemon-boot-id",
+  "sequence": 43,
+  "machine": "sympoies",
+  "observed_at": "2026-07-11T17:00:00Z",
+  "reason": "oversized_snapshot"
+}
+```
+
+Only this exact `reset` reason permits `sessions` to be omitted. It is a
+content-free invalidation, not an empty session list, and requires immediate
+`GET /sessions` reconciliation. Polling remains authoritative and available.
 
 Nested optional `turn_state` leaves use the same omission semantics as
 `GET /sessions`: absent provider ids, progress timestamps, attention, current
@@ -106,9 +125,10 @@ A retained cursor for the current stream replays events whose sequence is
 greater than the cursor. A malformed cursor, another daemon boot id, a cursor
 beyond the current sequence, or an evicted cursor receives the latest full
 state as `reset`. The replay window retains at most 128 frames and at most
-512 KiB of serialized event data. Oldest frames are evicted until both limits
-hold; if any sequence needed by a cursor was evicted (including an individual
-snapshot larger than the byte budget), the subscriber receives a full reset.
+512 KiB of pre-framed SSE wire bytes. Oldest frames are evicted until both
+limits hold; if any sequence needed by a cursor was evicted, the subscriber
+receives a reset. An oversized latest snapshot receives the content-free reset
+described above.
 
 Consumers deduplicate by `(machine, stream_id, sequence)`. A sequence gap or a
 `reset` triggers immediate `GET /sessions` reconciliation. Degraded resets have
@@ -116,13 +136,21 @@ unique increasing sequences even when several subscribers stop concurrently.
 The regular session poll remains active for convergence, daemon health, and
 old-peer fallback.
 
-The daemon uses a bounded 32-frame broadcast queue. Producers never await a
-subscriber. A lagged subscriber receives a full reset from the latest state.
-At most 64 concurrent SSE subscribers are admitted. Further authenticated
-requests receive 429 `activity-stream-capacity`; disconnecting a subscriber
-releases its permit and polling remains available throughout saturation.
-Filesystem notifications for `activity.json` and session lifecycle changes are
-coalesced before snapshot projection; HTTP polling is not the transition source.
+The producer serializes each event payload and complete SSE frame once, caches
+its wire length, and shares the same immutable frame across replay, broadcast,
+and every subscriber. A single-frame broadcast slot prevents the queue from
+retaining 32 large frames outside the 512 KiB replay budget; producers never
+await a subscriber, and a lagged subscriber receives a cached reset from the
+latest state. At most 64 concurrent SSE subscribers are admitted. Further
+authenticated requests receive 429 `activity-stream-capacity`; disconnecting a
+subscriber releases its permit and polling remains available throughout
+saturation.
+
+Filesystem notifications for `activity.json` and session lifecycle changes use
+a capacity-one dirty bit. Refresh waits for a trailing 25 ms quiet window but
+never waits more than the explicit 250 ms maximum cadence before starting a
+snapshot scan. Notifications arriving during a scan stay dirty and converge in
+a later bounded refresh; HTTP polling is not the transition source.
 
 ## Privacy boundary
 

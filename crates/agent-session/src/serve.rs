@@ -22,6 +22,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -33,7 +35,6 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use futures_util::{SinkExt, StreamExt};
@@ -88,12 +89,14 @@ const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const ACTIVITY_STREAM_EVENT_SCHEMA_VERSION: &str = "agent-session.activity-stream.event.v1";
-const ACTIVITY_STREAM_BROADCAST_CAPACITY: usize = 32;
+const ACTIVITY_STREAM_BROADCAST_CAPACITY: usize = 1;
 const ACTIVITY_STREAM_REPLAY_CAPACITY: usize = 128;
 const ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY: usize = 512 * 1024;
 const ACTIVITY_STREAM_SUBSCRIBER_CAPACITY: usize = 64;
 const ACTIVITY_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const ACTIVITY_STREAM_DEBOUNCE: Duration = Duration::from_millis(25);
+const ACTIVITY_STREAM_MAX_REFRESH_CADENCE: Duration = Duration::from_millis(250);
+const ACTIVITY_STREAM_OVERSIZED_REASON: &str = "oversized_snapshot";
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
 const RESET_AT_EPOCH_KEYS: &[&str] = &[
     "reset_at_epoch",
@@ -324,6 +327,8 @@ struct ActivityStreamEvent {
     machine: String,
     observed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sessions: Option<Vec<ActivityStreamSession>>,
 }
 
@@ -331,34 +336,87 @@ impl ActivityStreamEvent {
     fn sse_id(&self) -> String {
         format!("{}:{}", self.stream_id, self.sequence)
     }
+}
 
-    fn as_sse(&self) -> SseEvent {
-        SseEvent::default()
-            .id(self.sse_id())
-            .event(self.kind)
-            .data(serde_json::to_string(self).expect("activity stream event serializes"))
+#[derive(Debug)]
+struct ActivityStreamFrame {
+    kind: &'static str,
+    sequence: u64,
+    #[cfg(test)]
+    event: ActivityStreamEvent,
+    sse: Bytes,
+    wire_bytes: usize,
+}
+
+#[derive(Default)]
+struct ActivityFrameEncoder {
+    #[cfg(test)]
+    count: AtomicUsize,
+}
+
+impl ActivityFrameEncoder {
+    fn encode(&self, event: ActivityStreamEvent) -> Arc<ActivityStreamFrame> {
+        let payload = serde_json::to_vec(&event).expect("activity stream event serializes");
+        #[cfg(test)]
+        self.count.fetch_add(1, Ordering::SeqCst);
+        let id = event.sse_id();
+        let mut sse = Vec::with_capacity(id.len() + event.kind.len() + payload.len() + 24);
+        sse.extend_from_slice(b"id: ");
+        sse.extend_from_slice(id.as_bytes());
+        sse.extend_from_slice(b"\nevent: ");
+        sse.extend_from_slice(event.kind.as_bytes());
+        sse.extend_from_slice(b"\ndata: ");
+        sse.extend_from_slice(&payload);
+        sse.extend_from_slice(b"\n\n");
+        let wire_bytes = sse.len();
+        Arc::new(ActivityStreamFrame {
+            kind: event.kind,
+            sequence: event.sequence,
+            #[cfg(test)]
+            event,
+            sse: Bytes::from(sse),
+            wire_bytes,
+        })
     }
 
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+impl ActivityStreamFrame {
     fn replay_bytes(&self) -> usize {
-        serde_json::to_vec(self)
-            .expect("activity stream event serializes")
-            .len()
+        self.wire_bytes
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for ActivityStreamFrame {
+    type Target = ActivityStreamEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
     }
 }
 
 struct ActivityEventState {
-    history: VecDeque<Arc<ActivityStreamEvent>>,
+    history: VecDeque<Arc<ActivityStreamFrame>>,
     history_bytes: usize,
     latest_sessions: Vec<ActivityStreamSession>,
     latest_observed_at: String,
+    latest_snapshot_oversized: bool,
+    cached_snapshot: Option<Arc<ActivityStreamFrame>>,
+    cached_reset: Option<Arc<ActivityStreamFrame>>,
 }
 
 struct ActivityEventLog {
     stream_id: String,
     machine: String,
+    encoder: ActivityFrameEncoder,
     sequence: AtomicU64,
     state: StdMutex<ActivityEventState>,
-    sender: broadcast::Sender<Arc<ActivityStreamEvent>>,
+    sender: broadcast::Sender<Arc<ActivityStreamFrame>>,
     lifecycle: watch::Sender<ActivityBrokerLifecycle>,
 }
 
@@ -376,15 +434,33 @@ impl ActivityEventLog {
     ) -> Arc<Self> {
         let stream_id = uuid::Uuid::new_v4().to_string();
         let observed_at = activity_observed_at();
-        let initial = Arc::new(ActivityStreamEvent {
+        let encoder = ActivityFrameEncoder::default();
+        let initial = encoder.encode(ActivityStreamEvent {
             schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
             kind: "snapshot",
             stream_id: stream_id.clone(),
             sequence: 1,
             machine: machine.clone(),
             observed_at: observed_at.clone(),
+            reason: None,
             sessions: Some(sessions.clone()),
         });
+        let latest_snapshot_oversized =
+            initial.replay_bytes() > ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY;
+        let initial = if latest_snapshot_oversized {
+            encoder.encode(ActivityStreamEvent {
+                schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
+                kind: "reset",
+                stream_id: stream_id.clone(),
+                sequence: 1,
+                machine: machine.clone(),
+                observed_at: observed_at.clone(),
+                reason: Some(ACTIVITY_STREAM_OVERSIZED_REASON),
+                sessions: None,
+            })
+        } else {
+            initial
+        };
         let mut history = VecDeque::with_capacity(ACTIVITY_STREAM_REPLAY_CAPACITY);
         let initial_bytes = initial.replay_bytes();
         let history_bytes = if initial_bytes <= ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY {
@@ -397,12 +473,16 @@ impl ActivityEventLog {
         Arc::new(Self {
             stream_id,
             machine,
+            encoder,
             sequence: AtomicU64::new(1),
             state: StdMutex::new(ActivityEventState {
                 history,
                 history_bytes,
                 latest_sessions: sessions,
                 latest_observed_at: observed_at,
+                latest_snapshot_oversized,
+                cached_snapshot: Some(initial.clone()),
+                cached_reset: (initial.kind == "reset").then(|| initial.clone()),
             }),
             sender,
             lifecycle,
@@ -414,6 +494,8 @@ impl ActivityEventLog {
         let unchanged = state.latest_sessions == sessions;
         if unchanged {
             state.latest_observed_at = activity_observed_at();
+            state.cached_snapshot = None;
+            state.cached_reset = None;
             return;
         }
         drop(state);
@@ -427,19 +509,45 @@ impl ActivityEventLog {
     fn publish(&self, kind: &'static str, sessions: Option<Vec<ActivityStreamSession>>) {
         let mut state = self.state.lock().expect("activity event state lock");
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        let event = Arc::new(ActivityStreamEvent {
+        let observed_at = activity_observed_at();
+        let event = self.encoder.encode(ActivityStreamEvent {
             schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
             kind,
             stream_id: self.stream_id.clone(),
             sequence,
             machine: self.machine.clone(),
-            observed_at: activity_observed_at(),
+            observed_at: observed_at.clone(),
+            reason: None,
             sessions: sessions.clone(),
         });
         if let Some(sessions) = sessions {
             state.latest_sessions = sessions;
-            state.latest_observed_at = event.observed_at.clone();
+            state.latest_observed_at = observed_at;
+            state.latest_snapshot_oversized =
+                event.replay_bytes() > ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY;
         }
+        state.cached_snapshot = None;
+        state.cached_reset = None;
+        let event = if event.replay_bytes() > ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY {
+            let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+            let reset = self.content_free_reset_frame(sequence, &state.latest_observed_at);
+            state.cached_snapshot = Some(reset.clone());
+            state.cached_reset = Some(reset.clone());
+            reset
+        } else {
+            if event.kind == "snapshot" {
+                state.cached_snapshot = Some(event.clone());
+            }
+            event
+        };
+        self.retain_and_broadcast_locked(&mut state, event);
+    }
+
+    fn retain_and_broadcast_locked(
+        &self,
+        state: &mut ActivityEventState,
+        event: Arc<ActivityStreamFrame>,
+    ) {
         state.history_bytes = state.history_bytes.saturating_add(event.replay_bytes());
         state.history.push_back(event.clone());
         while state.history.len() > ACTIVITY_STREAM_REPLAY_CAPACITY
@@ -459,11 +567,11 @@ impl ActivityEventLog {
         // snapshot may be present in both sources; the sequence filter removes
         // those duplicates without losing an event.
         let receiver = self.sender.subscribe();
-        let state = self.state.lock().expect("activity event state lock");
+        let mut state = self.state.lock().expect("activity event state lock");
         let current_sequence = self.sequence.load(Ordering::SeqCst);
         let pending = match last_event_id.and_then(parse_activity_event_id) {
             None if last_event_id.is_none() => {
-                VecDeque::from([self.full_event_locked(&state, current_sequence, "snapshot")])
+                VecDeque::from([self.full_event_locked(&mut state, current_sequence, "snapshot")])
             }
             Some((stream_id, sequence))
                 if stream_id == self.stream_id && sequence <= current_sequence =>
@@ -491,10 +599,10 @@ impl ActivityEventLog {
                 if contiguous {
                     replay
                 } else {
-                    VecDeque::from([self.reset_event_locked(&state, current_sequence)])
+                    VecDeque::from([self.reset_event_locked(&mut state, current_sequence)])
                 }
             }
-            _ => VecDeque::from([self.reset_event_locked(&state, current_sequence)]),
+            _ => VecDeque::from([self.reset_event_locked(&mut state, current_sequence)]),
         };
         ActivitySubscription {
             log: self.clone(),
@@ -512,48 +620,94 @@ impl ActivityEventLog {
         }
     }
 
-    fn reset_event(&self) -> Arc<ActivityStreamEvent> {
-        let state = self.state.lock().expect("activity event state lock");
+    fn reset_event(&self) -> Arc<ActivityStreamFrame> {
+        let mut state = self.state.lock().expect("activity event state lock");
         let sequence = self.sequence.load(Ordering::SeqCst);
-        self.reset_event_locked(&state, sequence)
+        self.reset_event_locked(&mut state, sequence)
     }
 
-    fn degraded_reset_event(&self) -> Arc<ActivityStreamEvent> {
+    fn degraded_reset_event(&self) -> Arc<ActivityStreamFrame> {
         let state = self.state.lock().expect("activity event state lock");
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        self.reset_event_locked(&state, sequence)
+        self.uncached_full_event_locked(&state, sequence, "reset")
     }
 
     fn reset_event_locked(
         &self,
-        state: &ActivityEventState,
+        state: &mut ActivityEventState,
         sequence: u64,
-    ) -> Arc<ActivityStreamEvent> {
+    ) -> Arc<ActivityStreamFrame> {
         self.full_event_locked(state, sequence, "reset")
     }
 
     fn full_event_locked(
         &self,
+        state: &mut ActivityEventState,
+        sequence: u64,
+        kind: &'static str,
+    ) -> Arc<ActivityStreamFrame> {
+        let cached = if kind == "snapshot" {
+            &state.cached_snapshot
+        } else {
+            &state.cached_reset
+        };
+        if let Some(frame) = cached
+            && frame.sequence == sequence
+        {
+            return frame.clone();
+        }
+        let frame = self.uncached_full_event_locked(state, sequence, kind);
+        if kind == "snapshot" {
+            state.cached_snapshot = Some(frame.clone());
+        } else {
+            state.cached_reset = Some(frame.clone());
+        }
+        frame
+    }
+
+    fn uncached_full_event_locked(
+        &self,
         state: &ActivityEventState,
         sequence: u64,
         kind: &'static str,
-    ) -> Arc<ActivityStreamEvent> {
-        Arc::new(ActivityStreamEvent {
+    ) -> Arc<ActivityStreamFrame> {
+        if state.latest_snapshot_oversized {
+            return self.content_free_reset_frame(sequence, &state.latest_observed_at);
+        }
+        self.encoder.encode(ActivityStreamEvent {
             schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
             kind,
             stream_id: self.stream_id.clone(),
             sequence,
             machine: self.machine.clone(),
             observed_at: state.latest_observed_at.clone(),
+            reason: None,
             sessions: Some(state.latest_sessions.clone()),
+        })
+    }
+
+    fn content_free_reset_frame(
+        &self,
+        sequence: u64,
+        observed_at: &str,
+    ) -> Arc<ActivityStreamFrame> {
+        self.encoder.encode(ActivityStreamEvent {
+            schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
+            kind: "reset",
+            stream_id: self.stream_id.clone(),
+            sequence,
+            machine: self.machine.clone(),
+            observed_at: observed_at.to_string(),
+            reason: Some(ACTIVITY_STREAM_OVERSIZED_REASON),
+            sessions: None,
         })
     }
 }
 
 struct ActivitySubscription {
     log: Arc<ActivityEventLog>,
-    pending: VecDeque<Arc<ActivityStreamEvent>>,
-    receiver: broadcast::Receiver<Arc<ActivityStreamEvent>>,
+    pending: VecDeque<Arc<ActivityStreamFrame>>,
+    receiver: broadcast::Receiver<Arc<ActivityStreamFrame>>,
     lifecycle: watch::Receiver<ActivityBrokerLifecycle>,
     last_sequence: u64,
     reconciliation_sent: bool,
@@ -561,7 +715,7 @@ struct ActivitySubscription {
 }
 
 impl ActivitySubscription {
-    fn reconcile_or_stop(&mut self) -> Option<Arc<ActivityStreamEvent>> {
+    fn reconcile_or_stop(&mut self) -> Option<Arc<ActivityStreamFrame>> {
         if self.reconciliation_sent {
             None
         } else {
@@ -570,7 +724,7 @@ impl ActivitySubscription {
         }
     }
 
-    async fn next_event(&mut self) -> Option<Arc<ActivityStreamEvent>> {
+    async fn next_event(&mut self) -> Option<Arc<ActivityStreamFrame>> {
         loop {
             if *self.lifecycle.borrow() != ActivityBrokerLifecycle::Ready {
                 return self.reconcile_or_stop();
@@ -902,8 +1056,36 @@ async fn activity_change_loop(
             );
             return;
         }
-        tokio::time::sleep(ACTIVITY_STREAM_DEBOUNCE).await;
-        while changes.try_recv().is_ok() {}
+        let quiet = tokio::time::sleep(ACTIVITY_STREAM_DEBOUNCE);
+        let cadence = tokio::time::sleep(ACTIVITY_STREAM_MAX_REFRESH_CADENCE);
+        tokio::pin!(quiet);
+        tokio::pin!(cadence);
+        loop {
+            tokio::select! {
+                biased;
+                changed = lifecycle_rx.changed() => {
+                    if changed.is_err()
+                        || *lifecycle_rx.borrow() != ActivityBrokerLifecycle::Ready
+                    {
+                        return;
+                    }
+                }
+                _ = &mut cadence => break,
+                _ = &mut quiet => break,
+                change = changes.recv() => {
+                    if change.is_none() {
+                        degrade_activity_broker(
+                            &lifecycle,
+                            "activity filesystem notification channel closed; activity stream disabled",
+                        );
+                        return;
+                    }
+                    quiet
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + ACTIVITY_STREAM_DEBOUNCE);
+                }
+            }
+        }
         if !activity_refresh_snapshot(
             log.clone(),
             lifecycle.clone(),
@@ -1734,9 +1916,13 @@ async fn activity_events_handler(
         subscription
             .next_event()
             .await
-            .map(|event| (Ok::<_, Infallible>(event.as_sse()), subscription))
+            .map(|event| (Ok::<_, Infallible>(event.sse.clone()), subscription))
     });
-    let mut response = Sse::new(stream).into_response();
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        "text/event-stream".parse().expect("static header"),
+    );
     response.headers_mut().insert(
         "cache-control",
         "no-cache, no-transform".parse().expect("static header"),
@@ -6058,6 +6244,7 @@ mod tests {
             sequence: 42,
             machine: "fixture-machine".to_string(),
             observed_at: "2026-07-11T17:01:01Z".to_string(),
+            reason: None,
             sessions: Some(vec![
                 ActivityStreamSession {
                     id: "working-minimal".to_string(),
@@ -6155,7 +6342,8 @@ mod tests {
         let reset = replay.next_event().await.unwrap();
         assert_eq!(reset.kind, "reset");
         assert_eq!(reset.sequence, log.sequence.load(Ordering::SeqCst));
-        assert_eq!(reset.sessions.as_ref().unwrap().len(), 128);
+        assert_eq!(reset.reason, Some(ACTIVITY_STREAM_OVERSIZED_REASON));
+        assert!(reset.sessions.is_none());
     }
 
     #[tokio::test]
@@ -6173,6 +6361,95 @@ mod tests {
         assert_eq!(reset.kind, "reset");
         assert_eq!(reset.sequence, log.sequence.load(Ordering::SeqCst));
         assert!(reset.sessions.is_some());
+    }
+
+    #[tokio::test]
+    async fn activity_stream_oversized_max_fanout_and_lag_reconcile_with_bounded_frames() {
+        let broker = ActivityBroker::for_test(MACHINE);
+        let cursor = format!("{}:1", broker.log.stream_id);
+        let mut subscribers = (0..ACTIVITY_STREAM_SUBSCRIBER_CAPACITY)
+            .map(|_| {
+                broker
+                    .subscribe(Some(&cursor))
+                    .expect("admitted subscriber")
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            broker.subscribe(Some(&cursor)),
+            Err(ActivitySubscribeError::Capacity)
+        ));
+        let sessions = (0..128)
+            .map(|index| ActivityStreamSession {
+                id: format!("oversized-{index:03}-{}", "x".repeat(128)),
+                turn_state: Some(test_stream_turn_state(index, "x".repeat(8192))),
+            })
+            .collect();
+
+        let encode_count = broker.log.encoder.count();
+        broker.log.publish_snapshot(sessions);
+        let mut slow = subscribers.pop().expect("lagging subscriber");
+        let first = subscribers[0]
+            .next_event()
+            .await
+            .expect("oversized reconciliation frame");
+        assert_eq!(first.kind, "reset");
+        assert_eq!(first.reason, Some(ACTIVITY_STREAM_OVERSIZED_REASON));
+        assert!(first.sessions.is_none());
+        assert!(first.replay_bytes() <= ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY);
+        let (_, _, wire) = parse_activity_sse_frame(
+            std::str::from_utf8(first.sse.as_ref()).expect("UTF-8 SSE frame"),
+        );
+        assert_eq!(wire["type"], "reset");
+        assert_eq!(wire["reason"], ACTIVITY_STREAM_OVERSIZED_REASON);
+        assert!(wire.get("sessions").is_none());
+        assert_eq!(
+            broker.log.encoder.count(),
+            encode_count + 2,
+            "oversized payload and its bounded reset each serialize once"
+        );
+        for subscriber in &mut subscribers[1..] {
+            let observed = subscriber
+                .next_event()
+                .await
+                .expect("shared oversized reconciliation frame");
+            assert!(Arc::ptr_eq(&first, &observed));
+        }
+        assert_eq!(
+            broker.log.encoder.count(),
+            encode_count + 2,
+            "maximum subscriber fan-out must share the pre-serialized frame"
+        );
+
+        for _ in 0..(ACTIVITY_STREAM_BROADCAST_CAPACITY + 4) {
+            broker.log.publish_heartbeat();
+        }
+        let before_lag_reset = broker.log.encoder.count();
+        let lagged = tokio::time::timeout(Duration::from_millis(100), slow.next_event())
+            .await
+            .expect("lagged subscriber reset")
+            .expect("lagged subscriber event");
+        assert_eq!(lagged.kind, "reset");
+        assert_eq!(lagged.reason, Some(ACTIVITY_STREAM_OVERSIZED_REASON));
+        assert!(lagged.sessions.is_none());
+        assert!(lagged.replay_bytes() <= ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY);
+        assert_eq!(
+            broker.log.encoder.count(),
+            before_lag_reset + 1,
+            "the first lagging subscriber materializes one cached reset frame"
+        );
+        let second_lagged = subscribers[0]
+            .next_event()
+            .await
+            .expect("second lagging subscriber reset");
+        assert!(Arc::ptr_eq(&lagged, &second_lagged));
+        assert_eq!(
+            broker.log.encoder.count(),
+            before_lag_reset + 1,
+            "lagging subscribers must share the cached reconciliation frame"
+        );
+        let state = broker.log.state.lock().expect("activity event state lock");
+        assert!(state.history_bytes <= ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY);
+        assert_eq!(ACTIVITY_STREAM_BROADCAST_CAPACITY, 1);
     }
 
     #[tokio::test]
@@ -6508,6 +6785,87 @@ mod tests {
             .expect("refreshed snapshot");
         assert_eq!(refreshed.kind, "snapshot");
         assert_eq!(refreshed.sessions.as_ref().unwrap()[0].id, "source-after");
+
+        change_task.abort();
+        let _ = change_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activity_broker_notification_storm_bounds_slow_scans_and_converges_final_revision() {
+        const NOTIFICATIONS: usize = 300;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let tmux = minimal_tmux(tmp.path());
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        for id in ["storm-before", "storm-final"] {
+            seed_fresh_provider_session(tmp.path(), id, "codex", &format!("hs-{id}"), &cwd, None);
+        }
+        let source_revision = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let collector_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_revision = source_revision.clone();
+        let observed_calls = collector_calls.clone();
+        let collector: SessionCollector = Arc::new(move |context, tmux_bin| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(75));
+            let expected_id = if observed_revision.load(Ordering::SeqCst) == NOTIFICATIONS {
+                "storm-final"
+            } else {
+                "storm-before"
+            };
+            list_sessions(context, Some(tmux_bin)).map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| session.id == expected_id)
+                    .collect()
+            })
+        });
+        let broker = ActivityBroker::for_test_with_session_collector(
+            MACHINE,
+            &context,
+            &tmux,
+            collector.clone(),
+        );
+        let mut subscription = broker.subscribe(None).expect("ready subscription");
+        let initial = subscription.next_event().await.expect("initial snapshot");
+        assert_eq!(initial.sessions.as_ref().unwrap()[0].id, "storm-before");
+        collector_calls.store(0, Ordering::SeqCst);
+        let (change_tx, change_rx) = mpsc::channel(1);
+        let change_task = tokio::spawn(activity_change_loop(
+            broker.log.clone(),
+            broker.lifecycle.clone(),
+            collector,
+            context,
+            tmux,
+            change_rx,
+        ));
+
+        for revision in 1..=NOTIFICATIONS {
+            source_revision.store(revision, Ordering::SeqCst);
+            let _ = change_tx.try_send(());
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let final_snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = subscription.next_event().await.expect("activity event");
+                if event.sessions.as_ref().is_some_and(|sessions| {
+                    sessions.iter().any(|session| session.id == "storm-final")
+                }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("storm converges to final revision");
+        assert_eq!(final_snapshot.kind, "snapshot");
+        assert!(
+            collector_calls.load(Ordering::SeqCst) <= 3,
+            "notification storm triggered too many full scans: {}",
+            collector_calls.load(Ordering::SeqCst)
+        );
 
         change_task.abort();
         let _ = change_task.await;
