@@ -927,6 +927,9 @@ async fn activity_heartbeat_loop(
 ) {
     let mut interval = tokio::time::interval(ACTIVITY_STREAM_HEARTBEAT_INTERVAL);
     let mut lifecycle_rx = lifecycle.subscribe();
+    if *lifecycle_rx.borrow() != ActivityBrokerLifecycle::Ready {
+        return;
+    }
     interval.tick().await;
     loop {
         tokio::select! {
@@ -6229,6 +6232,180 @@ mod tests {
         let snapshot = subscription.next_event().await.expect("stream snapshot");
         assert_eq!(snapshot.sessions, Some(Vec::new()));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn activity_broker_initial_collector_failure_starts_degraded_and_returns_poll_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let failing_collector: SessionCollector = Arc::new(|_, _| {
+            Err(CliError::runtime(
+                "activity-snapshot-failed",
+                "injected initial activity snapshot failure",
+                None,
+            ))
+        });
+        let broker = ActivityBroker::start(
+            context,
+            MACHINE.to_string(),
+            minimal_tmux(tmp.path()),
+            failing_collector.clone(),
+        )
+        .await;
+        assert_eq!(
+            *broker.lifecycle.borrow(),
+            ActivityBrokerLifecycle::Degraded
+        );
+        assert!(matches!(
+            broker.subscribe(None),
+            Err(ActivitySubscribeError::Unavailable)
+        ));
+
+        let st = state_with_dependencies(
+            tmp.path(),
+            Some(TOKEN),
+            PathBuf::from("tmux"),
+            broker,
+            failing_collector,
+        );
+        let (status, body) = call(router(st), get_auth("/activity/events", Some(TOKEN))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "activity-stream-unavailable");
+    }
+
+    #[tokio::test]
+    async fn activity_broker_change_channel_close_resets_once_stops_stream_and_heartbeat() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let broker = ActivityBroker::for_test(MACHINE);
+        let mut subscription = broker.subscribe(None).expect("ready subscription");
+        assert_eq!(
+            subscription
+                .next_event()
+                .await
+                .expect("initial snapshot")
+                .kind,
+            "snapshot"
+        );
+        let sequence_before_close = broker.log.sequence.load(Ordering::SeqCst);
+        let (change_tx, change_rx) = mpsc::channel(1);
+        let change_task = tokio::spawn(activity_change_loop(
+            broker.log.clone(),
+            broker.lifecycle.clone(),
+            default_session_collector(),
+            context,
+            PathBuf::from("tmux"),
+            change_rx,
+        ));
+        let heartbeat_task = tokio::spawn(activity_heartbeat_loop(
+            broker.log.clone(),
+            broker.lifecycle.clone(),
+        ));
+
+        drop(change_tx);
+        tokio::time::timeout(Duration::from_millis(250), change_task)
+            .await
+            .expect("change loop stops after notification channel close")
+            .expect("change loop task");
+        assert_eq!(
+            *broker.lifecycle.borrow(),
+            ActivityBrokerLifecycle::Degraded
+        );
+        assert_eq!(
+            subscription
+                .next_event()
+                .await
+                .expect("channel-close reconciliation")
+                .kind,
+            "reset"
+        );
+        assert!(subscription.next_event().await.is_none());
+        tokio::time::timeout(Duration::from_millis(250), heartbeat_task)
+            .await
+            .expect("heartbeat loop stops after degradation")
+            .expect("heartbeat loop task");
+        assert_eq!(
+            broker.log.sequence.load(Ordering::SeqCst),
+            sequence_before_close,
+            "notification-channel failure must not leave a healthy heartbeat running"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_broker_notification_refresh_matches_stateful_shared_poll_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let tmux = minimal_tmux(tmp.path());
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        for id in ["source-before", "source-after"] {
+            seed_fresh_provider_session(tmp.path(), id, "codex", &format!("hs-{id}"), &cwd, None);
+        }
+        let source_revision = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_revision = source_revision.clone();
+        let collector: SessionCollector = Arc::new(move |context, tmux_bin| {
+            let expected_id = if observed_revision.load(Ordering::SeqCst) == 0 {
+                "source-before"
+            } else {
+                "source-after"
+            };
+            list_sessions(context, Some(tmux_bin)).map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| session.id == expected_id)
+                    .collect()
+            })
+        });
+        let broker = ActivityBroker::for_test_with_session_collector(
+            MACHINE,
+            &context,
+            &tmux,
+            collector.clone(),
+        );
+        let mut subscription = broker.subscribe(None).expect("ready subscription");
+        let initial = subscription.next_event().await.expect("initial snapshot");
+        assert_eq!(initial.sessions.as_ref().unwrap()[0].id, "source-before");
+        let st = state_with_dependencies(
+            tmp.path(),
+            Some(TOKEN),
+            tmux.clone(),
+            broker.clone(),
+            collector.clone(),
+        );
+        source_revision.store(1, Ordering::SeqCst);
+
+        let (status, body) = call(router(st), get("/sessions")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["sessions"][0]["id"], "source-after");
+
+        let (change_tx, change_rx) = mpsc::channel(1);
+        let change_task = tokio::spawn(activity_change_loop(
+            broker.log.clone(),
+            broker.lifecycle.clone(),
+            collector,
+            context,
+            tmux,
+            change_rx,
+        ));
+        change_tx.send(()).await.expect("activity notification");
+        let refreshed = tokio::time::timeout(Duration::from_secs(1), subscription.next_event())
+            .await
+            .expect("notification refresh")
+            .expect("refreshed snapshot");
+        assert_eq!(refreshed.kind, "snapshot");
+        assert_eq!(refreshed.sessions.as_ref().unwrap()[0].id, "source-after");
+
+        change_task.abort();
+        let _ = change_task.await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
